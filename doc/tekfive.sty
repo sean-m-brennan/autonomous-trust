@@ -1,0 +1,65 @@
+% TekFive branding
+% 
+% 
+\NeedsTeXFormat{LaTeX2e}[1994/06/01]
+
+\ProvidesPackage{tekfive}[2020/12/30 v0.01 LaTeX package for TekFive branding]
+
+\RequirePackage{graphicx}
+\RequirePackage{fancyhdr}
+\RequirePackage{geometry}
+\RequirePackage{color}
+\RequirePackage{xcolor}
+\RequirePackage{lastpage}
+\RequirePackage{afterpage}
+\RequirePackage{xkeyval}
+
+% parameter defaults
+\newcommand{\tfDocumentType}{whitepaper}
+\newcommand{\tfDocumentPageStyle}{plain}
+
+\DeclareOptionX{type}{\renewcommand{\tfDocumentType}{#1}}
+\DeclareOptionX{style}{\renewcommand{\tfDocumentStyle}{#1}}
+\DeclareOptionX*{\PackageWarning{tekfive}{Unknown option ‘\CurrentOption’}}
+\ProcessOptionsX\relax
+
+\pagestyle{fancy}
+
+\fancyhead{}
+\fancyfoot{}
+
+\definecolor{T5blue}{HTML}{1d6186}
+
+\renewcommand{\headrulewidth}{0pt}%
+\fancypagestyle{\tfDocumentPageStyle}{%
+	\fancyhf{}%
+	\fancyhead[LO]{%
+		\includegraphics[width=1in]{t5logo}
+		\hfill \sffamily \color{T5blue} a TekFive \tfDocumentType{}
+		\noindent\textcolor{T5blue}{\rule{\linewidth}{1mm}}
+	}
+	\fancyfoot[LO]{
+		\noindent\textcolor{T5blue}{\rule{\linewidth}{0.25mm}}
+		\sffamily \color{T5blue} TekFive Inc. \hfill info@tekfive.com\\
+		3001 9th Avenue SW Suite 104 \hfill 256.213.1060\\
+		Huntsville, AL 35805, USA
+	}
+}
+
+\fancyfoot[RO,LE]{Page \thepage~of \pageref{LastPage} }
+
+\newcommand{\TekFiveTitle}{
+	\newlength{\firstPageBottom}
+	% add three extra lines of height to bottom margin
+	\setlength{\firstPageBottom}{\dimexpr \paperheight - \textheight + \topmargin %
+			- \footskip + 3\baselineskip}
+	\newgeometry{bottom=\firstPageBottom} % for footer
+	\vspace*{0.5in}
+	{\let\newpage\relax\maketitle}
+	\afterpage{\globaldefs=1 \restoregeometry}
+}
+
+
+\endinput
+%%
+%% End of file `tekfive.sty'.
