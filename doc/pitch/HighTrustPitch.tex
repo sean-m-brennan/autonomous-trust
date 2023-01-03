@@ -1,0 +1,60 @@
+\documentclass[10pt, twoside]{article}
+\usepackage [left=2.5cm, top=2.5cm, bottom=2.5cm, right=3cm] {geometry}
+\usepackage[type=product~leaflet]{tekfive}
+\usepackage{datetime}
+
+\geometry{letterpaper}
+\renewcommand*\familydefault{\sfdefault}
+
+
+\newcommand{\projectName}{\emph{AutonomousTrust }}
+
+\title{\textbf{\huge \projectName}\\ NSF Seed Fund Project Pitch}
+%\author{Sean M. Brennan}
+\date{\monthname{} \the\year}
+
+\begin{document}
+	
+\TekFiveTitle
+
+\section{The Technical Innovation}
+
+\projectName is TekFive's high-trust cooperative computing concept --- a data messaging framework that, as part of a larger application, requests and serves encrypted data \textit{only} with trusted peers and only to the extent of that fine-grained trust. Said trust is dynamically evaluated in real time to rapidly eliminate incoming threats and even reclassify existing peers as their behavior changes and thus protect resources. Greater risk requires greater trust. An autonomous agent using this framework can adaptively: 1) refuse communications from severely untrusted peers, conserving bandwidth; 2) communicate with but refuse computation services to faintly trusted peers, protecting CPU time; 3) offer services but refuse data-sharing to moderately trusted peers, protecting data; \textit{and} 4) offer data-sharing to well trusted peers; all with a configurable gradient of access at every level, and all within the same application.
+
+Our system replicates certain aspects of human social behavior in seven key facets:
+\begin{itemize}
+	\item scalable: limited direct communication among peers within a hierarchy
+	\item formally linguistic: utilizing a domain-specific markup language descended from an ur-language, easily extended
+	\item shared goals: established by a strict negotiation protocol
+	\item consistent identity: a crypto-ledger for identity (shared among cohorts only)
+	\item reputation-based: derived from transaction outcome evaluation/scoring --- shared and self-immutable
+	\item optimization: allows reputation bootstrapping through game-theoretic trust-blindly-once strategies
+	\item prioritization: to balance opportunity versus security
+\end{itemize}
+In combination, these facets are the backbone of an ecosystem supporting a community of autonomous agents which perform decentralized computing in a way that minimizes security risks and optimizes cooperation.
+
+\projectName is related to advances in Internet-of-Things (IoT) and machine-to-machine (M2M) messaging technologies, but explicitly addresses a prevalent lack of security in that paradigm, as well as cybersecurity shortcomings in general. This concept is also a highly-distributed answer to the extreme centralization of Cloud computing, in which we perceive foundational vulnerabilities. Although Web3 principles are incorporated here, our concept is a concrete step beyond, emphasizing blockchain's roots in distributed consensus. Our intended realization of this project into a product would be no mere incremental step, but a paradigm-shift for computation, much like cloud computing was before it.
+
+\section{The Technical Objectives and Challenges}
+
+This proof-of-concept project will necessarily be an exercise of engineering development to flesh-out the operational viability of the above mechanisms, but it will also research and explore the effectiveness of the concept itself. To this end, we will study three things: 1) the structure, efficiency and resiliency of self-formed network topologies, 2) effective patterns of negotiation and reputation-building at scale, and 3) the resistance of the network at each level to failure and attack. This last item is our primary metric for success. We will intentionally include and then exploit several classes of known CVE vulnerabilities against individual agents, run established attacks such as DoS, 51\% and Sybil against our blockchains, and conduct system-specific attacks. We have identified five attack vectors specific to our system: 1) service deception (falsifying results), 2) trust betrayal (building up reputation then attacking), 3) reputation trashing (colluding to ruin a target), 4) atomization (collusion to isolate a target), and 5) authority corruption (using one's position in the hierarchy to isolate or mislead a group of targets). Additional possible attacks may be discovered as development proceeds. Statistical methods will be used to determine our effectiveness compared to a na\"ive implementation.
+
+Our mature product will likely be written in C for performance and deployed in containers, but at this stage we will be using Python for rapid prototyping and little or no sandboxing. We will develop a testbed environment that will enable network behavior visualization, injection of errors and attacks, and general debugging. This tool can later be used as a development environment for instances of the ultimate product as well.
+
+\section{The Market Opportunity}
+
+Although potentially widely applicable, this concept is perfect for contentious inter-organizational data sharing. Without naming names, our experience has shown that within and among Executive-level agencies in the government, a combination of competition for funding, conflicting expertise, and overlapping domain authority creates social barriers to trust. This distrust is highly detrimental to data sharing and collaboration that is often crucial to mission objectives. Mandates from on-high only exacerbate the problem by creating more friction. Our personal experience \emph{also} indicates that if the barrier of initial social distrust can be overcome, often misunderstandings resolve and relations smooth out.
+
+In addition to being a mechanism for secure data and computation services, \projectName can be a tool for objectively demonstrating good-will across the divide. By formalizing the collaboration in detail, and providing concrete, traceable metrics of cooperation, it can dispel unfounded suspicion and foster an environment for teamwork even in a massive organization. Keeping government agencies from stepping on each other's toes would alone be an important boon to the nation.
+
+\section{The Company and Team}
+
+Founded in 2007, TekFive is a veteran-owned, veteran centric, innovative and agile services company. We provide comprehensive federal IT domain experience, while offering the latest commercial industry insight, a highly motivated full-stack development team and a network of successful industry partners to rapidly respond to your enterprise IT challenges.
+
+Sean Brennan is the principal investigator for this effort. He has over 20 years of research and engineering experience, specializing in large-scale, resource-constrained networks and software correctness. He has been involved in 12 DOE-funded projects related to nuclear nonproliferation, and was the technical lead for five of these.
+Dr. Brennan received a Ph.D. in Computer Science from the University of New Mexico, and is an author on 15 published papers.
+
+Corey Baswell is TekFive's Chief Technology Officer. He has over 20 years of enterprise IT experience as a full stack engineer in the areas of application development, enterprise architecture, and platform development. He has developed numerous enterprise software services including the NASA OpenESB, the NASA and VA DevSecOps pipeline, the NASA and VA Pulse app analytics, and the NASA Application Portfolio Management tool.
+Mr. Baswell received a Bachelor of Science degree in Computer Engineering from Auburn University where he graduated summa cum laude.
+
+\end{document}
