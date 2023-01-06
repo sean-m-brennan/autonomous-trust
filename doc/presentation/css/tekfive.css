@@ -1,26 +1,4 @@
 /*
-    So you like the style of impress.js demo?
-    Or maybe you are just curious how it was done?
-
-    You couldn't find a better place to find out!
-
-    Welcome to the stylesheet impress.js demo presentation.
-
-    Please remember that it is not meant to be a part of impress.js and is
-    not required by impress.js.
-    I expect that anyone creating a presentation for impress.js would create
-    their own set of styles.
-
-    But feel free to read through it and learn how to get the most of what
-    impress.js provides.
-
-    And let me be your guide.
-
-    Shall we begin?
-*/
-
-
-/*
     We start with a good ol' reset.
     That's the one by Eric Meyer http://meyerweb.com/eric/tools/css/reset/
 
@@ -84,14 +62,6 @@ table {
 body {
     font-family: 'PT Sans', sans-serif;
     min-height: 740px;
-
-    background: rgb(215, 215, 215);
-    background: -webkit-gradient(radial, 50% 50%, 0, 50% 50%, 500, from(rgb(240, 240, 240)), to(rgb(190, 190, 190)));
-    background: -webkit-radial-gradient(rgb(240, 240, 240), rgb(190, 190, 190));
-    background:    -moz-radial-gradient(rgb(240, 240, 240), rgb(190, 190, 190));
-    background:     -ms-radial-gradient(rgb(240, 240, 240), rgb(190, 190, 190));
-    background:      -o-radial-gradient(rgb(240, 240, 240), rgb(190, 190, 190));
-    background:         radial-gradient(rgb(240, 240, 240), rgb(190, 190, 190));
 }
 
 /*
@@ -124,18 +94,6 @@ a:focus {
     text-shadow: -1px -1px 2px rgba(100,100,100,0.5);
 }
 
-/*
-    Because the main point behind the impress.js demo is to demo impress.js
-    we display a fallback message for users with browsers that don't support
-    all the features required by it.
-
-    All of the content will be still fully accessible for them, but I want
-    them to know that they are missing something - that's what the demo is
-    about, isn't it?
-
-    And then we hide the message, when support is detected in the browser.
-*/
-
 .fallback-message {
     font-family: sans-serif;
     line-height: 1.3;
@@ -157,11 +115,6 @@ a:focus {
     display: none;
 }
 
-/*
-    Now let's style the presentation steps.
-
-    We start with basics to make sure it displays correctly in everywhere ...
-*/
 
 .step {
     position: relative;
@@ -245,22 +198,65 @@ a:focus {
     white-space: nowrap;
 }
 
-/*
-    And now we start to style each step separately.
 
-    I agree that this may be not the most efficient, object-oriented and
-    scalable way of styling, but most of steps have quite a custom look
-    and typography tricks here and there, so they had to be styled separately.
-
-    First is the title step with a big <h1> (no room for padding) and some
-    3D positioning along Z axis.
-*/
+/* Title page */
 
 #title {
     padding: 0;
 }
 
-#title .try {
+#t5header {
+    color: #1f6387;
+}
+
+#t5header img {
+    width: 200px;
+}
+
+#t5header .author {
+    justify: right;
+    float: right;
+    margin-top: 80px;
+    margin-right: 10px;
+}
+
+#t5header hr {
+    height: 8px;
+    background-color: #1f6387;
+    border-color: #1f6387;
+}
+
+#t5footer {
+    position: absolute;
+    top: 560px;
+    width: 900px;
+    color: #1f6387;
+}
+
+#t5footer hr {
+    size: 1px;
+    background-color: #1f6387;
+    border-color: #1f6387;
+}
+
+#title .title {
+    font-size: 50px;
+    line-height: 72px;
+    font-weight: bold;
+    text-align: center;
+}
+
+#title .subtitle {
+    font-size: 45px;
+    line-height: 72px;
+    text-align: center;
+}
+
+
+
+
+
+#title2 .try {
     font-size: 64px;
     position: absolute;
     top: -0.5em;
@@ -273,7 +269,7 @@ a:focus {
     transform:         translateZ(20px);
 }
 
-#title h1 {
+#title2 h1 {
     font-size: 180px;
 
     -webkit-transform: translateZ(50px);
@@ -283,7 +279,7 @@ a:focus {
     transform:         translateZ(50px);
 }
 
-#title .footnote {
+#title2 .footnote {
     font-size: 32px;
 }
 
@@ -396,29 +392,6 @@ a:focus {
     font-size: 78px;
 }
 
-/*
-    There is nothing really special about 'use the source, Luke' step, too,
-    except maybe of the Yoda background.
-
-    As you can see below I've 'hard-coded' it in data URL.
-    That's not the best way to serve images, but because that's just this one
-    I decided it will be OK to have it this way.
-
-    Just make sure you don't blindly copy this approach.
-*/
-#source {
-    width: 700px;
-    padding-bottom: 300px;
-
-    /* Yoda Icon :: Pixel Art from Star Wars http://www.pixeljoint.com/pixelart/1423.htm */
-    background-image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAARgAAAEYCAMAAACwUBm+AAAAAXNSR0IArs4c6QAAAKtQTFRFsAAAvbWSLUUrLEQqY1s8UYJMqJ1vNTEgOiIdIzYhjIFVLhsXZ6lgSEIsP2U8JhcCVzMsSXZEgXdOO145XJdWOl03LzAYMk4vSXNExr+hwcuxRTs1Qmk+RW9Am49eFRANQz4pUoNMQWc+OSMDTz0wLBsCNVMxa2NBOyUDUoNNSnlEWo9VRGxAVzYFl6tXCggHbLNmMUIcHhwTXkk5f3VNRT8wUT8xAAAACQocRBWFFwAAAAF0Uk5TAEDm2GYAAAPCSURBVHja7d3JctNAFIZRMwRCCGEmzPM8z/D+T8bu/ptbXXJFdij5fMt2Wuo+2UgqxVmtttq5WVotLzBgwIABAwYMGDCn0qVqbo69psPqVpWx+1XG5iaavF8wYMCAAQMGDBgwi4DJ6Y6qkxB1HNlcN3a92gbR5P2CAQMGDBgwYMCAWSxMlrU+UY5yu2l9okfV4bAxUVbf7TJnAwMGDBgwYMCAAbMLMHeqbGR82Zy+VR1Ht81nVca6R+UdTLaU24Ruzd3qM/e4yjnAgAEDBgwYMGDA7AJMd1l/3NRdVGcj3eX/2WEhCmDGxnM7yqygu8XIPjJj8iN/MGDAgAEDBgwYMAuDGb8q0RGlLCHLv1t9qDKWn3vdNHVuEI6HPaxO9Jo3GDBgwIABAwYMmIXBdC9ShGgMk+XnkXUeuGcsP/e1+lhNnZsL/G5Vs3OAAQMGDBgwYMCAWSxMR3SzOmraG5atdy9wZKzb+vg16qyqe2FltbnAgAEDBgwYMGDALAxmTJSuN3WA76rnVca6GTnemGN1WoEBAwYMGDBgwIBZGMxUomy4+xO899V4LAg5Xnc2MGDAgAEDBgwYMGA218Wq+2K1LDqvY9xZu8zN8fICdM6btYABAwYMGDBgwIABMzfH0+pGU5afze2tXebmeAfVz+p8BQYMGDBgwIABAwbMPBzZ+oWmfJrln1273FhkbHzee9WWbw7AgAEDBgwYMGDALAKm43hcdctKgblcPamOhuXnXlY5Xs6bsW4FGyQCAwYMGDBgwIABswiYMceZKgvMo+h8mrHLTdn676rj+FEFoTtHd8MwOxEYMGDAgAEDBgyYRcBM5UhXqiymW3R3c9ARhWO/OmjqfjVZy+xEYMCAAQMGDBgwYBYG073OnCV0RFNhMhaOa9WfKmOB6XjHMN1tQmaAAQMGDBgwYMCA2VWY7vXjz1U4croAzgPztwIDBgwYMGDAgAEDZhswh035NBw59Dww3RgYMGDAgAEDBgwYMJuD6f4tXT7NUqfCdBvZLkxXdgQGDBgwYMCAAQNmt2DGj8WzwAfV/w7T/aq7mxwwYMCAAQMGDBgwuwqTOo7uTwTngflSzQ3TdaJvAwEDBgwYMGDAgAED5gSvgbyo5oHZ4Pc+gwEDBgwYMGDAgAEzhOm+5G0qTGaAAQMGDBgwYMCAAXNaMOcnls3tNwWm+zRzp54NDBgwYMCAAQMGDJh5YNL36k1TLuGvVq+qnKMbS5n7tulT9asCAwYMGDBgwIABA2ZumKuztLnjgQEDBgwYMGDAgNl5mH/4/ltKA6vBNAAAAABJRU5ErkJggg==);
-    background-position: bottom right;
-    background-repeat: no-repeat;
-}
-
-#source q {
-    font-size: 60px;
-}
 
 /*
     And the "it's in 3D" step again brings some 3D typography - just for fun.
