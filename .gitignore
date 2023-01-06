@@ -1,0 +1,9 @@
+doc/*/*.aux
+doc/*/*.bbl
+doc/*/*.bcf
+doc/*/*.blg
+doc/*/*.dep
+doc/*/*.log
+doc/*/*.run.xml
+doc/*/*.synctex.gz
+
