@@ -24,8 +24,6 @@
       <p>For the best experience please use the latest <b>Chrome</b>, <b>Safari</b> or <b>Firefox</b> browser.</p>
     </div>
 
-    <!-- <svg width="960" height="600"></svg> -->
-
     <div id="impress"
 	 data-transition-duration="1000"
 	 data-width="1024"
@@ -182,9 +180,9 @@
     <div id="impress-toolbar"></div>
 
 
-    <!-- Scripts -->
+    <!-- Leave scripts at the end of the doc -->
     <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.1/jquery.min.js"></script>
-    <script type="text/javascript" src="https://d3js.org/d3.v4.min.js"></script>
+    <script type="text/javascript" src="https://d3js.org/d3.v4.min.js" charset="utf-8"></script>
 
     <!-- <script type="text/x-mathjax-config">
       MathJax.Hub.Config({
@@ -195,11 +193,23 @@
     </script> -->
 
     <script src="js/impress.js"></script>
-    <script>$(document).ready(function() {
-        impress().init();
-    });</script>
-
     <script src="js/force.js"></script>
 
+    <script>
+      $(document).ready(function() {
+          impress().init();
+          const forcesGraph = createForcesGraph()
+          forcesGraph.run();
+	  window.addEventListener('impress:stepenter', function(event) {
+	      if (event.target.id == "slide4")
+		  forcesGraph.start();
+		  
+	  });
+	  window.addEventListener('impress:stepleave', function(event) {
+	      if (event.target.id == "slide4")
+		  forcesGraph.stop();
+	  });
+      });
+    </script>
   </body>
 </html>
