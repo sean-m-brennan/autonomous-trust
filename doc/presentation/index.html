@@ -3,7 +3,6 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=1024" />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
     <title>Autonomous Trust</title>
     
     <meta name="description" content="" />
@@ -14,9 +13,6 @@
     <link href="css/tekfive.css" rel="stylesheet" />
     <link href="css/impress-common.css" rel="stylesheet" />
     <link href="css/force.css" rel="stylesheet" />
-    
-    <link rel="shortcut icon" href="favicon.png" />
-    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
   </head>
   <body class="impress-not-supported">
     <div class="fallback-message">
@@ -65,7 +61,7 @@
       </div>
 
       <div id="slide4" class="step" data-x="0" data-y="0" data-scale="3">
-        <div class="graph-container" style="width: 800px;"></div>
+        <div class="graph-container" style="width: 800px; height: 600px;"></div>
       </div>
 
       <!--
@@ -198,8 +194,8 @@
     <script>
       $(document).ready(function() {
           impress().init();
-          const forcesGraph = createForcesGraph()
-          forcesGraph.run();
+          const forcesGraph = createForcesGraph();
+          forcesGraph.init(8888);
 	  window.addEventListener('impress:stepenter', function(event) {
 	      if (event.target.id == "slide4")
 		  forcesGraph.start();
