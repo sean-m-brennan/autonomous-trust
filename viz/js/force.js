@@ -4,15 +4,18 @@
  */
 
 createForcesGraph = () => {
-    const debug = true;
+    const debug = false;
     
     let msg_num = 0;
-    const max_msgs = 500;
+    const max_msgs = 300;
     const use_ws = true;
     let ws_port = 8000;
     let ws_active = false;
     let ws_init = false;
     let ws = null;
+
+    const node_metadata = ["group"];
+    const link_metadata = ["group", "value"];
    
     let graph = {
         nodes: [],
@@ -44,7 +47,7 @@ createForcesGraph = () => {
           .style("fill", "none")
           .style("pointer-events", "all")
           .call(d3.zoom()
-                .scaleExtent([1/2, 64])
+                .scaleExtent([1/32, 64])
                 .on("zoom", zoomed));
 
     const simulation = d3.forceSimulation()
@@ -112,6 +115,29 @@ createForcesGraph = () => {
         
         // Exit any old nodes
         node.exit().remove();
+
+        // validate connectivity
+        var node_ids = [];
+        for (var i = 0; i < graph.nodes.length; i++) {
+            node_ids.push(graph.nodes[i].id);
+        }
+        var bad_links = [];
+        for (var i = 0; i < graph.links.length; i++) {
+            src = graph.links[i].source
+            tgt = graph.links[i].target
+            if (src.hasOwnProperty("id"))
+                src = src.id
+            if (tgt.hasOwnProperty("id"))
+                tgt = tgt.id
+            if (!node_ids.includes(src) || !node_ids.includes(tgt)) {
+                if (debug)
+                    console.log("Bad link: " + src.toString() +
+                                " " + tgt.toString())
+                bad_links.push(graph.links[i]);
+            }
+        }
+        if (bad_links.length > 0)
+            remove_links(bad_links, false);
         
         // Redefine and restart simulation
         simulation
@@ -172,16 +198,34 @@ createForcesGraph = () => {
         }
         update();
     }
-    
-    function remove_nodes(nodes) {
+
+    function update_nodes(nodes, callback) {
         for (var i = 0; i < nodes.length; i++) {
             for (var j = 0; j < graph.nodes.length; j++) {
-                if (graph.nodes[j] === nodes[i]) {
-                    graph.nodes.splice(j, 1);
-                    break
+                if (graph.nodes[j]["id"] === nodes[i]) {
+                    callback(i, j);
+                    break;
                 }
             }
         }
+    }
+    
+    function remove_nodes(nodes) {
+        update_nodes(nodes, function (i, j) {
+            graph.nodes.splice(j, 1);
+        });
+        update();
+    }
+
+    function change_nodes(nodes) {
+        update_nodes(nodes, function (i, j) {
+            for (var prop in nodes[i]) {
+                if (Object.prototype.hasOwnProperty.call(nodes[i], prop) &&
+                    node_metadata.includes(prop)) {
+                    graph.nodes[j][prop] = nodes[i][prop]
+                }
+            }
+        });
         update();
     }
     
@@ -192,15 +236,35 @@ createForcesGraph = () => {
         update();
     }
     
-    function remove_links(links) {
+    function update_links(links, callback) {
         for (var i = 0; i < links.length; i++) {
             for (var j = 0; j < graph.links.length; j++) {
-                if (graph.links[j] === links[i]) {
-                    graph.links.splice(j, 1);
-                    break
+                if (graph.links[j].source.id === links[i].source &&
+                    graph.links[j].target.id === links[i].target) {
+                    callback(i, j);
+                    break;
                 }
             }
         }
+    }
+
+    function remove_links(links, with_update=true) {
+        update_links(links, function (i, j) {
+            graph.links.splice(j, 1);
+        });
+        if (with_update)
+            update();
+    }
+
+    function change_links(links) {
+        update_links(links, function (i, j) {
+            for (var prop in links[i]) {
+                if (Object.prototype.hasOwnProperty.call(links[i], prop) &&
+                    link_metadata.includes(prop)) {
+                    graph.links[j][prop] = links[i][prop];
+                }
+            }
+        });
         update();
     }
     
@@ -248,16 +312,38 @@ createForcesGraph = () => {
             if (graph_in.links.length > 0)
                 remove_links(graph_in.links);
             reset();
+        } else if ("type" in graph_in && graph_in.type == "meta") {
+            if (graph_in.nodes.length > 0)
+                change_nodes(graph_in.nodes);
+            if (graph_in.links.length > 0)
+                change_links(graph_in.links);
         } else {
             if (debug)
                 console.log("full graph")
             plot_new_graph(graph_in);
             reset(0.3);
         }
-        if (msg_num < max_msgs) {
+        if (max_msgs < 1 || msg_num < max_msgs) {
             ws.send("");
             msg_num++;
         }
+    }
+
+    function save_svg() {
+        /*const $svg = targetElement.querySelector('svg')
+            const svgAsXML = (new XMLSerializer()).serializeToString($svg)
+            const svgData = `data:image/svg+xml,${encodeURIComponent(svgAsXML)}`
+            const loadImage = async url => {
+    const $img = document.createElement('img')
+    $img.src = url
+    return new Promise((resolve, reject) => {
+        $img.onload = () => resolve($img)
+        $img.onerror = reject
+        $img.src = url
+    })
+}
+
+*/
     }
 
     return ({
@@ -288,11 +374,24 @@ createForcesGraph = () => {
                     console.log(e)
                 }
             }
+            document.addEventListener('keyup', e => {
+                //console.log(e.which)
+                if (e.which === 73) {  // 'i' for image
+                    simulation.stop();
+                    save_svg();
+                }
+                else if(e.which === 78)  // 'n'
+                    console.log("Step " + msg_num.toString());
+                else if (e.which === 83) { // 's' for stop
+                    msg_num = max_msgs;
+                    simulation.stop();
+                }
+            });
         },
-        start: function () {
+        start: function (initMsg = "") {
             if (use_ws) {
                 if (ws_active) {
-                    ws.send("");
+                    ws.send(initMsg);
                     msg_num++;
                     ws_init = false;
                 } else {
@@ -307,6 +406,7 @@ createForcesGraph = () => {
         },
         stop: function () {
             msg_num = max_msgs
+            simulation.stop();
         }
     });
 };

@@ -5,9 +5,11 @@ import argparse
 import asyncio
 import quart
 import network_graph as ng
+import social_graphs
 
 
 default_port = 8000
+initial_size = 12
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-d', '--directory', type=str, default=os.getcwd())
@@ -26,13 +28,18 @@ async def page():
 
 @app.websocket('/ws')
 async def ws():
-    # two bells of arg1 nodes, connected with arg2 nodes between
-    graph = ng.RandomNetwork(6, 0)
+    graph = None
     while True:
         msg = await quart.websocket.receive()
+        if graph is None:
+            for impl in ng.Graphs.Implementation:
+                if msg == impl.value:
+                    graph = ng.Graphs.get_graph(impl.value, initial_size)
+                    print(' * Simulating %s network graph' % msg)
         seconds, data = graph.get_update()
         await quart.websocket.send(data)
         await asyncio.sleep(seconds)
+
 
 
 app.run(port=args.port)
