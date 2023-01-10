@@ -198,8 +198,8 @@
           forcesGraph.init(8888);
 	  window.addEventListener('impress:stepenter', function(event) {
 	      if (event.target.id == "slide4")
-		  forcesGraph.start();
-		  
+		  forcesGraph.start("sybil");
+              // other slides, other sims
 	  });
 	  window.addEventListener('impress:stepleave', function(event) {
 	      if (event.target.id == "slide4")

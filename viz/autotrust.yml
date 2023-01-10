@@ -5,6 +5,7 @@ channels:
 dependencies:
   - _libgcc_mutex=0.1=conda_forge
   - _openmp_mutex=4.5=2_gnu
+  - aenum=3.1.11=pyhd8ed1ab_0
   - aiofiles=22.1.0=pyhd8ed1ab_0
   - async_generator=1.10=py_0
   - attrs=22.2.0=pyh71513ae_0
@@ -56,4 +57,3 @@ dependencies:
   - wsproto=1.2.0=pyhd8ed1ab_0
   - xz=5.2.6=h166bdaf_0
   - zipp=3.11.0=pyhd8ed1ab_0
-
