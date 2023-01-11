@@ -1,1 +1,1 @@
-../../../viz/js/force.js
+../../../autonomous_trust/viz/js/force.js

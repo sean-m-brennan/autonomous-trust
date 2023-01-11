@@ -294,7 +294,7 @@ createForcesGraph = () => {
     function process_msg(graph_in) {
         var num_nodes = graph_in.nodes.length.toString()
         var num_links = graph_in.links.length.toString()
-        if ("type" in graph_in && graph_in.type == "add") {
+        if ("type" in graph_in && graph_in.type === "add") {
             if (debug)
                 console.log("add " + num_nodes + " nodes and " +
                             num_links + " links")
@@ -303,7 +303,7 @@ createForcesGraph = () => {
             if (graph_in.links.length > 0)
                 add_links(graph_in.links);
             reset();
-        } else if ("type" in graph_in && graph_in.type == "remove") {
+        } else if ("type" in graph_in && graph_in.type === "remove") {
             if (debug)
                 console.log("remove " + num_nodes + " nodes and " +
                             num_links + " links")
@@ -312,7 +312,7 @@ createForcesGraph = () => {
             if (graph_in.links.length > 0)
                 remove_links(graph_in.links);
             reset();
-        } else if ("type" in graph_in && graph_in.type == "meta") {
+        } else if ("type" in graph_in && graph_in.type === "meta") {
             if (graph_in.nodes.length > 0)
                 change_nodes(graph_in.nodes);
             if (graph_in.links.length > 0)
@@ -374,15 +374,15 @@ createForcesGraph = () => {
                     console.log(e)
                 }
             }
-            document.addEventListener('keyup', e => {
-                //console.log(e.which)
-                if (e.which === 73) {  // 'i' for image
+            document.addEventListener('keypress', e => {
+                console.log(e.key)
+                if (e.key === "i") {
                     simulation.stop();
                     save_svg();
                 }
-                else if(e.which === 78)  // 'n'
+                else if(e.key === "n")
                     console.log("Step " + msg_num.toString());
-                else if (e.which === 83) { // 's' for stop
+                else if (e.key === "s") {
                     msg_num = max_msgs;
                     simulation.stop();
                 }
@@ -406,6 +406,7 @@ createForcesGraph = () => {
         },
         stop: function () {
             msg_num = max_msgs
+            ws.send("done")
             simulation.stop();
         }
     });

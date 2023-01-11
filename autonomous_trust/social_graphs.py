@@ -1,15 +1,16 @@
 import random
 import networkx as nx
-import network_graph as ng
+
+from . import network_graph as ng
 
 
 class SybilNetwork(ng.NetworkGraph):
-    def __init__(self, size):
+    def __init__(self, size, **kwargs):
         self.sybils = list(range(size - 2))  # indices
         self.victim = size - 2  # index
         self.assist = size - 1  # index
         self.iteration = 0
-        super().__init__(nx.lollipop_graph, size - 1, 1)
+        super().__init__(nx.lollipop_graph, size - 1, 1, **kwargs)
 
     def _sybil_neighbors(self, n):
         if n in self.sybils + [self.victim]:
@@ -23,6 +24,13 @@ class SybilNetwork(ng.NetworkGraph):
 
     def node_removal_rejected(self, n):
         return n in self.sybils
+
+    def link_addition_limit(self):
+        node_list = []
+        for n in self.G:
+            if len(list(self.G.neighbors(n))) == 0:
+                node_list.append(n)
+        return node_list
 
     def link_addition_rejected(self, u, v):
         for n in [u, v]:
