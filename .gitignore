@@ -7,4 +7,4 @@ doc/*/*.dep
 doc/*/*.log
 doc/*/*.run.xml
 doc/*/*.synctex.gz
-
+doc/whitepaper/research

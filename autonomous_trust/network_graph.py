@@ -13,8 +13,8 @@ class Graphs(object):
     _MAP = {}
 
     @classmethod
-    def get_graph(cls, name, size):
-        return cls._MAP[name](size)
+    def get_graph(cls, name, size, debug=False):
+        return cls._MAP[name](size, debug=debug)
 
     @classmethod
     def register_implementation(cls, name, impl_cls, is_default=False):
@@ -32,7 +32,6 @@ class NetworkGraph(object):
     Abstract base class for dynamic network graphs
     """
     initial_delay = 2000  # millisec
-    debug = True #False
     node_data = ['id', 'group']
     link_data = ['source', 'target', 'group', 'value']
 
@@ -41,10 +40,15 @@ class NetworkGraph(object):
         ADD = "add"
         REMOVE = "remove"
 
-    def __init__(self, generator, *args, **kwargs):
+    def __init__(self, generator, *args, debug=False, **kwargs):
         self.graph_gen = generator
         self.args = args
+        self.debug = debug
         self.kwargs = kwargs
+        self.G = None
+        self.change_type = None
+        self.initialized = False
+        self.next_change = 0
         self._reset()
 
     def _reset(self):
@@ -117,26 +121,35 @@ class NetworkGraph(object):
         edge_list = []
         for u, v, a in self.G.edges(data=True):
             if a["value"] <= 0:
-                edge_list.append((u,v))
+                edge_list.append((u, v))
         for edge in edge_list:
             self.remove_edge(*edge)
 
-    def _random_node(self, exclude=None):
-        idx = random.randint(0, len(self.node_ids)-1)
-        if idx == exclude:
+    def _random_node(self, limit_to=None, exclude=None):
+        if limit_to is None or len(limit_to) == 0:
+            limit_to = self.node_ids
+        if exclude is None:
+            exclude = []
+        elif not isinstance(exclude, list):
+            exclude = [exclude]
+        idx = random.randint(0, len(limit_to)-1)
+        if idx in exclude:
             if exclude == 0:
                 idx += 1
             else:
                 idx -= 1
-        return self.node_ids[idx]
+        return limit_to[idx]
 
-    def _random_pair(self):
-        n1 = self._random_node()
-        n2 = self._random_node(n1)
+    def _random_pair(self, limit_to=None):
+        n1 = self._random_node(limit_to=limit_to)
+        n2 = self._random_node(limit_to=limit_to, exclude=n1)
         return n1, n2
 
     def node_removal_rejected(self, n):
         return False
+
+    def link_addition_limit(self):
+        return None
 
     def link_addition_rejected(self, u, v):
         return False
@@ -144,12 +157,12 @@ class NetworkGraph(object):
     def link_removal_rejected(self, u, v):
         return False
 
-    def random_change(self, an=10, ae=70, re=95):
+    def random_change(self, an=5, ae=80, re=95):
         r = random.randint(1, 100)
         if r < an:
             self.add_node()
         elif an < r < ae:
-            edge = self._random_pair()
+            edge = self._random_pair(limit_to=self.link_addition_limit())
             while self.G.has_edge(*edge) and self.link_addition_rejected(*edge):
                 edge = self._random_pair()
             self.add_edge(*edge)
@@ -219,10 +232,10 @@ class NetworkGraph(object):
 
 
 class RandomNetwork(NetworkGraph):
-    ## randomized behavior
-    def __init__(self, size):
+    # randomized behavior
+    def __init__(self, size, **kwargs):
         m1 = size // 2
-        super().__init__(nx.barbell_graph, m1, 0)
+        super().__init__(nx.barbell_graph, m1, 0, **kwargs)
 
     def change(self):
         self.random_change()
