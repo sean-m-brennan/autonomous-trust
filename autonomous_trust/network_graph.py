@@ -85,8 +85,8 @@ class NetworkGraph(object):
     def get_update(self):
         if self.initialized:
             self.change()
-            self.grouping()
-            self.prune_edges()
+        self.grouping()
+        self.prune_edges()
         if self.debug:
             print("Serve %sgraph data: %d nodes, %d links" %
                   ("full " if not self.initialized else "",

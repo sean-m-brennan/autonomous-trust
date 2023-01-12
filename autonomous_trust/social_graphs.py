@@ -55,19 +55,20 @@ class SybilNetwork(ng.NetworkGraph):
         self.iteration += 1
 
     def grouping(self):
+        max_grp = 7
         if self.iteration == 0:
             for n in self.G:
                 self.G.nodes[n]["name"] = n
-                self.G.nodes[n]["group"] = 11
-            self.G.nodes[self.victim]["group"] = 7
+                self.G.nodes[n]["group"] = max_grp
+            self.G.nodes[self.victim]["group"] = max_grp - 1
         elif self.iteration == 1:
             self.G.nodes[self.assist]["name"] = self.assist
-            self.G.nodes[self.assist]["group"] = 8
+            self.G.nodes[self.assist]["group"] = max_grp - 2
         else:
             for n in self.G:
                 if n > self.assist:
                     self.G.nodes[n]["name"] = n
-                    self.G.nodes[n]["group"] = random.randint(1, 6)
+                    self.G.nodes[n]["group"] = random.randint(1, max_grp - 3)
                     
         for u, v, a in self.G.edges(data=True):
             src = self.G.nodes[u]
