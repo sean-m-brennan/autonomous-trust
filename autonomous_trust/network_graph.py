@@ -31,19 +31,22 @@ class NetworkGraph(object):
     """
     Abstract base class for dynamic network graphs
     """
-    initial_delay = 2000  # millisec
+    initial_delay = 2000  # milliseconds
     node_data = ['id', 'group']
     link_data = ['source', 'target', 'group', 'value']
+    default_groups = 'a b c d e f g h i j'.split(' ')
 
     class PhaseChange(enum.Enum):
         META = 'meta'
         ADD = "add"
         REMOVE = "remove"
 
-    def __init__(self, generator, *args, debug=False, **kwargs):
+    def __init__(self, generator, *args, debug=False, groups=None, **kwargs):
         self.graph_gen = generator
         self.args = args
         self.debug = debug
+        self.groupLabels = self.default_groups if groups is None else groups
+        self.groups_len = len(self.groupLabels)
         self.kwargs = kwargs
         self.G = None
         self.change_type = None
@@ -85,13 +88,15 @@ class NetworkGraph(object):
     def get_update(self):
         if self.initialized:
             self.change()
+            if self.debug:
+                print("Serve graph data: %d nodes, %d links" %
+                      (len(self._to_dict()["nodes"]),
+                       len(self._to_dict()["links"])))
+        elif self.debug:
+            print("Serve full graph data: %d nodes, %d links" %
+                  (len(self.node_ids), len(self.G.edges)))
         self.grouping()
         self.prune_edges()
-        if self.debug:
-            print("Serve %sgraph data: %d nodes, %d links" %
-                  ("full " if not self.initialized else "",
-                   len(self._to_dict()["nodes"]),
-                   len(self._to_dict()["links"])))
         data = str(self)
         self._record_state()
         self.initialized = True
@@ -120,7 +125,7 @@ class NetworkGraph(object):
     def prune_edges(self):
         edge_list = []
         for u, v, a in self.G.edges(data=True):
-            if a["value"] <= 0:
+            if "value" in a.keys() and a["value"] <= 0:
                 edge_list.append((u, v))
         for edge in edge_list:
             self.remove_edge(*edge)
@@ -175,10 +180,15 @@ class NetworkGraph(object):
             while not self.G.has_edge(*edge) and self.link_removal_rejected(*edge):
                 edge = self._random_pair()
             self.remove_edge(*edge)
-        
+
+    def node_metadata(self, nodeset):
+        return set([tuple([n[k] for k in self.node_data if k in n.keys()]) for n in nodeset])
+
+    def edge_metadata(self, edgeset):
+        return set([tuple([e[k] for k in self.link_data if k in e.keys()]) for e in edgeset])
+
     def nodeset_diff(self, s1, s2):
-        node_diff = set([tuple([n[k] for k in self.node_data]) for n in s1]) - \
-            set([tuple([n[k] for k in self.node_data]) for n in s2])
+        node_diff = self.node_metadata(s1) - self.node_metadata(s2)
         result = []
         for n in node_diff:
             for d in s2 + s1:
@@ -188,8 +198,7 @@ class NetworkGraph(object):
         return result
 
     def edgeset_diff(self, s1, s2):
-        edge_diff = set([tuple([e[k] for k in self.link_data]) for e in s1]) - \
-            set([tuple([e[k] for k in self.link_data]) for e in s2])
+        edge_diff = self.edge_metadata(s1) - self.edge_metadata(s2)
         result = []
         for e in edge_diff:
             for d in s2 + s1:
@@ -202,6 +211,7 @@ class NetworkGraph(object):
     def _to_dict(self, track_change=True):
         # node-link format to serialize
         data_obj = nx.json_graph.node_link_data(self.G)
+        data_obj['groups'] = self.groupLabels
         if track_change and self.change_type is not None:
             data_obj['type'] = self.change_type.value.lower()
             if self.change_type == self.PhaseChange.ADD:
