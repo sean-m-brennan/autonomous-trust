@@ -4,13 +4,59 @@ import networkx as nx
 from . import network_graph as ng
 
 
+class DeceitNetwork(ng.NetworkGraph):
+    def __init__(self, size, **kwargs):
+        groups = 'a b c d e f g'.split(' ')
+        super().__init__(nx.lollipop_graph, size - 1, 1, groups=groups, **kwargs)
+
+    def change(self):
+        pass
+
+    def grouping(self):
+        pass
+
+
+ng.Graphs.register_implementation('lies', DeceitNetwork)
+
+
+class BetrayalNetwork(ng.NetworkGraph):
+    def __init__(self, size, **kwargs):
+        groups = 'a b c d e f g'.split(' ')
+        super().__init__(nx.lollipop_graph, size - 1, 1, groups=groups, **kwargs)
+
+    def change(self):
+        pass
+
+    def grouping(self):
+        pass
+
+
+ng.Graphs.register_implementation('frenemy', BetrayalNetwork)
+
+
+class ReputationManipulationNetwork(ng.NetworkGraph):
+    def __init__(self, size, **kwargs):
+        groups = 'a b c d e f g'.split(' ')
+        super().__init__(nx.lollipop_graph, size - 1, 1, groups=groups, **kwargs)
+
+    def change(self):
+        pass
+
+    def grouping(self):
+        pass
+
+
+ng.Graphs.register_implementation('clique', ReputationManipulationNetwork)
+
+
 class SybilNetwork(ng.NetworkGraph):
     def __init__(self, size, **kwargs):
         self.sybils = list(range(size - 2))  # indices
         self.victim = size - 2  # index
         self.assist = size - 1  # index
         self.iteration = 0
-        super().__init__(nx.lollipop_graph, size - 1, 1, **kwargs)
+        groups = 'a b c d e f g'.split(' ')
+        super().__init__(nx.lollipop_graph, size - 1, 1, groups=groups, **kwargs)
 
     def _sybil_neighbors(self, n):
         if n in self.sybils + [self.victim]:
@@ -49,31 +95,31 @@ class SybilNetwork(ng.NetworkGraph):
         elif self.iteration == 1:
             self.next_change = 2000
         else:
-            self.next_change = random.randint(1, 2000)
             self.random_change()
+        self.next_change = random.randint(1, 500)
         self.grouping()
         self.iteration += 1
 
     def grouping(self):
-        max_grp = 7
         if self.iteration == 0:
             for n in self.G:
                 self.G.nodes[n]["name"] = n
-                self.G.nodes[n]["group"] = max_grp
-            self.G.nodes[self.victim]["group"] = max_grp - 1
+                self.G.nodes[n]["group"] = self.groups_len
+            self.G.nodes[self.victim]["group"] = self.groups_len - 1
         elif self.iteration == 1:
             self.G.nodes[self.assist]["name"] = self.assist
-            self.G.nodes[self.assist]["group"] = max_grp - 2
+            self.G.nodes[self.assist]["group"] = self.groups_len - 2
         else:
             for n in self.G:
                 if n > self.assist:
                     self.G.nodes[n]["name"] = n
-                    self.G.nodes[n]["group"] = random.randint(1, max_grp - 3)
+                    self.G.nodes[n]["group"] = random.randint(1, self.groups_len - 3)
                     
         for u, v, a in self.G.edges(data=True):
             src = self.G.nodes[u]
             tgt = self.G.nodes[v]
-            a["group"] = src["group"] if src["group"] == tgt["group"] else 0
+            if "group" in src.keys() and "group" in tgt.keys():
+                a["group"] = src["group"] if src["group"] == tgt["group"] else 0
             if u in self.sybils and v in self.sybils:
                 a["value"] = 10  # remain together
             elif u in self.sybils or v in self.sybils:
@@ -98,3 +144,18 @@ class SybilNetwork(ng.NetworkGraph):
 
 
 ng.Graphs.register_implementation('sybil', SybilNetwork)
+
+
+class CorruptAuthorityNetwork(ng.NetworkGraph):
+    def __init__(self, size, **kwargs):
+        groups = 'a b c d e f g'.split(' ')
+        super().__init__(nx.lollipop_graph, size - 1, 1, groups=groups, **kwargs)
+
+    def change(self):
+        pass
+
+    def grouping(self):
+        pass
+
+
+ng.Graphs.register_implementation('captain', CorruptAuthorityNetwork)

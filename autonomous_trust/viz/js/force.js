@@ -5,10 +5,12 @@
    Requires: JQuery v3.6.1+, D3 v4, D3-legend v2.25.6
  */
 
-createForcesGraph = () => {
-    const use_ws = true;
+createForcesGraph = function (containerSelect=".graph-container", with_websockets=true, debugging=false) {
+    // only settable in constructor
+    const use_ws = with_websockets;
+    const debug = debugging;
 
-    let debug = false;
+    // optionally set in init()
     let max_msgs = 500;
     let ws_port = 8000;
 
@@ -16,6 +18,7 @@ createForcesGraph = () => {
     let ws_active = false;
     let ws_init = false;
     let ws = null;
+    let group_ids = null;
 
     const node_metadata = ["group"];
     const link_metadata = ["group", "value"];
@@ -24,7 +27,7 @@ createForcesGraph = () => {
         nodes: [],
         links: [],
     };
-    const targetElement = document.querySelector('.graph-container');
+    const targetElement = document.querySelector(containerSelect);
     const width = targetElement.offsetWidth ? targetElement.offsetWidth : 800;
     const height = targetElement.offsetHeight ? targetElement.offsetHeight : width * 2/3;
 
@@ -43,12 +46,11 @@ createForcesGraph = () => {
     let linkGroup = g.attr("class", "links")
         .selectAll("line");
 
-    let legend = g.attr("class","legend")
-        .attr("transform","translate(50,30)")
-        .style("font-size","12px")
-        //.call(d3.legend); // FIXME
-
     const color = d3.scaleOrdinal(d3.schemeCategory10);
+
+    const legend = svg.append("g")
+        .attr("class", "legend")
+        .attr("transform", "translate(20,20)scale(.5)");
 
     const simulation = d3.forceSimulation()
         .force("x", d3.forceX(width / 2).strength(0.4))
@@ -83,6 +85,21 @@ createForcesGraph = () => {
     
     function update() {
         clear();
+
+        // construct dynamic graph legend
+        const groupNames = group_ids == null ? 'abcdefghijklmnopqrst'.split('') : group_ids;
+        const max_grp_num = groupNames.length;
+        const groupArray = Array.from({length: max_grp_num}, (_, i) => i + 1);
+        let ordinal = d3.scaleOrdinal()
+            .domain(groupArray)
+            .range(d3.schemeCategory20);  // TODO handle if max_grp_num larger than 20
+
+        let setLegend = d3.legendColor()
+            .title("Domains")
+            .shapePadding(10)
+            .labels(groupNames)
+            .scale(ordinal);
+        legend.call(setLegend);
 
         // Update links
         let link = linkGroup.data(graph.links);
@@ -342,6 +359,7 @@ createForcesGraph = () => {
         } else {
             if (debug)
                 console.log("full graph")
+            group_ids = graph_in.groups
             plot_new_graph(graph_in);
             reset(0.3);
         }
@@ -369,10 +387,9 @@ createForcesGraph = () => {
     }
 
     return ({
-        init: function (port=8000, duration=500, debugging=false) {
+        init: function (port=8000, duration=500) {
             ws_port = port;
             max_msgs = duration;
-            debug = debugging;
 
             if (use_ws) {
                 ws_active = false;

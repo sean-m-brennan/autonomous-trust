@@ -22,13 +22,13 @@ if __name__ == '__main__':
 
     print(' * Directory on host: %s' % args.directory)
     app = quart.Quart(__package__.split('.')[0],
-                      static_url_path='', static_folder=args.directory)
+                      static_url_path='', static_folder=args.directory, template_folder=args.directory)
     app.debug = True
 
 
     @app.route("/")
     async def page():
-        return await quart.send_from_directory(args.directory, "index.html")
+        return await quart.render_template("index.html")
 
 
     @app.websocket('/ws')

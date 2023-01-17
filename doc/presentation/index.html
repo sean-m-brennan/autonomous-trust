@@ -1,216 +1,978 @@
 <!DOCTYPE html>
-<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
-  <head>
-      <meta charset="utf-8" />
-      <meta name="viewport" content="width=1024" />
-      <title>Autonomous Trust</title>
-    
-      <meta name="description" content="" />
-      <meta name="author" content="Sean Brennan" />
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml" xmlns="http://www.w3.org/1999/html">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=1024"/>
+    <title>Autonomous Trust</title>
 
-      <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
-      <meta http-equiv="Pragma" content="no-cache" />
-      <meta http-equiv="Expires" content="0" />
+    <meta name="description" content=""/>
+    <meta name="author" content="Sean Brennan"/>
 
-      <link href="//fonts.googleapis.com/css?family=Open+Sans:regular,semibold,italic,italicsemibold|PT+Sans:400,700,400italic,700italic|PT+Serif:400,700,400italic,700italic" rel="stylesheet" />
+    <meta http-equiv="cache-control" content="no-cache, no-store, must-revalidate"/>
 
-      <link href="css/tekfive.css" rel="stylesheet" />
-      <link href="css/impress-common.css" rel="stylesheet" />
-      <link href="css/force.css" rel="stylesheet" />
-  </head>
-  <body class="impress-not-supported">
-    <div class="fallback-message">
-      <p>Your browser <b>doesn't support the features required</b> by impress.js, so you are presented with a simplified version of this presentation.</p>
-      <p>For the best experience please use the latest <b>Chrome</b>, <b>Safari</b> or <b>Firefox</b> browser.</p>
+    <link href="//fonts.googleapis.com/css?family=Open+Sans:regular,semibold,italic,italicsemibold|PT+Sans:400,700,400italic,700italic|PT+Serif:400,700,400italic,700italic"
+          rel="stylesheet"/>
+
+    <link href="css/tekfive.css" rel="stylesheet"/>
+    <link href="css/impress-common.css" rel="stylesheet"/>
+    <link href="css/force.css" rel="stylesheet"/>
+    <link href="css/fontawesome.min.css" rel="stylesheet"/>
+    <link href="js/fontawesome.min.js" rel="javascript"/>
+
+    <link rel="preload" as="image" href="images/opte_20221012.0800.png"/>
+</head>
+<body class="impress-not-supported">
+<div class="fallback-message">
+    <p>Your browser <b>doesn't support the features required</b> by impress.js, so you are presented with a simplified
+        version of this presentation.</p>
+    <p>For the best experience please use the latest <b>Chrome</b>, <b>Safari</b> or <b>Firefox</b> browser.</p>
+</div>
+
+<div id="impress"
+     data-transition-duration="1000"
+     data-width="1024"
+     data-height="768"
+     data-max-scale="3"
+     data-min-scale="0"
+     data-perspective="1000"
+     data-autoplay="0">
+
+    <div id="title" class="step slide" data-x="-2000" data-y="-2000" data-autoplay="0">
+        <div id="t5header">
+            <img src="images/t5logo.png" alt="T5"/>
+            <div class="author">Sean Brennan<br/>January 2023</div>
+            <hr/>
+        </div>
+
+        <br/><br/>
+        <div class="title">AutonomousTrust</div>
+        <div class="subtitle">High-trust systems for secure cooperation</div>
+
+        <div id="t5footer">
+            <hr>
+            <div style="float:left;">TekFive Inc.</div>
+            <div style="float:right;">info@tekfive.com</div>
+            <div style="clear:both;"></div>
+            <div style="float:left;">3001 9th Avenue SW Suite 104</div>
+            <div style="float:right;">256.213.1060</div>
+            <div style="clear:both;"></div>
+            <div style="float:left;">Huntsville, AL 35805, USA</div>
+        </div>
+    </div>  <!-- end slide -->
+
+    <div class="step slide bare" data-x="-500" data-y="-2000">
+        <div class="topic"><strong>Zero Trust Architecture</strong> (ZTA)</div>
+        <div style="padding: 40px 60px;">
+            Improves security through:
+            <ul>
+                <li>strong user identity verification</li>
+                <li>device compliance validation</li>
+                <li>least privilege access</li>
+                <li>explicit resource authorization</li>
+            </ul>
+            <p style="margin-bottom: 3cm;"></p>
+            Drawback:
+            <p>The user is not monitored once access is granted.</p>
+        </div>
+
+        <div class="t5footer">
+            <hr>
+            <img src="images/t5logo.png" alt="T5"/>
+            <div style="float:right;">AutonomousTrust</div>
+        </div>
     </div>
 
-    <div id="impress"
-	 data-transition-duration="1000"
-	 data-width="1024"
-	 data-height="768"
-	 data-max-scale="3"
-	 data-min-scale="0"
-	 data-perspective="1000"
-	 data-autoplay="0">
+    <div class="step slide bare" data-x="1000" data-y="-2000">
+        <div class="topic"><strong>Intrusion Detection Systems</strong> (IDS)</div>
+        <div style="padding: 40px 60px;">
+            Improve security through:
+            <ul>
+                <li>Pattern recognition (known suspect sequences)</li>
+                <li>Anomaly detection (unknown deviations)</li>
+            </ul>
+            <p style="margin-bottom: 5cm;"></p>
+            Drawbacks:
+            <p>Requires prior patterning or local-only behavioral learning</p>
+            <p>Usually network-messaging-centric (packet analysis)</p>
+        </div>
 
-      <div id="title" class="step slide" data-x="-2000" data-y="-2000" data-autoplay="0">
-	<div id="t5header">
-	  <img src="t5logo.png"/>
-	  <div class="author">Sean Brennan<br/>January 2023</div>
-	  <hr/>
-	</div>
-
-	<br/><br/>
-	<div class="title">AutonomousTrust</div>
-	<div class="subtitle">High-trust systems for secure cooperation</div>
-
-	<div id="t5footer">
-	  <hr>
-	  <div style="float:left;">TekFive Inc.</div>
-	  <div style="float:right;">info@tekfive.com</div>
-	  <div style="clear:both;"></div>
-	  <div style="float:left;">3001 9th Avenue SW Suite 104</div>
-	  <div style="float:right;">256.213.1060</div>
-	  <div style="clear:both;"></div>
-	  <div style="float:left;">Huntsville, AL 35805, USA</div>
-	</div>
-      </div>  <!-- end slide -->
-
-      <div id="slide2" class="step slide" data-x="-500" data-y="-2000">
-        <q>Don’t you think that presentations given <strong>in modern browsers</strong> shouldn’t <strong>copy the limits</strong> of ‘classic’ slide decks?</q>
+        <div class="t5footer">
+            <hr>
+            <img src="images/t5logo.png" alt="T5"/>
+            <div style="float:right;">AutonomousTrust</div>
+        </div>
     </div>
 
-      <div id="slide3" class="step slide" data-x="1000" data-y="-2000">
-        <q>Would you like to <strong>impress your audience</strong> with <strong>stunning visualization</strong> of your talk?</q>
-      </div>
+    <div class="step slide bare" data-x="2500" data-y="-2000">
+        <div class="topic"><strong>AutonomousTrust</strong></div>
+        <div style="padding: 40px 60px;">
+            We can do <strong>better</strong>:
+            <ul>
+                <li>Dynamic resource access - not static</li>
+                <li>Proactive exclusion - not just reactive</li>
+                <li>AI-driven</li>
+            </ul>
+            <p style="margin-bottom: 3cm;"></p>
+            <p>But how?</p>
+        </div>
 
-      <div id="slide4" class="step" data-x="0" data-y="0" data-scale="3">
-        <div class="graph-container" style="width: 800px; height: 600px;"></div>
-      </div>
+        <div class="t5footer">
+            <hr>
+            <img src="images/t5logo.png" alt="T5"/>
+            <div style="float:right;">AutonomousTrust</div>
+        </div>
+    </div>
 
-      <!--
-        
-        This element introduces rotation.
-        
-        Notation shouldn't be a surprise. We use `data-rotate="90"` attribute, meaning that this
-        element should be rotated by 90 degrees clockwise.
-        
-	-->
-      <div id="its" class="step" data-x="850" data-y="4000" data-rotate="90" data-scale="5">
-        <p>It’s a <strong>presentation tool</strong> <br/>
-          inspired by the idea behind <a href="http://prezi.com">prezi.com</a> <br/>
-          and based on the <strong>power of CSS3 transforms and transitions</strong> in modern browsers.</p>
-      </div>
+    <div class="step clearstep slide bare" data-x="2500" data-y="-2000">
+        <div class="topic"><strong>AutonomousTrust</strong></div>
+        <div style="padding: 40px 60px;">
+            We can do <strong>better</strong>:
+            <ul>
+                <li>Dynamic resource access - not static</li>
+                <li>Proactive exclusion - not just reactive</li>
+                <li>AI-driven</li>
+            </ul>
+            <p style="margin-bottom: 3cm;"></p>
+            <p>But how?</p>
+            <p style="float: right;">... with a paradigm shift</p>
+        </div>
 
-      <div id="big" class="step" data-x="3500" data-y="2100" data-rotate="180" data-scale="6">
-        <p>visualize your <b>big</b> <span class="thoughts">thoughts</span></p>
-      </div>
-
-      <!--
-        
-        And now it gets really exciting! We move into third dimension!
-        
-        Along with `data-x` and `data-y`, you can define the position on third (Z) axis, with
-        `data-z`. In the example below we use `data-z="-3000"` meaning that element should be
-        positioned far away from us (by 3000px).
-        
-	-->
-      <div id="tiny" class="step" data-x="2825" data-y="2325" data-z="-3000" data-rotate="300" data-scale="1">
-        <p>and <b>tiny</b> ideas</p>
-      </div>
-
-      <!--
-        
-        This step here doesn't introduce anything new when it comes to data attributes, but you
-        should notice in the demo that some words of this text are being animated.
-        It's a very basic CSS transition that is applied to the elements when this step element is
-        reached.
-        
-        At the very beginning of the presentation all step elements are given the class of `future`.
-        It means that they haven't been visited yet.
-        
-        When the presentation moves to given step `future` is changed to `present` class name.
-        That's how animation on this step works - text moves when the step has `present` class.
-        
-        Finally when the step is left the `present` class is removed from the element and `past`
-        class is added.
-        
-        So basically every step element has one of three classes: `future`, `present` and `past`.
-        Only one current step has the `present` class.
-        
-        Note: data-x/y/z attributes, if not defined, by default will inherit the value of the 
-        previous step. So to get back to 0 on the z-axis, we must set it to 0.
-        See src/plugins/rel/README.md for more information.
-        
-	-->
-      <div id="ing" class="step" data-x="3500" data-y="-850" data-z="0" data-rotate="270" data-scale="6">
-        <p>by <b class="positioning">positioning</b>, <b class="rotating">rotating</b> and <b class="scaling">scaling</b> them on an infinite canvas</p>
-      </div>
-
-      <div id="imagination" class="step" data-x="6700" data-y="-300" data-scale="6">
-        <p>the only <b>limit</b> is your <b class="imagination">imagination</b></p>
-      </div>
-
-      <div id="source" class="step" data-x="6300" data-y="2000" data-rotate="20" data-scale="4">
-        <p>want to know more?</p>
-        <q><a href="http://github.com/impress/impress.js">use the source</a>, Luke!</q>
-      </div>
-
-      <div id="one-more-thing" class="step" data-x="6000" data-y="4000" data-scale="2">
-        <p>one more thing...</p>
-      </div>
-
-      <!--
-        
-        And the last one shows full power and flexibility of impress.js.
-        
-        You can not only position element in 3D, but also rotate it around any axis.
-        So this one here will get rotated by -40 degrees (40 degrees anticlockwise) around X axis and
-        10 degrees (clockwise) around Y axis.
-        
-        You can of course rotate it around Z axis with `data-rotate-z` - it has exactly the same effect
-        as `data-rotate` (these two are basically aliases).
-        
-	-->
-      <div id="its-in-3d" class="step" data-x="6200" data-y="4300" data-z="-100" data-rotate-x="-40" data-rotate-y="10" data-scale="2">
-        <p><span class="have">have</span> <span class="you">you</span> <span class="noticed">noticed</span> <span class="its">it’s</span> <span class="in">in</span> <b>3D<sup>*</sup></b>?</p>
-        <span class="footnote">* beat that, prezi ;)</span>
-      </div>
-
-      <!--
-        
-        So to summarize of all the possible attributes used to position presentation steps, we have:
-        
-        * `data-x`, `data-y`, `data-z` - they define the position of **the center** of step element on
-            the canvas in pixels; their default value is 0;
-        * `data-rotate-x`, `data-rotate-y`, 'data-rotate-z`, `data-rotate` - they define the rotation of
-            the element around given axis in degrees; their default value is 0; `data-rotate` and `data-rotate-z`
-            are exactly the same;
-        * `data-scale` - defines the scale of step element; default value is 1
-        
-        These values are used by impress.js in CSS transformation functions, so for more information consult
-        CSS transfrom docs: https://developer.mozilla.org/en/CSS/transform
-        
-	-->
-      <div id="overview" class="step" data-x="3000" data-y="1500" data-z="0" data-scale="10">
-      </div>
-
-    </div> <!-- end presentation -->
-
-    <div id="impress-toolbar"></div>
+        <div class="t5footer">
+            <hr>
+            <img src="images/t5logo.png" alt="T5"/>
+            <div style="float:right;">AutonomousTrust</div>
+        </div>
+    </div>
 
 
-    <!-- Leave scripts at the end of the doc -->
-    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.1/jquery.min.js"></script>
-    <script type="text/javascript" src="https://d3js.org/d3.v4.min.js" charset="utf-8"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3-legend/2.25.6/d3-legend.min.js"></script>
+    <!-- Describe 4 levels of access -->
+    <div id="access1" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
+        <div class="issue">Dynamic trust</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <table class="ctr">
+            <tr>
+                <th></th>
+                <th class="spaced"></th>
+                <th></th>
+                <th class="rep">Reputation Level</th>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-database"></i></td>
+                <td></td>
+                <td>Data-sharing</td>
+                <td class="level"></td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-server"></i></td>
+                <td></td>
+                <td>Services</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-arrow-right-arrow-left"></i></td>
+                <td></td>
+                <td>Communication</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 1;">
+                <td class="icon"><i class="fa-solid fa-network-wired"></i></td>
+                <td></td>
+                <td>Transport connected</td>
+                <td>
+                    <div class="level" style="background-color: darkred"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon" colspan="3"><i class="fa-solid fa-ban"></i></td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+        </table>
+    </div>
 
-    <!-- <script type="text/x-mathjax-config">
-      MathJax.Hub.Config({
-        showProcessingMessages: false,
-        messageStyle: "none",
-        TeX : { extensions : ['color.js'] }
-      });
-    </script> -->
+    <div id="access2" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
+        <div class="issue">Dynamic trust</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <table class="ctr">
+            <tr>
+                <th></th>
+                <th class="spaced"></th>
+                <th></th>
+                <th class="rep">Reputation Level</th>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-database"></i></td>
+                <td></td>
+                <td>Data-sharing</td>
+                <td class="level"></td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-server"></i></td>
+                <td></td>
+                <td>Services</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-arrow-right-arrow-left"></i></td>
+                <td></td>
+                <td>Communication</td>
+                <td>
+                    <div class="level" style="background-color: darkorange"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 1;">
+                <td class="icon"><i class="fa-solid fa-network-wired"></i></td>
+                <td></td>
+                <td>Transport connected</td>
+                <td>
+                    <div class="level" style="background-color: darkorange"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon" colspan="3"><i class="fa-solid fa-ban"></i></td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+        </table>
+    </div>
 
-    <script src="js/impress.js"></script>
-    <script src="js/force.js"></script>
+    <div id="access3" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
+        <div class="issue">Dynamic trust</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <table class="ctr">
+            <tr>
+                <th></th>
+                <th class="spaced"></th>
+                <th></th>
+                <th class="rep">Reputation Level</th>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-database"></i></td>
+                <td></td>
+                <td>Data-sharing</td>
+                <td class="level"></td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-server"></i></td>
+                <td></td>
+                <td>Services</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 1;">
+                <td class="icon"><i class="fa-solid fa-arrow-right-arrow-left"></i></td>
+                <td></td>
+                <td>Communication</td>
+                <td>
+                    <div class="level" style="background-color: darkorange"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.6;">
+                <td class="icon"><i class="fa-solid fa-network-wired"></i></td>
+                <td></td>
+                <td>Transport connected</td>
+                <td>
+                    <div class="level" style="background-color: darkorange"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon" colspan="3"><i class="fa-solid fa-ban"></i></td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+        </table>
+    </div>
 
-    <script>
-      $(document).ready(function() {
-          impress().init();
-          const forcesGraph = createForcesGraph();
-          forcesGraph.init(8888);
-	  window.addEventListener('impress:stepenter', function(event) {
-	      if (event.target.id == "slide4")
-		  forcesGraph.start("sybil");
-              // other slides, other sims
-	  });
-	  window.addEventListener('impress:stepleave', function(event) {
-	      if (event.target.id == "slide4")
-		  forcesGraph.stop();
-	  });
-      });
-    </script>
-  </body>
+    <div id="access4" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
+        <div class="issue">Dynamic trust</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <table style="margin-left: auto;margin-right: auto;">
+            <tr>
+                <th></th>
+                <th class="spaced"></th>
+                <th></th>
+                <th class="rep">Reputation Level</th>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-database"></i></td>
+                <td></td>
+                <td>Data-sharing</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-server"></i></td>
+                <td></td>
+                <td>Services</td>
+                <td>
+                    <div class="level" style="background-color: yellow"></div>
+                <td>
+            </tr>
+            <tr style="opacity: 1;">
+                <td class="icon"><i class="fa-solid fa-arrow-right-arrow-left"></i></td>
+                <td></td>
+                <td>Communication</td>
+                <td>
+                    <div class="level" style="background-color: yellow"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.6;">
+                <td class="icon"><i class="fa-solid fa-network-wired"></i></td>
+                <td></td>
+                <td>Transport connected</td>
+                <td>
+                    <div class="level" style="background-color: yellow"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon" colspan="3"><i class="fa-solid fa-ban"></i></td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    <div id="access5" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
+        <div class="issue">Dynamic trust</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <table style="margin-left: auto;margin-right: auto;">
+            <tr>
+                <th></th>
+                <th class="spaced"></th>
+                <th></th>
+                <th class="rep">Reputation Level</th>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-database"></i></td>
+                <td></td>
+                <td>Data-sharing</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 1;">
+                <td class="icon"><i class="fa-solid fa-server"></i></td>
+                <td></td>
+                <td>Services</td>
+                <td>
+                    <div class="level" style="background-color: yellow"></div>
+                <td>
+            </tr>
+            <tr style="opacity: 0.6;">
+                <td class="icon"><i class="fa-solid fa-arrow-right-arrow-left"></i></td>
+                <td></td>
+                <td>Communication</td>
+                <td>
+                    <div class="level" style="background-color: yellow"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.4;">
+                <td class="icon"><i class="fa-solid fa-network-wired"></i></td>
+                <td></td>
+                <td>Transport connected</td>
+                <td>
+                    <div class="level" style="background-color: yellow"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon" colspan="3"><i class="fa-solid fa-ban"></i></td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    <div id="access6" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
+        <div class="issue">Dynamic trust</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <table class="ctr">
+            <tr>
+                <th></th>
+                <th class="spaced"></th>
+                <th></th>
+                <th class="rep">Reputation Level</th>
+                <td></td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-database"></i></td>
+                <td></td>
+                <td>Data-sharing</td>
+                <td>
+                    <div class="level" style="background-color: darkgreen"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 1;">
+                <td class="icon"><i class="fa-solid fa-server"></i></td>
+                <td></td>
+                <td>Services</td>
+                <td>
+                    <div class="level" style="background-color: darkgreen"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.6;">
+                <td class="icon"><i class="fa-solid fa-arrow-right-arrow-left"></i></td>
+                <td></td>
+                <td>Communication</td>
+                <td>
+                    <div class="level" style="background-color: darkgreen"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.4;">
+                <td class="icon"><i class="fa-solid fa-network-wired"></i></td>
+                <td></td>
+                <td>Transport connected</td>
+                <td>
+                    <div class="level" style="background-color: darkgreen"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon" colspan="3"><i class="fa-solid fa-ban"></i></td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    <div id="access7" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
+        <div class="issue">Dynamic trust</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <table class="ctr">
+            <tr>
+                <th></th>
+                <th class="spaced"></th>
+                <th></th>
+                <th class="rep">Reputation Level</th>
+                <td></td>
+            </tr>
+            <tr style="opacity: 1;">
+                <td class="icon"><i class="fa-solid fa-database"></i></td>
+                <td></td>
+                <td>Data-sharing</td>
+                <td>
+                    <div class="level" style="background-color: darkgreen"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.6;">
+                <td class="icon"><i class="fa-solid fa-server"></i></td>
+                <td></td>
+                <td>Services</td>
+                <td>
+                    <div class="level" style="background-color: darkgreen"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.4;">
+                <td class="icon"><i class="fa-solid fa-arrow-right-arrow-left"></i></td>
+                <td></td>
+                <td>Communication</td>
+                <td>
+                    <div class="level" style="background-color: darkgreen"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.2;">
+                <td class="icon"><i class="fa-solid fa-network-wired"></i></td>
+                <td></td>
+                <td>Transport connected</td>
+                <td>
+                    <div class="level" style="background-color: darkgreen"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon" colspan="3"><i class="fa-solid fa-ban"></i></td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    <div id="access8" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
+        <div class="issue">Dynamic trust</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <table class="ctr">
+            <tr>
+                <th></th>
+                <th class="spaced"></th>
+                <th></th>
+                <th class="rep">Reputation Level</th>
+                <td></td>
+            </tr>
+            <tr style="opacity: 1;">
+                <td class="icon"><i class="fa-solid fa-database"></i></td>
+                <td></td>
+                <td>Data-sharing</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.6;">
+                <td class="icon"><i class="fa-solid fa-server"></i></td>
+                <td></td>
+                <td>Services</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.4;">
+                <td class="icon"><i class="fa-solid fa-arrow-right-arrow-left"></i></td>
+                <td></td>
+                <td>Communication</td>
+                <td>
+                    <div class="level" style="background-color: darkorange"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.2;">
+                <td class="icon"><i class="fa-solid fa-network-wired"></i></td>
+                <td></td>
+                <td>Transport connected</td>
+                <td>
+                    <div class="level" style="background-color: darkorange"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon" colspan="3"><i class="fa-solid fa-ban"></i></td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    <div id="access9" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
+        <div class="issue">Dynamic trust</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <table class="ctr">
+            <tr>
+                <th></th>
+                <th class="spaced"></th>
+                <th></th>
+                <th class="rep">Reputation Level</th>
+                <td></td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-database"></i></td>
+                <td></td>
+                <td>Data-sharing</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-server"></i></td>
+                <td></td>
+                <td>Services</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 1;">
+                <td class="icon"><i class="fa-solid fa-arrow-right-arrow-left"></i></td>
+                <td></td>
+                <td>Communication</td>
+                <td>
+                    <div class="level" style="background-color: darkorange"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.6;">
+                <td class="icon"><i class="fa-solid fa-network-wired"></i></td>
+                <td></td>
+                <td>Transport connected</td>
+                <td>
+                    <div class="level" style="background-color: darkorange"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon" colspan="3"><i class="fa-solid fa-ban"></i></td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    <div id="access10" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
+        <div class="issue">Dynamic trust</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <table class="ctr">
+            <tr>
+                <th></th>
+                <th class="spaced"></th>
+                <th></th>
+                <th class="rep">Reputation Level</th>
+                <td></td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-database"></i></td>
+                <td></td>
+                <td>Data-sharing</td>
+                <td>
+                    <div class="level" style="background-color: darkgreen"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-server"></i></td>
+                <td></td>
+                <td>Services</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 1;">
+                <td class="icon"><i class="fa-solid fa-arrow-right-arrow-left"></i></td>
+                <td></td>
+                <td>Communication</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.6;">
+                <td class="icon"><i class="fa-solid fa-network-wired"></i></td>
+                <td></td>
+                <td>Transport connected</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 0.8;">
+                <td class="icon" colspan="3" style="opacity: 0;"><i class="fa-solid fa-ban"></i></td>
+                <td>
+                    <div class="level" style="background-color: black"></div>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    <div id="access11" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
+        <div class="issue">Dynamic trust</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <table class="ctr">
+            <tr>
+                <th></th>
+                <th class="spaced"></th>
+                <th></th>
+                <th class="rep">Reputation Level</th>
+                <td></td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-database"></i></td>
+                <td></td>
+                <td>Data-sharing</td>
+                <td>
+                    <div class="level" style="background-color: darkgreen"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-server"></i></td>
+                <td></td>
+                <td>Services</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-arrow-right-arrow-left"></i></td>
+                <td></td>
+                <td>Communication</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr class="invisible">
+                <td class="icon"><i class="fa-solid fa-network-wired"></i></td>
+                <td></td>
+                <td>Transport connected</td>
+                <td>
+                    <div class="level"></div>
+                </td>
+            </tr>
+            <tr style="opacity: 1;">
+                <td class="icon" colspan="3"><i class="fa-solid fa-ban"></i></td>
+                <td>
+                    <div class="level" style="background-color: black"></div>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+
+    <!-- Seven facets -->
+    <div id="facet1" class="step" data-x="6000" data-y="-1000" data-z="-1000" data-rotate-y="-90">
+        <div class="issue">Building blocks</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <div style="float:left;font-size:x-large;">
+            <ul>
+                <li>Scalability</li>
+                <li>Domain language</li>
+                <li>Shared goals</li>
+                <li>Consistent identity</li>
+                <li>Reputation-based</li>
+                <li>Bootstrapping optimizations</li>
+                <li>Opportunity vs. security</li>
+            </ul>
+        </div>
+    </div>
+
+    <div id="facet2" class="step" data-x="6000" data-y="0" data-z="0" data-rotate-y="-90">
+        <div class="issue">Building blocks</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <div style="float:left;font-size:x-large;">
+            <ul>
+                <li><strong>Scalability</strong></li>
+                <li>Domain language</li>
+                <li>Shared goals</li>
+                <li>Consistent identity</li>
+                <li>Reputation-based</li>
+                <li>Bootstrapping optimizations</li>
+                <li>Opportunity vs. security</li>
+            </ul>
+        </div>
+        <div style="float:right;">
+            image
+        </div>
+    </div>
+
+    <div id="facet3" class="step" data-x="6000" data-y="1000" data-z="1000" data-rotate-y="-90">
+        <div class="issue">Building blocks</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <div style="float:left;font-size:x-large;">
+            <ul>
+                <li>Scalability</li>
+                <li><strong>Domain language</strong></li>
+                <li>Shared goals</li>
+                <li>Consistent identity</li>
+                <li>Reputation-based</li>
+                <li>Bootstrapping optimizations</li>
+                <li>Opportunity vs. security</li>
+            </ul>
+        </div>
+        <div style="float:right;">
+            image
+        </div>
+    </div>
+
+    <div id="facet4" class="step" data-x="6000" data-y="2000" data-z="2000" data-rotate-y="-90">
+        <div class="issue">Building blocks</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <div style="float:left;font-size:x-large;">
+            <ul>
+                <li>Scalability</li>
+                <li>Domain language</li>
+                <li><strong>Shared goals</strong></li>
+                <li>Consistent identity</li>
+                <li>Reputation-based</li>
+                <li>Bootstrapping optimizations</li>
+                <li>Opportunity vs. security</li>
+            </ul>
+        </div>
+        <div style="float:right;">
+            image
+        </div>
+    </div>
+
+    <div id="facet5" class="step" data-x="6000" data-y="3000" data-z="3000" data-rotate-y="-90">
+        <div class="issue">Building blocks</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <div style="float:left;font-size:x-large;">
+            <ul>
+                <li>Scalability</li>
+                <li>Domain language</li>
+                <li>Shared goals</li>
+                <li><strong>Consistent identity</strong></li>
+                <li>Reputation-based</li>
+                <li>Bootstrapping optimizations</li>
+                <li>Opportunity vs. security</li>
+            </ul>
+        </div>
+        <div style="float:right;">
+            image
+        </div>
+    </div>
+
+    <div id="facet6" class="step" data-x="6000" data-y="4000" data-z="4000" data-rotate-y="-90">
+        <div class="issue">Building blocks</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <div style="float:left;font-size:x-large;">
+            <ul>
+                <li>Scalability</li>
+                <li>Domain language</li>
+                <li>Shared goals</li>
+                <li>Consistent identity</li>
+                <li><strong>Reputation-based</strong></li>
+                <li>Bootstrapping optimizations</li>
+                <li>Opportunity vs. security</li>
+            </ul>
+        </div>
+        <div style="float:right;">
+            image
+        </div>
+    </div>
+
+    <div id="facet7" class="step" data-x="6000" data-y="5000" data-z="5000" data-rotate-y="-90">
+        <div class="issue">Building blocks</div><br/>
+        <p style="margin-bottom: 2cm;"></p>
+        <div style="float:left;font-size:x-large;">
+            <ul>
+                <li>Scalability</li>
+                <li>Domain language</li>
+                <li>Shared goals</li>
+                <li>Consistent identity</li>
+                <li>Reputation-based</li>
+                <li><strong>Bootstrapping optimizations</strong></li>
+                <li>Opportunity vs. security</li>
+            </ul>
+        </div>
+        <div style="float:right;">
+            image
+        </div>
+    </div>
+
+    <div id="facet8" class="step" data-x="6000" data-y="6000" data-z="6000" data-rotate-y="-90">
+        <div class="issue">Building blocks</div>
+        <p style="margin-bottom: 2cm;"></p>
+        <div style="float:left;font-size:x-large;">
+            <ul>
+                <li>Scalability</li>
+                <li>Domain language</li>
+                <li>Shared goals</li>
+                <li>Consistent identity</li>
+                <li>Reputation-based</li>
+                <li>Bootstrapping optimizations</li>
+                <li><strong>Opportunity vs. security</strong></li>
+            </ul>
+        </div>
+        <div style="float:right;">
+            image
+        </div>
+    </div>
+
+
+    <!-- Network security -->
+    <div id="network1" class="step clearstep bare dark-mode" data-x=250 data-y=2000 data-rotate-x="-90" data-scale="10">
+        <img src="images/opte_20221012.0800.png" alt="Internet map"
+             style="width: 150%; margin-left: -220px; margin-right: 0; display: block;"/>
+    </div>
+
+    <!-- Deception -->
+    <div id="lies" class="step dark-mode sim" data-x="3000" data-y="0" data-z="3500" data-rotate-x="-90" data-scale="1">
+        <div style="color: white;">Deception</div>
+        <div id="lies-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
+    </div>
+
+    <div id="network2" class="step clearstep bare dark-mode" data-x=250 data-y=2000 data-rotate-x="-90" data-scale="10">
+        <img src="images/opte_20221012.0800.png" alt="Internet map"
+             style="width: 150%; margin-left: -220px; margin-right: 0; display: block;"/>
+    </div>
+
+
+    <!-- Betrayal -->
+    <div id="frenemy" class="step dark-mode sim" data-x="1000" data-y="0" data-z="-1500" data-rotate-x="-90" data-scale="1">
+        <div style="color: white;">Betrayal</div>
+        <div id="frenemy-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
+    </div>
+
+    <div id="network3" class="step clearstep bare dark-mode" data-x=250 data-y=2000 data-rotate-x="-90" data-scale="10">
+        <img src="images/opte_20221012.0800.png" alt="Internet map"
+             style="width: 150%; margin-left: -220px; margin-right: 0; display: block;"/>
+    </div>
+
+
+    <!-- Reputation trashing -->
+    <div id="clique" class="step dark-mode sim" data-x="-1500" data-y="0" data-z="1500" data-rotate-x="-90" data-scale="1">
+        <div style="color: white;">Reputation</div>
+        <div id="clique-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
+    </div>
+
+    <div id="network4" class="step clearstep bare dark-mode" data-x=250 data-y=2000 data-rotate-x="-90" data-scale="10">
+        <img src="images/opte_20221012.0800.png" alt="Internet map"
+             style="width: 150%; margin-left: -220px; margin-right: 0; display: block;"/>
+    </div>
+
+
+    <!-- atomization (sybil) -->
+    <div id="sybil" class="step dark-mode sim" data-x="-2000" data-y="0" data-z="-2500" data-rotate-x="-90" data-scale="1">
+        <div style="color: white;">Atomization</div>
+        <div id="sybil-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
+    </div>
+
+    <div id="network5" class="step clearstep bare dark-mode" data-x=250 data-y=2000 data-rotate-x="-90" data-scale="10">
+        <img src="images/opte_20221012.0800.png" alt="Internet map"
+             style="width: 150%; margin-left: -220px; margin-right: 0; display: block;"/>
+    </div>
+
+
+    <!-- corrupt authority -->
+    <div id="captain" class="step dark-mode sim" data-x="2000" data-y="0" data-z="-3500" data-rotate-x="-90" data-scale="1">
+        <div style="color: white;">Corrupt authority</div>
+        <div id="captain-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
+    </div>
+
+
+</div> <!-- end presentation -->
+
+<div id="impress-toolbar"></div>
+
+
+<!-- Leave scripts at the end of the doc -->
+<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.1/jquery.min.js"></script>
+<script src="https://d3js.org/d3.v4.min.js" type="text/javascript" charset="utf-8"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3-legend/2.25.6/d3-legend.min.js"></script>
+
+<!-- <script type="text/x-mathjax-config">
+  MathJax.Hub.Config({
+    showProcessingMessages: false,
+    messageStyle: "none",
+    TeX : { extensions : ['color.js'] }
+  });
+</script> -->
+
+<script src="js/impress.js"></script>
+<script src="js/force.js"></script>
+
+<script>
+    $(document).ready(function () {
+        impress().init();
+        const graphPort = 8888;
+        let forcesGraph = null;
+        const slideStartWithIn = function (name, array) {
+            for (let i = 0; i < array.length; i++) {
+                if (name.startsWith(array[i]))
+                    return true;
+            }
+            return false;
+        }
+        window.addEventListener('impress:stepenter', function (event) {
+            console.log(event.target)
+            if (event.target.className.includes("sim")) {
+                forcesGraph = createForcesGraph("#" + event.target.id + "-graph");
+                forcesGraph.init(graphPort, 400);
+                forcesGraph.start(event.target.id);
+            }
+            const whitePages = ["title", "step-", "access", "facet"]
+            if (slideStartWithIn(event.target.id, whitePages)) {
+                document.body.style.backgroundColor = "white";
+            } else {
+                document.body.style.backgroundColor = "black";
+            }
+        });
+        window.addEventListener('impress:stepleave', function (event) {
+            if (event.target.className.includes("sim"))
+                if (forcesGraph != null)
+                    forcesGraph.stop();
+        });
+    });
+</script>
+</body>
 </html>
