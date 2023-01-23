@@ -115,11 +115,8 @@ class SybilNetwork(ng.NetworkGraph):
                     self.G.nodes[n]["name"] = n
                     self.G.nodes[n]["group"] = random.randint(1, self.groups_len - 3)
                     
+        self.propagate_node_grouping()
         for u, v, a in self.G.edges(data=True):
-            src = self.G.nodes[u]
-            tgt = self.G.nodes[v]
-            if "group" in src.keys() and "group" in tgt.keys():
-                a["group"] = src["group"] if src["group"] == tgt["group"] else 0
             if u in self.sybils and v in self.sybils:
                 a["value"] = 10  # remain together
             elif u in self.sybils or v in self.sybils:
@@ -148,14 +145,46 @@ ng.Graphs.register_implementation('sybil', SybilNetwork)
 
 class CorruptAuthorityNetwork(ng.NetworkGraph):
     def __init__(self, size, **kwargs):
-        groups = 'a b c d e f g'.split(' ')
-        super().__init__(nx.lollipop_graph, size - 1, 1, groups=groups, **kwargs)
+        groups = 'a b c'.split(' ')
+        num_levels = 3
+        g, levels = self._hierarchy_gen(size*num_levels, num_levels)
+        self.orig = lambda _: nx.Graph(g)
+        self.levels = levels
+        super().__init__(self.orig, size*levels, groups=groups, **kwargs)
+
+    @staticmethod
+    def _hierarchy_gen(size, num_levels):
+        levels = []
+        g = None
+        sizes = [-1]
+        for lev in range(1, num_levels+1):
+            sizes.append(lev * size // num_levels)
+        for lev in range(1, num_levels+1):
+            level_graph = nx.complete_graph(range(sizes[lev-1] + 1, sizes[lev]))
+            if lev == 1:
+                g = level_graph
+            else:
+                g = nx.compose(g, level_graph)
+            level_nodes = list(level_graph)
+            level_head = level_nodes[0]
+            if lev > 1:
+                for n in levels[lev-2]:
+                    g.add_edge(n, level_head)
+            levels.append(level_nodes)
+        return g, levels
 
     def change(self):
-        pass
+        self.change_type = self.PhaseChange.META
+        self.next_change = random.randint(1, 500)
+        self.grouping()
 
     def grouping(self):
-        pass
+        for n in self.G:
+            self.G.nodes[n]["name"] = n
+            for idx, level in enumerate(self.levels):
+                if n in level:
+                    self.G.nodes[n]["group"] = self.groupLabels[idx]
+        self.propagate_node_grouping()
 
 
 ng.Graphs.register_implementation('captain', CorruptAuthorityNetwork)
