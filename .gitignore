@@ -8,3 +8,12 @@ doc/*/*.log
 doc/*/*.run.xml
 doc/*/*.synctex.gz
 doc/whitepaper/research
+doc/presentation/images/file.png
+doc/presentation/images/file.shape
+doc/presentation/images/file.svg
+doc/presentation/images/identity.svg
+doc/presentation/images/network.png
+doc/presentation/images/reputation.svg
+doc/presentation/images/spreadsheet.png
+doc/presentation/images/spreadsheet.shape
+doc/presentation/images/spreadsheet.svg
