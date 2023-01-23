@@ -63,6 +63,10 @@ class NetworkGraph(object):
         self.grouping()
         self._record_state()
 
+    @staticmethod
+    def identity(g):
+        return lambda _: g
+
     @property
     def node_ids(self):
         return list([n for n in self.G])
@@ -81,6 +85,13 @@ class NetworkGraph(object):
 
     def grouping(self):
         raise NotImplementedError
+
+    def propagate_node_grouping(self):
+        for u, v, a in self.G.edges(data=True):
+            src = self.G.nodes[u]
+            tgt = self.G.nodes[v]
+            if "group" in src.keys() and "group" in tgt.keys():
+                a["group"] = src["group"] if src["group"] == tgt["group"] else 0
 
     def renew(self):
         self._reset()

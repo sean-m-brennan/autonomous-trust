@@ -5,7 +5,7 @@
    Requires: JQuery v3.6.1+, D3 v4, D3-legend v2.25.6
  */
 
-createForcesGraph = function (containerSelect=".graph-container", with_websockets=true, debugging=false) {
+createForcesGraph = function (containerSelect=".graph-container", debugging=false, with_websockets=true) {
     // only settable in constructor
     const use_ws = with_websockets;
     const debug = debugging;
@@ -28,15 +28,21 @@ createForcesGraph = function (containerSelect=".graph-container", with_websocket
         links: [],
     };
     const targetElement = document.querySelector(containerSelect);
+    let initialMessage = targetElement.id;
     const width = targetElement.offsetWidth ? targetElement.offsetWidth : 800;
     const height = targetElement.offsetHeight ? targetElement.offsetHeight : width * 2/3;
 
-    const svg = d3.select(targetElement).append('svg')
-        .attr("width", width)
-        .attr("height", height)
-        .attr("xmlns", "http://www.w3.org/2000/svg")
-        .attr("xml:space", "preserve");
-
+    let svgElt = targetElement.querySelector('svg');
+    let svgPrime;
+    if (svgElt == null)
+        svgPrime = d3.select(targetElement).append('svg')
+            .attr("width", width)
+            .attr("height", height)
+            .attr("xmlns", "http://www.w3.org/2000/svg")
+            .attr("xml:space", "preserve");
+    else
+        svgPrime = d3.select(svgElt);
+    const svg = svgPrime;
     const g = svg.append("g");
 
     let nodeGroup = g.attr("class", "nodes")
@@ -46,7 +52,7 @@ createForcesGraph = function (containerSelect=".graph-container", with_websocket
     let linkGroup = g.attr("class", "links")
         .selectAll("line");
 
-    const color = d3.scaleOrdinal(d3.schemeCategory10);
+    const color = d3.scaleOrdinal(d3.schemeCategory20);
 
     const legend = svg.append("g")
         .attr("class", "legend")
@@ -88,11 +94,9 @@ createForcesGraph = function (containerSelect=".graph-container", with_websocket
 
         // construct dynamic graph legend
         const groupNames = group_ids == null ? 'abcdefghijklmnopqrst'.split('') : group_ids;
-        const max_grp_num = groupNames.length;
-        const groupArray = Array.from({length: max_grp_num}, (_, i) => i + 1);
         let ordinal = d3.scaleOrdinal()
-            .domain(groupArray)
-            .range(d3.schemeCategory20);  // TODO handle if max_grp_num larger than 20
+            .domain(groupNames)
+            .range(d3.schemeCategory10);  // TODO handle if max_grp_num larger than 20
 
         let setLegend = d3.legendColor()
             .title("Domains")
@@ -111,7 +115,9 @@ createForcesGraph = function (containerSelect=".graph-container", with_websocket
                 return Math.sqrt(d.value);
             })
             .style("stroke", function (d) {
-                return color(d.group);
+                if (d.group == 0)
+                    return "#777";
+                return ordinal(d.group);
             });
         link = linkEnter.merge(link);
         
@@ -140,7 +146,7 @@ createForcesGraph = function (containerSelect=".graph-container", with_websocket
             })*/
             .style("opacity", 1)
             .style("fill", function (d) {
-                return color(d.group);
+                return ordinal(d.group);
             })
             .call(d3.drag()
                   .on("start", dragstarted)
@@ -387,9 +393,11 @@ createForcesGraph = function (containerSelect=".graph-container", with_websocket
     }
 
     return ({
-        init: function (port=8000, duration=500) {
+        init: function (port=8000, duration=500, msg=null) {
             ws_port = port;
             max_msgs = duration;
+            if (msg != null)
+                initialMessage = msg;
 
             if (use_ws) {
                 ws_active = false;
@@ -400,7 +408,7 @@ createForcesGraph = function (containerSelect=".graph-container", with_websocket
                 ws.onopen = function () {
                     ws_active = true;
                     if (ws_init) {
-                        ws.send("");
+                        ws.send(initialMessage);
                         msg_num++;
                         ws_init = false;
                     }
@@ -408,6 +416,8 @@ createForcesGraph = function (containerSelect=".graph-container", with_websocket
                         console.log("WS opened");
                 }
                 ws.onclose = function () {
+                    ws_active = false;
+                    ws_init = false;
                     if (debug)
                         console.log("WS closed");
                 }
@@ -429,10 +439,10 @@ createForcesGraph = function (containerSelect=".graph-container", with_websocket
             });
         },
 
-        start: function (initMsg = "") {
+        start: function () {
             if (use_ws) {
                 if (ws_active) {
-                    ws.send(initMsg);
+                    ws.send(initialMessage);
                     msg_num++;
                     ws_init = false;
                 } else {
