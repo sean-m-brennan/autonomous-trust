@@ -728,7 +728,7 @@
     <div id="facet2" class="step" data-x="6000" data-y="0" data-z="0" data-rotate-y="-90">
         <div class="issue">Building blocks</div>
         <p style="margin-bottom: 2cm;"></p>
-        <div style="float:left;font-size:x-large;">
+        <div style="float:left;font-size:x-large;width:50%;padding:0;">
             <ul>
                 <li><strong>Scalability</strong></li>
                 <li>Domain language</li>
@@ -739,15 +739,16 @@
                 <li>Opportunity vs. security</li>
             </ul>
         </div>
-        <div style="float:right;">
-            image
-        </div>
+        <img class="zoomableByHeight" src="images/hierarchy.svg" alt="hierarchy" style="float:right;width:50%;padding:0;"/>
+        <span style="position:absolute;bottom:50px;right:80px;font-size:small;">
+            Three fully-connected cohorts in a simple hierarchy.
+        </span>
     </div>
 
     <div id="facet3" class="step" data-x="6000" data-y="1000" data-z="1000" data-rotate-y="-90">
         <div class="issue">Building blocks</div>
         <p style="margin-bottom: 2cm;"></p>
-        <div style="float:left;font-size:x-large;">
+        <div style="float:left;font-size:x-large;width:50%;padding:0;">
             <ul>
                 <li>Scalability</li>
                 <li><strong>Domain language</strong></li>
@@ -759,14 +760,14 @@
             </ul>
         </div>
         <div style="float:right;">
-            image
+            <img class="zoomable" src="images/language.svg" alt="language" style="float:right;width:50%;padding:0;"/>
         </div>
     </div>
 
     <div id="facet4" class="step" data-x="6000" data-y="2000" data-z="2000" data-rotate-y="-90">
         <div class="issue">Building blocks</div>
         <p style="margin-bottom: 2cm;"></p>
-        <div style="float:left;font-size:x-large;">
+        <div style="float:left;font-size:x-large;width:50%;padding:0;">
             <ul>
                 <li>Scalability</li>
                 <li>Domain language</li>
@@ -778,14 +779,14 @@
             </ul>
         </div>
         <div style="float:right;">
-            image
+            <img class="zoomable" src="images/goals.svg" alt="goals" style="float:right;width:50%;padding:0;"/>
         </div>
     </div>
 
     <div id="facet5" class="step" data-x="6000" data-y="3000" data-z="3000" data-rotate-y="-90">
         <div class="issue">Building blocks</div>
         <p style="margin-bottom: 2cm;"></p>
-        <div style="float:left;font-size:x-large;">
+        <div style="float:left;font-size:x-large;width:50%;padding:0;">
             <ul>
                 <li>Scalability</li>
                 <li>Domain language</li>
@@ -797,14 +798,17 @@
             </ul>
         </div>
         <div style="float:right;">
-            image
+            <img class="zoomableByWidth" src="images/identity.svg" alt="identity" style="width:50%;padding:0;position:absolute;right:30px;bottom:100px"/>
+            <span style="position:absolute;bottom:50px;right:80px;font-size:small;">
+                Four peers sharing immutable identity in a distributed ledger.
+            </span>
         </div>
     </div>
 
     <div id="facet6" class="step" data-x="6000" data-y="4000" data-z="4000" data-rotate-y="-90">
         <div class="issue">Building blocks</div>
         <p style="margin-bottom: 2cm;"></p>
-        <div style="float:left;font-size:x-large;">
+        <div style="float:left;font-size:x-large;width:50%;padding:0;">
             <ul>
                 <li>Scalability</li>
                 <li>Domain language</li>
@@ -815,15 +819,26 @@
                 <li>Opportunity vs. security</li>
             </ul>
         </div>
-        <div style="float:right;">
-            image
+        <div style="float:left;">
+            <img class="zoomableByWidth" src="images/reputation.svg" alt="reputation" style="width:40%;padding:0;position:absolute;right:70px;bottom:200px"/><br/>
+            <div style="float: left;font-size: large;position: absolute; bottom: 0px;">
+                <span style="float: left;text-indent: 2em;">When \(R_x^\prime \gt 0.5\):</span><br/>
+                <span style="float: left;text-indent: 6em;">\(R_x = \sum\limits_{i=1}^n \frac{S_x^i R_i^\prime}{n}\)</span><br/>
+                <span style="float: left;text-indent: 3em;">where \(R_i^\prime\) is the previous \(R_i\)</span><br/>
+                <span style="float: left;text-indent: 2em;">else:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span><br/>
+                <span style="float: left;text-indent: 6em;">\(R_x = R_x^{\prime\prime}\)</span><br/>
+                <span style="float: left;text-indent: 3em;">where \(R_x^{\prime\prime}\) is the TFT sum.</span><br/>
+            </div>
+            <span style="position:absolute;bottom:-40px;right:60px;font-size:small;">
+                Deriving weighted reputation scores from peer gossip via a ledger.
+            </span>
         </div>
     </div>
 
     <div id="facet7" class="step" data-x="6000" data-y="5000" data-z="5000" data-rotate-y="-90">
         <div class="issue">Building blocks</div><br/>
         <p style="margin-bottom: 2cm;"></p>
-        <div style="float:left;font-size:x-large;">
+        <div style="float:left;font-size:x-large;width:50%;padding:0;">
             <ul>
                 <li>Scalability</li>
                 <li>Domain language</li>
@@ -835,14 +850,15 @@
             </ul>
         </div>
         <div style="float:right;">
-            image
+            \(R^\prime\)<br/>
+            <img class="zoomable" src="images/bootstrap.svg" alt="bootstrap" style="float:right;width:50%;padding:0;"/>
         </div>
     </div>
 
     <div id="facet8" class="step" data-x="6000" data-y="6000" data-z="6000" data-rotate-y="-90">
         <div class="issue">Building blocks</div>
         <p style="margin-bottom: 2cm;"></p>
-        <div style="float:left;font-size:x-large;">
+        <div style="float:left;font-size:x-large;width:50%;padding:0;">
             <ul>
                 <li>Scalability</li>
                 <li>Domain language</li>
@@ -854,7 +870,7 @@
             </ul>
         </div>
         <div style="float:right;">
-            image
+            <img class="zoomable" src="images/priorities.svg" alt="priorities" style="float:right;width:50%;padding:0;"/>
         </div>
     </div>
 
@@ -863,10 +879,11 @@
     <div id="network1" class="step clearstep bare dark-mode" data-x=250 data-y=2000 data-rotate-x="-90" data-scale="10">
         <img src="images/opte_20221012.0800.png" alt="Internet map"
              style="width: 150%; margin-left: -220px; margin-right: 0; display: block;"/>
+        <div style="font-size: small; position: absolute; right: -150px; bottom: 180px;"> Map of the Internet 12-Oct-2022<br/> by Barrett Lyon / The Opte Project</div>
     </div>
 
     <!-- Deception -->
-    <div id="lies" class="step dark-mode sim" data-x="3000" data-y="0" data-z="3500" data-rotate-x="-90" data-scale="1">
+    <div id="lies" class="step clearstep dark-mode sim" data-x="3000" data-y="-1000" data-z="3500" data-rotate-x="-90" data-scale="1">
         <div style="color: white;">Deception</div>
         <div id="lies-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
     </div>
@@ -874,11 +891,12 @@
     <div id="network2" class="step clearstep bare dark-mode" data-x=250 data-y=2000 data-rotate-x="-90" data-scale="10">
         <img src="images/opte_20221012.0800.png" alt="Internet map"
              style="width: 150%; margin-left: -220px; margin-right: 0; display: block;"/>
+        <div style="font-size: small; position: absolute; right: -150px; bottom: 180px;"> Map of the Internet 12-Oct-2022<br/> by Barrett Lyon / The Opte Project</div>
     </div>
 
 
     <!-- Betrayal -->
-    <div id="frenemy" class="step dark-mode sim" data-x="1000" data-y="0" data-z="-1500" data-rotate-x="-90" data-scale="1">
+    <div id="frenemy" class="step clearstep dark-mode sim" data-x="1000" data-y="-2000" data-z="-1500" data-rotate-x="-90" data-scale="1">
         <div style="color: white;">Betrayal</div>
         <div id="frenemy-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
     </div>
@@ -886,11 +904,12 @@
     <div id="network3" class="step clearstep bare dark-mode" data-x=250 data-y=2000 data-rotate-x="-90" data-scale="10">
         <img src="images/opte_20221012.0800.png" alt="Internet map"
              style="width: 150%; margin-left: -220px; margin-right: 0; display: block;"/>
+        <div style="font-size: small; position: absolute; right: -150px; bottom: 180px;"> Map of the Internet 12-Oct-2022<br/> by Barrett Lyon / The Opte Project</div>
     </div>
 
 
     <!-- Reputation trashing -->
-    <div id="clique" class="step dark-mode sim" data-x="-1500" data-y="0" data-z="1500" data-rotate-x="-90" data-scale="1">
+    <div id="clique" class="step clearstep dark-mode sim" data-x="-1500" data-y="-3000" data-z="1500" data-rotate-x="-90" data-scale="1">
         <div style="color: white;">Reputation</div>
         <div id="clique-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
     </div>
@@ -898,11 +917,12 @@
     <div id="network4" class="step clearstep bare dark-mode" data-x=250 data-y=2000 data-rotate-x="-90" data-scale="10">
         <img src="images/opte_20221012.0800.png" alt="Internet map"
              style="width: 150%; margin-left: -220px; margin-right: 0; display: block;"/>
+        <div style="font-size: small; position: absolute; right: -150px; bottom: 180px;"> Map of the Internet 12-Oct-2022<br/> by Barrett Lyon / The Opte Project</div>
     </div>
 
 
     <!-- atomization (sybil) -->
-    <div id="sybil" class="step dark-mode sim" data-x="-2000" data-y="0" data-z="-2500" data-rotate-x="-90" data-scale="1">
+    <div id="sybil" class="step clearstep dark-mode sim" data-x="-2000" data-y="-4000" data-z="-2500" data-rotate-x="-90" data-scale="1">
         <div style="color: white;">Atomization</div>
         <div id="sybil-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
     </div>
@@ -910,11 +930,12 @@
     <div id="network5" class="step clearstep bare dark-mode" data-x=250 data-y=2000 data-rotate-x="-90" data-scale="10">
         <img src="images/opte_20221012.0800.png" alt="Internet map"
              style="width: 150%; margin-left: -220px; margin-right: 0; display: block;"/>
+        <div style="font-size: small; position: absolute; right: -150px; bottom: 180px;"> Map of the Internet 12-Oct-2022<br/> by Barrett Lyon / The Opte Project</div>
     </div>
 
 
     <!-- corrupt authority -->
-    <div id="captain" class="step dark-mode sim" data-x="2000" data-y="0" data-z="-3500" data-rotate-x="-90" data-scale="1">
+    <div id="captain" class="step clearstep dark-mode sim" data-x="2000" data-y="-5000" data-z="-3500" data-rotate-x="-90" data-scale="1">
         <div style="color: white;">Corrupt authority</div>
         <div id="captain-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
     </div>
@@ -929,14 +950,8 @@
 <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.1/jquery.min.js"></script>
 <script src="https://d3js.org/d3.v4.min.js" type="text/javascript" charset="utf-8"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3-legend/2.25.6/d3-legend.min.js"></script>
-
-<!-- <script type="text/x-mathjax-config">
-  MathJax.Hub.Config({
-    showProcessingMessages: false,
-    messageStyle: "none",
-    TeX : { extensions : ['color.js'] }
-  });
-</script> -->
+<script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+<script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 
 <script src="js/impress.js"></script>
 <script src="js/force.js"></script>
@@ -946,6 +961,8 @@
         impress().init();
         const graphPort = 8888;
         let forcesGraph = null;
+        let zoomedImage = null;
+        let imgOrigCss = null;
         const slideStartWithIn = function (name, array) {
             for (let i = 0; i < array.length; i++) {
                 if (name.startsWith(array[i]))
@@ -954,11 +971,10 @@
             return false;
         }
         window.addEventListener('impress:stepenter', function (event) {
-            console.log(event.target)
             if (event.target.className.includes("sim")) {
-                forcesGraph = createForcesGraph("#" + event.target.id + "-graph");
-                forcesGraph.init(graphPort, 400);
-                forcesGraph.start(event.target.id);
+                forcesGraph = createForcesGraph("#" + event.target.id + "-graph", true);
+                forcesGraph.init(graphPort, 400, event.target.id);
+                forcesGraph.start();
             }
             const whitePages = ["title", "step-", "access", "facet"]
             if (slideStartWithIn(event.target.id, whitePages)) {
@@ -968,9 +984,57 @@
             }
         });
         window.addEventListener('impress:stepleave', function (event) {
-            if (event.target.className.includes("sim"))
+            if (event.target.className.includes("sim")) {
                 if (forcesGraph != null)
                     forcesGraph.stop();
+            }
+        });
+        window.addEventListener('click', function (event) {
+            function zoom(byWidth) {
+                if (zoomedImage == null) {
+                    let imgOrig = event.target;
+                    let div = document.createElement("div");
+                    div.style.width = '100%';
+                    div.style.height = '100%';
+                    div.style.display = 'flex';
+                    div.style.alignItems = 'center';
+                    div.style.justifyContent = 'center';
+                    div.style.backgroundColor = '#fff';
+                    div.style.position = 'absolute';
+                    div.style.zIndex = '100';
+                    let imgCopy = event.target.cloneNode(true);
+                    let size = document.documentElement.clientHeight;
+                    if (byWidth) {
+                        imgCopy.style.width = '90%';
+                        //let ratio = imgOrig.clientHeight / imgOrig.clientWidth;
+                        //imgCopy.style.height = (size * ratio).toString() + 'px';
+                        //imgCopy.style.width = size.toString() + 'px';
+                    } else {
+                        let ratio = imgOrig.clientWidth / imgOrig.clientHeight;
+                        imgCopy.style.height = size.toString() + 'px';
+                        imgCopy.style.width = (size * ratio).toString() + 'px';
+                    }
+                    div.appendChild(imgCopy);
+                    document.body.appendChild(div)
+                    zoomedImage = div;
+                } else {
+                    document.body.removeChild(zoomedImage);
+                    zoomedImage = null;
+                    imgOrigCss = null;
+                }
+            }
+            if (event.target.className.includes("zoomableByWidth"))
+                zoom(true);
+            else if (event.target.className.includes("zoomableByHeight"))
+                zoom(false);
+        });
+        document.addEventListener('keypress', e => {
+            if (e.key === "x") {
+                if (zoomedImage != null)
+                    document.body.removeChild(zoomedImage);
+                zoomedImage = null;
+                imgOrigCss = null;
+            }
         });
     });
 </script>
