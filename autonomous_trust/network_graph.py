@@ -192,7 +192,7 @@ class NetworkGraph(object):
     def add_node(self):
         if self.change_type not in [None, self.PhaseChange.ADD]:
             self.__backlog.append((self.PhaseChange.ADD, 'add_node',))
-            return
+            return None
         node_num = self.max_node_id + 1
         self.change_type = self.PhaseChange.ADD
         self.G.add_node(node_num)
@@ -238,12 +238,8 @@ class NetworkGraph(object):
             exclude = []
         elif not isinstance(exclude, list):
             exclude = [exclude]
+        limit_to = list(set(limit_to) - set(exclude))
         idx = random.randint(0, len(limit_to)-1)
-        if idx in exclude:
-            if exclude == 0:
-                idx += 1
-            else:
-                idx -= 1
         return limit_to[idx]
 
     def _random_pair(self, limit_to=None):
@@ -266,25 +262,33 @@ class NetworkGraph(object):
     def link_removal_rejected(self, u, v):  # noqa
         return False
 
-    def random_change(self, an=5, ae=80, re=95):
+    def random_change(self, add_nodes=20, add_edges=80, remove_edges=95, persist=False, groups=True):
         r = random.randint(1, 100)
-        if r < an:
+        if r <= add_nodes:
             if not self.node_addition_rejected():
-                self.add_node()
-        elif an < r < ae:
-            edge = self._random_pair(limit_to=self.link_addition_limit())
-            while self.G.has_edge(*edge) and self.link_addition_rejected(*edge):
+                node_num = self.add_node()
+                self.G.nodes[node_num]["group"] = self.groupLabels[random.randint(0, len(self.groupLabels))-1]
+                self.G.nodes[node_num]["persist"] = persist
+        elif add_nodes < r <= add_edges:
+            if len(self.G) > 1:
+                # FIXME prefer nodes from the same group
+                edge = self._random_pair(limit_to=self.link_addition_limit())
+                while self.G.has_edge(*edge) and self.link_addition_rejected(*edge):
+                    edge = self._random_pair(limit_to=self.link_addition_limit())
+                self.add_edge(*edge)
+                self.propagate_node_grouping()
+                self.G[edge[0]][edge[1]]["weight"] = random.randint(1, self.maximum_weight)
+        elif add_edges < r <= remove_edges:
+            if len(self.G.edges) > 2:
                 edge = self._random_pair()
-            self.add_edge(*edge)
-        elif r > re:
-            node_num = self._random_node()
-            if not self.node_removal_rejected(node_num):
-                self.remove_node(node_num)
-        elif ae < r < re:
-            edge = self._random_pair()
-            while not self.G.has_edge(*edge) and self.link_removal_rejected(*edge):
-                edge = self._random_pair()
-            self.remove_edge(*edge)
+                while not self.G.has_edge(*edge) and self.link_removal_rejected(*edge):
+                    edge = self._random_pair()
+                self.remove_edge(*edge)
+        elif r > remove_edges:
+            if len(self.G) > 1:
+                node_num = self._random_node()
+                if not self.node_removal_rejected(node_num):
+                    self.remove_node(node_num)
 
     def node_metadata(self, nodeset):
         return set([tuple([n[k] for k in self.node_data if k in n.keys()]) for n in nodeset])
@@ -348,14 +352,21 @@ class NetworkGraph(object):
 
 class RandomNetwork(NetworkGraph):
     # randomized behavior
-    def __init__(self, size, **kwargs):
+    def __init__(self, size, persist=False, speed=50, **kwargs):
+        self.node_data.append('persist')
         m1 = size // 2
         super().__init__(nx.barbell_graph, m1, 0, **kwargs)
+        self.persist = persist
+        self.speed = speed
+        for n in self.G:
+            self.G.nodes[n]["persist"] = persist
 
     def change(self):
-        self.random_change()
-        self.grouping()
-        self.next_change = random.randint(500, 2000)
+        self.random_change(persist=self.persist, groups=True)
+        if self.speed is None:
+            self.next_change = random.randint(100, 500)
+        else:
+            self.next_change = self.speed
 
 
 Graphs.register_implementation('random', RandomNetwork, True)
