@@ -940,6 +940,18 @@
         <div id="captain-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
     </div>
 
+    <div id="network6" class="step clearstep bare dark-mode" data-x=250 data-y=2000 data-rotate-x="-90" data-scale="10">
+        <img src="images/opte_20221012.0800.png" alt="Internet map"
+             style="width: 150%; margin-left: -220px; margin-right: 0; display: block;"/>
+        <div style="font-size: small; position: absolute; right: -150px; bottom: 180px;"> Map of the Internet 12-Oct-2022<br/> by Barrett Lyon / The Opte Project</div>
+    </div>
+
+
+    <!-- closing -->
+    <div id="random" class="step clearstep sim" data-x="2000" data-y="-5000" data-z="-3500" data-rotate-y="-180" data-scale="1">
+        <div style="text-align: center;">Questions?</div><br/>
+        <div id="random-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
+    </div>
 
 </div> <!-- end presentation -->
 
@@ -973,10 +985,16 @@
         window.addEventListener('impress:stepenter', function (event) {
             if (event.target.className.includes("sim")) {
                 forcesGraph = createForcesGraph("#" + event.target.id + "-graph", true);
-                forcesGraph.init(graphPort, 400, 10, event.target.id);
+                let steps = 400;
+                let legend = true;
+                if (event.target.id === "random") {
+                    steps = 4000;
+                    legend = false;
+                }
+                forcesGraph.init(graphPort, steps, 10, event.target.id, legend);
                 forcesGraph.start();
             }
-            const whitePages = ["title", "step-", "access", "facet"]
+            const whitePages = ["title", "step-", "access", "facet", "random"]
             if (slideStartWithIn(event.target.id, whitePages)) {
                 document.body.style.backgroundColor = "white";
             } else {
