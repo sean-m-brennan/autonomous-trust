@@ -5,7 +5,7 @@ import argparse
 import asyncio
 import quart
 from .. import network_graph as ng
-from .. import social_graphs
+from .. import social_graphs  # noqa
 
 default_port = 8000
 initial_size = 12
@@ -28,7 +28,7 @@ if __name__ == '__main__':
 
     @app.route("/")
     async def page():
-        return await quart.render_template("index.html")
+        return await quart.render_template("index.html")  # noqa
 
 
     @app.websocket('/ws')
@@ -37,15 +37,18 @@ if __name__ == '__main__':
         while True:
             msg = await quart.websocket.receive()
             if graph is None:
-                for impl in ng.Graphs.Implementation:
+                for impl in ng.Graphs.Implementation:  # noqa
                     if msg == impl.value:
                         graph = ng.Graphs.get_graph(impl.value, args.size, args.debug)
                         print(' * Simulating %s network graph' % msg)
             if msg == 'done':
                 print(' * Simulation done')
                 break
-            seconds, data = graph.get_update()
-            await quart.websocket.send(data)
+            seconds, data, stop = graph.get_update()
+            if stop:
+                break
+            if data is not None:
+                await quart.websocket.send(data)
             await asyncio.sleep(seconds)
 
 

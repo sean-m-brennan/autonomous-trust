@@ -13,6 +13,7 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
     // optionally set in init()
     let max_msgs = 500;
     let ws_port = 8000;
+    let max_link_weight = 10;
 
     let msg_num = 0;
     let ws_active = false;
@@ -21,7 +22,7 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
     let group_ids = null;
 
     const node_metadata = ["group"];
-    const link_metadata = ["group", "value"];
+    const link_metadata = ["group", "weight"];
    
     let graph = {
         nodes: [],
@@ -52,19 +53,25 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
     let linkGroup = g.attr("class", "links")
         .selectAll("line");
 
-    const color = d3.scaleOrdinal(d3.schemeCategory20);
-
     const legend = svg.append("g")
         .attr("class", "legend")
         .attr("transform", "translate(20,20)scale(.5)");
 
+    const weightScale = d3.scaleLinear()
+        .domain([1, max_link_weight])
+        .range([.1, 1])
+
+    const linkFactor = 1000;
+
     const simulation = d3.forceSimulation()
         .force("x", d3.forceX(width / 2).strength(0.4))
         .force("y", d3.forceY(height / 2).strength(0.6))
-        .force("link", d3.forceLink().id(function (d) {
-            return d.id;
-        }))
-        .force("charge", d3.forceManyBody().strength(-1000))
+        .force("link", d3.forceLink()
+            .id(function (d) { return d.id; })
+            .distance(function (d) { return 2 * linkFactor * d.weight / max_link_weight; })
+            .strength (function (d) { return weightScale(d.weight); })
+        )
+        .force("charge", d3.forceManyBody().strength(-linkFactor))
         .force("collide", d3.forceCollide().radius(function (d) {
             return d.r * 10;
         }))
@@ -94,15 +101,20 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
 
         // construct dynamic graph legend
         const groupNames = group_ids == null ? 'abcdefghijklmnopqrst'.split('') : group_ids;
+        let scheme = d3.schemeCategory10;
+        if (groupNames.length > 10)
+            scheme = d3.schemeCategory20;
+        // TODO handle if groupNames.length larger than 20
         let ordinal = d3.scaleOrdinal()
             .domain(groupNames)
-            .range(d3.schemeCategory10);  // TODO handle if max_grp_num larger than 20
+            .range(scheme);
 
         let setLegend = d3.legendColor()
             .title("Domains")
             .shapePadding(10)
             .labels(groupNames)
-            .scale(ordinal);
+            .scale(ordinal)
+            .cellFilter(function (d) { return d.data.trim().length !== 0; });
         legend.call(setLegend);
 
         // Update links
@@ -112,10 +124,11 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
         let linkEnter = link
             .enter().append("line")
             .style("stroke-width", function (d) {
-                return Math.sqrt(d.value);
+                //return Math.sqrt(d.weight);
+                return d.weight / 2.0;
             })
             .style("stroke", function (d) {
-                if (d.group == 0)
+                if (d.group === 0)
                     return "#777";
                 return ordinal(d.group);
             });
@@ -125,13 +138,27 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
         link.exit().remove();
 
         let node2neighbors = {};
-        for (let i =0; i < graph.nodes.length; i++){
-            let name = graph.nodes[i].name;
-            node2neighbors[name] = graph.links.filter(function(d){
-                return d.source.name === name || d.target.name === name;
-            }).map(function(d){
-                return d.source.name === name ? d.target.name : d.source.name;
-            });
+        for (let i =0; i < graph.nodes.length; i++) {
+            let id = graph.nodes[i].id;
+            node2neighbors[id] = graph.links
+                .filter(function(d){
+                    let src = d.source;
+                    if (src.hasOwnProperty("id"))
+                        src = src.id;
+                    let tgt = d.target;
+                    if (tgt.hasOwnProperty("id"))
+                        tgt = tgt.id;
+                    return src === id || tgt === id;
+                })
+                .map(function(d){
+                    let src = d.source;
+                    if (src.hasOwnProperty("id"))
+                        src = src.id;
+                    let tgt = d.target;
+                    if (tgt.hasOwnProperty("id"))
+                        tgt = tgt.id;
+                    return src === id ? tgt : src;
+                });
         }
 
         // Update the nodes
@@ -141,17 +168,19 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
         let nodeEnter = node
             .enter().append("circle")
             .attr("r", 5)
-            /*.style("opacity", function (d) {
-                return node2neighbors[d.name].length > 0 ? 1 : 0;  // FIXME not working
-            })*/
-            .style("opacity", 1)
+            .style("opacity", function (d) {
+                if (!d.hasOwnProperty("persist") || !d.persist)
+                    return node2neighbors[d.id].length > 0 ? 1 : 0;
+            })
             .style("fill", function (d) {
                 return ordinal(d.group);
             })
+            .style("stroke", "white")
+            .attr("stroke-width", "1")
             .call(d3.drag()
-                  .on("start", dragstarted)
+                  .on("start", drag_started)
                   .on("drag", dragged)
-                  .on("end", dragended));
+                  .on("end", drag_ended));
         
         nodeEnter.append("title")
             .text(function (d) {
@@ -218,7 +247,7 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
         }
     }
     
-    function dragstarted(d) {
+    function drag_started(d) {
         if (!d3.event.active) reset(0.5);
         d.fx = d.x;
         d.fy = d.y;
@@ -229,7 +258,7 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
         d.fy = d3.event.y;
     }
     
-    function dragended(d) {
+    function drag_ended(d) {
         if (!d3.event.active) simulation.alphaTarget(0);
         d.fx = null;
         d.fy = null;
@@ -337,6 +366,8 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
     }
     
     function process_msg(graph_in) {
+        if (debug)
+            console.log(graph_in)
         let num_nodes = graph_in.nodes.length.toString();
         let num_links = graph_in.links.length.toString();
         if ("type" in graph_in && graph_in.type === "add") {
@@ -362,7 +393,7 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
                 change_nodes(graph_in.nodes);
             if (graph_in.links.length > 0)
                 change_links(graph_in.links);
-        } else {
+        } else if ("type" in graph_in && graph_in.type === "new") {
             if (debug)
                 console.log("full graph")
             group_ids = graph_in.groups
@@ -393,9 +424,10 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
     }
 
     return ({
-        init: function (port=8000, duration=500, msg=null) {
+        init: function (port=8000, duration=500, max_weight=10, msg=null) {
             ws_port = port;
             max_msgs = duration;
+            max_link_weight = max_weight;
             if (msg != null)
                 initialMessage = msg;
 
