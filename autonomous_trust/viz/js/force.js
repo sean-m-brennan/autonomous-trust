@@ -14,6 +14,7 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
     let max_msgs = 500;
     let ws_port = 8000;
     let max_link_weight = 10;
+    let with_legend = true;
 
     let msg_num = 0;
     let ws_active = false;
@@ -115,7 +116,8 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
             .labels(groupNames)
             .scale(ordinal)
             .cellFilter(function (d) { return d.data.trim().length !== 0; });
-        legend.call(setLegend);
+        if (with_legend)
+            legend.call(setLegend);
 
         // Update links
         let link = linkGroup.data(graph.links);
@@ -424,12 +426,13 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
     }
 
     return ({
-        init: function (port=8000, duration=500, max_weight=10, msg=null) {
+        init: function (port=8000, duration=500, max_weight=10, msg=null, legend=true) {
             ws_port = port;
             max_msgs = duration;
             max_link_weight = max_weight;
             if (msg != null)
                 initialMessage = msg;
+            with_legend = legend;
 
             if (use_ws) {
                 ws_active = false;

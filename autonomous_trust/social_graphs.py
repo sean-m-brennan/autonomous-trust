@@ -34,7 +34,6 @@ class DeceitNetwork(ng.NetworkGraph):
             self.next_change = 3000
         else:
             self.next_change = random.randint(500, 2000)
-        self.grouping()
         self.iteration += 1
 
     def grouping(self):  # noqa
@@ -82,7 +81,6 @@ class BetrayalNetwork(ng.NetworkGraph):
 
     def change(self):
         self.next_change = random.randint(500, 2000)
-        self.grouping()
         self.iteration += 1
 
     def grouping(self):  # noqa
@@ -144,7 +142,6 @@ class ReputationManipulationNetwork(ng.NetworkGraph):
             self.G[current[0]][current[1]]["weight"] = 1
             self.next_change = 3000
         self.next_change = random.randint(500, 2000)
-        self.grouping()
         self.iteration += 1
 
     def grouping(self):  # noqa
@@ -218,7 +215,6 @@ class SybilNetwork(ng.NetworkGraph):
             self.next_change = 3000
         else:
             self.next_change = random.randint(500, 2000)
-        self.grouping()
         self.iteration += 1
 
     def grouping(self):  # noqa
@@ -311,17 +307,14 @@ class CorruptAuthorityNetwork(ng.NetworkGraph):
             self.next_change = 3000
         else:
             self.next_change = random.randint(500, 2000)
-        self.grouping()
         self.iteration += 1
 
     def grouping(self):  # noqa
         if not super().grouping():
             return
-        problems = []
         for u, v, a in self.G.edges(data=True):
             if (u in self.levels[0] or v in self.levels[0]) and \
                     (u == self.problem or v == self.problem):
-                problems.append((u, v))
                 if self.iteration < 15:
                     a["weight"] = self.maximum_weight
                 else:
@@ -329,6 +322,7 @@ class CorruptAuthorityNetwork(ng.NetworkGraph):
                         a["weight"] -= 1
             else:
                 a["weight"] = random.randint(1, self.maximum_weight)
+        # FIXME spurious edge
 
 
 ng.Graphs.register_implementation('captain', CorruptAuthorityNetwork)
