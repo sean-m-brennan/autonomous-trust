@@ -973,7 +973,7 @@
         window.addEventListener('impress:stepenter', function (event) {
             if (event.target.className.includes("sim")) {
                 forcesGraph = createForcesGraph("#" + event.target.id + "-graph", true);
-                forcesGraph.init(graphPort, 400, event.target.id);
+                forcesGraph.init(graphPort, 400, 10, event.target.id);
                 forcesGraph.start();
             }
             const whitePages = ["title", "step-", "access", "facet"]
