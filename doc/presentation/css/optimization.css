@@ -10,17 +10,14 @@
     opacity: 0;
     display: block;
 }
-#ds1, #ds2, #dd1, #dd2, #p8, #p9 {
+#p8, #p9 {
     opacity: 0;
     display: block;
 }
-
-.hide {
+#ds1, #ds2, #dd1, #dd2 {
     opacity: 0;
-    transition: opacity 0.6s linear;;
+    display: block;
 }
-
-.show {
-    opacity: 1;
-    transition: opacity 0.6s linear;;
+#ds1 g ellipse {
+    stroke: #A52A2a;
 }
