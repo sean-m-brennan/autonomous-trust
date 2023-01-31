@@ -1,0 +1,26 @@
+#n1, #n2, #n3, #n4, #n5, #n6, #n7, #n8, #n9 {
+    opacity: 1;
+    display: block;
+}
+#s1, #s2, #s3, #s4, #s5, #s6, #s7, #s8, #s9 {
+    opacity: 0;
+    display: block;
+}
+#u1, #u2, #u3, #u4, #u5, #u6, #u7, #u8, #u9 {
+    opacity: 0;
+    display: block;
+}
+#ds1, #ds2, #dd1, #dd2, #p8, #p9 {
+    opacity: 0;
+    display: block;
+}
+
+.hide {
+    opacity: 0;
+    transition: opacity 0.6s linear;;
+}
+
+.show {
+    opacity: 1;
+    transition: opacity 0.6s linear;;
+}
