@@ -1,0 +1,12 @@
+#h1, #h2, #h3, #h4, #h5, #h6, #h7, #h8, #h9 {
+    opacity: 1;
+    display: block;
+}
+#s1, #s2, #s3, #s4, #s5 {
+    opacity: 0;
+    display: block;
+}
+#p5, #p6, #p7, #p8, #p9 {
+    opacity: 0;
+    display: block;
+}
