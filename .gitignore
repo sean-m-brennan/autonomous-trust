@@ -1,13 +1,25 @@
+### Intellij ###
+idea/**/workspace.xml
+.idea/**/tasks.xml
+.idea/**/usage.statistics.xml
+.idea/**/dictionaries
+.idea/**/shelf
+
 __pycache__
-doc/*/*.aux
-doc/*/*.bbl
-doc/*/*.bcf
-doc/*/*.blg
-doc/*/*.dep
-doc/*/*.log
-doc/*/*.run.xml
-doc/*/*.synctex.gz
+
+### Latex ###
+doc/**/*.aux
+doc/**/*.bbl
+doc/**/*.bcf
+doc/**/*.blg
+doc/**/*.dep
+doc/**/*.log
+doc/**/*.run.xml
+doc/**/*.synctex.gz
+
 doc/whitepaper/research
+
+## Generated images
 doc/presentation/images/*.shape
 doc/presentation/images/network.png
 doc/presentation/images/identity.svg
