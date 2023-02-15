@@ -101,34 +101,52 @@ let society_animate = function (container, loops, faces, initial, extras=[]) {
     }
 
     const prioritization_step = async function (loop, state) {
-        await sleep(to_ms(2));
-        for (let idx = 8; idx > 3; idx--) {
-            swap(idx, state[idx], 'p');
-            state[idx] = 'p';
-            await sleep(to_ms(1));
+        // init at reputation
+        for (let idx = 0; idx < 5; idx++) {
+            swap(idx, 's', 'h', 0.5)
+            state[idx] = 'h'
         }
-        await sleep(to_ms(1));
         for (let idx = 4; idx < 9; idx++) {
-            swap(idx, state[idx], 'h');
-            state[idx] = 'h';
-            if (idx < 8)
-                await sleep(to_ms(1));
+            swap(idx, 'p', 'h', 0.5)
+            state[idx] = 'h'
         }
+        await sleep(to_ms(2));
+        // phase in stealth
         for (let idx = 0; idx < 5; idx++) {
             swap(idx, state[idx], 's');
             state[idx] = 's';
             await sleep(to_ms(1));
         }
         await sleep(to_ms(1));
+        // phase out stealth
+        for (let idx = 4; idx >= 0; idx--) {
+            swap(idx, state[idx], 'h');
+            state[idx] = 'h';
+            if (idx < 8)
+                await sleep(to_ms(1));
+        }
+        // phase in enforce
+        for (let idx = 8; idx > 3; idx--) {
+            swap(idx, state[idx], 'p');
+            state[idx] = 'p';
+            await sleep(to_ms(1));
+        }
+        await sleep(to_ms(1));
+        // phase out enforce
+        for (let idx = 4; idx < 9; idx++) {
+            swap(idx, state[idx], 'h');
+            state[idx] = 'h';
+            await sleep(to_ms(1));
+        }
+        await sleep(to_ms(1));
+        // final balance
         swap(8, state[8], 'p', 2);
         state[8] = 'p';
         swap(5, state[5], 'p', 2);
         state[5] = 'p';
-        for (let idx = 4; idx > 0; idx--) {
-            swap(idx, state[idx], 'h');
-            await sleep(to_ms(0.75));
-        }
-        await sleep(to_ms(4));
+        swap(0, state[0], 's', 2);
+        state[0] = 's';
+        await sleep(to_ms(5));
     }
 
     return ({
