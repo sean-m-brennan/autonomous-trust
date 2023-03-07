@@ -103,11 +103,11 @@ let society_animate = function (container, loops, faces, initial, extras=[]) {
     const prioritization_step = async function (loop, state) {
         // init at reputation
         for (let idx = 0; idx < 5; idx++) {
-            swap(idx, 's', 'h', 0.5)
+            swap(idx, 's', 'h', 0.01)
             state[idx] = 'h'
         }
         for (let idx = 4; idx < 9; idx++) {
-            swap(idx, 'p', 'h', 0.5)
+            swap(idx, 'p', 'h', 0.01)
             state[idx] = 'h'
         }
         await sleep(to_ms(2));
@@ -163,7 +163,7 @@ let society_animate = function (container, loops, faces, initial, extras=[]) {
                     cur_elt.style.transition = "opacity 0.1s linear";
                     cur_elt.style.opacity = "0";
                 }
-                if (l === 0)
+                if (l === 0 && step === "optimization")
                     await sleep(to_ms(2));
 
                 if (step === "optimization")
