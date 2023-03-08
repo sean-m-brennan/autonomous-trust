@@ -28,18 +28,18 @@ We are now departing from normal computing workflow: log in, run commands, or cl
 For the moment, think beyond shell access or website interfaces 
 and more along the lines of APIs, queries and services.
 
-This is primarily a machine-to-machine paradigm, where the user makes the big decisions, then processes or agents (I'll use them interchangeably) do the grunt work on the user's behalf.
+AutonomousTrust is primarily a machine-to-machine paradigm, where the user makes the big decisions, then processes or agents (I'll use them interchangeably) do the grunt work on the user's behalf.
 
 As we proceed, I'm going to use scenarios from Internet of Things (IoT from now on), because that paradigm is predominantly machine-to-machine. As such, device == agent == node.
 
 But I want to stress that this is not an IoT-centric concept, and in fact we foresee it's strongest utility in workflows tying edge computing with cloud computing and everything in-between. 
 
 ---------- 6
-Let's look at our basic levels of trust and how that directly corresponds to access.
+Next we look at our basic levels of trust and how that directly corresponds to access.
 
 This level is primarily a census of presence in the network. The device participates in, for example, something like ARP, but that's about it.
 
-let's setup our IoT example. It consists of: first, sensory nodes that can deliver live in-situ data; second, coordination nodes that can request different data exposures; and third, inference nodes that can make sense of all the input.
+Let's setup our IoT example. It consists of: first, sensory nodes that can deliver live in-situ data; second, coordination nodes that can request different data exposures; and third, inference nodes that can make sense of all the input.
 
 One thing to keep in mind is that this trust graphic is just a one-to-one slice of a many-to-many matrix. 
 
@@ -59,7 +59,7 @@ Data can now be shared. This is the strongest level of trust, but can also have 
 IoT sensors come online: i.e. if coordination nodes reach this level of trust, they can request specific data. 
 
 ---------- 13
-However, at any time, violation of expectations can cause a drop in reputation, and an immediate loss of access. 
+However, at any time, a violation of expectations can cause a drop in reputation, and an immediate loss of access. 
 
 ---------- 14
 (Here, for instance, a sensor is reporting verifiably out-of-bounds readings - so it is ignored as faulty.)
@@ -101,7 +101,7 @@ This means we must bootstrap reputations first to even have a remembered reputat
 
 ---------- 23
 Bootstrapping reputations: 
-Contrite Tit-for-Tat is an eye-for-an-eye strategy for interaction in the absence of reputation data. In game theory terms, if you defect on me, I defect on you. 'Contrite' means that there is room for forgiveness in case of a mistake. Our graphic indicates that when new peers arrive, some nodes go into tit-for-tat mode to both give the newbies a chance to build reputation, or to protect the rest of the cohort from attack. Attackers are starved out because they cannot gain positive reputation, while trustworthy new nodes are bootstrapped into the populace. 
+Contrite Tit-for-Tat is an eye-for-an-eye strategy for interaction in the absence of reputation data. In game theory terms, if you defect on me, I defect on you. 'Contrite' means that there is room for forgiveness in case of a mistake. Our graphic indicates that when new peers arrive, some nodes go into tit-for-tat mode to both give the newbies a chance to build reputation, or to protect the rest of the cohort from attack. Attackers are starved out because they cannot gain positive reputation, while well-behaved new nodes are bootstrapped into the populace. 
 
 ---------- 24
 Opportunity vs safety:
@@ -111,7 +111,7 @@ Another protective measure is to go dark and intentionally be unreachable. This 
 This is a snapshot of the Internet, color-coded by geography. Note the scale-free topology which we anticipate to also be a feature of AutonomousTrust.
 
 Our greatest security vulnerability lies in our prerequisite blockchains, and hardening these will be an ongoing challenge.
-Some traditional attacks, such as man-in-the-middle, denial-of-service, direct access, or social engineering or spoofing are either inapplicable or trivially neutralized under AutonomousTrust.
+Some traditional attacks, such as man-in-the-middle, denial-of-service, or spoofing are either inapplicable or trivially neutralized under AutonomousTrust.
 
 We will now look at some *other* possible attack vectors under this paradigm, and how they may be overcome.
 
@@ -125,7 +125,7 @@ In this one, we have a defector that targets just one other node. Trust erodes h
 
 ---------- 30
 Bad reputation:
-This is a coordinated reputation attack by a subset of the cohort. The target is able to bypass this by making contacts with another connected cohort. One thing to note here is that connections can be costly, so all-to-all networks are not likely.
+This is a coordinated reputation attack by a subset of the cohort. The target is able to bypass this by making contacts with another connected cohort. One thing to note here is that connections can be costly, so all-to-all networks, although useful for this scenario, are not likely.
 
 ---------- 32
 Atomization:
