@@ -367,6 +367,35 @@ ol, ul {
     font-size: 32px;
 }
 
+.notes-shown {
+    display: inline;
+    font-size: medium;
+    height: 2.5em;
+    line-height: 1.2em;
+    overflow: hidden;
+    position: absolute;
+    right: -10px; bottom: 65px;
+    width: 100%;
+}
+
+.notes-shown > span {
+    position: absolute;
+    top: 0;
+    animation: captionScroll 20s 1.5s infinite;
+    animation-name: captionScroll;
+    animation-timing-function: linear;
+    animation-delay: 1.5s;
+}
+
+@keyframes captionScroll {
+    from {
+        transform: translateY(0);
+    }
+    to {
+        transform: translateY(-100%);
+    }
+}
+
 /*
     Second step is nothing special, just a text with a link, so it doesn't need
     any special styling.

@@ -59,6 +59,12 @@
             <div style="clear:both;"></div>
             <div style="float:left;">Huntsville, AL 35805, USA</div>
         </div>
+        <div class="notes" style="bottom: 180px">
+            <span>
+            AutonomousTrust - TekFive's concept for cooperative cybersecurity. <br/>
+            Before explaining what AutonomousTrust is, we'll start with some familiar ground:
+            </span>
+        </div>
     </div>  <!-- end slide -->
 
     <div class="step slide bare" data-x="-500" data-y="-2000">
@@ -82,14 +88,22 @@
             <div style="float:right;">AutonomousTrust</div>
         </div>
         <div class="notes">
-            <ul>
-                <li>Familiar in the IT field, common best-practices which we should have been doing all along</li>
-                <li>By <a href="https://www.whitehouse.gov/briefing-room/presidential-actions/2021/05/12/executive-order-on-improving-the-nations-cybersecurity/">executive order</a></li>
-                <li>Taken to its logical conclusion, this means constant user/device/resource revalidation</li>
-                <li>The executive order is even explicit: "constantly limits access"</li>
-                <li>In practice, it falls short and to the extent it falls short, allows breaches</li>
-                <li>Emphasis on the Cloud - so yesterday. Increasingly seeing computing at the edge; decentralization.</li>
-            </ul>
+            <span>
+            *Zero* Trust is a codification of common security best-practices <br/>
+            which we (hopefully) have been doing all along: <br/>
+            verifying user identity, device compliance, least privilege, and explicit resource allocation. <br/>
+            None of this is new. <br/>
+            <br/>
+            ZTA is now a big deal due to a 2021 executive order. <br/>
+            But taken to its logical conclusion, this means constant user/device/resource revalidation. <br/>
+            The executive order itself is even explicit: "constantly limits access". <br/>
+            <br/>
+            In practice, we necessarily fall short and to the extent we fall short, allow breaches. <br/>
+            Often the user session is not monitored once authorized. <br/>
+            <br/>
+            Also the emphasis is on the Cloud, where this is most easily implemented. <br/>
+            But we are increasingly seeing computing at the edge; decentralization.
+            </span>
         </div>
     </div>
 
@@ -113,11 +127,17 @@
             <div style="float:right;">AutonomousTrust</div>
         </div>
         <div class="notes">
-            <ul>
-                <li>Can be useful in coherent (i.e. well-patterned, unchanging) security environment</li>
-                <li>Problems with both false positives and false negatives</li>
-                <li>Blind spots due to centralization</li>
-            </ul>
+            <span>
+            One option to improve this situtation is IDS (or sometimes IPS [prevention instead of detection]). <br/>
+            This is usually achieved through detecting either <br/>
+            suspicious patterns (looks improper) <br/>
+            or anomalies (doesn't look proper). <br/>
+            This can be useful in coherent (i.e. well-patterned, unchanging) security environments (again the Cloud). <br/>
+            <br/>
+            The former approach (patterning) suffers most in resolving false positives due to inherent rigidity, <br/>
+            while the latter in resolving false negatives due to watching only local behavior. <br/>
+            These blind spots are primarily due to centralization.
+            </span>
         </div>
     </div>
 
@@ -140,11 +160,14 @@
             <div style="float:right;">AutonomousTrust</div>
         </div>
         <div class="notes">
+            <span>
+            In contrast, AutonomousTrust has <br/>
             <ul>
-                <li>Access levels that change over very short times</li>
-                <li>Task-specific, fine-grained responses - not all or nothing (i.e. nothing)</li>
-                <li>Machine-governed, no human input</li>
+                <li>dynamic access levels that change over very short times</li>
+                <li>task-specific, fine-grained responses - not all or nothing (i.e. nothing)</li>
+                <li>is machine-governed, no human input</li>
             </ul>
+            </span>
         </div>
     </div>
 
@@ -168,30 +191,23 @@
             <div style="float:right;">AutonomousTrust</div>
         </div>
         <div class="notes">
-            We are departing from normal computing workflow:
-              log in, run commands, or click, click, click, timeout/logoff.
+            <span>
+            We are departing from normal computing workflow: <br/>
+            log in, run commands, or click, click, click, timeout/logoff. <br/>
             <br/>
-            For the moment, think beyond:
-            <ul>
-                <li>shell access</li>
-                <li>website interfaces</li>
-                <li></li>
-            </ul>
-            and more along the lines of:
-            <ul>
-                <li>APIs</li>
-                <li>queries</li>
-                <li>services</li>
-            </ul>
+            For the moment, think beyond shell access and website interfaces <br/>
+            and more along the lines of APIs, queries and services. <br/>
             <br/>
-            This is primarily a machine-to-machine paradigm, where the user makes the big decisions,
-            then processes or agents (I'll use them interchangeably) do the grunt work on the user's behalf.
+            AutonomousTrust is primarily a machine-to-machine paradigm, where the user makes the big decisions, <br/>
+            then processes or agents (I'll use them interchangeably) do the grunt work on the user's behalf. <br/>
             <br/>
-            As we proceed, I'm going to use scenarios from Internet of Things (IoT from now on),
-            because that paradigm is predominantly machine-to-machine. As such, device == agent == node.
+            As we proceed, I'm going to use scenarios from Internet of Things (IoT from now on), <br/>
+            because that paradigm is predominantly machine-to-machine. As such, device == agent == node. <br/>
             <br/>
-            But I want to stress that this is not an IoT-centric concept, and in fact we foresee it's strongest utility
-            in workflows tying edge computing with cloud computing and everything in-between.
+            But I want to stress that this is not an IoT-centric concept, <br/>
+            and in fact we foresee it's strongest utility in workflows <br/>
+            tying edge computing with cloud computing and everything in-between.
+            </span>
         </div>
     </div>
 
@@ -244,17 +260,20 @@
                 </td>
             </tr>
         </table>
-        <div class="notes">
-            Let's look at the basic levels of trust and how that directly corresponds to access.
+        <div class="notes" style="bottom: 20px">
+            <span>
+            Next we look at the basic levels of trust and how that directly corresponds to access. <br/>
             <br/>
-            This level is primarily a census of presence in the network.
-            The device participates in, for example, ARP, but that's about it.
+            This level is primarily a census of presence in the network. <br/>
+            The device participates in, for example, something like ARP, but that's about it. <br/>
             <br/>
-            Our IoT example consists of: first, sensory nodes that can deliver live in-situ data,
-            second, coordination nodes that can request different data exposures,
-            and third, inference nodes that can make sense of all the input.
+            Let's setup our IoT example. It consists of: <br/>
+            first, sensory nodes that can deliver live in-situ data, <br/>
+            second, coordination nodes that can request different data exposures, <br/>
+            and third, inference nodes that can make sense of all the input. <br/>
             <br/>
             One thing to keep in mind is that this trust graphic is just a one-to-one slice of a many-to-many matrix.
+            </span>
         </div>
     </div>
 
@@ -305,8 +324,6 @@
                 </td>
             </tr>
         </table>
-        <div class="notes">
-        </div>
     </div>
 
     <div id="access3" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
@@ -356,10 +373,12 @@
                 </td>
             </tr>
         </table>
-        <div class="notes">
-            Messaging can occur, but no tasking.
+        <div class="notes" style="bottom: 20px">
+            <span>
+            Messaging can occur, but no tasking. <br/>
             <br/>
             In our example, roles can be established now, but nothing more.
+            </span>
         </div>
     </div>
 
@@ -412,9 +431,6 @@
                 </td>
             </tr>
         </table>
-        <div class="notes">
-
-        </div>
     </div>
 
     <div id="access5" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
@@ -466,11 +482,14 @@
                 </td>
             </tr>
         </table>
-        <div class="notes">
-            Compute services can be requested, effectively sharing CPU resources.
-            Note that finer divisions of access (i.e. which services) can be present at this level.
+        <div class="notes" style="bottom: 20px">
+            <span>
+            Compute services can be requested, effectively sharing CPU resources. <br/>
+            Note that finer divisions of access (i.e. which services) can be present at this level. <br/>
             <br/>
-            In our IoT scenario, coordination and inference are fully online.
+            In our IoT scenario, coordination and inference nodes <br/>
+            that have reached this level of trust are fully online.
+            </span>
         </div>
     </div>
 
@@ -524,9 +543,6 @@
                 </td>
             </tr>
         </table>
-        <div class="notes">
-
-        </div>
     </div>
 
     <div id="access7" class="step clearstep" data-x="4000" data-y="-4000" data-rotate-z="-90">
@@ -579,11 +595,14 @@
                 </td>
             </tr>
         </table>
-        <div class="notes">
-            Data can now be shared.
-            This is the strongest level of trust, but can also have multiple sub-levels of access within it.
+        <div class="notes" style="bottom: 20px">
+            <span>
+            Data can now be shared. <br/>
+            This is the strongest level of trust, but can also have multiple sub-levels of access within it. <br/>
             <br/>
-            IoT sensors come online: i.e. if coordination nodes reach this level of trust, they can request specific data.
+            IoT sensors come online: <br/>
+            i.e. if coordination nodes reach this level of trust, they can request specific data.
+            </span>
         </div>
     </div>
 
@@ -637,9 +656,11 @@
                 </td>
             </tr>
         </table>
-        <div class="notes">
-            However, at any time, violation of expectations can cause a drop in reputation,
+        <div class="notes" style="bottom: 20px">
+            <span>
+            However, at any time, violation of expectations can cause a drop in reputation, <br/>
             and an immediate loss of access.
+            </span>
         </div>
     </div>
 
@@ -693,8 +714,11 @@
                 </td>
             </tr>
         </table>
-        <div class="notes">
-            Here a sensor is reporting verifiably out-of-bounds readings - so it is ignored as faulty.
+        <div class="notes" style="bottom: 20px">
+            <span>
+            (Here, for instance, a sensor is reporting verifiably out-of-bounds readings - <br/>
+            so it is ignored as faulty.)
+            </span>
         </div>
     </div>
 
@@ -748,9 +772,11 @@
                 </td>
             </tr>
         </table>
-        <div class="notes">
-            And even the inability to re-establish contact.
+        <div class="notes" style="bottom: 20px">
+            <span>
+            And a reputation drop can even result in the inability to re-establish contact. <br/>
             Such as a coordination node that is draining sensor resources.
+            </span>
         </div>
     </div>
 
@@ -804,8 +830,10 @@
                 </td>
             </tr>
         </table>
-        <div class="notes">
+        <div class="notes" style="bottom: 20px">
+            <span>
             At this level, link-layer mechanisms hide a device from an offending peer.
+            </span>
         </div>
     </div>
 
@@ -825,8 +853,11 @@
                 <li>Opportunity vs. security</li>
             </ul>
         </div>
-        <div class="notes">
-            Seven facets that define how AutonomousTrust works.
+        <div class="notes" style="bottom: -60px">
+            <span>
+            How does this work? <br/>
+            We'll look at seven facets that define how AutonomousTrust does this.
+            </span>
         </div>
     </div>
 
@@ -848,10 +879,14 @@
         <span style="text-align:center;position:absolute;bottom:50px;right:80px;font-size:small;">
             Three fully-connected cohorts in a simple hierarchy.
         </span>
-        <div class="notes">
-            Peer-to-peer with hierarchical connections. Agents further up the hierarchy have greater capabilities:
-            bandwidth, computing, and/or data storage.
-            Corresponding here to sensors, coordination, and inference.
+        <div class="notes" style="bottom: -60px">
+            <span>
+            Network scalability: peer-to-peer with hierarchical connections. <br/>
+            Agents further up the hierarchy have greater capabilities: <br/>
+            bandwidth, computing, and/or data storage. <br/>
+            <br/>
+            Corresponding here to sensors (1) in blue, coordination (2) in orange, and inference (3) in green.
+            </span>
         </div>
     </div>
 
@@ -875,10 +910,14 @@
                 Library of XML schemas for coordinating among numerous domains.
             </span>
         </div>
-        <div class="notes">
-            For example, sensors use a modality-specific XML schema for reporting readings;
-            coordination primarily uses negotiation protocols to elicit additional data;
+        <div class="notes" style="bottom: -60px">
+            <span>
+            Common domain language embodied as XML schemas. <br/>
+            <br/>
+            For example, sensors use a modality-specific XML schema for reporting readings; <br/>
+            coordination primarily uses negotiation protocols to elicit additional data; <br/>
             inference uses a schema that speaks of higher-level phenomena.
+            </span>
         </div>
     </div>
 
@@ -902,9 +941,13 @@
                 Negotiation protocol for establishing shared goals <br/> among a temporary cooperation cohort.
             </span>
         </div>
-        <div class="notes">
-            Sensors, coordination and inference all need to cooperate yet maintain self-preservation.
+        <div class="notes" style="bottom: -60px">
+            <span>
+            Accomplishing shared goals through cooperation protocols. <br/>
+            <br/>
+            Sensors, coordination and inference all need to cooperate yet maintain self-preservation. <br/>
             This is accomplished primarily through negotiation.
+            </span>
         </div>
     </div>
 
@@ -928,8 +971,11 @@
                 Four peers sharing immutable identity in a distributed ledger.
             </span>
         </div>
-        <div class="notes">
+        <div class="notes" style="bottom: -60px">
+            <span>
+            Consistent identity through a distributed ledger. <br/>
             Trust and cooperation is just not possible if identities can be spoofed.
+            </span>
         </div>
     </div>
 
@@ -961,13 +1007,19 @@
                 Deriving weighted reputation scores from peer gossip via a ledger.
             </span>
         </div>
-        <div class="notes">
-            In the nominal case, trust is based on reputation.
-            To arrive at a reputation level (zero to one) for a target peer, we sum transaction scores as reported from other peers,
-            weighted by our remembered reputation level for each of those other peers.
-            A reputation of 0.5 is the threshold for this mode of interaction, because anything less torpedoes everyone else's scores.
+        <div class="notes" style="bottom: -60px">
+            <span>
+            Reputation-based trust through ledgered transaction scores. A machine social mesh. <br/>
+            <br/>
+            In the nominal case, AutonomousTrust is based on reputation. <br/>
+            To arrive at a reputation level (from zero to one) for a target peer that we want to interact with, <br/>
+            we average transaction scores as reported from other peers, <br/>
+            weighted by our remembered reputation level for each of those other peers. <br/>
+            A reputation of 0.5 is the threshold for this mode of interaction, <br/>
+            because anything less torpedoes everyone else's scores.
             <br/>
             This means we must bootstrap reputations first to even have a remembered reputation.
+            </span>
         </div>
     </div>
 
@@ -994,14 +1046,18 @@
                 Evaluating peers in the absence of reputation.
             </span>
         </div>
-        <div class="notes">
-            Contrite Tit-for-Tat is an eye-for-an-eye strategy for interaction in the absence of reputation data.
-            In game theory terms, if you defect on me, I defect on you.
-            Contrite means that there is room for forgiveness in case of a mistake.
-            Our graphic indicates that when new peers arrive, some nodes go into tit-for-tat mode to both
-            give the newbies a chance to build reputation, or to protect the rest of the cohort from attack.
-            Attackers are starved out because they cannot gain positive reputation,
-            while new nodes are bootstrapped into the populace.
+        <div class="notes" style="bottom: -60px">
+            <span>
+            Bootstrapping reputations: <br/>
+            <br/>
+            Contrite Tit-for-Tat is an eye-for-an-eye strategy for interaction in the absence of reputation data. <br/>
+            In game theory terms, if you defect on me, I defect on you. <br/>
+            Contrite means that there is room for forgiveness in case of a mistake. <br/>
+            Our graphic indicates that when new peers arrive, some nodes go into tit-for-tat mode to both <br/>
+            give the newbies a chance to build reputation, or to protect the rest of the cohort from attack. <br/>
+            Attackers are starved out because they cannot gain positive reputation, <br/>
+            while well-behaved new nodes are bootstrapped into the populace.
+            </span>
         </div>
     </div>
 
@@ -1025,11 +1081,16 @@
                 Balancing sociable vulnerability versus secure paranoia <br/> through community enforcement.
             </span>
        </div>
-        <div class="notes">
-            Another protective measure is to go dark and intentionally be unreachable.
-            This degrades the utility of the cohort, but saves the individual.
-            In contrast, enforcement mode is more expensive to the individual in that it engages with the unknown.
-            A preponderance of either is undesirable, so it is important to find a balance and safely maximize the peers in reputation mode.
+        <div class="notes" style="bottom: -60px">
+            <span>
+            Opportunity vs safety: <br/>
+            <br/>
+            Another protective measure is to go dark and intentionally be unreachable. <br/>
+            This degrades the utility of the cohort, but saves the individual. <br/>
+            In contrast, enforcement mode is more expensive to the individual in that it engages with the unknown. <br/>
+            A preponderance of either is undesirable, so it is important to find a balance <br/>
+            and safely maximize the peers in reputation mode.
+            </span>
         </div>
     </div>
 
@@ -1047,9 +1108,18 @@
             <span style="color: rgb(163, 209, 219);">RFC1918 IP Addresses</span><br>
             <span style="color: rgb(255, 255, 255);">Unknown&nbsp;</span>
         </div>
-        <div class="notes">
-            This is a snapshot of the Internet. Note the scale-free topology.
-            Now we are going to look at some possible attack vectors under this paradigm, and how they may be overcome.
+        <div class="notes" style="bottom: 180px; z-index: 1000">
+            <span>
+            This is a snapshot of the Internet., color-coded by geography. <br/>
+            Note the scale-free topology which we anticipate to also be a feature of AutonomousTrust. <br/>
+            <br/>
+            Our greatest security vulnerability lies in our prerequisite blockchains, <br/>
+            and hardening these will be an ongoing challenge. <br/>
+            Some traditional attacks, such as man-in-the-middle, denial-of-service, or spoofing <br/>
+            are either inapplicable or trivially neutralized under AutonomousTrust. <br/>
+            <br/>
+            We will now look at some *other* possible attack vectors under this paradigm, and how they may be overcome.
+            </span>
         </div>
     </div>
 
@@ -1058,7 +1128,12 @@
         <div style="color: white;">Deception</div>
         <div id="lies-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
         <div class="notes">
-            A single faulty node, the links denote trust levels, observe the erosion of trust and the ultimate ejection of the bad node.
+            <span>
+            Deception: <br/>
+            Here we have a single faulty node; <br/>
+            the link weights denote trust levels which change as reputation shifts. <br/>
+            Observe the erosion of trust and the ultimate ejection of the bad node.
+            </span>
         </div>
     </div>
 
@@ -1074,9 +1149,6 @@
             <span style="color: rgb(163, 209, 219);">RFC1918 IP Addresses</span><br>
             <span style="color: rgb(255, 255, 255);">Unknown&nbsp;</span>
         </div>
-        <div class="notes">
-
-        </div>
     </div>
 
 
@@ -1085,7 +1157,8 @@
         <div style="color: white;">Betrayal</div>
         <div id="frenemy-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
         <div class="notes">
-            Here we have a defector that targets just one other node.
+            Betrayal: <br/>
+            In this one, we have a defector that targets just one other node. <br/>
             Trust erodes here as well, but neither are ejected, because peers have no knowledge of who is at fault.
         </div>
     </div>
@@ -1102,9 +1175,6 @@
             <span style="color: rgb(163, 209, 219);">RFC1918 IP Addresses</span><br>
             <span style="color: rgb(255, 255, 255);">Unknown&nbsp;</span>
         </div>
-        <div class="notes">
-
-        </div>
     </div>
 
 
@@ -1113,8 +1183,13 @@
         <div style="color: white;">Reputation</div>
         <div id="clique-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
         <div class="notes">
-            This is a coordinated reputation attack.
-            The target is able to bypass this by making contacts with another connected cohort.
+            <span>
+            Bad reputation: <br/>
+            This is a coordinated reputation attack by a subset of the cohort. <br/>
+            The target is able to bypass this by making contacts with another connected cohort. <br/>
+            One thing to note here is that connections can be costly, <br/>
+            so all-to-all networks, although useful for this scenario, are not likely.
+            </span>
         </div>
     </div>
 
@@ -1130,9 +1205,6 @@
             <span style="color: rgb(163, 209, 219);">RFC1918 IP Addresses</span><br>
             <span style="color: rgb(255, 255, 255);">Unknown&nbsp;</span>
         </div>
-        <div class="notes">
-
-        </div>
     </div>
 
 
@@ -1141,9 +1213,13 @@
         <div style="color: white;">Atomization</div>
         <div id="sybil-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
         <div class="notes">
-            This is another coordinated attack, a Sybil denial of service.
-            Again the solution is to make contact with the other cohort.
-            This time the sybil cohort's reputation suffers, and it is cut-off from the other segment.
+            <span>
+            Atomization: <br/>
+            This is another coordinated attack, a Sybil denial of service, where the whole cohort seeks to isolate the target. <br/>
+            Again the solution is to make contact with the other cohort. <br/>
+            This time the Sybil cohort's reputation suffers once the target is lost, <br/>
+            and it is cut-off from the other segment.
+            </span>
         </div>
     </div>
 
@@ -1159,9 +1235,6 @@
             <span style="color: rgb(163, 209, 219);">RFC1918 IP Addresses</span><br>
             <span style="color: rgb(255, 255, 255);">Unknown&nbsp;</span>
         </div>
-        <div class="notes">
-
-        </div>
     </div>
 
 
@@ -1170,8 +1243,12 @@
         <div style="color: white;">Corrupt authority</div>
         <div id="captain-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
         <div class="notes">
-            Here the contact in the other cohort ruins attempts to bypass it.
-            The solution is to connect with the next cohort up the hierarchy, effectively changing the network topology.
+            <span>
+            Corrupt authority: <br/>
+            Here the contact in the other cohort ruins attempts to bypass it. <br/>
+            The solution is to connect with the next cohort up the hierarchy, <br/>
+            effectively changing the network topology.
+            </span>
         </div>
     </div>
 
@@ -1187,9 +1264,6 @@
             <span style="color: rgb(163, 209, 219);">RFC1918 IP Addresses</span><br>
             <span style="color: rgb(255, 255, 255);">Unknown&nbsp;</span>
         </div>
-        <div class="notes">
-
-        </div>
     </div>
 
 
@@ -1198,7 +1272,10 @@
         <div style="text-align: center;">Questions?</div><br/>
         <div id="random-graph" class="graph-container" style="width: 800px; height: 600px;"></div>
         <div class="notes">
-
+            <span>
+            We hope you have gotten a sense of how AutonomousTrust works and the advantages it promises. <br/>
+            Questions? <a href="mailto:sean.brennan@tekfive.com">sean.brennan@tekfive.com</a>
+            </span>
         </div>
     </div>
 
@@ -1232,6 +1309,7 @@
         let forcesGraph = null;
         let zoomedImage = null;
         let imgOrigCss = null;
+        let captionState = false;
         const slideStartWithIn = function (name, array) {
             for (let i = 0; i < array.length; i++) {
                 if (name.startsWith(array[i]))
@@ -1240,6 +1318,10 @@
             return false;
         }
         window.addEventListener('impress:stepenter', function (event) {
+            let notes = event.target.querySelector('.notes')
+            if (notes != null && captionState === true) {
+                notes.className = 'notes-shown';
+            }
             if (event.target.id === "facet7") {
                 const loops = 3;
                 const faces = ['s', 'n', 'u'];
@@ -1327,6 +1409,12 @@
                     document.body.removeChild(zoomedImage);
                 zoomedImage = null;
                 imgOrigCss = null;
+            }
+            if (e.key ==="c") {
+                if (captionState)
+                    captionState = false
+                else
+                    captionState = true
             }
         });
     });
