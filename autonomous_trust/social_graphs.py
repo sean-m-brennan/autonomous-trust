@@ -249,6 +249,7 @@ ng.Graphs.register_implementation('sybil', SybilNetwork)
 
 class CorruptAuthorityNetwork(ng.NetworkGraph):
     def __init__(self, size, **kwargs):
+        self.speed = 1000
         self.iteration = 0
         groups = 'a b c trouble'.split(' ')
         num_levels = 3
@@ -278,7 +279,7 @@ class CorruptAuthorityNetwork(ng.NetworkGraph):
 
     def change(self):
         if self.iteration == 0:
-            self.next_change = 10000
+            self.next_change = 10 * self.speed
         elif self.iteration < 10:  # try/fail to connect to level 1
             if self.previous is not None:
                 self.change_type = self.PhaseChange.REMOVE
@@ -286,35 +287,38 @@ class CorruptAuthorityNetwork(ng.NetworkGraph):
                 self.previous = None
             else:
                 self.change_type = self.PhaseChange.ADD
+                eligible = list(self.levels[1])
+                eligible.remove(self.problem)
                 edge = (self._random_node(limit_to=self.levels[0]),
-                        self._random_node(limit_to=self.levels[1]))
+                        self._random_node(limit_to=eligible))
                 self.add_edge(*edge)
                 self.G[edge[0]][edge[1]]["group"] = 0
                 self.G[edge[0]][edge[1]]["weight"] = 3
                 self.previous = edge
-            self.next_change = 1000
+            self.next_change = self.speed
         elif self.iteration < 11:
             if self.previous is not None:
                 self.change_type = self.PhaseChange.REMOVE
                 self.remove_edge(*self.previous)
-            self.next_change = 3000
+                self.previous = None
+            self.next_change = 3 * self.speed
         elif self.iteration < 15:  # connect to level 2
             self.change_type = self.PhaseChange.ADD
             current = (self._random_node(limit_to=self.levels[0]),
                        self._random_node(limit_to=self.levels[2]))
             self.add_edge(*current)
             self.G[current[0]][current[1]]["group"] = 0
-            self.next_change = 3000
+            self.next_change = 3 * self.speed
         else:
-            self.next_change = random.randint(500, 2000)
+            self.next_change = random.randint(self.speed // 2, 2 * self.speed)
         self.iteration += 1
 
     def grouping(self):  # noqa
         if not super().grouping():
             return
         for u, v, a in self.G.edges(data=True):
-            if (u in self.levels[0] or v in self.levels[0]) and \
-                    (u == self.problem or v == self.problem):
+            if (u in self.levels[0] and v == self.problem) or \
+                    (v in self.levels[0] and u == self.problem):
                 if self.iteration < 15:
                     a["weight"] = self.maximum_weight
                 else:
@@ -322,7 +326,6 @@ class CorruptAuthorityNetwork(ng.NetworkGraph):
                         a["weight"] -= 1
             else:
                 a["weight"] = random.randint(1, self.maximum_weight)
-        # FIXME spurious edge
 
 
 ng.Graphs.register_implementation('captain', CorruptAuthorityNetwork)
