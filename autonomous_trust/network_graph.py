@@ -113,7 +113,7 @@ class NetworkGraph(object):
         return True
 
     @staticmethod
-    def _hierarchy_gen(size, num_levels):
+    def _hierarchy_gen(size, num_levels, with_links=True):
         levels = []
         g = None
         sizes = [0]
@@ -127,7 +127,7 @@ class NetworkGraph(object):
                 g = nx.compose(g, level_graph)
             level_nodes = list(level_graph)
             level_head = level_nodes[0]
-            if lev > 1:
+            if lev > 1 and with_links:
                 for n in levels[lev-2]:
                     g.add_edge(n, level_head)
             levels.append(level_nodes)

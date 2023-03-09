@@ -194,6 +194,7 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
         node.exit().remove();
 
         // validate connectivity
+        /*
         let node_ids = [];
         for (let n = 0; n < graph.nodes.length; n++) {
             node_ids.push(graph.nodes[n].id);
@@ -215,7 +216,8 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
         }
         if (bad_links.length > 0)
             remove_links(bad_links, false);
-        
+        */
+
         // Redefine and restart simulation
         simulation
             .nodes(graph.nodes)
