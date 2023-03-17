@@ -17,9 +17,9 @@ doc/**/*.log
 doc/**/*.run.xml
 doc/**/*.synctex.gz
 
-doc/whitepaper/research
+doc/research
 
-## Generated images
+## Generated files
 doc/presentation/images/*.shape
 doc/presentation/images/network.png
 doc/presentation/images/identity.svg
@@ -28,5 +28,7 @@ doc/presentation/images/language.svg
 doc/presentation/images/negotiation.svg
 doc/presentation/images/optimization.svg
 doc/presentation/images/prioritization.svg
+doc/presentation/css/tekfive.css*
+doc/presentation/notes
 
 emulation/.vagrant
