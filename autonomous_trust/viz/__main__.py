@@ -4,11 +4,14 @@ import os
 import argparse
 import asyncio
 import quart
+
 from .. import network_graph as ng
 from .. import social_graphs  # noqa
+from .middleware import SassASGIMiddleware
 
 default_port = 8000
 initial_size = 12
+
 
 if __name__ == '__main__':
     this_dir = os.path.abspath(os.path.dirname(__file__))
@@ -21,9 +24,14 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     print(' * Directory on host: %s' % args.directory)
-    app = quart.Quart(__package__.split('.')[0],
+    appname = __package__.split('.')[0]
+    app = quart.Quart(appname,
                       static_url_path='', static_folder=args.directory, template_folder=args.directory)
     app.debug = True
+
+    os.environ['PATH_INFO'] = '/scss/tekfive.scss'
+    app.asgi_app = SassASGIMiddleware(app, {appname: (os.path.join(args.directory, 'scss'),
+                                                      os.path.join(args.directory, 'css'), '/css', True)})
 
 
     @app.route("/")
