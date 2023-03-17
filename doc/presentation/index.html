@@ -61,25 +61,72 @@
         </div>
         <div class="notes" style="bottom: 180px">
             <span>
-            AutonomousTrust - TekFive's concept for cooperative cybersecurity. <br/>
-            Before explaining what AutonomousTrust is, we'll start with some familiar ground:
+                Good morning/afternoon. I'm Sean Brennan, and I'll be talking about AutonomousTrust -
+                TekFive's nascent concept for cooperative cybersecurity.
             </span>
         </div>
     </div>  <!-- end slide -->
 
     <div class="step slide bare" data-x="-500" data-y="-2000">
-        <div class="topic"><strong>Zero Trust Architecture</strong> (ZTA)</div>
+        <div class="topic">Premise:</div>
         <div style="padding: 40px 60px;">
-            Improves security through:
+            System knowledge is essentially dispersed:
             <ul>
-                <li>strong user identity verification</li>
-                <li>device compliance validation</li>
-                <li>least privilege access</li>
-                <li>explicit resource authorization</li>
+                <li>local</li>
+                <li>situational</li>
+                <li>ever changing</li>
             </ul>
-            <p style="margin-bottom: 3cm;"></p>
-            Drawback:
-            <p>The user is not monitored once access is granted.</p>
+            <p style="margin-bottom: 1cm;"></p>
+            and distinctly not:
+            <ul>
+                <li>centralized</li>
+                <li>predictable</li>
+                <li>static</li>
+            </ul>
+            <div style="position: absolute; bottom: 100px; left: 60px;">
+                <p style="margin-bottom: 1cm;"></p>
+                <div class="scroller three">
+                    therefore <b>decentralize</b>&nbsp; <span>control<br/>detection<br/>response<br/></span>
+                </div>
+            </div>
+        </div>
+
+        <div class="t5footer">
+            <hr>
+            <img src="images/t5logo.png" alt="T5"/>
+            <div style="float:right;">AutonomousTrust</div>
+        </div>
+        <div class="notes">
+            <span>
+
+            </span>
+        </div>
+    </div>
+
+    <div class="step slide bare" data-x="1000" data-y="-2000">
+        <div class="topic">CyberSecurity State of the Art:</div>
+
+        <div style="padding: 40px 20px;">
+            <div>
+                <p><strong>Zero Trust Architecture</strong> (ZTA)</p>
+                <div style="font-size: large">
+                    <ul>
+                        <li>strong user identity verification</li>
+                        <li>device compliance validation</li>
+                        <li>least privilege access</li>
+                        <li>explicit resource authorization</li>
+                    </ul>
+                </div>
+            </div>
+            <div style="position: absolute; bottom: 160px;">
+                <p><strong>Intrusion Detection Systems</strong> (IDS)</p>
+                <div style="font-size: large">
+                    <ul>
+                        <li>pattern recognition (known suspect sequences)</li>
+                        <li>anomaly detection (unknown deviations)</li>
+                    </ul>
+                </div>
+            </div>
         </div>
 
         <div class="t5footer">
@@ -103,32 +150,8 @@
             <br/>
             Also the emphasis is on the Cloud, where this is most easily implemented. <br/>
             But we are increasingly seeing computing at the edge; decentralization.
-            </span>
-        </div>
-    </div>
-
-    <div class="step slide bare" data-x="1000" data-y="-2000">
-        <div class="topic"><strong>Intrusion Detection Systems</strong> (IDS)</div>
-        <div style="padding: 40px 60px;">
-            Improve security through:
-            <ul>
-                <li>Pattern recognition (known suspect sequences)</li>
-                <li>Anomaly detection (unknown deviations)</li>
-            </ul>
-            <p style="margin-bottom: 5cm;"></p>
-            Drawbacks:
-            <p>Requires prior patterning or local-only behavioral learning</p>
-            <p>Frequently network-messaging-centric (packet analysis)</p>
-        </div>
-
-        <div class="t5footer">
-            <hr>
-            <img src="images/t5logo.png" alt="T5"/>
-            <div style="float:right;">AutonomousTrust</div>
-        </div>
-        <div class="notes">
-            <span>
-            One option to improve this situtation is IDS (or sometimes IPS [prevention instead of detection]). <br/>
+            <br/>
+            One option to improve this situation is IDS. <br/>
             This is usually achieved through detecting either <br/>
             suspicious patterns (looks improper) <br/>
             or anomalies (doesn't look proper). <br/>
@@ -142,6 +165,45 @@
     </div>
 
     <div class="step slide bare" data-x="2500" data-y="-2000">
+        <div class="topic">... is not enough</div>
+        <div style="padding: 40px 60px;">
+            <div style="position: absolute; bottom: 50px; left: 120px;">
+                <p style="font-size: medium;">SolarWinds SunBurst supply-chain attack: 9/2019 - 12/2020+</p>
+                <img src="images/rId15_image2.png" alt="SunBurst">
+            </div>
+        </div>
+
+        <div class="t5footer">
+            <hr>
+            <img src="images/t5logo.png" alt="T5"/>
+            <div style="float:right;">AutonomousTrust</div>
+        </div>
+        <div class="notes">
+            <span>
+            </span>
+        </div>
+    </div>
+
+    <div class="step slide bare" data-x="3500" data-y="-2000">
+        <div class="topic">Users to the periphery</div>
+        <div style="padding: 40px 60px;">
+            <div style="position: absolute; bottom: 50px; left: 120px;">
+                <img src="images/users.png" alt="User shell" style="width:80%;padding:0;z-index:-999">
+            </div>
+        </div>
+
+        <div class="t5footer">
+            <hr>
+            <img src="images/t5logo.png" alt="T5"/>
+            <div style="float:right;">AutonomousTrust</div>
+        </div>
+        <div class="notes">
+            <span>
+            </span>
+        </div>
+    </div>
+
+    <div class="step slide bare" data-x="4000" data-y="-2000">
         <div class="topic"><strong>AutonomousTrust</strong></div>
         <div style="padding: 40px 60px;">
             We can do <strong>better</strong>:
@@ -171,7 +233,7 @@
         </div>
     </div>
 
-    <div class="step clearstep slide bare" data-x="2500" data-y="-2000">
+    <div class="step clearstep slide bare" data-x="4000" data-y="-2000">
         <div class="topic"><strong>AutonomousTrust</strong></div>
         <div style="padding: 40px 60px;">
             We can do <strong>better</strong>:
@@ -861,7 +923,7 @@
         </div>
     </div>
 
-    <div id="facet2" class="step" data-x="6000" data-y="0" data-z="0" data-rotate-y="-90">
+    <div id="facet2-Scalability" class="step" data-x="6000" data-y="0" data-z="0" data-rotate-y="-90">
         <div class="issue">Building blocks</div>
         <p style="margin-bottom: 2cm;"></p>
         <div style="float:left;font-size:x-large;width:50%;padding:0;">
@@ -890,7 +952,7 @@
         </div>
     </div>
 
-    <div id="facet3" class="step" data-x="6000" data-y="1000" data-z="1000" data-rotate-y="-90">
+    <div id="facet3-Language" class="step" data-x="6000" data-y="1000" data-z="1000" data-rotate-y="-90">
         <div class="issue">Building blocks</div>
         <p style="margin-bottom: 2cm;"></p>
         <div style="float:left;font-size:x-large;width:50%;padding:0;">
@@ -921,7 +983,7 @@
         </div>
     </div>
 
-    <div id="facet4" class="step" data-x="6000" data-y="2000" data-z="2000" data-rotate-y="-90">
+    <div id="facet4-Goals" class="step" data-x="6000" data-y="2000" data-z="2000" data-rotate-y="-90">
         <div class="issue">Building blocks</div>
         <p style="margin-bottom: 2cm;"></p>
         <div style="float:left;font-size:x-large;width:50%;padding:0;">
@@ -951,7 +1013,7 @@
         </div>
     </div>
 
-    <div id="facet5" class="step" data-x="6000" data-y="3000" data-z="3000" data-rotate-y="-90">
+    <div id="facet5-Identity" class="step" data-x="6000" data-y="3000" data-z="3000" data-rotate-y="-90">
         <div class="issue">Building blocks</div>
         <p style="margin-bottom: 2cm;"></p>
         <div style="float:left;font-size:x-large;width:50%;padding:0;">
@@ -979,7 +1041,7 @@
         </div>
     </div>
 
-    <div id="facet6" class="step" data-x="6000" data-y="4000" data-z="4000" data-rotate-y="-90">
+    <div id="facet6-Reputation" class="step" data-x="6000" data-y="4000" data-z="4000" data-rotate-y="-90">
         <div class="issue">Building blocks</div>
         <p style="margin-bottom: 2cm;"></p>
         <div style="float:left;font-size:x-large;width:50%;padding:0;">
@@ -1023,7 +1085,7 @@
         </div>
     </div>
 
-    <div id="facet7" class="step" data-x="6000" data-y="5000" data-z="5000" data-rotate-y="-90">
+    <div id="facet7-Bootstrapping" class="step" data-x="6000" data-y="5000" data-z="5000" data-rotate-y="-90">
         <div class="issue">Building blocks</div><br/>
         <p style="margin-bottom: 2cm;"></p>
         <div style="float:left;font-size:x-large;width:50%;padding:0;">
@@ -1061,7 +1123,7 @@
         </div>
     </div>
 
-    <div id="facet8" class="step" data-x="6000" data-y="6000" data-z="6000" data-rotate-y="-90">
+    <div id="facet8-Opportunity/security" class="step" data-x="6000" data-y="6000" data-z="6000" data-rotate-y="-90">
         <div class="issue">Building blocks</div>
         <p style="margin-bottom: 2cm;"></p>
         <div style="float:left;font-size:x-large;width:50%;padding:0;">
@@ -1090,6 +1152,21 @@
             In contrast, enforcement mode is more expensive to the individual in that it engages with the unknown. <br/>
             A preponderance of either is undesirable, so it is important to find a balance <br/>
             and safely maximize the peers in reputation mode.
+            </span>
+        </div>
+    </div>
+
+    <div class="step slide bare" style="border: none;box-shadow: none;" data-x="6500" data-y="-3500">
+        <div class="topic">AutonomousTrust versus SunBurst</div>
+        <div style="padding: 40px 60px;">
+            <img src="images/rId15_image2.png" alt="SunBurst" style="position: absolute; bottom: 50px; left: 120px;">
+        </div>
+
+        <div class="notes">
+            <span>
+                ZTA strong authentication prevents step #1<br/>
+                AT makes steps #2 and #3 impossible<br/>
+                AT at client sites makes steps #5 and #6 impossible<br/>
             </span>
         </div>
     </div>
@@ -1322,7 +1399,7 @@
             if (notes != null && captionState === true) {
                 notes.className = 'notes-shown';
             }
-            if (event.target.id === "facet7") {
+            if (event.target.id.startsWith("facet7")) {
                 const loops = 3;
                 const faces = ['s', 'n', 'u'];
                 const initial = ['n', 'n', 'n', 'n', 'n', 'n', 'n', 'n', 'n'];
@@ -1332,7 +1409,7 @@
                 let anim = society_animate(document.getElementById("optimization"), loops, faces, initial, extras);
                 anim.run("optimization");
             }
-            else if (event.target.id === "facet8") {
+            else if (event.target.id .startsWith("facet8")) {
                 const loops = 3;
                 const faces = ['s', 'h', 'p']
                 const initial = ['h', 'h', 'h', 'h', 'h', 'h', 'h', 'h', 'h']

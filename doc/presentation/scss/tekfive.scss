@@ -381,18 +381,75 @@ ol, ul {
 .notes-shown > span {
     position: absolute;
     top: 0;
-    animation: captionScroll 20s 1.5s infinite;
-    animation-name: captionScroll;
+    animation: smoothVScroll 20s 1.5s infinite;
+    animation-name: smoothVScroll;
     animation-timing-function: linear;
     animation-delay: 1.5s;
 }
 
-@keyframes captionScroll {
+@keyframes smoothVScroll {
     from {
         transform: translateY(0);
     }
     to {
         transform: translateY(-100%);
+    }
+}
+
+.scroller {
+    height: 1.2em;
+    line-height: 1.2em;
+    position: relative;
+    overflow: hidden;
+    width: 35em;
+}
+
+.scroller.two {
+    --scrollCount: 2;
+}
+
+.scroller.three {
+    --scrollCount: 3;
+}
+
+.scroller.four {
+    --scrollCount: 4;
+}
+
+.scroller > span {
+    position: absolute;
+    top: 0;
+    font-weight: bold;
+}
+
+@function capitalize($string) {
+  @return to-upper-case(str-slice($string, 1, 1)) + str-slice($string, 2);
+}
+
+@function toCardinal($number) {
+    @if $number == 1 { @return one; }
+    @if $number == 2 { @return two; }
+    @if $number == 3 { @return three; }
+    @if $number == 4 { @return four; }
+    @if $number == 5 { @return five; }
+    @if $number == 6 { @return six; }
+    @if $number == 7 { @return seven; }
+    @if $number == 8 { @return eight; }
+    @if $number == 9 { @return nine; }
+    @if $number == 10 { @return ten; }
+    @else { @return unknown; }
+}
+
+$maxScrollCount: 10;
+@for $i from 2 through $maxScrollCount {
+    $cardinal: toCardinal($i);
+    $name: stepScroll#{capitalize($cardinal)};
+    .scroller.#{$cardinal} > span { animation: #{$name} 6s 1.5s infinite; }
+    @keyframes #{$name} {
+        @for $j from 0 through $i - 1 {
+            $percent: 0% + floor((100 / $i) * $j);
+            #{$percent} { top: $j * -1.2em }
+        }
     }
 }
 
