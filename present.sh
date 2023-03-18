@@ -14,7 +14,7 @@ conda_dir=$(conda info | grep -i 'base environment' | awk '{print $4}')
 source "$conda_dir/etc/profile.d/conda.sh"
 conda activate $env
 
-python3 -m autonomous_trust.viz --directory doc/presentation --port $port &
+python3 -m autonomous_trust.viz --directory "$PWD"/doc/presentation --port $port &
 sim_pid=$!
 sleep 1
 xdg-open http://localhost:$port
