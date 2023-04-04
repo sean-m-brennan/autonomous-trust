@@ -1,0 +1,25 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="HighTrust_VA" type="LATEX_RUN_CONFIGURATION" factoryName="LaTeX configuration factory">
+    <texify>
+      <compiler>PDFLATEX</compiler>
+      <compiler-path />
+      <sumatra-path />
+      <pdf-viewer>EVINCE</pdf-viewer>
+      <viewer-command />
+      <compiler-arguments />
+      <envs>
+        <env name="AUTONOMOUSTRUST_SCENARIO" value="va" />
+      </envs>
+      <main-file>$PROJECT_DIR$/doc/whitepaper/HighTrust_VA.tex</main-file>
+      <output-path>$PROJECT_DIR$/doc/whitepaper/out</output-path>
+      <auxil-path>$PROJECT_DIR$/doc/whitepaper/out</auxil-path>
+      <compile-twice>true</compile-twice>
+      <output-format>PDF</output-format>
+      <latex-distribution>MIKTEX</latex-distribution>
+      <has-been-run>true</has-been-run>
+      <bib-run-config>[BibTeX.HighTrust_VA bibliography]</bib-run-config>
+      <makeindex-run-config>[]</makeindex-run-config>
+    </texify>
+    <method v="2" />
+  </configuration>
+</component>

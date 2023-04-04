@@ -1,0 +1,90 @@
+Wherein we review the literature on the relevant state-of-the-art for human trust relationship modeling, automated machine communication, reputation systems, and cybersecurity.
+
+\subsection{Human trust models}\label{subsec:trust}
+
+The state of the art in understanding human trust (interpersonal trust in the social literature) is rather amorphous, suffers from foundational issues of taxonomy, and formal formulations of the mechanics of trust are almost non-existent.
+Therefore, we will be connecting the dots to span gaps in the social and psychological literature.
+Our simplified human trust model outlined above is based on discoveries in evolutionary biology and experimental economics as related to self-enforcing game theory and reciprocity.
+\\[10pt]
+The limits of personal social scale (\#\ref{scale} of our model) are well explored in Dunbar, giving us a ranged maximum of around 100 to 230 peers (often the number 150 is used as short-hand for this range)~\cite{dunbar1992neocortex}.
+This number is subject to community cohesion and mission urgency, such that less of either results in a smaller maximum scale.
+Additionally, human groups have tiered scaling at membership numbers at 5, 15, and 35 individuals for progressively less intense relationships~\cite{hill2003social}.
+These numbers also demonstrate the cognitive limits inherent in social reach, with direct implications for trust.
+In a military setting, the maximum limit is roughly the size of a company and the minimum that of a squad, but an overarching hierarchy of larger-than-maximum structures is used to loosely cohere the whole.
+
+Language (\#\ref{language}) is a critical bonding element in human socialization, partially fulfilling the same social role as grooming in other primates~\cite{dunbar2004gossip}.
+As such, this permits bonding and collaboration across temporal and spatial distance, and additionally over a larger scale of participants.
+Dunbar notes that language is used for knowledge-passing, behavior-policing, self-promotion, and deception; all of which fold directly into the nature of trust relationships.
+
+Shared goals (\#\ref{mission}) contribute greatly to collective coherence and are observable in nonverbal human behavior, separating merely working nearby another from working together~\cite{sacheli2015social}.
+Notably trust is hardly present or needed in the latter, but critical for the former.
+
+The importance of consistent personal identity (\#\ref{identity}) in human social interaction is a major gap in the literature.
+As humans, we assume (inaccurately) that individual identification of our social peers is correct, and it usually is, but at the extremities of the Dunbar number perhaps not so much.
+That this \emph{can} happen at all is seen from the social reaction to inconsistency.
+Revealing false identity, misrepresentation, or mis-identification results in immediate distrust, manifesting in emotion ranging from embarrassment to aggression.
+The social impact of this is so strong that we are sensitive to our own presentation: consistency of self-identity directly relates to psychological well-being~\cite{suh2002culture}.
+
+
+Reputation (\#\ref{reputation}) enables indirect reciprocity, i.e.\ an actor reacts to a peer based on how it is likely to affect their reputation with 3rd parties, rather than the immediate interaction~\cite{phelps2012emergence}.
+Despite high dynamism in individual reputation status, overall human social network metrics tend to equilibrium.
+Both indirect and direct reciprocity are the bases of trust relationships.
+
+To determine approaches to optimization (\#\ref{optimized}) for direct reciprocity, separate from cooperative reputation strategies, we turn to game theory.
+Axelrod's generous or contrite tit-for-tat (TFT) has been consistently shown to disarm the always-defect tactic, making space for fragile but more optimal and stable strategies such as win-stay/lose-shift~\cite{axelrod1981evolution, axelrod1997complexity, nowak1995arithmetics}.
+In an iterative prisoner's dilemma game, TFT is a strategy wherein an actor cooperates until the other defects, then defects until the other cooperates.
+The generous (GTFT) and contrite (CTFT) variants either cooperate more often or defect less often (respectively), and they do somewhat better than plain TFT. This effectively ensures a non-zero-sum game.
+Win-stay/lose-shift (WS/LS) is an approach wherein an actor only swaps cooperation or defection upon losing a round, but otherwise sticks with what worked previously.
+WS/LS is vulnerable to always-defect (as all strategies but TFT are), and so needs the guard-dog of TFT to keep it safe.
+
+Prioritization and shortcuts (\#\ref{priorities}) are critical because processing social network information can be cognitively taxing and thus place limits on social group scales~\cite{davidbarrett2013processing}.
+As an example, hierarchical social structures are a frequent means of bypassing this limitation, but still utilizes heuristics for rapid in-group identification.
+This means as scale grows, social roles play a greater part of trust structures.
+
+
+\subsection{Distributed machine-to-machine communications}\label{subsec:m2m}
+
+A precursor to the message-sharing aspect of the system described herein was articulated by Vestrand, et al.\ as the Dynamic Coalition Architecture (DCA), implemented as the Python SatChat library~\cite{vestrand2021artificial}.
+Originally applied in the astronomy community - socially a small, well-connected group of scientists with relatively high cohesion - SatChat enabled rapid, controlled sharing of global telescopic data to enhance automated rapid response to detections of extraterrestrial events.
+It utilizes a published XML schema which dictates an open message header and an encrypted body, a centralized routing process, and simple communication via zeroMQ that assumes a reliable substrate.
+This DCA system worked well in it's intended environment.
+In an effort to expand funding, DCA was then applied to a very different environment: coordinating sensory data and model conclusions among six national laboratories.
+DCA did \textit{not} do well.
+The human-social assumptions no longer held and in fact exhibited negative cohesion, and the software itself was (naturally) unable to compensate. \projectName tackles that challenge of interpersonal distrust head-on, but shares zero intellectual property with Vestrand's library.
+
+More generally, machine-to-machine communication (M2M) consists of automated message-passing and coordination driven by artificial intelligence (AI), machine learning (ML), or simple command-and-response scripting.
+M2M can be found in telemedicine, mobile payment (Google Wallet/Apple Pay), smart home systems, or the amorphous internet of things (IoT). As an example, a prominent protocol (and ISO recommendation) for M2M is Message Queuing Telemetry Transport (MQTT), providing a publish/subscribe transport.
+Much like SatChat/DCA, it relies on a central broker server to route and distribute messages between resource-constrained clients using low overhead and allowing high latency~\cite{oasis2019mqtt}.
+
+
+\subsection{Reputation-based systems}\label{subsec:reputation}
+
+When reviewing the literature for machine reputation, it is important to distinguish whose reputation.
+Online Reputation Management (ORM) is a very active field that focuses on business and user reputations.
+It is human-oriented and thus unrelated to this work, though it may look similar in its toolset~\cite{hasan2022privacy}.
+
+The most relevant field for our purposes is frequently part of Multi-Agent Systems (MAS) or Distributed Artificial intelligence (DAI).
+Per a meta-review of the multi-agent literature by Granatyr, et al., other work on computational trust and reputation consists largely of theoretical and/or academic models~\cite{granatyr2015trust}.
+In contrast to \emph{all} the 106 models surveyed therein, \projectName is not domain-specific.
+Our work does fall under their numeric paradigm, as opposed to their cognitive paradigm (wherein agents reason about trust), but does not use statistical methods as ``almost all'' others do.
+
+Notably, despite massive interest and dire need, no product has emerged out of the academe.
+
+
+\subsection{Cybersecurity}\label{subsec:cyber}
+
+In this section, we distinguish between compile-time security (software design and vulnerabilities) and run-time security (access control, threat detection).
+Compile-time vulnerabilities are always a class of insider threat (innocent or malicious), whether it be backdoors, trojan horses, spoofing, or simply exploitable bugs.
+Much of what appears to be run-time attacks is only possible through compile-time (or configuration-time) vulnerabilities.
+For example, malware is powerless if the operating system refuses to run it.
+Man-in-the-middle (MITM) attacks can do nothing with strongly encrypted end-to-end communications.
+If software development, installation, and use (such as password practices) are all on-point, then the available attack surface of a system is greatly minimized.
+
+True run-time vulnerability then consists of attacks such as denial-of-service (DoS and DDoS), direct access and tampering, and social engineering.
+These are all attack vectors that cannot be sealed off a-priori.
+
+Current cybersecurity techniques for mitigating these threats largely consists of Blue-team response to Red-team hacking.
+Most solutions passively seek to cut off attack vectors (firewalls, disk encryption, authentication, least-privilege).
+Such policy-based protections are currently marketed as Zero-Trust Architectures.
+Active solutions usually involve vulnerability detection (proactive), intrusion or anomaly detection (reactive) and postmortem forensics~\cite{anderson2020security, brooks2018cybersecurity, wittkop2022cybersecurity}.
+Combining all of these approaches represents the industry-best-practice of defense-in-depth.

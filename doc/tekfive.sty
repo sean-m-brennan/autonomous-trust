@@ -17,9 +17,26 @@
 % parameter defaults
 \newcommand{\tfDocumentType}{whitepaper}
 \newcommand{\tfDocumentPageStyle}{plain}
+\newcommand{\tfDocumentPaper}{letterpaper}
+\newlength{\tfMarginLeft}
+\setlength{\tfMarginLeft}{2.5cm}
+\newlength{\tfMarginRight}
+\setlength{\tfMarginRight}{3cm}
+\newlength{\tfMarginTop}
+\setlength{\tfMarginTop}{2.5cm}
+\newlength{\tfMarginBottom}
+\setlength{\tfMarginBottom}{2.5cm}
+\newcommand{\tfDocumentSidedness}{oneside}
+\newcommand{\tfOneSided}{oneside}
 
 \DeclareOptionX{type}{\renewcommand{\tfDocumentType}{#1}}
 \DeclareOptionX{style}{\renewcommand{\tfDocumentStyle}{#1}}
+\DeclareOptionX{paper}{\renewcommand{\tfDocumentPaper}{#1}}
+\DeclareOptionX{left}{\renewcommand{\tfMarginLeft}{#1}}
+\DeclareOptionX{right}{\renewcommand{\tfMarginRight}{#1}}
+\DeclareOptionX{top}{\renewcommand{\tfMarginTop}{#1}}
+\DeclareOptionX{bottom}{\renewcommand{\tfMarginBottom}{#1}}
+\DeclareOptionX{sided}{\renewcommand{\tfDocumentSidedness}{#1}}
 \DeclareOptionX*{\PackageWarning{tekfive}{Unknown option ‘\CurrentOption’}}
 \ProcessOptionsX\relax
 
@@ -48,13 +65,18 @@
 
 \fancyfoot[RO,LE]{Page \thepage~of \pageref{LastPage} }
 
-\newcommand{\TekFiveTitle}{
+\ifx\tfOneSided\tfDocumentSidedness %
+   \renewcommand{\tfDocumentSidedness}{} %
+\fi
+\geometry{paper=\tfDocumentPaper, \tfDocumentSidedness, left=\tfMarginLeft, top=\tfMarginTop, right=\tfMarginRight, bottom=\tfMarginBottom}
+
+\newcommand{\TekFiveTitle}[1][0.5in]{
 	\newlength{\firstPageBottom}
-	% add three extra lines of height to bottom margin
+	% add three extra lines of height to bottom margin for address footer
 	\setlength{\firstPageBottom}{\dimexpr \paperheight - \textheight + \topmargin %
 			- \footskip + 3\baselineskip}
-	\newgeometry{bottom=\firstPageBottom} % for footer
-	\vspace*{0.5in}
+	\newgeometry{left=2.5cm, top=2.5cm, right=3cm, bottom=\firstPageBottom} % for footer
+	\vspace*{#1}
 	{\let\newpage\relax\maketitle}
 	\afterpage{\globaldefs=1 \restoregeometry}
 }
