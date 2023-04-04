@@ -1,0 +1,68 @@
+This system is for naught if it does not protect against attack.
+To get a sense of how \projectName might fare against real-world conditions, we consider the novel 2019--20 SunBurst software supply chain attack via the SolarWinds Orion network administration tool.
+Analysis of this attack suggests that, aside from the initial SolarWinds network breach, state-of-the-art cybersecurity techniques and tools would have been ineffective at preventing or even detecting this hack~\cite{gao2022cybersecurity, fireeye2020sunburst}.
+Once inside the network, attacker activity would have been indistinguishable from that of valid developers, and client companies would have no reason to cut-off Orion's access to the Internet.
+In short, while Zero-Trust would have likely prevented the initial network hack, neither it nor most intrusion detection systems could have halted the rest of this attack.
+Notably, Ken Thompson predicted and even wrote an implementation of this attack style, and commented on the almost total inability to detect it four decades ago~\cite{thompson1984trust}.
+With either social engineering or other insider access, instead of just a possible lousy password, a repeat of this attack is currently unstoppable.
+And how would you ever know that a more sophisticated version of this attack isn't already humming along inside your network already?
+
+\projectName makes this attack \emph{impossible}.
+Using our system, even code developers would not have direct access to the build system -- eliminating the binary injection.
+Clients that used an \projectName-based product would immediately know if that product was violating the scope of its specification, when the Trojan Horse either phones home or tries to control the rest of the client system.
+
+As mentioned in section~\ref{subsec:cyber}, compile-time security is outside the scope of this system --- but that does not mean we will ignore it.
+Such security is a well-understood problem, although it can become complicated as a code-base grows.
+In an over-simplified nutshell, it consists of careful design with correct implementation, and vigilant monitoring for vulnerabilities coupled with rapid mitigation.
+TekFive offers products and techniques that address these problems, which we use in implementation -- specifically our \analysisName vulnerability discovery product and our code-correctness proofing expertise.
+
+Run-time threats, however, are fundamentally complex and this emerges at large scale.
+As this is a new computing paradigm, some attack vectors are solved by the nature of the system, some explicitly by design.
+Such are fairly obviously no longer problems.
+Some means of attack, particularly known distributed computing weaknesses, require research into the resiliency of our system to demonstrate its resistance.
+
+\subsection{Possibly solved}\label{subsec:possibly-solved}
+
+We believe the following known attack vectors are either significantly or wholly ameliorated (and this must be confirmed):
+
+Because every message is encrypted end-to-end with post-quantum techniques, classic identity attacks (MITM, spoofing) are neutralized.
+
+Although metadata attacks (who associates with whom) are hampered by only exposing identity/address pairs in messaging, they are still possible.
+This system allows for near-contact networking with long latencies, so due diligence could eliminate the collection of metadata also.
+Additionally, identities can be anonymous and still be useful --- at least in domains that do not demand KYC (know your customer).
+Such anonymity renders metadata harvesting mostly useless.
+
+DoS is largely mitigated by rejecting spurious messages, but at large enough scale can continue to be a problem until and unless network switches themselves run this system also.
+With firmware-level enforcement, DoS can be eliminated and even the impact of DDoS can be lessened.
+
+DLT-specific attacks that attempt to inject bad blocks into the chain, such as DDoS or the 51\% attack, are significantly reduced by our use of two disparate but mutually supporting blockchains and the required investment of reputation-building.
+
+
+\subsection{System-specific}\label{subsec:system-specific}
+
+The foremost class of attacks this system is susceptible to is divide-and-conquer tactics facilitated by \textit{lying}.
+The solution in every case is to uncover the lie, then respond with the warhead of TFT, but such detection is not always easy.
+
+Firstly, there is straight-up \textbf{Deceit}: malicious agents may falsify data or results.
+In \projectName, this cannot survive when competing service providers are present.
+Even a single client can make comparisons that will reveal this attack.
+
+Next we have the case where a peer builds trust up just to betray it.
+The \textbf{Frenemy} is a singular malicious agent that is patient enough to choose its time to strike.
+Such a strike is very costly as it must be public, and as such can only occur once for a given identity.
+
+In \textbf{bad reputation}, a group of peers colludes to drive your agent's reputation score down, most easily through gossip, but also via low transaction scores.
+A peer leader can independently review and verify gossip in the former, and for the latter case can increase your external connections to test if your agent is the problem.
+
+The infamous \textbf{Sybil} attack occurs when numerous agent identities controlled by a single entity seek to interfere with or derail the network.
+The textbook solution to this is to make identity generation expensive. \projectName identities are cheap to create, but reputation is hard-earned.
+Impatient Sybils are trivial to ignore.
+Sybil Frenemies however are a serious threat.
+
+\textbf{Atomization}, known in distributed computing as the Eclipse attack, occurs when malicious agents isolate a given peer.
+This is often also a Sybil attack.
+The isolated agent may be unaware that the data and reputations it is seeing is false.
+This can be mitigated by having connections outside the enclave.
+
+\textbf{Wicked Captain} is atomization caused by an authority in the hierarchy.
+An entire enclave can be affected by this, but as any peer can become a leader, out-competing a malicious authority is an easy fix.

@@ -1,0 +1,57 @@
+When the Internet was young (ARPA-net and into the BBS-era), participants were necessarily specialists, and existing social controls allowed for fine-grained trust calibration.
+The Internet rapidly advanced well beyond that state, but we continue to pretend that human social techniques are adequate for an extremely large scale environment.
+In the Cloud, we run proprietary processes with highly sensitive data on someone else's hardware and struggle with the opposing demands to maintain control of access yet be productive in a timely manner.
+Zero Trust may be just a re-packaging of well-known system security best-practices (individualized credentials, least privilege access, time-limited sessions) but it is indicative of the growing network security crisis that is already upon us --- and that our best answers are over thirty years old.
+Clearly the current cybersecurity paradigm is bankrupt: ever-increasing restrictions are complex and anti-scalable, and have but one logical end-point - total lockdown of all resources.
+This is the opposite of what we want.
+\\[10pt]
+What do we want, ideally?
+In very general terms, as an owner of certain resources, I want to only give access to the extent that I benefit, no more, no less.
+As a user, I also want to benefit from that access, so I should in turn have value to offer.
+This is an implied contract, and as the adage goes: if you can't identify the product being sold, you are that product.
+Without other context, there is no guarantee of the quality of the resources on offer, and the user's value may be time-deferred or fragmented, which means that some trust and its associated risk are usually required - so let's make that explicit.
+Our premise is that system knowledge -- particularly security context -- is local, situational, and ever changing.
+It is best then if control, detection and response are also local.
+It follows that we must embrace automation to recreate trust structures for data-sharing.
+Like many other successful computing paradigms (genetic algorithms, swarm optimization, neural networks), a solution to this problem becomes apparent through modeling biological processes, in this case, human trust.
+What do human trust relationships look like?
+\\Generically, they:
+\begin{enumerate}
+	\item are \textbf{scalable}, multilayered in small groups, allowing a broad but shallow hierarchy, most clearly in military, government or corporate organizations; \label{scale}
+	\item share \textbf{language}, often exclusive to a community -- linguistic constructs act as in-group signifiers in addition to means for more efficient knowledge-transfer; \label{language}
+	\item share \textbf{goals}, concerns, beliefs or mission; \label{mission}
+	\item require \textbf{consistent identity} (preferably immutable) -- naturally accomplished by face-to-face interactions; \label{identity}
+	\item are \textbf{reputation-based}, using dynamic evidence of intent -- a lifetime to build, seconds to destroy; \label{reputation}
+	\item are \textbf{optimized} in the case of strangers interacting where reputation information is sparse (e.g.\ two-strikes rule); \label{optimized}
+	\item are \textbf{prioritized}, utilizing shortcuts, frequently in the form of social roles, since tracking trust relationships tends to be high cognitive load. \label{priorities}
+\end{enumerate}
+We will justify our breakdown of trust relationships into these seven facets in section~\ref{subsec:trust}.
+\\[10pt]
+Machine trust would be built with similar characteristics (respectively):
+\begin{enumerate}
+	\item limited direct communication among peers, but with hierarchical network traversal;
+	\item a domain-specific markup language descended from an ur-language, easily extended -- the language a machine implements indicates the groups it participates in;
+	\item a strict negotiation protocol, reaching accord in agreed goals;
+	\item a crypto-ledger for identity, shared directly among cohorts only but accessible as sub-chains anywhere;
+	\item transaction outcome evaluation/scoring, shared and self-immutable -- machine reputation is both public knowledge yet privately evaluated;
+	\item allows onboarding and reputation bootstrapping through game-theoretic strategies;
+	\item assuming scalability (\#\ref{scale}) is optimized, various prioritization strategies (gullibility, cynicism) can be employed to balance opportunity versus security in groupings that include strangers.
+\end{enumerate}
+Note that the machine characteristics above directly implement the corresponding aspects of the human trust model.
+This reveals our founding assumption: that human trust mechanisms, developed over at least one hundred thousand years, is likely to be more effective than anything we can design.
+This is detailed in section~\ref{sec:implementation}.
+
+
+\subsection{Concept}\label{subsec:concept}
+
+\textbf{\projectName}is TekFive's high-trust cooperative computing concept --- a data messaging framework that allows for dynamic composibility, requesting and serving encrypted data \textit{only} with trusted peers and only to the extent of that fine-grained trust.
+Said trust is dynamically evaluated in real time to rapidly eliminate incoming threats and even reclassify existing peers as their behavior changes and thus protect resources.
+Greater risk requires greater trust.
+An autonomous agent using this framework can adaptively: 1) refuse communications from severely untrusted peers, conserving bandwidth; 2) communicate with but refuse computation services to faintly trusted peers, protecting CPU time; 3) offer services but refuse data-sharing to moderately trusted peers, protecting data; \textit{and} 4) offer data-sharing to well trusted peers; all with a configurable gradient of access at every level, and all within the same application.
+
+In more concrete terms, \projectName is an operations framework for a vast distributed system that dynamically composes numerous individual micro-services into a coherent application on-demand -- with security at its core.
+We follow the Unix philosophy: do one thing well, work together, use a universal (text) interface; yet implemented such that each micro-service can choose it's level of participation.
+
+To illustrate this concept in detail, we will describe a use-case involving secure data-sharing among several entities.
+Within this example, we discuss the above seven system facets of communication, language, negotiation, identity, reputation, optimization and prioritization.
+Orthogonal to, and cutting through, these conceptual divisions, yet also of critical importance, are operational concerns such as sub-system management and debugging, service discovery, dynamic name-to-address mapping, network resiliency and message reliability.
