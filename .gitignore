@@ -8,14 +8,7 @@ idea/**/workspace.xml
 __pycache__
 
 ### Latex ###
-doc/**/*.aux
-doc/**/*.bbl
-doc/**/*.bcf
-doc/**/*.blg
-doc/**/*.dep
-doc/**/*.log
-doc/**/*.run.xml
-doc/**/*.synctex.gz
+doc/**/out
 
 doc/research
 
