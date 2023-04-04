@@ -1,0 +1,25 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="HighTrust_DOD" type="LATEX_RUN_CONFIGURATION" factoryName="LaTeX configuration factory">
+    <texify>
+      <compiler>PDFLATEX</compiler>
+      <compiler-path />
+      <sumatra-path />
+      <pdf-viewer>EVINCE</pdf-viewer>
+      <viewer-command />
+      <compiler-arguments />
+      <envs>
+        <env name="AUTONOMOUSTRUST_SCENARIO" value="dod" />
+      </envs>
+      <main-file>$PROJECT_DIR$/doc/whitepaper/HighTrust_DOD.tex</main-file>
+      <output-path>$PROJECT_DIR$/doc/whitepaper/out</output-path>
+      <auxil-path>$PROJECT_DIR$/doc/whitepaper/out</auxil-path>
+      <compile-twice>false</compile-twice>
+      <output-format>PDF</output-format>
+      <latex-distribution>MIKTEX</latex-distribution>
+      <has-been-run>true</has-been-run>
+      <bib-run-config>[BibTeX.HighTrust_DOD bibliography]</bib-run-config>
+      <makeindex-run-config>[]</makeindex-run-config>
+    </texify>
+    <method v="2" />
+  </configuration>
+</component>
