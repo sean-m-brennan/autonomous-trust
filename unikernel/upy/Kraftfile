@@ -1,0 +1,43 @@
+---
+specification: '0.5'
+name: autonomoustrust_upy
+unikraft:
+  version: stable
+  kconfig:
+    - CONFIG_LIBUKMMAP=y
+    - CONFIG_OPTIMIZE_NONE=y
+targets:
+  - architecture: x86_64
+    platform: linuxu
+  - architecture: x86_64
+    platform: kvm
+  - architecture: x86_64
+    platform: xen
+  - architecture: arm64
+    platform: kvm
+libraries:
+  musl:
+    version: stable
+  lwip:
+    version: stable
+    kconfig:
+      - CONFIG_LWIP=y
+      - CONFIG_LWIP_IGMP=y
+      - CONFIG_LWIP_NOTHREADS=y
+  micropython:
+    version: stable
+    kconfig:
+      - CONFIG_LIBMICROPYTHON=y
+      - CONFIG_LIBMICROPYTHON_MAIN_FUNCTION=y
+  libsodium:
+    version: stable
+    kconfig:
+      - CONFIG_LIBSODIUM=y
+  libuuid:
+    version: stable
+    kconfig:
+      - CONFIG_LIBUUID=y
+volumes:
+  vol0:
+    driver: initrd
+    source: ./helloworld.py
