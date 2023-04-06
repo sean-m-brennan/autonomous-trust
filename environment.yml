@@ -10,4 +10,4 @@ dependencies:
   - networkx
   - python>=3.10
   - quart
-prefix: /opt/miniconda3/envs/autonomous_trust
+
