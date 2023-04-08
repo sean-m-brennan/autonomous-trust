@@ -1,0 +1,46 @@
+$(eval $(call addlib,appautonomoustrust_py))
+
+# entrypoint python script
+AT_PY_INIT_SCRIPT = init.py
+
+# supporting python packages
+AT_PY_SOURCES = autonomous_trust
+
+# required by libpython3, will create python rootfs in APP_BASE
+path = fs0
+
+
+AT_PY_SRC_PATHS := $(addprefix $(APP_BASE)/, $(AT_PY_SOURCES))
+AT_PY_ROOTFS = $(APP_BASE)/$(path)
+AT_PY_LIBPYTHON_DEST = $(AT_PY_ROOTFS)$(CONFIG_LIBPYTHON3_PYTHONPATH)
+AT_PY_HOST_PYVER = python$(shell python3 --version | awk '{print $$2}' | awk -F. '{print $$1 "." $$2}')
+AT_PY_LIB_PYVER = $(shell echo $(CONFIG_LIBPYTHON3_PYTHONPATH) | awk -F/ '{print $$NF}')
+
+
+# Fix potential version mismatch in python rootfs
+$(AT_PY_ROOTFS)/.fixed: python-rootfs
+	@if [ "$(AT_PY_LIB_PYVER)" != "" ] && \
+            [ "$(AT_PY_LIB_PYVER)" != "$(AT_PY_HOST_PYVER)" ]; then \
+		echo RM      $(AT_PY_ROOTFS)/lib/$(AT_PY_HOST_PYVER); \
+		rm -rf $(AT_PY_ROOTFS)/lib/$(AT_PY_HOST_PYVER); \
+	fi
+	@$(TOUCH) $@
+
+# Add extra packages
+$(AT_PY_ROOTFS)/.extra: $(AT_PY_ROOTFS)/.fixed
+	@echo CP      $(AT_PY_SOURCES)
+	@cp -rL $(AT_PY_SRC_PATHS) $(AT_PY_LIBPYTHON_DEST)/
+	@echo CP      $(AT_PY_INIT_SCRIPT)
+	@cp $(APP_BASE)/$(AT_PY_INIT_SCRIPT) $(AT_PY_ROOTFS)/
+	@$(TOUCH) $@
+
+# Compress
+$(APP_BASE)/minrootfs.tgz: $(AT_PY_ROOTFS)/.extra
+	@echo TAR     $(path)
+	@tar czf $@ -C $(APP_BASE)/$(path) .
+
+$(APPAUTONOMOUSTRUST_PY_BUILD)/.prepared: $(APP_BASE)/minrootfs.tgz
+	@$(TOUCH) $@
+
+UK_PREPARE += $(APPAUTONOMOUSTRUST_PY_BUILD)/.prepared
+
