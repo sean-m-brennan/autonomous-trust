@@ -14,6 +14,6 @@ config APPAUTONOMOUSTRUST_PRINTARGS
 config APPAUTONOMOUSTRUST_SPINNER
 	bool "Stay alive"
 	select LIBPOSIX_TIME
-	default n
+	default y
 	help
 	  Shows an animation instead of shutting down
