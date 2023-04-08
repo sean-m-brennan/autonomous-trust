@@ -1,5 +1,11 @@
 #!/bin/bash
 
+this_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+working_dir=$(pwd)
+
+export UK_WORKDIR=${this_dir}/.unikraft
+export KRAFTRC=${this_dir}/.kraftrc
+
 # 2023/04/06: pykraft deprecated, but KraftKit too alpha to use
 
 # pykraft or kraftkit
@@ -98,16 +104,15 @@ if [ ! -f .update ] || [ $(find . -maxdepth 1 -mtime +1 -type f -name ".update" 
 fi
 
 # Build
-cd $impl
+cd $this_dir/$impl
 if $clean; then
     $kraft clean
 fi
 if $pristine; then
-    git clean .
+    git clean -xdf .
 fi
 if [ "$tool" = "pykraft" ]; then
     cp Kraftfile kraft.yaml
-    $kraft init
     $kraft configure -m $arch -p $platform -t ${target}_${platform}-$arch $force
     $kraft build
     if $run; then
@@ -120,4 +125,4 @@ if [ "$tool" = "kraftkit" ]; then
 	$kraft run
     fi
 fi
-cd ..
+cd $working_dir

@@ -1,0 +1,10 @@
+menuconfig LIBZMQ
+	bool "ZeroMQ core engine"
+	default n
+
+if LIBZMQ
+config LIBZMQ_MAIN_FUNCTION
+	bool "Provide main function"
+	default n
+
+endif
