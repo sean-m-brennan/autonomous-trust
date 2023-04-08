@@ -2,7 +2,7 @@
 specification: '0.5'
 name: autonomoustrust_py
 unikraft:
-  version: staging
+  version: stable
   kconfig:
     - CONFIG_LIBUK9P=y
     - CONFIG_LIB9PFS=y
@@ -23,17 +23,17 @@ targets:
     platform: kvm
 libraries:
   musl:
-    version: staging
+    version: stable
   lwip:
-    version: staging
+    version: stable
   zlib:
-    version: staging
+    version: stable
   libuuid:
-    version: staging
+    version: stable
   libsodium:
-    version: staging
+    version: stable
   python3:
-    version: staging
+    version: stable
     kconfig:
       - CONFIG_LIBPYTHON3=y
       - CONFIG_LIBPYTHON3_EXTENSIONS=y
