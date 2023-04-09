@@ -2,3 +2,4 @@ kraft.yaml
 build
 .config*
 fs0
+minrootfs.tgz
