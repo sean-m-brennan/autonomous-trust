@@ -36,7 +36,8 @@
 \renewcommand{\abstractname}{Executive Summary}
 
 \newcommand{\projectName}{\emph{AutonomousTrust }}
-\newcommand{\analysisName}{\emph{Flexline }}
+%\newcommand{\analysisName}{\emph{Flexline }}
+\newcommand{\analysisName}{\emph{MaterialCentral }}
 
 \bibliographystyle{unsrt}
 
@@ -49,17 +50,17 @@
 \TekFiveTitle
 
 \begin{abstract}
-	Cybersecurity efforts are at a running-in-place standstill due to the utterly non-scalable assumptions currently embedded in our computing paradigms.
+	Cybersecurity efforts are woefully struggling due to the utterly non-scalable assumptions currently embedded in our computing paradigms.
 	Software, hardware and administrative strategies, too numerous to count, all attempt to shoehorn security into new and existing systems, only to impair automated cooperation and collaboration.
 	We struggle with this because default human models of reciprocity simply do not hold at large scales, or when participants are at cross-purposes.
 	Our software constructs unconsciously reflect that.
 	
-	We should not have to think about security, automation should take care of that for us.
+	We should not have to think about security; automation should take care of that for us.
 	Why doesn't it?
 	Because we haven't taught computers how to trust.
 	To combat this limitation we allow the machine to be in charge of the trust model - and that in turn unlocks more efficient processing (less noise), more direct routing (no middleman), and as such much greater scaling, securely.
 		
-	The ecosystem we present here is fully realizable with current technology --- no special hardware (though we might be careful about what we choose), no unproven libraries (but again choosing carefully) --- just small XML messages over any connection and a few small, shared blockchain ledgers.
+	The ecosystem we present here is fully realizable with current technology --- no special hardware (though we might be careful about what we choose), no unproven libraries (but again choosing carefully) --- just small messages over any connection and a few small, shared blockchain ledgers.
 \end{abstract}
 
 \getenv[\SCENARIO]{AUTONOMOUSTRUST_SCENARIO}\show\SCENARIO
@@ -83,6 +84,10 @@ Combining the best of cryptography, blockchain, and distributed computing techno
 When combined with TekFive's \analysisName product and program-correctness expertise, \projectName offers a comprehensive environment for decentralized computing that minimizes security risks and optimizes cooperation.
 \\[10pt]
 \input{scenario_\SCENARIO_conclusion}
+
+Our security approach holds for more everyday circumstances as well.
+Given what we know about the SunBurst supply-chain attack, \projectName would have eliminated the routes this hack took for both the vendor and their clients.
+In this case, the protection is primarily due to the automatic capabilities restrictions that arise naturally in \projectName.
 \\[10pt]
 One glaring omission we have not addressed here is the potential vulnerabilities presented by the operating system and hardware that \projectName runs on.
 The equally obvious solution would be to run our system on bare metal, or a minimal, provably-secure OS. This will be the subject of additional research.

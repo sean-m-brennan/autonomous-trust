@@ -1,7 +1,7 @@
 $(eval $(call addlib,appautonomoustrust_py))
 
 # entrypoint python script
-AT_PY_INIT_SCRIPT = init.py
+AT_PY_INIT_SCRIPT = at_init.py
 
 # supporting python packages
 AT_PY_SOURCES = autonomous_trust
