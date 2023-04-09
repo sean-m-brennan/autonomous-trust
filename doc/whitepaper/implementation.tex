@@ -14,7 +14,7 @@ Offset by text that looks like this paragraph, the following sections show how e
 In addressing model facet \#\ref{scale} (scale), we note that decentralization is critical to scalability, therefore we utilize peer-to-peer direct messaging.
 Address-lookup for directly-unknown resources is handled by the network hierarchy.
 Similarly, we are carrier and protocol agnostic.
-All communications use post-quantum elliptic-curve cryptography from end to end.
+All communications use cryptography from end to end.  % post-quantum elliptic-curve crypto
 What all this means in practice: NNG messaging written in C, Curve25519 key exchange with ChaCha20-Poly1305 transport cipher, and a custom replacement for the Domain Name System (DNS) (see section~\ref{subsec:id}).
 These details allow us to make messaging itself a first-class trust-scoreable transaction, which in turn leads to the ability to dynamically tune-out harmful messaging with our trust mechanism.
 Deliverability reports trace message receipts to determine underlying network reachability at any given time, which can be critical if the application requires timeliness or reliability.
@@ -29,7 +29,7 @@ All hierarchy leaders are also participants in their own enclave, so the network
 
 \begin{figure}
 	\centering
-	\includegraphics[width=0.6\linewidth]{network}
+	\includegraphics[width=0.4\linewidth]{network}
 	\caption{Sample network connectivity graph}
 	\label{fig:network}
 \end{figure}
@@ -157,7 +157,16 @@ Otherwise, in server roles, they can advertise their services.
 These messages are collated by peer leaders in order to efficiently traverse the hierarchy.
 This encourages cross-domain communications and system-wide trust versus clique-formation.
 
+\begin{figure}
+	\centering
+	\includegraphics[width=0.4\linewidth]{users}
+	\caption{User interfaces}
+	\label{fig:users}
+\end{figure}
+
 Outside of the programming phase where agent capabilities are defined, user interaction with agents is strictly based on configuration (new schemas or negotiation inputs) or triggering events such as functionality or data requests, or authorizing new networks.
+Users are kept in a domain separate from the main activity of the network, as seen in Figure~\ref{fig:users}.
+This is a key aspect of system security, similar to CPU protection rings which restrict direct hardware access.
 This clearly becomes a challenge for debugging or simply administering a system, likely solved by administrative agents.
 
 \begin{ppl}
