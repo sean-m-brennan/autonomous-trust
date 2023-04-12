@@ -5,7 +5,7 @@
 #include <uk/config.h>
 #endif /* __Unikraft__ */
 
-#if CONFIG_APPHELLOWORLD_SPINNER
+#if CONFIG_APPAUTONOMOUSTRUST_SPINNER
 #include <time.h>
 #include <errno.h>
 #include "monkey.h"
@@ -21,24 +21,24 @@ static void millisleep(unsigned int millisec)
 		ret = nanosleep(&ts, &ts);
 	while (ret && errno == EINTR);
 }
-#endif /* CONFIG_APPHELLOWORLD_SPINNER */
+#endif /* CONFIG_APPAUTONOMOUSTRUST_SPINNER */
 
 int main(int argc, char *argv[])
 {
-#if CONFIG_APPHELLOWORLD_PRINTARGS || CONFIG_APPHELLOWORLD_SPINNER
+#if CONFIG_APPAUTONOMOUSTRUST_PRINTARGS || CONFIG_APPAUTONOMOUSTRUST_SPINNER
 	int i;
 #endif
 
 	printf("Hello world!\n");
 
-#if CONFIG_APPHELLOWORLD_PRINTARGS
+#if CONFIG_APPAUTONOMOUSTRUST_PRINTARGS
 	printf("Arguments: ");
 	for (i=0; i<argc; ++i)
 		printf(" \"%s\"", argv[i]);
 	printf("\n");
-#endif /* CONFIG_APPHELLOWORLD_PRINTARGS */
+#endif /* CONFIG_APPAUTONOMOUSTRUST_PRINTARGS */
 
-#if CONFIG_APPHELLOWORLD_SPINNER
+#if CONFIG_APPAUTONOMOUSTRUST_SPINNER
 	i = 0;
 	printf("\n\n\n");
 	for (;;) {
@@ -49,7 +49,7 @@ int main(int argc, char *argv[])
 		fflush(stdout);
 		millisleep(250);
 	}
-#endif /* CONFIG_APPHELLOWORLD_SPINNER */
+#endif /* CONFIG_APPAUTONOMOUSTRUST_SPINNER */
 
 	return 0;
 }
