@@ -41,8 +41,3 @@ libraries:
       - CONFIG_LIBPYTHON3_EXTENSION_LIBMPDEC=y
       - CONFIG_LIBPYTHON3_EXTENSION_UUID=y
       - CONFIG_LIBPYTHON3_EXTENSION_ZLIB=y
-      - CONFIG_LIBPYTHON3_MAIN_FUNCTION=y
-volumes:
-  fs0:
-    driver: 9pfs
-    source: ./minrootfs.tgz

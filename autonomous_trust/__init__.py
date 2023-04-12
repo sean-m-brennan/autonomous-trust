@@ -1,3 +1,1 @@
-
-def main():
-    print("You're using AutonomousTrust")
+from .automate import main  # noqa

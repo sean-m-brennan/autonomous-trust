@@ -1,7 +1,7 @@
 import random
 import networkx as nx
 
-from . import network_graph as ng
+from viz import network_graph as ng
 
 
 class DeceitNetwork(ng.NetworkGraph):
