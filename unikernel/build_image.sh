@@ -1,4 +1,5 @@
 #!/bin/bash
+#set -x
 
 this_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 working_dir=$(pwd)
@@ -21,7 +22,7 @@ platform=kvm
 impl=py
 
 usage() {
-    echo "Usage: $(basename $0) [--tool TOOL] [-m|--architecture ARCH] [-p|--platform PLAT] [-i|--implementation IMPL] [--initramfs] [--run] [--clean] [--pristine] [--force] [--debug] [--help]"
+    echo "Usage: $(basename $0) [--tool TOOL] [-m|--architecture ARCH] [-p|--platform PLAT] [-i|--implementation IMPL] [--initrd] [--run] [--clean] [--pristine] [--force] [--debug] [--help]"
     echo "  where"
     echo "       TOOL is pykraft or kraftkit"
     echo "       ARCH is x86_64 or arm64 or arm"
@@ -29,12 +30,13 @@ usage() {
     echo "       IMPL is py or c"
 }
 
-initramfs=false
+initrdfs=false
 run=false
 debug=false
 force=
 clean=false
 pristine=false
+qemu_native=x86_64
 
 while [ -n "$1" ]; do
     if [ "$1" = "--tool" ]; then
@@ -49,8 +51,11 @@ while [ -n "$1" ]; do
     elif [[ "$1" = "--impl"* ]] || [ "$1" = "-i" ]; then
         shift
         impl="$1"
-    elif [ "$1" = "--initramfs" ]; then
-        initramfs=true
+    elif [[ "$1" = "--qemu-native" ]]; then
+        shift
+        qemu_native="$1"
+    elif [ "$1" = "--initrd" ]; then
+        initrdfs=true
     elif [ "$1" = "--run" ]; then
         run=true
     elif [ "$1" = "--debug" ]; then
@@ -142,7 +147,7 @@ fi
 set -e
 if [ "$tool" = "pykraft" ]; then
     cp Kraftfile.9pfs kraft.yaml
-    if $initramfs; then
+    if $initrdfs; then
         cp Kraftfile.initrd kraft.yaml
     fi
     $kraft configure -m $arch -p $platform -t $kernel $force
@@ -150,7 +155,7 @@ if [ "$tool" = "pykraft" ]; then
 fi
 if [ "$tool" = "kraftkit" ]; then
     cp Kraftfile.9pfs Kraftfile
-    if $initramfs; then
+    if $initrdfs; then
         cp Kraftfile.initrd Kraftfile
     fi
     $kraft build -m $arch -p $platform --log-type simple $force
@@ -161,7 +166,8 @@ graphics="-nographic -vga none -device sga"
 initrd=
 blkdev=
 if [ -d fs0 ]; then
-    if $initramfs; then
+    # autonomous_trust and required packages installed using Makefile.uk
+    if $initrdfs; then
         cd fs0 && find . | cpio -o --format=newc | gzip -9 >../initramfz && cd ..
         initrd="-initrd ${this_dir}/${impl}/initramfz"
     else
@@ -173,9 +179,12 @@ if $run; then
     if [ "$platform" = "linuxu" ]; then
         $kernel_path
     elif [ "$platform" = "kvm" ]; then
+        if $initrdfs; then
+            echo "Warning: filesystem is read-only"
+        fi
         echo "To exit QEMU, press ctrl-a x"
-        echo qemu args: $graphics -m 1G $blkdev $initrd -kernel $kernel_path
-        qemu-system-x86_64 $graphics -m 1G $blkdev $initrd -kernel $kernel_path
+        #echo qemu args: $graphics -m 1G $blkdev $initrd -kernel $kernel_path
+        qemu-system-${qemu_native} $graphics -m 1G $blkdev $initrd -kernel $kernel_path
     fi
 fi
 
