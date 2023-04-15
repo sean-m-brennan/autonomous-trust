@@ -4,13 +4,8 @@ name: autonomoustrust_py
 unikraft:
   version: stable
   kconfig:
-    - CONFIG_LIBUK9P=y
-    - CONFIG_LIB9PFS=y
-    - CONFIG_LIBDEVFS=y
-    - CONFIG_LIBDEVFS_AUTOMOUNT=y
     - CONFIG_LIBVFSCORE_AUTOMOUNT_ROOTFS=y
-    - CONFIG_LIBVFSCORE_ROOTFS_9PFS=y
-    - CONFIG_LIBVFSCORE_ROOTDEV="fs0"
+    - CONFIG_LIBVFSCORE_ROOTFS_INITRD=y
     - CONFIG_LIBUKLIBPARAM=y
 targets:
   - architecture: x86_64

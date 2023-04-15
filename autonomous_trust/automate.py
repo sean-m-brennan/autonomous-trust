@@ -1,8 +1,8 @@
 import os
 import time
 
-CFG_VAR_NAME = 'AUTONOMOUS_TRUST_CONFIG'
-CFG_DEFAULT = os.path.join('etc', 'at')
+from .configuration import Configuration
+from .identity import Identity, Peers
 
 
 def banner():
@@ -12,16 +12,34 @@ def banner():
 
 
 def configure():
-    for cfg in os.listdir(os.environ.get(CFG_VAR_NAME, '/' + CFG_DEFAULT)):
-        pass
-        # TODO initialize AT per configuration files in os.environ["AUTONOMOUS_TRUST_CONFIG"] or /etc
-    print("Configuring for (unknown domain)")
-    return ['communications', 'reputation', 'computing services', 'data services']
+    configs = {}
+    cfg_dir = os.environ.get(Configuration.VARIABLE_NAME, Configuration.PATH_DEFAULT)
+
+    def get_cfg_type(path):
+        return os.path.splitext(os.path.basename(path))[0]
+
+    config_files = os.listdir(cfg_dir)
+    cfg_types = map(get_cfg_type, config_files)
+    if 'identity' not in cfg_types:
+        Identity.initialize('myself', '127.0.0.1').to_file(os.path.join(cfg_dir, 'identity.yaml'))
+    if 'peers' not in cfg_types:
+        Peers().to_file(os.path.join(cfg_dir, 'peers.yaml'))
+    # TODO etc
+    config_files = os.listdir(cfg_dir)
+    config_paths = map(lambda x: os.path.join(cfg_dir, x), config_files)
+    for cfg_file in config_paths:
+        configs[get_cfg_type(cfg_file)] = Configuration.from_file(cfg_file)
+    # TODO domain?:
+    print("Configuring %s at %s for %s" %
+          (configs['identity'].nickname, configs['identity'].address, '(unknown domain)'))
+    # TODO this is fake:
+    configs['processes'] = ['communications', 'reputation', 'computing services', 'data services']
+    return configs
 
 
 def main():
     banner()
-    procs = configure()
+    procs = configure()['processes']
     for proc in procs:
         # TODO start child processes (comms, sensors, data-processing, etc)
         print("Starting %s ..." % proc)
