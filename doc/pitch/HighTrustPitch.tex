@@ -7,6 +7,8 @@
 
 \newcommand{\projectName}{\emph{AutonomousTrust }}
 
+%\newcommand\wordcount{\immediate\write18{texcount -sub-section \jobname.tex | grep "Section" | sed -e 's/+.+//' | sed -n \thesection p > 'count.txt'}(\input{count.txt}words)}
+
 \title{\textbf{\huge \projectName}\\ NSF Seed Fund Project Pitch %
 \vspace{-2em}% comment out if author is used
 }
@@ -19,10 +21,7 @@
 
 \section{The Technical Innovation}\label{sec:innovation}
 
-\projectName is TekFive's high-trust cooperative computing concept --- a data messaging framework that, as part of a larger application, requests and serves encrypted data \textit{only} with trusted peers and only to the extent of that fine-grained trust.
-Said trust is dynamically evaluated in real time to rapidly eliminate incoming threats and even reclassify existing peers as their behavior changes and thus protect resources.
-Greater risk requires greater trust.
-An autonomous agent using this framework can adaptively: 1) refuse communications from severely untrusted peers, conserving bandwidth; 2) communicate with but refuse computation services to faintly trusted peers, protecting CPU time; 3) offer services but refuse data-sharing to moderately trusted peers, protecting data; \textit{and} 4) offer data-sharing to well trusted peers; all with a configurable gradient of access at every level, and all within the same application.
+\input{concept}
 
 Our system presumes that the best viewpoint of security is local, situational and ever-changing, thereby requiring decentralized control, detection and response.
 As such, our system replicates certain aspects of human social behavior in seven key facets.
@@ -32,17 +31,19 @@ We use a strict negotiation protocol to dynamically mediate peer interactions.
 We provide for consistent, immutable identity with a crypto-ledger --- shared among cohorts only.
 This allows reputation scoring derived from shared transaction scores.
 Reputation is bootstrapped through game-theoretic strategies.
-Lastly, paranoid security and vulnerable opportunity are dynamically self-balanced.
+Lastly, the opposing strategies of paranoid security and vulnerable opportunity are dynamically self-balanced.
 In combination, these facets are the backbone of an ecosystem supporting a community of autonomous agents which perform decentralized computing in a way that minimizes security risks and optimizes cooperation.
 
-\projectName is related to advances in Internet-of-Things (IoT) and machine-to-machine (M2M) messaging technologies, but explicitly addresses a prevalent lack of security in that paradigm, as well as cybersecurity shortcomings in general.
+\projectName is related to advances in Internet-of-Things (IoT) and machine-to-machine (M2M) messaging technologies, but explicitly addresses a prevalent lack of security in those paradigms, as well as cybersecurity shortcomings in general.
 This concept is also a highly-distributed answer to the extreme centralization of Cloud computing, in which we perceive foundational vulnerabilities.
 Although Web3 principles are incorporated here, our concept is a concrete step beyond, emphasizing blockchain's roots in distributed consensus.
 Our intended realization of this project into a product would be no mere incremental step, but a paradigm-shift for computation, much like cloud computing was before it.
 
+\wordcount
+
 \section{The Technical Objectives and Challenges}\label{sec:objectives}
 
-This proof-of-concept project will necessarily be an exercise of engineering development to flesh-out the operational viability of the above mechanisms, but it will also research and explore the effectiveness of the concept itself.
+This proof-of-concept project will necessarily require engineering development to rough-out the operational viability of the above mechanisms, but it will also research and explore the effectiveness of the concept itself.
 To this end, we will study three things: 1) the structure, efficiency and resiliency of self-formed network topologies, 2) effective patterns of negotiation and reputation-building at scale, and 3) the resistance of the network at each level to failure and attack.
 This last item is our primary metric for success, ultimately comparing against the 2019--2020 SunBurst supply-chain attack on the SolarWinds Orion product.
 We will intentionally include and then exploit several classes of known CVE vulnerabilities against individual agents, run established attacks such as DoS, 51\% and Sybil against our blockchains, and conduct system-specific attacks.
@@ -50,21 +51,29 @@ We have identified five attack vectors specific to our system: 1) service decept
 Additional possible attacks may be discovered as development proceeds.
 Statistical methods will be used to determine our effectiveness compared to both naïve and state-of-the-art implementations.
 
-Our mature product will likely be written in C for performance and deployed in containers, but at this stage we will be using Python for rapid prototyping and little or no sandboxing.
+Our mature product will likely be written in C for performance and deployed in containers or virtual machines, but at this stage we will be using Python for rapid prototyping and little or no sandboxing.
 We will develop a testbed environment that will enable network behavior visualization, injection of errors and attacks, and general debugging.
 This tool can later be used as a development environment for instances of the ultimate product as well.
 
+\wordcount
+
 \section{The Market Opportunity}\label{sec:opportunity}
 
-Although potentially widely applicable, this concept is perfect for contentious inter-organizational data sharing.
-Without naming names, our experience has shown that within and among U.S.\ federal agencies a combination of competition for funding, conflicting expertise, and overlapping domain authority creates social barriers to trust.
-This distrust is highly detrimental to data sharing and collaboration that is often crucial to mission objectives.
+Although potentially widely applicable, this concept is perfect for coordination in hostile environments and contentious inter-organizational data sharing.
+For USDOD customers, this product could be a key element for reliable sixth generation warfare (6GW) [non-contact] or 7GW [total automation].
+Numerous U.S.\ federal agencies, IC in particular, are informationally siloed from one another, either intentionally or through a combination of competition for funding, conflicting expertise, and overlapping domain authority.
+These structural barriers are highly detrimental to data sharing and collaboration which is often crucial to mission objectives.
 
-In addition to being a mechanism for secure data and computation resources, \projectName can be a tool for objectively demonstrating good-will across the divide and allow for building social trust.
-By formalizing the collaboration in detail, and providing concrete, traceable metrics of cooperation, it can dispel unfounded suspicion and foster an environment for teamwork even in a massive organization.
-Keeping government agencies from stepping on each other's toes would alone be an important boon to the nation.
+The private sector is no less contentious and under-threat, yet commerce requires some level of sharing.
+Analysis of the SunBurst attack suggests that, aside from the initial SolarWinds network breach, state-of-the-art cybersecurity techniques and tools would have been ineffective at preventing or even detecting this hack.
+Once inside the network, attacker activity would have been indistinguishable from that of valid developers, and client companies would have no reason to cut-off Orion's access to the Internet.
+In short, while Zero-Trust would have likely prevented the initial network hack, neither it nor most intrusion detection systems could have halted the rest of this attack.
 
-We also envision follow-on expansions of this product into human trustworthiness to solve the software supply-chain problem once and for all.
+As we will show in this project, \projectName makes this attack \emph{impossible}.
+Using our system, even code developers would not have direct access to the build system -- eliminating the binary injection.
+Clients that used an \projectName-based product would immediately know if that product was violating the scope of its specification, when the Trojan Horse either phones home or tries to control the rest of the client system.
+
+\wordcount
 
 \section{The Company and Team}\label{sec:team}
 
@@ -80,5 +89,7 @@ Corey Baswell is TekFive's Chief Technology Officer.
 He has over 20 years of enterprise IT experience as a full stack engineer in the areas of application development, enterprise architecture, and platform development.
 He has developed numerous enterprise software services including the NASA OpenESB, the NASA and VA DevSecOps pipeline, the NASA and VA Pulse app analytics, and the NASA Application Portfolio Management tool.
 Mr. Baswell received a Bachelor of Science degree in Computer Engineering from Auburn University where he graduated summa cum laude.
+
+\wordcount
 
 \end{document}
