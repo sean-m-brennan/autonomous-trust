@@ -32,6 +32,8 @@ libraries:
     version: stable
   libsodium:
     version: stable
+  libffi:
+    version: staging
   python3:
     version: stable
     kconfig:
@@ -41,6 +43,8 @@ libraries:
       - CONFIG_LIBPYTHON3_EXTENSION_LIBMPDEC=y
       - CONFIG_LIBPYTHON3_EXTENSION_UUID=y
       - CONFIG_LIBPYTHON3_EXTENSION_ZLIB=y
+      - CONFIG_LIBPYTHON3_EXTENSION_SODIUM=y
+      - CONFIG_LIBPYTHON3_EXTENSION_SODIUM_MODULE_C="_sodium.c"
 volumes:
   fs0:
     driver: 9pfs
