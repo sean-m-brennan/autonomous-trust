@@ -4,46 +4,36 @@ $(eval $(call addlib,appautonomoustrust_py))
 APPAUTONOMOUSTRUST_PY_SRCS-y += $(APPAUTONOMOUSTRUST_PY_BASE)/main.c
 
 # supporting python packages (not from pip)
-APPAUTONOMOUSTRUST_PY_SOURCES = autonomous_trust
+APPAUTONOMOUSTRUST_PY_SOURCES = autonomous_trust sodium
 
 APPAUTONOMOUSTRUST_PY_SRC_PATHS := $(addprefix $(APP_BASE)/, $(APPAUTONOMOUSTRUST_PY_SOURCES))
 
 
+# Tells lib-libpython3 where to build filesystem
+path = fs0
+
 # Python rootfs in APP_BASE
-PYTHON3_ROOTFS = $(APP_BASE)/fs0
+PYTHON3_ROOTFS = $(APP_BASE)/$(path)
 
 SITE_PACKAGES = $(PYTHON3_ROOTFS)$(CONFIG_LIBPYTHON3_PYTHONPATH)/site-packages
 HOST_PYTHON_VERSION = $(shell python3 --version | awk '{print $$2}' | awk -F. '{print $$1 "." $$2}')
 
-LIBPYTHON3_VERSION = $(shell echo $(CONFIG_LIBPYTHON3_PYTHONPATH) | awk -F/ '{print $$NF}' | sed 's/python//')
-LIBPYTHON3_BUILD = $(APP_BASE)/build/libpython3/
-LIBPYTHON3_SRC = $(LIBPYTHON3_BUILD)/origin/Python-$(LIBPYTHON3_VERSION)
-LIBPYTHON3_BASE = $(CONFIG_UK_LIB)/python3
+# Unfortunately, hard-coded full version
+LIB_PYTHON3_FULL_VERSION = 3.7.4
+LIB_PYTHON3_VERSION = $(shell echo $(CONFIG_LIBPYTHON3_PYTHONPATH) | awk -F/ '{print $$NF}' | sed 's/python//')
+LIB_PYTHON3_BUILD = $(APP_BASE)/build/libpython3
+LIB_PYTHON3_SRC = $(LIB_PYTHON3_BUILD)/origin/Python-$(LIB_PYTHON3_FULL_VERSION)
+LIB_PYTHON3_BASE = $(CONFIG_UK_LIB)/python3
 
-###############################
-# The following is straight out of the lib-libpython3 Makefile.uk
-# ... with modifications, of course
-
-# Create virtual environment
-$(PYTHON3_ROOTFS)/.keep: $(LIBPYTHON3_BUILD)/.origin
-	python3 -m venv $(PYTHON3_ROOTFS) && touch $@
-
-# Configure origin
-$(PYTHON3_ROOTFS)/.configured: $(PYTHON3_ROOTFS)/.keep
-	@mkdir -p $(PYTHON3_ROOTFS) &>/dev/null
-	@cd $(LIBPYTHON3_SRC) && ./configure --prefix=$(shell realpath $(PYTHON3_ROOTFS)) && $(TOUCH) $@
-
-# Install Python standard library into virtual environment
-$(PYTHON3_ROOTFS)/.done: $(PYTHON3_ROOTFS)/.configured
-	@cd $(LIBPYTHON3_SRC) && make install
-	@cp $(LIBPYTHON3_BASE)/_sysconfigdata.py $(PYTHON3_ROOTFS)/lib/python3.7/
+# Install full Python into virtual environment, must artificially trigger lib-libpython3 build
+$(PYTHON3_ROOTFS)/.rebuilt: $(PYTHON3_ROOTFS)/.configured python-rootfs
+	@cd $(LIB_PYTHON3_SRC) && make install >$(APP_BASE)/libpython-build.log
 	@$(TOUCH) $@
-###########################
 
 # Fix potential version mismatch in python rootfs
-$(PYTHON3_ROOTFS)/.fixed: $(PYTHON3_ROOTFS)/.done
-	@if [ "$(LIBPYTHON3_VERSION)" != "" ] && \
-            [ "$(LIBPYTHON3_VERSION)" != "$(HOST_PYTHON_VERSION)" ]; then \
+$(PYTHON3_ROOTFS)/.fixed: $(PYTHON3_ROOTFS)/.rebuilt
+	@if [ "$(LIB_PYTHON3_VERSION)" != "" ] && \
+            [ "$(LIB_PYTHON3_VERSION)" != "$(HOST_PYTHON_VERSION)" ]; then \
 		echo "RM      $(PYTHON3_ROOTFS)/lib/python$(HOST_PYTHON_VERSION)"; \
 		rm -rf $(PYTHON3_ROOTFS)/lib/python$(HOST_PYTHON_VERSION); \
 		rm -rf $(PYTHON3_ROOTFS)/bin/python$(HOST_PYTHON_VERSION)*; \
@@ -51,14 +41,18 @@ $(PYTHON3_ROOTFS)/.fixed: $(PYTHON3_ROOTFS)/.done
 	fi
 	@$(TOUCH) $@
 
-# Add extra packages
-$(PYTHON3_ROOTFS)/.extra: $(PYTHON3_ROOTFS)/.fixed
-	@mkdir -p $(PYTHON3_ROOTFS)/etc/at
-	@echo "CP      $(APPAUTONOMOUSTRUST_PY_SOURCES) -> $(SITE_PACKAGE)/"
-	@cp -rL $(APPAUTONOMOUSTRUST_PY_SRC_PATHS) $(SITE_PACKAGES)/
+# Install required packages with pip  # FIXME missing _ctypes (bad timing - not built yet) need post-build hook
+$(PYTHON3_ROOTFS)/.pip_pkgs: $(PYTHON3_ROOTFS)/.fixed
 	@source $(PYTHON3_ROOTFS)/bin/activate && \
 	$(PYTHON3_ROOTFS)/bin/python3 -m ensurepip && \
-	$(PYTHON3_ROOTFS)/bin/pip3 install -r $(APP_BASE)/requirements.txt
+	source $(APP_BASE)/piprc && $(PYTHON3_ROOTFS)/bin/pip3 install -r $(APP_BASE)/requirements.txt
+	@$(TOUCH) $@
+
+# Add extra packages
+$(PYTHON3_ROOTFS)/.extra: $(PYTHON3_ROOTFS)/.fixed #FIXME .pip_pkgs
+	@mkdir -p $(PYTHON3_ROOTFS)/etc/at
+	@echo "CP      $(APPAUTONOMOUSTRUST_PY_SOURCES) -> $(SITE_PACKAGES)/"
+	@cp -rL $(APPAUTONOMOUSTRUST_PY_SRC_PATHS) $(SITE_PACKAGES)/
 	@$(TOUCH) $@
 
 # Compress

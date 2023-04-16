@@ -1,10 +1,7 @@
 menuconfig LIBZMQ
-	bool "ZeroMQ core engine"
+	bool "libzmq - ZeroMQ library"
 	default n
-
-if LIBZMQ
-config LIBZMQ_MAIN_FUNCTION
-	bool "Provide main function"
-	default n
-
-endif
+	select LIBCXX
+	select LIBCXXABI
+	select LIBUNWIND
+	select COMPILER_RT
