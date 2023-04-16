@@ -1,0 +1,52 @@
+diff -ur .unikraft.orig/unikraft/plat/linuxu/memory.c .unikraft.devel/unikraft/plat/linuxu/memory.c
+--- .unikraft.orig/unikraft/plat/linuxu/memory.c	2023-04-14 21:38:44.695000000 -0600
++++ .unikraft.devel/unikraft/plat/linuxu/memory.c	2023-04-14 18:06:47.810000000 -0600
+@@ -127,9 +127,11 @@
+ 
+ int ukplat_memregion_count(void)
+ {
+-	static int have_heap = 0;
+-	static int have_initrd = 0;
+-	int rc = 0;
++	static int init;
++	int rc;
++
++	if (init)
++		return init;
+ 
+ 	/*
+ 	 * NOTE: The heap size and initrd file can be changed by a
+@@ -137,17 +139,13 @@
+ 	 * by the boot library shortly before memory regions are
+ 	 * scanned. This is why we initialize the heap here.
+ 	 */
+-	if (!have_heap) {
+-		rc = __linuxu_plat_heap_init();
+-		have_heap = (rc == 0) ? 1 : 0;
+-	}
+-
+-	if (!have_initrd) {
+-		rc = __linuxu_plat_initrd_init();
+-		have_initrd = (rc == 0) ? 1 : 0;
+-	}
++	rc = __linuxu_plat_heap_init();
++	init += (rc == 0) ? 1 : 0 ;
++
++	rc = __linuxu_plat_initrd_init();
++	init += (rc == 0) ? 1 : 0 ;
+ 
+-	return have_heap + have_initrd;
++	return init;
+ }
+ 
+ int ukplat_memregion_get(int i, struct ukplat_memregion_desc **m)
+@@ -157,6 +155,9 @@
+ 
+ 	UK_ASSERT(m);
+ 
++	if (i >= ukplat_memregion_count())
++	        return -1;
++	
+ 	if (i == 0 && _liblinuxuplat_opts.heap.base) {
+ 		mrd[0].pbase = (__paddr_t)_liblinuxuplat_opts.heap.base;
+ 		mrd[0].vbase = mrd[0].pbase;

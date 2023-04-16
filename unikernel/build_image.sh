@@ -87,7 +87,7 @@ kernel_path=${this_dir}/${impl}/build/$kernel
 # if not already in conda env, activate it
 if [ "$CONDA_PREFIX" = "" ] || [[ "$CONDA_PREFIX" != *"$env" ]]; then
     if [ "$(conda env list | awk '{print $1}' | grep $env)" = "" ]; then
-        conda env create --file ../environment.yml
+        conda env create --file ${this_dir}/../environment.yml
     fi
 
     conda_dir=$(conda info | grep -i 'base environment' | awk '{print $4}')
@@ -122,28 +122,73 @@ if [ "$kraft" = "" ]; then
     fi
 fi
 
+if $pristine; then
+    git clean -xdf ${this_dir}/$impl
+fi
+if $clean; then
+    cd $this_dir/$impl && $kraft clean
+    cd $working_dir
+fi
+
+
+# Prep libraries
+if [ ! -e ${this_dir}/py/build/_sodium.c ]; then
+    cd ${this_dir}
+    if [ ! -d pynacl ]; then
+        git clone https://github.com/pyca/pynacl.git
+    fi
+    cd pynacl
+    PYNACL_SODIUM_STATIC=1 SODIUM_INSTALL_MINIMAL=1 python3 setup.py build &> build.log
+    mkdir -p ${this_dir}/py/build
+    cp "$(find . -name _sodium.c)" ${this_dir}/py/build/
+    cd $working_dir
+fi
+
+libs="libffi libzmq"
+for lib in $libs; do
+    mkdir -p ${this_dir}/lib
+    if [ ! -d ${this_dir}/lib/$lib ]; then
+        cd ${this_dir}/lib && $kraft lib init --no-prompt \
+            --author-name "$(git config --list | grep "user\.name" | awk -F= '{print $2}')" \
+            --author-email "$(git config --list | grep "user\.email" | awk -F= '{print $2}')" \
+            --origin "$(cat ${this_dir}/$lib/origin)" \
+            --version "$(cat ${this_dir}/$lib/version)" $lib
+        cd ${this_dir}
+        cp ${this_dir}/$lib/*.uk ${this_dir}/lib/$lib/
+        cp -r ${this_dir}/$lib/patch ${this_dir}/$lib/include ${this_dir}/lib/$lib/
+        cd ${this_dir}/lib/$lib && git add ./* && git commit -a -m"Initial"
+        rm -f ${this_dir}/.update
+        $kraft list add  ${this_dir}/lib/$lib
+    fi
+done
+
 # Update once a day
-if [ ! -f .update ] || [ "$(find . -maxdepth 1 -mtime +1 -type f -name ".update" 2>/dev/null)" ]; then
+if [ ! -d ${this_dir}/.unikraft ] || [ ! -f ${this_dir}/.update ] || [ "$(find ${this_dir}/ -maxdepth 1 -mtime +1 -type f -name ".update" 2>/dev/null)" ]; then
     if [ "$tool" = "pykraft" ]; then
         $kraft list update
     elif [ "$tool" = "kraftkit" ]; then
         $kraft pkg update
     fi
-    # FIXME use a proper patch
-    if [ -e unikraft.plat.linuxu.memory.c ]; then
-        cp unikraft.plat.linuxu.memory.c .unikraft/unikraft/plat/linuxu/memory.c
+    touch ${this_dir}/.update
+fi
+
+# Initialize and patch
+cd $this_dir/$impl || exit 1
+if [ ! -e $this_dir/$impl/.init ]; then
+    $kraft init
+    touch $this_dir/$impl/.init
+fi
+if [ ! -e $UK_WORKDIR/.patched ]; then
+    cd $UK_WORKDIR && patch -p1 --forward < $this_dir/unikraft.patch
+    cd $this_dir/$impl
+    if [ -e $this_dir/unikraft.patch.$impl ]; then
+        cd $UK_WORKDIR && patch -p1 --forward < $this_dir/unikraft.patch.$impl
+        cd $this_dir/$impl
     fi
-    touch .update
+    touch $UK_WORKDIR/.patched
 fi
 
 # Build
-cd $this_dir/$impl || exit 1
-if $clean; then
-    $kraft clean
-fi
-if $pristine; then
-    git clean -xdf .
-fi
 set -e
 if [ "$tool" = "pykraft" ]; then
     cp Kraftfile.9pfs kraft.yaml
@@ -166,7 +211,9 @@ graphics="-nographic -vga none -device sga"
 initrd=
 blkdev=
 if [ -d fs0 ]; then
-    # autonomous_trust and required packages installed using Makefile.uk
+    # autonomous_trust installed using Makefile.uk
+    bash -c "export SODIUM_INSTALL=system && source fs0/bin/activate && fs0/bin/python3 -m ensurepip && source piprc && fs0/bin/pip3 install -r requirements.txt"
+    grep -RIl "from nacl\._sodium" fs0/lib/python3.7/site-packages/nacl | xargs sed -i 's|from nacl\._sodium|from _sodium|g'
     if $initrdfs; then
         cd fs0 && find . | cpio -o --format=newc | gzip -9 >../initramfz && cd ..
         initrd="-initrd ${this_dir}/${impl}/initramfz"
@@ -183,7 +230,7 @@ if $run; then
             echo "Warning: filesystem is read-only"
         fi
         echo "To exit QEMU, press ctrl-a x"
-        #echo qemu args: $graphics -m 1G $blkdev $initrd -kernel $kernel_path
+        echo qemu args: $graphics -m 1G $blkdev $initrd -kernel $kernel_path
         qemu-system-${qemu_native} $graphics -m 1G $blkdev $initrd -kernel $kernel_path
     fi
 fi
