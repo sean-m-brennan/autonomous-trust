@@ -1,0 +1,138 @@
+diff -x .git -urN .unikraft.orig/libs/libsodium/Makefile.uk .unikraft/libs/libsodium/Makefile.uk
+--- .unikraft.orig/libs/libsodium/Makefile.uk	2023-04-14 21:39:06.505000000 -0600
++++ .unikraft/libs/libsodium/Makefile.uk	2023-04-15 20:42:20.996000000 -0600
+@@ -88,6 +88,7 @@
+                      -DPACKAGE_URL=\"https://github.com/jedisct1/libsodium\" \
+                      -DPACKAGE=\"libsodium\" \
+                      -DVERSION=\"$(LIBSODIUM_VERSION)\" \
++                     -DSODIUM_STATIC=1 \
+                      -DSODIUM_LIBRARY_MINIMAL=1 \
+                      -D__linux__ \
+                      -DSTDC_HEADERS=1 \
+diff -x .git -urN .unikraft.orig/libs/python3/Config.uk .unikraft/libs/python3/Config.uk
+--- .unikraft.orig/libs/python3/Config.uk	2023-04-14 21:39:07.947000000 -0600
++++ .unikraft/libs/python3/Config.uk	2023-04-18 12:20:18.200000000 -0600
+@@ -80,6 +80,16 @@
+ 	bool "zlib"
+ 	default y
+ endif
++config LIBPYTHON3_EXTENSION_CFFI
++    bool "cffi"
++    default n
++    select LIBFFI
++config LIBPYTHON3_EXTENSION_SODIUM
++    bool "libsodium"
++    default n
++    select LIBPYTHON3_EXTENSION_CTYPES
++    select LIBPYTHON3_EXTENSION_CFFI
++    select LIBSODIUM
+ endif
+ 
+ endif
+diff -x .git -urN .unikraft.orig/libs/python3/Makefile.uk .unikraft/libs/python3/Makefile.uk
+--- .unikraft.orig/libs/python3/Makefile.uk	2023-04-14 21:39:07.947000000 -0600
++++ .unikraft/libs/python3/Makefile.uk	2023-04-18 12:55:42.687000000 -0600
+@@ -312,6 +312,8 @@
+ LIBPYTHON3_EXTENSIONS_SRCS-y += $(LIBPYTHON3_SRC)/Modules/_blake2/impl/blake2s-ref.c
+ endif
+ LIBPYTHON3_EXTENSIONS_SRCS-$(CONFIG_LIBPYTHON3_EXTENSION_BZIP2) += $(LIBPYTHON3_SRC)/Modules/_bz2module.c
++LIBPYTHON3_EXTENSIONS_SRCS-$(CONFIG_LIBPYTHON3_EXTENSION_CFFI) += $(LIBPYTHON3_SRC)/Modules/cffi/_cffi_backend.c
++LIBPYTHON3_EXTENSIONS_CFLAGS-$(CONFIG_LIBPYTHON3_EXTENSION_CFFI) += -I$(LIBPYTHON3_SRC)/Modules/cffi
+ LIBPYTHON3_EXTENSIONS_SRCS-y += $(LIBPYTHON3_SRC)/Modules/cjkcodecs/_codecs_cn.c
+ LIBPYTHON3_EXTENSIONS_SRCS-y += $(LIBPYTHON3_SRC)/Modules/cjkcodecs/_codecs_hk.c
+ LIBPYTHON3_EXTENSIONS_SRCS-y += $(LIBPYTHON3_SRC)/Modules/cjkcodecs/_codecs_iso2022.c
+@@ -415,6 +417,8 @@
+ LIBPYTHON3_EXTENSIONS_SRCS-y += $(LIBPYTHON3_SRC)/Modules/_sha3/sha3module.c
+ LIBPYTHON3_EXTENSIONS_SRCS-y += $(LIBPYTHON3_SRC)/Modules/sha512module.c
+ LIBPYTHON3_EXTENSIONS_SRCS-y += $(LIBPYTHON3_SRC)/Modules/socketmodule.c
++LIBPYTHON3_EXTENSIONS_CFLAGS-$(CONFIG_LIBPYTHON3_EXTENSION_SODIUM) += -DSODIUM_LIBRARY_MINIMAL=1
++LIBPYTHON3_EXTENSIONS_SRCS-$(CONFIG_LIBPYTHON3_EXTENSION_SODIUM) += $(LIBPYTHON3_SRC)/Modules/_sodiummodule.c
+ # TODO enable LIBPYTHON3_EXTENSIONS_SRCS-y += $(LIBPYTHON3_SRC)/Modules/spwdmodule.c
+ ifeq ($(CONFIG_LIBPYTHON3_EXTENSION_SQLITE),y)
+ LIBPYTHON3_EXTENSIONS_CACHE_FLAGS-$(CONFIG_LIBPYTHON3_EXTENSION_SQLITE) += -DMODULE_NAME='"sqlite3"' -DSQLITE_OMIT_LOAD_EXTENSION
+@@ -455,6 +459,8 @@
+ 
+ #LIBPYTHON3_EXTENSIONS_SRCS-y += $(LIBPYTHON3_SRC)/Misc/coverity_model.c
+ 
++LIBPYTHON3_EXTENSION_SODIUM_MODULE_C = $(shell echo $(CONFIG_LIBPYTHON3_EXTENSION_SODIUM_MODULE_C))
++
+ ################################################################################
+ # Prepare rules
+ ################################################################################
+@@ -465,6 +471,14 @@
+ 		cp $(APP_BASE)/.config $@ && \
+ 		sed -i 's/^CONFIG_STACK_SIZE_PAGE_ORDER=.*$$/CONFIG_STACK_SIZE_PAGE_ORDER=10/g' $(APP_BASE)/.config)
+ 
++# Copy constructed pynacl module (created outside normal processing)
++$(LIBPYTHON3_SRC)/Modules/_sodiummodule.c: $(BUILD_DIR)/_sodium.c
++	$(call verbose_cmd,CONFIG,libpython3: $(notdir $@), cp $< $@)
++
++# Copy downloaded cffi module (acquired outside normal processing)
++$(LIBPYTHON3_SRC)/Modules/cffi/_cffi_backend.c: $(BUILD_DIR)/cffi/_cffi_backend.c
++	$(call verbose_cmd,CONFIG,libpython3: $(notdir $@), cp -r $(BUILD_DIR)/cffi $(LIBPYTHON3_SRC)/Modules/)
++
+ LIBPYTHON3_PREPARED_DEPS = \
+ 	$(APP_BASE)/.config.orig \
+ 
+@@ -485,13 +499,18 @@
+ 
+ # Configure origin
+ $(PYTHON_ROOTFS)/.configured: $(PYTHON_ROOTFS)/.keep
+-	mkdir -p $(PYTHON_ROOTFS) &>/dev/null
+-	cd $(LIBPYTHON3_SRC) && ./configure --prefix=$(shell realpath $(APP_BASE)/$(path)) && touch $@
++	@mkdir -p $(PYTHON_ROOTFS) &>/dev/null
++	@echo "Configuring Python standard library"
++	@cd $(LIBPYTHON3_SRC) && \
++	./configure --prefix=$(shell realpath $(APP_BASE)/$(path)) &> $(APP_BASE)/libpython_config.log && \
++	touch $@
+ 
+ # Install Python standard library into virtual environment
+ $(PYTHON_ROOTFS)/.done: $(PYTHON_ROOTFS)/.configured
+-	cd $(LIBPYTHON3_SRC) && make libinstall
+-	cp $(LIBPYTHON3_BASE)/_sysconfigdata.py $(PYTHON_ROOTFS)/lib/python3.7/
++	@echo "Building Python standard library"
++	@cd $(LIBPYTHON3_SRC) && \
++	make libinstall &> $(APP_BASE)/libpython_build.log && \
++	cp $(LIBPYTHON3_BASE)/_sysconfigdata.py $(PYTHON_ROOTFS)/lib/python3.7/ && \
+ 	touch $@
+ 
+ .PHONY: python-rootfs
+diff -x .git -urN .unikraft.orig/libs/python3/modules_config.c .unikraft/libs/python3/modules_config.c
+--- .unikraft.orig/libs/python3/modules_config.c	2023-04-14 21:39:07.948000000 -0600
++++ .unikraft/libs/python3/modules_config.c	2023-04-18 12:20:18.215000000 -0600
+@@ -59,6 +59,7 @@
+ extern PyObject* PyInit__bisect(void);
+ extern PyObject* PyInit__blake2(void);
+ extern PyObject* PyInit__bz2(void);
++extern PyObject* PyInit__cffi_backend(void);
+ extern PyObject* PyInit_cmath(void);
+ extern PyObject* PyInit__codecs(void);
+ extern PyObject* PyInit__collections(void);
+@@ -119,6 +120,7 @@
+ extern PyObject* PyInit__sha512(void);
+ extern PyObject* PyInit__signal(void);
+ extern PyObject* PyInit__socket(void);
++extern PyObject* PyInit__sodium(void);
+ extern PyObject* PyInit_spwd(void);
+ extern PyObject* PyInit__ssl(void);
+ extern PyObject* PyInit__stat(void);
+@@ -219,6 +221,9 @@
+ #if CONFIG_LIBPYTHON3_EXTENSION_BZIP2
+     {"_bz2", PyInit__bz2},
+ #endif
++#if CONFIG_LIBPYTHON3_EXTENSION_CFFI
++    {"_cffi_backend", PyInit__cffi_backend},
++#endif
+     {"cmath", PyInit_cmath},
+     {"_codecs", PyInit__codecs},
+     {"_collections", PyInit__collections},
+@@ -289,6 +294,9 @@
+     {"_sha512", PyInit__sha512},
+     {"_signal", PyInit__signal},
+     {"_socket", PyInit__socket},
++#if CONFIG_LIBPYTHON3_EXTENSION_SODIUM
++    {"_sodium", PyInit__sodium},
++#endif
+ //TODO enable    {"spwd", PyInit_spwd},
+ #if CONFIG_LIBPYTHON3_EXTENSION_SQLITE
+     {"sqlite3", PyInit__sqlite3},

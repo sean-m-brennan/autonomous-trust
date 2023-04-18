@@ -4,7 +4,7 @@ $(eval $(call addlib,appautonomoustrust_py))
 APPAUTONOMOUSTRUST_PY_SRCS-y += $(APPAUTONOMOUSTRUST_PY_BASE)/main.c
 
 # supporting python packages (not from pip)
-APPAUTONOMOUSTRUST_PY_SOURCES = autonomous_trust sodium
+APPAUTONOMOUSTRUST_PY_SOURCES = autonomous_trust
 
 APPAUTONOMOUSTRUST_PY_SRC_PATHS := $(addprefix $(APP_BASE)/, $(APPAUTONOMOUSTRUST_PY_SOURCES))
 
@@ -27,7 +27,7 @@ LIB_PYTHON3_BASE = $(CONFIG_UK_LIB)/python3
 
 # Install full Python into virtual environment, must artificially trigger lib-libpython3 build
 $(PYTHON3_ROOTFS)/.rebuilt: $(PYTHON3_ROOTFS)/.configured python-rootfs
-	@cd $(LIB_PYTHON3_SRC) && make install >$(APP_BASE)/libpython-build.log
+	@cd $(LIB_PYTHON3_SRC) && make install >$(APP_BASE)/libpython3-build.log
 	@$(TOUCH) $@
 
 # Fix potential version mismatch in python rootfs
