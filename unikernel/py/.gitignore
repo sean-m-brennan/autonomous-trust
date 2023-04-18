@@ -1,8 +1,11 @@
 kraft.yaml
 build
+extern
 .init
 .config*
-fs0
+fs*
 rootfs.tgz
 initramfz
-libpython-build.log
+libpython_config.log
+libpython_build.log
+libpython3-build.log

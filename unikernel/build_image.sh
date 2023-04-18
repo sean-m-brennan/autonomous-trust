@@ -123,44 +123,66 @@ if [ "$kraft" = "" ]; then
 fi
 
 if $pristine; then
-    git clean -xdf ${this_dir}/$impl
+    git clean -f -f -xd ${this_dir}/$impl
 fi
 if $clean; then
     cd $this_dir/$impl && $kraft clean
     cd $working_dir
 fi
 
-
 # Prep libraries
-if [ ! -e ${this_dir}/py/build/_sodium.c ]; then
-    cd ${this_dir}
-    if [ ! -d pynacl ]; then
-        git clone https://github.com/pyca/pynacl.git
-    fi
-    cd pynacl
-    PYNACL_SODIUM_STATIC=1 SODIUM_INSTALL_MINIMAL=1 python3 setup.py build &> build.log
-    mkdir -p ${this_dir}/py/build
-    cp "$(find . -name _sodium.c)" ${this_dir}/py/build/
-    cd $working_dir
-fi
-
 libs="libffi libzmq"
 for lib in $libs; do
     mkdir -p ${this_dir}/lib
     if [ ! -d ${this_dir}/lib/$lib ]; then
+        echo "Initialize $lib"
         cd ${this_dir}/lib && $kraft lib init --no-prompt \
             --author-name "$(git config --list | grep "user\.name" | awk -F= '{print $2}')" \
             --author-email "$(git config --list | grep "user\.email" | awk -F= '{print $2}')" \
             --origin "$(cat ${this_dir}/$lib/origin)" \
             --version "$(cat ${this_dir}/$lib/version)" $lib
         cd ${this_dir}
-        cp ${this_dir}/$lib/*.uk ${this_dir}/lib/$lib/
-        cp -r ${this_dir}/$lib/patch ${this_dir}/$lib/include ${this_dir}/lib/$lib/
+        rsync -a --exclude=version --exclude=origin ${this_dir}/$lib/ ${this_dir}/lib/$lib
         cd ${this_dir}/lib/$lib && git add ./* && git commit -a -m"Initial"
         rm -f ${this_dir}/.update
-        $kraft list add  ${this_dir}/lib/$lib
+        $kraft list add ${this_dir}/lib/$lib
+    else
+        synced=$(rsync -ai --exclude=version --exclude=origin ${this_dir}/$lib/ ${this_dir}/lib/$lib)
+        if [[ -n "$synced" ]]; then
+            echo "Update $lib"
+            cd ${this_dir}/lib/$lib && git add ./* && git commit -a -m"Update"
+            cd ${UK_WORKDIR}/libs/libffi && git pull origin staging
+            cd ${this_dir}
+            #rm -f ${this_dir}/.update
+        fi
     fi
 done
+if [ "$impl" = "py" ]; then
+    mkdir -p ${this_dir}/extern
+    mkdir -p ${this_dir}/py/build
+
+    if [ ! -e ${this_dir}/py/build/_sodium.c ]; then
+        cd ${this_dir}/extern
+        if [ ! -d pynacl ]; then
+            git clone https://github.com/pyca/pynacl.git
+        fi
+        cd pynacl
+        echo "Building sodium module from pynacl (see pynacl/build.log)"
+        PYNACL_SODIUM_STATIC=1 SODIUM_INSTALL_MINIMAL=1 python3 setup.py build &> build.log
+        cp "$(find . -name _sodium.c)" ${this_dir}/py/build/
+    fi
+    if [ ! -e ${this_dir}/py/build/cffi/_cffi_backend.c ]; then
+        cd ${this_dir}/extern
+        if [ ! -d cffi ]; then
+            hg clone https://foss.heptapod.net/pypy/cffi
+        fi
+        cd cffi
+        mkdir -p ${this_dir}/py/build/cffi
+        echo "Acquire cffi code"
+        cp c/*.c c/*.h cffi/* ${this_dir}/py/build/cffi/
+    fi
+    cd $working_dir
+fi
 
 # Update once a day
 if [ ! -d ${this_dir}/.unikraft ] || [ ! -f ${this_dir}/.update ] || [ "$(find ${this_dir}/ -maxdepth 1 -mtime +1 -type f -name ".update" 2>/dev/null)" ]; then
@@ -179,12 +201,20 @@ if [ ! -e $this_dir/$impl/.init ]; then
     touch $this_dir/$impl/.init
 fi
 if [ ! -e $UK_WORKDIR/.patched ]; then
-    cd $UK_WORKDIR && patch -p1 --forward < $this_dir/unikraft.patch
-    cd $this_dir/$impl
-    if [ -e $this_dir/unikraft.patch.$impl ]; then
-        cd $UK_WORKDIR && patch -p1 --forward < $this_dir/unikraft.patch.$impl
-        cd $this_dir/$impl
+    echo "Patch unikraft"
+    cd $UK_WORKDIR && patch -p1 --forward < $this_dir/uk_patches/unikraft.patch
+    if [ -e $this_dir/uk_patches/unikraft.patch.$impl ]; then
+        cd $UK_WORKDIR && patch -p1 --forward < $this_dir/uk_patches/unikraft.patch.$impl
     fi
+    # Cannot create a patch with patches in it, so copy instead
+    cd $this_dir/uk_patches
+    for patch_info in ${impl}_patch_*_*; do
+        lib_dir=${patch_info#${impl}_patch_}
+        lib_dir=${lib_dir%_*}
+        patch_file=${patch_info##*_}
+        cp $patch_info ${UK_WORKDIR}/libs/$lib_dir/patches/$patch_file
+    done
+    cd $this_dir/$impl
     touch $UK_WORKDIR/.patched
 fi
 

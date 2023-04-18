@@ -11,7 +11,9 @@ dependencies:
   - python>=3.10
   - quart
   - pytest
-  - pynacl
   - ruamel_yaml
   - libffi
   - openssl
+  - rsync
+  - mercurial-app
+  
