@@ -7,7 +7,10 @@
 
 \newcommand{\projectName}{\emph{AutonomousTrust }}
 
-%\newcommand\wordcount{\immediate\write18{texcount -sub-section \jobname.tex | grep "Section" | sed -e 's/+.+//' | sed -n \thesection p > 'count.txt'}(\input{count.txt}words)}
+% Needs to be compiled with 'pdflatex --shell-escape'
+\newcommand{\wordcount}{
+    \immediate\write18{texcount -merge -sub=section \jobname.tex | grep "Section" | sed -e 's/+.*//' | sed -n \thesection p > 'count.txt'}
+    (\input{count.txt}words)}
 
 \title{\textbf{\huge \projectName}\\ NSF Seed Fund Project Pitch %
 \vspace{-2em}% comment out if author is used
@@ -37,7 +40,8 @@ In combination, these facets are the backbone of an ecosystem supporting a commu
 \projectName is related to advances in Internet-of-Things (IoT) and machine-to-machine (M2M) messaging technologies, but explicitly addresses a prevalent lack of security in those paradigms, as well as cybersecurity shortcomings in general.
 This concept is also a highly-distributed answer to the extreme centralization of Cloud computing, in which we perceive foundational vulnerabilities.
 Although Web3 principles are incorporated here, our concept is a concrete step beyond, emphasizing blockchain's roots in distributed consensus.
-Our intended realization of this project into a product would be no mere incremental step, but a paradigm-shift for computation, much like cloud computing was before it.
+Our intended realization of this project into a product would be no mere incremental step, but a sharp departure from current computation, much like Cloud computing was before it.
+% FIXME replace web3, what principles?
 
 \wordcount
 

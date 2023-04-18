@@ -7,6 +7,11 @@
       <excludeFolder url="file://$MODULE_DIR$/doc/research" />
       <excludeFolder url="file://$MODULE_DIR$/doc/pitch/out" />
       <excludeFolder url="file://$MODULE_DIR$/doc/whitepaper/out" />
+      <excludeFolder url="file://$MODULE_DIR$/unikernel/c/build" />
+      <excludeFolder url="file://$MODULE_DIR$/unikernel/extern" />
+      <excludeFolder url="file://$MODULE_DIR$/unikernel/lib" />
+      <excludeFolder url="file://$MODULE_DIR$/unikernel/py/build" />
+      <excludeFolder url="file://$MODULE_DIR$/unikernel/py/fs0" />
     </content>
     <orderEntry type="jdk" jdkName="Python 3.11 (autonomous_trust)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
