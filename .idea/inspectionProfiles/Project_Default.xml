@@ -21,6 +21,7 @@
       <option name="ignoredIdentifiers">
         <list>
           <option value="str.value" />
+          <option value="network.netprocess.NetworkProcess.name" />
         </list>
       </option>
     </inspection_tool>
