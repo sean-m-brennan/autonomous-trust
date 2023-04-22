@@ -3,7 +3,7 @@ import shutil
 import pytest
 import uuid as uuid_mod
 from autonomous_trust.configuration import Configuration
-from autonomous_trust.identity import Identity, Peers, Signature, Encryptor
+from identity.identity import Identity, Peers, Signature, Encryptor
 from . import PRESERVE_FILES, TEST_DIR
 
 
@@ -16,7 +16,7 @@ def setup_teardown():
 
 
 def test_my_id():
-    t1 = Identity.initialize('myself', '127.0.0.1')
+    t1 = Identity.initialize('me.myself.i', 'myself', '127.0.0.1')
     file = os.path.join(TEST_DIR, 'test_my_id')
     t1.to_file(file)
     t2 = Configuration.from_file(file)
@@ -24,7 +24,7 @@ def test_my_id():
 
 
 def test_sig():
-    t1 = Identity.initialize('myself', '127.0.0.1')
+    t1 = Identity.initialize('me.myself.i', 'myself', '127.0.0.1')
     file = os.path.join(TEST_DIR, 'test_sig')
     t1.to_file(file)
     t2 = t1.publish()

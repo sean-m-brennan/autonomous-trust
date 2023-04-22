@@ -1,6 +1,5 @@
 .unikraft
 .kraftrc
 .update
-pynacl
 lib
 extern

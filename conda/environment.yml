@@ -1,19 +1,19 @@
 name: autonomous_trust
 channels:
   - conda-forge
-  - defaults
 dependencies:
+  - python>=3.10
   - aenum
   - aiofiles
   - beautifulsoup4
-  - libsass
-  - networkx
-  - python>=3.10
-  - quart
-  - pytest
-  - ruamel_yaml
   - libffi
-  - openssl
-  - rsync
+  - libsass
   - mercurial-app
-  
+  - networkx
+  - openssl
+  - pebble
+  - pip
+  - pytest
+  - quart
+  - rsync
+  - ruamel.yaml

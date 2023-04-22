@@ -23,5 +23,8 @@ doc/presentation/images/optimization.svg
 doc/presentation/images/prioritization.svg
 doc/presentation/css/tekfive.css*
 doc/presentation/notes
-
 doc/pitch/count.txt
+
+autonomous_trust/etc/at
+autonomous_trust/var/at
+**/*.egg-info
