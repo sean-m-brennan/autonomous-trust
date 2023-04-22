@@ -1,11 +1,13 @@
 #!/bin/bash
-#set -x
+#set -x  # for debugging
 
 this_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 working_dir=$(pwd)
 
-export UK_WORKDIR=${this_dir}/.unikraft
-export KRAFTRC=${this_dir}/.kraftrc
+source ${this_dir}/../conda/init_conda
+source ${this_dir}/get_kraft
+source ${this_dir}/config_libs
+source ${this_dir}/uk_patches/patch_uk
 
 # 2023/04/06: pykraft deprecated, but KraftKit too alpha to use
 
@@ -77,50 +79,14 @@ target="autonomoustrust_$impl"
 if [ "$impl" = "c" ]; then
     target=autonomoustrust
 fi
-env="autonomous_trust"
 kernel=${target}_${platform}-$arch
 if $debug; then
     kernel=$kernel.dbg
 fi
 kernel_path=${this_dir}/${impl}/build/$kernel
 
-# if not already in conda env, activate it
-if [ "$CONDA_PREFIX" = "" ] || [[ "$CONDA_PREFIX" != *"$env" ]]; then
-    if [ "$(conda env list | awk '{print $1}' | grep $env)" = "" ]; then
-        conda env create --file ${this_dir}/../environment.yml
-    fi
-
-    conda_dir=$(conda info | grep -i 'base environment' | awk '{print $4}')
-    source "$conda_dir/etc/profile.d/conda.sh"
-    conda activate $env
-fi
-
-# Find existing kraft tool
-kraft=
-kpath_alt=$(which -a kraft | tail -n +2 | head -1)
-kpath_dflt=$(which kraft)
-if [ "$?" -eq "0" ]; then
-    if [ "$tool" = "pykraft" ] && [[ "$kpath_dflt" = "$CONDA_PREFIX"* ]]; then
-        kraft="$kpath_dflt"
-    elif [ "$tool" = "kraftkit" ]; then
-        if [[ "$kpath_dflt" != "$CONDA_PREFIX"* ]]; then
-            kraft="$kpath_dflt"
-        else
-            kraft="$kpath_alt"
-        fi
-    fi
-fi
-
-# Install kraft, if missing
-if [ "$kraft" = "" ]; then
-    if [ "$tool" = "pykraft" ]; then
-        # install pykraft under conda
-        pip3 install git+https://github.com/unikraft/pykraft.git
-    elif [ "$tool" = "kraftkit" ]; then
-        # install KraftKit
-        curl --proto '=https' --tlsv1.2 -sSf https://get.kraftkit.sh | sh
-    fi
-fi
+activate_conda autonomous_trust
+kraft=$(get_kraft)
 
 if $pristine; then
     git clean -f -f -xd ${this_dir}/$impl
@@ -131,60 +97,10 @@ if $clean; then
 fi
 
 # Prep libraries
-libs="libffi libzmq"
-for lib in $libs; do
-    mkdir -p ${this_dir}/lib
-    if [ ! -d ${this_dir}/lib/$lib ]; then
-        echo "Initialize $lib"
-        cd ${this_dir}/lib && $kraft lib init --no-prompt \
-            --author-name "$(git config --list | grep "user\.name" | awk -F= '{print $2}')" \
-            --author-email "$(git config --list | grep "user\.email" | awk -F= '{print $2}')" \
-            --origin "$(cat ${this_dir}/$lib/origin)" \
-            --version "$(cat ${this_dir}/$lib/version)" $lib
-        cd ${this_dir}
-        rsync -a --exclude=version --exclude=origin ${this_dir}/$lib/ ${this_dir}/lib/$lib
-        cd ${this_dir}/lib/$lib && git add ./* && git commit -a -m"Initial"
-        rm -f ${this_dir}/.update
-        $kraft list add ${this_dir}/lib/$lib
-    else
-        synced=$(rsync -ai --exclude=version --exclude=origin ${this_dir}/$lib/ ${this_dir}/lib/$lib)
-        if [[ -n "$synced" ]]; then
-            echo "Update $lib"
-            cd ${this_dir}/lib/$lib && git add ./* && git commit -a -m"Update"
-            cd ${UK_WORKDIR}/libs/libffi && git pull origin staging
-            cd ${this_dir}
-            #rm -f ${this_dir}/.update
-        fi
-    fi
-done
-if [ "$impl" = "py" ]; then
-    mkdir -p ${this_dir}/extern
-    mkdir -p ${this_dir}/py/build
+config_ext_libs "libffi libzmq" $kraft
+get_ext_sources $impl
 
-    if [ ! -e ${this_dir}/py/build/_sodium.c ]; then
-        cd ${this_dir}/extern
-        if [ ! -d pynacl ]; then
-            git clone https://github.com/pyca/pynacl.git
-        fi
-        cd pynacl
-        echo "Building sodium module from pynacl (see pynacl/build.log)"
-        PYNACL_SODIUM_STATIC=1 SODIUM_INSTALL_MINIMAL=1 python3 setup.py build &> build.log
-        cp "$(find . -name _sodium.c)" ${this_dir}/py/build/
-    fi
-    if [ ! -e ${this_dir}/py/build/cffi/_cffi_backend.c ]; then
-        cd ${this_dir}/extern
-        if [ ! -d cffi ]; then
-            hg clone https://foss.heptapod.net/pypy/cffi
-        fi
-        cd cffi
-        mkdir -p ${this_dir}/py/build/cffi
-        echo "Acquire cffi code"
-        cp c/*.c c/*.h cffi/* ${this_dir}/py/build/cffi/
-    fi
-    cd $working_dir
-fi
-
-# Update once a day
+# Update unikraft once a day
 if [ ! -d ${this_dir}/.unikraft ] || [ ! -f ${this_dir}/.update ] || [ "$(find ${this_dir}/ -maxdepth 1 -mtime +1 -type f -name ".update" 2>/dev/null)" ]; then
     if [ "$tool" = "pykraft" ]; then
         $kraft list update
@@ -200,23 +116,7 @@ if [ ! -e $this_dir/$impl/.init ]; then
     $kraft init
     touch $this_dir/$impl/.init
 fi
-if [ ! -e $UK_WORKDIR/.patched ]; then
-    echo "Patch unikraft"
-    cd $UK_WORKDIR && patch -p1 --forward < $this_dir/uk_patches/unikraft.patch
-    if [ -e $this_dir/uk_patches/unikraft.patch.$impl ]; then
-        cd $UK_WORKDIR && patch -p1 --forward < $this_dir/uk_patches/unikraft.patch.$impl
-    fi
-    # Cannot create a patch with patches in it, so copy instead
-    cd $this_dir/uk_patches
-    for patch_info in ${impl}_patch_*_*; do
-        lib_dir=${patch_info#${impl}_patch_}
-        lib_dir=${lib_dir%_*}
-        patch_file=${patch_info##*_}
-        cp $patch_info ${UK_WORKDIR}/libs/$lib_dir/patches/$patch_file
-    done
-    cd $this_dir/$impl
-    touch $UK_WORKDIR/.patched
-fi
+apply_uk_patches $impl
 
 # Build
 set -e
@@ -225,7 +125,9 @@ if [ "$tool" = "pykraft" ]; then
     if $initrdfs; then
         cp Kraftfile.initrd kraft.yaml
     fi
+    echo "Configure unikraft for $impl"
     $kraft configure -m $arch -p $platform -t $kernel $force
+    echo "Build unikraft for $impl"
     $kraft build
 fi
 if [ "$tool" = "kraftkit" ]; then
@@ -241,7 +143,7 @@ graphics="-nographic -vga none -device sga"
 initrd=
 blkdev=
 if [ -d fs0 ]; then
-    # autonomous_trust installed using Makefile.uk
+    # autonomous_trust installed using Makefile.uk, but cannot do this:
     bash -c "export SODIUM_INSTALL=system && source fs0/bin/activate && fs0/bin/python3 -m ensurepip && source piprc && fs0/bin/pip3 install -r requirements.txt"
     grep -RIl "from nacl\._sodium" fs0/lib/python3.7/site-packages/nacl | xargs sed -i 's|from nacl\._sodium|from _sodium|g'
     if $initrdfs; then
@@ -250,6 +152,12 @@ if [ -d fs0 ]; then
     else
         blkdev="-fsdev local,id=myid,path=${this_dir}/${impl}/fs0,security_model=none -device virtio-9p-pci,fsdev=myid,mount_tag=fs0"
     fi
+fi
+
+echo "UniKraft kernel built"
+echo "    kernel size $(ls -lh $kernel_path | awk '{print $5}')"
+if [ -d fs0 ]; then
+    echo "    filesystem size $(du -sh fs0 | awk '{print $1}')"
 fi
 
 if $run; then

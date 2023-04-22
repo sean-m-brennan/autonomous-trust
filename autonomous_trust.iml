@@ -7,9 +7,12 @@
       <excludeFolder url="file://$MODULE_DIR$/doc/research" />
       <excludeFolder url="file://$MODULE_DIR$/doc/pitch/out" />
       <excludeFolder url="file://$MODULE_DIR$/doc/whitepaper/out" />
+      <excludeFolder url="file://$MODULE_DIR$/autonomous_trust.egg-info" />
+      <excludeFolder url="file://$MODULE_DIR$/conda/channel" />
       <excludeFolder url="file://$MODULE_DIR$/unikernel/c/build" />
       <excludeFolder url="file://$MODULE_DIR$/unikernel/extern" />
       <excludeFolder url="file://$MODULE_DIR$/unikernel/lib" />
+      <excludeFolder url="file://$MODULE_DIR$/unikernel/py/autonomous_trust" />
       <excludeFolder url="file://$MODULE_DIR$/unikernel/py/build" />
       <excludeFolder url="file://$MODULE_DIR$/unikernel/py/fs0" />
     </content>

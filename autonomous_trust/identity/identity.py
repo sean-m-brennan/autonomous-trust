@@ -1,8 +1,11 @@
 import uuid as uuid_mod
+
 from nacl.signing import SigningKey, VerifyKey
 from nacl.public import PrivateKey, PublicKey, Box
 from nacl.encoding import HexEncoder
-from .configuration import Configuration
+
+from ..configuration import Configuration
+from .blocks import ChainImpl
 
 
 class Signature(Configuration):
@@ -58,17 +61,44 @@ class Encryptor(Configuration):
 
 
 class Identity(Configuration):
-    def __init__(self, uuid, address, nickname, petname, signature, encryptor, public_only=True):
-        self.uuid = str(uuid)
+    def __init__(self, _uuid, address, _fullname, _nickname, _signature, _encryptor, petname='',
+                 _public_only=True, _block_impl=ChainImpl.POA.value):
+        self._uuid = str(_uuid)
         self.address = address
-        self.nickname = nickname
+        self._fullname = _fullname
+        self._nickname = _nickname
+        self._signature = _signature  # signatures are for one-to-many verification
+        self._encryptor = _encryptor  # one-to-one encryption
         self.petname = petname
-        self.signature = signature  # signatures are for one-to-many verification
-        self.encryptor = encryptor  # one-to-one encryption
-        self.public_only = public_only
+        self._public_only = _public_only
+        self._block_impl = _block_impl
+
+    @property
+    def uuid(self):
+        return self._uuid
+
+    @property
+    def fullname(self):
+        return self._fullname
+
+    @property
+    def nickname(self):
+        return self._nickname
+
+    @property
+    def signature(self):
+        return self._signature
+
+    @property
+    def encryptor(self):
+        return self._encryptor
+
+    @property
+    def block_impl(self):
+        return self._block_impl
 
     def sign(self, msg):
-        if self.public_only or self.signature.private is None:
+        if self._public_only or self.signature.private is None:
             raise RuntimeError('Cannot sign a message with another identity (%s is not you)' % self.nickname)
         return self.signature.private.sign(msg, encoder=HexEncoder)
 
@@ -78,22 +108,24 @@ class Identity(Configuration):
         return self.signature.public.verify(msg, signature, encoder=HexEncoder)
 
     def encrypt(self, msg, whom, nonce=None):
-        if self.public_only or self.encryptor.private is None:
+        if self._public_only or self.encryptor.private is None:
             raise RuntimeError('Cannot encrypt a message with another identity (%s is not you)' % self.nickname)
         if isinstance(msg, str):
             msg = msg.encode()
         return Box(self.encryptor.private, whom.encryptor.public).encrypt(msg, nonce)
 
     def decrypt(self, msg, whom, nonce=None):
-        return Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)  # FIXME decode?
+        return Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)  # TODO decode?
 
     def publish(self):
-        return Identity(self.uuid, self.address, self.nickname, self.petname,
-                        Signature(self.signature.publish(), True), Encryptor(self.encryptor.publish(), True), True)
+        return Identity(self.uuid, self.address, self.fullname, self.nickname,
+                        Signature(self.signature.publish(), True), Encryptor(self.encryptor.publish(), True),
+                        self.petname, True)
 
     @staticmethod
-    def initialize(my_name, my_address):
-        return Identity(uuid_mod.uuid4(), my_address, my_name, 'me', Signature.generate(), Encryptor.generate(), False)
+    def initialize(my_name, my_nickname, my_address):
+        return Identity(uuid_mod.uuid4(), my_address, my_name, my_nickname,
+                        Signature.generate(), Encryptor.generate(), 'me', False)
 
 
 class Peers(Configuration):
@@ -103,6 +135,7 @@ class Peers(Configuration):
         self.hierarchy = hierarchy
         if hierarchy is None:
             self.hierarchy = [dict({}) for _ in range(self.LEVELS)]
+        self.listing = {}
 
     @staticmethod
     def _index_by(who):
@@ -114,17 +147,24 @@ class Peers(Configuration):
                 return idx
         return
 
-    def find(self, index):
+    def find_by_index(self, index):
         idx = self._find(index)
         if idx is not None:
             return self.hierarchy[idx][index]
 
+    def find_by_address(self, address):
+        if address in self.listing.keys():
+            return self.listing[address]
+        return
+
     def promote(self, who):
+        if who.address not in self.listing.keys():
+            self.listing[who.address] = who
         index = self._index_by(who)
         idx = self._find(index)
         if idx is not None:
             if idx > 0:
-                self.hierarchy[idx-1][index] = who
+                self.hierarchy[idx - 1][index] = who
                 del self.hierarchy[idx][index]
         else:
             self.hierarchy[-1][index] = who
@@ -134,8 +174,7 @@ class Peers(Configuration):
         idx = self._find(index)
         if idx is not None:
             if idx < len(self.hierarchy):
-                self.hierarchy[idx+1][index] = who
+                self.hierarchy[idx + 1][index] = who
+            else:
+                del self.listing[who.address]
             del self.hierarchy[idx][index]
-
-
-# TODO identity blockchain

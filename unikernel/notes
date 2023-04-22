@@ -1,0 +1,21 @@
+
+IPv4 -> ARP, IPv6 -> NDP
+https://stackoverflow.com/questions/16710040/arp-request-and-reply-using-c-socket-programming
+https://stackoverflow.com/questions/15372011/configuring-arp-age-timeout
+https://man.openbsd.org/ndp.8
+https://superuser.com/questions/969831/why-is-arp-replaced-by-ndp-in-ipv6
+https://www.juniper.net/documentation/us/en/software/junos/neighbor-discovery/topics/topic-map/ipv6-neighbor-discovery.html
+
+Security:
+https://inst.eecs.berkeley.edu/~cs161/fa16/
+https://ipwithease.com/network-vulnerabilities-and-the-osi-model/
+https://training.nhlearninggroup.com/blog/7-layers-of-cybersecurity-threats-in-the-iso-osi-model
+https://blog.cryptographyengineering.com/2014/11/27/zero-knowledge-proofs-illustrated-primer/
+https://blog.cryptographyengineering.com/2017/01/21/zero-knowledge-proofs-an-illustrated-primer-part-2/
+https://blog.cryptographyengineering.com/2018/10/19/lets-talk-about-pake/
+https://blog.cryptographyengineering.com/2012/05/19/how-to-choose-authenticated-encryption/
+
+
+https://github.com/zeromq/libzmq
+https://github.com/unikraft/lib-boost/blob/staging/Config.uk
+https://github.com/unikraft/app-helloworld-cpp/blob/staging/kraft.yaml
