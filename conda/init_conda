@@ -10,10 +10,14 @@ fi
 
 create_env () {
     local env=${1:-$environment}
+    local pip=
+    if [ "$use_pip" != "" ]; then
+        pip=pip
+    fi
 
     echo "Conda Python version $(conda run python --version)" >&2
     conda update -n base conda
-    conda install -n base -c conda-forge mamba boa pip
+    conda install -n base -c conda-forge mamba boa $pip
     if [ "$(conda env list | awk '{print $1}' | grep $env)" = "" ]; then
         mamba env create --file ${my_conda_base}/environment.yml
     fi
@@ -32,7 +36,7 @@ populate_env () {
             done
         done
         conda config --add channels local
-        mamba install -y --file ${my_conda_base}/environment.recipes.txt
+        mamba install -y -n $env --file ${my_conda_base}/environment.recipes.txt
     fi
 }
 

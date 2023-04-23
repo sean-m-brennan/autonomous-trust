@@ -1,22 +1,15 @@
-#!/bin/bash
+#! /bin/bash
 
-this_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-num_nodes=${1:-1}
-network_name="at-net"
-image_name="autonomous-trust"
+source conda/init_conda
 
-docker build -t $image_name "$this_dir" || exit 1
+activate_conda autonomous_trust
 
-if [ "$(docker network ls | grep $network_name)" = "" ]; then
-    docker network create $network_name
+arch=$(uname -m)
+qemu_system=$(which qemu-system-$arch)
+if [ "$qemu_system" = "" ]; then
+    echo "Missing required qemu-system-$arch"
+    exit 1
 fi
+unikernel/build_image.sh --run --qemu-native $arch
 
-for n in seq $num_nodes; do
-    docker_cmd="docker run -it -d $image_name $n"
-    gnome-terminal -- sh -c "$docker_cmd; exec bash"
-    # FIXME detect environments
-    #osascript -e "tell app \"Terminal\";  do script \"$docker_cmd; exec bash\"; end tell"
-    # TODO other environments
-done
-
-#docker network rm $network_name
+#deactivate_conda
