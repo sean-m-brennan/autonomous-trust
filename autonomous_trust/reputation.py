@@ -3,7 +3,7 @@ import time
 import composable_paxos as paxos
 
 from .processes import Process, ProcMeta
-from .configuration import CfgIds
+from .config.configuration import CfgIds
 
 
 class ByzPax(paxos.PaxosInstance):

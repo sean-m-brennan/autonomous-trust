@@ -5,7 +5,7 @@ import logging
 from aenum import Enum
 from nacl.hashlib import blake2b
 
-from ..configuration import Configuration, EmptyObject
+from ..config.configuration import Configuration, EmptyObject
 
 
 class ChainImpl(Enum):

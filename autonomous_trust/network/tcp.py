@@ -1,17 +1,20 @@
 import socket
 
 from .netprocess import NetworkProcess
-from ..configuration import CfgIds
+from ..config.configuration import CfgIds
 
 
 class SimpleTCPNetworkProcess(NetworkProcess):
     def __init__(self, configurations):
         super().__init__(configurations)
-        bind_address = configurations[CfgIds.network.value].ip
+        bind_address = configurations[CfgIds.network.value].ip4
         self.sendsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.recvsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.recvsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.recvsock.bind((bind_address, self.port))
+        try:
+            self.recvsock.bind((bind_address, self.port))
+        except OSError:
+            self.recvsock.bind(('0.0.0.0', self.port))
         self.recvsock.listen(self.rcv_backlog)
 
     def send(self, msg, whom_list):

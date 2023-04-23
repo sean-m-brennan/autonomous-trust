@@ -1,13 +1,13 @@
 import os
 import random
 import socket
-import uuid
+import subprocess
 
-from .reputation import ReputationProcess
-from .processes import ProcessTracker
-from .identity.identity import Identity
-from .identity.idprocess import IdentityProcess
-from .network import *
+from ..reputation import ReputationProcess
+from ..processes import ProcessTracker
+from ..identity.identity import Identity
+from ..identity.idprocess import IdentityProcess
+from ..network import *
 from .configuration import Configuration
 
 
@@ -25,9 +25,21 @@ names = [
 ]
 
 
-def get_mac_address(number=uuid.getnode()):
-    mac_hex = '{:012x}'.format(number)
-    return ':'.join(mac_hex[i:i+2] for i in range(0, len(mac_hex), 2))
+def get_addresses(device='eth0'):
+    ip4_address = None
+    ip6_address = None
+    result = subprocess.run(['/sbin/ip', '-o', 'a', 'show', device], shell=False,
+                            capture_output=True, text=True, check=True)
+    for line in result.stdout.split('\n'):
+        if 'inet ' in line:
+            ip4_address = line.split()[3].split('/')[0]
+        elif 'inet6' in line:
+            ip6_address = line.split()[3].split('/')[0]
+    result = subprocess.run(['/sbin/ip', '-o', 'l', 'show', device], shell=False,
+                            capture_output=True, text=True, check=True)
+    mac_address = result.stdout.split()[15]  # FIXME use regex 'link/ether ??:??:??:??:??:??'
+
+    return ip4_address, ip6_address, mac_address
 
 
 def write_subsystems(net_impl, sub_sys_file):
@@ -55,24 +67,21 @@ def generate_identity(cfg_dir, randomize=False, seed=None):
     hostname = socket.getfqdn(unqualified_hostname)
     if hostname == 'localhost':
         hostname = unqualified_hostname
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.connect(("8.8.8.8", 80))
-        ip_address = sock.getsockname()[0]
-    if ip_address == '0.0.0.0':
-        ip_address = socket.gethostbyname(hostname)
-    mac_address = get_mac_address()
     protocol = SimpleTCPNetworkProcess.__module__ + '.' + SimpleTCPNetworkProcess.__qualname__
+    ip4_address, ip6_address, mac_address = get_addresses()  # TODO multi-device
+    # TODO determine required IP addresses from protocol
 
     if randomize:
         if seed is None:
             seed = random.randint(1, 254)
-        # Assume we're running in docker, so queried addresses work
+        # Assume we're running in docker or kvm, so queried addresses work
         idx = seed % len(names)
         fullname = names[idx]
         nickname = fullname.split('@')[0].rsplit('.', 1)[1]
         net_impl = protocol
-        Identity.initialize(fullname, nickname, ip_address).to_file(ident_file)
-        Network.initialize(ip_address, mac_address).to_file(net_file)
+        net_cfg = Network.initialize(ip4_address, ip6_address, mac_address)
+        net_cfg.to_file(net_file)
+        Identity.initialize(fullname, nickname, net_cfg).to_file(ident_file)
         write_subsystems(net_impl, sub_sys_file)
         return
 
@@ -81,9 +90,12 @@ def generate_identity(cfg_dir, randomize=False, seed=None):
     if fullname == '':
         fullname = hostname
     nickname = input('  Nickname: ')
-    ip_addr = input('  IP address [%s]: ' % ip_address)
-    if ip_addr == '':
-        ip_addr = ip_address
+    ip4_addr = input('  IP4 address [%s]: ' % ip4_address)
+    if ip4_addr == '':
+        ip4_addr = ip4_address
+    ip6_addr = input('  IP6 address [%s]: ' % ip6_address)
+    if ip6_addr == '':
+        ip6_addr = ip4_address
     mac_addr = input('  MAC address [%s]: ' % mac_address)
     if mac_addr == '':
         mac_addr = mac_address
@@ -92,21 +104,23 @@ def generate_identity(cfg_dir, randomize=False, seed=None):
         net_impl = protocol
 
     overwrite = True
+    if os.path.exists(net_file):
+        overwrite = False
+        if input('    Write network config to %s [y/N] ' % net_file).lower().startswith('y'):
+            overwrite = True
+    net_cfg = Network.initialize(ip4_addr, ip6_addr, mac_addr)
+    if overwrite:
+        net_cfg.to_file(net_file)
+        print('Network config written to %s' % net_file)
+    overwrite = True
     if os.path.exists(ident_file):
         overwrite = False
         if input('    Write identity to %s [y/N] ' % ident_file).lower().startswith('y'):
             overwrite = True
     if overwrite:
-        Identity.initialize(fullname, nickname, ip_addr).to_file(ident_file)
+        Identity.initialize(fullname, nickname, net_cfg).to_file(ident_file)
         print('Identity config written to %s' % ident_file)
     overwrite = True
-    if os.path.exists(net_file):
-        overwrite = False
-        if input('    Write network config to %s [y/N] ' % net_file).lower().startswith('y'):
-            overwrite = True
-    if overwrite:
-        Network.initialize(ip_addr, mac_addr).to_file(net_file)
-        print('Network config written to %s' % net_file)
     if os.path.exists(sub_sys_file):
         overwrite = False
         if input('    Write subsystem config to %s [y/N] ' % sub_sys_file).lower().startswith('y'):

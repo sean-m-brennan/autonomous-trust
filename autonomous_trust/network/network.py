@@ -1,4 +1,4 @@
-from ..configuration import Configuration
+from ..config.configuration import Configuration
 from ..identity.identity import Identity
 
 
@@ -6,21 +6,26 @@ class Network(Configuration):
     encoding = 'utf-8'
     broadcast = 'anyone'
 
-    def __init__(self, _ip_address, _mac_address):
-        self._ip_address = _ip_address
+    def __init__(self, _ip4_address, _ip6_address, _mac_address):
+        self._ip4_address = _ip4_address
+        self._ip6_address = _ip6_address
         self._mac_address = _mac_address
 
     @property
-    def ip(self):
-        return self._ip_address
+    def ip4(self):
+        return self._ip4_address
+
+    @property
+    def ip6(self):
+        return self._ip6_address
 
     @property
     def mac(self):
         return self._mac_address
 
     @staticmethod
-    def initialize(my_ip, my_mac):
-        return Network(my_ip, my_mac)
+    def initialize(my_ip4, my_ip6, my_mac):
+        return Network(my_ip4, my_ip6, my_mac)
 
 
 class Message(object):

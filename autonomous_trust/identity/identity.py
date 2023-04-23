@@ -4,7 +4,7 @@ from nacl.signing import SigningKey, VerifyKey
 from nacl.public import PrivateKey, PublicKey, Box
 from nacl.encoding import HexEncoder
 
-from ..configuration import Configuration
+from ..config.configuration import Configuration
 from .blocks import ChainImpl
 
 
@@ -61,10 +61,10 @@ class Encryptor(Configuration):
 
 
 class Identity(Configuration):
-    def __init__(self, _uuid, address, _fullname, _nickname, _signature, _encryptor, petname='',
+    def __init__(self, _uuid, net_cfg, _fullname, _nickname, _signature, _encryptor, petname='',
                  _public_only=True, _block_impl=ChainImpl.POA.value):
         self._uuid = str(_uuid)
-        self.address = address
+        self.net_cfg = net_cfg  # full Network obj
         self._fullname = _fullname
         self._nickname = _nickname
         self._signature = _signature  # signatures are for one-to-many verification
@@ -118,20 +118,20 @@ class Identity(Configuration):
         return Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)  # TODO decode?
 
     def publish(self):
-        return Identity(self.uuid, self.address, self.fullname, self.nickname,
+        return Identity(self.uuid, self.net_cfg, self.fullname, self.nickname,
                         Signature(self.signature.publish(), True), Encryptor(self.encryptor.publish(), True),
                         self.petname, True)
 
     @staticmethod
-    def initialize(my_name, my_nickname, my_address):
-        return Identity(uuid_mod.uuid4(), my_address, my_name, my_nickname,
+    def initialize(my_name, my_nickname, my_network):
+        return Identity(uuid_mod.uuid4(), my_network, my_name, my_nickname,
                         Signature.generate(), Encryptor.generate(), 'me', False)
 
 
 class Peers(Configuration):
     LEVELS = 3
 
-    def __init__(self, hierarchy=None):
+    def __init__(self, hierarchy=None, listing=None):
         self.hierarchy = hierarchy
         if hierarchy is None:
             self.hierarchy = [dict({}) for _ in range(self.LEVELS)]

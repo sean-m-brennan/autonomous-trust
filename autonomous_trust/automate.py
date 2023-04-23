@@ -8,7 +8,7 @@ from multiprocessing import Manager
 from queue import Empty
 from concurrent.futures import TimeoutError, CancelledError
 
-from .configuration import Configuration, CfgIds
+from .config.configuration import Configuration, CfgIds
 from .processes import Process, LogLevel, SUBSYSTEMS
 from .identity import Peers
 
@@ -48,22 +48,17 @@ def configure(logger):
     for cfg_file in config_paths:
         configs[get_cfg_type(cfg_file)] = Configuration.from_file(cfg_file)
 
-    # cross-reference
-    net_cfg = configs[CfgIds.network.value]
     identity = configs[CfgIds.identity.value]
-    if identity.address != net_cfg.ip:  # TODO other addressing (and do this somewhere else, net_impl?)
-        logger.error('Identity and network addresses differ: %s vs %s' % (identity.address, net_cfg.ip))
-        logger.warning('  Using the network addresses in identity and saving')
-        identity.address = net_cfg.ip
-        identity.to_file(os.path.join(cfg_dir, CfgIds.identity.value + Configuration.yaml_file_ext))
+    #configs[CfgIds.network.value] = identity.net_cfg
 
-    logger.info("Configuring '%s' at %s for %s" % (identity.fullname, identity.address, '(unknown domain)'))
+    # FIXME display address appropriate to protocol
+    logger.info("Configuring '%s' at %s for %s" % (identity.fullname, identity.net_cfg.ip4, '(unknown domain)'))
     logger.info('Signature: %s' % identity.signature.publish())  # FIXME these might be wrong for passing around
     logger.info("Public key: %s" % identity.encryptor.publish())
 
     # init configured process classes
     configs[Process.key] = []
-    for sub_sys_cls in SUBSYSTEMS.values():
+    for sub_sys_cls in SUBSYSTEMS.ordered:
         configs[Process.key].append(sub_sys_cls(configs))
     return configs
 

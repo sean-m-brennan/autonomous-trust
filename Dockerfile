@@ -1,14 +1,12 @@
-FROM continuumio/miniconda3:latest
+FROM continuumio/miniconda3
 
 WORKDIR /app
 SHELL ["/bin/bash", "-c"]
+RUN apt-get update && apt-get install -y iproute2 iputils-ping iputils-arping iputils-tracepath && apt-get clean
 COPY conda conda
-COPY autonomous_trust autonomous_trust
-COPY setup.py setup.py
-RUN source conda/init_conda && create_env
-RUN source conda/init_conda && populate_env
+RUN source conda/init_conda && create_env && conda clean -afy
 SHELL ["conda", "run", "-n", "autonomous_trust", "/bin/bash", "-c"]
-RUN pip install -e .
-ENV identifier 1  # FIXME random number
-#CMD conda run -n autonomous_trust python3 -m autonomous_trust $identifier
-ENTRYPOINT ["conda", "run", "-n", "--no-capture-output", "autonomous_trust", "python3 -m autonomous_trust"]
+RUN source conda/init_conda && populate_env && conda clean -afy
+COPY autonomous_trust autonomous_trust
+RUN rm -rf autonomous_trust/etc autonomous_trust/var
+CMD ["conda", "run", "--live-stream", "-n", "autonomous_trust", "python3", "-m", "autonomous_trust"]
