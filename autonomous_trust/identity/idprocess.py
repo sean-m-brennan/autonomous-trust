@@ -1,7 +1,7 @@
 import time
 from queue import Empty, Full
 
-from ..configuration import CfgIds
+from ..config.configuration import CfgIds
 from ..processes import Process, ProcMeta
 from ..network import Message, Network
 from .blocks import IdentityChain, IdentityBlock, IdentityProof
@@ -42,6 +42,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self._chain.catch_up(existing.chain)
         except Empty:
             self.phase += 1
+            self.debug('No chain: generate my own.')
         while self.keep_running(signal):
             try:
                 message = queue.get(block=True)  # FIXME need IPC obj to know whether from network or reputation

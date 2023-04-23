@@ -13,6 +13,7 @@ dependencies:
   - openssl
   - pebble
   - pip
+  - pynacl
   - pytest
   - quart
   - rsync

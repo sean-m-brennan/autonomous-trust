@@ -4,11 +4,12 @@ import logging
 from importlib import import_module
 from queue import Empty
 from collections.abc import Mapping
+from collections import OrderedDict
 
 from aenum import IntEnum
 from ruamel.yaml import YAML
 
-from .configuration import Configuration
+from .config.configuration import Configuration
 
 yaml = YAML(typ='safe')
 
@@ -18,11 +19,19 @@ class ProcessTracker(Mapping):
 
     def __init__(self):
         self._classes = []
-        self._registry = dict({})
+        self._registry = OrderedDict()
+        self._order = []
 
     @property
     def classes(self):
-        return {k: v for k, v in self._classes}
+        d = OrderedDict()
+        for k, v in self._classes:
+            d[k] = v
+        return d
+
+    @property
+    def ordered(self):
+        return self._order
 
     def register_subsystem(self, cfg_name, class_spec):
         self._classes.append((cfg_name, class_spec))
@@ -35,6 +44,7 @@ class ProcessTracker(Mapping):
             module = import_module(mod_name, pkg_name)
             cls = getattr(module, class_name)
         self._registry[cfg_name] = cls  # given cfg from CfgIds, yield proc
+        self._order.append(cls)
 
     def _validate_path(self, path):
         if path is None or path == '':

@@ -3,9 +3,9 @@
 import os
 import sys
 from autonomous_trust.automate import main
-from autonomous_trust.configuration import Configuration
+from autonomous_trust.config.configuration import Configuration
 from autonomous_trust.processes import LogLevel
-from autonomous_trust.generate_config import generate_identity
+from autonomous_trust.config.generate_config import generate_identity
 
 
 if __name__ == '__main__':
@@ -18,6 +18,6 @@ if __name__ == '__main__':
         os.path.join(this_dir, ident, Configuration.CFG_PATH)
     if not os.path.isdir(cfg_dir):
         os.makedirs(cfg_dir, exist_ok=True)
-        generate_identity(cfg_dir, randomize=True, seed=id)
+        generate_identity(cfg_dir, randomize=True, seed=ident)
     os.environ[Configuration.VARIABLE_NAME] = cfg_dir
     main(multiproc=True, log_level=LogLevel.DEBUG, logfile=Configuration.log_stdout)
