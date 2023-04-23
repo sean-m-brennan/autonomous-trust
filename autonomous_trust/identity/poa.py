@@ -1,4 +1,3 @@
-from ..configuration import Configuration
 from .blocks import IdentityChain
 
 

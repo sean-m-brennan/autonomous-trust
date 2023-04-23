@@ -1,5 +1,5 @@
 from ..processes import Process, Empty, ProcMeta, SUBSYSTEMS
-from ..configuration import CfgIds
+from ..config.configuration import CfgIds
 from .network import Message, Network
 
 

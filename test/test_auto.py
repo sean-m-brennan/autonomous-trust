@@ -1,7 +1,7 @@
 import os
 import shutil
 import pytest
-from autonomous_trust.configuration import Configuration
+from config.configuration import Configuration
 from autonomous_trust.automate import configure
 from . import PRESERVE_FILES, TEST_DIR
 

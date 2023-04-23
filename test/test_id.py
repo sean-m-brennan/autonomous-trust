@@ -2,7 +2,7 @@ import os
 import shutil
 import pytest
 import uuid as uuid_mod
-from autonomous_trust.configuration import Configuration
+from config.configuration import Configuration
 from identity.identity import Identity, Peers, Signature, Encryptor
 from . import PRESERVE_FILES, TEST_DIR
 
