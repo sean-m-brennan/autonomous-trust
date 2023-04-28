@@ -1,4 +1,4 @@
-from .blocks import IdentityChain
+from .dag import IdentityChain
 
 
 class IdentityProofOfStake(IdentityChain):
@@ -18,6 +18,8 @@ class IdentityProofOfStake(IdentityChain):
         return block.compute_hash()
 
     def verify(self, block, proof, sig):
+        if not super().verify(block, proof, sig):
+            return False
         if not self.validate(block, proof, sig):
             return False
         if block not in self._votes.keys():

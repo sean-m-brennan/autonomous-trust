@@ -2,20 +2,23 @@
 
 import os
 import sys
-from autonomous_trust.automate import main
-from autonomous_trust.config.configuration import Configuration
-from autonomous_trust.processes import LogLevel
-from autonomous_trust.config.generate_config import generate_identity
+from . import dev_root_dir
+from .automate import main
+from .config.configuration import Configuration
+from .processes import LogLevel
+from .config.generate import generate_identity
 
 
 if __name__ == '__main__':
     ident = None
     if len(sys.argv) > 1:
         ident = sys.argv[1]
-    this_dir = os.path.abspath(os.path.dirname(__file__))
-    cfg_dir = os.path.join(this_dir, Configuration.CFG_PATH)
-    if ident is not None:
-        os.path.join(this_dir, ident, Configuration.CFG_PATH)
+    if Configuration.VARIABLE_NAME in os.environ.keys():
+        cfg_dir = Configuration.get_cfg_dir()
+    else:
+        cfg_dir = os.path.join(dev_root_dir, Configuration.CFG_PATH)
+        if ident is not None:
+            cfg_dir = os.path.join(dev_root_dir, ident, Configuration.CFG_PATH)
     if not os.path.isdir(cfg_dir):
         os.makedirs(cfg_dir, exist_ok=True)
         generate_identity(cfg_dir, randomize=True, seed=ident)

@@ -19,4 +19,4 @@ job_id=$(jobs -l | grep " $sim_pid " | awk '{print $1}' | sed 's/.*\[\(.*\)\].*/
 fg "$job_id"
 echo "Simulation closed"
 
-deactivate_conda
+#deactivate_conda

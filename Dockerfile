@@ -9,4 +9,5 @@ SHELL ["conda", "run", "-n", "autonomous_trust", "/bin/bash", "-c"]
 RUN source conda/init_conda && populate_env && conda clean -afy
 COPY autonomous_trust autonomous_trust
 RUN rm -rf autonomous_trust/etc autonomous_trust/var
+COPY tests tests
 CMD ["conda", "run", "--live-stream", "-n", "autonomous_trust", "python3", "-m", "autonomous_trust"]

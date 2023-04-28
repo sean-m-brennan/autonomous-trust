@@ -2,14 +2,20 @@
 
 import os
 import sys
-from config.configuration import Configuration
-from autonomous_trust.config.generate_config import generate_identity
+from .. import dev_root_dir
+from .configuration import Configuration
+from .generate import generate_identity
 
 
 if __name__ == '__main__':
+    silent = True
     randomize = False
     if '--random' in sys.argv:
         randomize = True
-    this_dir = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
-    cfg_dir = os.path.join(this_dir, Configuration.CFG_PATH)
-    generate_identity(cfg_dir, randomize)
+    if '--verbose' in sys.argv:
+        silent = False
+    if Configuration.VARIABLE_NAME in os.environ.keys():
+        cfg_dir = Configuration.get_cfg_dir()
+    else:
+        cfg_dir = os.path.abspath(os.path.join(dev_root_dir, Configuration.CFG_PATH))
+    generate_identity(cfg_dir, randomize, silent=silent)

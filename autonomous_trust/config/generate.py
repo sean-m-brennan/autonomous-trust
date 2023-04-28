@@ -1,12 +1,13 @@
 import os
+import sys
 import random
+import re
 import socket
 import subprocess
 
 from ..reputation import ReputationProcess
 from ..processes import ProcessTracker
-from ..identity.identity import Identity
-from ..identity.idprocess import IdentityProcess
+from ..identity import Identity, IdentityProcess
 from ..network import *
 from .configuration import Configuration
 
@@ -25,24 +26,27 @@ names = [
 ]
 
 
-def get_addresses(device='eth0'):
+def _get_addresses(device='eth0'):
     ip4_address = None
     ip6_address = None
     result = subprocess.run(['/sbin/ip', '-o', 'a', 'show', device], shell=False,
                             capture_output=True, text=True, check=True)
     for line in result.stdout.split('\n'):
         if 'inet ' in line:
-            ip4_address = line.split()[3].split('/')[0]
+            ip4_address = line.split()[3]
         elif 'inet6' in line:
-            ip6_address = line.split()[3].split('/')[0]
+            ip6_address = line.split()[3]
     result = subprocess.run(['/sbin/ip', '-o', 'l', 'show', device], shell=False,
                             capture_output=True, text=True, check=True)
-    mac_address = result.stdout.split()[15]  # FIXME use regex 'link/ether ??:??:??:??:??:??'
+    hex_pattern = r'[0-9a-f][0-9a-f]'
+    mac_pattern = r'{hex}:{hex}:{hex}:{hex}:{hex}:{hex}'.format(hex=hex_pattern)
+    match = re.search(r'link/ether (%s)' % mac_pattern, result.stdout)
+    mac_address = match.group(1)
 
     return ip4_address, ip6_address, mac_address
 
 
-def write_subsystems(net_impl, sub_sys_file):
+def _write_subsystems(net_impl, sub_sys_file):
     pt = ProcessTracker()
     pt.register_subsystem(NetworkProcess.cfg_name, net_impl)
     pt.register_subsystem(IdentityProcess.cfg_name,
@@ -52,7 +56,7 @@ def write_subsystems(net_impl, sub_sys_file):
     pt.to_file(sub_sys_file)
 
 
-def generate_identity(cfg_dir, randomize=False, seed=None):
+def generate_identity(cfg_dir, randomize=False, seed=None, silent=True):
     if seed is not None:
         try:
             seed = int(seed)
@@ -68,8 +72,17 @@ def generate_identity(cfg_dir, randomize=False, seed=None):
     if hostname == 'localhost':
         hostname = unqualified_hostname
     protocol = SimpleTCPNetworkProcess.__module__ + '.' + SimpleTCPNetworkProcess.__qualname__
-    ip4_address, ip6_address, mac_address = get_addresses()  # TODO multi-device
-    # TODO determine required IP addresses from protocol
+    ip4_address, ip6_address, mac_address = _get_addresses()  # TODO multi-device
+
+    mod, cls = protocol.rsplit('.', 1)
+    proto_cls = getattr(sys.modules[mod], cls)
+    address = None
+    if proto_cls.net_proto == NetworkProtocol.IPV4:
+        address = ip4_address
+    elif proto_cls.net_proto == NetworkProtocol.IPV6:
+        address = ip6_address
+    elif proto_cls.net_proto == NetworkProtocol.MAC:
+        address = mac_address
 
     if randomize:
         if seed is None:
@@ -80,9 +93,14 @@ def generate_identity(cfg_dir, randomize=False, seed=None):
         nickname = fullname.split('@')[0].rsplit('.', 1)[1]
         net_impl = protocol
         net_cfg = Network.initialize(ip4_address, ip6_address, mac_address)
-        net_cfg.to_file(net_file)
-        Identity.initialize(fullname, nickname, net_cfg).to_file(ident_file)
-        write_subsystems(net_impl, sub_sys_file)
+        if not os.path.exists(net_file):
+            net_cfg.to_file(net_file)
+        if not os.path.exists(ident_file):
+            Identity.initialize(fullname, nickname, address).to_file(ident_file)
+        if not os.path.exists(sub_sys_file):
+            _write_subsystems(net_impl, sub_sys_file)
+        if not silent:
+            print('Wrote configs to %s' % cfg_dir)
         return
 
     print('Configuring an AutonomousTrust identity')
@@ -126,5 +144,5 @@ def generate_identity(cfg_dir, randomize=False, seed=None):
         if input('    Write subsystem config to %s [y/N] ' % sub_sys_file).lower().startswith('y'):
             overwrite = True
     if overwrite:
-        write_subsystems(net_impl, sub_sys_file)
+        _write_subsystems(net_impl, sub_sys_file)
         print('Subsystems config written to %s' % sub_sys_file)
