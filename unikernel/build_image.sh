@@ -23,13 +23,20 @@ platform=kvm
 # c or py or upy
 impl=py
 
+# cpus available for smp
+cpu_count=$(lscpu | grep "^CPU(s)" | awk '{print $2}')
+
+
 usage() {
-    echo "Usage: $(basename $0) [--tool TOOL] [-m|--architecture ARCH] [-p|--platform PLAT] [-i|--implementation IMPL] [--initrd] [--run] [--clean] [--pristine] [--force] [--debug] [--help]"
+    echo -n "Usage: $(basename $0) [--tool TOOL] [-m|--architecture ARCH] [-p|--platform PLAT] "
+    echo -n "[-i|--implementation IMPL] [--smp SMP] [--initrd] [--run] [--clean] [--pristine] "
+    echo "[--force] [--debug] [--help]"
     echo "  where"
     echo "       TOOL is pykraft or kraftkit"
     echo "       ARCH is x86_64 or arm64 or arm"
     echo "       PLAT is kvm or linuxu or xen"
     echo "       IMPL is py or c"
+    echo "       SMP is number of cpus"
 }
 
 initrdfs=false
@@ -53,6 +60,10 @@ while [ -n "$1" ]; do
     elif [[ "$1" = "--impl"* ]] || [ "$1" = "-i" ]; then
         shift
         impl="$1"
+    elif [[ "$1" = "--smp" ]]; then
+        shift
+        if [ "$1" -gt "0" ]; then
+            cpu_count="$1"
     elif [[ "$1" = "--qemu-native" ]]; then
         shift
         qemu_native="$1"
@@ -125,6 +136,8 @@ if [ "$tool" = "pykraft" ]; then
     if $initrdfs; then
         cp Kraftfile.initrd kraft.yaml
     fi
+    # For SMP multiprocessing increase CPU count
+    sed -i "s/CONFIG_UKPLAT_LCPU_MAXCOUNT=1/CONFIG_UKPLAT_LCPU_MAXCOUNT=${cpu_count}/" kraft.yaml
     echo "Configure unikraft for $impl"
     $kraft configure -m $arch -p $platform -t $kernel $force
     echo "Build unikraft for $impl"

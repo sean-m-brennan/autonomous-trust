@@ -1,4 +1,4 @@
-from .blocks import IdentityChain
+from .dag import IdentityChain
 
 
 class IdentityProofOfWork(IdentityChain):
@@ -21,6 +21,8 @@ class IdentityProofOfWork(IdentityChain):
         return computed_hash
 
     def verify(self, block, proof, sig):
+        if not super().verify(block, proof, sig):
+            return False
         if not self.validate(block, proof, sig):
             return False
         if proof.digest.startswith('0' * self.DIFFICULTY) and proof.digest == block.compute_hash():

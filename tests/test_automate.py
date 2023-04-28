@@ -1,8 +1,9 @@
 import os
 import shutil
 import pytest
-from config.configuration import Configuration
-from autonomous_trust.automate import configure
+
+from autonomous_trust.config import Configuration, generate_identity
+from autonomous_trust.automate import AutonomousTrust
 from . import PRESERVE_FILES, TEST_DIR
 
 
@@ -17,5 +18,9 @@ def setup_teardown():
 
 
 def test_config():
-    cfgs = configure()
+    generate_identity(os.environ[Configuration.VARIABLE_NAME], True)
+    at = AutonomousTrust(logfile=Configuration.log_stdout)
+    cfgs = at.configure(start=False)
+    assert 'network' in cfgs.keys()
     assert 'identity' in cfgs.keys()
+    assert 'peers' in cfgs.keys()

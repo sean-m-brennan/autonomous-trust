@@ -1,63 +1,35 @@
 from datetime import datetime
 from copy import deepcopy
-import logging
 
-from aenum import Enum
-from nacl.hashlib import blake2b
-
-from ..config.configuration import Configuration, EmptyObject
+from ...config import Configuration, EmptyObject
+from ...processes import ProcessLogger
+from .blocks import IdentityBlock
 
 
-class ChainImpl(Enum):
-    POW = 'work'
-    POS = 'stake'
-    POA = 'authority'
-
-
-class IdentityBlock(Configuration):
-    def __init__(self, index, identity, timestamp, previous_hash, sig_hash, nonce=0):
-        self.index = index
-        self.identity = identity
-        self.timestamp = timestamp
-        self.previous_hash = previous_hash
-        self.sig_hash = sig_hash
-        self.nonce = nonce
-        self.hash = self.compute_hash()
-
-    def __eq__(self, other):
-        return self.identity == other.identity
-
-    def compute_hash(self, nonce=None):
-        if nonce is None:
-            nonce = ''
-        msg_str = self.to_yaml_string() + nonce
-        return blake2b(msg_str.encode('utf-8')).hexdigest()
-
-    def validate(self):  # check data types of all info in a block
-        instances = [self.index, self.timestamp, self.previous_hash, self.hash]
-        types = [int, datetime, str, str]
-        if sum(map(lambda inst_, type_: isinstance(inst_, type_), instances, types)) == len(instances):
-            return True
-        else:
-            return False
-
-
-class IdentityChain(object):
+class IdentityChain(Configuration):
     GENESIS_BLOCK = IdentityBlock(0, EmptyObject(), datetime.utcnow(), None, '0')
     request_chain = 'request_identity_chain'
     provide_chain = 'provide_identity_chain'
     propose = 'propose_block'
     vote = 'vote_block'
 
-    def __init__(self, me, peers, timeout=0, blacklist=None):
+    def __init__(self, me, peers, log_queue, timeout=0, blacklist=None):
         self.blocks = [self.GENESIS_BLOCK]
         self._me = me
         self._peers = peers
+        self.logger = ProcessLogger(self.__class__.__name__, log_queue)
         self._timeout = timeout
         self.blacklist = blacklist
         if blacklist is None:
             self.blacklist = []
-        self.logger = logging.getLogger(__name__)
+        self.block_queue = dict({})  # keyed by identity
+
+    def __len__(self):
+        return len(self.blocks)
+
+    @property
+    def timeout(self):
+        return self._timeout
 
     @property
     def last_block(self):
@@ -68,20 +40,16 @@ class IdentityChain(object):
         return datetime.utcnow()
 
     def add_block(self, block, proof, sig):
-        previous_hash = self.last_block.hash
-        if previous_hash != block.previous_hash:  # FIXME change for DAG
-            return False
-        if not self.verify(block, proof, sig):  # FIXME allow for delayed approval (voting)
-            return False
-        # FIXME finalize(block)
-        block.hash = proof
+        #block.hash = proof  # FIXME wrong
         block.sig_hash = sig
         self.blocks.append(block)
-        return True
 
     def catch_up(self, other_chain):
         if len(self.blocks) < 3:
             self.blocks = other_chain
+        for ident in [b.identity for b in self.blocks]:
+            self._peers.promote(ident)
+
 
     ####################
     # DAG functions
@@ -131,43 +99,40 @@ class IdentityChain(object):
                 self.logger.error(f'Backdating at block {i}.')
         return flag
 
-    def validate(self, new_block, proof, sig, verbose=True):
+    def validate(self, new_block, proof, signed_proof):
         if new_block in self.blocks:
             self.logger.error(f'Duplicate of existing block.')
             return False
+        # FIXME must happen early to decode message
         peer = None
-        for p in self._peers:
+        for p in self._peers.all:
             if p.uuid == proof.uuid:
                 peer = p
                 break
-        if sig != peer.verify(proof):
+        if peer is not None and proof != peer.verify(signed_proof):  # FIXME verify takes (signed msg, sig) -> msg
             self.logger.error(f'Invalid proof signature.')
             return False
         return True
 
     def verify(self, block, proof, sig):
+        previous_hash = self.last_block.hash
+        if previous_hash != block.previous_hash:  # FIXME change for DAG
+            self.logger.error('Invalid previous hash')
+            self.logger.debug('%s vs %s' % (previous_hash, block.previous_hash))
+            return False
+        return True
+
+    def finalize(self, block):
         raise NotImplementedError
 
 
-class IdentityProof(Configuration):
-    """
-    Structure of transmitted proof of identity
-    """
-    def __init__(self, uuid, digest, approval):
-        self.uuid = uuid
-        self.digest = digest
-        self.approval = approval
-
-
-class BlockMessage(Configuration):
-    def __init__(self, block, proof, sig):
-        self.block = block
-        self.proof = proof
-        self.sig = sig
-
-
+# FIXME transmit as tuple
 class BlockChainMessage(Configuration):
-    def __init__(self, impl, chain):
+    def __init__(self, impl, chain, signed_chain=None):
         self.impl = impl
         self.chain = chain
-        # FIXME signed?
+        self.signed_chain = signed_chain
+
+    def signed(self):
+        #self.signed_chain = 0  # FIXME
+        return self

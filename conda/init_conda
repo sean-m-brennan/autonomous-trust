@@ -29,15 +29,21 @@ populate_env () {
     if [ "$use_pip" != "" ]; then
         pip install -r ${my_conda_base}/environment.recipes.txt
     else
+        python_version=$(grep "\- python.*=" $my_conda_base/environment.yaml | awk -F"=" '{print $NF}' )
         for pkg in ${my_conda_base}/recipes/*; do
             prebuilt=false
             for arch in noarch $(conda run -n $env python3 ${my_conda_base}/getarch.py); do
-                conda mambabuild $pkg
+                conda mambabuild --python ${python_version} $pkg
             done
         done
+        #conda index $CONDA_PREFIX_1/conda-bld
         conda config --add channels local
-        mamba install -y -n $env --file ${my_conda_base}/environment.recipes.txt
+        mamba install -y -n $env -c local --file ${my_conda_base}/environment.recipes.txt
     fi
+
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    rustup install nightly
+    rustup default nightly
 }
 
 activate_conda () {
