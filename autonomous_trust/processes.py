@@ -44,7 +44,8 @@ class ProcessTracker(Mapping):
             module = import_module(mod_name, pkg_name)
             cls = getattr(module, class_name)
         self._registry[cfg_name] = cls  # given cfg from CfgIds, yield proc
-        self._order.append(cls)
+        if cls not in self._order:
+            self._order.append(cls)
 
     def _validate_path(self, path):
         if path is None or path == '':
@@ -73,9 +74,6 @@ class ProcessTracker(Mapping):
         return iter(self._registry)
 
 
-SUBSYSTEMS = ProcessTracker()
-
-
 class LogLevel(IntEnum):
     CRITICAL = logging.CRITICAL
     ERROR = logging.ERROR
@@ -101,13 +99,17 @@ class ProcMeta(type):
 
 class Process(metaclass=ProcMeta):
     key = 'processes'
+    level = 'log-level'
     output_timeout = 1
     sig_quit = 'quit'
     cadence = 0.1
-    exit_timeout = 30
+    q_cadence = 0.001
+    exit_timeout = 5
 
-    def __init__(self, configurations, dependencies=None, log_level=LogLevel.INFO):
+    def __init__(self, configurations, subsystems, log_queue, dependencies=None, log_level=LogLevel.INFO):
         self.configs = configurations
+        self.subsystems = subsystems
+        self.log_queue = log_queue
         self.dependencies = dependencies
         if dependencies is None:
             self.dependencies = []
@@ -115,7 +117,10 @@ class Process(metaclass=ProcMeta):
             if dep not in map(lambda x: x.name, configurations['processes']):
                 raise RuntimeError('Unmet dependency for %s: %s' % (self.name, dep))
         self.log_level = log_level
-        self.logger = logging.getLogger(self.__class__.__name__)
+        if Process.level in self.configs.keys():
+            self.log_level = self.configs[Process.level]
+        self.logger = ProcessLogger(self.__class__.__name__, log_queue)
+        self.mocks = []  # list of Mockery objs
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -124,8 +129,32 @@ class Process(metaclass=ProcMeta):
     def __setstate__(self, state):
         self.__dict__.update(state)
 
+    def keep_running(self, signal):
+        running = True
+        try:
+            sig = signal.get_nowait()
+            self.logger.debug('Quit %s' % self.__class__.__name__)
+            if sig == self.sig_quit:
+                running = False
+        except Empty:
+            pass
+        return running
+
+    def process(self, queues, signal):
+        raise NotImplementedError
+
+
+class ProcessLogger(object):
+    def __init__(self, name, log_q):
+        self.name = name
+        self.log_queue = log_q
+        self.logger = logging.getLogger(name)
+
     def log(self, level, msg):
-        self.logger.log(level, msg)
+        if self.log_queue is not None:
+            self.log_queue.put((level, self.name, msg), block=True, timeout=0.001)
+        else:
+            self.logger.log(level, msg)
 
     def verbose(self, msg):
         self.log(LogLevel.VERBOSE, msg)
@@ -145,19 +174,24 @@ class Process(metaclass=ProcMeta):
     def critical(self, msg):
         self.log(LogLevel.CRITICAL, msg)
 
-    def keep_running(self, signal):
-        running = True
-        try:
-            sig = signal.get_nowait()
-            self.warning('Quit')
-            if sig == self.sig_quit:
-                running = False
-        except Empty:
-            pass
-        return running
 
-    def listen(self, queues, output, signal):
-        raise NotImplementedError
 
-    def speak(self, queues, output, signal):
-        raise NotImplementedError
+
+class Mockery(object):
+    def __init__(self, name, obj=None, value=None):
+        self.name = name
+        self.obj = obj
+        self.value = value
+        # FIXME assert
+
+    def patch(self, mocker):
+        if self.obj is None:
+            mocker.patch(self.name)  # always relative to SUBSYSTEMS
+        else:
+            if self.value is None:
+                mocker.patch.object(self.obj, self.name)
+            else:
+                mocker.patch.object(self.obj, self.name, return_value=self.value)
+
+    def assertion(self):
+        pass  # FIXME
