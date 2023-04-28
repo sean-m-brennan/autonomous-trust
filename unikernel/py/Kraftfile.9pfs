@@ -12,6 +12,7 @@ unikraft:
     - CONFIG_LIBVFSCORE_ROOTFS_9PFS=y
     - CONFIG_LIBVFSCORE_ROOTDEV="fs0"
     - CONFIG_LIBUKLIBPARAM=y
+    - CONFIG_UKPLAT_LCPU_MAXCOUNT=1
 targets:
   - architecture: x86_64
     platform: kvm

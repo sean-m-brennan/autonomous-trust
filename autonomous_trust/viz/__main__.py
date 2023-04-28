@@ -1,6 +1,6 @@
 #!/usr/bin/env -S python3 -m
 
-import server
+from . import server
 import os
 import argparse
 
@@ -18,4 +18,4 @@ if __name__ == '__main__':
     parser.add_argument('--size', type=int, default=initial_size)
     args = parser.parse_args()
 
-    server.web_visuals(args.directory, args.port, args.debug, args.size)
+    server.VizServer(args.directory, args.port, args.debug, args.size).run()

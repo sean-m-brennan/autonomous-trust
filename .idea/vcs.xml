@@ -3,12 +3,6 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/unikernel/extern/cffi" vcs="hg4idea" />
-    <mapping directory="$PROJECT_DIR$/unikernel/extern/lib-gcc" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/unikernel/extern/libffi" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/unikernel/extern/libnacl" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/unikernel/extern/pynacl" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/unikernel/extern/pysodium" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/unikernel/libs/libffi" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/unikernel/libs/libzmq" vcs="Git" />
   </component>
 </project>

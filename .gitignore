@@ -25,6 +25,10 @@ doc/presentation/css/tekfive.css*
 doc/presentation/notes
 doc/pitch/count.txt
 
-autonomous_trust/etc/at
-autonomous_trust/var/at
+at
+at
 **/*.egg-info
+.tox
+.coverage*
+coverage
+**/.pytest-cache

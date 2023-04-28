@@ -2,8 +2,8 @@ import os
 import shutil
 import pytest
 import uuid as uuid_mod
-from config.configuration import Configuration
-from identity.identity import Identity, Peers, Signature, Encryptor
+from autonomous_trust.config import Configuration
+from autonomous_trust.identity import Identity, Peers, Signature, Encryptor
 from . import PRESERVE_FILES, TEST_DIR
 
 
@@ -48,4 +48,6 @@ def test_peers():
     file = os.path.join(TEST_DIR, 'test_peers')
     t3.to_file(file)
     t4 = Configuration.from_file(file)
+    print(t3.listing)
+    print(t4.listing)
     assert repr(t3) == repr(t4)

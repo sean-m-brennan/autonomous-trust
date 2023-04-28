@@ -4,115 +4,111 @@ import time
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import traceback
-from multiprocessing import Manager
-from queue import Empty
+from multiprocessing import get_context
+import queue
 from concurrent.futures import TimeoutError, CancelledError
 
-from .config.configuration import Configuration, CfgIds
-from .processes import Process, LogLevel, SUBSYSTEMS
+from .config import Configuration, CfgIds
+from .processes import Process, LogLevel, ProcessTracker
 from .identity import Peers
 
 
-def banner():
-    print("")
-    print("You are using\033[94m AutonomousTrust\033[00m from\033[96m TekFive\033[00m.")
-    print("")
+class AutonomousTrust(object):
+    # default to production values
+    def __init__(self, multiproc=True, log_level=LogLevel.WARNING, logfile=None, context='forkserver'):
+        self.mp = multiproc
+        if multiproc:
+            # Multiprocessing
+            from pebble import ProcessPool
+            self.pool_type = ProcessPool
+            ctx = get_context(context)
+            self.pool_kwargs = {'context': ctx}
+            manager = ctx.Manager()
+            self.queue_type = manager.Queue  # noqa
+        else:
+            # Threading
+            from pebble import ThreadPool
+            self.pool_type = ThreadPool
+            self.pool_kwargs = {}
+            self.queue_type = queue.Queue
+            # FIXME monkeypatch shutdown?
 
+        self.log_level = log_level
+        self.log_file = logfile
+        self.name = self.__class__.__name__
+        if logfile is None:
+            self.log_file = os.path.join(Configuration.get_data_dir(), 'autonomous_trust.log')
+        root = logging.getLogger()
+        root.setLevel(logging.DEBUG)
+        if logfile == Configuration.log_stdout:
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setFormatter(logging.Formatter('%(message)s'))
+        else:
+            handler = TimedRotatingFileHandler(logfile, when="midnight", interval=1, backupCount=5)
+            handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
+                                                   '%Y-%m-%d %H:%M:%S'))
+        handler.setLevel(log_level)
+        self.logger = logging.getLogger(self.name)
+        self.logger.addHandler(handler)
+        self.output = self.queue_type()
 
-def configure(logger):
-    required = [CfgIds.network.value, CfgIds.identity.value, CfgIds.peers.value]
-    defaultable = {CfgIds.peers.value: Peers, }
+        self.subsystems = ProcessTracker()
 
-    configs = {}
-    cfg_dir = Configuration.get_cfg_dir()
-    SUBSYSTEMS.from_file(cfg_dir)
+    @staticmethod
+    def banner():
+        print("")
+        print("You are using\033[94m AutonomousTrust\033[00m from\033[96m TekFive\033[00m.")
+        print("")
 
-    def get_cfg_type(path):
+    @staticmethod
+    def _get_cfg_type(path):
         if path.endswith(Configuration.yaml_file_ext):
-            return os.path.basename(path).removesuffix(Configuration.yaml_file_ext)
+                return os.path.basename(path).removesuffix(Configuration.yaml_file_ext)
 
-    # find missing, set defaults
-    config_files = os.listdir(cfg_dir)
-    cfg_types = list(map(get_cfg_type, config_files))
-    for cfg_name in required:
-        if cfg_name not in cfg_types:
-            if cfg_name in defaultable.keys():
-                defaultable[cfg_name]().to_file(os.path.join(cfg_dir, cfg_name + Configuration.yaml_file_ext))
-            else:
-                logger.error('Required %s configuration missing' % cfg_name)
-                return None
+    def configure(self, start=True):
+        required = [CfgIds.network.value, CfgIds.identity.value, CfgIds.peers.value]
+        defaultable = {CfgIds.peers.value: Peers, }
+
+        configs = {}
+        cfg_dir = Configuration.get_cfg_dir()
+        self.subsystems.from_file(cfg_dir)
+
+        # find missing, set defaults
+        config_files = os.listdir(cfg_dir)
+        cfg_types = list(map(self._get_cfg_type, config_files))
+        for cfg_name in required:
+            if cfg_name not in cfg_types:
+                if cfg_name in defaultable.keys():
+                    defaultable[cfg_name]().to_file(os.path.join(cfg_dir, cfg_name + Configuration.yaml_file_ext))
+                else:
+                    self.logger.error(self.name + ':  Required %s configuration missing' % cfg_name)
+                    return None
 
     # load configs
-    config_files = [x for x in os.listdir(cfg_dir) if x.endswith(Configuration.yaml_file_ext)]
-    config_paths = list(map(lambda x: os.path.join(cfg_dir, x), config_files))
-    for cfg_file in config_paths:
-        configs[get_cfg_type(cfg_file)] = Configuration.from_file(cfg_file)
+        config_files = [x for x in os.listdir(cfg_dir) if x.endswith(Configuration.yaml_file_ext)]
+        config_paths = list(map(lambda x: os.path.join(cfg_dir, x), config_files))
+        for cfg_file in config_paths:
+            configs[self._get_cfg_type(cfg_file)] = Configuration.from_file(cfg_file)
 
-    identity = configs[CfgIds.identity.value]
-    #configs[CfgIds.network.value] = identity.net_cfg
+        net_cfg = configs[CfgIds.network.value]
+        identity = configs[CfgIds.identity.value]
+        # FIXME cross-reference addresses, identity.address is as appropriate for net protocol
 
-    # FIXME display address appropriate to protocol
-    logger.info("Configuring '%s' at %s for %s" % (identity.fullname, identity.net_cfg.ip4, '(unknown domain)'))
-    logger.info('Signature: %s' % identity.signature.publish())  # FIXME these might be wrong for passing around
-    logger.info("Public key: %s" % identity.encryptor.publish())
+        self.logger.info(self.name + ":  Configuring '%s' at %s for %s" %
+                         (identity.fullname, identity.address, '(unknown domain)'))
+        self.logger.info(self.name + ':  Signature: %s' % identity.signature.publish())  # FIXME these might be wrong for passing around
+        self.logger.info(self.name + ':  Public key: %s' % identity.encryptor.publish())
 
-    # init configured process classes
-    configs[Process.key] = []
-    for sub_sys_cls in SUBSYSTEMS.ordered:
-        configs[Process.key].append(sub_sys_cls(configs))
-    return configs
+        configs[Process.level] = self.log_level
+        configs[Process.key] = []
+        if start:
+            # init configured process classes
+            sub_sys_list = self.subsystems.ordered
+            for sub_sys_cls in sub_sys_list:
+                configs[Process.key].append(sub_sys_cls(configs, self.subsystems, self.output))
+        return configs
 
-
-# default to production values
-def main(multiproc=False, log_level=LogLevel.WARNING, logfile=None):
-    os.makedirs(Configuration.get_data_dir(), exist_ok=True)
-    if multiproc:
-        from pebble import ProcessPool as ExecPool
-    else:
-        from pebble import ThreadPool as ExecPool
-
-    if logfile is None:
-        logfile = os.path.join(Configuration.get_data_dir(), 'autonomous_trust.log')
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
-    if logfile == Configuration.log_stdout:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setLevel(log_level)
-        handler.setFormatter(logging.Formatter('%(name)s: %(message)s'))
-        root.addHandler(handler)
-    else:
-        log_fmt = '%(asctime)s.%(msecs)03d - %(levelname)s %(name)s  %(message)s'
-        date_fmt = '%Y-%m-%d %H:%M:%S'
-        handler = TimedRotatingFileHandler(logfile, when="midnight", interval=1, backupCount=5)
-        handler.setLevel(log_level)
-        handler.setFormatter(logging.Formatter(log_fmt, date_fmt))
-        root.addHandler(handler)
-    logger = logging.getLogger(__name__)
-    if log_level <= LogLevel.INFO:
-        banner()
-    procs = configure(logger)[Process.key]
-    if procs is None:
-        return
-    manager = Manager()
-    queues = dict(zip(list(map(lambda x: x.name, procs)), [manager.Queue() for _ in range(len(procs))]))
-    signals = {}
-    output = manager.Queue()
-    with ExecPool(max_workers=len(procs)*2) as pool:
-        future_info = {}
-        for proc in procs:
-            # start all listeners first
-            logger.info("Starting %s ..." % proc.name)
-            task_name = proc.name.replace(' ', '_') + '.in'
-            signals[task_name] = manager.Queue()
-            future_info[task_name] = pool.schedule(proc.listen, (queues, output, signals[task_name]))
-        for proc in procs:
-            # then allow speakers - so no messages are lost
-            task_name = proc.name.replace(' ', '_') + '.in'
-            signals[task_name] = manager.Queue()
-            future_info[task_name] = pool.schedule(proc.speak, (queues, output, signals[task_name]))
-        pool.close()  # no more tasks
-        logger.info('                                        Ready.')
-
+    def __main_loop(self, future_info, signals):
         while True:
             try:
                 # record subprocess exceptions
@@ -120,25 +116,59 @@ def main(multiproc=False, log_level=LogLevel.WARNING, logfile=None):
                     if future.done():
                         try:
                             ex = future.exception(0)
-                            logger.error(''.join(traceback.TracebackException.from_exception(ex).format()))
+                            self.logger.error(self.name + ':  ' +
+                                              ''.join(traceback.TracebackException.from_exception(ex).format()))
                         except (TimeoutError, CancelledError):
                             pass
                 # record subprocess outputs, if any
                 try:
-                    level, name, msg = output.get_nowait()
-                    logger.log(level, '%s: %s' % (name, msg))
-                except Empty:
+                    level, name, msg = self.output.get_nowait()
+                    self.logger.log(level, '%s: %s' % (name, msg))
+                except queue.Empty:
                     pass
                 time.sleep(Process.cadence)
             except KeyboardInterrupt:
                 for sig in signals.values():
                     sig.put_nowait(Process.sig_quit)
                 break
-        futures = list(future_info.items())
-        futures.reverse()
-        for name, future in futures:
-            if not future.done():
-                future.cancel()
-            logger.info("%s halted" % name)
-        pool.join(Process.exit_timeout)
-    logger.info("Shutdown")
+
+    def run_forever(self, override_loop=None):
+        os.makedirs(Configuration.get_data_dir(), exist_ok=True)
+        if self.log_level <= LogLevel.INFO:
+            self.banner()
+        procs = self.configure()[Process.key]
+        if procs is None:
+            return
+        queues = dict(zip(list(map(lambda x: x.name, procs)), [self.queue_type() for _ in range(len(procs))]))
+        signals = {}
+        with self.pool_type(max_workers=len(procs), **self.pool_kwargs) as pool:
+            future_info = {}
+            for proc in procs:
+                self.logger.info(self.name + ':  Starting %s ...' % proc.name)
+                signals[proc.name] = self.queue_type()
+                future_info[proc.name] = pool.schedule(proc.process, (queues, signals[proc.name]))
+            pool.close()  # no more tasks
+            self.logger.info(self.name + ':                                          Ready.')
+
+            # loop
+            if override_loop is not None:
+                override_loop(self, future_info, signals)
+            else:
+                self.__main_loop(future_info, signals)
+
+            # halt
+            futures = list(future_info.items())
+            futures.reverse()
+            for name, future in futures:
+                if self.mp and not future.done():
+                    future.cancel()
+                self.logger.info(self.name + ':  %s halted' % name)
+            pool.stop()
+            if self.mp:
+                pool.join(Process.exit_timeout)
+            # FIXME shutdown of threads
+        self.logger.info(self.name + ':  Shutdown')
+
+
+def main(multiproc=True, log_level=LogLevel.WARNING, logfile=None, override_loop=None):
+    AutonomousTrust(multiproc, log_level, logfile).run_forever(override_loop)
