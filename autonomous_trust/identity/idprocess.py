@@ -2,12 +2,11 @@ import time
 from queue import Empty, Full
 import threading
 
-from ..config.configuration import CfgIds
+from ..algorithms import AgreementProof, AgreementImpl
+from ..config import CfgIds
 from ..processes import Process, ProcMeta
 from ..network import Message, Network
-from .blocks import IdentityChain, IdentityBlock, IdentityProof, ChainImpl
-from .blocks import BlockMessage, BlockSignedMessage, BlockChainMessage
-from .blocks import IdentityProofOfWork, IdentityProofOfStake, IdentityProofOfAuthority
+from .history import IdentityByWork, IdentityByStake, IdentityByAuthority, IdentityProtocol
 
 
 class IdentityProcess(Process, metaclass=ProcMeta,
@@ -24,20 +23,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.phase = 0
         self.confirmed_block = []
         impl = self.ident.block_impl
-        if impl == ChainImpl.POW.value:
-            self._chain = IdentityProofOfWork(self.ident, self.peers, log_q, 0)
-        elif impl == ChainImpl.POS.value:
-            self._chain = IdentityProofOfStake(self.ident, self.peers, log_q, 5)
-        elif impl == ChainImpl.POA.value:
-            self._chain = IdentityProofOfAuthority(self.ident, self.peers, log_q, 5)
+        if impl == AgreementImpl.POW.value:
+            self._history = IdentityByWork(self.ident, self.peers, log_q, 0)
+        elif impl == AgreementImpl.POS.value:
+            self._history = IdentityByStake(self.ident, self.peers, log_q, 5)
+        elif impl == AgreementImpl.POA.value:
+            self._history = IdentityByAuthority(self.ident, self.peers, log_q, 5)
         else:
-            raise RuntimeError('Invalid blockchain implementation: %s' % impl)
+            raise RuntimeError('Invalid identity history implementation: %s' % impl)
         self.messages = []
 
     def _process_block(self, block):
-        digest = self._chain.confirm(block)
+        digest = self._history.prove(block)
         if digest is not None:
-            proof = IdentityProof(block.identity.uuid, digest, True)
+            proof = AgreementProof(block.identity.uuid, digest, True)
             self.confirmed_block.append((block, proof, self.ident.sign(proof)))
 
     def request_chain(self, queues):
@@ -50,12 +49,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         """
         if self.phase != 0:
             return
-        if len(self._chain) > 1:
+        if len(self._history) > 1:
             self.phase = 1
             return
         try:
             self.logger.debug('Request existing chain')
-            message = Message(self.name, IdentityChain.request_chain, '', to_whom=Network.broadcast)
+            message = Message(self.name, IdentityProtocol.request.value, '', to_whom=Network.broadcast)
             queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
         except Full:
             self.logger.error('IdProc(1): Network queue full')
@@ -75,11 +74,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             # FIXME possible fraud here, compare multiples, but what if < 3 respond?
             # need provers
             message = queues[self.name].get(block=True, timeout=self.init_timeout)
-            if message.function == IdentityChain.provide_chain:
+            if message.function == IdentityProtocol.provide.value:
                 self.logger.debug('Received existing chain')
-                existing = BlockChainMessage.from_yaml_string(message.obj)
-                if existing.impl == self.ident.block_impl:
-                    self._chain.catch_up(existing.chain)
+                #existing = BlockChainMessage.from_yaml_string(message.obj)
+                existing = self._history.hear(*message.obj)
+                self._history.catch_up(existing)
+                #if existing.impl == self.ident.block_impl:
+                #    self._history.catch_up(existing.chain)
             else:
                 self.messages.append(message)
         except Empty:
@@ -98,25 +99,25 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             time.sleep(self.cadence)
         try:
             self.logger.debug('Create my identity')
-            last = self._chain.last_block
-            block = IdentityBlock(last.index + 1, self.ident.publish(), self._chain.now, last.hash, '0')
-            digest = self._chain.confirm(block)  # confirm my own identity for bootstrapping
+            last = self._history.last_block
+            block = IdentityBlock(last.index + 1, self.ident.publish(), self._history.now, last.hash, '0')
+            digest = self._history.prove(block)  # confirm my own identity for bootstrapping
             if digest:
-                proof = IdentityProof(block.identity.uuid, digest, True)
+                proof = AgreementProof(block.identity.uuid, digest, True)
                 sig_msg = self.ident.sign(proof.to_yaml_string().encode())
                 sig_hash = BlockSignedMessage(sig_msg.message, sig_msg.signature)
-                if not self._chain.verify(block, proof, sig_hash):  # may run long
+                if not self._history.verify(block, proof, sig_hash):  # may run long
                     self.logger.error('Invalid identity block for myself')
                 else:
                     msg_str = BlockMessage(block, proof, sig_hash).to_yaml_string()
                     peers = self.configs[CfgIds.peers.value].all
                     if len(peers) > 0:
-                        message = Message(self.name, IdentityChain.propose, msg_str, to_whom=peers)
+                        message = Message(self.name, IdentityProtocol.propose.value, msg_str, to_whom=peers)
                     else:
-                        message = Message(self.name, IdentityChain.propose, msg_str, to_whom=Network.broadcast)
+                        message = Message(self.name, IdentityProtocol.propose.value, msg_str, to_whom=Network.broadcast)
                     self.logger.debug('Send block proposal')
                     queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
-                    if not block.checker(self._chain, proof, sig_hash):  # will run long
+                    if not block.checker(self._history, proof, sig_hash):  # will run long
                         self.logger.error('Not accepted by peers')
                         # FIXME what if I'm refused?
         except Full:
@@ -135,7 +136,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if self.phase != 3:
             return
         try:
-            if message.function == IdentityChain.propose:
+            if message.function == IdentityProtocol.propose.value:
                 self.logger.debug('Received block proposal')
                 block = BlockMessage.from_yaml_string(message.obj)  # FIXME verify
                 threading.Thread(target=self._process_block, args=(block,), daemon=True).start()
@@ -159,7 +160,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 return
             block = self.confirmed_block.pop(0)
             msg_str = BlockMessage(*block).signed().to_yaml_string()
-            message = Message(self.name, IdentityChain.vote, msg_str, to_whom=self.peers)
+            message = Message(self.name, IdentityProtocol.vote.value, msg_str, to_whom=self.peers)
             self.logger.debug("Send confirmed block")
             queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
         except Full:
@@ -177,10 +178,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if self.phase != 3:
             return
         try:
-            if message.function == IdentityChain.request_chain:
+            if message.function == IdentityProtocol.request.value:
                 to_whom = message.from_whom
-                msg = BlockChainMessage(self.ident.block_impl, self._chain).signed().to_yaml_string()
-                message = Message(self.name, IdentityChain.provide_chain, msg, to_whom=to_whom)
+                msg = BlockChainMessage(self.ident.block_impl, self._history).signed().to_yaml_string()
+                message = Message(self.name, IdentityProtocol.provide.value, msg, to_whom=to_whom)
                 self.logger.debug('Send requested chain')
                 queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
         except Empty:
