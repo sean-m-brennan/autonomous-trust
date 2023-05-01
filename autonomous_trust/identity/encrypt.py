@@ -31,7 +31,7 @@ class Encryptor(Configuration):
         if self.public_only:
             seed = self.publish()
         else:
-            seed = self.private.encode(encoder=HexEncoder)
+            seed = self.serialize()
         return dict(hex_seed=seed, public_only=self.public_only)
 
     def serialize(self):  # WARNING: serialization of signature keys is insecure if physically breached
