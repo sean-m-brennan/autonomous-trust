@@ -1,6 +1,6 @@
 import pytest
 
-from autonomous_trust.identity.blocks.tree import Tree, _flatten
+from identity.structures.redblack import Tree, _flatten
 
 
 def test_tuples():

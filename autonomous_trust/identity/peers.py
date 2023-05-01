@@ -33,6 +33,12 @@ class Peers(Configuration):
         if idx is not None:
             return self.hierarchy[idx][index]
 
+    def find_by_uuid(self, uuid):
+        ids = {p.uuid: p for p in self.listing.values()}
+        if uuid in ids.keys():
+            return ids[uuid]
+        return None
+
     def find_by_address(self, address):
         if address in self.listing.keys():
             return self.listing[address]
