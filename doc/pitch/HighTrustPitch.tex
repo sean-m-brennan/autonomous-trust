@@ -1,15 +1,18 @@
 \documentclass[10pt]{article}
 \usepackage[type=product~leaflet]{tekfive}
 \usepackage{datetime}
+\usepackage{relsize}
 
 \geometry{letterpaper}
 \renewcommand*\familydefault{\sfdefault}
+
+\newcommand\CC{C\nolinebreak[4]\hspace{-.05em}\raisebox{.45ex}{\relsize{-2}{\textbf{++}}}}
 
 \newcommand{\projectName}{\emph{AutonomousTrust }}
 
 % Needs to be compiled with 'pdflatex --shell-escape'
 \newcommand{\wordcount}{
-    \immediate\write18{texcount -merge -sub=section \jobname.tex | grep "Section" | sed -e 's/+.*//' | sed -n \thesection p > 'count.txt'}
+    \immediate\write18{texcount -merge -sub=section \jobname.tex | grep Section | sed -e 's/+.*//' | sed -n \thesection p > 'count.txt'}
     (\input{count.txt}words)}
 
 \title{\textbf{\huge \projectName}\\ NSF Seed Fund Project Pitch %
@@ -35,18 +38,20 @@ We provide for consistent, immutable identity with a crypto-ledger --- shared am
 This allows reputation scoring derived from shared transaction scores.
 Reputation is bootstrapped through game-theoretic strategies.
 Lastly, the opposing strategies of paranoid security and vulnerable opportunity are dynamically self-balanced.
-In combination, these facets are the backbone of an ecosystem supporting a community of autonomous agents which perform decentralized computing in a way that minimizes security risks and optimizes cooperation.
+In combination, these facets are the backbone of a software ecosystem supporting a community of autonomous agents which perform decentralized computing in a way that minimizes security risks and optimizes cooperation.
+We strongly restrict the capabilities of any one node of the system; no general computing here.
+But, through micro-service composability, the system as a whole is generally capable yet highly secure because the interfaces are very specific and continuously, autonomously monitored.
 
-\projectName is related to advances in Internet-of-Things (IoT) and machine-to-machine (M2M) messaging technologies, but explicitly addresses a prevalent lack of security in those paradigms, as well as cybersecurity shortcomings in general.
+\projectName is tangentially related to advances in Internet-of-Things (IoT) and machine-to-machine (M2M) messaging technologies, but explicitly addresses a prevalent lack of security in those paradigms, as well as cybersecurity shortcomings in general.
 This concept is also a highly-distributed answer to the extreme centralization of Cloud computing, in which we perceive foundational vulnerabilities.
-Although the Web3 principle of decentralization is incorporated here, our concept is a concrete step beyond, emphasizing blockchain's roots in distributed consensus.
-Our intended realization of this project into a product would be no mere incremental step, but a sharp departure from current computation, much like Cloud computing was before it.
+Although the Web3 principles of decentralization and knowledge-proofing is incorporated here, our concept is a concrete step beyond, emphasizing blockchain's roots in distributed consensus.
+Our intended realization of this project into a product would be no mere incremental step, but a sharp departure from current computation practices, much like Cloud computing was before it.
 
 \wordcount
 
 \section{The Technical Objectives and Challenges}\label{sec:objectives}
 
-This proof-of-concept project will necessarily require engineering development to rough-out the operational viability of the above mechanisms, but it will also research and explore the effectiveness of the concept itself.
+This proof-of-concept project will necessarily require some engineering development to rough-out the operational viability of the above mechanisms, but primarily it will research and explore the effectiveness of the concept itself.
 To this end, we will study three things: 1) the structure, efficiency and resiliency of self-formed network topologies, 2) effective patterns of negotiation and reputation-building at scale, and 3) the resistance of the network at each level to failure and attack.
 This last item is our primary metric for success, ultimately comparing against the 2019--2020 SunBurst supply-chain attack on the SolarWinds Orion product.
 We will intentionally include and then exploit several classes of known CVE vulnerabilities against individual agents, run established attacks such as DoS, 51\% and Sybil against our blockchains, and conduct system-specific attacks.
@@ -54,9 +59,17 @@ We have identified five attack vectors specific to our system: 1) service decept
 Additional possible attacks may be discovered as development proceeds.
 Statistical methods will be used to determine our effectiveness compared to both naïve and state-of-the-art implementations.
 
-Our mature product will likely be written in C for performance and deployed in containers or virtual machines, but at this stage we will be using Python for rapid prototyping and little or no sandboxing.
+The strongest challenge for our system lies in network bootstrapping and insertion of valid new nodes.
+While nominal communications between nodes are fully encrypted, initial contact cannot be.
+We anticipate using specialized nodes -- more capable and hardened -- to act as diplomats to vet and shepherd new nodes, as a protective ring around the core of the system.
+These diplomatic nodes will have separate open and encrypted channels, to interface with either side of the barrier, but to an inevitable extent the open channel presents an attack vector.
+We will have to pay particular attention to the potential vulnerabilities in this outward-facing ring.
+Studying this aspect will begin at the outset of the project because this is also how the network as a whole is created from scratch.
+That will also help ensure our emphasis is on testing security from step one.
+
+Our mature product will likely be written in C, \CC, or Rust for performance and deployed in containers or virtual machines, but at this stage we will be using Python for rapid prototyping and little or no sandboxing.
 We will develop a testbed environment that will enable network behavior visualization, injection of errors and attacks, and general debugging.
-This tool can later be used as a development environment for instances of the ultimate product as well.
+This tool can later be used as a development environment for rapidly prototyping instances of the ultimate product as well.
 
 \wordcount
 

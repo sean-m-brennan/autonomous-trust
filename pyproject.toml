@@ -43,3 +43,4 @@ python-source = "."
 python-packages = ["autonomous_trust"]
 manifest-path = "rust/Cargo.toml"
 features = ["pyo3/extension-module"]
+compatibility = "manylinux2014"

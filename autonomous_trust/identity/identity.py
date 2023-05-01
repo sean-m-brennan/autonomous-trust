@@ -3,19 +3,19 @@ import uuid as uuid_mod
 from nacl.public import Box
 from nacl.encoding import HexEncoder
 
-from ..config.configuration import Configuration
-from .blocks import ChainImpl
+from ..config import Configuration
+from ..algorithms import AgreementVoter, AgreementImpl
 from .sign import Signature
 from .encrypt import Encryptor
 
 
-class Identity(Configuration):
+class Identity(Configuration, AgreementVoter):
     """
     Identity details that can be saved to file or transmitted
     """
-    def __init__(self, _uuid, address, _fullname, _nickname, _signature, _encryptor, petname='',
-                 _public_only=True, _block_impl=ChainImpl.POA.value):
-        self._uuid = str(_uuid)
+    def __init__(self, _uuid, address, _fullname, _nickname, _signature, _encryptor, petname='', _rank=0,
+                 _public_only=True, _block_impl=AgreementImpl.POA.value):
+        super().__init__(str(_uuid), _rank)
         self.address = address  # corresponds to one address in Network config
         self._fullname = _fullname
         self._nickname = _nickname
