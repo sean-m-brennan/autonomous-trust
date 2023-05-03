@@ -12,22 +12,14 @@
 \usepackage[yyyymmdd,hhmmss]{datetime}
 \usepackage{comment}
 \usepackage{xparse}
+\usepackage{ifpdf}
+\usepackage{catchfile}
 
-\ExplSyntaxOn
-\NewDocumentCommand{\getenv}{om}
- {
-  \sys_get_shell:nnN { kpsewhich ~ --var-value ~ #2 } { } \l_tmpa_tl
-  \tl_trim_spaces:N \l_tmpa_tl
-  \IfNoValueTF { #1 }
-   {
-    \tl_use:N \l_tmpa_tl
-   }
-   {
-    \tl_set_eq:NN #1 \l_tmpa_tl
-   }
- }
-\ExplSyntaxOff
-
+\newcommand{\getenv}[3][]{%
+  \CatchFileEdef{\temp}{"|kpsewhich --var-value #2"}{\endlinechar=-1}%
+  \typeout{\temp}%
+  \ifx\temp\empty\def\temp{#3}\fi%
+  \if\relax\detokenize{#1}\relax\temp\else\let#1\temp\fi}
 
 \renewcommand*\familydefault{\sfdefault}
 
@@ -45,9 +37,16 @@
 \author{Sean M. Brennan}
 \date{\monthname{} \the\year}
 
+\getenv[\SCENARIO]{AUTONOMOUSTRUST_SCENARIO}{dod}%\show\SCENARIO
+
+
 \begin{document}
-	
+
+\ifpdf
 \TekFiveTitle
+\else
+\chapter{\projectName}
+\fi
 
 \begin{abstract}
 	Cybersecurity efforts are woefully struggling due to the utterly non-scalable assumptions currently embedded in our computing paradigms.
@@ -62,8 +61,6 @@
 		
 	The ecosystem we present here is fully realizable with current technology --- no special hardware (though we might be careful about what we choose), no unproven libraries (but again choosing carefully) --- just small messages over any connection and a few small, shared blockchain ledgers.
 \end{abstract}
-
-\getenv[\SCENARIO]{AUTONOMOUSTRUST_SCENARIO}\show\SCENARIO
 
 \section{Introduction}\label{sec:intro}
 \input{introduction}
@@ -83,7 +80,7 @@
 Combining the best of cryptography, blockchain, and distributed computing technologies, this system creates a setting for automated software agents to interact and self-regulate as a community.
 When combined with TekFive's \analysisName product and program-correctness expertise, \projectName offers a comprehensive environment for decentralized computing that minimizes security risks and optimizes cooperation.
 \\[10pt]
-\input{scenario_\SCENARIO_conclusion}
+\input{\SCENARIO/scenario_conclusion}
 
 Our security approach holds for more everyday circumstances as well.
 Given what we know about the SunBurst supply-chain attack, \projectName would have eliminated the routes this hack took for both the vendor and their clients.
@@ -91,6 +88,8 @@ In this case, the protection is primarily due to the automatic capabilities rest
 \\[10pt]
 One glaring omission we have not addressed here is the potential vulnerabilities presented by the operating system and hardware that \projectName runs on.
 The equally obvious solution would be to run our system on bare metal, or a minimal, provably-secure OS. This will be the subject of additional research.
+
+\nocite{*}
 
 \bibliography{HighTrust}
 

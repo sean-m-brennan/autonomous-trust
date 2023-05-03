@@ -2,6 +2,7 @@
 \usepackage[type=product~leaflet]{tekfive}
 \usepackage{datetime}
 \usepackage{relsize}
+\usepackage{ifpdf}
 
 \geometry{letterpaper}
 \renewcommand*\familydefault{\sfdefault}
@@ -13,7 +14,8 @@
 % Needs to be compiled with 'pdflatex --shell-escape'
 \newcommand{\wordcount}{
     \immediate\write18{texcount -merge -sub=section \jobname.tex | grep Section | sed -e 's/+.*//' | sed -n \thesection p > 'count.txt'}
-    (\input{count.txt}words)}
+    \IfFileExists{count.txt}{(\input{count.txt}words)}{}}
+
 
 \title{\textbf{\huge \projectName}\\ NSF Seed Fund Project Pitch %
 \vspace{-2em}% comment out if author is used
@@ -23,9 +25,13 @@
 
 \begin{document}
 	
+\ifpdf
 \TekFiveTitle[0in]
+\else
+\chapter{\projectName}
+\fi
 
-\section{The Technical Innovation}\label{sec:innovation}
+\section{The Technical Innovation}
 
 \input{concept}
 
@@ -49,7 +55,7 @@ Our intended realization of this project into a product would be no mere increme
 
 \wordcount
 
-\section{The Technical Objectives and Challenges}\label{sec:objectives}
+\section{The Technical Objectives and Challenges}
 
 This proof-of-concept project will necessarily require some engineering development to rough-out the operational viability of the above mechanisms, but primarily it will research and explore the effectiveness of the concept itself.
 To this end, we will study three things: 1) the structure, efficiency and resiliency of self-formed network topologies, 2) effective patterns of negotiation and reputation-building at scale, and 3) the resistance of the network at each level to failure and attack.
@@ -73,7 +79,8 @@ This tool can later be used as a development environment for rapidly prototyping
 
 \wordcount
 
-\section{The Market Opportunity}\label{sec:opportunity}
+
+\section{The Market Opportunity}
 
 Although potentially widely applicable, this concept is perfect for coordination in hostile environments and contentious inter-organizational data sharing.
 For USDOD customers, this product could be a key element for reliable sixth generation warfare (6GW) [non-contact] or 7GW [total automation].
@@ -91,7 +98,8 @@ Clients that used an \projectName-based product would immediately know if that p
 
 \wordcount
 
-\section{The Company and Team}\label{sec:team}
+
+\section{The Company and Team}
 
 Founded in 2007, TekFive is a veteran-owned, veteran centric, innovative and agile services company.
 We provide comprehensive federal IT domain experience, while offering the latest commercial industry insight, a highly motivated full-stack development team and a network of successful industry partners to rapidly respond to your enterprise IT challenges.
