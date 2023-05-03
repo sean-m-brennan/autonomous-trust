@@ -9,8 +9,6 @@ create_env () {
         pip=pip
     fi
     local my_conda_base=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-    local env_dir=$(conda env list | grep "/${env}$" | awk '{print $NF}')
-    local platform=$(conda info | grep platform | awk '{print $NF}')
 
     echo "Conda Python version $(conda run python --version)" >&2
     conda update -n base conda
@@ -19,8 +17,10 @@ create_env () {
         mamba env create --file ${my_conda_base}/environment.yml
     fi
 
+    local env_dir=$(conda env list | grep "/${env}$" | awk '{print $NF}')
+    local platform=$(conda info | grep platform | awk '{print $NF}')
     if [ "$(which gcc)" = "" ] && [ -e ${my_conda_base}/$platform ]; then
-        conda env update -n $env --file ${my_conda_base}/${platform}/platform.yml --prune
+        conda env update -n $env --file ${my_conda_base}/${platform}/platform.yaml --prune
 
         shopt -s nullglob
         local cc=${env_dir}/bin/*gcc
