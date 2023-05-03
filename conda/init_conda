@@ -1,7 +1,8 @@
-source defaults
-source env/create_conda_env
-source extra/populate_conda_env
-source rust/add_rust_to_env
+init_conda_dir=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+source ${init_conda_dir}/defaults
+source ${init_conda_dir}/env/create_conda_env
+source ${init_conda_dir}/extra/populate_conda_env
+source ${init_conda_dir}/rust/add_rust_to_env
 
 activate_conda () {
     local env=${1:-$environment}
