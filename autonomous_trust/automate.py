@@ -8,6 +8,7 @@ from multiprocessing import get_context
 import queue
 from concurrent.futures import TimeoutError, CancelledError
 
+from . import __version__ as version
 from .config import Configuration, CfgIds
 from .processes import Process, LogLevel, ProcessTracker
 from .identity import Peers
@@ -57,7 +58,7 @@ class AutonomousTrust(object):
     @staticmethod
     def banner():
         print("")
-        print("You are using\033[94m AutonomousTrust\033[00m from\033[96m TekFive\033[00m.")
+        print("You are using\033[94m AutonomousTrust\033[00m v%s from\033[96m TekFive\033[00m." % version)
         print("")
 
     @staticmethod

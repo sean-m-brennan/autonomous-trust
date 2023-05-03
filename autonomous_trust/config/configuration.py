@@ -9,11 +9,23 @@ yaml = YAML(typ='safe')
 yaml.default_flow_style = False
 
 
+def to_yaml_string(item):
+    sio = StringIO()
+    yaml.dump(item, sio)
+    return sio.getvalue()
+
+
+def from_yaml_string(string):
+    sio = StringIO(string)
+    return yaml.load(sio)
+
+
 class CfgIds(Enum):
     network = 'network'
     identity = 'identity'
     peers = 'peers'
     reputation = 'reputation'
+    group = 'group'
 
 
 class Configuration(object):

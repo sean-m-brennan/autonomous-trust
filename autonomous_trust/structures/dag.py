@@ -132,17 +132,19 @@ class StepDAG(ABC):
         step.parent = current
         self.__branch_lists[name].append(step)
 
-    def ingest_branch(self, steps):
+    def ingest_branch(self, steps, name=None):
         """
         Accept an external branch, as a list fom head to root
-        :param steps:
+        :param steps: list of steps for branch
+        :param name: optional name for branch
         :return: name of the branch
         """
-        temp = self.temp_name
-        self.branch(temp, steps[-1], Genesis)
+        if name is None:
+            name = self.temp_name
+        self.branch(name, steps[-1], Genesis)
         for step in reversed(steps[:-1]):
-            self.add_step(step, temp)
-        return temp
+            self.add_step(step, name)
+        return name
 
     def diff(self, branch, target=None):
         """
@@ -206,7 +208,7 @@ class StepDAG(ABC):
             return deepcopy(self.heads[head])
         raise InvalidBranchError(head)
 
-    def recite(self, branch=None):
+    def recite(self, branch=None, root=None):
         """
         Prepare a step list for transmission
         :param branch: branch name
@@ -214,11 +216,15 @@ class StepDAG(ABC):
         """
         if branch is None:
             branch = self.main_branch
+        if root is None:
+            root = Genesis
         step_list = []
         step = self.heads[branch]
-        while step is not Genesis:
+        while step != root:
             step_list.append(step.to_dict())
             step = step.parent
+        if root is not Genesis:
+            step_list.append(step.to_dict())
         return step_list
 
     @abstractmethod
@@ -232,5 +238,7 @@ class StepDAG(ABC):
         :return:
         """
         name = self.ingest_branch(other_steps)
+        branch_diff = self.recite(name, self.diff(name))
         if self._validate(name):
             self.merge(name)
+        return branch_diff

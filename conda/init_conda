@@ -1,50 +1,7 @@
-
-conda_activated=false
-my_conda_base=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-if [ -z "$use_pip" ]; then
-    use_pip=false
-fi
-if [ -z "$environment" ]; then
-    environment=autonomous_trust
-fi
-
-create_env () {
-    local env=${1:-$environment}
-    local pip=
-    if [ "$use_pip" != "" ]; then
-        pip=pip
-    fi
-
-    echo "Conda Python version $(conda run python --version)" >&2
-    conda update -n base conda
-    conda install -n base -c conda-forge mamba boa $pip
-    if [ "$(conda env list | awk '{print $1}' | grep $env)" = "" ]; then
-        mamba env create --file ${my_conda_base}/environment.yml
-    fi
-}
-
-populate_env () {
-    local env=${1:-$environment}
-
-    if [ "$use_pip" != "" ]; then
-        pip install -r ${my_conda_base}/environment.recipes.txt
-    else
-        python_version=$(grep "\- python.*=" $my_conda_base/environment.yaml | awk -F"=" '{print $NF}' )
-        for pkg in ${my_conda_base}/recipes/*; do
-            prebuilt=false
-            for arch in noarch $(conda run -n $env python3 ${my_conda_base}/getarch.py); do
-                conda mambabuild --python ${python_version} $pkg
-            done
-        done
-        #conda index $CONDA_PREFIX_1/conda-bld
-        conda config --add channels local
-        mamba install -y -n $env -c local --file ${my_conda_base}/environment.recipes.txt
-    fi
-
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-    rustup install nightly
-    rustup default nightly
-}
+source defaults
+source env/create_conda_env
+source extra/populate_conda_env
+source rust/add_rust_to_env
 
 activate_conda () {
     local env=${1:-$environment}
@@ -53,6 +10,7 @@ activate_conda () {
     if [ "$CONDA_PREFIX" = "" ] || [[ "$CONDA_PREFIX" != *"$env" ]]; then
         create_env $env
         populate_env $env
+        init_rust $env
 
         conda_dir=$(conda info | grep -i 'base environment' | awk '{print $4}')
         source "$conda_dir/etc/profile.d/conda.sh"

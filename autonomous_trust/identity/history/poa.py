@@ -1,5 +1,5 @@
 from ...algorithms import AgreementByAuthority, AgreementProof
-from .history import IdentityHistory
+from .history import IdentityHistory, IdentityObj
 
 
 class IdentityByAuthority(AgreementByAuthority, IdentityHistory):
@@ -10,21 +10,19 @@ class IdentityByAuthority(AgreementByAuthority, IdentityHistory):
         IdentityHistory.__init__(self, me, peers, log_queue, timeout, blacklist)
         AgreementByAuthority.__init__(self, me, peers.all, threshold_rank)
 
-    def prove(self, block):
-        if block.identity.uuid in map(lambda x: x.uuid, self.blacklist):
+    def prove(self, blob: IdentityObj):
+        if blob.identity.uuid in map(lambda x: x.uuid, self.blacklist):
             return None
-        if block.identity.address in map(lambda x: x.address, self.blacklist):
+        if blob.identity.address in map(lambda x: x.address, self.blacklist):
             return None
-        return block.compute_hash()
+        return blob.get_hash()
 
-    def _pre_verify(self, block, proof, sig):
-        if not IdentityHistory.verify(self, block, proof, sig):
-            return False
-        if not self.validate(block, proof, sig):
+    def _pre_verify(self, blob: IdentityObj, proof: AgreementProof, sig):
+        if not self.verify_object(blob, proof, sig):
             return False
         return True
 
-    def finalize(self, block):
-        approve = super().finalize(block)
-        self.logger.debug("Block approval: %s" % approve)
+    def finalize(self, blob: IdentityObj):
+        approve = super().finalize(blob)
+        self.logger.debug("Approval: %s" % approve)
         return approve

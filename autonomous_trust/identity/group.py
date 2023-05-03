@@ -2,7 +2,7 @@ import uuid as uuid_mod
 
 from nacl.public import Box
 
-from ..config.configuration import Configuration
+from ..config import Configuration
 from .encrypt import Encryptor
 
 
@@ -16,6 +16,11 @@ class Group(Configuration):
         self._nickname = _nickname
         self._encryptor = _encryptor  # group-shared key
         self._public_only = _public_only
+
+    def __eq__(self, other):
+        if not isinstance(other, self.__class__):
+            return False
+        return self.uuid == other.uuid and self.encryptor.publish() == other.encryptor.publish()
 
     @property
     def uuid(self):

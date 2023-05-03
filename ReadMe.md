@@ -4,10 +4,8 @@ AutonomousTrust
 QuickStart
 ----------
 
-Run ./present.sh
+Run ./emulate.sh
 
 Requires:
-Conda: https://anaconda.com
-
-Debian:
-apt-get install vtun
+ * Conda: https://anaconda.com
+ * Docker
