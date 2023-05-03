@@ -13,8 +13,8 @@ class Identity(Configuration, AgreementVoter):
     """
     Identity details that can be saved to file or transmitted
     """
-    def __init__(self, _uuid, address, _fullname, _nickname, _signature, _encryptor, petname='', _rank=0,
-                 _public_only=True, _block_impl=AgreementImpl.POA.value):
+    def __init__(self, _uuid, address, _fullname, _nickname, _signature, _encryptor, petname='',
+                 _public_only=True, _rank=0, _block_impl=AgreementImpl.POA.value):
         super().__init__(str(_uuid), _rank)
         self.address = address  # corresponds to one address in Network config
         self._fullname = _fullname
@@ -24,6 +24,18 @@ class Identity(Configuration, AgreementVoter):
         self.petname = petname
         self._public_only = _public_only
         self._block_impl = _block_impl
+        if self._public_only:
+            print('Public: %s' % self._nickname)
+        else:
+            print('Private: %s' % self._nickname)
+        if self.encryptor.private is None:
+            print('Public encrypt: %s' % self._nickname)
+        else:
+            print('Private encrypt: %s' % self._nickname)
+        if self.signature.private is None:
+            print('Public sign: %s' % self._nickname)
+        else:
+            print('Private sign: %s' % self._nickname)
 
     def __eq__(self, other):
         return self.__class__.__name__ == other.__class__.__name__ and self.uuid == other.uuid and \
@@ -60,7 +72,7 @@ class Identity(Configuration, AgreementVoter):
         :param msg: bytes
         :return: SignedMessage (msg, sig)
         """
-        if self._public_only or self.signature.private is None:
+        if self._public_only or self.signature.private is None:  # FIXME cannot sign
             raise RuntimeError('Cannot sign a message with another identity (%s is not you)' % self.nickname)
         return self.signature.private.sign(msg, encoder=HexEncoder)
 

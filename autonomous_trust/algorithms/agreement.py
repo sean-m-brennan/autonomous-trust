@@ -1,17 +1,22 @@
 from abc import ABC, abstractmethod
+from uuid import UUID
 
+from ..config import Configuration
 from ..structures import SimplestBlob
 
 
-class AgreementProof(object):
+class AgreementProof(Configuration):
     """
     Minimum structure of a provable, transmissible vote
     """
-    def __init__(self, uuid, digest, approval, nonce=None):
+    def __init__(self, uuid: UUID, digest: bytes, approval: bool, nonce: bytes = None):
         self.uuid = uuid  # voter
         self.digest = digest  # hash of proposal
         self.approval = approval  # yea/nay
         self.nonce = nonce
+
+    def __bytes__(self):
+        return str(self.uuid).encode('utf-8') + self.digest + bytes(self.approval) + self.nonce
 
 
 class AgreementVoter(ABC):
@@ -77,7 +82,8 @@ class AgreementProtocol(VoterTracker):
         :param sig: bytes
         :return: bool
         """
-        self._pre_verify(blob, proof, sig)
+        if not self._pre_verify(blob, proof, sig):
+            return False
         if blob not in self._votes.keys():
             self._votes[blob] = []
         self._votes[blob].append((proof, sig))
@@ -106,7 +112,7 @@ class AgreementProtocol(VoterTracker):
         self._prep_vote()
         voters = {peer.uuid: peer for peer in self.others}
         approvals = []
-        for block, proof, sig in self._votes[blob.uuid]:
+        for blob, proof, sig in self._votes[blob.uuid]:
             if proof.uuid not in voters.keys():
                 continue
             idx, voter = voters[proof.uuid]

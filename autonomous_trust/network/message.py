@@ -1,5 +1,5 @@
-from ..config.configuration import Configuration
-from ..identity.identity import Identity
+from ..config import Configuration
+from ..identity import Identity, Group
 from .network import Network
 
 
@@ -25,6 +25,8 @@ class Message(object):
                 self.to_whom = []
             elif isinstance(to_whom, Identity):
                 self.to_whom = [to_whom]
+            elif isinstance(to_whom, Group):
+                pass
             elif hasattr(to_whom, '__iter__'):
                 if len(to_whom) > 0 and not isinstance(to_whom[0], Identity):
                     raise RuntimeError('Invalid to_whom arg. Must be a list of Identity, but got %s' % type(to_whom[0]))

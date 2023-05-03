@@ -4,13 +4,15 @@ channels:
 dependencies:
   - python==3.10
   - mercurial-app
+  - rsync
+  - curl
   - libffi
   - maturin
   - tox
-  - rsync
   - pytest
   - pytest-aiohttp
   - pytest-cov
+  - pandoc
 
   - aenum
   - libsass
