@@ -26,9 +26,10 @@ doc/presentation/notes
 doc/pitch/count.txt
 
 at
-at
 **/*.egg-info
 .tox
 .coverage*
 coverage
 **/.pytest-cache
+target
+unikernel/extern
