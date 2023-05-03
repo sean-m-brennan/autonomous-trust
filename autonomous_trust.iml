@@ -16,7 +16,7 @@
       <excludeFolder url="file://$MODULE_DIR$/unikernel/py/build" />
       <excludeFolder url="file://$MODULE_DIR$/unikernel/py/fs0" />
     </content>
-    <orderEntry type="jdk" jdkName="Python 3.11 (autonomous_trust)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Python 3.10 (autonomous_trust)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
     <orderEntry type="library" name="jquery" level="application" />
     <orderEntry type="library" name="d3.v4" level="application" />

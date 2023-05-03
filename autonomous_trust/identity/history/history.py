@@ -1,10 +1,10 @@
-from abc import ABC
 from uuid import UUID
 
 from ...algorithms import VoterTracker
 from ...structures import StepDAG, MerkleTree, SimplestBlob, LinkedStep
-from ...config import Configuration
+from ...config import Configuration, from_yaml_string
 from ...processes import ProcessLogger
+from ..identity import Identity
 
 
 # FIXME how does a DAG relate to the merkle tree?
@@ -29,8 +29,6 @@ from ...processes import ProcessLogger
 class IdentityObj(SimplestBlob, Configuration):
     """
     Identity encapsulation for transmission
-    A StepDAG of MerkleTree root_hash history, the Merkle leaf-blobs are Identities or Groups
-    Essentially an efficient, long-memory identity recognizer
     """
     def __init__(self, identity, originator: UUID):
         super().__init__(originator, identity.uuid)
@@ -50,7 +48,9 @@ class IdentityObj(SimplestBlob, Configuration):
 
 class IdentityHistory(StepDAG, VoterTracker, Configuration):
     """
-    Tracks community identity history with provable
+    Tracks community identity history with provable membership
+    A StepDAG of MerkleTree root_hash history, the Merkle leaf-blobs are Identities or Groups
+    Essentially an efficient, long-memory identity recognizer
     """
     def __init__(self, myself, peers, log_queue, timeout=0, blacklist=None):
         StepDAG.__init__(self)
@@ -97,7 +97,13 @@ class IdentityHistory(StepDAG, VoterTracker, Configuration):
         if identity_blob is not None:
             return self._merkle.inclusion_proof(item)  # to yaml?
 
+    def verify_existence(self, item, proof):
+        identity_blob = self._find_identity(item)
+        if identity_blob is not None:
+            return self._merkle.audit(item, proof)
+
     def _validate(self, branch):
+        # FIXME better validation
         flag = True
         blobs = self.__branch_lists[branch]  # root to head
         for i in range(1, len(blobs)):
@@ -114,6 +120,15 @@ class IdentityHistory(StepDAG, VoterTracker, Configuration):
                 flag = False
                 self.logger.error(f'Backdating at block {i}.')
         return flag
+
+    def verify_object(self, blob, proof, sig):
+        if not isinstance(blob, IdentityObj) or not isinstance(blob.identity, Identity):
+            return False
+        # FIXME verify sig
+        ident = blob
+        if isinstance(blob, IdentityObj):
+            ident = blob.identity
+        return self.verify_existence(ident, proof)
 
     def share(self):
         """
@@ -132,8 +147,7 @@ class IdentityHistory(StepDAG, VoterTracker, Configuration):
         :return: list of steps
         """
         if self.myself.verify(steps_msg, sig):
-            # FIXME from yaml
-            steps = []
+            steps = from_yaml_string(steps_msg)
             return steps
         return None
 

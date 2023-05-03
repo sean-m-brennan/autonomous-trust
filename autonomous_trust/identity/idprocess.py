@@ -1,69 +1,64 @@
+import os
 import time
 from queue import Empty, Full
 import threading
+from datetime import datetime
 
-from ..algorithms import AgreementProof, AgreementImpl
-from ..config import CfgIds
+from . import Identity
+from .group import Group
+from ..algorithms import AgreementImpl
+from ..config import Configuration, CfgIds, to_yaml_string, from_yaml_string
 from ..processes import Process, ProcMeta
 from ..network import Message, Network
-from .history import IdentityByWork, IdentityByStake, IdentityByAuthority, IdentityProtocol
+from .history import IdentityByWork, IdentityByStake, IdentityByAuthority
+from .history import IdentityProtocol, FullHistoryMessage, IdentityObj
 
 
 class IdentityProcess(Process, metaclass=ProcMeta,
                       proc_name=CfgIds.identity.value, description='Identity registration'):
     """
     Handle Identity and Peer tracking
+    Zero trust in this stage
     """
     init_timeout = 10
+    init_extra = 2
 
     def __init__(self, configurations, subsystems, log_q):
         super().__init__(configurations, subsystems, log_q, dependencies=[CfgIds.network.value])
-        self.ident = configurations[self.cfg_name]
+        self.identity = configurations[self.cfg_name]
         self.peers = configurations[CfgIds.peers.value]
-        self.phase = 0
+        self.phase = 1
         self.confirmed_block = []
-        impl = self.ident.block_impl
+        impl = self.identity.block_impl
         if impl == AgreementImpl.POW.value:
-            self._history = IdentityByWork(self.ident, self.peers, log_q, 0)
+            self._history = IdentityByWork(self.identity, self.peers, log_q, 0)
         elif impl == AgreementImpl.POS.value:
-            self._history = IdentityByStake(self.ident, self.peers, log_q, 5)
+            self._history = IdentityByStake(self.identity, self.peers, log_q, 5)
         elif impl == AgreementImpl.POA.value:
-            self._history = IdentityByAuthority(self.ident, self.peers, log_q, 5)
+            self._history = IdentityByAuthority(self.identity, self.peers, log_q, 5)
         else:
             raise RuntimeError('Invalid identity history implementation: %s' % impl)
         self.messages = []
+        self.group = None
+        self.border_guard_mode = True
+        self.histories = []
 
-    def _process_block(self, block):
-        digest = self._history.prove(block)
-        if digest is not None:
-            proof = AgreementProof(block.identity.uuid, digest, True)
-            self.confirmed_block.append((block, proof, self.ident.sign(proof)))
+    def _remember_activity(self, queues, name, obj):
+        self.configs[name] = obj
+        obj.to_file(os.path.join(Configuration.get_cfg_dir(), name + Configuration.yaml_file_ext))
+        queues[CfgIds.network.value].put(obj, block=True, timeout=self.q_cadence)
 
-    def request_chain(self, queues):
+    def _record_group(self, queues):
+        self._remember_activity(queues, CfgIds.group.value, self.group)
+
+    def _record_peers(self, queues):
+        self._remember_activity(queues, CfgIds.peers.value, self.peers)
+
+    def announce_identity(self, queues):
         """
-        Enqueue a request for an existing list of Identities for transmission
+        Request access for my identity
+        Open broadcast channel
         Non-blocking
-        Phase 0 of protocol
-        :param queues: Interprocess communication queues
-        :return: None
-        """
-        if self.phase != 0:
-            return
-        if len(self._history) > 1:
-            self.phase = 1
-            return
-        try:
-            self.logger.debug('Request existing chain')
-            message = Message(self.name, IdentityProtocol.request.value, '', to_whom=Network.broadcast)
-            queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
-        except Full:
-            self.logger.error('IdProc(1): Network queue full')
-        self.phase = 1
-
-    def receive_chain(self, queues):
-        """
-        Receive an external list of Identities or timeout
-        Blocking! - Must precede the process loop or be enclosed in a Thread
         Phase 1 of protocol
         :param queues: Interprocess communication queues
         :return: None
@@ -71,123 +66,262 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if self.phase != 1:
             return
         try:
-            # FIXME possible fraud here, compare multiples, but what if < 3 respond?
-            # need provers
-            message = queues[self.name].get(block=True, timeout=self.init_timeout)
-            if message.function == IdentityProtocol.provide.value:
-                self.logger.debug('Received existing chain')
-                #existing = BlockChainMessage.from_yaml_string(message.obj)
-                existing = self._history.hear(*message.obj)
-                self._history.catch_up(existing)
-                #if existing.impl == self.ident.block_impl:
-                #    self._history.catch_up(existing.chain)
-            else:
-                self.messages.append(message)
-        except Empty:
-            self.logger.debug('No chain: generate my own.')
+            self.logger.debug('Announce myself')
+            message = Message(self.name, IdentityProtocol.announce.value,
+                              self.identity.publish(), to_whom=Network.broadcast)
+            queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('announce_identity: Network queue full')
         self.phase = 2
 
-    def propose_my_block(self, queues):  # propose my own identity to (only) peers on the chain; blocking!
+    def choose_group(self, queues):
         """
-        Sign and package my own Identity as a Block, enqueue for transmission
-        Blocking! - must be in a Thread
-        Phase 2 of protocol
-        :param queues: Interprocess communication queues
+        Await incoming histories, choose from among them
+        :param queues:
         :return: None
         """
-        while self.phase < 2:
+        start = datetime.utcnow()
+        while (datetime.utcnow() - start).seconds <= self.init_timeout:
             time.sleep(self.cadence)
+        accepted = None, None
+        for hist_msg in self.histories:
+            group = hist_msg.group
+            steps = hist_msg.history
+            # FIXME validate steps
+            if CfgIds.group.value in self.configs.keys() and self.configs[CfgIds.group.value] == group:
+                #FIXME verify history goes with group
+                accepted = group, steps
+                break
+            else:
+                if accepted == (None, None):
+                    accepted = group, steps
+                elif len(steps) > len(accepted[1]):  # noqa
+                    accepted = group, steps
         try:
-            self.logger.debug('Create my identity')
-            last = self._history.last_block
-            block = IdentityBlock(last.index + 1, self.ident.publish(), self._history.now, last.hash, '0')
-            digest = self._history.prove(block)  # confirm my own identity for bootstrapping
-            if digest:
-                proof = AgreementProof(block.identity.uuid, digest, True)
-                sig_msg = self.ident.sign(proof.to_yaml_string().encode())
-                sig_hash = BlockSignedMessage(sig_msg.message, sig_msg.signature)
-                if not self._history.verify(block, proof, sig_hash):  # may run long
-                    self.logger.error('Invalid identity block for myself')
-                else:
-                    msg_str = BlockMessage(block, proof, sig_hash).to_yaml_string()
-                    peers = self.configs[CfgIds.peers.value].all
-                    if len(peers) > 0:
-                        message = Message(self.name, IdentityProtocol.propose.value, msg_str, to_whom=peers)
-                    else:
-                        message = Message(self.name, IdentityProtocol.propose.value, msg_str, to_whom=Network.broadcast)
-                    self.logger.debug('Send block proposal')
-                    queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
-                    if not block.checker(self._history, proof, sig_hash):  # will run long
-                        self.logger.error('Not accepted by peers')
-                        # FIXME what if I'm refused?
+            if accepted != (None, None):
+                self.group = accepted[0]
+                self.logger.debug('Updated group key')
+                self._record_group(queues)
+                existing = self._history.hear(*accepted[1])  # noqa
+                diff = self._history.catch_up(existing)
+                msg_str = to_yaml_string(diff)
+                message = Message(self.name, IdentityProtocol.diff.value, msg_str, to_whom=self.group)
+                self.logger.debug('Send history diff')
+                queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
+            else:
+                self.logger.debug('No history/group key: generate my own.')
+                self.group = Group.initialize([self.identity.address], 'nick')  # FIXME name generation
+                self._record_group(queues)
         except Full:
-            self.logger.error('IdProc(3): Network queue full')
+            self.logger.error('receive_history: Network queue full')
         self.phase = 3
 
-    def process_blocks(self, _, message):
+    def receive_history(self, _, message):
         """
-        Process received block proposals (if the given message matches)
-        Non-blocking - spins up autonomous thread for processing
-        Phase 3 of protocol
-        :param _: Unused Interprocess communication queues
-        :param message: The request Message
-        :return: 
+        Receive a full history plus group key or timeout
+        Phase 2 of protocol
+        :param _: Interprocess communication queues (unused)
+        :param message: identity, history, tuple of history steps, group
+        :return: bool (message handled)
+        """
+        if self.phase != 2:
+            return False
+        if message.function == IdentityProtocol.history.value:
+            self.logger.debug('Received existing history')
+            self.histories.append(from_yaml_string(message.obj))
+            return True
+        return False
+
+    def count_vote(self, _, message):
+        """
+        Receive/record a vote
+        :param _:
+        :param message: tuple of blob, proof, sig
+        :return: bool (message handled)
         """
         if self.phase != 3:
-            return
-        try:
-            if message.function == IdentityProtocol.propose.value:
-                self.logger.debug('Received block proposal')
-                block = BlockMessage.from_yaml_string(message.obj)  # FIXME verify
-                threading.Thread(target=self._process_block, args=(block,), daemon=True).start()
-        except Empty:
-            pass
-        except Full:
-            self.logger.error('IdProc(4): Network queue full')
+            return False
+        if message.function == IdentityProtocol.vote.value:
+            # FIXME check signature -> message.from_whom.identity.verify
+            self._history.verify(*message.obj)
+            return True
+        return False
 
-    def block_processing_response(self, queues):
+    def _vote_collection(self, queues, new_guy, blob):
+        try:
+            start = datetime.utcnow()
+            voted = False
+            while (datetime.utcnow() - start).seconds <= self._history.timeout:
+                if not voted:
+                    for vote in self.confirmed_block:
+                        if vote[0] == blob:
+                            # FIXME check signature (my own!)
+                            self._history.verify(*vote)
+                            self.confirmed_block.remove(vote)
+                            voted = True
+                time.sleep(self.cadence)
+            if self._history.finalize(blob):
+                self.group.addresses.append(blob.identity.address)
+                self._record_group(queues)
+                message = Message(self.name, IdentityProtocol.confirm.value, blob, to_whom=self.group)
+                queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
+
+                msg_str = to_yaml_string((self._history.recite(), self.group))
+                message = Message(self.name, IdentityProtocol.history.value, msg_str, to_whom=new_guy)
+                self.logger.debug('Send full history')
+                queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('vote_collection: Network queue full')
+
+    def welcoming_committee(self, queues, message):
+        """
+        Handle incoming newbies
+        :param queues: Interprocess communication queues
+        :param message: The new Identity
+        :return: bool (message handled)
+        """
+        if self.phase != 3 or not self.border_guard_mode:
+            return False
+        if message.function == IdentityProtocol.announce.value:
+            try:
+                new_id = message.obj
+                if new_id == self.identity:
+                    self.logger.debug('Should not have received my own announcement')
+                    return
+                self.logger.debug('Received new identity')
+                id_obj = IdentityObj(new_id, new_id.uuid)
+                #FIXME
+                threading.Thread(target=self._process_id, args=(id_obj,), daemon=True).start()
+                if message.from_whom != new_id:
+                    self.logger.error('Something\'s  wrong')
+                threading.Thread(target=self._vote_collection,  # FIXME I need to vote too
+                                 args=(queues, message.from_whom, id_obj), daemon=True).start()
+                msg_str = id_obj.to_yaml_string()  # FIXME validate
+                message = Message(self.name, IdentityProtocol.propose.value, msg_str, to_whom=self.group)
+                queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
+            except Full:
+                self.logger.error('welcoming_committee: Network queue full')
+            return True
+        return False
+
+    def _add_peer(self, queues, identity):
+        self._history.upgrade_peer(identity)
+        # FIXME write peers
+        self.peers.promote(identity)
+        self._record_peers(queues)
+
+    def _process_id(self, blob):
+        proof = self._history.prove(blob)
+        self.confirmed_block.append((blob, proof, self.identity.sign(proof)))  # FIXME cannot sign
+
+    def handle_vote_on_peer(self, queues, message):
+        """
+        Process received proposals
+        Non-blocking - spins up autonomous thread for processing
+        Phase 4 of protocol
+        :param queues: Unused Interprocess communication queues
+        :param message: The request Message
+        :return: bool (message handled)
+        """
+        if self.phase != 3:
+            return False
+        if message.function == IdentityProtocol.propose.value:
+            self.logger.debug('Received peer proposal')
+            # FIXME should I be in border_guard_mode?
+            blob = IdentityObj.from_yaml_string(message.obj)
+            # FIXME verify
+            threading.Thread(target=self._process_id, args=(blob,), daemon=True).start()
+            return True
+        return False
+
+    def vote_response(self, queues):
         """
         Enqueue previously processed blocks for transmission
         Non-blocking
-        Phase 3 of protocol
+        Phase 4 of protocol
         :param queues: Interprocess communication queues
-        :return: None
-        """
-        try:
-            if self.phase != 3:
-                return
-            if len(self.confirmed_block) < 1:
-                return
-            block = self.confirmed_block.pop(0)
-            msg_str = BlockMessage(*block).signed().to_yaml_string()
-            message = Message(self.name, IdentityProtocol.vote.value, msg_str, to_whom=self.peers)
-            self.logger.debug("Send confirmed block")
-            queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
-        except Full:
-            self.logger.error('IdProc(5): Network queue full')
-
-    def chain_response(self, queues, message):
-        """
-        Sign the current requested blockchain and enqueue for transmission (if the given message matches)
-        Non_blocking
-        Phase 3 of protocol
-        :param queues: Interprocess communication queues
-        :param message: The request Message
         :return: None
         """
         if self.phase != 3:
             return
+        if len(self.confirmed_block) < 1:
+            return
         try:
-            if message.function == IdentityProtocol.request.value:
-                to_whom = message.from_whom
-                msg = BlockChainMessage(self.ident.block_impl, self._history).signed().to_yaml_string()
-                message = Message(self.name, IdentityProtocol.provide.value, msg, to_whom=to_whom)
-                self.logger.debug('Send requested chain')
-                queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
-        except Empty:
-            pass
+            vote = self.confirmed_block.pop(0)
+            # FIXME handle if I proposed the vote
+            msg_str = to_yaml_string(vote)
+            message = Message(self.name, IdentityProtocol.vote.value, msg_str, to_whom=self.group)
+            self.logger.debug("Send vote")
+            queues[CfgIds.network.value].put(message, block=True, timeout=self.q_cadence)
         except Full:
-            self.logger.error('IdProc(6): Network queue full')
+            self.logger.error('vote_response: Network queue full')
+
+    def handle_confirm_peer(self, queues, message):
+        """
+        Receive peer confirmation, add new peer to list
+        :param queues:
+        :param message:
+        :return: bool (message handled)
+        """
+        if self.phase != 3:
+            return False
+        if message.function == IdentityProtocol.confirm.value:
+            self.logger.debug('Received peer confirmation')
+            # FIXME validate blob
+            self._add_peer(queues, message.obj.identity)
+            return True
+        return False
+
+    def handle_history_diff(self, _, message):
+        """
+        Receive a history diff, possibly merge
+        :param _:
+        :param message:
+        :return: bool (message handled)
+        """
+        if self.phase != 3:
+            return False
+        if message.function == IdentityProtocol.diff.value:
+            self.logger.debug('Received history diff')
+            steps = from_yaml_string(message.obj)
+            self._history.ingest_branch(steps, message.from_whom.nickname)
+            # FIXME validate and merge
+            return True
+        return False
+
+    def handle_group_update(self, queues, message):
+        """
+        Receive a group update (addresses list only)
+        :param queues:
+        :param message:
+        :return: bool (message handled)
+        """
+        if self.phase != 3:
+            return False
+        if message.function == IdentityProtocol.update.value:
+            self.logger.debug('Received group update')
+            group = Group.from_yaml_string(message.obj)
+            if self.group == group:
+                self.group = group
+                self._record_group(queues)
+            return True
+        return False
+
+    def _run_handlers(self, queues, message):
+        self.vote_response(queues)
+        if self.receive_history(queues, message):
+            return True
+        if self.welcoming_committee(queues, message):
+            return True
+        if self.handle_vote_on_peer(queues, message):
+            return True
+        if self.count_vote(queues, message):
+            return True
+        if self.handle_history_diff(queues, message):
+            return True
+        if self.handle_group_update(queues, message):
+            return True
+        return False
 
     def process(self, queues, signal):
         """
@@ -196,21 +330,26 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         :param signal: IPC queue for signalling halt
         :return: None
         """
-        self.phase = 0
-        self.request_chain(queues)
-        self.receive_chain(queues)  # blocks on purpose
-        threading.Thread(target=self.propose_my_block, args=(queues,), daemon=True).start()
+        phase = self.phase
+        self.logger.debug('Phase %s' % self.phase)
+        self.announce_identity(queues)
+        threading.Thread(target=self.choose_group, args=(queues,), daemon=True).start()
         while self.keep_running(signal):
-            if self.phase > 1:
-                self.block_processing_response(queues)
-                while len(self.messages) > 0:
-                    message = self.messages.pop(0)
-                    self.process_blocks(queues, message)
-                    self.chain_response(queues, message)
-                try:
-                    message = queues[self.name].get(block=True, timeout=self.q_cadence)
-                    self.process_blocks(queues, message)
-                    self.chain_response(queues, message)
-                except Empty:
-                    pass
+            if self.phase != phase:
+                self.logger.debug('Phase %s' % self.phase)
+                phase = self.phase
+            untouched = []
+            while len(self.messages) > 0:
+                message = self.messages.pop(0)
+                #self.logger.debug('Stored message %s' % message.function)
+                if not self._run_handlers(queues, message):
+                    untouched.append(message)
+            try:
+                message = queues[self.name].get(block=True, timeout=self.q_cadence)
+                #self.logger.debug('New message %s' % message.function)
+                if not self._run_handlers(queues, message):
+                    untouched.append(message)
+            except Empty:
+                pass
+            self.messages += untouched
             time.sleep(self.cadence)

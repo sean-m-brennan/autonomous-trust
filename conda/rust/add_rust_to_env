@@ -1,0 +1,30 @@
+add_rust_to_env_dir=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+source ${add_rust_to_env_dir}/../defaults
+
+init_rust() {
+    local env=${1:-$environment}
+    local env_dir=$(conda env list | grep "/${env}$" | awk '{print $NF}')
+    local rustup_home=${env_dir}/rustup
+    local cargo_home=${env_dir}
+
+    export RUSTUP_HOME=$rustup_home
+    export CARGO_HOME=$cargo_home
+    export PATH=$CARGO_HOME/bin:$PATH
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
+    rustup install nightly
+    rustup default nightly
+
+    mkdir -p ${env_dir}/etc/conda/activate.d
+    cat << EOF > ${env_dir}/etc/conda/activate.d/rust_activate.sh
+#!/bin/sh
+export RUSTUP_HOME=$rustup_home
+export CARGO_HOME=$cargo_home
+EOF
+
+    mkdir -p ${env_dir}/etc/conda/deactivate.d
+    cat << EOF > ${env_dir}/etc/conda/deactivate.d/rust_deactivate.sh
+#!/bin/sh
+unset RUSTUP_HOME
+unset CARGO_HOME
+EOF
+}

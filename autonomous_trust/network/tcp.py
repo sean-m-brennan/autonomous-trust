@@ -17,17 +17,29 @@ class SimpleTCPNetworkProcess(NetworkProcess):
     def __init__(self, configurations, subsystems, log_q, acceptance_func=None, use_mcast=False):
         super().__init__(configurations, subsystems, log_q, acceptance_func)
         bind_address = self.net_cfg.ip4
-        self.recv_tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.recv_tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.recv_ptp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.recv_ptp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            self.recv_tcp_sock.bind((bind_address, self.port))
+            self.recv_ptp_sock.bind((bind_address, self.port))
         except OSError as err1:
             self.logger.warning('Address %s:%s error: %s' % (bind_address, self.port, str(err1)))
             bind_address = '0.0.0.0'
-            self.recv_tcp_sock.bind((bind_address, self.port))
-        self.my_address, self.port = self.recv_tcp_sock.getsockname()
+            self.recv_ptp_sock.bind((bind_address, self.port))
+        self.my_address, self.port = self.recv_ptp_sock.getsockname()
         self.logger.info('Bound peer recv to %s:%s' % (self.my_address, self.port))
-        self.recv_tcp_sock.listen(self.rcv_backlog)
+        self.recv_ptp_sock.listen(self.rcv_backlog)
+
+        self.recv_grp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.recv_grp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.group_port = self.port + 1
+        try:
+            self.recv_grp_sock.bind((bind_address, self.group_port))
+        except OSError as err1:
+            self.logger.warning('Address %s:%s error: %s' % (bind_address, self.group_port, str(err1)))
+            bind_address = '0.0.0.0'
+            self.recv_grp_sock.bind((bind_address, self.group_port))
+        self.logger.info('Bound group recv to %s:%s' % (self.my_address, self.group_port))
+        self.recv_grp_sock.listen(self.rcv_backlog)
 
         if use_mcast:
             self.packet_size = 65527
@@ -66,7 +78,23 @@ class SimpleTCPNetworkProcess(NetworkProcess):
                     raise TransmissionError("socket connection broken")
                 total_sent = total_sent + sent
 
-    def send_all(self, msg):
+    def send_group(self, msg, host):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            if not isinstance(msg, bytes):
+                msg = msg.encode(self.enc)
+            print('Connect to %s:%s' % (host, self.group_port))
+            sock.connect((host, self.group_port))
+            sent = sock.send(('%d|' % len(msg)).encode(self.enc))  # FIXME encoding
+            if sent == 0:
+                raise TransmissionError("socket connection broken")
+            total_sent = 0
+            while total_sent < len(msg):
+                sent = sock.send(msg[total_sent:])
+                if sent == 0:
+                    raise TransmissionError("socket connection broken")
+                total_sent = total_sent + sent
+
+    def send_any(self, msg):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
             if not isinstance(msg, bytes):
                 msg = msg.encode(self.enc)
@@ -93,17 +121,25 @@ class SimpleTCPNetworkProcess(NetworkProcess):
         return b''.join(chunks).decode(self.enc)
 
     def recv_peer(self):
-        (clientsock, address) = self.recv_tcp_sock.accept()
-        if address == self.my_address:
-            return None, None  # my own message
-        if not self.accept_peer_message(address):
-            return None, address  # reject
-        return self._recv(clientsock), address
+        (clientsock, (addr, port)) = self.recv_ptp_sock.accept()
+        if addr == self.my_address:
+            return None, None, None  # my own message
+        if not self.accept_peer_message(addr):
+            return None, addr, port  # reject
+        return self._recv(clientsock), addr, port
+
+    def recv_group(self):
+        (clientsock, (addr, port)) = self.recv_grp_sock.accept()
+        if addr == self.my_address:
+            return None, None, None  # my own message
+        if not self.accept_group_message(addr):
+            return None, addr, port  # reject
+        return self._recv(clientsock), addr, port
 
     def recv_any(self):
-        msg, addr = self.recv_udp_sock.recvfrom(self.packet_size)
+        msg, (addr, port) = self.recv_udp_sock.recvfrom(self.packet_size)
         if addr == self.my_address:
-            return None, None  # my own message
+            return None, None, None  # my own message
         if self.reject_message(addr):
-            return None, addr  # reject
-        return msg, addr
+            return None, addr, port  # reject
+        return msg, addr, port
