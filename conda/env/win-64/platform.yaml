@@ -1,0 +1,5 @@
+name: autonomous_trust
+channels:
+  - conda-forge
+dependencies:
+  - mingwpy

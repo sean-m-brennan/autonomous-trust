@@ -4,6 +4,7 @@ from enum import Enum
 
 from ..processes import Process, ProcMeta
 from ..config.configuration import CfgIds
+from ..identity import Group, Peers
 from .network import Network
 from .message import Message
 
@@ -45,18 +46,26 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             self.port = self.default_port
         self.myself = configurations[CfgIds.identity.value]
         self.peers = configurations[CfgIds.peers.value]
+        self.group = None
         self.peer_messages = []
+        self.group_messages = []
         self.unknown_messages = []
         self.acceptance = acceptance_func
         self.pests = {}
 
-    def send_peer(self, msg, whom_list):
+    def send_peer(self, msg, whom):
         raise NotImplementedError
 
-    def send_all(self, msg):
+    def send_group(self, msg, whom):
+        raise NotImplementedError
+
+    def send_any(self, msg):
         raise NotImplementedError
 
     def recv_peer(self):
+        raise NotImplementedError
+
+    def recv_group(self):
         raise NotImplementedError
 
     def recv_any(self):
@@ -74,23 +83,28 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             return False
         return True
 
+    def accept_group_message(self, address):
+        """
+        Accept/reject group messages based on sender's address
+        :param address: Incoming sender
+        :return: bool
+        """
+        if address not in self.group.addresses:
+            return False
+        return self.accept_peer_message(address)
+
     def reject_message(self, address):  # FIXME
         return False
 
-    def peer_receiver(self):
-        """
-        Receive thread for point-to-point
-        Track peers not on whitelist (accept_peer_message), demote if they persist
-        :return: None
-        """
+    def _encr_recv(self, method, msg_queue):
         while True:
             try:
-                raw_msg, from_addr = self.recv_peer()
+                raw_msg, from_addr, from_port = method()
             except TransmissionError as err:
                 self.logger.error('Network: %s' % err)
                 continue
             if raw_msg is not None:
-                self.peer_messages.append((raw_msg, from_addr))
+                msg_queue.append((raw_msg, from_addr))
             else:
                 who = self.peers.find_by_address(from_addr)
                 if who is not None:
@@ -101,6 +115,22 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         self.peers.demote(who)
                         del self.pests[who]
 
+    def peer_receiver(self):
+        """
+        Receive thread for point-to-point
+        Track peers not on whitelist (accept_peer_message), demote if they persist
+        :return: None
+        """
+        self._encr_recv(self.recv_peer, self.peer_messages)
+
+    def group_receiver(self):
+        """
+        Receive thread for pseudo-multicast with a single encryption key
+        Track peers not on whitelist (accept_peer_message), demote if they persist
+        :return: None
+        """
+        self._encr_recv(self.recv_group, self.group_messages)
+
     def unknown_receiver(self):
         """
         Receive thread for one-to_many
@@ -108,7 +138,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         """
         while True:
             try:
-                raw_msg, from_addr = self.recv_any()
+                raw_msg, from_addr, from_port = self.recv_any()
             except TransmissionError as err:
                 self.logger.error('Network: %s' % err)
                 continue
@@ -126,6 +156,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         :return:
         """
         threading.Thread(target=self.peer_receiver, daemon=True).start()
+        threading.Thread(target=self.group_receiver, daemon=True).start()
         threading.Thread(target=self.unknown_receiver, daemon=True).start()
         while self.keep_running(signal):
             try:
@@ -133,17 +164,32 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             except Empty:
                 message = None
             if message:
-                if isinstance(message, Message):
-                    self.logger.debug('Send network message: %s' % message.process)
+                if isinstance(message, Group):
+                    self.group = message
+                    self.logger.debug('Updated group')
+                elif isinstance(message, Peers):
+                    self.peers = message
+                    self.logger.debug('Updated peers')
+                elif isinstance(message, Message):
+                    self.logger.debug('Send network message: %s:%s' % (message.process, message.function))
                     try:
                         if message.to_whom == Network.broadcast:
                             try:
-                                self.send_all(bytes(message))
+                                self.send_any(bytes(message))
                             except TransmissionError as err:
                                 self.logger.error('Network: %s' % err)
+                        elif isinstance(message.to_whom, Group):
+                            encrypt_msg = self.group.encrypt(bytes(message), self.group)
+                            for addr in message.to_whom.addresses:
+                                if addr == self.myself.address:
+                                    continue
+                                try:
+                                    self.send_group(encrypt_msg, addr)
+                                except TransmissionError as err:
+                                    self.logger.error('Network: %s' % err)
                         else:  # defaults to pseudo-multicast
-                            for who in message.to_whom:  # Message ensures this is list
-                                encrypt_msg = self.myself.encrypt(bytes(message), who)
+                            for who in message.to_whom:  # Message ensures this is list  # noqa
+                                encrypt_msg = self.myself.encrypt(bytes(message), who)  # FIXME cannot sign
                                 try:
                                     self.send_peer(encrypt_msg, who.address)
                                 except TransmissionError as err:
@@ -155,7 +201,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                       type(message))
                     self.logger.debug('Message: %s' % str(message))
 
-            # async recv peer messages
+            # async recv point-to-point messages
             if len(self.peer_messages) > 0:
                 raw_msg, from_addr = self.peer_messages.pop(0)
                 from_whom = self.configs[CfgIds.peers.value].find_by_address(from_addr)
@@ -166,11 +212,32 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         if message.process == sub_sys_proc:
                             try:
                                 queues[sub_sys_proc].put(message, block=True, timeout=self.q_cadence)
-                                self.logger.debug('Recvd network message for %s:%s' % (sub_sys_proc, message.function))
+                                self.logger.debug('Recvd network message for %s:%s from %s' %
+                                                  (sub_sys_proc, message.function, from_whom.nickname))
                             except Full:
                                 self.logger.error('Network: %s queue is full' % sub_sys_proc)
                 else:
                     self.logger.error('Recvd transmission from %s - not recognized as a peer. Ignoring.' % from_addr)
+                    self.logger.debug('Message: %s' % str(message))
+
+            # async recv group messages
+            if len(self.group_messages) > 0:
+                raw_msg, from_addr = self.group_messages.pop(0)
+                if from_addr in self.group.addresses:
+                    decrypt_msg = self.group.decrypt(raw_msg, self.group)
+                    from_whom = self.configs[CfgIds.peers.value].find_by_address(from_addr)
+                    if from_whom is not None:
+                        message = Message.parse(decrypt_msg, from_whom)
+                        for sub_sys_proc in self.subsystems.keys():
+                            if message.process == sub_sys_proc:
+                                try:
+                                    queues[sub_sys_proc].put(message, block=True, timeout=self.q_cadence)
+                                    self.logger.debug('Recvd network message for %s:%s from %s' %
+                                                      (sub_sys_proc, message.function, from_whom.nickname))
+                                except Full:
+                                    self.logger.error('Network: %s queue is full' % sub_sys_proc)
+                else:
+                    self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
                     self.logger.debug('Message: %s' % str(message))
 
             # async recv stranger messages (separate channel)
@@ -181,6 +248,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     if message.process == sub_sys_proc:
                         try:
                             queues[sub_sys_proc].put(message, block=True, timeout=self.q_cadence)
-                            self.logger.debug('Recvd multicast message for %s:%s' % (sub_sys_proc, message.function))
+                            self.logger.debug('Recvd multicast message for %s:%s from %s' %
+                                              (sub_sys_proc, message.function, from_addr))
                         except Full:
                             self.logger.error('Network: %s queue is full' % sub_sys_proc)
