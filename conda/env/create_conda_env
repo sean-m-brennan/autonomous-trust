@@ -11,8 +11,8 @@ create_env () {
     local my_conda_base=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 
     echo "Conda Python version $(conda run python --version)" >&2
-    conda update -n base conda
-    conda install -n base -c conda-forge mamba boa $pip
+    conda update -y -n base conda
+    conda install -y -n base -c conda-forge mamba boa $pip
     if [ "$(conda env list | awk '{print $1}' | grep $env)" = "" ]; then
         mamba env create --file ${my_conda_base}/environment.yml
     fi
