@@ -67,8 +67,10 @@ for n in $(seq $num_nodes); do
     docker_cmd="docker run --rm --name at-$n --network=$network_name $remote_dbg -it $image_name"
     if [ "$(which gnome-terminal)" != "" ]; then
         gnome-terminal -- sh -c "$docker_cmd $debug_run"
+    elif [ "$(which qterminal)" != "" ]; then
+        qterminal -e "$docker_cmd $debug_run"
     elif [ "$(which osascript)" != "" ]; then
-        osascript -e "tell app \"Terminal\";  do script \"$docker_cmd; exec bash\"; end tell"
+        osascript -e "tell app \"Terminal\";  do script \"$docker_cmd $debug_run\"; end tell"
     fi
     # TODO other environments
     sleep $((min_sec + RANDOM % max_sec))
