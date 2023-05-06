@@ -5,7 +5,6 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
-from concurrent.futures import TimeoutError, CancelledError
 
 import pytest
 from autonomous_trust.config import Configuration, CfgIds, generate_identity
@@ -14,31 +13,32 @@ from autonomous_trust.automate import AutonomousTrust
 from . import PRESERVE_FILES, TEST_DIR
 
 
-class Helper(object):
+class ShortTimer(AutonomousTrust):
     default_runtime = 20
 
-    def __init__(self, runtime=None, debug=False):
+    def __init__(self, runtime=None, debug=False, **kwargs):
+        super().__init__(**kwargs)
         self.exceptions = []
         self.runtime = runtime
         if runtime is None:
             self.runtime = runtime
         self.debug = debug
 
-    def nothing_loop(self, logger, future_info, output, signals):
+    def autonomous_loop(self, results, queues, signals):
         start = datetime.utcnow()
         end = start + timedelta(seconds=self.runtime)
         if self.debug:
             print()
         while datetime.utcnow() < end:
-            for name, future in future_info.items():
-                if future.done():
-                    try:
-                        self.exceptions.append(future.exception(0))
-                    except (TimeoutError, CancelledError):
-                        pass
             time.sleep(1)
             if self.debug:
                 print('%d    ' % (end - datetime.utcnow()).seconds, end='\r')
+        for result in results.values():
+            if result.ready():
+                try:
+                    result.get(0)
+                except Exception as e:
+                    self.exceptions.append(e)
         for sig in signals.values():
             sig.put_nowait(Process.sig_quit)
         if self.debug:
@@ -58,9 +58,9 @@ def run_main(mp=True, debug=True, reconfig=True, runtime=None):
                 contents.append(line)
         with open(net_cfg_file, 'w') as net:
             net.writelines(contents)
-    helper = Helper(debug=debug, runtime=runtime)
-    AutonomousTrust(multiproc=mp, logfile=Configuration.log_stdout).run_forever(override_loop=helper.nothing_loop)
-    assert len(helper.exceptions) == 0
+    at = ShortTimer(runtime=runtime, debug=debug, multiproc=mp, logfile=Configuration.log_stdout)
+    at.run_forever()
+    assert len(at.exceptions) == 0
 
 
 class DockerThread(threading.Thread):
@@ -103,4 +103,3 @@ def test_two():
     DockerThread().start()
     time.sleep(5)
     run_main(True, False, False, 60)
-

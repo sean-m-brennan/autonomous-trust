@@ -1,6 +1,6 @@
 import pytest
 
-from identity.structures.redblack import Tree, _flatten
+from structures.redblack import Tree, _flatten  # noqa
 
 
 def test_tuples():

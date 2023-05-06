@@ -1,4 +1,4 @@
-from nacl.public import PrivateKey, PublicKey, Box
+from nacl.public import PrivateKey, PublicKey
 from nacl.encoding import HexEncoder
 
 from ..config.configuration import Configuration

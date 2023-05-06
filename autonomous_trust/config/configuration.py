@@ -1,4 +1,3 @@
-import enum
 import os
 import sys
 import enum
@@ -38,7 +37,6 @@ class CfgIds(str, enum.Enum,  metaclass=ConfigEnumMeta):
 
     def __str__(self) -> str:
         return str.__str__(self)
-
 
 
 class Configuration(object):

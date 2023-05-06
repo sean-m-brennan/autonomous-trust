@@ -4,9 +4,11 @@ from sass import CompileError
 
 
 class SassASGIMiddleware(SassMiddleware):
-    def __init__(self, app, manifests, package_dir={}, error_status='200 OK'):
-        self.logger = app.logger
-        super().__init__(app.asgi_app, manifests, package_dir, error_status)
+    def __init__(self, app, manifests, package_dir=None, error_status='200 OK'):
+        if package_dir is None:
+            package_dir = {}
+        self.logger = app.logger  # noqa
+        super().__init__(app.asgi_app, manifests, package_dir, error_status)  # noqa
 
     async def __call__(self, scope, recv, send):  # noqa
         path = scope.get('path', '/')

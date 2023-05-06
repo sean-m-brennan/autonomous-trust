@@ -1,7 +1,5 @@
 from enum import Enum
 
-from ...config import Configuration
-
 
 class IdentityProtocol(Enum):
     """
