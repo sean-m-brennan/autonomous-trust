@@ -1,31 +1,25 @@
 import time
-from queue import Empty, Full
+from queue import Empty
 
-import composable_paxos as paxos
-
+from ..identity import Peers, Group
 from ..network import Message
-from ..identity import Group, Peers
 from ..processes import Process, ProcMeta
 from ..config import CfgIds
 
 
-class ByzPax(paxos.PaxosInstance):
-    def __init__(self, network_uid, quorum_size):
-        super().__init__(network_uid, quorum_size)
-
-
-class ReputationProcess(Process, metaclass=ProcMeta,
-                        proc_name='reputation', description='Reputation tracking', cfg_name=CfgIds.reputation.value):
+class NegotiationProcess(Process, metaclass=ProcMeta,
+                         proc_name=CfgIds.negotiation.value, description='Negotiate transactions'):
+    """
+    Handle transaction agreement negotiations
+    """
     def __init__(self, configurations, subsystems, log_q):
         super().__init__(configurations, subsystems, log_q,
-                         dependencies=[CfgIds.network.value, CfgIds.identity.value, CfgIds.negotiation.value])
-        self.pax = ByzPax(configurations[CfgIds.network.value], 3)
+                         dependencies=[CfgIds.network.value, CfgIds.identity.value])
         self.peers = configurations[CfgIds.peers.value]
 
     def _run_handlers(self, queues, message):
         if isinstance(message, Group):
-            self.group = message
-            self.logger.debug('Updated group')
+            # ignore
             return True
         if isinstance(message, Peers):
             self.peers = message
@@ -45,13 +39,5 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 message = None
             if message:
                 self._run_handlers(queues, message)
-
-            # FIXME reputatiom handling
-            try:
-                if False:
-                    msg = 'test'  # FIXME
-                    queues[CfgIds.network.value].put(msg, block=True, timeout=self.q_cadence)
-            except Full:
-                self.logger.error('Reputation: network queue is full')
 
             time.sleep(self.cadence)
