@@ -23,20 +23,21 @@ def from_yaml_string(string):
 class ConfigEnumMeta(enum.EnumMeta):
     def __contains__(cls, item):
         if isinstance(item, str):
-            return item in [x for x in cls]
+            return item in [x.value for x in cls]
         else:
             return super().__contains__(item)
 
 
-class CfgIds(str, enum.Enum,  metaclass=ConfigEnumMeta):
+class CfgIds(enum.Enum,  metaclass=ConfigEnumMeta):
     network = 'network'
     identity = 'identity'
     peers = 'peers'
-    reputation = 'reputation'
     group = 'group'
+    negotiation = 'negotiation'
+    reputation = 'reputation'
 
-    def __str__(self) -> str:
-        return str.__str__(self)
+    #def __str__(self) -> str:
+    #    return str.__str__(self)
 
 
 class Configuration(object):

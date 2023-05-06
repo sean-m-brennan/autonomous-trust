@@ -4,7 +4,8 @@ import argparse
 
 from .system import dev_root_dir
 from .automate import AutonomousTrust
-from .config import Configuration, random_config
+from .config import Configuration
+from .config.generate import random_config
 from .processes import LogLevel
 
 

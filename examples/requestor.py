@@ -4,7 +4,8 @@ import time
 from queue import Empty, Full
 from multiprocessing import get_context
 
-from autonomous_trust import AutonomousTrust, Process, ProcMeta, LogLevel, random_config, CfgIds
+from autonomous_trust import AutonomousTrust, Process, ProcMeta, LogLevel, CfgIds
+from autonomous_trust.config.generate import random_config
 
 
 class RequestorProcess(Process, metaclass=ProcMeta,
