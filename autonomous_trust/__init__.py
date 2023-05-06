@@ -1,14 +1,10 @@
-import os
-import importlib.metadata
+try:
+    import importlib.metadata  # noqa
+    __version__ = importlib.metadata.version("autonomous_trust")
+except ImportError:
+    __version__ = 0
 
-__version__ = importlib.metadata.version("autonomous_trust")
+from .automate import AutonomousTrust  # noqa
 
-from .automate import main  # noqa
-
-from . import config  # noqa
-from . import network  # noqa
-from . import identity  # noqa
-from . import reputation  # noqa
-from . import viz  # noqa
-
-dev_root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+from .processes import *  # noqa
+from .config import *  # noqa

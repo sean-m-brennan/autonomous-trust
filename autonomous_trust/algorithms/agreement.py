@@ -3,6 +3,7 @@ from uuid import UUID
 
 from ..config import Configuration
 from ..structures import SimplestBlob
+from ..system import encoding
 
 
 class AgreementProof(Configuration):
@@ -16,7 +17,7 @@ class AgreementProof(Configuration):
         self.nonce = nonce
 
     def __bytes__(self):
-        return str(self.uuid).encode('utf-8') + self.digest + bytes(self.approval) + self.nonce
+        return str(self.uuid).encode(encoding) + self.digest + bytes(self.approval) + self.nonce
 
 
 class AgreementVoter(ABC):
@@ -57,10 +58,9 @@ class AgreementProtocol(VoterTracker):
     """
     def __init__(self, myself: AgreementVoter, others: list[AgreementVoter]):
         VoterTracker.__init__(self, myself)
-        self.others = others
+        self.voters = others + [myself]
         self._votes = {}
 
-    @abstractmethod
     def prove(self, blob: SimplestBlob) -> AgreementProof:
         """
         Ensure the consistency of the data in the blob, then return its hash
@@ -84,9 +84,9 @@ class AgreementProtocol(VoterTracker):
         """
         if not self._pre_verify(blob, proof, sig):
             return False
-        if blob not in self._votes.keys():
-            self._votes[blob] = []
-        self._votes[blob].append((proof, sig))
+        if blob.uuid not in self._votes:
+            self._votes[blob.uuid] = []
+        self._votes[blob.uuid].append((blob, proof, sig))
         return True
 
     def _prep_vote(self):
@@ -110,13 +110,13 @@ class AgreementProtocol(VoterTracker):
             return True
 
         self._prep_vote()
-        voters = {peer.uuid: peer for peer in self.others}
+        voters = {peer.uuid: peer for peer in self.voters}
         approvals = []
         for blob, proof, sig in self._votes[blob.uuid]:
-            if proof.uuid not in voters.keys():
+            if proof.uuid not in voters:
                 continue
-            idx, voter = voters[proof.uuid]
-            if voter.verify(proof, sig):  # properly signed proof
-                approvals.append(self._count_vote(blob, proof, voter))
+            voter = voters[proof.uuid]
+            #if voter.verify(proof, sig):  # properly signed proof  # FIXME The signature must be exactly 64 bytes long
+            approvals.append(self._count_vote(blob, proof, voter))
         del self._votes[blob.uuid]
         return self._accumulate_votes(approvals)

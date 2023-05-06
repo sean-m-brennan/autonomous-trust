@@ -4,18 +4,23 @@ this_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 network_name="at-net"
 image_name="autonomous-trust"
 
-mcast=false
+network_type="macvlan"
+mcast=false  # FIXME overlays
 remote_port=2357
+#ipv6="--ipv6"
 
 num_nodes=2
 force=
 debug=
+tunnel_host=
 for arg in $@; do
     if [ "$arg" = "--force" ]; then
         force="--no-cache"
     elif [ "$arg" = "--help" ]; then
-        echo "$(basename "$0") [--debug-build|--debug-run|--debug] [--force] NUM_NODES"
+        echo "$(basename "$0") [--debug-build|--debug-run|--debug] [--tunnel WHO@WHERE] [--force] NUM_NODES"
         exit 0
+    elif [ "$arg" = "--tunnel" ]; then
+        tunnel_host=
     elif [ "$arg" = "--debug-build" ]; then
         debug="build $debug"
     elif [ "$arg" = "--debug-run" ]; then
@@ -29,15 +34,14 @@ for arg in $@; do
     fi
 done
 
-if [ "$(docker network ls | grep $network_name)" = "" ]; then
+if [ "$(docker network ls | awk '{print $2}' | grep $network_name)" = "" ]; then
     if $mcast; then
         docker swarm init
-        docker network create --driver=weaveworks/net-plugin:latest_release --attachable $network_name
+        docker network create $ipv6 --driver=weaveworks/net-plugin:latest_release --attachable $network_name
     else
-        docker network create $network_name
+        docker network create $ipv6 --driver $network_type $network_name
     fi
 fi
-docker network ls | grep $network_name
 remote_ip=$(docker network inspect ${network_name} | grep Gateway | awk '{print $NF}' | sed 's/"//g')
 remote="${remote_ip}:${remote_port}"
 
@@ -55,6 +59,11 @@ if [[ "$debug" = *"remote"* ]]; then
     remote_debug=true
 fi
 
+tunnel=
+if [ "$tunnel_host" != "" ]; then
+    tunnel="ssh $tunnel_host -c "
+fi
+
 docker build -t $image_name $force $debug_build "$this_dir" || exit 1
 
 min_sec=1
@@ -66,11 +75,11 @@ for n in $(seq $num_nodes); do
     fi
     docker_cmd="docker run --rm --name at-$n --network=$network_name $remote_dbg -it $image_name"
     if [ "$(which gnome-terminal)" != "" ]; then
-        gnome-terminal -- sh -c "$docker_cmd $debug_run"
+        gnome-terminal -- sh -c "$tunnel $docker_cmd $debug_run"
     elif [ "$(which qterminal)" != "" ]; then
-        qterminal -e "$docker_cmd $debug_run"
+        qterminal -e "$tunnel $docker_cmd $debug_run"
     elif [ "$(which osascript)" != "" ]; then
-        osascript -e "tell app \"Terminal\";  do script \"$docker_cmd $debug_run\"; end tell"
+        osascript -e "tell app \"Terminal\";  do script \"$tunnel $docker_cmd $debug_run\"; end tell"
     fi
     # TODO other environments
     sleep $((min_sec + RANDOM % max_sec))

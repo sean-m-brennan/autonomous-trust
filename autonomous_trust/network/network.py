@@ -1,10 +1,11 @@
 import ipaddress
 
-from ..config.configuration import Configuration
+from ..config import Configuration
+from ..system import encoding
 
 
 class Network(Configuration):
-    encoding = 'utf-8'
+    encoding = encoding
     broadcast = 'anyone'
     multicast_v4_address = '239.0.0.65'
     multicast_v6_address = 'ff00::41e9:dddc:e4c7:e7e7'

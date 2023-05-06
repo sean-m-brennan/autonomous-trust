@@ -10,6 +10,7 @@ from ..processes import ProcessTracker
 from ..identity import Identity, IdentityProcess
 from ..network import *
 from .configuration import Configuration
+from ..system import communications
 
 
 names = [
@@ -71,16 +72,15 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True):
     hostname = socket.getfqdn(unqualified_hostname)
     if hostname == 'localhost':
         hostname = unqualified_hostname
-    protocol = SimpleTCPNetworkProcess.__module__ + '.' + SimpleTCPNetworkProcess.__qualname__
     ip4_address, ip6_address, mac_address = _get_addresses()  # TODO multi-device
 
-    mod, cls = protocol.rsplit('.', 1)
+    mod, cls = communications.rsplit('.', 1)
     proto_cls = getattr(sys.modules[mod], cls)
     address = None
     if proto_cls.net_proto == NetworkProtocol.IPV4:
-        address = ip4_address
+        address = ip4_address.split('/')[0]
     elif proto_cls.net_proto == NetworkProtocol.IPV6:
-        address = ip6_address
+        address = ip6_address.split('/')[0]
     elif proto_cls.net_proto == NetworkProtocol.MAC:
         address = mac_address
 
@@ -91,7 +91,7 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True):
         idx = seed % len(names)
         fullname = names[idx]
         nickname = fullname.split('@')[0].rsplit('.', 1)[1]
-        net_impl = protocol
+        net_impl = communications
         net_cfg = Network.initialize(ip4_address, ip6_address, mac_address)
         if not os.path.exists(net_file):
             net_cfg.to_file(net_file)
@@ -117,9 +117,9 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True):
     mac_addr = input('  MAC address [%s]: ' % mac_address)
     if mac_addr == '':
         mac_addr = mac_address
-    net_impl = input('  Network Implementation [%s]: ' % protocol)
+    net_impl = input('  Network Implementation [%s]: ' % communications)
     if net_impl == '':
-        net_impl = protocol
+        net_impl = communications
 
     overwrite = True
     if os.path.exists(net_file):

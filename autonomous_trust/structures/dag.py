@@ -6,6 +6,8 @@ from collections import defaultdict
 import random
 import string
 
+from ..config import Configuration
+
 
 class Step(ABC):
     def __init__(self, uuid):
@@ -30,7 +32,7 @@ class GenesisType(Step):
 Genesis = GenesisType()
 
 
-class LinkedStep(Step):
+class LinkedStep(Step, Configuration):
     """
     A link in a DAG
     From any link, can only navigate in a chain back to the root
@@ -104,7 +106,7 @@ class StepDAG(ABC):
         """
         if branch is None:
             branch = self.main_branch
-        if branch not in self.heads.keys():
+        if branch not in self.heads:
             raise InvalidBranchError()
         step.parent = self.heads[branch]
         self.heads[branch] = step
@@ -118,14 +120,14 @@ class StepDAG(ABC):
         :param source: name of source branch, or Genesis
         :return: None
         """
-        if name in self.heads.keys():
+        if name in self.heads:
             raise BranchExistsError(name)
         if source is None:
             source = self.main_branch
-        if source not in self.heads.keys():
-            raise InvalidBranchError(source)
         if source is Genesis:
             current = Genesis
+        elif source not in self.heads:
+            raise InvalidBranchError(source)
         else:
             current = self.heads[source]
         self.heads[name] = step
@@ -155,19 +157,20 @@ class StepDAG(ABC):
         """
         if target is None:
             target = self.main_branch
-        if branch not in self.heads.keys():
+        if branch not in self.heads:
             raise InvalidBranchError(branch)
-        if target not in self.heads.keys():
+        if target not in self.heads:
             raise InvalidBranchError(target)
 
         shorter = min(len(self.__branch_lists[branch]), len(self.__branch_lists[target]))
         common_root = Genesis
+        idx = 0
         for idx in range(0, shorter):
             if self.__branch_lists[branch][idx] != self.__branch_lists[target][idx]:
                 if idx > 0:
                     common_root = self.__branch_lists[branch][idx - 1]
                 break
-        return common_root
+        return idx, common_root
 
     def _sort_step_list(self, steps):
         return sorted(steps, key=lambda x: x.timestamp)
@@ -182,12 +185,12 @@ class StepDAG(ABC):
         """
         if target is None:
             target = self.main_branch
-        if branch not in self.heads.keys():
+        if branch not in self.heads:
             raise InvalidBranchError(branch)
-        if target not in self.heads.keys():
+        if target not in self.heads:
             raise InvalidBranchError(target)
 
-        common_root = self.diff(branch, target)
+        idx, common_root = self.diff(branch, target)
         temp = self.temp_name
         self.heads[temp] = common_root
         steps = self.__branch_lists[branch][idx:] + self.__branch_lists[target][idx:]  # noqa
@@ -204,7 +207,7 @@ class StepDAG(ABC):
             head = self.main_branch
         if head == self.all_branches:
             return deepcopy(self.heads)
-        elif head in self.heads.keys():
+        elif head in self.heads:
             return deepcopy(self.heads[head])
         raise InvalidBranchError(head)
 
@@ -221,10 +224,10 @@ class StepDAG(ABC):
         step_list = []
         step = self.heads[branch]
         while step != root:
-            step_list.append(step.to_dict())
+            step_list.append(step)
             step = step.parent
         if root is not Genesis:
-            step_list.append(step.to_dict())
+            step_list.append(step)
         return step_list
 
     @abstractmethod
@@ -238,7 +241,7 @@ class StepDAG(ABC):
         :return:
         """
         name = self.ingest_branch(other_steps)
-        branch_diff = self.recite(name, self.diff(name))
+        branch_diff = self.recite(name, self.diff(name)[1])
         if self._validate(name):
             self.merge(name)
         return branch_diff

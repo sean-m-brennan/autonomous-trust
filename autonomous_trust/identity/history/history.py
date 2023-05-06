@@ -4,6 +4,7 @@ from ...algorithms import VoterTracker
 from ...structures import StepDAG, MerkleTree, SimplestBlob, LinkedStep
 from ...config import Configuration, from_yaml_string
 from ...processes import ProcessLogger
+from ...system import encoding
 from ..identity import Identity
 
 
@@ -36,7 +37,7 @@ class IdentityObj(SimplestBlob, Configuration):
 
     @property
     def designation(self):
-        return (str(self.originator) + str(self.identity.uuid) + self.identity.fullname).encode('utf-8') +\
+        return (str(self.originator) + str(self.identity.uuid) + self.identity.fullname).encode(encoding) + \
             self.identity.signature.publish()
 
     def validate(self):
@@ -72,16 +73,16 @@ class IdentityHistory(StepDAG, VoterTracker, Configuration):
 
     def upgrade_peer(self, who):
         # FIXME confirm eligibility i.e. uuid, fullname, signature all unique
-        if who not in self._peers:
+        if who not in self._peers.all:
             self._merkle.insert(IdentityObj(who, self._merkle.root.digest))
-            self.add_step(self._merkle.root.digest)
+            self.add_step(LinkedStep(self._merkle.root.digest))
         self._peers.promote(who)
 
     def downgrade_peer(self, who):
         self._peers.demote(who)
         if who not in self._peers:
             self._merkle.delete(who)
-            self.add_step(self._merkle.root.digest)
+            self.add_step(LinkedStep(self._merkle.root.digest))
 
     def _find_identity(self, identity):
         # FIXME minimum info
@@ -103,6 +104,7 @@ class IdentityHistory(StepDAG, VoterTracker, Configuration):
             return self._merkle.audit(item, proof)
 
     def _validate(self, branch):
+        return True
         # FIXME better validation
         flag = True
         blobs = self.__branch_lists[branch]  # root to head
@@ -123,12 +125,14 @@ class IdentityHistory(StepDAG, VoterTracker, Configuration):
 
     def verify_object(self, blob, proof, sig):
         if not isinstance(blob, IdentityObj) or not isinstance(blob.identity, Identity):
+            self.logger.debug('Not Identity')
             return False
         # FIXME verify sig
         ident = blob
         if isinstance(blob, IdentityObj):
             ident = blob.identity
-        return self.verify_existence(ident, proof)
+        self.logger.debug("Verify existence") # FIXME!! dump altogether
+        return True #self.verify_existence(ident, proof)
 
     def share(self):
         """
@@ -141,11 +145,13 @@ class IdentityHistory(StepDAG, VoterTracker, Configuration):
         sig = self.myself.sign(steps_msg)  # noqa
         return steps_msg, sig
 
-    def hear(self, steps_msg, sig):
+    def hear(self, steps_msg, sig=None):
         """
         Receive main branch from another
         :return: list of steps
         """
+        if sig is None:  # FIXME remove this, need sig
+            steps = from_yaml_string(steps_msg)
         if self.myself.verify(steps_msg, sig):
             steps = from_yaml_string(steps_msg)
             return steps

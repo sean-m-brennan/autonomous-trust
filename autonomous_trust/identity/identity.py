@@ -4,6 +4,7 @@ from nacl.public import Box
 from nacl.encoding import HexEncoder
 
 from ..config import Configuration
+from ..system import encoding
 from ..algorithms import AgreementVoter, AgreementImpl
 from .sign import Signature
 from .encrypt import Encryptor
@@ -13,6 +14,8 @@ class Identity(Configuration, AgreementVoter):
     """
     Identity details that can be saved to file or transmitted
     """
+    enc = encoding
+
     def __init__(self, _uuid, address, _fullname, _nickname, _signature, _encryptor, petname='',
                  _public_only=True, _rank=0, _block_impl=AgreementImpl.POA.value):
         super().__init__(str(_uuid), _rank)
@@ -24,18 +27,6 @@ class Identity(Configuration, AgreementVoter):
         self.petname = petname
         self._public_only = _public_only
         self._block_impl = _block_impl
-        if self._public_only:
-            print('Public: %s' % self._nickname)
-        else:
-            print('Private: %s' % self._nickname)
-        if self.encryptor.private is None:
-            print('Public encrypt: %s' % self._nickname)
-        else:
-            print('Private encrypt: %s' % self._nickname)
-        if self.signature.private is None:
-            print('Public sign: %s' % self._nickname)
-        else:
-            print('Private sign: %s' % self._nickname)
 
     def __eq__(self, other):
         return self.__class__.__name__ == other.__class__.__name__ and self.uuid == other.uuid and \
@@ -72,6 +63,10 @@ class Identity(Configuration, AgreementVoter):
         :param msg: bytes
         :return: SignedMessage (msg, sig)
         """
+        if isinstance(msg, str):
+            msg = msg.encode(self.enc)
+        elif isinstance(msg, Configuration):
+            msg = msg.to_yaml_string().encode(self.enc)
         if self._public_only or self.signature.private is None:  # FIXME cannot sign
             raise RuntimeError('Cannot sign a message with another identity (%s is not you)' % self.nickname)
         return self.signature.private.sign(msg, encoder=HexEncoder)
@@ -83,6 +78,10 @@ class Identity(Configuration, AgreementVoter):
         :param signature: sig, if msg was bytes
         :return: bytes
         """
+        if isinstance(msg, str):
+            msg = msg.encode(self.enc)
+        elif isinstance(msg, Configuration):
+            msg = msg.to_yaml_string().encode(self.enc)
         if signature is None:  # msg is a tuple
             return self.signature.public.verify(msg, encoder=HexEncoder)
         return self.signature.public.verify(msg, signature, encoder=HexEncoder)
@@ -118,5 +117,7 @@ class Identity(Configuration, AgreementVoter):
 
     @staticmethod
     def initialize(my_name, my_nickname, my_address):
+        if '/' in my_address:
+            my_address = my_address.split('/')[0]
         return Identity(uuid_mod.uuid4(), my_address, my_name, my_nickname,
                         Signature.generate(), Encryptor.generate(), 'me', False)

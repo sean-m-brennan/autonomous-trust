@@ -1,7 +1,7 @@
 import random
 import networkx as nx
 
-from viz import network_graph as ng
+from . import network_graph as ng
 
 
 class DeceitNetwork(ng.NetworkGraph):
@@ -235,7 +235,7 @@ class SybilNetwork(ng.NetworkGraph):
                     a["weight"] = self.maximum_weight  # starting value
             elif u in [self.target, self.assist] and \
                  v in [self.target, self.assist]:
-                if "weight" in a.keys():
+                if "weight" in a:
                     if a["weight"] < self.maximum_weight:
                         a["weight"] += 1
                 else:

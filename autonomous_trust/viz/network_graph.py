@@ -108,7 +108,7 @@ class NetworkGraph(object):
             self.change_type = self.PhaseChange.META
         if defaults:
             for u, v, a in self.G.edges(data=True):
-                if "weight" not in a.keys():
+                if "weight" not in a:
                     a["weight"] = random.randint(1, self.maximum_weight)
         return True
 
@@ -137,7 +137,7 @@ class NetworkGraph(object):
         for u, v, a in self.G.edges(data=True):
             src = self.G.nodes[u]
             tgt = self.G.nodes[v]
-            if "group" in src.keys() and "group" in tgt.keys():
+            if "group" in src and "group" in tgt:
                 a["group"] = src["group"] if src["group"] == tgt["group"] else 0
 
     def renew(self):
@@ -224,7 +224,7 @@ class NetworkGraph(object):
     def prune_edges(self):
         edge_list = []
         for u, v, a in self.G.edges(data=True):
-            if "weight" in a.keys() and a["weight"] <= 0:
+            if "weight" in a and a["weight"] <= 0:
                 edge_list.append((u, v))
         if self.debug and len(edge_list) > 0:
             print("Prune %d edges" % len(edge_list))
@@ -291,10 +291,10 @@ class NetworkGraph(object):
                     self.remove_node(node_num)
 
     def node_metadata(self, nodeset):
-        return set([tuple([n[k] for k in self.node_data if k in n.keys()]) for n in nodeset])
+        return set([tuple([n[k] for k in self.node_data if k in n]) for n in nodeset])
 
     def edge_metadata(self, edgeset):
-        return set([tuple([e[k] for k in self.link_data if k in e.keys()]) for e in edgeset])
+        return set([tuple([e[k] for k in self.link_data if k in e]) for e in edgeset])
 
     def nodeset_diff(self, s1, s2):
         node_diff = self.node_metadata(s1) - self.node_metadata(s2)

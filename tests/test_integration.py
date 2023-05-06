@@ -10,7 +10,7 @@ from concurrent.futures import TimeoutError, CancelledError
 import pytest
 from autonomous_trust.config import Configuration, CfgIds, generate_identity
 from autonomous_trust.processes import Process
-from autonomous_trust.automate import main
+from autonomous_trust.automate import AutonomousTrust
 from . import PRESERVE_FILES, TEST_DIR
 
 
@@ -59,7 +59,7 @@ def run_main(mp=True, debug=True, reconfig=True, runtime=None):
         with open(net_cfg_file, 'w') as net:
             net.writelines(contents)
     helper = Helper(debug=debug, runtime=runtime)
-    main(multiproc=mp, logfile=Configuration.log_stdout, override_loop=helper.nothing_loop)
+    AutonomousTrust(multiproc=mp, logfile=Configuration.log_stdout).run_forever(override_loop=helper.nothing_loop)
     assert len(helper.exceptions) == 0
 
 
