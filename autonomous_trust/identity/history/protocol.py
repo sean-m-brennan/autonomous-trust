@@ -1,4 +1,4 @@
-from aenum import Enum
+from enum import Enum
 
 from ...config import Configuration
 
@@ -25,7 +25,9 @@ class IdentityProtocol(Enum):
           - eldest n remain in border-mode
        c. vote -> (blob, proof, sig)
        d. listen for votes <- (blob, proof, sig)
-          - if approved, respond with full_history + group key privately -> steps list + Group
+          - if approved:
+             * respond first with my id and hash in open privately
+             * then respond with full_history + group key privately (closed) -> steps list + Group
        e. confirm peer -> IdentityObj
        f. update group -> Group
     4. listen on closed broadcast channel for peer confirmation <- IdentityObj
@@ -38,6 +40,7 @@ class IdentityProtocol(Enum):
     Items 3, 4, & 5 are concurrent
     """
     announce = 'request_access'
+    accept = 'access_granted'
     history = 'full_history'
     diff = 'history_diff'
     propose = 'propose_peer'
@@ -45,8 +48,5 @@ class IdentityProtocol(Enum):
     confirm = 'peer_accepted'
     update = 'group_key_update'
 
-
-class FullHistoryMessage(Configuration):
-    def __init__(self, history, group):
-        self.history = history
-        self.group = group
+    def __str__(self) -> str:
+        return str.__str__(self)

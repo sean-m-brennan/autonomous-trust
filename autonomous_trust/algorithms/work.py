@@ -1,6 +1,6 @@
 from abc import ABC
 from .agreement import AgreementProtocol, AgreementVoter, AgreementProof
-
+from ..system import encoding
 
 class AgreementByWork(AgreementProtocol, ABC):
     """
@@ -20,7 +20,7 @@ class AgreementByWork(AgreementProtocol, ABC):
         try:
             while not computed_hash.startswith(b'0' * self.DIFFICULTY):
                 nonce += 1
-                computed_hash = blob.get_hash(str(nonce).encode('utf-8'))
+                computed_hash = blob.get_hash(str(nonce).encode(encoding))
         except MemoryError:
             pass
         return AgreementProof(self.myself.uuid, computed_hash, True)
@@ -36,4 +36,3 @@ class AgreementByWork(AgreementProtocol, ABC):
             self._approved.remove(blob)
             return True
         return False
-

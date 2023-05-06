@@ -6,10 +6,11 @@ from queue import Empty
 from collections.abc import Mapping
 from collections import OrderedDict
 
-from aenum import IntEnum
+from enum import IntEnum
 from ruamel.yaml import YAML
 
-from .config.configuration import Configuration
+from .config import Configuration
+from .system import cadence, queue_cadence
 
 yaml = YAML(typ='safe')
 
@@ -32,6 +33,10 @@ class ProcessTracker(Mapping):
     @property
     def ordered(self):
         return self._order
+
+    @property
+    def names(self):
+        return self._registry
 
     def register_subsystem(self, cfg_name, class_spec):
         self._classes.append((cfg_name, class_spec))
@@ -102,8 +107,8 @@ class Process(metaclass=ProcMeta):
     level = 'log-level'
     output_timeout = 1
     sig_quit = 'quit'
-    cadence = 0.1
-    q_cadence = 0.001
+    cadence = cadence
+    q_cadence = queue_cadence
     exit_timeout = 5
 
     def __init__(self, configurations, subsystems, log_queue, dependencies=None, log_level=LogLevel.INFO):
@@ -117,10 +122,11 @@ class Process(metaclass=ProcMeta):
             if dep not in map(lambda x: x.name, configurations['processes']):
                 raise RuntimeError('Unmet dependency for %s: %s' % (self.name, dep))
         self.log_level = log_level
-        if Process.level in self.configs.keys():
+        if Process.level in self.configs:
             self.log_level = self.configs[Process.level]
         self.logger = ProcessLogger(self.__class__.__name__, log_queue)
         self.mocks = []  # list of Mockery objs
+        self.package_hash = None
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -139,6 +145,11 @@ class Process(metaclass=ProcMeta):
         except Empty:
             pass
         return running
+
+    def update(self, msg, queues):
+        for name, q in queues.items():
+            if name != self.name:
+                q.put(msg, block=True, timeout=self.q_cadence)
 
     def process(self, queues, signal):
         raise NotImplementedError
