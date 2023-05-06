@@ -1,5 +1,6 @@
 from collections.abc import Iterable
 from enum import Enum
+from typing import Union
 
 from networkx.algorithms.tree import coding as nx_tree
 
@@ -66,7 +67,6 @@ class Node(object):
         if not isinstance(sibling, Node):
             return None
         return sibling
-
 
     @property
     def level(self):
@@ -143,7 +143,7 @@ class EmptyNodeType(object):
             cls._self = super().__new__(cls)
         return cls._self
 
-    #def __init__(self):
+    # def __init__(self):
     #    self.red = False
 
 
@@ -320,13 +320,14 @@ class Tree(object):
         if not color:
             self._recolor_del(fix_root)
 
-    def _min_leaf(self, node):
+    @staticmethod
+    def _min_leaf(node):
         all_leaves = node.leaves()
         min_key = min([leaf.key for leaf in all_leaves])
         return [leaf for leaf in all_leaves if leaf.key == min_key][0]
 
     def _transplant(self, u, v):
-        if u.parent == None:
+        if u.parent is None:
             self.root = v
         elif u == u.parent.left:
             u.parent.left = v
@@ -381,7 +382,7 @@ class Tree(object):
                     node = self.root
         node.red = False
 
-    def find(self, key) -> Node | None:
+    def find(self, key) -> Union[Node, None]:
         """
         Find the Node at key
         :param key: int

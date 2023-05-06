@@ -2,9 +2,11 @@ from nacl.hash import blake2b
 from collections import defaultdict
 from abc import ABC, abstractmethod
 from uuid import UUID, uuid4
+from typing import Union
 
 from .redblack import Node, Tree, EmptyNode
 from ..system import encoding
+
 
 class SimplestBlob(ABC):
     """
@@ -67,7 +69,7 @@ class MerkleTree(Tree):
         return 1  # unsorted, derived classed might override
 
     @classmethod
-    def get_hash(cls, x: bytes | str) -> bytes:
+    def get_hash(cls, x: Union[bytes, str]) -> bytes:
         if not isinstance(x, bytes):
             x = x.encode(cls.byte_enc)
         return cls.hash_func(x)
@@ -172,7 +174,7 @@ class MerkleTree(Tree):
             return None
         node = self.find(key)
         while node != self.root:
-            if node.sibling == self.empty:
+            if node.sibling is EmptyNode:
                 nodes.append((None, None))
             elif node == node.parent.left:
                 nodes.append((None, node.right.digest))

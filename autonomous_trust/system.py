@@ -4,13 +4,13 @@ import sys
 from nacl.hash import blake2b
 from traceback import print_tb
 
+
 # Constants for system tweaking
-#communications = 'autonomous_trust.network.TCPNetworkProcess'
+# communications = 'autonomous_trust.network.TCPNetworkProcess'  # FIXME not working
 communications = 'autonomous_trust.network.UDPNetworkProcess'
 encoding = 'utf-8'  # FIXME hex?
 cadence = 0.5
 queue_cadence = 0.01
-
 dev_root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 

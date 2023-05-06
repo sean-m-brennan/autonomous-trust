@@ -12,11 +12,10 @@ class AgreementByAuthority(AgreementProtocol, ABC):
         self.threshold_rank = threshold_rank
 
     def _count_vote(self, blob, proof, voter):
-        if voter.rank < self.threshold_rank:  # FIXME
+        if voter.rank < self.threshold_rank:  # FIXME derive threshold
             return voter.rank, proof.approval
         return voter.rank, False
 
     def _accumulate_votes(self, votes):
-        self.logger.debug([voter.rank for voter in self.voters])
         leader = max([voter.rank for voter in self.voters])
         return dict(votes)[leader]

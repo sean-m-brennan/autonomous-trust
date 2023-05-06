@@ -233,12 +233,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.confirmed_block.append((blob, proof,
                                      self.identity.sign(proof.to_yaml_string().encode(self.enc))))
 
-    def handle_vote_on_peer(self, queues, message):
+    def handle_vote_on_peer(self, _, message):
         """
         Process received proposals
         Non-blocking - spins up autonomous thread for processing
         Phase 4 of protocol
-        :param queues: Unused Interprocess communication queues
+        :param _: Unused Interprocess communication queues
         :param message: The request Message
         :return: bool (message handled)
         """

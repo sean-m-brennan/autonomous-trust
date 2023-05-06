@@ -2,7 +2,7 @@ import os
 import shutil
 import pytest
 
-from autonomous_trust.network.tcp import SimpleTCPNetworkProcess
+from autonomous_trust.network.tcp import TCPNetworkProcess
 from autonomous_trust.config import Configuration, CfgIds, generate_identity
 from autonomous_trust.automate import AutonomousTrust
 from . import PRESERVE_FILES, TEST_DIR
@@ -22,9 +22,9 @@ def setup_teardown():
 
 def test_reject():
     at = AutonomousTrust(logfile=Configuration.log_stdout)
-    cfgs = at.configure(start=False)
+    cfgs = at._configure(start=False)
     net_addr = cfgs[CfgIds.network.value].ip4
-    tcp = SimpleTCPNetworkProcess(cfgs, dict({}), None)
+    tcp = TCPNetworkProcess(cfgs, dict({}), None)
     tcp.send_peer('test1', net_addr)
     msg_tpl = tcp.recv_peer()
     assert msg_tpl[0] is None
@@ -33,9 +33,9 @@ def test_reject():
 
 def test_p2p():
     at = AutonomousTrust(logfile=Configuration.log_stdout)
-    cfgs = at.configure(start=False)
+    cfgs = at._configure(start=False)
     net_addr = cfgs[CfgIds.network.value].ip4
-    tcp = SimpleTCPNetworkProcess(cfgs, dict({}), None, acceptance_func=lambda x: True)
+    tcp = TCPNetworkProcess(cfgs, dict({}), None, acceptance_func=lambda x: True)
     tcp.send_peer('test1', net_addr)
     msg_tpl = tcp.recv_peer()
     assert 'test1' == msg_tpl[0]
@@ -45,8 +45,7 @@ def test_p2p():
 @pytest.mark.skip(reason="blocked by firewall")
 def test_mcast():
     at = AutonomousTrust(logfile=Configuration.log_stdout)
-    cfgs = at.configure(start=False)
-    tcp = SimpleTCPNetworkProcess(cfgs, dict({}), None)
-    tcp.send_all('test2')
+    cfgs = at._configure(start=False)
+    tcp = TCPNetworkProcess(cfgs, dict({}), None)
+    tcp.send_any('test2')
     assert 'test2' == tcp.recv_any()
-
