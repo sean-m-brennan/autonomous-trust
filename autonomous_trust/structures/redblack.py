@@ -131,11 +131,23 @@ class Node(object):
         return cls(tpl[0], None, left, right)
 
 
-class EmptyNode(object):
+class EmptyNodeType(object):
     """
     Red/Black sentinel
     """
+    _self = None
     red = False
+
+    def __new__(cls):
+        if cls._self is None:
+            cls._self = super().__new__(cls)
+        return cls._self
+
+    #def __init__(self):
+    #    self.red = False
+
+
+EmptyNode = EmptyNodeType()
 
 
 class DuplicateKey(RuntimeError):
@@ -146,13 +158,12 @@ class Tree(object):
     """
     Red/Black balanced tree
     """
-    empty = EmptyNode()
     node_class = Node
 
     def __init__(self, root=None):
         self.root = root
         if root is None:
-            self.root = self.empty
+            self.root = EmptyNode
             self.leaves = []
             self.first = None
             self.last = None
@@ -194,7 +205,7 @@ class Tree(object):
         """
         if key is None:
             key = self.size + 1  # auto-assign key
-        node = self.node_class(key, data, left=self.empty, right=self.empty, red=True)
+        node = self.node_class(key, data, left=EmptyNode, right=EmptyNode, red=True)
         if self.first is None or self.first.key > key:
             self.first = node
         if self.last is None or self.last.key < key:
@@ -202,7 +213,7 @@ class Tree(object):
         self.leaves.append(node)
         parent = None
         current = self.root
-        while current != self.empty:
+        while current is not EmptyNode:
             parent = current
             if node.key < current.key:
                 current = current.left
@@ -227,9 +238,9 @@ class Tree(object):
         counter = d_enum.incr()
         pivot = node.get_child(counter)
         node.set_child(counter, pivot.get_child(direction))
-        if pivot.get_child(direction) != self.empty:
+        if pivot.get_child(direction) is not EmptyNode:
             pivot.get_child(direction).parent = node
-        if node.left == self.empty and node.right == self.empty:
+        if node.left is EmptyNode and node.right is EmptyNode:
             self.leaves.append(node)
 
         pivot.parent = node.parent
@@ -286,10 +297,10 @@ class Tree(object):
             self.last = node.parent
         temp = node
         color = temp.red
-        if node.left == self.empty:
+        if node.left is EmptyNode:
             fix_root = node.right
             self._transplant(node, node.right)
-        elif node.right == self.empty:
+        elif node.right is EmptyNode:
             fix_root = node.left
             self._transplant(node, node.left)
         else:  # both
@@ -377,7 +388,7 @@ class Tree(object):
         :return: Node
         """
         current = self.root
-        while current != self.empty:
+        while current is not EmptyNode:
             if key < current.key:
                 current = current.left
             elif key > current.key:
@@ -391,9 +402,10 @@ class Tree(object):
         Encode structure (but not data) as a nested tuple
         :return: tuple
         """
-        if isinstance(self.root, EmptyNode):
+        try:
+            return self.root.to_tuple()
+        except AttributeError:
             return ()
-        return self.root.to_tuple()  # noqa
 
     def to_nx_graph(self):
         """

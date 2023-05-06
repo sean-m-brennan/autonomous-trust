@@ -8,7 +8,7 @@ class AgreementByAuthority(AgreementProtocol, ABC):
     Still abstract
     """
     def __init__(self, myself: AgreementVoter, peers: list[AgreementVoter], threshold_rank):
-        super().__init__(myself, peers)
+        AgreementProtocol.__init__(self, myself, peers)
         self.threshold_rank = threshold_rank
 
     def _count_vote(self, blob, proof, voter):
@@ -17,5 +17,6 @@ class AgreementByAuthority(AgreementProtocol, ABC):
         return voter.rank, False
 
     def _accumulate_votes(self, votes):
-        max([voter.rank for voter in self.others])
-        return dict(votes)[max([voter.rank for voter in self.others])]
+        self.logger.debug([voter.rank for voter in self.voters])
+        leader = max([voter.rank for voter in self.voters])
+        return dict(votes)[leader]

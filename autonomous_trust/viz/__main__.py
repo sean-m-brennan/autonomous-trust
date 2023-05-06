@@ -1,8 +1,8 @@
 #!/usr/bin/env -S python3 -m
 
-from . import server
 import os
 import argparse
+from .server import VizServer
 
 default_port = 8000
 initial_size = 12
@@ -18,4 +18,4 @@ if __name__ == '__main__':
     parser.add_argument('--size', type=int, default=initial_size)
     args = parser.parse_args()
 
-    server.VizServer(args.directory, args.port, args.debug, args.size).run()
+    VizServer(args.directory, args.port, args.debug, args.size).run()

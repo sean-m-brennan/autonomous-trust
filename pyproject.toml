@@ -5,7 +5,7 @@ build-backend = "maturin"
 
 [project]
 name = "autonomous_trust"
-dynamic = ["version"]
+version = "0.1.0"
 description = "AutonomousTrust - a high-trust cooperative computing framework"
 authors = [
     {name = "Sean M Brennan", email = "sean.brennan@tekfive.com"}

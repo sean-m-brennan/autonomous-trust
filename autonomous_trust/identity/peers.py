@@ -24,7 +24,7 @@ class Peers(Configuration):
 
     def _find(self, index):
         for idx in range(len(self.hierarchy)):
-            if index in self.hierarchy[idx].keys():
+            if index in self.hierarchy[idx]:
                 return idx
         return
 
@@ -35,17 +35,19 @@ class Peers(Configuration):
 
     def find_by_uuid(self, uuid):
         ids = {p.uuid: p for p in self.listing.values()}
-        if uuid in ids.keys():
+        if uuid in ids:
             return ids[uuid]
         return None
 
     def find_by_address(self, address):
-        if address in self.listing.keys():
+        if '/' in address:
+            address = address.split('/')[0]
+        if address in self.listing:
             return self.listing[address]
         return None
 
     def promote(self, who):
-        if who.address not in self.listing.keys():
+        if who.address not in self.listing:
             self.listing[who.address] = who
         if who not in self.all:
             self.all.append(who)
