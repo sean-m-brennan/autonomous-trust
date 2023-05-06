@@ -5,12 +5,11 @@ import re
 import socket
 import subprocess
 
-from ..reputation import ReputationProcess
+from .configuration import Configuration, CfgIds
 from ..processes import ProcessTracker
-from ..identity import Identity, IdentityProcess
-from ..network import *
-from .configuration import Configuration
-from ..system import communications
+from ..network import Network, NetworkProtocol
+from ..identity import Identity
+from ..system import communications, core_system
 
 
 names = [
@@ -49,11 +48,11 @@ def _get_addresses(device='eth0'):
 
 def _write_subsystems(net_impl, sub_sys_file):
     pt = ProcessTracker()
-    pt.register_subsystem(NetworkProcess.cfg_name, net_impl)
-    pt.register_subsystem(IdentityProcess.cfg_name,
-                          IdentityProcess.__module__ + '.' + IdentityProcess.__qualname__)
-    pt.register_subsystem(ReputationProcess.cfg_name,
-                          ReputationProcess.__module__ + '.' + ReputationProcess.__qualname__)
+    for name, impl in core_system.items():
+        if name == CfgIds.network.value:
+            pt.register_subsystem(name, net_impl)
+        else:
+            pt.register_subsystem(name, impl)
     pt.to_file(sub_sys_file)
 
 
@@ -64,8 +63,8 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True):
         except ValueError:
             seed = sum([ord(x) for x in seed])
 
-    ident_file = os.path.join(cfg_dir, IdentityProcess.cfg_name + Configuration.yaml_file_ext)
-    net_file = os.path.join(cfg_dir, NetworkProcess.cfg_name + Configuration.yaml_file_ext)
+    ident_file = os.path.join(cfg_dir, CfgIds.identity.value + Configuration.yaml_file_ext)
+    net_file = os.path.join(cfg_dir, CfgIds.network.value + Configuration.yaml_file_ext)
     sub_sys_file = os.path.join(cfg_dir, ProcessTracker.default_filename)
 
     unqualified_hostname = socket.gethostname()
@@ -91,14 +90,13 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True):
         idx = seed % len(names)
         fullname = names[idx]
         nickname = fullname.split('@')[0].rsplit('.', 1)[1]
-        net_impl = communications
         net_cfg = Network.initialize(ip4_address, ip6_address, mac_address)
         if not os.path.exists(net_file):
             net_cfg.to_file(net_file)
         if not os.path.exists(ident_file):
             Identity.initialize(fullname, nickname, address).to_file(ident_file)
         if not os.path.exists(sub_sys_file):
-            _write_subsystems(net_impl, sub_sys_file)
+            _write_subsystems(communications, sub_sys_file)
         if not silent:
             print('Wrote configs to %s' % cfg_dir)
         return
@@ -146,3 +144,16 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True):
     if overwrite:
         _write_subsystems(net_impl, sub_sys_file)
         print('Subsystems config written to %s' % sub_sys_file)
+
+
+def random_config(base_dir, ident: str = None):
+    if Configuration.VARIABLE_NAME in os.environ:
+        cfg_dir = Configuration.get_cfg_dir()
+    else:
+        cfg_dir = os.path.join(base_dir, Configuration.CFG_PATH)
+        if ident is not None:
+            cfg_dir = os.path.join(base_dir, ident, Configuration.CFG_PATH)
+    if not os.path.isdir(cfg_dir):
+        os.makedirs(cfg_dir, exist_ok=True)
+        generate_identity(cfg_dir, randomize=True, seed=ident)
+    os.environ[Configuration.VARIABLE_NAME] = cfg_dir

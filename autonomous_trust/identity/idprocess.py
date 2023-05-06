@@ -4,6 +4,7 @@ from queue import Empty, Full
 import threading
 from datetime import datetime
 
+from .peers import Peers
 from .group import Group
 from ..algorithms import AgreementImpl
 from ..config import Configuration, CfgIds, to_yaml_string, from_yaml_string
@@ -340,21 +341,30 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         return False
 
     def _run_handlers(self, queues, message):
-        self.vote_response(queues)
-        if self.handle_acceptance(queues, message):
+        if isinstance(message, Group):
+            self.group = message
+            self.logger.debug('Updated group')
             return True
-        if self.receive_history(queues, message):
+        if isinstance(message, Peers):
+            self.peers = message
+            self.logger.debug('Updated peers')
             return True
-        if self.welcoming_committee(queues, message):
-            return True
-        if self.handle_vote_on_peer(queues, message):
-            return True
-        if self.count_vote(queues, message):
-            return True
-        if self.handle_history_diff(queues, message):
-            return True
-        if self.handle_group_update(queues, message):
-            return True
+        if isinstance(message, Message):
+            self.vote_response(queues)
+            if self.handle_acceptance(queues, message):
+                return True
+            if self.receive_history(queues, message):
+                return True
+            if self.welcoming_committee(queues, message):
+                return True
+            if self.handle_vote_on_peer(queues, message):
+                return True
+            if self.count_vote(queues, message):
+                return True
+            if self.handle_history_diff(queues, message):
+                return True
+            if self.handle_group_update(queues, message):
+                return True
         return False
 
     def process(self, queues, signal):
