@@ -1,7 +1,8 @@
 import os
 from queue import Empty
 
-from autonomous_trust import AutonomousTrust, Process, ProcMeta, Configuration, LogLevel, random_config
+from autonomous_trust import AutonomousTrust, Process, ProcMeta, Configuration, LogLevel
+from autonomous_trust.config.generate import random_config
 
 
 class MonitorProcess(Process, metaclass=ProcMeta,

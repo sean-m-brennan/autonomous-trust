@@ -1,3 +1,4 @@
+import importlib
 import os
 import sys
 import logging
@@ -41,12 +42,13 @@ class ProcessTracker(Mapping):
     def register_subsystem(self, cfg_name, class_spec):
         self._classes.append((cfg_name, class_spec))
         module_name, class_name = class_spec.rsplit('.', 1)
-        module = sys.modules[module_name]
         try:
+            module = sys.modules[module_name]
             cls = getattr(module, class_name)
         except KeyError:  # module_name not imported yet
-            pkg_name, mod_name = module_name.rsplit('.', 1)
-            module = import_module(mod_name, pkg_name)
+            #pkg_name, mod_name = module_name.rsplit('.', 1)
+            #module = import_module(mod_name, pkg_name)
+            module = import_module(module_name)
             cls = getattr(module, class_name)
         self._registry[cfg_name] = cls  # given cfg from CfgIds, yield proc
         if cls not in self._order:
