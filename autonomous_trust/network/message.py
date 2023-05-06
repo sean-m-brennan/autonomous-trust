@@ -12,11 +12,12 @@ class Message(object):
     | size | process | function | data |
     ====================================
     """
-    def __init__(self, process, function, obj, to_whom=None, from_whom=None):
+    def __init__(self, process, function, obj, to_whom=None, from_whom=None, encrypt=True):
         try:
             self.process = process.value
         except AttributeError:
             self.process = process
+        self.encrypt = encrypt
         self.function = function
         self.obj = obj
         self.to_whom = to_whom

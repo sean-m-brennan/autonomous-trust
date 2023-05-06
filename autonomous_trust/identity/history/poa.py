@@ -15,10 +15,10 @@ class IdentityByAuthority(AgreementByAuthority, IdentityHistory):
             return None
         if blob.identity.address in map(lambda x: x.address, self.blacklist):
             return None
-        return blob.get_hash()
+        return super().prove(blob)
 
     def _pre_verify(self, blob: IdentityObj, proof: AgreementProof, sig):
-        if not self.verify_object(blob, proof, sig):
+        if not self.verify_object(blob, proof, sig):  # FIXME blob.validate(proof, sig)
             return False
         return True
 

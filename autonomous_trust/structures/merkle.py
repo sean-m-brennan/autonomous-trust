@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from uuid import UUID, uuid4
 
 from .redblack import Node, Tree, EmptyNode
-
+from ..system import encoding
 
 class SimplestBlob(ABC):
     """
@@ -51,7 +51,7 @@ class MerkleTree(Tree):
     """
     node_class = _MerkleNode
     hash_func = blake2b
-    byte_enc = 'utf-8'
+    byte_enc = encoding
 
     def __init__(self, root=None, blobs=None, super_hash=None):
         super().__init__(root)
@@ -74,9 +74,10 @@ class MerkleTree(Tree):
 
     @property
     def root_digest(self):
-        if isinstance(self.root, EmptyNode):
+        try:
+            return self.root.digest
+        except AttributeError:
             return None
-        return self.root.digest
 
     def insert(self, blob):  # noqa
         """
