@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Union
 from .agreement import AgreementProtocol, AgreementVoter
 
 
@@ -12,7 +13,7 @@ class AgreementByStake(AgreementProtocol, ABC):
         self.nay = 0
 
     @abstractmethod
-    def _get_stake(self, voter: AgreementVoter) -> int | float:
+    def _get_stake(self, voter: AgreementVoter) -> Union[int, float]:
         return 0
 
     def _count_vote(self, blob, proof, voter):

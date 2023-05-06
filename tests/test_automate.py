@@ -20,7 +20,7 @@ def setup_teardown():
 def test_config():
     generate_identity(os.environ[Configuration.VARIABLE_NAME], True)
     at = AutonomousTrust(logfile=Configuration.log_stdout)
-    cfgs = at.configure(start=False)
+    cfgs = at._configure(start=False)
     assert 'network' in cfgs.keys()
     assert 'identity' in cfgs.keys()
     assert 'peers' in cfgs.keys()

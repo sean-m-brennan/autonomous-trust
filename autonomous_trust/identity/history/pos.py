@@ -1,4 +1,4 @@
-from ...algorithms import AgreementByStake, AgreementProof
+from ...algorithms import AgreementByStake
 from .history import IdentityHistory
 
 
