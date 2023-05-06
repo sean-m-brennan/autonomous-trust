@@ -10,7 +10,7 @@ from ..config import Configuration
 
 
 class Step(ABC):
-    def __init__(self, uuid):
+    def __init__(self, uuid):  # FIXME
         self.uuid = None
 
 
@@ -172,7 +172,8 @@ class StepDAG(ABC):
                 break
         return idx, common_root
 
-    def _sort_step_list(self, steps):
+    @staticmethod
+    def _sort_step_list(steps):
         return sorted(steps, key=lambda x: x.timestamp)
 
     def merge(self, branch, target=None, keep=False):
@@ -215,6 +216,7 @@ class StepDAG(ABC):
         """
         Prepare a step list for transmission
         :param branch: branch name
+        :param root: first node of sequence
         :return: list of steps
         """
         if branch is None:

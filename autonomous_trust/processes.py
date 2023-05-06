@@ -186,8 +186,6 @@ class ProcessLogger(object):
         self.log(LogLevel.CRITICAL, msg)
 
 
-
-
 class Mockery(object):
     def __init__(self, name, obj=None, value=None):
         self.name = name

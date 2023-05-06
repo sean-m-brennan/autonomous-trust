@@ -11,7 +11,7 @@ from typing import Union
 import multiprocessing as mp
 from multiprocessing import Pool as ProcessPool
 from multiprocessing.dummy import Pool as ThreadPool
-from multiprocessing.pool import AsyncResult
+from multiprocessing.pool import AsyncResult  # noqa
 
 try:
     from . import __version__ as version
@@ -143,7 +143,8 @@ class AutonomousTrust(object):
         identity = configs[CfgIds.identity.value]
         self.logger.info(self.name + ":  Configuring '%s' at %s for %s" %
                          (identity.fullname, identity.address, '(unknown domain)'))
-        self.logger.info(self.name + ':  Signature: %s' % identity.signature.publish())  # FIXME these might be wrong for passing around
+        self.logger.info(self.name + ':  Signature: %s' % identity.signature.publish())
+        # FIXME these might be wrong for passing around
         self.logger.info(self.name + ':  Public key: %s' % identity.encryptor.publish())
 
         if procs is None:

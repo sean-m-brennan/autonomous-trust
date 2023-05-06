@@ -19,7 +19,6 @@ async def test_simulation():
     assert response.status_code == 200
     ws_client = app.test_client().websocket('/ws')
     await ws_client.send('test')
-    #response = await ws_client.receive_json()
+    # response = await ws_client.receive_json()
     await ws_client.send('done')
     # FIXME check json
-

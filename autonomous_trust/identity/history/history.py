@@ -47,7 +47,7 @@ class IdentityObj(SimplestBlob, Configuration):
         return dict(identity=self.identity, originator=self.originator)
 
 
-class IdentityHistory(StepDAG, VoterTracker, Configuration):
+class IdentityHistory(StepDAG, VoterTracker):
     """
     Tracks community identity history with provable membership
     A StepDAG of MerkleTree root_hash history, the Merkle leaf-blobs are Identities or Groups
@@ -131,8 +131,8 @@ class IdentityHistory(StepDAG, VoterTracker, Configuration):
         ident = blob
         if isinstance(blob, IdentityObj):
             ident = blob.identity
-        self.logger.debug("Verify existence") # FIXME!! dump altogether
-        return True #self.verify_existence(ident, proof)
+        self.logger.debug("Verify existence")  # FIXME!! dump altogether
+        return True  # self.verify_existence(ident, proof)
 
     def share(self):
         """
@@ -169,7 +169,7 @@ class IdentityHistory(StepDAG, VoterTracker, Configuration):
         if peer is not None and proof != peer.verify(sig):
             self.logger.error(f'Invalid proof signature.')
             return False
-        #previous_hash = self.main.root.digest
+        # previous_hash = self.main.root.digest
         # FIXME handle divergence in branches (i.e. check other branch heads)
         # steps have previous
         # if previous_hash != blob.previous:
