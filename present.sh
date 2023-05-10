@@ -9,7 +9,7 @@ port=8888
 
 activate_conda autonomous_trust
 
-python3 -m autonomous_trust.viz --directory "$PWD"/doc/presentation --port $port &
+python3 -m autonomous_inspector.viz --directory "$PWD"/doc/presentation --port $port &
 sim_pid=$!
 sleep 1
 xdg-open http://localhost:$port

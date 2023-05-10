@@ -5,12 +5,12 @@ source conda/init_conda
 # Enable job control
 set -m
 
-src_file=autonomous_trust/viz/__main__.py
+src_file=autonomous_inspector/viz/__main__.py
 port=$(grep "default_port =" $src_file | awk '{print $3}')
 
 activate_conda autonomous_trust
 
-python3 -m autonomous_trust.viz &
+python3 -m autonomous_inspector.viz &
 sim_pid=$!
 sleep 1
 xdg-open "http://localhost:$port"

@@ -49,7 +49,7 @@ def _get_addresses(device='eth0'):
 def _write_subsystems(net_impl, sub_sys_file):
     pt = ProcessTracker()
     for name, impl in core_system.items():
-        if name == CfgIds.network.value:
+        if name == CfgIds.network:
             pt.register_subsystem(name, net_impl)
         else:
             pt.register_subsystem(name, impl)
@@ -63,8 +63,8 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True):
         except ValueError:
             seed = sum([ord(x) for x in seed])
 
-    ident_file = os.path.join(cfg_dir, CfgIds.identity.value + Configuration.yaml_file_ext)
-    net_file = os.path.join(cfg_dir, CfgIds.network.value + Configuration.yaml_file_ext)
+    ident_file = os.path.join(cfg_dir, CfgIds.identity + Configuration.yaml_file_ext)
+    net_file = os.path.join(cfg_dir, CfgIds.network + Configuration.yaml_file_ext)
     sub_sys_file = os.path.join(cfg_dir, ProcessTracker.default_filename)
 
     unqualified_hostname = socket.gethostname()
