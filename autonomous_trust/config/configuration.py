@@ -1,9 +1,10 @@
 import os
 import sys
-import enum
 from io import StringIO
 
 from ruamel.yaml import YAML
+
+from ..util import ClassEnumMeta
 
 yaml = YAML(typ='safe')
 yaml.default_flow_style = False
@@ -20,24 +21,14 @@ def from_yaml_string(string):
     return yaml.load(sio)
 
 
-class ConfigEnumMeta(enum.EnumMeta):
-    def __contains__(cls, item):
-        if isinstance(item, str):
-            return item in [x.value for x in cls]
-        else:
-            return super().__contains__(item)
-
-
-class CfgIds(enum.Enum,  metaclass=ConfigEnumMeta):
+class CfgIds(object, metaclass=ClassEnumMeta):
+    main = 'main'
     network = 'network'
     identity = 'identity'
     peers = 'peers'
     group = 'group'
     negotiation = 'negotiation'
     reputation = 'reputation'
-
-    #def __str__(self) -> str:
-    #    return str.__str__(self)
 
 
 class Configuration(object):

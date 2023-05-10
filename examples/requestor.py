@@ -10,7 +10,7 @@ from autonomous_trust.config.generate import random_config
 
 class RequestorProcess(Process, metaclass=ProcMeta,
                        proc_name='requestor', description='Interactive system monitor'):
-    command_deck = [item for item in CfgIds] + ['package_hash', 'log-level', 'processes']
+    command_deck = [item.value for item in CfgIds] + ['package_hash', 'log-level', 'processes']
 
     def __init__(self, configurations, subsystems, log_q, dependencies):
         super().__init__(configurations, subsystems, log_q, dependencies=dependencies)

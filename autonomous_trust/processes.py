@@ -2,6 +2,8 @@ import importlib
 import os
 import sys
 import logging
+import time
+from datetime import datetime
 from importlib import import_module
 from queue import Empty
 from collections.abc import Mapping
@@ -127,6 +129,7 @@ class Process(metaclass=ProcMeta):
         if Process.level in self.configs:
             self.log_level = self.configs[Process.level]
         self.logger = ProcessLogger(self.__class__.__name__, log_queue)
+        self.loop_start = None
         self.mocks = []  # list of Mockery objs
         self.package_hash = None
 
@@ -146,7 +149,13 @@ class Process(metaclass=ProcMeta):
                 running = False
         except Empty:
             pass
+        self.loop_start = datetime.utcnow()
         return running
+
+    def sleep_until(self, how_long):
+        delta = how_long - (datetime.utcnow() - self.loop_start)
+        if delta > 0:
+            time.sleep(delta)
 
     def update(self, msg, queues):
         for name, q in queues.items():

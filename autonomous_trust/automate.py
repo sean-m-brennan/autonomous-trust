@@ -12,6 +12,9 @@ import multiprocessing as mp
 from multiprocessing import Pool as ProcessPool
 from multiprocessing.dummy import Pool as ThreadPool
 from multiprocessing.pool import AsyncResult  # noqa
+from operator import mul, pow
+
+import psutil
 
 try:
     from . import __version__ as version
@@ -20,7 +23,12 @@ except ImportError:
 from .config import Configuration, CfgIds
 from .processes import Process, LogLevel, ProcessTracker
 from .identity import Peers
-from .system import PackageHash
+from .capabilities import Capabilities
+from .system import PackageHash, queue_cadence, max_concurrency
+from .protocol import Protocol
+from .negotiation import Task, TaskStatus, Status, TaskResult, NegotiationProtocol
+from .network import Message
+from .reputation import Transaction, ReputationProtocol
 
 PoolType = Union[ProcessPool, ThreadPool]
 QueueType = Union[queue.Queue, mp.Queue]
@@ -35,7 +43,7 @@ class Ctx(str, Enum):
         return str.__str__(self)
 
 
-class AutonomousTrust(object):
+class AutonomousTrust(Protocol):
     """
     Creates an AutonomousTrust machine
     """
@@ -56,7 +64,6 @@ class AutonomousTrust(object):
             # Threading
             self._pool_type = ThreadPool
             self._queue_type = queue.Queue
-            # FIXME monkeypatch shutdown?
 
         self._log_level = log_level
         self.name = self.__class__.__name__
@@ -74,7 +81,10 @@ class AutonomousTrust(object):
         handler.setLevel(log_level)
         self._logger = logging.getLogger(self.name)
         self._logger.addHandler(handler)
-        self._output = self.queue_type()  # process logging
+        super().__init__(CfgIds.main, self._logger, None, None)
+
+        self.capabilities = Capabilities()
+        self._output = self.queue_type()  # subsystem logging
         self._subsystems = ProcessTracker()
         self._additional_workers = []
         self._my_queue = self.queue_type()
@@ -82,10 +92,6 @@ class AutonomousTrust(object):
     @property
     def queue_type(self) -> type[QueueType]:
         return self._queue_type
-
-    @property
-    def logger(self) -> logging.Logger:
-        return self._logger
 
     @property
     def system_dependencies(self) -> list[str]:
@@ -100,6 +106,19 @@ class AutonomousTrust(object):
         """
         self._additional_workers.append((process, dependencies))
 
+    def autonomous_ability(self, queues: dict[str, QueueType]):
+        """
+        Override this to register real services (see add_worker).
+        :param queues: Interprocess communication queues to each process
+        :return: None
+        """
+        self.capabilities.register_ability('mult', mul)
+        self.capabilities.register_ability('pow', pow)
+
+        for q_name in queues:
+            if q_name != self.proc_name:
+                queues[q_name].put(self.capabilities, block=True, timeout=queue_cadence)
+
     def autonomous_loop(self, results: dict[str, AsyncResult], queues: dict[str, QueueType],
                         signals: dict[str, QueueType]) -> None:
         """
@@ -109,25 +128,71 @@ class AutonomousTrust(object):
         :param signals: queues listening for a quit signal
         :return: None
         """
-        while True:
-            try:
-                self._monitor_processes(results)
-                if self.external_control in queues:
+        self.autonomous_ability(queues)
+        with self._pool_type(len(max_concurrency)) as pool:
+            active_tasks = {}
+            active_pids = {}
+            while True:
+                try:
+                    self._monitor_processes(results)
+
+                    if self.external_control in queues:
+                        try:
+                            cmd = queues[self.external_control].get_nowait()
+                            if isinstance(cmd, Task):
+                                message = Message(self.name, NegotiationProtocol.start, cmd)
+                                queues[CfgIds.negotiation].put(message, block=True, timeout=queue_cadence)
+                            elif cmd == Process.sig_quit:
+                                self.logger.debug(self.name + ": External signal to quit")
+                                break
+                        except queue.Empty:
+                            pass
+
                     try:
-                        cmd = queues[self.external_control].get_nowait()
-                        if cmd == Process.sig_quit:
-                            self.logger.debug(self.name + ": External signal to quit")
-                            break
+                        message = queues[self.proc_name].get(block=True, timeout=queue_cadence)
                     except queue.Empty:
                         pass
 
-                # do nothing else
+                    if message is not None:
+                        if not self.run_message_handlers(queues, message):
+                            if isinstance(message, TaskStatus):
+                                if message.uuid in active_pids:
+                                    pid = active_pids[message.uuid]
+                                    message.status = Status.from_ps(psutil.Process(pid).status())
+                                else:
+                                    message.status = Status.unknown
+                                queues[CfgIds.negotiation].put(message, block=True, timeout=queue_cadence)
+                            elif isinstance(message, TaskResult):
+                                tx = Transaction()  # FIXME relevant evaluation
+                                rep_msg = Message(self.name, ReputationProtocol.transaction, tx)
+                                queues[CfgIds.reputation].put(rep_msg, block=True, timeout=queue_cadence)
+                                if self.external_feedback in queues:
+                                    queues[self.external_feedback].put(message, block=True, timeout=queue_cadence)
+                            elif isinstance(message, Task):
+                                task = message
+                                if task.capability.name in self.capabilities:
+                                    capability = self.capabilities[task.capability.name]
+                                    pq = self.queue_type()
+                                    results[task.uuid] = pool.apply_async(capability.execute, (task, pq))
+                                    try:
+                                        pid = pq.get(block=True, timeout=1)
+                                    except queue.Empty:
+                                        self.logger.error('Process failed')  # FIXME more info
+                                    active_tasks[task.uuid] = task
+                                    active_pids[task.uuid] = pid
 
-                time.sleep(Process.cadence)
-            except KeyboardInterrupt:
-                for sig in signals.values():
-                    sig.put_nowait(Process.sig_quit)
-                break
+                    for key in results:
+                        if results[key].ready():
+                            result = results[key].get()
+                            tr = TaskResult(active_tasks[key], result)
+                            msg = Message(self.name, NegotiationProtocol.result, tr, task.requestor)
+                            queues[CfgIds.negotiation].put(msg, block=True, timeout=queue_cadence)
+
+                    time.sleep(Process.cadence)
+                except KeyboardInterrupt:
+                    for sig in signals.values():
+                        sig.put_nowait(Process.sig_quit)
+                    break
 
     def run_forever(self, q_in: QueueType = None, q_out: QueueType = None):
         """
@@ -140,18 +205,17 @@ class AutonomousTrust(object):
         if self._log_level <= LogLevel.WARNING:
             self._banner()
         self.logger.info(self.name + ':  Package signature %s' % configs[PackageHash.key])
-        identity = configs[CfgIds.identity.value]
+        identity = configs[CfgIds.identity]
         self.logger.info(self.name + ":  Configuring '%s' at %s for %s" %
                          (identity.fullname, identity.address, '(unknown domain)'))
         self.logger.info(self.name + ':  Signature: %s' % identity.signature.publish())
-        # FIXME these might be wrong for passing around
         self.logger.info(self.name + ':  Public key: %s' % identity.encryptor.publish())
 
         if procs is None:
             return
         queues = dict(zip(list(map(lambda x: x.name, procs)),
                           [self.queue_type() for _ in range(len(procs))]))
-        queues['main'] = self._my_queue
+        queues[self.proc_name] = self._my_queue
         signals = {}
         results = {}
         with self._pool_type(len(procs)) as pool:
@@ -186,8 +250,8 @@ class AutonomousTrust(object):
 
     def _configure(self, start=True):
         # Pull initial state from configuration files
-        required = [CfgIds.network.value, CfgIds.identity.value, CfgIds.peers.value]
-        defaultable = {CfgIds.peers.value: Peers, }
+        required = [CfgIds.network, CfgIds.identity, CfgIds.peers]
+        defaultable = {CfgIds.peers: Peers, }
 
         configs = {}
         cfg_dir = Configuration.get_cfg_dir()
@@ -215,8 +279,8 @@ class AutonomousTrust(object):
         configs[Process.level] = self._log_level
         configs[Process.key] = []
 
-        net_cfg = configs[CfgIds.network.value]
-        identity = configs[CfgIds.identity.value]
+        net_cfg = configs[CfgIds.network]
+        identity = configs[CfgIds.identity]
         # FIXME cross-reference addresses, identity.address is as appropriate for net protocol
 
         if start:
