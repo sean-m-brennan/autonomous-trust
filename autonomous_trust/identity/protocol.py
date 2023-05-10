@@ -1,7 +1,7 @@
-from enum import Enum
+from ..protocol import Protocol
 
 
-class IdentityProtocol(Enum):
+class IdentityProtocol(Protocol):
     """
     Protocol for establishing Identity
     ----------------------------------
@@ -45,6 +45,3 @@ class IdentityProtocol(Enum):
     vote = 'vote_on_peer'
     confirm = 'peer_accepted'
     update = 'group_key_update'
-
-    def __str__(self) -> str:
-        return str.__str__(self)

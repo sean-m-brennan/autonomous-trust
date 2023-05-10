@@ -10,7 +10,10 @@ initial_size = 12
 
 
 class VizServer(object):
-    def __init__(self, directory, port, debug, size):
+    def __init__(self, directory, port, debug=False, size=-1, data_q=None, finished=None):
+        if finished is None:
+            finished = lambda: None  # noqa
+        self.finished = finished
         self.port = port
         print(' * Directory on host: %s' % directory)
         appname = __package__.split('.')[0]
@@ -30,15 +33,19 @@ class VizServer(object):
         async def ws():
             graph = None
             while True:
-                msg = await quart.websocket.receive()
-                if graph is None:
-                    for impl in ng.Graphs.Implementation:  # noqa
-                        if msg == impl.value:
-                            graph = ng.Graphs.get_graph(impl.value, size, debug)
-                            print(' * Simulating %s network graph' % msg)
-                if msg == 'done':
-                    print(' * Simulation done')
-                    break
+                if size < 0:
+                    graph = ng.Graphs.get_graph('live', size, debug, data_q=data_q)
+                    print(' * Visualizing live network graph')
+                else:
+                    msg = await quart.websocket.receive()
+                    if graph is None:
+                        for impl in ng.Graphs.Implementation:  # noqa
+                            if msg == impl.value:
+                                graph = ng.Graphs.get_graph(impl.value, size, debug)
+                                print(' * Simulating %s network graph' % msg)
+                    if msg == 'done':
+                        print(' * Simulation done')
+                        break
                 seconds, data, stop = graph.get_update()
                 if stop:
                     break
@@ -48,3 +55,7 @@ class VizServer(object):
 
     def run(self):
         self.app.run(port=self.port)
+
+    def stop(self):
+        self.finished()
+        self.app.shutdown()
