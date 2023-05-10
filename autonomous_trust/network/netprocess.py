@@ -3,6 +3,7 @@ import time
 from queue import Empty, Full
 from enum import Enum
 
+from ..protocol import Protocol
 from ..identity import Identity
 from ..processes import Process, ProcMeta
 from ..config.configuration import CfgIds
@@ -25,7 +26,7 @@ class TransmissionError(RuntimeError):
 class _NetProcMeta(ProcMeta):  # so that subclasses inherit meta args
     def __init__(cls, name, bases, namespace, cadence=0.0001, port=27787):
         super().__init__(name, bases, namespace,
-                         proc_name=CfgIds.network.value, description='Network I/O')
+                         proc_name=CfgIds.network, description='Network I/O')
         cls.cadence = cadence
         cls.default_port = port
 
@@ -42,20 +43,27 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
 
     def __init__(self, configurations, subsystems, log_q, acceptance_func=None):
         super().__init__(configurations, subsystems, log_q)
-        self.net_cfg = configurations[CfgIds.network.value]
+        self.net_cfg = configurations[CfgIds.network]
         port = self.net_cfg.port
         self.port = port
         if port is None:
             self.port = self.default_port
-        self.myself = configurations[CfgIds.identity.value]
-        self.peers = configurations[CfgIds.peers.value]
-        self.group = None
+        self.myself = configurations[CfgIds.identity]
         self.peer_messages = []
         self.encrypted_messages = []
         self.group_messages = []
         self.unknown_messages = []
         self.acceptance = acceptance_func
         self.pests = {}
+        self.protocol = Protocol(self.name, self.logger, configurations[CfgIds.peers])
+
+    @property
+    def peers(self):
+        return self.protocol.peers
+
+    @property
+    def group(self):
+        return self.protocol.group
 
     def send_peer(self, msg, whom):
         raise NotImplementedError
@@ -211,14 +219,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 message = queues[self.name].get(block=True, timeout=self.q_cadence)
             except Empty:
                 message = None
-            if message:
-                if isinstance(message, Group):
-                    self.group = message
-                    self.logger.debug('Updated group')
-                elif isinstance(message, Peers):
-                    self.peers = message
-                    self.logger.debug('Updated peers')
-                elif isinstance(message, Message):
+            if message and not self.protocol.run_message_handlers(queues, message):
+                if isinstance(message, Message):
                     self.logger.debug('Send network message: %s:%s' % (message.process, message.function))
                     try:
                         if message.to_whom == Network.broadcast:
@@ -262,7 +264,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             # async recv point-to-point messages
             if len(self.peer_messages) > 0:
                 raw_msg, from_addr = self.peer_messages.pop(0)
-                peers = self.configs[CfgIds.peers.value]
+                peers = self.configs[CfgIds.peers]
                 from_whom = peers.find_by_address(from_addr)
                 if len(peers.all) < 1:
                     # bootstrapping will not (cannot) be encrypted

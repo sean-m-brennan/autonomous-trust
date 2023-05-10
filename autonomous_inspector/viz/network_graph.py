@@ -13,8 +13,8 @@ class Graphs(object):
     _MAP = {}
 
     @classmethod
-    def get_graph(cls, name, size, debug=False):
-        return cls._MAP[name](size, debug=debug)
+    def get_graph(cls, name, size, debug=False, **kwargs):
+        return cls._MAP[name](size, debug=debug, **kwargs)
 
     @classmethod
     def register_implementation(cls, name, impl_cls, is_default=False):

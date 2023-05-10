@@ -14,11 +14,12 @@ encoding = 'utf-8'  # FIXME hex?
 cadence = 0.5
 queue_cadence = 0.01
 dev_root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-core_system = {CfgIds.network.value: communications,
-               CfgIds.identity.value: 'autonomous_trust.identity.IdentityProcess',
-               CfgIds.negotiation.value: 'autonomous_trust.negotiation.NegotiationProcess',
-               CfgIds.reputation.value: 'autonomous_trust.reputation.ReputationProcess',
+core_system = {CfgIds.network: communications,
+               CfgIds.identity: 'autonomous_trust.identity.IdentityProcess',
+               CfgIds.negotiation: 'autonomous_trust.negotiation.NegotiationProcess',
+               CfgIds.reputation: 'autonomous_trust.reputation.ReputationProcess',
                }
+max_concurrency = os.cpu_count() * 2
 
 
 class PackageHash(object):

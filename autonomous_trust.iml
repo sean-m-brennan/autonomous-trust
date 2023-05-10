@@ -15,6 +15,10 @@
       <excludeFolder url="file://$MODULE_DIR$/unikernel/py/autonomous_trust" />
       <excludeFolder url="file://$MODULE_DIR$/unikernel/py/build" />
       <excludeFolder url="file://$MODULE_DIR$/unikernel/py/fs0" />
+      <excludeFolder url="file://$MODULE_DIR$/.tox" />
+      <excludeFolder url="file://$MODULE_DIR$/coverage" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+      <excludeFolder url="file://$MODULE_DIR$/tests/.pytest_cache" />
     </content>
     <orderEntry type="jdk" jdkName="Python 3.10 (autonomous_trust)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

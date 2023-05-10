@@ -18,7 +18,7 @@ dependencies:
   - aenum
   - libsass
   - networkx
-  - pebble
+  - psutil
   - pynacl
   - quart
   - ruamel.yaml
