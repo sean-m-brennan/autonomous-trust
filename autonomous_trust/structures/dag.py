@@ -7,7 +7,7 @@ import random
 import string
 
 from ..config import Configuration
-
+from ..system import now
 
 class Step(ABC):
     def __init__(self, uuid):  # FIXME
@@ -44,7 +44,7 @@ class LinkedStep(Step, Configuration):
         super().__init__(uuid)
         self.timestamp = timestamp
         if timestamp is None:
-            self.timestamp = datetime.utcnow()
+            self.timestamp = now()
         self.payload = payload
         self.parent = parent
         if parent is None:

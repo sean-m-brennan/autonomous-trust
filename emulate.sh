@@ -7,7 +7,11 @@ image_name="autonomous-trust"
 network_type="macvlan"
 mcast=false  # FIXME overlays
 remote_port=2357
+ipv6=
 #ipv6="--ipv6"
+
+#exclude_classes=""
+exclude_classes="network"
 
 num_nodes=2
 force=
@@ -33,6 +37,10 @@ for arg in $@; do
         num_nodes=$arg
     fi
 done
+
+# cleanup unused docker resources
+docker images prune -f
+#docker images prune -a -f --filter "until=24h"
 
 if [ "$(docker network ls | awk '{print $2}' | grep $network_name)" = "" ]; then
     if $mcast; then
@@ -69,11 +77,18 @@ docker build -t $image_name $force $debug_build "$this_dir" || exit 1
 min_sec=1
 max_sec=5
 
+excludes=
+for class in $exclude_classes; do
+    excludes="$excludes --exclude-logs $class"
+done
+
 for n in $(seq $num_nodes); do
+    remote_dbg=
     if $remote_debug && [ "$n" = "1" ]; then
-      remote_dbg="-e REMOTE_DEBUG_SERVER=$remote"
+      remote_dbg="--remote-debug $remote"
     fi
-    docker_cmd="docker run --rm --name at-$n --network=$network_name $remote_dbg -it $image_name"
+    extra_args="-e AUTONOMOUS_TRUST_ARGS=\"--test $remote_dbg $excludes\""
+    docker_cmd="docker run --rm --name at-$n --network=$network_name $extra_args -it $image_name"
     if [ "$(which gnome-terminal)" != "" ]; then
         gnome-terminal -- sh -c "$tunnel $docker_cmd $debug_run"
     elif [ "$(which qterminal)" != "" ]; then

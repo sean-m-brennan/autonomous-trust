@@ -67,7 +67,7 @@ class Identity(Configuration, AgreementVoter):
             msg = msg.encode(self.enc)
         elif isinstance(msg, Configuration):
             msg = msg.to_yaml_string().encode(self.enc)
-        if self._public_only or self.signature.private is None:  # FIXME cannot sign
+        if self._public_only or self.signature.private is None:
             raise RuntimeError('Cannot sign a message with another identity (%s is not you)' % self.nickname)
         return self.signature.private.sign(msg, encoder=HexEncoder)
 

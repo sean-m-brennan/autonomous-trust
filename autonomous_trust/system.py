@@ -1,8 +1,10 @@
 import os
 import pkgutil
 import sys
-from nacl.hash import blake2b
 from traceback import print_tb
+from datetime import datetime
+
+from nacl.hash import blake2b
 
 from .config import CfgIds
 
@@ -20,6 +22,10 @@ core_system = {CfgIds.network: communications,
                CfgIds.reputation: 'autonomous_trust.reputation.ReputationProcess',
                }
 max_concurrency = os.cpu_count() * 2
+
+
+def now():  # FIXME NTP sourced
+    return datetime.utcnow()
 
 
 class PackageHash(object):

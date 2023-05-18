@@ -7,4 +7,7 @@ class ClassEnumMeta(type):
         return item in [attr for attr in dir(cls)
                         if not attr.startswith('_') and not callable(getattr(cls, attr))]
 
-
+    def __iter__(cls):
+        for attr in dir(cls):
+            if not attr.startswith('_') and not callable(getattr(cls, attr)):
+                yield attr

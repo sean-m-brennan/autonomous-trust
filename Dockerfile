@@ -24,5 +24,5 @@ COPY autonomous_trust autonomous_trust
 RUN rm -rf autonomous_trust/etc autonomous_trust/var
 RUN maturin develop
 
-ENV REMOTE_DEBUG_SERVER=""
-CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 -m autonomous_trust --remote-debug $REMOTE_DEBUG_SERVER"]
+ENV AUTONOMOUS_TRUST_ARGS=""
+CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 -m autonomous_trust $AUTONOMOUS_TRUST_ARGS"]

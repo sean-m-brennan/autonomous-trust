@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 
 import psutil
 
-from ..system import max_concurrency
+from ..system import max_concurrency, now
 from ..config import Configuration
 
 
@@ -38,6 +38,8 @@ class Status(Enum):
 
 
 class TaskParameters(Configuration):
+    default_duration = 1
+    default_timeout = 30
     timeout_extension = 120  # seconds
     duration_fraction = 10  # percent
 
@@ -47,13 +49,13 @@ class TaskParameters(Configuration):
         self._flexible = _flexible
         self.when = when
         if when is None:
-            self.when = datetime.utcnow()
+            self.when = now()
         self.duration = duration
         if duration is None:
-            self.duration = timedelta(seconds=0)
+            self.duration = timedelta(seconds=self.default_duration)
         self.timeout = timeout
         if timeout is None:
-            self.timeout = timedelta(seconds=0)
+            self.timeout = timedelta(seconds=self.default_timeout)
         self.args = args
         if args is None:
             self.args = ()
@@ -72,14 +74,21 @@ class TaskParameters(Configuration):
         return self._capability
 
 
-class Task(Configuration):
-    def __init__(self, parameters: TaskParameters, requestor, uuid: UUID = None, size=1):
-        self.parameters = parameters
-        self.requestor = requestor
+class TaskInfo(Configuration):
+    def __init__(self, requestor, uuid: UUID = None, size=1, **kwargs):
         self.uuid = uuid
         if uuid is None:
             self.uuid = uuid4()
+        self.requestor = requestor
         self.size = size
+        # ignore kwargs
+
+
+class Task(TaskInfo):
+    def __init__(self, parameters: TaskParameters, requestor, **kwargs):
+        super().__init__(requestor, **kwargs)
+        self.parameters = parameters
+        # ignore kwargs
 
     @property
     def capability(self):
@@ -87,14 +96,22 @@ class Task(Configuration):
 
 
 class TaskStatus(Task):
-    def __init__(self, task, status=None):
-        super().__init__(**task.to_dict())
+    def __init__(self, task=None, status=None, **kwargs):
+        if task is None:
+            task_args = {}
+        else:
+            task_args = task.to_dict()
+        super().__init__(**task_args, **kwargs)
         self.status = status
 
 
-class TaskResult(Task):
-    def __init__(self, task, result):
-        super().__init__(**task.to_dict())
+class TaskResult(TaskInfo):
+    def __init__(self, task=None, result=None, **kwargs):
+        if task is None:
+            task_args = {}
+        else:
+            task_args = task.to_dict()
+        super().__init__(**task_args, **kwargs)
         self.result = result
 
 
@@ -137,19 +154,24 @@ class JobQueue(object):
     def __init__(self):
         self._heap = []
 
+    def __len__(self):
+        return len(self._heap)
+
     def push(self, item: Job) -> None:
         """Push a Job into sorted position on the queue"""
         heapq.heappush(self._heap, (item.start, item.id, item))
 
-    def pop(self) -> Task:
+    def pop(self) -> Job:
         """Pop the next Job from the queue"""
         if len(self._heap) < 1:
             raise Empty
         return heapq.heappop(self._heap)[2]
 
-    def min(self) -> datetime:
+    def min(self) -> Union[datetime, None]:
         """What is the datetime of the next Job"""
-        return datetime.fromtimestamp(self._heap[0][0])
+        if len(self) > 0:
+            return datetime.fromtimestamp(self._heap[0][0])
+        return None
 
     def clear(self) -> None:
         """Reset the queue"""
