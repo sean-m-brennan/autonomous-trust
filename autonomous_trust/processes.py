@@ -1,9 +1,7 @@
-import importlib
 import os
 import sys
 import logging
 import time
-from datetime import datetime
 from importlib import import_module
 from queue import Empty
 from collections.abc import Mapping
@@ -13,7 +11,7 @@ from enum import IntEnum
 from ruamel.yaml import YAML
 
 from .config import Configuration
-from .system import cadence, queue_cadence
+from .system import cadence, queue_cadence, now
 
 yaml = YAML(typ='safe')
 
@@ -48,8 +46,6 @@ class ProcessTracker(Mapping):
             module = sys.modules[module_name]
             cls = getattr(module, class_name)
         except KeyError:  # module_name not imported yet
-            #pkg_name, mod_name = module_name.rsplit('.', 1)
-            #module = import_module(mod_name, pkg_name)
             module = import_module(module_name)
             cls = getattr(module, class_name)
         self._registry[cfg_name] = cls  # given cfg from CfgIds, yield proc
@@ -115,7 +111,8 @@ class Process(metaclass=ProcMeta):
     q_cadence = queue_cadence
     exit_timeout = 5
 
-    def __init__(self, configurations, subsystems, log_queue, dependencies=None, log_level=LogLevel.INFO):
+    def __init__(self, configurations, subsystems, log_queue, dependencies=None,
+                 log_level=LogLevel.INFO, suppress_log=False):
         self.configs = configurations
         self.subsystems = subsystems
         self.log_queue = log_queue
@@ -128,7 +125,7 @@ class Process(metaclass=ProcMeta):
         self.log_level = log_level
         if Process.level in self.configs:
             self.log_level = self.configs[Process.level]
-        self.logger = ProcessLogger(self.__class__.__name__, log_queue)
+        self.logger = ProcessLogger(self.__class__.__name__, log_queue, suppress_log)
         self.loop_start = None
         self.mocks = []  # list of Mockery objs
         self.package_hash = None
@@ -149,11 +146,11 @@ class Process(metaclass=ProcMeta):
                 running = False
         except Empty:
             pass
-        self.loop_start = datetime.utcnow()
+        self.loop_start = now()
         return running
 
     def sleep_until(self, how_long):
-        delta = how_long - (datetime.utcnow() - self.loop_start)
+        delta = how_long - (now() - self.loop_start).total_seconds()
         if delta > 0:
             time.sleep(delta)
 
@@ -167,12 +164,15 @@ class Process(metaclass=ProcMeta):
 
 
 class ProcessLogger(object):
-    def __init__(self, name, log_q):
+    def __init__(self, name, log_q, suppress=False):
         self.name = name
         self.log_queue = log_q
         self.logger = logging.getLogger(name)
+        self.suppress = suppress
 
     def log(self, level, msg):
+        if self.suppress:
+            return
         if self.log_queue is not None:
             self.log_queue.put((level, self.name, msg), block=True, timeout=0.001)
         else:
@@ -197,7 +197,7 @@ class ProcessLogger(object):
         self.log(LogLevel.CRITICAL, msg)
 
 
-class Mockery(object):
+class Mockery(object):  # FIXME move to testing
     def __init__(self, name, obj=None, value=None):
         self.name = name
         self.obj = obj

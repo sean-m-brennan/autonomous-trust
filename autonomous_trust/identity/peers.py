@@ -46,6 +46,18 @@ class Peers(Configuration):
             return self.listing[address]
         return None
 
+    def find_top_n(self, n):
+        if n >= len(self.all):
+            return self.all
+        p_list = []
+        for idx in range(len(self.hierarchy)):
+            for peer in self.hierarchy[idx].values():
+                if len(p_list) >= n:
+                    break
+                p_list.append(peer)
+            if len(p_list) >= n:
+                break
+
     def promote(self, who):
         if who.address not in self.listing:
             self.listing[who.address] = who

@@ -2,17 +2,19 @@ import os
 import time
 from queue import Empty, Full
 import threading
-from datetime import datetime
+
+from nacl.exceptions import BadSignatureError
 
 from .group import Group
 from ..algorithms import AgreementImpl
 from ..config import Configuration, CfgIds, to_yaml_string, from_yaml_string
 from ..processes import Process, ProcMeta
 from ..network import Message, Network
+from ..capabilities import PeerCapabilities
 from .history import IdentityByWork, IdentityByStake, IdentityByAuthority
 from .history import IdentityObj
 from .protocol import IdentityProtocol
-from ..system import encoding, PackageHash
+from ..system import encoding, PackageHash, now
 
 
 class IdentityProcess(Process, metaclass=ProcMeta,
@@ -25,15 +27,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     init_extra = 2
     enc = encoding
 
-    def __init__(self, configurations, subsystems, log_q):
-        super().__init__(configurations, subsystems, log_q, dependencies=[CfgIds.network])
+    def __init__(self, configurations, subsystems, log_q, **kwargs):
+        super().__init__(configurations, subsystems, log_q, dependencies=[CfgIds.network], **kwargs)
         self.identity = configurations[self.cfg_name]
         self.protocol = IdentityProtocol(self.name, self.logger, configurations[CfgIds.peers])
         self.peers = self.protocol.peers
         self.group = self.protocol.group
         self.phase = 0
         self.confirmed_block = []
-        self.peer_capacities = {}
+        self.peer_capabilities = PeerCapabilities()
         impl = self.identity.block_impl
         if impl == AgreementImpl.POW.value:
             self._history = IdentityByWork(self.identity, self.peers, log_q, 0)
@@ -48,6 +50,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.histories = []
         self.package_hash = self.configs[PackageHash.key]
         self.choosing = False
+        self.peer_potentials = {}
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
         self.protocol.register_handler(IdentityProtocol.accept, self.handle_acceptance)
         self.protocol.register_handler(IdentityProtocol.history, self.receive_history)
@@ -72,9 +75,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     def _record_peers(self, queues):
         self._remember_activity(queues, CfgIds.peers, self.peers)
 
-    def acquire_capabilities(self):
-        start = datetime.utcnow()
-        while (datetime.utcnow() - start).seconds <= self.init_timeout:
+    def acquire_capabilities(self, queues):
+        start = now()
+        while (now() - start).seconds <= self.init_timeout:
+            try:
+                message = queues[self.name].get(block=True, timeout=self.q_cadence)
+            except Empty:
+                message = None
+            if message is not None and not self.protocol.run_message_handlers(queues, message):
+                self.messages.append(message)
             if self.capabilities is not None:
                 break
             time.sleep(self.cadence)
@@ -93,7 +102,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return
         try:
             self.logger.debug('Announce myself')
-            msg_str = to_yaml_string((self.identity.publish(), self.package_hash, self.capabilities))
+            msg_str = to_yaml_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
             message = Message(self.name, IdentityProtocol.announce,
                               msg_str, to_whom=Network.broadcast, encrypt=False)
             queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -107,9 +116,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         :param queues:
         :return: None
         """
-        start = datetime.utcnow()
+        start = now()
         self.choosing = True
-        while (datetime.utcnow() - start).seconds <= self.init_timeout:
+        while (now() - start).seconds <= self.init_timeout:
             time.sleep(self.cadence)
         accepted = None, None
 
@@ -172,25 +181,29 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if self.phase != 3:
             return False
         if message.function == IdentityProtocol.vote:
-            # FIXME check signature -> message.from_whom.identity.verify
-            self._history.verify(*message.obj)
+            blob, proof, sig = message.obj
+            try:
+                message.from_whom.identity.verify(sig)
+                self._history.verify(blob, proof, sig)
+            except BadSignatureError:
+                self.logger.error('Vote had a bad signature')
             return True
         return False
 
     def _vote_collection(self, queues, new_guy, blob):
         try:
-            start = datetime.utcnow()
+            start = now()
             voted = False
-            while (datetime.utcnow() - start).seconds <= self._history.timeout:
+            while (now() - start).seconds <= self._history.timeout:
                 if not voted:
-                    for vote in self.confirmed_block:
-                        if vote[0] == blob:
-                            # FIXME check signature (my own!)
-                            if self._history.verify(*vote):
-                                self.confirmed_block.remove(vote)
-                                self.logger.debug('I voted')
-                                voted = True
-                time.sleep(self.cadence)
+                    vote = self._process_id(blob)
+                    self._history.verify(*vote)
+                    if vote in self.confirmed_block:
+                        self.confirmed_block.remove(vote)
+                    self.logger.debug('I voted')
+                    voted = True
+                else:
+                    time.sleep(self.cadence)
             if not voted:
                 self.logger.debug('I did not vote')
             if self._history.finalize(blob):
@@ -199,11 +212,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
 
                 self.group.addresses.append(blob.identity.address)
                 self._record_group(queues)
-                self._add_peer(queues, blob.identity)
-                print('Peers: %s' % self.peers.all)  # FIXME
+
+                self._add_peer(queues, blob.identity, self.peer_potentials[blob.identity.uuid])
+                del self.peer_potentials[blob.identity.uuid]
 
                 # send my identity in the open to enable encryption
-                msg_str = to_yaml_string((self.identity.publish(), self.package_hash))
+                msg_str = to_yaml_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
                 message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=new_guy, encrypt=False)
                 queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
@@ -226,7 +240,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.announce:
             try:
-                new_id, ph, cap = from_yaml_string(message.obj)
+                new_id, ph, caps = from_yaml_string(message.obj)
                 if new_id == self.identity:
                     self.logger.debug('Should not have received my own announcement')
                     return
@@ -234,10 +248,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.logger.error("Newbie is running a counterfeit; Ignore")
                     return True
                 self.logger.debug('Received new identity: %s' % new_id.nickname)
-                self.peer_capacities[new_id.uuid] = cap
+                self.peer_potentials[new_id.uuid] = caps
                 id_obj = IdentityObj(new_id, new_id.uuid)
-                threading.Thread(target=self._process_id, args=(id_obj,), daemon=True).start()
-                threading.Thread(target=self._vote_collection,  # FIXME I need to vote too
+                #threading.Thread(target=self._process_id, args=(id_obj,), daemon=True).start()
+                #time.sleep(self.cadence) # FIXME invalid
+                threading.Thread(target=self._vote_collection,
                                  args=(queues, new_id, id_obj), daemon=True).start()
                 msg_str = id_obj.to_yaml_string()  # FIXME validate
                 message = Message(self.name, IdentityProtocol.propose, msg_str, to_whom=self.group)
@@ -247,15 +262,19 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return True
         return False
 
-    def _add_peer(self, queues, identity):
+    def _add_peer(self, queues, identity, capabilities):
         self._history.upgrade_peer(identity)
         self.peers.promote(identity)
         self._record_peers(queues)
+        self.peer_capabilities.register(identity.uuid, capabilities)
+        queues[CfgIds.main].put(self.peer_capabilities, block=True, timeout=self.q_cadence)
+        queues[CfgIds.negotiation].put(self.peer_capabilities, block=True, timeout=self.q_cadence)
 
     def _process_id(self, blob):
         proof = self._history.prove(blob)
-        self.confirmed_block.append((blob, proof,
-                                     self.identity.sign(proof.to_yaml_string().encode(self.enc))))
+        vote = blob, proof, self.identity.sign(proof)
+        self.confirmed_block.append(vote)
+        return vote
 
     def handle_vote_on_peer(self, _, message):
         """
@@ -291,6 +310,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return
         try:
             vote = self.confirmed_block.pop(0)
+            if vote[0].uuid == vote[1].uuid:
+                return  # no voting for yourself
             # FIXME handle if I proposed the vote
             msg_str = to_yaml_string(vote)
             message = Message(self.name, IdentityProtocol.vote, msg_str, to_whom=self.group)
@@ -304,11 +325,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.accept:
             self.logger.debug('Received peer acceptance')
-            ident, ph = from_yaml_string(message.obj)
+            ident, ph, caps = from_yaml_string(message.obj)
             if ph != self.package_hash:
                 self.logger.error("Counterfeit 'peer'")
                 return True
-            self._add_peer(queues, ident)
+            self._add_peer(queues, ident, caps)
             return True
         return False
 
@@ -325,9 +346,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.logger.debug('Received peer confirmation')
             peer = message.obj.identity
             # FIXME validate blob
-            self._add_peer(queues, peer)
-            capacity = self.peer_capacities[peer.uuid]
-            queues[CfgIds.negotiation].put(capacity, block=True, timeout=self.q_cadence)
+            self._add_peer(queues, peer, self.peer_potentials[peer.uuid])
+            del self.peer_potentials[peer.uuid]
             return True
         return False
 
@@ -375,7 +395,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         """
         phase = self.phase
         self.logger.debug('Phase %s' % self.phase)
-        self.acquire_capabilities()
+        self.acquire_capabilities(queues)
         self.announce_identity(queues)
         if not self.choosing:
             # initial run, may be called again
