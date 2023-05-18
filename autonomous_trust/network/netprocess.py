@@ -41,8 +41,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     net_proto = NetworkProtocol.NONE
     mystery_max_retries = 60  # 30 seconds
 
-    def __init__(self, configurations, subsystems, log_q, acceptance_func=None):
-        super().__init__(configurations, subsystems, log_q)
+    def __init__(self, configurations, subsystems, log_q, acceptance_func=None, **kwargs):
+        super().__init__(configurations, subsystems, log_q, **kwargs)
         self.net_cfg = configurations[CfgIds.network]
         port = self.net_cfg.port
         self.port = port
@@ -117,7 +117,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 continue
             if raw_msg is not None:
                 msg_queue.append((raw_msg, from_addr))
-            else:
+            elif from_addr is not None:
                 who = self.peers.find_by_address(from_addr)
                 if who is not None:
                     if who not in self.pests:

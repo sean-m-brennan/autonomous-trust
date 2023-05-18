@@ -13,8 +13,8 @@ class TCPNetworkProcess(UDPNetworkProcess):
     rcv_backlog = 5
     net_proto = NetworkProtocol.IPV4
 
-    def __init__(self, configurations, subsystems, log_q, acceptance_func=None, use_mcast=False):
-        super().__init__(configurations, subsystems, log_q, acceptance_func)
+    def __init__(self, configurations, subsystems, log_q, acceptance_func=None, use_mcast=False, **kwargs):
+        super().__init__(configurations, subsystems, log_q, acceptance_func, **kwargs)
         bind_address = self.net_cfg.ip4
         self.recv_ptp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.recv_ptp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

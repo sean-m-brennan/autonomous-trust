@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from uuid import UUID
+from typing import Union
 
 from ..config import Configuration
 from ..structures import SimplestBlob
@@ -97,7 +98,7 @@ class AgreementProtocol(VoterTracker):
         return False
 
     @abstractmethod
-    def _accumulate_votes(self, votes):
+    def _accumulate_votes(self, votes) -> bool:
         return False
 
     def finalize(self, blob: SimplestBlob) -> bool:
@@ -112,6 +113,8 @@ class AgreementProtocol(VoterTracker):
         self._prep_vote()
         voters = {peer.uuid: peer for peer in self.voters}
         approvals = []
+        if blob.uuid not in self._votes:
+            return False
         for blob, proof, sig in self._votes[blob.uuid]:
             if proof.uuid not in voters:
                 continue

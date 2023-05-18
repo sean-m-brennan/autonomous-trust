@@ -1,7 +1,7 @@
 from .util import ClassEnumMeta
 from .identity import Group, Peers
 from .network import Message
-from .capabilities import Capabilities
+from .capabilities import Capabilities, PeerCapabilities
 
 
 class Protocol(object, metaclass=ClassEnumMeta):
@@ -10,7 +10,8 @@ class Protocol(object, metaclass=ClassEnumMeta):
         self.logger = logger
         self.peers = peers
         self.group = group
-        self.capabilities = []
+        self.capabilities = Capabilities()
+        self.peer_capabilities = PeerCapabilities()
         self.handlers = {}
 
     def register_handler(self, func_name, handler):
@@ -19,19 +20,19 @@ class Protocol(object, metaclass=ClassEnumMeta):
     def run_message_handlers(self, queues, message):
         if isinstance(message, Group):
             self.group = message
-            self.logger.debug('Updated group')
             return True
         if isinstance(message, Peers):
             self.peers = message
-            self.logger.debug('Updated peers')
             return True
         if isinstance(message, Capabilities):
             self.capabilities = message
-            self.logger.debug('Updated my own capabilities')
+            return True
+        if isinstance(message, PeerCapabilities):
+            self.peer_capabilities = message
             return True
         if isinstance(message, Message):
             if message.process == self.proc_name:
                 for name, handler in self.handlers.items():
-                    if name in self.handlers and name == message.function:
+                    if name == message.function:
                         return self.handlers[name](queues, message)
             return False
