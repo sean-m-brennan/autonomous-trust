@@ -8,7 +8,7 @@ class IdentityByAuthority(AgreementByAuthority, IdentityHistory):
     """
     def __init__(self, me, peers, log_queue, timeout, threshold_rank=3, blacklist=None):
         IdentityHistory.__init__(self, me, peers, log_queue, timeout, blacklist)
-        AgreementByAuthority.__init__(self, me, peers.all, threshold_rank)
+        AgreementByAuthority.__init__(self, me, peers.all, threshold_rank)  # noqa
 
     def prove(self, blob: IdentityObj):
         if blob.identity.uuid in map(lambda x: x.uuid, self.blacklist):

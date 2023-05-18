@@ -20,6 +20,7 @@ dependencies:
   - networkx
   - psutil
   - pynacl
+  - python-dateutil
   - quart
   - ruamel.yaml
 

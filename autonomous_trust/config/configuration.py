@@ -1,8 +1,13 @@
 import os
 import sys
 from io import StringIO
+from datetime import datetime, timedelta
+from dateutil import parser
+from uuid import UUID
+from decimal import Decimal, getcontext
 
 from ruamel.yaml import YAML
+from nacl.signing import SignedMessage
 
 from ..util import ClassEnumMeta
 
@@ -106,3 +111,68 @@ yaml.constructor.add_multi_constructor(Configuration.YAML_PREFIX, Configuration.
 
 class EmptyObject(Configuration):
     pass
+
+
+def datetime_representer(dumper, data: datetime):
+    return dumper.represent_scalar(u'!datetime', u'%s' % data.isoformat('T'))
+
+
+def datetime_constructor(loader, node):
+    value = loader.construct_scalar(node)
+    return parser.parse(value)
+
+
+yaml.representer.add_representer(datetime, datetime_representer),
+yaml.constructor.add_constructor(u'!datetime', datetime_constructor)
+
+
+def timedelta_representer(dumper, data: timedelta):
+    return dumper.represent_scalar(u'!timedelta', u'%s' % data.total_seconds())
+
+
+def timedelta_constructor(loader, node):
+    value = loader.construct_scalar(node)
+    return timedelta(seconds=float(value))
+
+
+yaml.representer.add_representer(timedelta, timedelta_representer),
+yaml.constructor.add_constructor(u'!timedelta', timedelta_constructor)
+
+
+def uuid_representer(dumper, data: UUID):
+    return dumper.represent_scalar(u'!UUID', u'%s' % str(data))
+
+
+def uuid_constructor(loader, node):
+    value = loader.construct_scalar(node)
+    return UUID(value)
+
+
+yaml.representer.add_representer(UUID, uuid_representer),
+yaml.constructor.add_constructor(u'!UUID', uuid_constructor)
+
+
+def signedmessage_representer(dumper, data: SignedMessage):
+    return dumper.represent_mapping(u'!signedmessage', dict(message=data.message, signature=data.signature))
+
+
+def signedmessage_constructor(loader, node):
+    return SignedMessage(**loader.construct_mapping(node, deep=True))
+
+
+yaml.representer.add_representer(SignedMessage, signedmessage_representer),
+yaml.constructor.add_constructor(u'!signedmessage', signedmessage_constructor)
+
+
+def decimal_representer(dumper, data: Decimal):
+    return dumper.represent_scalar(u'!Decimal', u'%s' % str(data))
+
+
+def decimal_constructor(loader, node):
+    value = loader.construct_scalar(node)
+    getcontext().prec = len(value)
+    return Decimal(value)
+
+
+yaml.representer.add_representer(Decimal, decimal_representer),
+yaml.constructor.add_constructor(u'!Decimal', decimal_constructor)

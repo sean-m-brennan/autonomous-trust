@@ -6,6 +6,8 @@ class IdentityProtocol(Protocol):
     Protocol for establishing Identity
     ----------------------------------
 
+    Permissionless consensus (must mitigate Sybil attack)
+
     Three channels:
         - unsecured broadcast channel
         - secure broadcast channel with group key

@@ -12,8 +12,8 @@ class UDPNetworkProcess(NetworkProcess):
     mcast_ttl = 2
     net_proto = NetworkProtocol.IPV4
 
-    def __init__(self, configurations, subsystems, log_q, acceptance_func=None, udp=True, use_mcast=False):
-        super().__init__(configurations, subsystems, log_q, acceptance_func)
+    def __init__(self, configurations, subsystems, log_q, acceptance_func=None, udp=True, use_mcast=False, **kwargs):
+        super().__init__(configurations, subsystems, log_q, acceptance_func, **kwargs)
         self.packet_size = 65507
         self.my_address = self.net_cfg.ip4
         self.group_port = self.port + 1
