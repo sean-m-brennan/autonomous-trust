@@ -4,5 +4,7 @@
     <mapping directory="" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/unikernel/extern/cffi" vcs="hg4idea" />
     <mapping directory="$PROJECT_DIR$/unikernel/extern/pynacl" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/unikernel/lib/libffi" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/unikernel/lib/libzmq" vcs="Git" />
   </component>
 </project>

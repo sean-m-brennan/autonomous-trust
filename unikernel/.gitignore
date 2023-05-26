@@ -1,5 +1,5 @@
-.unikraft
-.kraftrc
-.update
-lib
-extern
+/.unikraft
+/.kraftrc
+/.update
+/lib
+/extern

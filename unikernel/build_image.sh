@@ -4,7 +4,7 @@
 this_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 working_dir=$(pwd)
 
-source ${this_dir}/../conda/init_conda
+source ${this_dir}/../src/trust/conda/init_conda
 source ${this_dir}/get_kraft
 source ${this_dir}/config_libs
 source ${this_dir}/uk_patches/patch_uk
@@ -48,13 +48,13 @@ pristine=false
 qemu_native=x86_64
 
 while [ -n "$1" ]; do
-    if [ "$1" = "--tool" ]; then
+    if [[ "$1" = "--tool" ]]; then
         shift
         tool="$1"
     elif [[ "$1" = "--arch"* ]] || [ "$1" = "-m" ]; then
         shift
         arch="$1"
-    elif [ "$1" = "--platform" ] || [ "$1" = "-p" ]; then
+    elif [[ "$1" = "--platform" ]] || [ "$1" = "-p" ]; then
         shift
         platform="$1"
     elif [[ "$1" = "--impl"* ]] || [ "$1" = "-i" ]; then
@@ -64,22 +64,23 @@ while [ -n "$1" ]; do
         shift
         if [ "$1" -gt "0" ]; then
             cpu_count="$1"
+        fi
     elif [[ "$1" = "--qemu-native" ]]; then
         shift
         qemu_native="$1"
-    elif [ "$1" = "--initrd" ]; then
+    elif [[ "$1" = "--initrd" ]]; then
         initrdfs=true
-    elif [ "$1" = "--run" ]; then
+    elif [[ "$1" = "--run" ]]; then
         run=true
-    elif [ "$1" = "--debug" ]; then
+    elif [[ "$1" = "--debug" ]]; then
         debug=true
-    elif [ "$1" = "--force" ]; then
+    elif [[ "$1" = "--force" ]]; then
         force="-F"
-    elif [ "$1" = "--clean" ]; then
+    elif [[ "$1" = "--clean" ]]; then
         clean=true
-    elif [ "$1" = "--pristine" ]; then
+    elif [[ "$1" = "--pristine" ]]; then
         pristine=true
-    elif [ "$1" = "--help" ]; then
+    elif [[ "$1" = "--help" ]]; then
         usage
         exit 0
     fi
