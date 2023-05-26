@@ -1,5 +1,3 @@
-#!/bin/bash
-
 
 build_container() {
     image_name=$1
@@ -51,7 +49,8 @@ create_network() {
     network_type=$2
     mcast=${3:-false}
     ipv6=$4
-    net="172.18.2.0"  #FIXME from args, also ipv6 version
+    host_comms=${5:-false}
+    net="172.27.3.0"  #FIXME from args, also ipv6 version
 
     device=$(ip -o -4 route show to default | awk '{print $5}')
     mask=24
@@ -60,11 +59,13 @@ create_network() {
     subnet="$net/$mask"
     range="${prefix}.2/$((mask + 1))"  # limited to 128 containers
     gateway="${prefix}.1"
-    aux="${prefix}.200"  #FIXME IPv agnostic
+    aux="${prefix}.130"  #FIXME IPv agnostic
 
-    macvlan_bridge $network_name $aux $net/$((mask + 1)) $device
+    if $host_comms; then
+        macvlan_bridge $network_name $aux $net/$((mask + 1)) $device
+    fi
 
-    args="--opt parent=${network_name}-bridge $ipv6 --subnet $subnet --gateway $gateway --ip-range $range"
+    args="--opt parent=$device $ipv6 --subnet $subnet --gateway $gateway --ip-range $range"
     if [ "$network_type" = "macvlan" ]; then
         args="$args --aux-address host=${aux}"
     fi
