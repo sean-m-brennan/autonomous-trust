@@ -8,7 +8,8 @@ from testcontainers.core.waiting_utils import wait_container_is_ready, wait_for_
 
 network_name = 'at-net'
 image = 'autonomous-trust'
-host_docker_addr = '172.18.2.200'
+network = '172.27.3.0'
+mask = 24
 
 
 def docker_init():
@@ -16,8 +17,8 @@ def docker_init():
     try:
         client.networks.get(network_name)
     except docker.errors.NotFound:
-        # FIXME echo docker.sh create_network()
-        client.networks.create(network_name, driver="macvlan")  #FIXME more complicated
+        print('Network $s not found. Must be created: run tools/network_init.sh')
+    # FIXME builds differently (i.e. broken) than bash-scripted build
     #client.images.build(tag=image, path=os.path.abspath(os.path.join(os.path.dirname(__file__), '..')), nocache=False)
 
 
