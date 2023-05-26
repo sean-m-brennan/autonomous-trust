@@ -3,4 +3,9 @@
 this_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 source $this_dir/docker.sh
 
-create_network at-net macvlan
+# shellcheck disable=SC2199
+if [[ "$@" == *"--host"* ]]; then
+    create_network at-net macvlan false "" true
+else
+    create_network at-net macvlan
+fi
