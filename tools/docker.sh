@@ -32,7 +32,6 @@ macvlan_bridge() {
     address=$2
     range=$3
     device=$4
-    set -x #FIXME
 
     if [ "$(ip addr show dev $iface_name)" != "" ]; then
       sudo ip link delete $iface_name
@@ -41,6 +40,7 @@ macvlan_bridge() {
     sudo ip addr add $address/32 dev $iface_name && \
     sudo ip link set $iface_name up && \
     sudo ip route add $range dev $iface_name
+    ip a show dev $iface_name
 }
 
 
