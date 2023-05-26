@@ -1,0 +1,14 @@
+name: autonomous_trust
+channels:
+  - conda-forge
+dependencies:
+  - python==3.10
+  - icontract
+  - psutil
+  - pynacl
+  - python-dateutil
+  - ruamel.yaml
+  - aenum
+  - libsass
+  - networkx
+  - quart

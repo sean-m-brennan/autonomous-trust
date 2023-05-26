@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=0.14,<0.15"]
+build-backend = "maturin"
+
+
+[project]
+name = "autonomous-trust"
+version = "0.1.1"
+description = "AutonomousTrust - a high-trust cooperative computing framework"
+authors = [
+    {name = "Sean M Brennan", email = "sean.brennan@tekfive.com"}
+]
+requires-python = ">=3.10,<3.11"
+
+[tool.maturin]
+python-source = "."
+python-packages = ["autonomous_trust"]
+manifest-path = "rust/Cargo.toml"
+features = ["pyo3/extension-module"]
+compatibility = "manylinux2014"
