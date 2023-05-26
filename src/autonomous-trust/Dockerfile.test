@@ -1,0 +1,7 @@
+FROM autonomous-trust
+
+WORKDIR /app
+COPY tests tests
+
+ENV AUTONOMOUS_TRUST_TEST_ARGS=""
+CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 -m tests $AUTONOMOUS_TRUST_TEST_ARGS"]

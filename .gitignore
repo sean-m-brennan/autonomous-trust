@@ -25,11 +25,14 @@ doc/presentation/css/tekfive.css*
 doc/presentation/notes
 doc/pitch/count.txt
 
-at
 **/*.egg-info
 .tox
 .coverage*
 coverage
-**/.pytest-cache
+.pytest-cache
 target
-unikernel/extern
+
+src/trust/rust/Cargo.lock
+
+etc
+var
