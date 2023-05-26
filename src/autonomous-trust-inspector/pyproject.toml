@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools >= 64.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autonomous-trust-inspector"
+version = "0.1.1"
+description = "AutonomousTrust Inspector - the AutonomousTrust network visualization tool"
+authors = [
+    {name = "Sean M Brennan", email = "sean.brennan@tekfive.com"}
+]
+requires-python = ">=3.10,<3.11"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["inspector*"]
+namespaces = false
