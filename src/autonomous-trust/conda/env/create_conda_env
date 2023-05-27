@@ -3,18 +3,13 @@ source ${create_conda_env_dir}/../defaults
 
 create_env () {
     local env=${1:-$environment}
-    local use_pip=${2:-false}
-    local pip=
-    if [ "$use_pip" != "" ]; then
-        pip=pip
-    fi
     local my_conda_base=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 
     echo "Conda Python version $(conda run python --version)" >&2
     conda update -y -n base conda  || exit 1
-    conda install -y -n base -c conda-forge mamba boa $pip  || exit 1
+    conda install -y -n base -c conda-forge mamba boa pip  || exit 1
     if [ "$(conda env list | awk '{print $1}' | grep $env)" = "" ]; then
-        mamba env create --file ${my_conda_base}/environment.yml  || exit 1
+        conda env create --file ${my_conda_base}/environment.yml  || exit 1
     fi
     conda env update -n $env --file ${my_conda_base}/dev_env.yml  || exit 1
 
