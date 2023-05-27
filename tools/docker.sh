@@ -61,12 +61,12 @@ create_network() {
     gateway="${prefix}.1"
     aux="${prefix}.130"  #FIXME IPv agnostic
 
-    if $host_comms; then
+    if $host_comms && [ "$network_type" = "macvlan" ]; then
         macvlan_bridge $network_name $aux $net/$((mask + 1)) $device
     fi
 
     args="--opt parent=$device $ipv6 --subnet $subnet --gateway $gateway --ip-range $range"
-    if [ "$network_type" = "macvlan" ]; then
+    if $host_comms && [ "$network_type" = "macvlan" ]; then
         args="$args --aux-address host=${aux}"
     fi
     
@@ -94,7 +94,7 @@ run_container() {
     debug=${6:-false}
 
     tunnel=
-    if [ "$remote_host" != "" ]; then
+    if [ "$remote_host" != "" ]; then  # FIXME does not work (container is not remote)
 	      tunnel="ssh $remote_host -c "
     fi
     debug_arg=
@@ -103,7 +103,9 @@ run_container() {
     fi
 
     docker_cmd="docker run --rm --name $container_name --network=$network_name $extra_args -it $image_name"
-    if [ "$(which gnome-terminal)" != "" ]; then
+    if [ "$(which xterm)" != "" ]; then
+        xterm -- sh -c "$tunnel $docker_cmd $debug_arg"
+    elif [ "$(which gnome-terminal)" != "" ]; then
         gnome-terminal -- sh -c "$tunnel $docker_cmd $debug_arg"
     elif [ "$(which qterminal)" != "" ]; then
         qterminal -e "$tunnel $docker_cmd $debug_arg"
