@@ -90,13 +90,8 @@ run_container() {
     image_name=$2
     network_name=$3
     extra_args=$4
-    remote_host=$5
-    debug=${6:-false}
+    debug=${5:-false}
 
-    tunnel=
-    if [ "$remote_host" != "" ]; then  # FIXME does not work (container is not remote)
-	      tunnel="ssh $remote_host -c "
-    fi
     debug_arg=
     if $debug; then
 	      debug_arg="; exec bash"
@@ -104,13 +99,13 @@ run_container() {
 
     docker_cmd="docker run --rm --name $container_name --network=$network_name $extra_args -it $image_name"
     if [ "$(which xterm)" != "" ]; then
-        xterm -- sh -c "$tunnel $docker_cmd $debug_arg"
+        xterm -e /bin/sh -l -c "$docker_cmd $debug_arg" &
     elif [ "$(which gnome-terminal)" != "" ]; then
-        gnome-terminal -- sh -c "$tunnel $docker_cmd $debug_arg"
+        gnome-terminal -- sh -c "$docker_cmd $debug_arg"
     elif [ "$(which qterminal)" != "" ]; then
-        qterminal -e "$tunnel $docker_cmd $debug_arg"
+        qterminal -e "$docker_cmd $debug_arg"
     elif [ "$(which osascript)" != "" ]; then
-        osascript -e "tell app \"Terminal\";  do script \"$tunnel $docker_cmd $debug_arg\"; end tell"
+        osascript -e "tell app \"Terminal\";  do script \"$docker_cmd $debug_arg\"; end tell"
     fi
     # TODO other environments
 }
