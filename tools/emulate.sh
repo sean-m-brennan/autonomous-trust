@@ -50,7 +50,7 @@ while [ -n "$1" ]; do
 done
 
 
-create_network $network_name $network_type $mcast $ipv6
+create_network $network_name $network_type $mcast $ipv6 false
 remote_ip=$(network_ip)
 remote="${remote_ip}:${remote_port}"
 
