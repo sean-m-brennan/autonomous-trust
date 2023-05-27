@@ -22,6 +22,7 @@ force=false
 debug_build=false
 debug_run=false
 remote_debugging=false
+tunnel=false
 
 while [ -n "$1" ]; do
     if [ "$1" = "--force" ]; then
@@ -29,6 +30,8 @@ while [ -n "$1" ]; do
     elif [ "$1" = "--help" ]; then
         echo "$(basename "$0") [--debug-build|--debug-run|--debug] [--tunnel WHO@WHERE] [--force] NUM_NODES"
         exit 0
+    elif [ "$1" = "--tunnel" ]; then
+        tunnel=true
     elif [ "$1" = "--debug-build" ]; then
         debug_build=true
     elif [ "$1" = "--debug-run" ]; then
@@ -68,7 +71,7 @@ for n in $(seq $num_nodes); do
     fi
     extra_args="-e AUTONOMOUS_TRUST_ARGS=\"--test $remote_dbg $excludes\""
 
-    run_container at-$n $image_name $network_name "$extra_args" $debug_run
+    run_container at-$n $image_name $network_name "$extra_args" $debug_run $tunnel
     sleep $((min_sec + RANDOM % max_sec))
 done
 

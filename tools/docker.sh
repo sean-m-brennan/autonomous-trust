@@ -91,6 +91,7 @@ run_container() {
     network_name=$3
     extra_args=$4
     debug=${5:-false}
+    remote=${6:-false}
 
     debug_arg=
     if $debug; then
@@ -98,7 +99,10 @@ run_container() {
     fi
 
     docker_cmd="docker run --rm --name $container_name --network=$network_name $extra_args -it $image_name"
-    if [ "$(which xterm)" != "" ]; then
+    if [[ "$(xhost)" == *"unable to open display"* ]]; then
+      echo "Cannot open container terminals; try X11 forwarding"
+    fi
+    if $remote && [ "$(which xterm)" != "" ]; then
         xterm -e /bin/sh -l -c "$docker_cmd $debug_arg" &
     elif [ "$(which gnome-terminal)" != "" ]; then
         gnome-terminal -- sh -c "$docker_cmd $debug_arg"
