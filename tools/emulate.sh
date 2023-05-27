@@ -22,7 +22,6 @@ force=false
 debug_build=false
 debug_run=false
 remote_debugging=false
-tunnel_host=
 
 while [ -n "$1" ]; do
     if [ "$1" = "--force" ]; then
@@ -30,9 +29,6 @@ while [ -n "$1" ]; do
     elif [ "$1" = "--help" ]; then
         echo "$(basename "$0") [--debug-build|--debug-run|--debug] [--tunnel WHO@WHERE] [--force] NUM_NODES"
         exit 0
-    elif [ "$1" = "--tunnel" ]; then
-	      shift
-        tunnel_host=$1
     elif [ "$1" = "--debug-build" ]; then
         debug_build=true
     elif [ "$1" = "--debug-run" ]; then
@@ -50,7 +46,7 @@ while [ -n "$1" ]; do
 done
 
 
-create_network $network_name $network_type $mcast $ipv6 false
+create_network $network_name $network_type $mcast $ipv6
 remote_ip=$(network_ip)
 remote="${remote_ip}:${remote_port}"
 
@@ -72,7 +68,7 @@ for n in $(seq $num_nodes); do
     fi
     extra_args="-e AUTONOMOUS_TRUST_ARGS=\"--test $remote_dbg $excludes\""
 
-    run_container at-$n $image_name $network_name "$extra_args" "$tunnel_host" $debug_run
+    run_container at-$n $image_name $network_name "$extra_args" $debug_run
     sleep $((min_sec + RANDOM % max_sec))
 done
 
