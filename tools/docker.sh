@@ -1,10 +1,10 @@
 
 build_container() {
-    image_name=$1
-    directory=$2
-    force=${3:-false}
-    debug=${4:-false}
-    file=$5
+    local image_name=$1
+    local directory=$2
+    local force=${3:-false}
+    local debug=${4:-false}
+    local file=$5
 
     # cleanup unused docker resources
     docker images prune
@@ -28,13 +28,13 @@ build_container() {
 }
 
 macvlan_bridge() {
-    iface_name=${1}-bridge
-    address=$2
-    range=$3
-    device=$4
+    local iface_name=${1}-bridge
+    local address=$2
+    local range=$3
+    local device=$4
 
     if [ "$(ip addr show dev $iface_name)" != "" ]; then
-      sudo ip link delete $iface_name
+        sudo ip link delete $iface_name
     fi
     sudo ip link add $iface_name link $device type macvlan mode bridge && \
     sudo ip addr add $address/32 dev $iface_name && \
@@ -45,27 +45,42 @@ macvlan_bridge() {
 
 
 create_network() {
-    network_name=$1
-    network_type=$2
-    mcast=${3:-false}
-    ipv6=$4
-    host_comms=${5:-false}
-    net="172.27.3.0"  #FIXME from args, also ipv6 version
+    local net=$1
+    local network_name=$2
+    local network_type=$3
+    local mcast=${4:-false}
+    local ipv6=${5:-false}
+    local host_comms=${6:-false}
+    #local net="172.27.3.0"  #FIXME from args, also ipv6 version
 
-    device=$(ip -o -4 route show to default | awk '{print $5}')
-    mask=24
-    prefix=${net%.*}
+    local device=$(ip -o -4 route show to default | awk '{print $5}')
+    local mask=24
+    local prefix=${net%.*}
 
-    subnet="$net/$mask"
-    range="${prefix}.2/$((mask + 1))"  # limited to 128 containers
-    gateway="${prefix}.1"
-    aux="${prefix}.130"  #FIXME IPv agnostic
+    local subnet="$net/$mask"
+    local range="${prefix}.2/$((mask + 1))"  # limited to 128 containers
+    local gateway="${prefix}.1"
+    local aux="${prefix}.130"  #FIXME IPv agnostic
+    local router_addr="${prefix}.101"
+    local iface_name=${network_name}-bridge
 
     if $host_comms && [ "$network_type" = "macvlan" ]; then
         macvlan_bridge $network_name $aux $net/$((mask + 1)) $device
+    elif [ "$(ip addr show dev $iface_name)" != "" ]; then
+        sudo ip link delete $iface_name
     fi
 
-    args="--opt parent=$device $ipv6 --subnet $subnet --gateway $gateway --ip-range $range"
+    local args="--opt parent=${device}.27 --subnet $subnet --gateway $gateway --ip-range $range"
+    if [ "$router_addr" != "" ]; then
+        args="$args --aux-address router=${router_addr}"
+    fi
+    if $ipv6; then
+        args="$args --ipv6"
+    fi
+    if [ "$network_type" = "macvlan" ]; then
+        ip link set $device promisc on  # FIXME turn off when done
+        args="$args -o macvlan_mode=bridge"
+    fi
     if $host_comms && [ "$network_type" = "macvlan" ]; then
         args="$args --aux-address host=${aux}"
     fi
@@ -77,6 +92,7 @@ create_network() {
         docker swarm init
         docker network create $args --driver=weaveworks/net-plugin:latest_release --attachable $network_name
 	  else
+	      echo "docker network create $args --driver $network_type $network_name"
         docker network create $args --driver $network_type $network_name
 	  fi
 }
@@ -86,30 +102,73 @@ network_ip() {
 }
 
 run_container() {
-    container_name=$1
-    image_name=$2
-    network_name=$3
-    extra_args=$4
-    debug=${5:-false}
-    remote=${6:-false}
+    local container_name=$1
+    local image_name=$2
+    local network_name=$3
+    local extra_args="$4"
+    local debug=${5:-false}
+    local remote=${6:-false}
+    local testing_path=$7
 
-    debug_arg=
+    local debug_arg=
     if $debug; then
 	      debug_arg="; exec bash"
     fi
+    local test_arg=
+    if [ "$testing_path" != "" ]; then
+        test_arg="-v ${testing_path}:/app"
+    fi
 
-    docker_cmd="docker run --rm --name $container_name --network=$network_name $extra_args -it $image_name"
+    docker run --rm --name $container_name --network=$network_name $extra_args -d $image_name
+}
+
+run_interactive_container() {
+    local container_name=$1
+    local image_name=$2
+    local network_name=$3
+    local extra_args="$4"
+    local debug=${5:-false}
+    local remote=${6:-false}
+    local testing_path=$7
+    local blocking=${8:-false}
+
+    local debug_arg=
+    if $debug; then
+	      debug_arg="; exec bash"
+    fi
+    local test_arg=
+    if [ "$testing_path" != "" ]; then
+        test_arg="-v ${testing_path}:/app"
+    fi
+
+    local docker_cmd="docker run --rm --name $container_name $test_arg --network=$network_name $extra_args -it $image_name /bin/bash" #FIXME
     if [[ "$(xhost)" == *"unable to open display"* ]]; then
       echo "Cannot open container terminals; try X11 forwarding"
     fi
     if $remote && [ "$(which xterm)" != "" ]; then
-        xterm -e /bin/sh -l -c "$docker_cmd $debug_arg" &
+        if $blocking; then
+            xterm -e /bin/sh -l -c "$docker_cmd $debug_arg"
+        else
+            xterm -e /bin/sh -l -c "$docker_cmd $debug_arg" &
+        fi
     elif [ "$(which gnome-terminal)" != "" ]; then
-        gnome-terminal -- sh -c "$docker_cmd $debug_arg"
+        if $blocking; then
+            gnome-terminal --wait -- sh -c "$docker_cmd $debug_arg"
+        else
+            gnome-terminal -- sh -c "$docker_cmd $debug_arg"
+        fi
     elif [ "$(which qterminal)" != "" ]; then
-        qterminal -e "$docker_cmd $debug_arg"
+        if $blocking; then
+            qterminal -e "$docker_cmd $debug_arg"
+        else
+            qterminal -e "$docker_cmd $debug_arg" &
+        fi
     elif [ "$(which osascript)" != "" ]; then
-        osascript -e "tell app \"Terminal\";  do script \"$docker_cmd $debug_arg\"; end tell"
+        if $blocking; then
+            osascript -e "tell app \"Terminal\";  do script \"$docker_cmd $debug_arg\"; end tell"
+        else
+            osascript -e "tell app \"Terminal\";  do script \"$docker_cmd $debug_arg\"; end tell" &
+        fi
     fi
     # TODO other environments
 }

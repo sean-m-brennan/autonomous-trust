@@ -4,10 +4,7 @@ import time
 from datetime import timedelta
 import socket
 
-from ..system import now, comm_port
-
-ping_rcv_port = comm_port + 10
-ping_snd_port = ping_rcv_port + 1
+from ..system import now, ping_rcv_port, ping_snd_port
 
 
 class PingStats(object):
