@@ -4,6 +4,8 @@ import time
 from queue import Empty, Full
 from enum import Enum
 
+import nacl
+
 from ..protocol import Protocol
 from ..identity import Identity
 from ..processes import Process, ProcMeta
@@ -196,6 +198,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             message = Message.parse(msg, from_whom, validate=validate)
         except TypeError:
             print('Error parsing: %s' % msg)  #FIXME
+            return
         from_addr = from_whom
         if isinstance(from_whom, Identity):
             from_addr = from_whom.address
@@ -310,18 +313,22 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
 
             # async recv group messages
             if len(self.group_messages) > 0:
-                raw_msg, from_addr = self.group_messages.pop(0)
-                if from_addr in self.group.addresses:
-                    decrypt_msg = self.group.decrypt(raw_msg, self.group)
-                    from_whom = self.peers.find_by_address(from_addr)
-                    if from_whom is not None:
-                        self._msg_to_queue(decrypt_msg, from_whom, queues, 'group')
+                if self.group is not None:  # otherwise, skip for now
+                    raw_msg, from_addr = self.group_messages.pop(0)
+                    if from_addr in self.group.addresses:
+                        from_whom = self.peers.find_by_address(from_addr)
+                        try:
+                            decrypt_msg = self.group.decrypt(raw_msg, self.group)
+                            if from_whom is not None:
+                                self._msg_to_queue(decrypt_msg, from_whom, queues, 'group')
+                            else:
+                                self.logger.error('Recvd transmission from %s - not in peers. Ignoring.' % from_addr)
+                                self.logger.debug('Ignored message: %s' % str(message))
+                        except nacl.exceptions.CryptoError:
+                            self.logger.error('CryptoError decrypting message from %s' % from_whom.nickname)
                     else:
-                        self.logger.error('Recvd transmission from %s - not in peers. Ignoring.' % from_addr)
+                        self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
                         self.logger.debug('Ignored message: %s' % str(message))
-                else:
-                    self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
-                    self.logger.debug('Ignored message: %s' % str(message))
 
             # async recv stranger messages (separate channel)
             if len(self.unknown_messages) > 0:
