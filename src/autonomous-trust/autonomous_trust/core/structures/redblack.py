@@ -170,6 +170,7 @@ class Tree(object):
             keys = sorted(list(_flatten(self.to_tuple())))
             self.first = self.find(keys[0])
             self.last = self.find(keys[-1])
+        self.node_count = 0
 
     @property
     def size(self):
@@ -201,8 +202,10 @@ class Tree(object):
         :param key: int
         :return: None
         """
+        self.node_count += 1
         if key is None:
-            key = self.size + 1  # auto-assign key
+            #key = self.size + 1  # auto-assign key
+            key = self.node_count  # auto-assign key
         node = self.node_class(key, data, left=EmptyNode, right=EmptyNode, red=True)
         if self.first is None or self.first.key > key:
             self.first = node
@@ -317,6 +320,7 @@ class Tree(object):
             temp.red = node.red
         if not color:
             self._recolor_del(fix_root)
+        self.node_count -= 1
 
     @staticmethod
     def _min_leaf(node):

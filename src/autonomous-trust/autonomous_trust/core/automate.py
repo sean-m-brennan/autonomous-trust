@@ -331,6 +331,8 @@ class AutonomousTrust(Protocol):
                     result.get(0)
                 except mp.TimeoutError:
                     pass
+                except KeyboardInterrupt:
+                    pass
                 except Exception as ex:
                     self.logger.error(self.name + ':  ' +
                                       ''.join(traceback.TracebackException.from_exception(ex).format()))
@@ -427,6 +429,8 @@ class AutonomousTrust(Protocol):
                     queues[CfgIds.negotiation].put(tr, block=True, timeout=queue_cadence)
                     tx = TransactionScore(tr.uuid, 0.6)  # FIXME relevant evaluation
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
+                except KeyboardInterrupt:
+                    pass
                 except Exception:
                     self.logger.error('Exception processing task')  # FIXME more info
                     # FIXME send error result to negotiation
