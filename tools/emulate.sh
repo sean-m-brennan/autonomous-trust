@@ -11,8 +11,7 @@ network_name="at-net"
 network_type="macvlan"
 mcast=false  # FIXME overlays
 remote_port=2357
-ipv6=
-#ipv6="--ipv6"
+ipv6=false
 
 #exclude_classes=""
 exclude_classes="network"
@@ -49,7 +48,8 @@ while [ -n "$1" ]; do
 done
 
 
-create_network $network_name $network_type $mcast $ipv6
+#create_network 172.27.3.0 $network_name $network_type $mcast $ipv6 false
+create_network 172.27.3.0 $network_name ipvlan -o ipvlan_mode=l3 $mcast $ipv6 false
 remote_ip=$(network_ip)
 remote="${remote_ip}:${remote_port}"
 
@@ -71,7 +71,7 @@ for n in $(seq $num_nodes); do
     fi
     extra_args="-e AUTONOMOUS_TRUST_ARGS=\"--test $remote_dbg $excludes\""
 
-    run_container at-$n $image_name $network_name "$extra_args" $debug_run $tunnel
+    run_interactive_container at-$n $image_name $network_name "$extra_args" $debug_run $tunnel
     sleep $((min_sec + RANDOM % max_sec))
 done
 
