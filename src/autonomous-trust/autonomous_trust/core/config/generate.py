@@ -26,7 +26,18 @@ names = [
 ]
 
 
-def _get_addresses(device='eth0'):
+def _get_default_device():
+    ip = subprocess.Popen(['/sbin/ip', 'route'], stdout=subprocess.PIPE)
+    grep = subprocess.Popen(['grep', 'default'], stdin=ip.stdout, stdout=subprocess.PIPE)
+    awk = subprocess.Popen(['awk', "{print $5}"], stdin=grep.stdout, stdout=subprocess.PIPE)
+    out = ''
+    for line in awk.stdout:
+        out += line.decode()
+    return out.strip()
+
+
+def _get_addresses():
+    device = _get_default_device()
     ip4_address = None
     ip6_address = None
     result = subprocess.run(['/sbin/ip', '-o', 'a', 'show', device], shell=False,
