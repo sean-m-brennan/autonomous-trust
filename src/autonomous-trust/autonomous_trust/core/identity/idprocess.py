@@ -247,7 +247,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 if ph != self.package_hash:
                     self.logger.error("Newbie is running a counterfeit; Ignore")
                     return True
-                self.logger.debug('Received new identity: %s' % new_id.nickname)
+                self.logger.debug('Received new identity: %s - %s' % (new_id.nickname, new_id.uuid))
                 self.peer_potentials[new_id.uuid] = caps
                 id_obj = IdentityObj(new_id, new_id.uuid)
                 #threading.Thread(target=self._process_id, args=(id_obj,), daemon=True).start()
@@ -292,7 +292,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             # FIXME should I be in border_guard_mode?
             blob = IdentityObj.from_yaml_string(message.obj)
             # FIXME verify
-            threading.Thread(target=self._process_id, args=(blob,), daemon=True).start()
+            threading.Thread(target=self._process_id, args=(message.obj,), daemon=True).start()
             return True
         return False
 

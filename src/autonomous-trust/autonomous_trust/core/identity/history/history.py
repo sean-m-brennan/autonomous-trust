@@ -75,8 +75,8 @@ class IdentityHistory(StepDAG, VoterTracker):
     def upgrade_peer(self, who):
         # FIXME confirm eligibility i.e. uuid, fullname, signature all unique
         if who not in self._peers.all:
-            self._merkle.insert(IdentityObj(who, self._merkle.root.digest))
-            self.add_step(LinkedStep(self._merkle.root.digest))
+            self._merkle.insert(IdentityObj(who, self._merkle.root_digest))
+            self.add_step(LinkedStep(self._merkle.root_digest))
         self._peers.promote(who)
 
     def downgrade_peer(self, who):
