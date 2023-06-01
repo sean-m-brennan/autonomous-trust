@@ -1,20 +1,20 @@
 [build-system]
-requires = ["maturin>=0.14,<0.15"]
-build-backend = "maturin"
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
 
-
-[project]
-name = "autonomous-trust"
+[tool.poetry]
+name = "autonomous_trust"
 version = "0.1.1"
 description = "AutonomousTrust - a high-trust cooperative computing framework"
-authors = [
-    {name = "Sean M Brennan", email = "sean.brennan@tekfive.com"}
-]
-requires-python = ">=3.10,<3.11"
+authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
+#readme = "README.md"
+packages = [{include = "autonomous_trust"}]
+license = "Proprietary"
 
-[tool.maturin]
-python-source = "."
-python-packages = ["autonomous_trust"]
-manifest-path = "rust/Cargo.toml"
-features = ["pyo3/extension-module"]
-compatibility = "manylinux2014"
+[tool.poetry.dependencies]
+python = "^3.10"
+icontract = "^2.6.2"
+psutil = "^5.9.5"
+PyNaCl = "^1.5.0"
+python-dateutil = "^2.8.2"
+"ruamel.yaml" = ">= 0.15.80"
