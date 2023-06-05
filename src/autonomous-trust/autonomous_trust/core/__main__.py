@@ -19,6 +19,8 @@ def main():
                         help='exclude named classes from logging')
     parser.add_argument('--test', action='store_true',
                         help='run limited testing application')
+    parser.add_argument('--live', action='store_true',
+                        help='run in production environ')
     args = parser.parse_args()
 
     if args.remote_debug is not None:
@@ -27,7 +29,10 @@ def main():
         import pydevd_pycharm
         pydevd_pycharm.settrace(ip, port=int(port), stdoutToServer=True, stderrToServer=True)
 
-    random_config(dev_root_dir, args.ident)
+    if args.live:
+        random_config(Configuration.get_cfg_dir(), args.ident)
+    else:
+        random_config(dev_root_dir, args.ident)
     to_log = None
     if args.exclude_logs is not None:
         to_log = [cls for cls in list(CfgIds) if cls not in args.exclude_logs]

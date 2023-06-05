@@ -1,0 +1,44 @@
+# Runs AutonomousTrust from live sources
+
+# Build from repo base dir:
+#    docker build -t autonomous-trust-devel -f src/autonomous-trust/Dockerfile-devel .
+# For rapid development, run as:
+#    docker run --rm -u $(id -u):$(id -g) -v src/autonomous-trust:/app -it autonomous-trust-devel
+
+FROM continuumio/miniconda3
+
+WORKDIR /app
+SHELL ["/bin/bash", "-c"]
+RUN apt-get update && \
+    apt-get install -y build-essential iproute2 iputils-ping iputils-arping iputils-tracepath sudo && \
+    apt-get clean
+
+RUN useradd -U user -d /app
+COPY tools/conda/bashrc /app/.bashrc
+RUN echo "ALL            ALL = (ALL) NOPASSWD: ALL" >>/etc/sudoers
+
+#COPY tools .tools
+#RUN .tools/trust devel init
+
+RUN mkdir .conda
+COPY tools/conda/defaults.sh .conda/defaults.sh
+COPY tools/conda/env .conda/env
+RUN source .conda/env/create_conda_env.sh && create_env && conda clean -afy
+COPY tools/conda/extra conda/extra
+RUN source conda/extra/populate_conda_env.sh && populate_env && conda clean -afy
+COPY tools/conda/rust .conda/rust
+RUN source .conda/rust/add_rust_to_env.sh && init_rust
+
+SHELL ["conda", "run", "--live-stream", "-n", "autonomous_trust", "/bin/bash", "-c"]
+RUN pip install pydevd-pycharm
+COPY src/autonomous-trust/rust rust
+COPY src/autonomous-trust/autonomous_trust autonomous_trust
+RUN rm -rf autonomous_trust/etc autonomous_trust/var
+#COPY src/autonomous-trust/pyproject.toml.rust-ext pyproject.toml
+#RUN maturin develop
+COPY src/autonomous-trust/pyproject.toml pyproject.toml
+RUN poetry install
+
+ENV AUTONOMOUS_TRUST_ARGS=""
+CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 -m autonomous_trust $AUTONOMOUS_TRUST_ARGS || /bin/bash"]
+

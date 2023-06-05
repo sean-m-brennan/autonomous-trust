@@ -1,0 +1,17 @@
+# Runs automated testing for AutonomousTrust
+
+# Build from repo base dir, context is src/autonomous-trust:
+#    docker build -t autonomous-trust-test -f src/autonomous-trust/Dockerfile-test src/autonomous-trust
+# Run as:
+#    docker run --rm -u $(id -u):$(id -g) -v src/autonomous-trust:/app -it autonomous-trust-test
+
+FROM autonomous-trust-devel
+
+WORKDIR /app
+COPY tests tests
+COPY tox.ini tox.ini
+COPY requirements.txt requirements.txt
+COPY tests_require.txt tests_require.txt
+COPY MANIFEST.in MANIFEST.in
+
+CMD ["/bin/bash", "-c", "conda run --live-stream -n autonomous_trust tox 2>&1 | tee /app/tox.log"]

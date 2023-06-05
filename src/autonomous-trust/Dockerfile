@@ -1,27 +1,34 @@
+# Runs pre-built AutonomousTrust
+
+# Prerequisites: (build from repo base dir, context is src)
+#   docker build -t package-builder -f src/Dockerfile-build src
+#   docker run --rm -u $(id -u):$(id -g) -v src/autonomous-trust:/build/src -v src/dist:/build/dist -it package-builder
+#   docker build -t autonomous-trust -f src/autonomous-trust/Dockerfile src
+
 FROM continuumio/miniconda3
 
 WORKDIR /app
 SHELL ["/bin/bash", "-c"]
 RUN apt-get update && \
-    apt-get install -y curl build-essential iproute2 iputils-ping iputils-arping iputils-tracepath && \
+    apt-get install -y iproute2 iputils-ping iputils-arping iputils-tracepath sudo && \
     apt-get clean
 
-RUN mkdir conda
-COPY conda/defaults conda/defaults
-COPY conda/env conda/env
-RUN source conda/env/create_conda_env && create_env && conda clean -afy
-COPY conda/extra conda/extra
-RUN source conda/extra/populate_conda_env && populate_env && conda clean -afy
-COPY conda/rust conda/rust
-RUN source conda/rust/add_rust_to_env && init_rust
+RUN useradd -U user -d /app
+RUN echo "ALL            ALL = (ALL) NOPASSWD: ALL" >>/etc/sudoers
+
+RUN conda config --add channels conda-forge
+RUN conda update -y -n base conda
+RUN conda create -n autonomous_trust python=3.10 && conda clean -afy
+
+COPY autonomous-trust/entrypoint.sh /entrypoint.sh
+ENV ROUTER="172.17.0.1"
+ENTRYPOINT ["/entrypoint.sh"]
 
 SHELL ["conda", "run", "--live-stream", "-n", "autonomous_trust", "/bin/bash", "-c"]
 RUN pip install pydevd-pycharm
-COPY pyproject.toml pyproject.toml
-COPY rust rust
-COPY autonomous_trust autonomous_trust
-RUN rm -rf autonomous_trust/etc autonomous_trust/var
-RUN maturin develop
+RUN --mount=source=dist,target=/app/dist \
+    conda install -y -c file:///app/dist autonomous_trust && conda clean -afy
 
-ENV AUTONOMOUS_TRUST_ARGS=""
-CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 -m autonomous_trust $AUTONOMOUS_TRUST_ARGS"]
+#ENV AUTONOMOUS_TRUST_ROOT=/app
+ENV AUTONOMOUS_TRUST_ARGS="--live"
+CMD ["/bin/bash", "-c", "conda run --live-stream -n autonomous_trust python3 -m autonomous_trust $AUTONOMOUS_TRUST_ARGS || /bin/bash"]

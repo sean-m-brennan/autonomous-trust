@@ -1,0 +1,18 @@
+# Runs AutonomousTrust Inspector from live sources
+
+# Build from repo base dir:
+#    docker build -t autonomous-inspector-devel -f src/autonomous-trust-inspect/Dockerfile-devel .
+# For rapid development, run as:
+#    docker run --rm -u $(id -u):$(id -g) -v src/autonomous-trust-inspect:/app -it autonomous-inspector-devel
+
+FROM autonomous-trust-devel
+
+WORKDIR /app
+COPY src/autonomous-trust/autonomous_trust/core autonomous_trust/core
+COPY src/autonomous-trust-inspector/requirements.txt requirements.txt
+COPY src/autonomous-trust-inspector/pyproject.toml pyproject.toml
+COPY src/autonomous-trust-inspector/autonomous_trust/inspector autonomous_trust/inspector
+RUN poetry lock  # re-acquire dependencies (due to autonomous-trust image)
+RUN poetry install
+
+CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 -m autonomous_trust.inspector"]
