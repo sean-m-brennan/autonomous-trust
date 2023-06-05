@@ -1,0 +1,41 @@
+## conda-build *must* be called in the current directory (src/autonomous-trust)
+
+{% set rust_ext = False %}
+{% set toml = load_file_data(os.path.abspath('./pyproject.toml')) %}  # fails early if wrong path
+{% set project = toml.get('project', {}) %}
+{% set name = project.get('name') %}
+{% set version = project.get('version') %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ./
+
+build:
+{% if rust_ext %}
+  script: maturin build && {{PYTHON}} -m pip install ./dist/{{ name }}-{{ version }}.tar.gz --no-deps --ignore-installed -vv
+{% else %}
+  noarch: python
+  script: poetry build && {{PYTHON}} -m pip install ./dist/{{ name }}-{{ version }}.tar.gz --no-deps --ignore-installed -vv
+{% endif %}
+
+requirements:
+  build:
+    - python==3.10
+    - pip
+    - poetry
+    - maturin
+  host:
+    - python==3.10
+    - pip
+    - poetry
+    - maturin
+  run:
+    - python>=3.10
+    - icontract
+    - psutil
+    - pynacl
+    - python-dateutil
+    - ruamel.yaml

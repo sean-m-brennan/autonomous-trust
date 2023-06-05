@@ -1,0 +1,17 @@
+# Runs automated testing for AutonomousTrust
+
+# Build from repo base dir, context is src/autonomous-trust-inspector:
+#    docker build -t autonomous-inspector-test -f src/autonomous-trust-inspector/Dockerfile-test src/autonomous-trust-inspector
+# Run as:
+#    docker run --rm -u $(id -u):$(id -g) -v src/autonomous-trust-inspector:/app -it autonomous-inspector-test
+
+FROM autonomous-inspector-devel
+
+WORKDIR /app
+COPY tests tests
+COPY tox.ini tox.ini
+COPY requirements.txt requirements.txt
+COPY tests_require.txt tests_require.txt
+#COPY MANIFEST.in MANIFEST.in  # FIXME doesn't exist
+
+CMD ["sh", "-c", "python3 -m tests"]

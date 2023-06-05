@@ -11,6 +11,10 @@ authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
 packages = [{include = "autonomous_trust"}]
 license = "Proprietary"
 
+[project]
+name = "autonomous_trust"
+version = "0.1.1"
+
 [tool.poetry.dependencies]
 python = "^3.10"
 icontract = "^2.6.2"

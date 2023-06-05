@@ -1,6 +1,0 @@
-FROM autonomous-inspector
-
-WORKDIR /app
-COPY tests tests
-
-CMD ["sh", "-c", "python3 -m tests"]

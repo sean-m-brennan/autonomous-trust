@@ -2,7 +2,10 @@ import os
 import autonomous_trust
 from autonomous_trust.core.network.ping import ping
 
-host_dir = os.path.abspath(os.path.join(os.path.dirname(autonomous_trust.__file__), '..'))
+here = autonomous_trust.__file__
+if here is None:
+    here = '/app/autonomous_trust'
+host_dir = os.path.abspath(os.path.join(os.path.dirname(here), '..'))
 
 
 def test_peer_ping():
