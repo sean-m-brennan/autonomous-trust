@@ -1,11 +1,11 @@
 ### Intellij ###
-idea/**/workspace.xml
+.idea/**/workspace.xml
 .idea/**/tasks.xml
 .idea/**/usage.statistics.xml
 .idea/**/dictionaries
 .idea/**/shelf
 
-__pycache__
+**/__pycache__
 
 ### Latex ###
 doc/**/out
@@ -32,7 +32,24 @@ coverage
 .pytest-cache
 target
 
-src/trust/rust/Cargo.lock
+**/rust/target
+**/rust/Cargo.lock
+**/.cache
+**/.conda
+**/.conda_build_locks
+**/.rustup
 
-etc
-var
+**/etc
+**/var
+dist
+
+# Unikraft
+unikraft/.unikraft*
+unikraft/.kraftrc
+unikraft/.update
+unikraft/lib
+unikraft/extern
+
+/doc/nsf.txt
+/src/autonomous-trust/.local
+/src/autonomous-trust-inspector/.local

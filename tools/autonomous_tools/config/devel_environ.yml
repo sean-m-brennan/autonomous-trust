@@ -1,0 +1,21 @@
+name: autonomous_trust
+channels:
+  - conda-forge
+dependencies:
+  - python==3.10
+  - poetry
+  - maturin
+  - docker-py
+  - gitpython
+  - mercurial-app
+  - pexpect
+  - rsync
+  - curl
+  - libffi
+  - tox
+  - pandoc
+  - beautifulsoup4
+  - pytest
+  - pytest-aiohttp
+  - pytest-asyncio
+  - pytest-cov

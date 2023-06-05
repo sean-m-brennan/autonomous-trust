@@ -1,0 +1,32 @@
+# Generic builder for conda packages
+# Supports Rust/C/C++ extensions built with either 'python -m build' or 'maturin build'
+# User must provide sources, including a meta.yaml file for conda-build
+
+# Create multi-arch containers with: docker buildx build --platform linux/amd64,linux/arm64 --tag package-builder .
+# Run with: docker run --rm -u $(id -u):$(id -g) -v ~/path/to/source:/build/src -v ~/path/to/dist:/build/dist [-it | -d] package-builder:<arch>
+
+ARG ARCH=
+FROM ${ARCH}continuumio/anaconda-pkg-build:master
+
+WORKDIR /build
+SHELL ["/bin/bash", "-c"]
+# Rely on most recent image for updates instead of this:
+# RUN yum update -y && yum clean all
+
+RUN conda update -y -n base conda
+RUN conda config --add channels conda-forge
+RUN conda install -y -n base conda-build conda-verify pip python-build maturin
+
+ENV CARGO_HOME="/opt/rust"
+RUN curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+ENV PATH="/opt/rust/bin:${PATH}"
+RUN rustup install nightly && rustup default nightly
+
+WORKDIR /build/src
+RUN mkdir /tmp/conda-bld && chmod 777 /tmp/conda-bld
+ARG UID=1000
+RUN useradd -U user -u $UID -d /build/src
+RUN mkdir /build/dist
+
+CMD ["/bin/bash", "-c", "conda build -c conda-forge --no-verify --croot /tmp/conda-bld --output-folder /build/dist ."]
+
