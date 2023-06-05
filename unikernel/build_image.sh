@@ -4,10 +4,10 @@
 this_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 working_dir=$(pwd)
 
-source ${this_dir}/../src/trust/conda/init_conda
-source ${this_dir}/get_kraft
-source ${this_dir}/config_libs
-source ${this_dir}/uk_patches/patch_uk
+source ${this_dir}/../tools/conda/init_conda.sh
+source ${this_dir}/get_kraft.sh
+source ${this_dir}/config_libs.sh
+source ${this_dir}/uk_patches/patch_uk.sh
 
 # 2023/04/06: pykraft deprecated, but KraftKit too alpha to use
 

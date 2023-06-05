@@ -1,0 +1,30 @@
+#!/bin/bash
+
+env=autonomous_trust
+
+this_dir=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+addtnl_args=
+init_devel=false
+
+if which conda >/dev/null 2>&1; then  # conda exists
+    if [ "$(conda env list | grep "/${env}$")" != "" ]; then  # $env exists
+        if [ "$(env | grep CONDA_DEFAULT_ENV | grep "=${env}$")" = "" ]; then  # $env not active
+            eval "$(conda shell.bash hook)"
+            conda activate $env
+        fi
+    else  # need $env
+        init_devel=true
+        eval "$(conda shell.bash hook)"
+        conda activate base
+    fi
+else  # need conda
+    init_devel=true
+fi
+if $init_devel; then
+    # check for required 'devel init' command
+    if [[ "$@" != *"devel init"* ]]; then
+        addtnl_args="devel init"
+    fi
+fi
+
+PYTHONPATH="$PYTHONPATH:$this_dir" python3 -m autonomous_tools $@ $addtnl_args

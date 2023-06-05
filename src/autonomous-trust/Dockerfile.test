@@ -1,6 +1,0 @@
-FROM autonomous-trust
-
-WORKDIR /app
-COPY tests tests
-
-CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust tox"]

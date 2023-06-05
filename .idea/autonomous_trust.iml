@@ -7,6 +7,8 @@
       <sourceFolder url="file://$MODULE_DIR$/src/autonomous-trust/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/src/autonomous-trust" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/tests.local" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/src/autonomous-trust/tests.local" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/.tox" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/py" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/.pytest_cache" />
@@ -16,6 +18,19 @@
       <excludeFolder url="file://$MODULE_DIR$/unikernel/py/fs0" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/autonomous_trust/etc/at" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/autonomous_trust/var/at" />
+      <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/coverage" />
+      <excludeFolder url="file://$MODULE_DIR$/src/dist" />
+      <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/.conda" />
+      <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/.conda_build_locks" />
+      <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/.rustup" />
+      <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/autonomous_trust/core" />
+      <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/.cache" />
+      <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/.conda" />
+      <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/.conda_build_locks" />
+      <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/.rustup" />
+      <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/autonomous_trust/etc" />
+      <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/autonomous_trust/var" />
+      <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/rust/target" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

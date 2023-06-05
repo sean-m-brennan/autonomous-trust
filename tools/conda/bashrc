@@ -1,0 +1,4 @@
+. /etc/profile
+. /etc/bash.bashrc
+. /opt/conda/etc/profile.d/conda.sh
+. /opt/rust/env
