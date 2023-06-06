@@ -5,6 +5,9 @@ import platform
 ARCH = platform.machine()
 OS = sys.platform
 
+default_cpu_count = os.cpu_count()
+default_initrd_fs = False
+
 conda_home = os.path.join(os.path.expanduser('~'), '.miniconda3')
 
 qemu_user_prefix = '/opt/qemu-user-static'
