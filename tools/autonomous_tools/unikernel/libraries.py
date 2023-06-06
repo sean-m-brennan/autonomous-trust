@@ -5,7 +5,7 @@ import importlib.util
 import git
 
 from ..config import base_dir
-from ..util import GREEN, RESET
+from ..util import GREEN, RESET, cat
 from .cfg import uk_workdir
 
 uk_dir = os.path.join(base_dir, 'unikernel')
@@ -22,10 +22,11 @@ def config_ext_libs(lib_list, kraft):
             reader = repo.config_reader()
             a_name = reader.get_value("user", "name")
             a_email = reader.get_value("user", "email")
-            origin = os.path.join(uk_dir, lib, 'origin')
-            version = os.path.join(uk_dir, lib, 'version')
+            origin = cat(os.path.join(uk_dir, lib, 'origin'))
+            version = cat(os.path.join(uk_dir, lib, 'version'))
             cmd = [kraft, 'lib', 'init', '--no-prompt', '--author-name', a_name, '--author-email', a_email,
                    '--origin', origin, '--version', version, lib]
+            print(cmd) # FIXME
             subprocess.run(cmd, cwd=lib_dir)
             subprocess.run(['rsync', '-a', '--exclude=version', '--exclude=origin',
                             os.path.join(uk_dir, lib) + '/', os.path.join(lib_dir, lib)])
