@@ -1,0 +1,7 @@
+menuconfig LIBZMQ
+	bool "libzmq - ZeroMQ library"
+	default n
+	select LIBCXX
+	select LIBCXXABI
+	select LIBUNWIND
+	select COMPILER_RT
