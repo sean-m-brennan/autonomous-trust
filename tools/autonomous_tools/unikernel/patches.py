@@ -1,25 +1,30 @@
-"""
-patch_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-source ${patch_dir}/../get_kraft
+import os
+import subprocess
+from glob import glob
+from pathlib import Path
+import shutil
 
-apply_uk_patches () {
-    impl=$1
+from ..config import base_dir
+from ..util import GREEN, RESET
+from .cfg import uk_workdir
 
-    if [ ! -e $UK_WORKDIR/.patched ]; then
-        echo "Patch unikraft"
-        cd $UK_WORKDIR && patch -p1 --forward < $patch_dir/unikraft.patch
-        if [ -e $patch_dir/unikraft.patch.$impl ]; then
-            cd $UK_WORKDIR && patch -p1 --forward < $patch_dir/unikraft.patch.$impl
-        fi
+
+def apply_uk_patches(impl=None):
+    if impl is None:
+        impl = '*'
+    patch_dir = os.path.join(base_dir, 'unikernel', 'uk_patches')
+    if not os.path.exists(os.path.join(uk_workdir, '.patched')):
+        print(GREEN + "Patch unikraft" + RESET)
+        # main patch first
+        subprocess.run(['patch', '-p1', '--forward', '--input', os.path.join(patch_dir, 'unikraft.patch')],
+                       cwd=uk_workdir)
+        for pfile in glob(os.path.join(patch_dir, 'unikraft.%s.patch' % impl)):
+            subprocess.run(['patch', '-p1', '--forward', '--input', pfile], cwd=uk_workdir)
+
         # Cannot create a patch with patches in it, so copy instead
-        cd $patch_dir
-        for patch_info in ${impl}_patch_*_*; do
-            lib_dir=${patch_info#${impl}_patch_}
-            lib_dir=${lib_dir%_*}
-            patch_file=${patch_info##*_}
-            cp $patch_info ${UK_WORKDIR}/libs/$lib_dir/patches/$patch_file
-        done
-        touch $UK_WORKDIR/.patched
-    fi
-}
-"""
+        for patch_info in glob(os.path.join(patch_dir, '%s_patch_*_*' % impl)):
+            lib_dir = patch_info.split('_')[2]
+            patch_file = patch_info.split('_')[3]
+            shutil.copy(patch_info, os.path.join(uk_workdir, 'libs', lib_dir, 'patches', patch_file))
+
+        Path(os.path.join(uk_workdir, '.patched')).touch()

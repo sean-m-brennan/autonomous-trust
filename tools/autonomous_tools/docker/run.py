@@ -1,6 +1,8 @@
 import os
 import subprocess
 
+from ..util import which
+
 
 def _run_cmd(container_name: str, image_name: str, network_name: str, extra_args: list[str] = None,
              mounts: list[tuple[str, str]] = None, net_admin: bool = False, detached: bool = True) -> list[str]:
@@ -46,15 +48,16 @@ def get_terminal(tunnel=False):
     if 'unable to open display' in subprocess.getoutput('xhost'):
         raise RuntimeError('ERROR: Cannot open container terminals; try X11 forwarding.')
     if tunnel:
-        if subprocess.call(['which', 'xterm'], stdout=subprocess.DEVNULL) == 0:
+
+        if which('xterm') != '':
             return XTerm()
         raise RuntimeError('ERROR: need xterm for X11 tunnel, but xterm is missing.')
     else:
-        if subprocess.call(['which', 'gnome-terminal'], stdout=subprocess.DEVNULL) == 0:
+        if which('gnome-terminal') != '':
             return GnomeTerminal()
-        elif subprocess.call(['which', 'qterminal'], stdout=subprocess.DEVNULL) == 0:
+        elif which('qterminal') != '':
             return QTerminal()
-        elif subprocess.call(['which', 'osascript'], stdout=subprocess.DEVNULL) == 0:
+        elif which('osascript') != '':
             return TerminalApp()
         raise NotImplementedError
 

@@ -1,10 +1,18 @@
 import os
+import shutil
+import subprocess
+from pathlib import Path
 
-from ..config import base_dir, ARCH
-from .cfg import default_platform, default_implementation
+from ..config import base_dir, ARCH, default_cpu_count, default_initrd_fs
+from ..util import GREEN, RESET, sed_on_file
+from ..devel.unikraft import get_kraft, update_kraft
+from .cfg import default_platform, default_implementation, Kraft, unikernel_dir, kraft_tool
+from .libraries import config_ext_libs, get_ext_sources
+from .patches import apply_uk_patches
 
 
-def build_unikernel(implementation=default_implementation, platform=default_platform, debuggable=False):
+def build_unikernel(implementation=default_implementation, platform=default_platform, cpu_count=default_cpu_count,
+                    initrdfs=default_initrd_fs, do_clean=False, pristine=False, debuggable=False, force=False):
     src_dir = os.path.join(base_dir, 'unikernel', implementation)
 
     target = 'autonomoustrust_' + implementation
@@ -15,66 +23,55 @@ def build_unikernel(implementation=default_implementation, platform=default_plat
     if debuggable:
         kernel += '.dbg'
 
-    # FIXME if conda env not active, activate it
+    kraft = get_kraft()
+    update_kraft(kraft)
+
+    if do_clean or pristine:
+        clean(kraft, implementation, pristine)
+
+    # Prep libraries
+    config_ext_libs(['libffi', 'libzmq'], kraft)
+    get_ext_sources(implementation)
+
+    impl_dir = os.path.join(unikernel_dir, implementation)
+
+    # Initialize
+    if not os.path.exists(os.path.join(impl_dir, '.init')):
+        subprocess.run([kraft, 'init'], cwd=impl_dir)
+        Path(os.path.join(impl_dir, '.init')).touch()
+    # Patch
+    apply_uk_patches(implementation)
+
+    # Build
+    if kraft_tool == Kraft.pykraft:
+        shutil.copy(os.path.join(impl_dir, 'Kraftfile.9pfs'), os.path.join(impl_dir, 'kraft.yaml'))
+        if initrdfs:
+            shutil.copy(os.path.join(impl_dir, 'Kraftfile.initrd'), os.path.join(impl_dir, 'kraft.yaml'))
+        # For SMP multiprocessing increase CPU count
+        sed_on_file(os.path.join(impl_dir, 'kraft.yaml'),
+                    'CONFIG_UKPLAT_LCPU_MAXCOUNT=1', 'CONFIG_UKPLAT_LCPU_MAXCOUNT=%d' % cpu_count)
+        print(GREEN + 'Configure unikraft for %s' % implementation + RESET)
+        options = ['-m', ARCH, '-p', platform, '-t', kernel]
+        if force:
+            options += ['-F']
+        subprocess.run([kraft, 'configure'] + options)
+        print(GREEN + 'Build unikraft for %s' % implementation + RESET)
+        subprocess.run([kraft, 'build'])
+    elif kraft_tool == Kraft.kraftkit:
+        shutil.copy(os.path.join(impl_dir, 'Kraftfile.9pfs'), os.path.join(impl_dir, 'Kraft'))
+        if initrdfs:
+            shutil.copy(os.path.join(impl_dir, 'Kraftfile.initrd'), os.path.join(impl_dir, 'Kraft'))
+        options = ['-m', ARCH, '-p', platform, '--log-type', 'simple']
+        if force:
+            options += ['-F']
+        subprocess.run([kraft, 'build'] + options)
 
     return os.path.join(src_dir, kernel)
 
 
-"""
-
-activate_conda autonomous_trust
-kraft=$(get_kraft)
-
-if $pristine; then
-    git clean -f -f -xd ${this_dir}/$impl
-fi
-if $clean; then
-    cd $this_dir/$impl && $kraft clean
-    cd $working_dir
-fi
-
-# Prep libraries
-config_ext_libs "libffi libzmq" $kraft
-get_ext_sources $impl
-
-# Update unikraft once a day
-if [ ! -d ${this_dir}/.unikraft ] || [ ! -f ${this_dir}/.update ] || [ "$(find ${this_dir}/ -maxdepth 1 -mtime +1 -type f -name ".update" 2>/dev/null)" ]; then
-    if [ "$tool" = "pykraft" ]; then
-        $kraft list update
-    elif [ "$tool" = "kraftkit" ]; then
-        $kraft pkg update
-    fi
-    touch ${this_dir}/.update
-fi
-
-# Initialize and patch
-cd $this_dir/$impl || exit 1
-if [ ! -e $this_dir/$impl/.init ]; then
-    $kraft init
-    touch $this_dir/$impl/.init
-fi
-apply_uk_patches $impl
-
-# Build
-set -e
-if [ "$tool" = "pykraft" ]; then
-    cp Kraftfile.9pfs kraft.yaml
-    if $initrdfs; then
-        cp Kraftfile.initrd kraft.yaml
-    fi
-    # For SMP multiprocessing increase CPU count
-    sed -i "s/CONFIG_UKPLAT_LCPU_MAXCOUNT=1/CONFIG_UKPLAT_LCPU_MAXCOUNT=${cpu_count}/" kraft.yaml
-    echo "Configure unikraft for $impl"
-    $kraft configure -m $arch -p $platform -t $kernel $force
-    echo "Build unikraft for $impl"
-    $kraft build
-fi
-if [ "$tool" = "kraftkit" ]; then
-    cp Kraftfile.9pfs Kraftfile
-    if $initrdfs; then
-        cp Kraftfile.initrd Kraftfile
-    fi
-    $kraft build -m $arch -p $platform --log-type simple $force
-fi
-
-"""
+def clean(kraft, impl, pristine=False):
+    impl_dir = os.path.join(unikernel_dir, impl)
+    if pristine:
+        subprocess.run(['git', 'clean', '-f', '-xd', impl_dir])
+    else:
+        subprocess.run([kraft, 'clean'], cwd=impl_dir)
