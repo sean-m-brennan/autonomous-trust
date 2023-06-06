@@ -45,13 +45,11 @@ def get_kraft():
 
 
 def update_kraft(kraft):
-    print('UK ', os.environ['UK_WORKDIR'])
     update_file = os.path.join(unikernel_dir, '.update')
     if not os.path.isdir(os.path.join(unikernel_dir, '.unikraft')) or \
             not os.path.exists(update_file) or \
             (datetime.now() - datetime.fromtimestamp(os.path.getmtime(update_file))).days > 1:
         if kraft_tool == Kraft.pykraft:
-            print([kraft, 'list', 'update'])
             subprocess.run([kraft, 'list', 'update'])
         elif kraft_tool == Kraft.kraftkit:
             subprocess.run([kraft, 'pkg', 'update'])
