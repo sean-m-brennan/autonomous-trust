@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime
 
 from ..unikernel.cfg import Kraft, unikernel_dir, kraft_tool, uk_workdir
+from ..config import kraft_update_freq_days
 from ..util import which
 
 
@@ -48,7 +49,7 @@ def update_kraft(kraft):
     update_file = os.path.join(unikernel_dir, '.update')
     if not os.path.isdir(os.path.join(unikernel_dir, '.unikraft')) or \
             not os.path.exists(update_file) or \
-            (datetime.now() - datetime.fromtimestamp(os.path.getmtime(update_file))).days > 1:
+            (datetime.now() - datetime.fromtimestamp(os.path.getmtime(update_file))).days > kraft_update_freq_days:
         if kraft_tool == Kraft.pykraft:
             subprocess.run([kraft, 'list', 'update'])
         elif kraft_tool == Kraft.kraftkit:

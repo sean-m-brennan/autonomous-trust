@@ -39,7 +39,7 @@ def config_ext_libs(lib_list, kraft):
                 print(GREEN + 'Update ' + lib + RESET)
                 subprocess.run(['git', 'add', './*'], cwd=os.path.join(lib_dir, lib))
                 subprocess.run(['git', 'commit', '-a', '-m"Update"'], cwd=os.path.join(lib_dir, lib))
-                subprocess.run(['git', 'pull', '-origin', 'staging'],
+                subprocess.run(['git', 'pull', 'origin', 'staging'],
                                cwd=os.path.join(uk_workdir, 'libs', lib))
                 os.remove(os.path.join(uk_dir, '.update'))
 

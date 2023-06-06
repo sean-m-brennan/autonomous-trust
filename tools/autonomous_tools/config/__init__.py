@@ -16,6 +16,8 @@ supported_platforms = ['linux/amd64', 'linux/arm64']
 
 image_name = "autonomous-trust"
 
+kraft_update_freq_days = 7
+
 network_name = "at-net"
 network_type = "macvlan"
 macvlan_bridge = 'macvlan-bridge'
