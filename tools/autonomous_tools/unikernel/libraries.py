@@ -1,51 +1,58 @@
-"""
-lib_src_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-lib_dir=$lib_src_dir/lib
-extern_dir=$lib_src_dir/extern
-source ${lib_src_dir}/get_kraft
+import os
+import subprocess
+import glob
+import importlib.util
+import git
 
-config_ext_libs () {
-    local defaults="$(cd ${lib_src_dir} && ls lib?*)"
-    local lib_list=${1:-"$defaults"}
-    local kraft=${2:-kraft}
-    local cur_dir=$(pwd)
+from ..config import base_dir
+from ..util import GREEN, RESET
+from .cfg import uk_workdir
 
-    mkdir -p $lib_dir
-    for lib in $lib_list; do
-        if [ ! -d ${lib_dir}/$lib ]; then
-            echo "Initialize $lib"
-            cd ${lib_dir} && $kraft lib init --no-prompt \
-                --author-name "$(git config --list | grep "user\.name" | awk -F= '{print $2}')" \
-                --author-email "$(git config --list | grep "user\.email" | awk -F= '{print $2}')" \
-                --origin "$(cat ${lib_src_dir}/$lib/origin)" \
-                --version "$(cat ${lib_src_dir}/$lib/version)" $lib
-            rsync -a --exclude=version --exclude=origin ${this_src_dir}/$lib/ ${lib_dir}/$lib
-            cd ${lib_dir}/$lib && git add ./* && git commit -a -m"Initial"
-            rm -f ${lib_src_dir}/.update
-            $kraft list add ${lib_dir}/$lib
-        else
-            synced=$(rsync -ai --exclude=version --exclude=origin ${lib_src_dir}/$lib/ ${lib_dir}/$lib)
-            if [[ -n "$synced" ]]; then
-                echo "Update $lib"
-                cd ${lib_dir}/$lib && git add ./* && git commit -a -m"Update"
-                cd ${UK_WORKDIR}/libs/$lib && git pull origin staging
-                rm -f ${lib_src_dir}/.update
-            fi
-        fi
-    done
-    cd $cur_dir
-}
+uk_dir = os.path.join(base_dir, 'unikernel')
+lib_dir = os.path.join(base_dir, 'unikernel', 'lib')
+extern_dir = os.path.join(base_dir, 'unikernel', 'extern')
 
-get_ext_sources () {
-    local impl=$1
-    local cur_dir=$(pwd)
-    mkdir -p $extern_dir
-    mkdir -p ${lib_src_dir}/$impl/build
 
-    for cfg_file in ${lib_src_dir}/$impl/extern_*.cfg; do
-        source $cfg_file
-        fetch_build $extern_dir ${lib_src_dir}/$impl/build
-        cd $cur_dir
-    done
-}
-"""
+def config_ext_libs(lib_list, kraft):
+    os.makedirs(lib_dir, exist_ok=True)
+    for lib in lib_list:
+        if not os.path.isdir(os.path.join(lib_dir, lib)):
+            print(GREEN + 'Initialize ' + lib + RESET)
+            repo = git.Repo()
+            reader = repo.config_reader()
+            a_name = reader.get_value("user", "name")
+            a_email = reader.get_value("user", "email")
+            origin = os.path.join(uk_dir, lib, 'origin')
+            version = os.path.join(uk_dir, lib, 'version')
+            cmd = [kraft, 'lib', 'init', '--no-prompt', '--author-name', a_name, '--author-email', a_email,
+                   '--origin', origin, '--version', version, lib]
+            subprocess.run(cmd, cwd=lib_dir)
+            subprocess.run(['rsync', '-a', '--exclude=version', '--exclude=origin',
+                            os.path.join(uk_dir, lib) + '/', os.path.join(lib_dir, lib)])
+            subprocess.run(['git', 'add', './*'], cwd=os.path.join(lib_dir, lib))
+            subprocess.run(['git', 'commit', '-a', '-m"Initial"'], cwd=os.path.join(lib_dir, lib))
+            os.remove(os.path.join(uk_dir, '.update'))
+        else:
+            result = subprocess.run(['rsync', '-ai', '--exclude=version', '--exclude=origin',
+                                     os.path.join(uk_dir, lib) + '/', os.path.join(lib_dir, lib)], capture_output=True)
+            if result.stdout != '':
+                print(GREEN + 'Update ' + lib + RESET)
+                subprocess.run(['git', 'add', './*'], cwd=os.path.join(lib_dir, lib))
+                subprocess.run(['git', 'commit', '-a', '-m"Update"'], cwd=os.path.join(lib_dir, lib))
+                subprocess.run(['git', 'pull', '-origin', 'staging'],
+                               cwd=os.path.join(uk_workdir, 'libs', lib))
+                os.remove(os.path.join(uk_dir, '.update'))
+
+
+def get_ext_sources(impl):
+    impl_dir = os.path.join(base_dir, 'unikernel', impl)
+    os.makedirs(extern_dir, exist_ok=True)
+    os.makedirs(os.path.join(impl_dir, 'build'))
+
+    for cfg_file in glob.glob(os.path.join(impl_dir, 'extern_*_cfg.py')):
+        mod_name = os.path.basename(cfg_file).split('_')[1]
+        spec = importlib.util.spec_from_file_location(mod_name, cfg_file)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        print(GREEN + "Acquire sources for %s" % mod_name + RESET)
+        mod.fetch_build(extern_dir, os.path.join(impl_dir, 'build'))

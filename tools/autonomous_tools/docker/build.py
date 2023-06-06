@@ -82,7 +82,7 @@ def build_containers(pkg_name: Union[str, None] = None, which: Container = Conta
     src_dir = os.path.join(base_dir, 'src')
     package_list = [pkg_name]
     if pkg_name is None:
-        package_list = packages
+        package_list = packages.keys()
     for pkg_name in package_list:
         img_name = images[pkg_name]
         path = packages[pkg_name]

@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# libffi - foreign function interface library
+#
+# Authors: Sean Brennan <sean.brennan@tekfive.com>
+#
+# Copyright (c) 2023, Sean Brennan <sean.brennan@tekfive.com>. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+################################################################################
+# NOTE: currently only supporting x86_64, arm64
+
+################################################################################
+# Library registration
+################################################################################
+$(eval $(call addlib_s,libffi,$(CONFIG_LIBFFI)))
+
+################################################################################
+# Sources
+################################################################################]
+LIBFFI_VERSION = 3.4.4
+LIBFFI_URL = https://github.com/libffi/libffi/archive/refs/tags/v$(LIBFFI_VERSION).zip
+LIBFFI_SUBDIR = libffi-$(LIBFFI_VERSION)
+LIBFFI_PATCHDIR = $(LIBFFI_BASE)/patches
+$(eval $(call patch,libffi,$(LIBFFI_PATCHDIR),$(LIBFFI_SUBDIR)))
+$(eval $(call fetch,libffi,$(LIBFFI_URL)))
+
+################################################################################
+# Helpers
+################################################################################
+LIBFFI_SRC = $(LIBFFI_ORIGIN)/$(LIBFFI_SUBDIR)
+
+LIBFFI_ARCH = $(subst arm64,aarch64,$(ARCH))
+
+LIBFFI_ARCH_X86_64=n
+LIBFFI_ARCH_ARM64=n
+ifeq (x86_64,$(CONFIG_UK_ARCH))
+LIBFFI_ARCH_X86_64=y
+endif
+ifeq (arm64,$(CONFIG_UK_ARCH))
+LIBFFI_ARCH_ARM64=y
+endif
+
+################################################################################
+# Library includes
+################################################################################
+CINCLUDES-y += -I$(LIBFFI_BASE)/include
+CINCLUDES-y += -I$(LIBFFI_SRC)/include
+CINCLUDES-y += -I$(LIBFFI_SRC)/src
+CINCLUDES-$(LIBFFI_ARCH_X86_64) += -I$(LIBFFI_SRC)/src/x86
+CINCLUDES-$(LIBFFI_ARCH_X86_64) += -I$(LIBFFI_BASE)/include/x86_64
+CINCLUDES-$(LIBFFI_ARCH_ARM64) += -I$(LIBFFI_SRC)/src/aarch64
+CINCLUDES-$(LIBFFI_ARCH_ARM64) += -I$(LIBFFI_SRC)/include/arm64
+
+################################################################################
+# Flags
+################################################################################
+LIBFFI_FLAGS += -DHAVE_CONFIG_H -fexceptions -Wall \
+	-Wno-implicit-function-declaration -Wno-sign-compare \
+	-Wno-unused-parameter -Wno-empty-body -Wno-implicit-fallthrough
+
+# Suppress some warnings to make the build process look neater
+LIBFFI_FLAGS_SUPPRESS += \
+	-Wno-unused-variable -Wno-unused-value -Wno-unused-function \
+	-Wno-missing-field-initializers \
+	-Wno-cast-function-type -Wno-stringop-truncation \
+	-Wno-char-subscripts -Wno-sign-compare -Wno-maybe-uninitialized
+LIBFFI_CFLAGS_SUPPRESS-y += $(LIBFFI_FLAGS_SUPPRESS) -Wno-pointer-to-int-cast -Wno-int-to-pointer-cast
+
+LIBFFI_CFLAGS-y += $(LIBFFI_FLAGS)
+LIBFFI_CFLAGS-y += $(LIBFFI_FLAGS_SUPPRESS)
+LIBFFI_CFLAGS-y += $(LIBFFI_CFLAGS_SUPPRESS-y)
+
+
+################################################################################
+# Glue code
+################################################################################
+# Include paths
+LIBFFI_COMMON_CINCLUDES-y += $(CINCLUDES-y)
+LIBFFI_ASINCLUDES-y += $(LIBFFI_COMMON_CINCLUDES-y)
+LIBFFI_CINCLUDES-y  += $(LIBFFI_COMMON_CINCLUDES-y)
+
+################################################################################
+# Library sources
+################################################################################
+LIBFFI_SRCS-y += $(LIBFFI_SRC)/src/java_raw_api.c
+LIBFFI_SRCS-y += $(LIBFFI_SRC)/src/prep_cif.c
+LIBFFI_SRCS-y += $(LIBFFI_SRC)/src/raw_api.c
+LIBFFI_SRCS-y += $(LIBFFI_SRC)/src/debug.c
+
+ifneq ($(CONFIG_LIBPYTHON3_EXTENSION_CTYPES),y)
+LIBFFI_SRCS-y += $(LIBFFI_SRC)/src/types.c
+LIBFFI_SRCS-y += $(LIBFFI_SRC)/src/closures.c
+endif
+
+LIBFFI_SRCS-$(LIBFFI_ARCH_X86_64) += $(LIBFFI_SRC)/src/x86/ffi64.c
+LIBFFI_SRCS-$(LIBFFI_ARCH_X86_64) += $(LIBFFI_SRC)/src/x86/ffiw64.c
+LIBFFI_SRCS-$(LIBFFI_ARCH_X86_64) += $(LIBFFI_SRC)/src/x86/unix64.S|x86_64
+LIBFFI_SRCS-$(LIBFFI_ARCH_X86_64) += $(LIBFFI_SRC)/src/x86/win64.S|x86_64
+LIBFFI_SRCS-$(LIBFFI_ARCH_X86_64) += $(LIBFFI_SRC)/src/x86/sysv.S|x86_64
+
+LIBFFI_SRCS-$(LIBFFI_ARCH_ARM64) +=  $(LIBFFI_SRC)/src/aarch64/ffi.c
+LIBFFI_SRCS-$(LIBFFI_ARCH_ARM64) +=  $(LIBFFI_SRC)/src/aarch64/sysv.S|arm64
+LIBFFI_SRCS-$(LIBFFI_ARCH_ARM64) +=  $(LIBFFI_SRC)/src/aarch64/win64_armasm.S|arm64

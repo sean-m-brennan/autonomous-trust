@@ -31,6 +31,6 @@ def init():
         # FIXME may need to signal requirements for compilers
 
         # Advanced options
-        from .unikraft import install_unikraft
-        install_unikraft()
+        from .unikraft import get_kraft
+        get_kraft()
         # FIXME detect/signal kvm/qemu
