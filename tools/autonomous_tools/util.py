@@ -38,3 +38,9 @@ def sed_on_file(filepath, original, replacement):
             temp.write(re.sub(original, replacement, line))
     temp.close()
     shutil.move(temp_file, filepath)
+
+
+def cat(filepath):
+    with open(filepath, 'r') as file:
+        lines = file.read()
+    return lines
