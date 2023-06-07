@@ -10,8 +10,8 @@ def fetch_build (extern_dir, build_dir):
         subprocess.run(['git', 'clone', repo_url], cwd=extern_dir)
     print("Building sodium module from pynacl (see pynacl/build.log)")
     env = os.environ.copy()
-    env['PYNACL_SODIUM_STATIC'] = 1
-    env['SODIUM_INSTALL_MINIMAL'] = 1
+    env['PYNACL_SODIUM_STATIC'] = '1'
+    env['SODIUM_INSTALL_MINIMAL'] = '1'
     with open(os.path.join(extern_dir, 'pynacl', 'build.log'), 'w') as log:
         subprocess.run([sys.executable, 'setup.py', 'build'], env=env, cwd=os.path.join(extern_dir, 'pynacl'),
                        stdout=log, stderr=log)
