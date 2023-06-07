@@ -1,36 +1,35 @@
 ### Intellij ###
-.idea/**/workspace.xml
-.idea/**/tasks.xml
-.idea/**/usage.statistics.xml
-.idea/**/dictionaries
-.idea/**/shelf
+/.idea/**/workspace.xml
+/.idea/**/tasks.xml
+/.idea/**/usage.statistics.xml
+/.idea/**/dictionaries
+/.idea/**/shelf
+
+### Latex ###
+/doc/**/out
+
+/doc/research
+
+## Generated files
+/doc/presentation/images/*.shape
+/doc/presentation/images/network.png
+/doc/presentation/images/identity.svg
+/doc/presentation/images/reputation.svg
+/doc/presentation/images/language.svg
+/doc/presentation/images/negotiation.svg
+/doc/presentation/images/optimization.svg
+/doc/presentation/images/prioritization.svg
+/doc/presentation/css/tekfive.css*
+/doc/presentation/notes
+/doc/pitch/count.txt
 
 **/__pycache__
 
-### Latex ###
-doc/**/out
-
-doc/research
-
-## Generated files
-doc/presentation/images/*.shape
-doc/presentation/images/network.png
-doc/presentation/images/identity.svg
-doc/presentation/images/reputation.svg
-doc/presentation/images/language.svg
-doc/presentation/images/negotiation.svg
-doc/presentation/images/optimization.svg
-doc/presentation/images/prioritization.svg
-doc/presentation/css/tekfive.css*
-doc/presentation/notes
-doc/pitch/count.txt
-
 **/*.egg-info
-.tox
-.coverage*
-coverage
-.pytest-cache
-target
+**/.tox
+**/.coverage*
+**/coverage
+**/.pytest-cache
 
 **/rust/target
 **/rust/Cargo.lock
@@ -44,12 +43,11 @@ target
 dist
 
 # Unikraft
-unikraft/.unikraft*
-unikraft/.kraftrc
-unikraft/.update
-unikraft/lib
-unikraft/extern
+/unikernel/.unikraft*
+/unikernel/.kraftrc
+/unikernel/.update
+/unikernel/lib/*
+/unikernel/extern/*
 
-/doc/nsf.txt
 /src/autonomous-trust/.local
 /src/autonomous-trust-inspector/.local

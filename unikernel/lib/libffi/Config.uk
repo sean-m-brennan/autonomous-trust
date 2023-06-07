@@ -1,5 +1,0 @@
-menuconfig LIBFFI
-	bool "libffi - foreign function interface library"
-	default n
-    select LIBMUSL
-    select LIBPTHREAD_EMBEDDED
