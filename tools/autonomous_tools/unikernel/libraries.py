@@ -26,29 +26,34 @@ def config_ext_libs(lib_list, kraft):
             version = cat(os.path.join(uk_dir, lib, 'version'))
             cmd = [kraft, 'lib', 'init', '--no-prompt', '--author-name', a_name, '--author-email', a_email,
                    '--origin', origin, '--version', version, lib]
-            print(cmd) # FIXME
             subprocess.run(cmd, cwd=lib_dir)
             subprocess.run(['rsync', '-a', '--exclude=version', '--exclude=origin',
                             os.path.join(uk_dir, lib) + '/', os.path.join(lib_dir, lib)])
+            if not os.path.isdir(os.path.join(lib_dir, lib, '.git')):
+                raise RuntimeError('ERROR: kraft init on %s failed' % lib)
             subprocess.run(['git', 'add', './*'], cwd=os.path.join(lib_dir, lib))
-            subprocess.run(['git', 'commit', '-a', '-m"Initial"'], cwd=os.path.join(lib_dir, lib))
-            os.remove(os.path.join(uk_dir, '.update'))
+            subprocess.run(['git', 'commit', '-a', '-m', "Initial"], cwd=os.path.join(lib_dir, lib))
+            subprocess.run([kraft, 'list', 'add', os.path.join(lib_dir, lib)])
         else:
             result = subprocess.run(['rsync', '-ai', '--exclude=version', '--exclude=origin',
                                      os.path.join(uk_dir, lib) + '/', os.path.join(lib_dir, lib)], capture_output=True)
             if result.stdout != '':
                 print(GREEN + 'Update ' + lib + RESET)
+                if not os.path.isdir(os.path.join(lib_dir, lib, '.git')):
+                    raise RuntimeError('ERROR: original kraft init on %s failed - bad state detected' % lib)
                 subprocess.run(['git', 'add', './*'], cwd=os.path.join(lib_dir, lib))
-                subprocess.run(['git', 'commit', '-a', '-m"Update"'], cwd=os.path.join(lib_dir, lib))
+                subprocess.run(['git', 'commit', '-a', '-m', "Update"], cwd=os.path.join(lib_dir, lib))
                 subprocess.run(['git', 'pull', 'origin', 'staging'],
                                cwd=os.path.join(uk_workdir, 'libs', lib))
-                os.remove(os.path.join(uk_dir, '.update'))
+        # FIXME
+        #if os.path.exists(os.path.join(uk_dir, '.update')):
+        #    os.remove(os.path.join(uk_dir, '.update'))
 
 
 def get_ext_sources(impl):
     impl_dir = os.path.join(base_dir, 'unikernel', impl)
     os.makedirs(extern_dir, exist_ok=True)
-    os.makedirs(os.path.join(impl_dir, 'build'))
+    os.makedirs(os.path.join(impl_dir, 'build'), exist_ok=True)
 
     for cfg_file in glob.glob(os.path.join(impl_dir, 'extern_*_cfg.py')):
         mod_name = os.path.basename(cfg_file).split('_')[1]
