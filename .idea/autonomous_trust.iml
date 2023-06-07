@@ -31,6 +31,8 @@
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/autonomous_trust/etc" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/autonomous_trust/var" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/rust/target" />
+      <excludeFolder url="file://$MODULE_DIR$/unikernel/extern" />
+      <excludeFolder url="file://$MODULE_DIR$/unikernel/lib" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
