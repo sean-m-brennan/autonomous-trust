@@ -2,13 +2,14 @@ import os
 from queue import Queue
 import pytest
 from autonomous_trust.inspector.viz import server
+from .. import INSIDE_DOCKER
 
-base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
 
-
+@pytest.mark.skipif(INSIDE_DOCKER)
 @pytest.mark.asyncio
 async def test_presentation():
     pages_list = ['/']  # FIXME
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
     pres_dir = os.path.join(base_dir, 'doc', 'presentation')
     app = server.VizServer(pres_dir, 8998, False, 12).app
     for page in pages_list:

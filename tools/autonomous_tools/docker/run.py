@@ -5,7 +5,8 @@ from ..util import which
 
 
 def _run_cmd(container_name: str, image_name: str, network_name: str, extra_args: list[str] = None,
-             mounts: list[tuple[str, str]] = None, net_admin: bool = False, detached: bool = True) -> list[str]:
+             mounts: list[tuple[str, str]] = None, net_admin: bool = False,
+             detached: bool = True, override: bool = False) -> list[str]:
     if extra_args is None:
         extra_args = []
     if mounts is None:
@@ -24,12 +25,17 @@ def _run_cmd(container_name: str, image_name: str, network_name: str, extra_args
     else:
         opts += ['-it']
     opts += [image_name]
+    if override:
+        opts += ['/bin/bash']
     return cmd + opts
 
 
 def run_container(container_name: str, image_name: str, network_name: str, extra_args: list[str] = None,
-                  mounts: list[tuple[str, str]] = None, net_admin: bool = False, detached: bool = True) -> bool:
-    cmd = _run_cmd(container_name, image_name, network_name, extra_args, mounts, net_admin, detached)
+                  mounts: list[tuple[str, str]] = None, net_admin: bool = False,
+                  detached: bool = True, override: bool = False) -> bool:
+    if detached:
+        mounts += ['-v', '/dev/log:/dev/log']
+    cmd = _run_cmd(container_name, image_name, network_name, extra_args, mounts, net_admin, detached, override)
     p = subprocess.Popen(cmd)
     if p.returncode != 0:
         return False
@@ -37,9 +43,10 @@ def run_container(container_name: str, image_name: str, network_name: str, extra
 
 
 def run_interactive_container(container_name: str, image_name: str, network_name: str, extra_args: list[str] = None,
-                              mounts: list[tuple[str, str]] = None, net_admin: bool = False,
-                              debug_run: bool = False, tunnel: bool = False, blocking: bool = False) -> bool:
-    cmd = _run_cmd(container_name, image_name, network_name, extra_args, mounts, net_admin, detached=False)
+                              mounts: list[tuple[str, str]] = None, net_admin: bool = False, debug_run: bool = False,
+                              tunnel: bool = False, blocking: bool = False, override: bool = False) -> bool:
+    cmd = _run_cmd(container_name, image_name, network_name, extra_args, mounts, net_admin,
+                   detached=False, override=override)
     get_terminal(tunnel).run(' '.join(cmd), debug_run, blocking)
     return True
 
@@ -48,7 +55,6 @@ def get_terminal(tunnel=False):
     if 'unable to open display' in subprocess.getoutput('xhost'):
         raise RuntimeError('ERROR: Cannot open container terminals; try X11 forwarding.')
     if tunnel:
-
         if which('xterm') != '':
             return XTerm()
         raise RuntimeError('ERROR: need xterm for X11 tunnel, but xterm is missing.')
@@ -76,7 +82,12 @@ class XTerm(Terminal):
         invocation = ['xterm', '-e', '/bin/sh', '-l', '-c', command]
         if not blocking:
             invocation += ['&']
-        return subprocess.Popen(invocation)
+        #if debug:
+        #    print(invocation)
+        proc = subprocess.Popen(invocation)
+        if blocking:
+            proc.wait()
+        return proc
 
 
 class GnomeTerminal(Terminal):

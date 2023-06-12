@@ -51,3 +51,4 @@ dist
 
 /src/autonomous-trust/.local
 /src/autonomous-trust-inspector/.local
+/*.log

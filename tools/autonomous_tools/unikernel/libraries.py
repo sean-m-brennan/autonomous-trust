@@ -2,7 +2,6 @@ import os
 import subprocess
 import glob
 import importlib.util
-import git
 
 from ..config import base_dir
 from ..util import GREEN, RESET, cat
@@ -14,6 +13,7 @@ extern_dir = os.path.join(base_dir, 'unikernel', 'extern')
 
 
 def config_ext_libs(lib_list, kraft):
+    import git
     os.makedirs(lib_dir, exist_ok=True)
     for lib in lib_list:
         if not os.path.isdir(os.path.join(lib_dir, lib)):

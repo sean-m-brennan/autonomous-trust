@@ -11,8 +11,7 @@ from .libraries import config_ext_libs, get_ext_sources
 from .patches import apply_uk_patches
 
 
-def build_unikernel(implementation=default_implementation, platform=default_platform, cpu_count=default_cpu_count,
-                    initrdfs=default_initrd_fs, do_clean=False, pristine=False, debuggable=False, force=False):
+def get_kernel(implementation=default_implementation, platform=default_platform, debuggable=False):
     src_dir = os.path.join(base_dir, 'unikernel', implementation)
 
     target = 'autonomoustrust_' + implementation
@@ -22,6 +21,14 @@ def build_unikernel(implementation=default_implementation, platform=default_plat
     kernel = target + '_' + platform + '-' + ARCH
     if debuggable:
         kernel += '.dbg'
+
+    return src_dir, kernel
+
+
+def build_unikernel(implementation=default_implementation, platform=default_platform, cpu_count=default_cpu_count,
+                    initrdfs=default_initrd_fs, do_clean=False, pristine=False, debuggable=False, force=False):
+
+    src_dir, kernel = get_kernel(implementation, platform, debuggable)
 
     kraft = get_kraft()
     update_kraft(kraft)

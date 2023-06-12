@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.3
+
 # Runs AutonomousTrust Inspector from live sources
 
 # Build from repo base dir:
@@ -9,6 +11,7 @@ FROM autonomous-trust-devel
 
 WORKDIR /app
 COPY src/autonomous-trust/autonomous_trust/core autonomous_trust/core
+COPY src/autonomous-trust/autonomous_trust/__main__.py autonomous_trust/__main__.py
 COPY src/autonomous-trust-inspector/requirements.txt requirements.txt
 COPY src/autonomous-trust-inspector/pyproject.toml pyproject.toml
 COPY src/autonomous-trust-inspector/autonomous_trust/inspector autonomous_trust/inspector

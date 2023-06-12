@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.3
+
 # Runs pre-built AutonomousTrust
 
 # Prerequisites: (build from repo base dir, context is src)
@@ -14,6 +16,7 @@ RUN apt-get update && \
     apt-get clean
 
 RUN useradd -U user -d /app
+COPY autonomous-trust/.bashrc /app/.bashrc
 RUN echo "ALL            ALL = (ALL) NOPASSWD: ALL" >>/etc/sudoers
 
 RUN conda config --add channels conda-forge
