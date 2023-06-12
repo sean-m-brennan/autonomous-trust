@@ -1,19 +1,27 @@
 import os
 import subprocess
+import json
 import urllib.request
-from ..config.__init__ import conda_environ_name
+from ..config import conda_environ_name
 
 
 def install_rust(env_name=conda_environ_name):
-    cargo_home = ''  # FIXME get conda env directory
+    cargo_home = None
+    json_info = json.loads(subprocess.getoutput('conda info --json'))
+    for path in json_info['envs']:
+        if env_name in path:
+            cargo_home = path
+    if cargo_home is None:
+        raise RuntimeError('Installing Rust, but Conda env %s is not installed' % env_name)
+    print('Cargo ', cargo_home)
     os.environ['RUSTUP_HOME'] = cargo_home
-    os.environ['CARGO_HOME'] = cargo_home  # FIXME export?
+    os.environ['CARGO_HOME'] = cargo_home
     os.environ['PATH'] += ':' + os.path.join(cargo_home, 'bin')
     rustup_url = 'https://sh.rustup.rs'
     install_sh = '/tmp/rustup.sh'
     urllib.request.urlretrieve(rustup_url, install_sh)
-    subprocess.run([install_sh, '-y'])
-    subprocess.run(['rustup', 'install', 'nightly'])
+    subprocess.run(['/bin/sh', install_sh, '-y'], check=True)
+    subprocess.run(['rustup', 'install', 'nightly'], check=True)
     subprocess.run(['rustup', 'default', 'nightly'])
 
     active_dir = os.path.join(cargo_home, 'etc', 'conda', 'activate.d')

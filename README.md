@@ -13,8 +13,23 @@ We follow the Unix philosophy: do one thing well, work together, use a universal
 QuickStart
 ----------
 
-Run `tools/emulate.sh` from a bash shell.
+Run `tools/trust emulate` from a bash shell.
 
 Requires:
- * Conda: https://anaconda.com
- * Docker https://www.docker.com/get-started/
+  * Docker https://www.docker.com/get-started/
+
+The script downloads/installs all required software dependencies into the container(s).
+
+
+Alternatively, AutonomousTrust can be built as a virtual machine instead of a container.
+
+Run `tools/trust actuate` from a bash shell.
+
+Requires:
+  * QEMU https://wiki.qemu.org/Hosts
+
+Downloads/installs (local to working dir):
+  * Unikraft
+  * pyNaCl
+  * libffi
+

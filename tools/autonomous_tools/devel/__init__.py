@@ -1,3 +1,4 @@
+import os
 import subprocess
 from ..config import conda_environ_name
 
@@ -9,6 +10,9 @@ def conda_present():
 
 
 def conda_env_present(env_name):
+    conda_base = subprocess.getoutput('conda info --base')
+    if not os.path.isdir(os.path.join(conda_base, 'envs', env_name)):
+        return False
     envs_list = subprocess.getoutput('conda env list')
     for line in envs_list.split('\n'):
         if line and line.split()[0] == env_name:
@@ -16,21 +20,29 @@ def conda_env_present(env_name):
     return False
 
 
-def init():
+def init(conda_only=False, environ_only=False, no_virt=False):
     if not conda_present():
         from .conda import install_conda
         install_conda()  # this may restart the script
+        if conda_only:
+            return
     elif not conda_env_present(conda_environ_name):
         from .conda import init_conda_env
         init_conda_env()  # this may restart the script
-    else:
+        if environ_only:
+            return
+    elif not conda_only and not environ_only:
         from .rust import install_rust
         install_rust()
-        from .docker import install_docker
-        install_docker()
-        # FIXME may need to signal requirements for compilers
+        if not no_virt:
+            from .docker import install_docker
+            install_docker()
+            # Advanced options
+            from .unikraft import get_kraft, get_qemu
+            get_kraft()
+            get_qemu()
 
-        # Advanced options
-        from .unikraft import get_kraft
-        get_kraft()
-        # FIXME detect/signal kvm/qemu
+
+def update():
+    from .conda import update_env
+    update_env()

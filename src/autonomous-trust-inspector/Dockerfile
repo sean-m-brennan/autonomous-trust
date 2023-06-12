@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.3
+
 # Runs pre-built AutonomousTrust Inspector (useless without other AutonomousTrust instances)
 
 # Prerequisites: (build from repo base dir, context is src)
