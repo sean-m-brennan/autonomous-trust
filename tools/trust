@@ -22,8 +22,8 @@ else  # need conda
 fi
 if $init_devel; then
     # check for required 'devel init' command
-    if [[ "$@" != *"devel init"* ]]; then
-        addtnl_args="devel init"
+    if [[ "$@" != *"devel install"* ]]; then
+        addtnl_args="devel install"
     fi
 fi
 

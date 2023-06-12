@@ -33,7 +33,9 @@ def build_pkg_builders(force: bool = False):
     if force:
         options.insert(0, '--no-cache')
     p = subprocess.run(cmd + options)
-    return p.returncode == 0
+    if p.returncode != 0:
+        raise RuntimeError('Package-builder container build failed')
+    return True
 
 
 def build_packages():
@@ -66,7 +68,7 @@ def build_packages():
                        '-it', 'package-builder']
                 p = subprocess.run(cmd)
                 if p.returncode != 0:
-                    return False
+                    raise RuntimeError('Package creation for %s failed' % img_name)
     return True
 
 
@@ -116,5 +118,5 @@ def build_containers(pkg_name: Union[str, None] = None, which: Container = Conta
             options = extra + ['-t', target, '-f', os.path.join(path, 'Dockerfile' + suffix), context]
             p = subprocess.run(cmd + options)
             if p.returncode != 0:
-                return False
+                raise RuntimeError('Build of %s failed' % target)
     return True

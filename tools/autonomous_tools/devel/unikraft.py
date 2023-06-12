@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime
 
 from ..unikernel.cfg import Kraft, unikernel_dir, kraft_tool, uk_workdir
-from ..config import kraft_update_freq_days
+from ..config import kraft_update_freq_days, ARCH
 from ..util import which
 
 
@@ -33,14 +33,14 @@ def get_kraft():
     if kraft is None:
         if kraft_tool == Kraft.pykraft:
             # install pykraft under conda
-            subprocess.check_call([sys.executable, "-m", "pip", "install",
-                                   'git+https://github.com/unikraft/pykraft.git'])
+            subprocess.run([sys.executable, "-m", "pip", "install",
+                            'git+https://github.com/unikraft/pykraft.git'], check=True)
         elif kraft_tool == Kraft.kraftkit:
             # install KraftKit
             kraftkit_url = 'https://get.kraftkit.sh'
             install_sh = 'kraftkit.sh'
             urllib.request.urlretrieve(kraftkit_url, install_sh)
-            subprocess.run(['bin/sh', install_sh, '-y'])
+            subprocess.run(['bin/sh', install_sh, '-y'], check=True)
         kraft = which('kraft')
     return kraft
 
@@ -55,3 +55,14 @@ def update_kraft(kraft):
         elif kraft_tool == Kraft.kraftkit:
             subprocess.run([kraft, 'pkg', 'update'])
         Path(update_file).touch()
+
+
+def get_qemu():
+    qemu = which('qemu-system-' + ARCH)
+    if qemu is None:
+        qemu = which('qemu-kvm')
+        if qemu is None:
+            qemu = '/usr/libexec/qemu-kvm'
+            if not os.path.exists(qemu):
+                raise RuntimeError('QEMU installation not found')
+    return qemu

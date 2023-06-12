@@ -3,6 +3,7 @@ import subprocess
 import re
 import shutil
 import tempfile
+import getpass
 
 os.system('')  # allows colors for Windows terminals
 BLUE = '\033[94m'
@@ -44,3 +45,23 @@ def cat(filepath):
     with open(filepath, 'r') as file:
         lines = file.read()
     return lines
+
+
+def sudo_command(cmd, passwd=None, cwd=None, output=True, check=True):
+    import pexpect
+    if not isinstance(cmd, str):
+        cmd = ' '.join(cmd)
+    print("Running sudo '%s'" % cmd)
+    if passwd is None:
+            passwd = getpass.getpass('[sudo] password for %s: ' % getpass.getuser()) + '\n'
+    proc = pexpect.spawn('sudo ' + cmd, cwd=cwd)
+    if proc.expect(['(?i)password.*']) == 0:
+        proc.sendline(passwd)
+    proc.expect([pexpect.EOF, pexpect.TIMEOUT], timeout=1)
+    proc.close()
+    out = proc.before.decode()
+    if output:
+        print(out)
+    if check and proc.exitstatus != 0:
+        raise RuntimeError('sudo command failed: %d' % proc.exitstatus)
+    return passwd

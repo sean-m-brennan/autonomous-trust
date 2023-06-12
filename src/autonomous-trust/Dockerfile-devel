@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.3
+
 # Runs AutonomousTrust from live sources
 
 # Build from repo base dir:
@@ -14,20 +16,17 @@ RUN apt-get update && \
     apt-get clean
 
 RUN useradd -U user -d /app
-COPY tools/conda/bashrc /app/.bashrc
+COPY src/autonomous-trust/.bashrc /app/.bashrc
 RUN echo "ALL            ALL = (ALL) NOPASSWD: ALL" >>/etc/sudoers
 
-#COPY tools .tools
-#RUN .tools/trust devel init
+COPY src/autonomous-trust/entrypoint.sh /entrypoint.sh
+ENV ROUTER="172.17.0.1"
+ENTRYPOINT ["/entrypoint.sh"]
 
-RUN mkdir .conda
-COPY tools/conda/defaults.sh .conda/defaults.sh
-COPY tools/conda/env .conda/env
-RUN source .conda/env/create_conda_env.sh && create_env && conda clean -afy
-COPY tools/conda/extra conda/extra
-RUN source conda/extra/populate_conda_env.sh && populate_env && conda clean -afy
-COPY tools/conda/rust .conda/rust
-RUN source .conda/rust/add_rust_to_env.sh && init_rust
+RUN --mount=type=bind,source=tools,target=/app/.tools --mount=type=cache,target=/opt/conda/pkgs \
+    .tools/trust devel install --environ
+RUN --mount=type=bind,source=tools,target=/app/.tools --mount=type=cache,target=/opt/conda/pkgs \
+    .tools/trust devel install --basic
 
 SHELL ["conda", "run", "--live-stream", "-n", "autonomous_trust", "/bin/bash", "-c"]
 RUN pip install pydevd-pycharm
