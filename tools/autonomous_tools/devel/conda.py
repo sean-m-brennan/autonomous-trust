@@ -6,7 +6,7 @@ from ..config import OS, ARCH, conda_home, conda_environ_name
 from . import conda_env_present, conda_present
 
 wrap_script = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'trust'))
-cfg_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'config'))
+cfg_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'cfg'))
 
 
 def install_conda(dest=conda_home):
@@ -17,17 +17,25 @@ def install_conda(dest=conda_home):
         urllib.request.urlretrieve(conda_url, install_sh)
         subprocess.run(['/bin/sh', install_sh, '-b', '-p', dest])
     print("Utilizing conda")
-    os.execl(wrap_script, wrap_script, *sys.argv)  # activate base environ
+    os.execl(wrap_script, wrap_script, *sys.argv[1:])  # activate base environ (see trust script)
 
 
 def init_conda_env(env_name=conda_environ_name):
     if not conda_env_present(env_name):
-        from conda.cli import python_api as anaconda  # noqa
-
-        anaconda.run_command(anaconda.Commands.CONFIG, '--add', 'channels', 'conda-forge', stdout=None)
-        anaconda.run_command(anaconda.Commands.UPDATE, '-n', 'base', 'conda', stdout=None)
-        anaconda.run_command(anaconda.Commands.INSTALL, '-n', 'base', 'docker-py')
-        anaconda.run_command(anaconda.Commands.CREATE, '-n', env_name, '--file', os.path.join(cfg_dir, 'environment.yml'))
-        anaconda.run_command(anaconda.Commands.UPDATE, '-n', env_name, '--file', os.path.join(cfg_dir, 'dev_env.yml'))
+        subprocess.run(['conda', 'config', '--add', 'channels', 'conda-forge'])
+        subprocess.run(['conda', 'update', '-n', 'base', 'conda'], check=True)
+        subprocess.run(['conda', 'install', '-n', 'base', 'docker-py'], check=True)
+        subprocess.run(['conda', 'env', 'create', '-n', env_name, '--file',
+                        os.path.join(cfg_dir, 'environment.yml')], check=True)
+        subprocess.run(['conda', 'install', '-n', env_name, '--file', os.path.join(cfg_dir, 'dev_env.txt')], check=True)
         print("Activating conda environment")
-        os.execl(wrap_script, wrap_script, *sys.argv)  # activate target environ
+        os.execl(wrap_script, wrap_script, *sys.argv[1:])  # activate target environ (see trust script)
+
+
+def update_env(env_name=conda_environ_name):
+    if not conda_present():
+        install_conda()
+    if not conda_env_present(env_name):
+        init_conda_env(env_name)
+    subprocess.run(['conda', 'update', '-n', 'base', 'conda'], check=True)
+    subprocess.run(['conda', 'update', '-n', env_name, '--all'], check=True)

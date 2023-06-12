@@ -12,6 +12,8 @@ conda_home = os.path.join(os.path.expanduser('~'), '.miniconda3')
 
 qemu_user_prefix = '/opt/qemu-user-static'
 
+docker_multiarch = False
+
 supported_platforms = ['linux/amd64', 'linux/arm64']
 
 image_name = "autonomous-trust"
@@ -30,10 +32,18 @@ ipv6 = False
 ##############################
 # Constants
 conda_environ_name = 'autonomous_trust'
-base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+namespace = 'autonomous_trust'
 packages = {'autonomous_trust': os.path.join(base_dir, 'src', 'autonomous-trust'),
             'autonomous_trust.inspector': os.path.join(base_dir, 'src', 'autonomous-trust-inspector')}
 images = {k: v.split('/')[-1] for k, v in packages.items()}
+sources = {'autonomous_trust':
+           [(os.path.join(base_dir, 'src', 'autonomous-trust'), os.path.join(namespace, 'core')),
+            (os.path.join(base_dir, 'src', 'autonomous-trust'), os.path.join(namespace, '__main__.py'))],
+           'autonomous_trust.inspector':
+           [(os.path.join(base_dir, 'src', 'autonomous-trust-inspector'), os.path.join(namespace, 'inspector')),
+            (os.path.join(base_dir, 'src', 'autonomous-trust'), os.path.join(namespace, 'core')),
+            (os.path.join(base_dir, 'src', 'autonomous-trust'), os.path.join(namespace, '__main__.py'))]}
 
 if OS == 'Linux':
     for path in ['/usr/bin/qemu-system-' + ARCH, '/usr/libexec/qemu-kvm']:

@@ -30,8 +30,10 @@ def main(commands, args):
         return
     for name, cmd in commands.items():
         if name == Cmds.devel:
-            if cmd.function == 'init':
-                devel.init()
+            if cmd.function == 'install':
+                devel.init(cmd.conda, cmd.environ, cmd.basic)
+            elif cmd.function == 'update':
+                devel.update()
         elif name == Cmds.network:
             pass  # FIXME
         elif name == Cmds.tag:
@@ -48,22 +50,25 @@ def main(commands, args):
         elif name == Cmds.unikernel:
             unikernel.build.build_unikernel(initrdfs=cmd.initrdfs, do_clean=cmd.clean, pristine=cmd.pristine,
                                             debuggable=cmd.debug, force=cmd.force)
-            pass  # FIXME
         elif name == Cmds.test:
-            test.test(num_nodes=cmd.nodes, debug=cmd.debug, tunnel=cmd.tunnel, force=cmd.force)
+            test.test(num_nodes=cmd.nodes, debug=cmd.debug, tunnel=cmd.tunnel, force=cmd.force, quick=cmd.quick)
         elif name == Cmds.simulate:
             raise NotImplementedError
         elif name == Cmds.emulate:
             docker.emulate.emulate(num_nodes=cmd.nodes, debug=cmd.debug, devel=cmd.devel,
-                                   tunnel=cmd.tunnel, force=cmd.force)
+                                   tunnel=cmd.tunnel, force=cmd.force, quick=cmd.quick)
         elif name == Cmds.actuate:
-            unikernel.actuate.actuate(num_nodes=cmd.nodes, initrdfs=cmd.initrdfs)
+            unikernel.actuate.actuate(num_nodes=cmd.nodes, initrdfs=cmd.initrdfs, quick=cmd.quick)
 
 
 if __name__ == '__main__':
     cmd_struct = {
         Cmds.devel: Command(
-            [Function('init', [], 'Prepare development environment for use'),
+            [Function('install',
+                      [Argument('--conda', {'action': 'store_true', 'help': 'install only conda'}),
+                       Argument('--environ', {'action': 'store_true', 'help': 'install only conda environment'}),
+                       Argument('--basic', {'action': 'store_true', 'help': 'skip virtualization (Docker/QEMU/Unikraft'}),
+                       ], 'Prepare development environment for use'),
              Function('update', [], 'Update development environment'),
              ], [], 'Development environment'),
         Cmds.network: Command([], [], 'Prepare network for Docker/KVM'),
@@ -102,6 +107,7 @@ if __name__ == '__main__':
                            [Argument('-n|--nodes', {'type': int, 'default': default_num_test_nodes}),
                             Argument('--debug', {'choices': ['all', 'build', 'run', 'remote'],
                                                  'help': 'debugging flags'}),
+                            Argument('--quick', {'action': 'store_true', 'help': 'do not rebuild, even if out of date'}),
                             Argument('--tunnel', {'action': 'store_true', 'help': 'display over X11 tunnel'}),
                             Argument('--force', {'action': 'store_true', 'help': 'force builds (ignore cache)'}),
                             ], 'Run automated tests (using Docker)'),
@@ -113,11 +119,15 @@ if __name__ == '__main__':
                                Argument('--debug', {'choices': ['all', 'build', 'run', 'remote'],
                                                     'help': 'debugging flags'}),
                                Argument('--devel', {'action': 'store_true', 'help': 'run the development image'}),
+                               Argument('--quick', {'action': 'store_true', 'help':
+                                                    'do not rebuild, even if out of date'}),
                                Argument('--tunnel', {'action': 'store_true', 'help': 'display over X11 tunnel'}),
                                Argument('--force', {'action': 'store_true', 'help': 'force builds (ignore cache)'}),
                                ], 'Run AutonomousTrust instances in Docker'),
         Cmds.actuate: Command([],
                               [Argument('-n|--nodes', {'type': int, 'default': default_num_actuate_nodes}),
+                               Argument('--quick', {'action': 'store_true', 'help':
+                                                    'do not rebuild, even if out of date'}),
                                Argument('--initrdfs', {'action': 'store_true', 'help': 'use initrd filesystem'}),
                                ], 'Run AutonomousTrust unikernel instances in QEMU/KVM'),
     }
