@@ -30,6 +30,7 @@
 **/.coverage*
 **/coverage
 **/.pytest-cache
+**/poetry.lock
 
 **/rust/target
 **/rust/Cargo.lock
@@ -37,6 +38,7 @@
 **/.conda
 **/.conda_build_locks
 **/.rustup
+**/tox.log
 
 **/etc
 **/var

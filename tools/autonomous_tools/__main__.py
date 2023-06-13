@@ -46,17 +46,18 @@ def main(commands, args):
             elif cmd.function == 'packages':
                 docker.build.build_packages()
             elif cmd.function == 'containers':
-                docker.build.build_containers(pkg_name=cmd.pkg, which=cmd.which, debug=cmd.debug, force=cmd.force)
+                docker.build.build_containers(pkg_name=cmd.pkg_name, which=cmd.which, debug=cmd.debug, force=cmd.force)
         elif name == Cmds.unikernel:
             unikernel.build.build_unikernel(initrdfs=cmd.initrdfs, do_clean=cmd.clean, pristine=cmd.pristine,
                                             debuggable=cmd.debug, force=cmd.force)
         elif name == Cmds.test:
-            test.test(num_nodes=cmd.nodes, debug=cmd.debug, tunnel=cmd.tunnel, force=cmd.force, quick=cmd.quick)
+            test.test(num_nodes=cmd.nodes, debug=cmd.debug, tunnel=cmd.tunnel, force=cmd.force,
+                      quick=cmd.quick, shell=cmd.shell)
         elif name == Cmds.simulate:
             raise NotImplementedError
         elif name == Cmds.emulate:
             docker.emulate.emulate(num_nodes=cmd.nodes, debug=cmd.debug, devel=cmd.devel,
-                                   tunnel=cmd.tunnel, force=cmd.force, quick=cmd.quick)
+                                   tunnel=cmd.tunnel, force=cmd.force, quick=cmd.quick, shell=cmd.shell)
         elif name == Cmds.actuate:
             unikernel.actuate.actuate(num_nodes=cmd.nodes, initrdfs=cmd.initrdfs, quick=cmd.quick)
 
@@ -108,6 +109,8 @@ if __name__ == '__main__':
                             Argument('--debug', {'choices': ['all', 'build', 'run', 'remote'],
                                                  'help': 'debugging flags'}),
                             Argument('--quick', {'action': 'store_true', 'help': 'do not rebuild, even if out of date'}),
+                            Argument('--shell', {'action': 'store_true',
+                                                 'help': 'get a shell in docker instead of running tests'}),
                             Argument('--tunnel', {'action': 'store_true', 'help': 'display over X11 tunnel'}),
                             Argument('--force', {'action': 'store_true', 'help': 'force builds (ignore cache)'}),
                             ], 'Run automated tests (using Docker)'),
@@ -121,6 +124,8 @@ if __name__ == '__main__':
                                Argument('--devel', {'action': 'store_true', 'help': 'run the development image'}),
                                Argument('--quick', {'action': 'store_true', 'help':
                                                     'do not rebuild, even if out of date'}),
+                               Argument('--shell', {'action': 'store_true',
+                                                    'help': 'get a shell in docker instead of running the app'}),
                                Argument('--tunnel', {'action': 'store_true', 'help': 'display over X11 tunnel'}),
                                Argument('--force', {'action': 'store_true', 'help': 'force builds (ignore cache)'}),
                                ], 'Run AutonomousTrust instances in Docker'),
