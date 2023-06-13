@@ -101,8 +101,8 @@ def build_containers(pkg_name: Union[str, None] = None, which: Container = Conta
             construct_list = [devel]
         elif which == Container.test:
             construct_list = [test]
-            if pkg_name + '-devel' not in get_image_list():
-                construct_list.insert(0, devel)
+            #if pkg_name + '-devel' not in get_image_list():
+            #    construct_list.insert(0, devel)
 
         cmd = ['docker', 'build']
         extra = []

@@ -15,27 +15,35 @@ RUN apt-get update && \
     apt-get install -y build-essential iproute2 iputils-ping iputils-arping iputils-tracepath sudo && \
     apt-get clean
 
-RUN useradd -U user -d /app
-COPY src/autonomous-trust/.bashrc /app/.bashrc
-RUN echo "ALL            ALL = (ALL) NOPASSWD: ALL" >>/etc/sudoers
-
-COPY src/autonomous-trust/entrypoint.sh /entrypoint.sh
+COPY src/autonomous-trust/entrypoint.sh /bin/entrypoint.sh
 ENV ROUTER="172.17.0.1"
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/bin/entrypoint.sh"]
+
+RUN useradd -U user -d /app
+RUN echo "ALL            ALL = (ALL) NOPASSWD: ALL" >>/etc/sudoers
+RUN chmod -R 0777 /opt/conda
+RUN chown -R user:user /app
+USER user
 
 RUN --mount=type=bind,source=tools,target=/app/.tools --mount=type=cache,target=/opt/conda/pkgs \
     .tools/trust devel install --environ
 RUN --mount=type=bind,source=tools,target=/app/.tools --mount=type=cache,target=/opt/conda/pkgs \
     .tools/trust devel install --basic
 
+
 SHELL ["conda", "run", "--live-stream", "-n", "autonomous_trust", "/bin/bash", "-c"]
 RUN pip install pydevd-pycharm
-COPY src/autonomous-trust/rust rust
-COPY src/autonomous-trust/autonomous_trust autonomous_trust
+
+COPY --chown=user:user src/autonomous-trust/.bashrc .bashrc
+COPY --chown=user:user src/autonomous-trust/rust rust
+COPY --chown=user:user src/autonomous-trust/autonomous_trust autonomous_trust
 RUN rm -rf autonomous_trust/etc autonomous_trust/var
-#COPY src/autonomous-trust/pyproject.toml.rust-ext pyproject.toml
+
+# if using rust, swap with lines below
+#COPY --chown=user:user src/autonomous-trust/pyproject.toml.rust-ext pyproject.toml
 #RUN maturin develop
-COPY src/autonomous-trust/pyproject.toml pyproject.toml
+
+COPY --chown=user:user src/autonomous-trust/pyproject.toml pyproject.toml
 RUN poetry install
 
 ENV AUTONOMOUS_TRUST_ARGS=""

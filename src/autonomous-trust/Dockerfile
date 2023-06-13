@@ -15,17 +15,18 @@ RUN apt-get update && \
     apt-get install -y iproute2 iputils-ping iputils-arping iputils-tracepath sudo && \
     apt-get clean
 
-RUN useradd -U user -d /app
-COPY autonomous-trust/.bashrc /app/.bashrc
+#RUN useradd -U user -d /app
 RUN echo "ALL            ALL = (ALL) NOPASSWD: ALL" >>/etc/sudoers
+#RUN chown -R user:user /app
+#COPY --chown=user:user autonomous-trust/.bashrc /app/.bashrc
 
 RUN conda config --add channels conda-forge
 RUN conda update -y -n base conda
 RUN conda create -n autonomous_trust python=3.10 && conda clean -afy
 
-COPY autonomous-trust/entrypoint.sh /entrypoint.sh
+COPY autonomous-trust/entrypoint.sh /bin/entrypoint.sh
 ENV ROUTER="172.17.0.1"
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/bin/entrypoint.sh"]
 
 SHELL ["conda", "run", "--live-stream", "-n", "autonomous_trust", "/bin/bash", "-c"]
 RUN pip install pydevd-pycharm
