@@ -5,7 +5,7 @@
 # Prerequisites: (build from repo base dir, context is src)
 #   docker build -t package-builder -f src/Dockerfile-build src
 #   docker run --rm -u $(id -u):$(id -g) -v src/autonomous-trust-inspector:/build/src -v src/dist:/build/dist -it package-builder
-#   docker build -t autonomous-inspector -f src/autonomous-trust-inspector/Dockerfile src
+#   docker build -t autonomous-trust-inspector -f src/autonomous-trust-inspector/Dockerfile src
 
 FROM autonomous-trust
 

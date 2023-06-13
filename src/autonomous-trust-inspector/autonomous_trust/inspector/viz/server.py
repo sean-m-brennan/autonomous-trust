@@ -16,9 +16,9 @@ class VizServer(object):
         self.finished = finished
         self.port = port
         print(' * Directory on host: %s' % directory)
-        appname = __package__.split('.')[0]
-        self.app = quart.Quart(appname,
-                               static_url_path='', static_folder=directory, template_folder=directory)
+        #appname = __package__.split('.')[0]  # FIXME wrong for Quart, wrong also for SassASGI?
+        appname = __name__
+        self.app = quart.Quart(appname, static_url_path='', static_folder=directory, template_folder=directory)
         self.app.debug = True
 
         os.environ['PATH_INFO'] = '/scss/tekfive.scss'

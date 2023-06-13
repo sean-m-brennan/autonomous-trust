@@ -10,11 +10,12 @@
 FROM autonomous-trust-devel
 
 WORKDIR /app
-COPY tests tests
-COPY tox.ini tox.ini
-COPY requirements.txt requirements.txt
-COPY tests_require.txt tests_require.txt
-COPY MANIFEST.in MANIFEST.in
-RUN mkdir -p coverage
+USER user
+COPY --chown=user:user tests tests
+COPY --chown=user:user tox.ini tox.ini
+COPY --chown=user:user requirements.txt requirements.txt
+COPY --chown=user:user tests_require.txt tests_require.txt
+COPY --chown=user:user MANIFEST.in MANIFEST.in
+RUN mkdir -p /app/coverage
 
 CMD ["/bin/bash", "-c", "conda run --live-stream -n autonomous_trust tox 2>&1 | tee /app/tests/tox.log"]
