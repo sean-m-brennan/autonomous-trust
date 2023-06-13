@@ -34,7 +34,9 @@ def run_container(container_name: str, image_name: str, network_name: str, extra
                   mounts: list[tuple[str, str]] = None, net_admin: bool = False,
                   detached: bool = True, override: bool = False) -> bool:
     if detached:
-        mounts += ['-v', '/dev/log:/dev/log']
+        if mounts is None:
+            mounts = []
+        mounts += [('/dev/log', '/dev/log')]  # write to host's syslog
     cmd = _run_cmd(container_name, image_name, network_name, extra_args, mounts, net_admin, detached, override)
     p = subprocess.Popen(cmd)
     if p.returncode != 0:
@@ -47,6 +49,8 @@ def run_interactive_container(container_name: str, image_name: str, network_name
                               tunnel: bool = False, blocking: bool = False, override: bool = False) -> bool:
     cmd = _run_cmd(container_name, image_name, network_name, extra_args, mounts, net_admin,
                    detached=False, override=override)
+    #if debug_run:
+    #    print(cmd)
     get_terminal(tunnel).run(' '.join(cmd), debug_run, blocking)
     return True
 

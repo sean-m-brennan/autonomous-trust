@@ -5,7 +5,7 @@ from autonomous_trust.inspector.viz import server
 from .. import INSIDE_DOCKER
 
 
-@pytest.mark.skipif(INSIDE_DOCKER)
+@pytest.mark.skipif(INSIDE_DOCKER, reason='Inside docker (not valid)')
 @pytest.mark.asyncio
 async def test_presentation():
     pages_list = ['/']  # FIXME

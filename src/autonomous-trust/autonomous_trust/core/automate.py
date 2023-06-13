@@ -4,7 +4,7 @@ import random
 import sys
 import time
 import logging
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler, SysLogHandler
 import traceback
 import queue
 from enum import Enum
@@ -95,6 +95,8 @@ class AutonomousTrust(Protocol):
         handler.setLevel(log_level)
         self._logger = logging.getLogger(self.name)
         self._logger.addHandler(handler)
+        syslog_handler = SysLogHandler(address='/dev/log')
+        self._logger.addHandler(syslog_handler)
         super().__init__(CfgIds.main, self._logger, None, None)
         self.identity = None
 

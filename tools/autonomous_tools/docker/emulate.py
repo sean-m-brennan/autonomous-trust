@@ -17,7 +17,7 @@ class DbgModes(object):
 
 
 def emulate(num_nodes: int = 2, force: bool = False, debug: DbgModes = None, excludes=('network',),
-            tunnel: bool = False, devel: bool = False, quick: bool = False):
+            tunnel: bool = False, devel: bool = False, quick: bool = False, shell: bool = False):
     if not quick:
         build_containers('packaged')  # FIXME conditional build not working
     create_network(force=force)
@@ -45,7 +45,7 @@ def emulate(num_nodes: int = 2, force: bool = False, debug: DbgModes = None, exc
         extra_args = extras + ['-e', 'AUTONOMOUS_TRUST_ARGS="--live --test %s %s"' % (remote_dbg, exclude_args)]
         name = 'at-%s' % n
 
-        run_interactive_container(name, img_name, network_name,
-                                  extra_args=extra_args, mounts=mounts, debug_run=debug_run, tunnel=tunnel)
+        run_interactive_container(name, img_name, network_name, mounts=mounts, extra_args=extra_args,
+                                  debug_run=debug_run, tunnel=tunnel, override=shell)
         if n < num_nodes:
             time.sleep(random.randint(min_sec, max_sec))
