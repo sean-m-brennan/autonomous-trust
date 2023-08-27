@@ -12,3 +12,6 @@ dependencies:
   - libsass
   - networkx
   - quart
+  - numpy
+  - opencv
+  - imutils
