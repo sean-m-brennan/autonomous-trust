@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1.3
+
+# Runs automated testing for AutonomousTrust
+
+# Build from repo base dir, context is src/autonomous-trust-simulator:
+#    docker build -t autonomous-trust-inspector-test -f src/autonomous-trust-simulator/Dockerfile-test src/autonomous-trust-simulator
+# Run as:
+#    docker run --rm -u $(id -u):$(id -g) -v src/autonomous-trust-simulator:/app -it autonomous-trust-simulator-test
+
+FROM autonomous-trust-simulator-devel
+
+WORKDIR /app
+USER user
+COPY --chown=user:user tests tests
+COPY --chown=user:user tox.ini tox.ini
+COPY --chown=user:user requirements.txt requirements.txt
+COPY --chown=user:user tests_require.txt tests_require.txt
+RUN mkdir -p /app/coverage
+
+CMD ["sh", "-c", "python3 -m tests"]
