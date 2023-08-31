@@ -15,3 +15,5 @@ dependencies:
   - numpy
   - opencv
   - imutils
+  - geopy
+  - utm
