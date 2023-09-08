@@ -1,22 +1,45 @@
-from enum import Enum
-
-from .. import Serializable
+from ..util import SerializableEnum
 
 
-class NetInterface(Serializable):
-    def __init__(self, rate: int, mark: int):
-        self.rate = rate
-        self.mark = mark
+class Antenna(SerializableEnum):
+    DIPOLE = 'dipole'
+    YAGI = 'yagi'
+    PARABOLIC = 'parabolic'
+
+    @property
+    def gain(self):
+        """Antenna gain in dBm"""
+        if self.value == 'dipole':
+            return 3.0
+        if self.value == 'yagi':
+            return 12.0
+        if self.value == 'parabolic':
+            return 25.0
 
 
-class InterfaceClasses(NetInterface, Enum):
-    SMALL = NetInterface(10 * 1000, 11)  # 10Kbps
-    MEDIUM = NetInterface(10 * 1000 * 1000, 22)  # 10Mbps
-    LARGE = NetInterface(10 * 1000 * 1000 * 1000, 33)  # 10Gbps
+class NetInterface(SerializableEnum):
+    """Classes of network interfaces with transfer rate and identifier mark"""
+    SMALL = 'small'
+    MEDIUM = 'medium'
+    LARGE = 'large'
     POINT_TO_POINT = LARGE  # eg. laser
 
+    @property
+    def rate(self):
+        """Transfer rate in bps"""
+        if self.value == 'small':
+            return 10 * 1000  # 10Kbps
+        if self.value == 'medium':
+            return 10 * 1000 * 1000 # 10Mbps
+        if self.value == 'large':
+            return 10 * 1000 * 1000 * 1000 # 10Gbps
 
-class AntennaClasses(float, Enum):
-    DIPOLE = 3.0
-    YAGI = 12.0
-    PARABOLIC = 25.0
+    @property
+    def mark(self):
+        """iptables mark"""
+        if self.value == 'small':
+            return 11
+        if self.value == 'medium':
+            return 22
+        if self.value == 'large':
+            return 33

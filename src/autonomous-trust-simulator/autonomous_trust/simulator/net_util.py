@@ -124,6 +124,7 @@ class Server(object):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.set_socket_options()
+        print('Bind 0.0.0.0 port %d' % port)
         self.sock.bind(('0.0.0.0', port))
         self.sock.listen(5)
 
