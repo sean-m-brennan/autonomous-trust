@@ -4,6 +4,7 @@ from typing import Optional
 import cv2
 import imutils
 import numpy as np
+#from flask_socketio import SocketIO
 
 from .. import net_util as net
 from .noise import Noise, add_noise
@@ -46,7 +47,10 @@ class VideoRcvr(net.Client):
         frame, pause = self.get_frame(kwargs.get('noisy', True), kwargs.get('size', None))
         if frame is not None:
             self.image_shape = frame.shape
-            self.display_callback(kwargs['name'], frame, pause)
+            if kwargs.get('encode', False):
+                _, frame = cv2.imencode('.jpg', frame)
+            if self.display_callback is not None:
+                self.display_callback(kwargs.get('name', ''), frame, pause)
 
 
 if __name__ == '__main__':
