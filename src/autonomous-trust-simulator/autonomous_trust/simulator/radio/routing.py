@@ -1,13 +1,11 @@
 import argparse
-import json
 import os
 import subprocess
 import shlex
 
-from .iface import InterfaceClasses
+from .iface import NetInterface
 from .. import net_util as net
 from ..peer.peer import PeerConnection
-from ..sim_data import SimState
 
 
 class Router(net.Client):
@@ -57,7 +55,7 @@ class Router(net.Client):
                          'allot 1514 weight 1Mbit prio 5 maxburst 1000 avpkt 1000')
         self.traffic_ctl('qdisc', 'add dev', self.iface, 'parent 1:100 sfq quantum 1514b perturb 15')
         # throttled classes:
-        for net_class in [n.value for n in InterfaceClasses]:
+        for net_class in [n.value for n in NetInterface]:
             self.traffic_ctl('class', 'add dev', self.iface,
                              'parent 1:1 classid 1:200 cbq bandwidth %s rate %s ' % (self.max_bw, net_class.rate) +
                              'allot 1514 weight %s prio 3 maxburst 50 avpkt 1000 bounded' % net_class.rate)
@@ -104,8 +102,7 @@ class Router(net.Client):
         return False
 
     def recv_data(self, **kwargs):
-        data = self.recv_all(self.header_fmt)
-        state = SimState(**json.loads(data))
+        state = super().recv_data(**kwargs)
 
         chain = 'DOCKER-USER'
         if self.containerized:

@@ -51,8 +51,8 @@ def test_utm_dist_across_zones(locations):
 def test_position_conversion(locations):
     t5, uah, abq = locations
     dist1 = t5.distance(uah)
-    utm1 = t5.convert()
-    utm2 = uah.convert()
+    utm1 = t5.convert(UTMPosition)
+    utm2 = uah.convert(UTMPosition)
     dist2 = utm1.distance(utm2)
     assert dist2 == pytest.approx(dist1, rel=1e-2, abs=1e-2)
 
@@ -64,6 +64,6 @@ def test_position_conversion(locations):
     assert dist4 == pytest.approx(dist1, rel=1e-2, abs=1e-2)
 
     dist5 = abq.distance(t5)
-    utm3 = abq.convert()
+    utm3 = abq.convert(UTMPosition)
     dist6 = utm3.distance(utm1)  # differing zones
     assert dist6 == pytest.approx(dist5, abs=1e1)

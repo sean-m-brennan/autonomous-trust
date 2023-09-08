@@ -1,6 +1,7 @@
 import glob
 import os.path
 import struct
+import time
 from typing import Optional
 
 import cv2
@@ -23,13 +24,14 @@ class VideoSource(net.Server):
 
         for path in sorted(glob.glob(video_path_pattern)):
             loop = 0
+            vid = None
             while loop < loops:
                 vid = cv2.VideoCapture(path)
                 more = True
                 idx = 0
                 while more and not self.halt:
                     if synchronized and len(self.clients) < 1:
-                        # TODO time.sleep(.001)
+                        time.sleep(.001)
                         continue
                     more, frame = vid.read()
                     idx += 1
@@ -38,6 +40,8 @@ class VideoSource(net.Server):
                         continue
                     if idx % speed > 0:
                         continue
+
+                    frame = self.process_frame(frame)
 
                     if size is not None:
                         frame = imutils.resize(frame, width=size)
@@ -51,6 +55,12 @@ class VideoSource(net.Server):
                             except (ConnectionResetError, BrokenPipeError):
                                 self.clients.remove(client_socket)
                 loop += 1
+            if vid is not None:
+                vid.release()
+
+    def process_frame(self, frame):
+        """Implements frame processing before resizing and shipping. Default: pass-through"""
+        return frame
 
     def run(self, video_path_pattern: str, size: Optional[int] = 640, loops: int = 2, speed: int = 1, port: int = 9999,
             fast_encoding: bool = False, synchronized: bool = False):
