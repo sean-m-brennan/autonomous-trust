@@ -1,137 +1,184 @@
+import logging
 import os
 import threading
+import time
+from collections import deque, namedtuple
 from datetime import datetime, timedelta
 
-import plotly
 from flask import Flask
-from dash import Dash, html, dcc, Output, Input, State
+from dash import Dash, html, dcc, Output, Input
 import plotly.graph_objects as go
-import numpy as np
+import plotly.colors as colors
 from uuid import uuid4
 
 from ..radio.iface import Antenna, NetInterface
 from .peer import PeerData
 from .path import BezierData, PathData, EllipseData, Variability
 from .position import GeoPosition, UTMPosition
-from ..sim_data import SimState, SimConfig
+from ..sim_data import SimConfig
 from ..simulator import Simulator
 from ..sim_client import SimClient
+from .dash_config import generate_config, generate_small_config
 
 
-def generate_config(filepath: str):
-    t5 = GeoPosition(34.669650, -86.575907, 182).convert(UTMPosition)
-    uah = GeoPosition(34.725279, -86.639962, 198).convert(UTMPosition)
-    mid = t5.midpoint(uah)
-    one = UTMPosition(t5.zone, t5.easting, uah.northing, mid.alt)
-    two = UTMPosition(t5.zone, uah.easting, t5.northing, mid.alt)
-    start = datetime.now()
-    end = datetime.now() + timedelta(minutes=30)
-    shape1 = BezierData(t5, uah, [one, two])
-    path1 = PathData(start, end, shape1, Variability.GAUSSIAN, 4.4, Variability.UNIFORM)
-    peer1 = PeerData(str(uuid4()), '192.168.0.2', path1.shape.start, -200.,
-                     Antenna.DIPOLE, NetInterface.SMALL, start, end, path1, [])
-    shape2 = EllipseData(uah, 1000, 600, -45.)
-    path2 = PathData(start, end, shape2, Variability.GAUSSIAN, 4.4, Variability.UNIFORM)
-    peer2 = PeerData(str(uuid4()), '192.168.0.1', path2.shape.start, -200.,
-                     Antenna.DIPOLE, NetInterface.SMALL, start, end, path2, [])
-    config = SimConfig(time=start, peers=[peer1, peer2])
-    config.to_file(filepath)
+Coord = namedtuple('Coord', 'lat lon')
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)  # reduce callback noise from Flask
 
 
 class MapDisplay(object):
     """Dynamic map of peer positions that updates from simulator"""
-    def __init__(self, sim_config: str):
+    trace_len = 30
+
+    def __init__(self, host: str = '127.0.0.1', port: int = 8050, size: int = 600):
+        self.host = host
+        self.port = port
         self.server = Flask(__name__)
-        self.app = Dash(__name__, server=self.server)
-        self.sim = Simulator(sim_config)
-        self.cli = SimClient()
-        self.mapbox_token = os.environ.get('MAPBOX', '')
-        self.resolution = 20
+        self.app = Dash(__name__, server=self.server,
+                        prevent_initial_callbacks=True, update_title=None)
+        self.cli = SimClient(debug=True)
+        self.mapbox_token = os.environ.get('MAPBOX', None)
+        self.use_mapbox = False if self.mapbox_token is None else True
         self.tick = -1
-        self.state = SimState()
+        self.state = None
+        self.halt = False
+        self.started = False
+        self.height = size
 
         self.app.layout = html.Div([
             html.Div(id='time'),
             html.Div([
-                dcc.Graph(id='graph', animate=True),
-                dcc.Interval(id="interval", interval=1000, n_intervals=0),
-                # FIXME use store for previous n positions
-                # dcc.Store(id='offset', data=0),
-                # dcc.Store(id='store', data=dict(x=x, y=y, resolution=self.resolution)),
+                dcc.Graph(id='graph', config={'displayModeBar': False}),
+                dcc.Interval(id="interval", interval=.5 * 1000, n_intervals=0),
             ]),
-            html.Div(id='map')
         ])
+
+        self.fig = go.Figure()
+        self.color_map = {}
+        self.coords = {}
+        self.z_scale = 10000
+        self.all = []
 
         @self.app.callback(Output('time', 'children'),
                            Input('interval', 'n_intervals'))
         def update_time(tick):
             self.update_data(tick)
-            return self.state.time.isoformat(' ')
+            if self.state is None:
+                return
+            return self.state.time.isoformat(' ').rsplit('.')[0]
 
         @self.app.callback(Output('graph', 'figure'),
-                           Input('interval', 'n_intervals'))
-        def update_paths(tick):
+                           [Input('interval', 'n_intervals'),
+                            Input('graph', 'relayoutData')])
+        def update_paths(tick, relayout):
             self.update_data(tick)
-            x = []
-            y = []
+            if self.state is None:
+                if self.started:
+                    self.halt = True
+                return
+            self.started = True
+            #center = self.state.center.convert(GeoPosition)
             for uuid in self.state.peers:
-                position = self.state.peers[uuid]
-                x.append(position.x)
-                y.append(position.y)
-            # FIXME append trace
-            data = plotly.graph_objs.Scatter(x=x, y=y, name='Scatter', mode='lines+markers')
-            return {'data': [data],
-                    'layout': go.Layout(xaxis=dict(range=[min(x), max(x)]),
-                                        yaxis=dict(range=[min(y), max(y)]))
-                    }
+                position = self.state.peers[uuid].convert(GeoPosition)
+                if uuid not in self.coords:
+                    self.coords[uuid] = Coord(deque(maxlen=self.trace_len), deque(maxlen=self.trace_len))
+                self.coords[uuid].lat.append(position.x)
+                self.coords[uuid].lon.append(position.y)
+                self.fig.update_traces(selector=dict(name=uuid), mode='lines', overwrite=True,
+                                       lat=list(self.coords[uuid].lat), lon=list(self.coords[uuid].lon))
+                self.fig.update_traces(selector=dict(name='mark-%s' % uuid), mode='markers', overwrite=True,
+                                       lat=[self.coords[uuid].lat[-1]], lon=[self.coords[uuid].lon[-1]])
+                self.all.append(position)
+            scale = self.z_scale
+            if relayout is not None:
+                center = GeoPosition.middle(self.all)
+                if self.use_mapbox:
+                    if 'mapbox.zoom' in relayout:
+                        scale = relayout['mapbox.zoom']
+                    self.fig.update_layout({'mapbox.center.lat': center.lat,
+                                            'mapbox.center.lon': center.lon,
+                                            'mapbox.zoom': scale}, True)
+                else:
+                    if 'geo.projection.scale' in relayout:
+                        scale = relayout['geo.projection.scale']
+                    self.fig.update_layout({'geo.center.lat': center.lat,
+                                            'geo.center.lon': center.lon,
+                                            'geo.projection.scale': scale}, True)
+            return self.fig
 
-        @self.app.callback(Output('map', 'children'),
-                           Input('interval', 'n_intervals'))
-        def update_map(tick):
-            self.update_data(tick)
-            ctr = self.state.center
-            scale = self.state.scale
-            # FIXME update map
-            return
-
-        # self.app.clientside_callback(  # FIXME:
-        #    """
-
-    # function (n_intervals, data, offset) {
-    #    offset = offset % data.x.length;
-    #    const end = Math.min((offset + 10), data.x.length);
-    #    return [[{x: [data.x.slice(offset, end)], y: [data.y.slice(offset, end)]}, [0], 500], end]
-    # }
-    # """,
-    # [Output('graph', 'extendData'),
-    # Output('offset', 'data')],
-    # [Input('interval', 'n_intervals')],
-    # [State('store', 'data'), State('offset', 'data')]
-    # )
+    def acquire_initial_conditions(self):
+        while self.cli.is_socket_closed():
+            time.sleep(0.5)
+        self.update_data(0)
+        if self.state is None:
+            raise RuntimeError('Unconnected client')
+        center = self.state.center.convert(GeoPosition)
+        scatter = go.Scattergeo
+        if self.use_mapbox:
+            scatter = go.Scattermapbox
+            self.z_scale = 12  # TODO: compute, this is tuned
+        for idx, uuid in enumerate(self.state.peers):
+            position = self.state.peers[uuid].convert(GeoPosition)
+            self.color_map[uuid] = colors.qualitative.Light24[idx]
+            self.fig.add_trace(scatter(lat=[position.lat], lon=[position.lon],
+                                       mode='markers', marker=dict(color=self.color_map[uuid], opacity=.7),
+                                       name='mark-' + uuid))
+            self.fig.add_trace(scatter(lat=[position.lat], lon=[position.lon],
+                                       mode='lines', line=dict(color=self.color_map[uuid], width=3),
+                                       name=uuid))
+        basic_layout = dict(showlegend=False, autosize=False, hovermode='closest',
+                            uirevision='keep', height=self.height)
+        if self.use_mapbox:
+            self.fig.update_layout(**basic_layout,
+                                   mapbox=dict(
+                                       accesstoken=self.mapbox_token,
+                                       style="dark",
+                                       center=dict(lat=center.lat, lon=center.lon),
+                                       zoom=self.z_scale,
+                                   ))
+        else:
+            self.fig.update_layout(**basic_layout,
+                                   geo=dict(scope='usa',
+                                            showsubunits=True,
+                                            center=dict(lat=center.lat, lon=center.lon),
+                                            # zoom=self.z_scale  #FIXME wrong
+                                            ))
 
     def update_data(self, tick):
         if tick > self.tick:
             self.state = self.cli.recv_data()
             self.tick += 1
 
-    def run(self):
-        t1 = threading.Thread(target=self.sim.run, args=(8888,))
-        t1.start()
-        self.app.run_server(debug=True)
-        self.sim.halt = True
-        t1.join()
+    def run(self, sim_host: str = '127.0.0.1', sim_port: int = 8778,
+            with_server: bool = False, sim_config: str = None):
+        threads = []
+        sim = None
+        if with_server:
+            sim = Simulator(sim_config, 60, debug=True)  # in seconds
+            threads.append(threading.Thread(target=sim.run, args=(sim_port,)))
+
+        threads.append(threading.Thread(target=self.cli.run, args=(sim_host, sim_port)))
+        for t in threads:
+            t.start()
+        self.acquire_initial_conditions()
+        self.app.run(self.host, self.port)
+        self.cli.halt = True
+        if sim is not None:
+            sim.halt = True
+        for t in threads:
+            t.join()
 
 
 if __name__ == '__main__':
     cfg = os.path.join(os.path.dirname(__file__), 'test.cfg')
     if not os.path.exists(cfg):
         try:
-            generate_config(cfg)
+            generate_small_config(cfg)
         except:
             os.remove(cfg)
             raise
     try:
-        MapDisplay(cfg).run()
+        MapDisplay().run(with_server=True, sim_config=cfg)
     finally:
         if os.path.exists(cfg):
             os.remove(cfg)
