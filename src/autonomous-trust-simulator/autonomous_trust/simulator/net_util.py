@@ -6,12 +6,17 @@ import time
 from typing import Optional
 
 
+#NULL = b'\x00'
+NULL = b''
+
+
 class ReceiveFormatError(RuntimeError):
     pass
 
 
 class Client(object):
-    def __init__(self):
+    def __init__(self, debug: bool = False):
+        self.debug = debug
         self.halt = False
         self.sock: Optional[socket.socket] = None
 
@@ -49,10 +54,17 @@ class Client(object):
     def recv_all(self, header_fmt: str):
         header_size = struct.calcsize(header_fmt)
         data = b""
+        if NULL != b'':
+            b = b' '  # FIXME?
+            while b != NULL:
+                b = self.sock.recv(1)  # consume faulty bytes
+                if not b:
+                    break
         while len(data) < header_size:
             packet = self.sock.recv(1024)
             if not packet:
-                break
+                #break
+                return None, None
             data += packet
         packed_msg_size = data[:header_size]
         data = data[header_size:]
@@ -61,13 +73,16 @@ class Client(object):
             msg_size = header[0]
         except struct.error:
             raise ReceiveFormatError
+        if self.debug:
+            print('Recv %d bytes' % msg_size)
 
         while len(data) < msg_size:
-            data += self.sock.recv(msg_size - len(data))
+            #data += self.sock.recv(msg_size - len(data))  # FIXME?
+            data += self.sock.recv(1024)
         return header, data
 
     def recv_data(self, **kwargs):
-        # eg. data = self.sock.recv(1024)
+        # eg. data = self.recv_all(self.header_fmt)
         raise NotImplementedError
 
     def finish(self):
@@ -92,7 +107,8 @@ class Client(object):
 
 
 class Server(object):
-    def __init__(self):
+    def __init__(self, debug: bool = False):
+        self.debug = debug
         self.clients: list[socket.socket] = []
         self.halt: bool = False
         self.sock: Optional[socket.socket] = None
@@ -113,9 +129,10 @@ class Server(object):
         if self.sock is not None:
             self.sock.settimeout(0.2)
 
-    @staticmethod
-    def prepend_header(fmt, data, *args):
-        return struct.pack(fmt, len(data), *args) + data
+    def prepend_header(self, fmt, data, *args):
+        if self.debug:
+            print('Send %d bytes' % len(data))
+        return NULL + struct.pack(fmt, len(data), *args) + data
 
     def finish(self):
         pass
@@ -124,7 +141,6 @@ class Server(object):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.set_socket_options()
-        print('Bind 0.0.0.0 port %d' % port)
         self.sock.bind(('0.0.0.0', port))
         self.sock.listen(5)
 
