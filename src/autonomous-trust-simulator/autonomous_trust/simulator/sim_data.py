@@ -29,6 +29,12 @@ class SimState(Configuration):
         if reachable is None:
             self.reachable: Matrix = {}
 
+    def convert(self) -> 'SimState':
+        state = SimState(**self.to_dict())
+        for peer_id in state.peers:
+            state.peers[peer_id] = state.peers[peer_id].convert(GeoPosition)
+        return state
+
 
 class SimConfig(Configuration):
     """Just the scenario"""

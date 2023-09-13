@@ -17,3 +17,5 @@ dependencies:
   - imutils
   - geopy
   - utm
+  - dash==2.6.2
+  - flask
