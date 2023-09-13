@@ -21,7 +21,10 @@ class PeerConnection(Configuration):
 
     def can_reach(self, other: 'PeerConnection') -> bool:
         min_strength = -154 * 10 * math.log10(self.iface.rate)  # dBm * 10log10(bps)
-        signal_strength = (1.0 / (self.position.distance(other.position) ** 2) * self.signal) + self.antenna.gain
+        dist = self.position.distance(other.position)
+        if dist == 0:
+            dist = .001
+        signal_strength = (1.0 / (dist ** 2) * self.signal) + self.antenna.gain
         # dBm is negative, more negative is stronger
         return signal_strength < min_strength
 

@@ -58,7 +58,7 @@ class Configuration(object):
 
     def __repr__(self):
         attrs = []
-        for k, v in sorted(vars(self).items()):
+        for k, v in sorted(self.to_dict().items()):
             if isinstance(v, str):
                 attrs.append(k + '=' + v)
             else:

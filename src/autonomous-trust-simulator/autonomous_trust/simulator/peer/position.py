@@ -47,7 +47,7 @@ class Position(Configuration):
         if not all([isinstance(pos, type(others[0])) for pos in others]):
             raise RuntimeError('Cannot mix differing Position types')
         if isinstance(others[0], UTMPosition):
-            zones = [others[i].zone == others[i-1].zone for i in range(len(others)) if i > 0]  # noqa
+            zones = [others[i].zone == others[i - 1].zone for i in range(len(others)) if i > 0]  # noqa
             if not all(zones):
                 raise RuntimeError('Incompatible UTMPositions (differing zones)')
         x = [pos._x for pos in others]
@@ -58,17 +58,17 @@ class Position(Configuration):
         mid_z = None
         if len(z) > 0:
             mid_z = (max(z) + min(z)) / 2.
-        if cls == UTMPosition:
+        if cls == UTMPosition:  # FIXME
             return UTMPosition(others[0].zone, mid_x, mid_y, mid_z)  # noqa
         return GeoPosition(mid_x, mid_y, mid_z)
 
     def _additive_op(self, op, other) -> 'Position':
-        if not all([isinstance(pos, type(self)) for pos in [self, other]]):
-            raise RuntimeError('Cannot mix differing Position types')
         if op not in ['plus', 'minus']:
             raise RuntimeError('Invalid operation %s' % op)
-        if isinstance(other, UTMPosition):
-            if self.zone_num != other.zone_num:  # noqa
+        if isinstance(other, Position):
+            if not all([isinstance(pos, type(self)) for pos in [self, other]]):
+                raise RuntimeError('Cannot mix differing Position types')
+            if isinstance(other, UTMPosition) and self.zone_num != other.zone_num:  # noqa
                 raise RuntimeError('Incompatible UTMPositions (differing zones)')
             if op == 'plus':
                 x = self.x + other.x
@@ -120,13 +120,13 @@ class GeoPosition(Position):
     def __init__(self, lat: float, lon: float, alt: Optional[float] = None):
         """Specified in decimal degrees, plus meters for altitude"""
         super().__init__(lat, lon, alt)
-        self.lat = lat
-        self.lon = lon
-        self.alt = alt
+        self.lat = float(lat)
+        self.lon = float(lon)
+        self.alt = float(alt)
 
     def convert(self, cls):
         """Convert to UTM"""
-        if cls == GeoPosition:
+        if cls == self.__class__:
             return self
         easting, northing, zone_num, _ = utm.from_latlon(self.lat, self.lon)
         zone = '%d%s' % (zone_num, UTMPosition.hemisphere(self))
@@ -170,7 +170,7 @@ class UTMPosition(Position):
 
     def convert(self, cls):
         """Convert to Geo"""
-        if cls == UTMPosition:
+        if cls == self.__class__:
             return self
         lat, lon = utm.to_latlon(self.easting, self.northing, self.zone_num, northern=self.north)
         return GeoPosition(lat, lon, self.alt)
