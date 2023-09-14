@@ -1,47 +1,96 @@
+import base64
 import select
 import socket
 import struct
 import threading
 import time
+from queue import Queue, Empty
 from typing import Optional
 
 
-#NULL = b'\x00'
-NULL = b''
-
-
-class ReceiveFormatError(RuntimeError):
+class ReceiveError(RuntimeError):
     pass
 
 
-class Client(object):
+class ReceiveHeaderError(ReceiveError):
+    pass
+
+
+class ReceiveFormatError(ReceiveError):
+    pass
+
+
+class ReceiveDataError(ReceiveError):
+    pass
+
+
+class Net(object):
+    """Base networking class"""
+    header_fmt = '!L'  # max 4GB message size
+
     def __init__(self, debug: bool = False):
         self.debug = debug
         self.halt = False
         self.sock: Optional[socket.socket] = None
 
-    def is_socket_closed(self) -> bool:
+    def _read(self, sock: socket.socket, size: int) -> Optional[bytes]:
+        data = b""
+        while len(data) < size:
+            try:
+                new_data = sock.recv(size - len(data))
+            except OSError:
+                sock.close()
+                raise ReceiveError
+            if len(new_data) == 0:
+                raise ReceiveError
+            data += new_data
+        if self.debug:
+            print('Recv ', data)
+        return data
+
+    def _write(self, sock: socket.socket, data: bytes):
+        data_len = len(data)
+        offset = 0
+        while offset != data_len:
+            offset += sock.send(data[offset:])
+        if self.debug:
+            print('Send ', data)
+
+
+class Client(Net):
+    @property
+    def connected(self) -> bool:
         if self.sock is None:
-            return True
-        try:
-            data = self.sock.recv(16, socket.MSG_DONTWAIT | socket.MSG_PEEK)
-            if len(data) == 0:
-                return True
-        except BlockingIOError:
-            return False  # socket is open and reading from it would block
-        except ConnectionResetError:
-            return True  # socket was closed for some other reason
-        except OSError:
-            return True  # socket was never connected to begin with
-        except Exception:  # noqa
             return False
-        return False
+        if self.sock.fileno() < 0:
+            return False
+        flags = socket.MSG_PEEK  # required
+        tmo = False
+        if getattr(socket, 'MSG_DONTWAIT'):
+            flags |= socket.MSG_DONTWAIT
+        else:
+            self.sock.settimeout(0.0001)
+            tmo = True
+        try:
+            data = self.sock.recv(1, flags)
+            if len(data) == 0:
+                return False
+        except BlockingIOError:
+            return True  # socket is open, and reading from it would block
+        except TimeoutError:
+            pass
+        except OSError:
+            return False  # socket was never connected to begin with
+        finally:
+            if tmo:
+                self.sock.settimeout(None)
+        return True
 
     def reconnect(self, serv_addr: str, serv_port: int):
         while not self.halt:
             if self.sock is None:
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            if self.is_socket_closed():
+            if not self.connected:
                 try:
                     self.sock.connect((serv_addr, serv_port))
                 except ConnectionRefusedError:
@@ -49,36 +98,21 @@ class Client(object):
                 except OSError:
                     self.sock.close()
                     self.sock = None
-            time.sleep(0.001)
+            time.sleep(0.01)
 
-    def recv_all(self, header_fmt: str):
-        header_size = struct.calcsize(header_fmt)
-        data = b""
-        if NULL != b'':
-            b = b' '  # FIXME?
-            while b != NULL:
-                b = self.sock.recv(1)  # consume faulty bytes
-                if not b:
-                    break
-        while len(data) < header_size:
-            packet = self.sock.recv(1024)
-            if not packet:
-                #break
-                return None, None
-            data += packet
-        packed_msg_size = data[:header_size]
-        data = data[header_size:]
+    def decode(self, data: bytes) -> str:
+        return base64.b64decode(data).decode()
+
+    def recv_all(self) -> tuple:
+        header_size = struct.calcsize(self.header_fmt)
+        hdr_data = self._read(self.sock, header_size)
         try:
-            header = struct.unpack(header_fmt, packed_msg_size)
+            header = struct.unpack(self.header_fmt, hdr_data)  # always a tuple
             msg_size = header[0]
         except struct.error:
             raise ReceiveFormatError
-        if self.debug:
-            print('Recv %d bytes' % msg_size)
 
-        while len(data) < msg_size:
-            #data += self.sock.recv(msg_size - len(data))  # FIXME?
-            data += self.sock.recv(1024)
+        data = self._read(self.sock, msg_size)
         return header, data
 
     def recv_data(self, **kwargs):
@@ -106,12 +140,10 @@ class Client(object):
         self.halt = False  # makes object reusable
 
 
-class Server(object):
+class Server(Net):
     def __init__(self, debug: bool = False):
-        self.debug = debug
+        super().__init__(debug)
         self.clients: list[socket.socket] = []
-        self.halt: bool = False
-        self.sock: Optional[socket.socket] = None
         self.listener: Optional[threading.Thread] = None
 
     def listen(self):
@@ -129,10 +161,13 @@ class Server(object):
         if self.sock is not None:
             self.sock.settimeout(0.2)
 
-    def prepend_header(self, fmt, data, *args):
-        if self.debug:
-            print('Send %d bytes' % len(data))
-        return NULL + struct.pack(fmt, len(data), *args) + data
+    def encode(self, message: str) -> bytes:
+        return base64.b64encode(message.encode())
+
+    def send_all(self, sock: socket.socket, data: bytes, *args):
+        header = struct.pack(self.header_fmt, len(data), *args)
+        self._write(sock, header)
+        self._write(sock, data)
 
     def finish(self):
         pass
@@ -162,26 +197,50 @@ class Server(object):
 
 
 class SelectServer(Server):
+    def __init__(self, debug):
+        super().__init__(debug)
+        self.queues = {}
+
     def listen(self):  # override
+        outputs = []
         while not self.halt:
             inputs = list(self.clients) + [self.sock]
-            rd, wr, err = select.select(inputs, self.clients, inputs)
+            rd, wr, err = select.select(inputs, outputs, inputs)
             for sock in rd:
                 if sock is self.sock:
                     client_socket, _ = sock.accept()
                     client_socket.setblocking(False)
                     self.clients.append(client_socket)
+                    self.queues[client_socket] = Queue()
                 else:
-                    self.recv_data(sock)
+                    data = self.recv_data(sock)
+                    if data:
+                        self.queues[sock].put(data)
+                        if sock not in outputs:
+                            outputs.append(sock)
+                    else:
+                        if sock in outputs:
+                            outputs.remove(sock)
+                        self.clients.remove(sock)
+                        sock.close()
+                        del self.queues[sock]
             for sock in wr:
-                self.send_data(sock)
+                try:
+                    self.queues[sock].get_nowait()
+                    self.send_data(sock)
+                except (Empty, KeyError):
+                    if sock in outputs:
+                        outputs.remove(sock)
             for sock in err:
                 if sock is self.sock:
                     self.sock.close()
                     self.halt = True  # FIXME recovery?
                 else:
+                    if sock in outputs:
+                        outputs.remove(sock)
                     self.clients.remove(sock)
                     sock.close()
+                    del self.queues[sock]
 
     def recv_data(self, sock: socket.socket):
         raise NotImplementedError
@@ -192,26 +251,3 @@ class SelectServer(Server):
     def set_socket_options(self):  # override
         if self.sock is not None:
             self.sock.setblocking(False)
-
-    def run(self, port: int, **kwargs):  # override
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.setblocking(False)
-        self.sock.bind(('0.0.0.0', port))
-        self.sock.listen(5)
-
-        self.listener = threading.Thread(target=self.listen)
-        self.listener.start()
-
-        try:
-            while not self.halt:
-                self.process(**kwargs)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.halt = True
-            self.listener.join()
-        for client in self.clients:
-            client.close()
-        self.clients = []
-        self.halt = False
