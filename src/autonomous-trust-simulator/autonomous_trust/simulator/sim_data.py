@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional
 
 from autonomous_trust.core.config import Configuration
 from .peer.position import Position, GeoPosition
@@ -15,7 +15,8 @@ Map = dict[str, Position]
 class SimState(Configuration):
     """Communicates sim state snapshot"""
     def __init__(self, time: Optional[datetime] = None, center: Optional[GeoPosition] = None,
-                 scale: Optional[float] = None, peers: Optional[Map] = None, reachable: Optional[Matrix] = None):
+                 scale: Optional[float] = None, peers: Optional[Map] = None, reachable: Optional[Matrix] = None,
+                 blank: bool = False):
         super().__init__()
         self.time = time
         if time is None:
@@ -28,6 +29,7 @@ class SimState(Configuration):
         self.reachable = reachable
         if reachable is None:
             self.reachable: Matrix = {}
+        self.blank = blank
 
     def convert(self) -> 'SimState':
         state = SimState(**self.to_dict())
@@ -46,4 +48,3 @@ class SimConfig(Configuration):
     @classmethod
     def load(cls, data: str) -> 'SimConfig':
         return cls.from_yaml_string(data)
-
