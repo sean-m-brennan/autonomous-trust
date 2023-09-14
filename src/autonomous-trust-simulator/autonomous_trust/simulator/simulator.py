@@ -1,5 +1,6 @@
 import os.path
 import socket
+import struct
 import time
 from datetime import timedelta
 
@@ -9,11 +10,15 @@ from .sim_data import SimConfig, SimState, Map, Matrix
 from .sim_client import SimClient
 from . import net_util as net
 
+from .peer.dash_config import create_config
+
 
 class Simulator(net.SelectServer):
-    header_fmt = SimClient.header_fmt
+    seq_fmt = SimClient.seq_fmt
     time_resolution = 'seconds'
     cadence = 1
+
+    # FIXME logging + info output
 
     def __init__(self, cfg_file_path: str, max_time_steps: int = 100,
                  geo: bool = False, debug: bool = False):
@@ -54,22 +59,45 @@ class Simulator(net.SelectServer):
             self.pre_state[tick] = (center, max_dist, mapp, matrix)
         self.tick = 0
 
-    def recv_data(self, sock: socket.socket):
-        sock.recv(1024)  # should be empty
-        state = self.state
+    def send_state(self, tick, sock: socket.socket):
+        cur_time = self.start_time + timedelta(**{self.time_resolution: tick})
+        try:
+            state = SimState(cur_time, *self.pre_state[tick])
+        except KeyError:
+            self.send_all(sock, 'end'.encode())
+            return
         if self.return_geo:
-            state.convert()
-        info = state.to_yaml_string().encode()
-        message = self.prepend_header(self.header_fmt, info)
-        sock.sendall(message)
+            state = state.convert()
+        data = state.to_yaml_string().encode()
+        self.send_all(sock, data)
+
+    def recv_data(self, sock: socket.socket):  # asynchronous
+        seq_len = struct.calcsize(self.seq_fmt)
+        try:
+            seq_data = self._read(sock, seq_len)
+        except net.ReceiveError:
+            return None
+        seq_num = struct.unpack(self.seq_fmt, seq_data)[0]
+        self.send_state(seq_num, sock)
+        return seq_num
 
     def send_data(self, sock: socket.socket):
         pass  # do nothing
 
-    def process(self, **kwargs):
+    def process(self, **kwargs):  # synchronous alternative
         while not self.halt and self.tick < self.max_time_steps:
-            cur_time = self.start_time + timedelta(**{self.time_resolution: self.tick})
-            self.state = SimState(cur_time, *self.pre_state[self.tick])
-            self.tick += 1
+            if not isinstance(self, net.SelectServer):
+                for client_socket in self.clients:
+                    self.send_state(self.tick, client_socket)
+                self.tick += 1
             time.sleep(self.cadence)
         self.halt = True
+
+
+if __name__ == '__main__':
+    sim_config = create_config('full')
+    try:
+        Simulator(sim_config, 120).run(8778)
+    finally:
+        if os.path.exists(sim_config):
+            os.remove(sim_config)

@@ -1,25 +1,16 @@
 import logging
 import os
 import threading
-import time
 from collections import deque, namedtuple
-from datetime import datetime, timedelta
+from queue import Queue, Empty
 
 from flask import Flask
 from dash import Dash, html, dcc, Output, Input
 import plotly.graph_objects as go
 import plotly.colors as colors
-from uuid import uuid4
 
-from ..radio.iface import Antenna, NetInterface
-from .peer import PeerData
-from .path import BezierData, PathData, EllipseData, Variability
-from .position import GeoPosition, UTMPosition
-from ..sim_data import SimConfig
-from ..simulator import Simulator
 from ..sim_client import SimClient
-from .dash_config import generate_config, generate_small_config
-
+from .position import GeoPosition
 
 Coord = namedtuple('Coord', 'lat lon')
 log = logging.getLogger('werkzeug')
@@ -36,33 +27,31 @@ class MapDisplay(object):
         self.server = Flask(__name__)
         self.app = Dash(__name__, server=self.server,
                         prevent_initial_callbacks=True, update_title=None)
-        self.cli = SimClient(debug=True)
+        self.queue = Queue(maxsize=1)
         self.mapbox_token = os.environ.get('MAPBOX', None)
         self.use_mapbox = False if self.mapbox_token is None else True
-        self.tick = -1
+        self.interval = -1
         self.state = None
         self.halt = False
-        self.started = False
         self.height = size
-
-        self.app.layout = html.Div([
-            html.Div(id='time'),
-            html.Div([
-                dcc.Graph(id='graph', config={'displayModeBar': False}),
-                dcc.Interval(id="interval", interval=.5 * 1000, n_intervals=0),
-            ]),
-        ])
-
-        self.fig = go.Figure()
+        self.fig = None
         self.color_map = {}
         self.coords = {}
         self.z_scale = 10000
         self.all = []
 
+        self.app.layout = html.Div([
+            html.Div(id='time'),
+            html.Div([
+                dcc.Graph(id='graph', config={'displayModeBar': False}),
+                dcc.Interval(id="interval", interval=1000, n_intervals=0),
+            ]),
+        ])
+
         @self.app.callback(Output('time', 'children'),
                            Input('interval', 'n_intervals'))
-        def update_time(tick):
-            self.update_data(tick)
+        def update_time(_):
+            self.update_state()
             if self.state is None:
                 return
             return self.state.time.isoformat(' ').rsplit('.')[0]
@@ -70,14 +59,11 @@ class MapDisplay(object):
         @self.app.callback(Output('graph', 'figure'),
                            [Input('interval', 'n_intervals'),
                             Input('graph', 'relayoutData')])
-        def update_paths(tick, relayout):
-            self.update_data(tick)
+        def update_paths(_, relayout):
+            self.update_state()
             if self.state is None:
-                if self.started:
-                    self.halt = True
                 return
-            self.started = True
-            #center = self.state.center.convert(GeoPosition)
+            # center = self.state.center.convert(GeoPosition)
             for uuid in self.state.peers:
                 position = self.state.peers[uuid].convert(GeoPosition)
                 if uuid not in self.coords:
@@ -106,17 +92,36 @@ class MapDisplay(object):
                                             'geo.projection.scale': scale}, True)
             return self.fig
 
+    def state_to_queue(self):
+        def cb(state):
+            if state is not None:
+                self.queue.put(state, block=True, timeout=None)
+        return cb
+
+    def update_state(self, block: bool = True):
+        if block:
+            self.state = self.queue.get()
+        else:
+            try:
+                self.state = self.queue.get_nowait()
+            except Empty:
+                pass
+        if self.state.blank:
+            self.acquire_initial_conditions()
+
     def acquire_initial_conditions(self):
-        while self.cli.is_socket_closed():
-            time.sleep(0.5)
-        self.update_data(0)
-        if self.state is None:
-            raise RuntimeError('Unconnected client')
+        # reset
+        self.fig = go.Figure()
+        self.coords = {}
+        self.color_map = {}
+        self.all = []
+
+        self.update_state(block=True)
         center = self.state.center.convert(GeoPosition)
         scatter = go.Scattergeo
         if self.use_mapbox:
             scatter = go.Scattermapbox
-            self.z_scale = 12  # TODO: compute, this is tuned
+            self.z_scale = 12  # TODO: compute, this is tuned for the chosen config
         for idx, uuid in enumerate(self.state.peers):
             position = self.state.peers[uuid].convert(GeoPosition)
             self.color_map[uuid] = colors.qualitative.Light24[idx]
@@ -144,41 +149,16 @@ class MapDisplay(object):
                                             # zoom=self.z_scale  #FIXME wrong
                                             ))
 
-    def update_data(self, tick):
-        if tick > self.tick:
-            self.state = self.cli.recv_data()
-            self.tick += 1
-
-    def run(self, sim_host: str = '127.0.0.1', sim_port: int = 8778,
-            with_server: bool = False, sim_config: str = None):
-        threads = []
-        sim = None
-        if with_server:
-            sim = Simulator(sim_config, 60, debug=True)  # in seconds
-            threads.append(threading.Thread(target=sim.run, args=(sim_port,)))
-
-        threads.append(threading.Thread(target=self.cli.run, args=(sim_host, sim_port)))
-        for t in threads:
-            t.start()
+    def run(self, sim_host: str = '127.0.0.1', sim_port: int = 8778):
+        client = SimClient(callback=self.state_to_queue())
+        thread = threading.Thread(target=client.run, args=(sim_host, sim_port))
+        thread.start()
         self.acquire_initial_conditions()
         self.app.run(self.host, self.port)
-        self.cli.halt = True
-        if sim is not None:
-            sim.halt = True
-        for t in threads:
-            t.join()
+        client.halt = True
+        thread.join()
 
 
 if __name__ == '__main__':
-    cfg = os.path.join(os.path.dirname(__file__), 'test.cfg')
-    if not os.path.exists(cfg):
-        try:
-            generate_small_config(cfg)
-        except:
-            os.remove(cfg)
-            raise
-    try:
-        MapDisplay().run(with_server=True, sim_config=cfg)
-    finally:
-        if os.path.exists(cfg):
-            os.remove(cfg)
+    # simulator must be started separately (misbehaves as a thread)
+    MapDisplay().run()

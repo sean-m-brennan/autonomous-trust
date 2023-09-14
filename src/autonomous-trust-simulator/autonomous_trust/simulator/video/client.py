@@ -29,9 +29,9 @@ class VideoRcvr(net.Client):
     def get_frame(self, noisy: bool = True, size: Optional[int] = None) -> tuple[np.ndarray, int]:
         noise = add_noise(Noise.GAUSSIAN, None, self.image_shape), 100
 
-        if not self.is_socket_closed():
+        if self.connected:
             try:
-                (_, fast_encoding), data = self.recv_all(self.header_fmt)
+                (_, fast_encoding), data = self.recv_all()
             except (net.ReceiveFormatError, OSError, AttributeError):
                 return noise
 
