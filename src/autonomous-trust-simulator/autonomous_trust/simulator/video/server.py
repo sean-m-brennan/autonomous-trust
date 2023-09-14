@@ -49,9 +49,8 @@ class VideoSource(net.Server):
                     if len(self.clients) > 0 and frame is not None:
                         for client_socket in self.clients:
                             info = serialize(frame, fast_encoding)
-                            message = self.prepend_header(self.header_fmt, info, fast_encoding)
                             try:
-                                client_socket.sendall(message)
+                                self.send_all(client_socket, info, fast_encoding)
                             except (ConnectionResetError, BrokenPipeError):
                                 self.clients.remove(client_socket)
                 loop += 1

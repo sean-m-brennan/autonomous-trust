@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from uuid import uuid4
+import os
 
 from .path import BezierData, PathData, Variability, EllipseData
 from .peer import PeerData
@@ -8,7 +9,21 @@ from ..radio.iface import Antenna, NetInterface
 from ..sim_data import SimConfig
 
 
-def generate_config(filepath: str):
+def create_config(which):
+    cfg = os.path.join(os.path.dirname(__file__), 'test.cfg')
+    if not os.path.exists(cfg):
+        try:
+            if which == 'small':
+                generate_small_config(cfg)
+            elif which == 'full':
+                generate_full_config(cfg)
+        except:
+            os.remove(cfg)
+            raise
+    return cfg
+
+
+def generate_full_config(filepath: str):
     t5 = GeoPosition(34.669650, -86.575907, 182).convert(UTMPosition)
     uah = GeoPosition(34.725279, -86.639962, 198).convert(UTMPosition)
     mid = t5.midpoint(uah)
