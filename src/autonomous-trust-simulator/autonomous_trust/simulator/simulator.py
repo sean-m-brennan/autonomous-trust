@@ -1,6 +1,8 @@
+import logging
 import os.path
 import socket
 import struct
+import sys
 import time
 from datetime import timedelta
 
@@ -18,14 +20,21 @@ class Simulator(net.SelectServer):
     time_resolution = 'seconds'
     cadence = 1
 
-    # FIXME logging + info output
+    def __init__(self, cfg_file_path: str, max_time_steps: int = 100, geo: bool = False,
+                 log_level: int = logging.INFO, logfile: str = None):
+        if logfile is None:
+            handler = logging.StreamHandler(sys.stdout)
+        else:
+            handler = logging.FileHandler(logfile)
+        handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
+                                               '%Y-%m-%d %H:%M:%S'))
+        handler.setLevel(log_level)
+        self.logger = logging.getLogger(__name__)
+        self.logger.addHandler(handler)
+        super().__init__(self.logger)
 
-    def __init__(self, cfg_file_path: str, max_time_steps: int = 100,
-                 geo: bool = False, debug: bool = False):
-        super().__init__(debug)
         self.max_time_steps = max_time_steps
         self.return_geo = geo
-
         if not os.path.isabs(cfg_file_path):
             cfg_file_path = os.path.join(os.path.dirname(__file__), cfg_file_path)
         with open(cfg_file_path, 'r') as cfg_file:
@@ -36,8 +45,10 @@ class Simulator(net.SelectServer):
             self.peers[peer_info.uuid] = Peer(self.max_time_steps, self.cadence, peer_info.path)
         self.state = SimState()
         self.pre_state: dict[int, tuple[GeoPosition, float, Map, Matrix]] = {}
+        self.tick = 0
+        self.precompute_network()
 
-        # precompute network changes
+    def precompute_network(self):
         for tick in range(0, self.max_time_steps):
             mapp: Map = {}
             matrix: Matrix = {}
@@ -58,6 +69,7 @@ class Simulator(net.SelectServer):
             center: GeoPosition = mid.convert(GeoPosition)
             self.pre_state[tick] = (center, max_dist, mapp, matrix)
         self.tick = 0
+        self.logger.info('Ready')
 
     def send_state(self, tick, sock: socket.socket):
         cur_time = self.start_time + timedelta(**{self.time_resolution: tick})
@@ -77,7 +89,10 @@ class Simulator(net.SelectServer):
             seq_data = self._read(sock, seq_len)
         except net.ReceiveError:
             return None
-        seq_num = struct.unpack(self.seq_fmt, seq_data)[0]
+        seq_num, steps = struct.unpack(self.seq_fmt, seq_data)
+        if steps > 0:
+            self.max_time_steps = steps
+            self.precompute_network()
         self.send_state(seq_num, sock)
         return seq_num
 
