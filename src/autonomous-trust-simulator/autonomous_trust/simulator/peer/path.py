@@ -44,19 +44,21 @@ class BezierData(LineData):
 
 
 class BeziergonData(ShapeData):
-    def __init__(self, start: UTMPosition, ctl_pts: list[UTMPosition]):
+    def __init__(self, start: UTMPosition, ctl_pts: list[UTMPosition], loops: int):
         super().__init__(start)
         self.ctl_pts = ctl_pts
+        self.loops = loops
 
 
 class EllipseData(ShapeData):
-    def __init__(self, center: UTMPosition, semi_major: float, semi_minor: float, angle: float):
+    def __init__(self, center: UTMPosition, semi_major: float, semi_minor: float, angle: float, loops: int):
         """Angle is in decimal degrees"""
         super().__init__(center)
         self.center = center
         self.semi_major = max(semi_major, semi_minor)
         self.semi_minor = min(semi_major, semi_minor)
         self.angle = angle
+        self.loops = loops
 
     def to_dict(self) -> dict:
         d = super().to_dict()
@@ -218,7 +220,8 @@ class BeziergonPath(PathShape):
         if self.start not in self.ctl_pts:
             self.ctl_pts.insert(0, self.start)
             self.ctl_pts.append(self.start)  # closed, must start and end at same point
-        self.points += BezierPath.de_casteljau(num_steps, self.ctl_pts, self.start)
+        for _ in range(data.loops):
+            self.points += BezierPath.de_casteljau(num_steps//data.loops, self.ctl_pts, self.start)
         self.closed = True
 
     @property
@@ -237,13 +240,14 @@ class BeziergonPath(PathShape):
 class EllipsePath(PathShape):
     def __init__(self, num_steps: int, data: EllipseData):
         super().__init__(num_steps, data)
-        self.points = []
 
         # de La Hire's construction
         start_dist = self.semi_major * 2 + 1
-        t_step = 2. * math.pi / (num_steps - 1)
+        t_step = 2. * math.pi / ((num_steps // data.loops) - 1)
         pt_idx = 0
-        for idx, step in enumerate(range(1, num_steps+1)):
+
+        points = []
+        for idx, step in enumerate(range(1, (num_steps // data.loops)+1)):
             t = t_step * idx + math.radians(self.angle)
             if t < 0:
                 t += 2. * math.pi
@@ -252,14 +256,17 @@ class EllipsePath(PathShape):
             x = self.semi_major * math.cos(t)
             y = self.semi_minor * math.sin(t)
             pt = UTMPosition(self.center.zone, self.center.easting + x, self.center.northing + y, self.center.alt)
-            self.points.append(pt)
+            points.append(pt)
             dist = self.start.distance(pt)
             if dist < start_dist:
                 start_dist = dist
                 pt_idx = idx
 
         # rotate to point closest to given start
-        self.points = self.points[pt_idx:] + self.points[:pt_idx]
+        points = points[pt_idx:] + points[:pt_idx]
+        self.points = []
+        for _ in range(data.loops):
+            self.points += points
         self.data.start = self.points[0]
         self.closed = True
 

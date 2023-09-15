@@ -45,7 +45,7 @@ def generate_full_config(filepath: str):
     peer4 = PeerData(str(uuid4()), '192.168.0.5', path4.shape.start+4, -200.,
                      Antenna.DIPOLE, NetInterface.SMALL, start, end, path4, [])
     uah_alt = GeoPosition(34.725279, -86.639962, 5000).convert(UTMPosition)
-    shape0 = EllipseData(uah_alt, 1800, 1200, -45.)
+    shape0 = EllipseData(uah_alt, 1800, 1200, -90., 3)
     path0 = PathData(start, end, shape0, Variability.GAUSSIAN, 40.2, Variability.UNIFORM)
     peer0 = PeerData(str(uuid4()), '192.168.0.1', path0.shape.start, -1200.,
                      Antenna.PARABOLIC, NetInterface.LARGE, start, end, path0, [])
@@ -65,7 +65,7 @@ def generate_small_config(filepath: str):
     path1 = PathData(start, end, shape1, Variability.GAUSSIAN, 4.4, Variability.UNIFORM)
     peer1 = PeerData(str(uuid4()), '192.168.0.2', path1.shape.start, -200.,
                      Antenna.DIPOLE, NetInterface.SMALL, start, end, path1, [])
-    shape2 = EllipseData(uah, 1000, 600, -45.)
+    shape2 = EllipseData(uah, 1000, 600, -45., 1)
     path2 = PathData(start, end, shape2, Variability.GAUSSIAN, 4.4, Variability.UNIFORM)
     peer2 = PeerData(str(uuid4()), '192.168.0.1', path2.shape.start, -200.,
                      Antenna.DIPOLE, NetInterface.SMALL, start, end, path2, [])
