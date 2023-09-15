@@ -1,4 +1,5 @@
 import base64
+import logging
 import select
 import socket
 import struct
@@ -12,15 +13,7 @@ class ReceiveError(RuntimeError):
     pass
 
 
-class ReceiveHeaderError(ReceiveError):
-    pass
-
-
 class ReceiveFormatError(ReceiveError):
-    pass
-
-
-class ReceiveDataError(ReceiveError):
     pass
 
 
@@ -28,8 +21,8 @@ class Net(object):
     """Base networking class"""
     header_fmt = '!L'  # max 4GB message size
 
-    def __init__(self, debug: bool = False):
-        self.debug = debug
+    def __init__(self, logger: logging.Logger = None):
+        self.logger = logger
         self.halt = False
         self.sock: Optional[socket.socket] = None
 
@@ -44,8 +37,8 @@ class Net(object):
             if len(new_data) == 0:
                 raise ReceiveError
             data += new_data
-        if self.debug:
-            print('Recv ', data)
+        if self.logger is not None:
+            self.logger.debug('Recv %s' % data)
         return data
 
     def _write(self, sock: socket.socket, data: bytes):
@@ -53,8 +46,8 @@ class Net(object):
         offset = 0
         while offset != data_len:
             offset += sock.send(data[offset:])
-        if self.debug:
-            print('Send ', data)
+        if self.logger is not None:
+            self.logger.debug('Send %s' % data)
 
 
 class Client(Net):
@@ -62,7 +55,10 @@ class Client(Net):
     def connected(self) -> bool:
         if self.sock is None:
             return False
-        if self.sock.fileno() < 0:
+        try:
+            if self.sock.fileno() < 0:
+                return False
+        except AttributeError:
             return False
         flags = socket.MSG_PEEK  # required
         tmo = False
@@ -93,6 +89,8 @@ class Client(Net):
             if not self.connected:
                 try:
                     self.sock.connect((serv_addr, serv_port))
+                    if self.logger is not None:
+                        self.logger.info('Reconnect to %s:%d' % (serv_addr, serv_port))
                 except ConnectionRefusedError:
                     pass
                 except OSError:
@@ -141,16 +139,18 @@ class Client(Net):
 
 
 class Server(Net):
-    def __init__(self, debug: bool = False):
-        super().__init__(debug)
+    def __init__(self, logger: logging.Logger = None):
+        super().__init__(logger)
         self.clients: list[socket.socket] = []
         self.listener: Optional[threading.Thread] = None
 
     def listen(self):
         while not self.halt:
             try:
-                client_socket, _ = self.sock.accept()
+                client_socket, (host, port) = self.sock.accept()
                 self.clients.append(client_socket)
+                if self.logger is not None:
+                    self.logger.debug('New client at %s:%d' % (host, port))
             except socket.timeout:
                 pass
 
@@ -197,8 +197,8 @@ class Server(Net):
 
 
 class SelectServer(Server):
-    def __init__(self, debug):
-        super().__init__(debug)
+    def __init__(self, logger: logging.Logger = None):
+        super().__init__(logger)
         self.queues = {}
 
     def listen(self):  # override
@@ -208,10 +208,12 @@ class SelectServer(Server):
             rd, wr, err = select.select(inputs, outputs, inputs)
             for sock in rd:
                 if sock is self.sock:
-                    client_socket, _ = sock.accept()
+                    client_socket, (host, port) = sock.accept()
                     client_socket.setblocking(False)
                     self.clients.append(client_socket)
                     self.queues[client_socket] = Queue()
+                    if self.logger is not None:
+                        self.logger.debug('New client at %s:%d' % (host, port))
                 else:
                     data = self.recv_data(sock)
                     if data:

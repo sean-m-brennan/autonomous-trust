@@ -1,0 +1,13 @@
+Operational Detachment Alpha (ODA)
+ODC - Batalion HQ
+
+12 men:
+  * 1 Captain
+  * 1 1st LT (Warrant Oficer)
+  * 1 operations specialist
+  * 1 intelligence specialist
+  * 2 weapons specialists
+  * 2 communication specialists
+  * 2 medical specialists
+  * 2 engineer/demolition specialists.
+The specialists are all sergeants.
