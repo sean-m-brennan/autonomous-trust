@@ -7,12 +7,20 @@ from . import net_util as net
 from .sim_data import SimState
 
 
+class SimSync(object):
+    def __init__(self):
+        self.tick = 0
+        self.paused = False
+
+
 class SimClient(net.Client):
     seq_fmt = '!LL'
 
     def __init__(self, callback: Optional[Callable[[SimState], None]] = None, logger: logging.Logger = None):
         super().__init__(logger)
         self.callback = callback
+        if callback is None:
+            self.callback = lambda _: None
         self._tick = 0
         self._cadence = 1
         self._resolution = 0
@@ -59,12 +67,10 @@ class SimClient(net.Client):
                     if self.logger is not None:
                         self.logger.info('Reset simulation')
                     self.tick = 0
-                    if self.callback is not None:
-                        self.callback(SimState(blank=True))
+                    self.callback(SimState(blank=True))
                     return
                 state = SimState.from_yaml_string(info)
-                if self.callback is not None:
-                    self.callback(state)
+                self.callback(state)
             except net.ReceiveError:
                 if self.logger is not None:
                     self.logger.warning('ReceiveError: server disconnect')

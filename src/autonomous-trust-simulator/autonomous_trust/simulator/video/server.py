@@ -1,13 +1,12 @@
 import glob
 import os.path
-import struct
 import time
 from typing import Optional
 
 import cv2
 import imutils
 
-from .. import net_util as net
+from ..radio import networking as net
 from .serial import serialize
 
 
