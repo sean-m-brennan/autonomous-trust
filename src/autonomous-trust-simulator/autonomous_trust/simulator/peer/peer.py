@@ -9,10 +9,11 @@ from .path import PathData, Path
 
 class PeerConnection(Configuration):
     """Snapshot in time of peer connectivity"""
-    def __init__(self, uuid: str, ip4_addr: str, position: Position, signal: float,
+    def __init__(self, uuid: str, kind: str, ip4_addr: str, position: Position, signal: float,
                  antenna: Antenna, iface: NetInterface):
         super().__init__()
         self.uuid = uuid
+        self.kind = kind
         self.ip4_addr = ip4_addr
         self.position = position
         self.signal = signal
@@ -37,12 +38,13 @@ class DataStream(Configuration):
         self.bps = bps
 
 
-class PeerData(PeerConnection):
-    def __init__(self, uuid: str, ip4_addr: str, initial_position: Position,
+class PeerInfo(PeerConnection):
+    """Artificial, high-level hardware simulation data fed directly into a peer's system. Serializable."""
+    def __init__(self, uuid: str, kind: str, ip4_addr: str, initial_position: Position,
                  signal: float, antenna: Antenna, iface: NetInterface,
                  initial_time: datetime, last_seen: datetime, path: PathData,
                  data_streams: list[DataStream]):
-        super().__init__(uuid, ip4_addr, initial_position, signal, antenna, iface)
+        super().__init__(uuid, kind, ip4_addr, initial_position, signal, antenna, iface)
         self.initial_time = initial_time
         self.last_seen = last_seen
         self.initial_position = initial_position
@@ -60,7 +62,8 @@ class PeerData(PeerConnection):
         return d
 
 
-class Peer(object):
+class PeerMovement(object):
+    """Step-wise peer movement along a path"""
     def __init__(self, sim_steps: int, sim_cadence: float, path_data: PathData):
         self.path = Path(sim_steps, sim_cadence, path_data)
 

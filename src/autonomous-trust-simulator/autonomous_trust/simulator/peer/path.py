@@ -5,7 +5,7 @@ from typing import Optional
 
 from autonomous_trust.core.config.configuration import Configuration
 from .position import UTMPosition
-from ..util import SerializableEnum
+from ..serial import SerializableEnum
 
 
 class Variability(SerializableEnum):

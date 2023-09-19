@@ -1,4 +1,4 @@
-from ..util import SerializableEnum
+from ..serial import SerializableEnum
 
 
 class Antenna(SerializableEnum):
