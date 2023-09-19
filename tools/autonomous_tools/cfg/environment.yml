@@ -18,4 +18,8 @@ dependencies:
   - geopy
   - utm
   - dash==2.6.2
+  - dash-bootstrap-components
+  - dash-daq
   - flask
+  - pip:
+      - dash-iconify

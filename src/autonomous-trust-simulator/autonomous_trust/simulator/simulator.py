@@ -6,16 +6,15 @@ import sys
 import time
 from datetime import timedelta
 
-from .peer.peer import Peer
+from .peer.peer import PeerMovement
 from .peer.position import GeoPosition, UTMPosition
 from .sim_data import SimConfig, SimState, Map, Matrix
 from .sim_client import SimClient
 from . import net_util as net
 
-from .peer.dash_config import create_config
-
 
 class Simulator(net.SelectServer):
+    """Given a scenario config, simulate peer movement and connectivity."""
     seq_fmt = SimClient.seq_fmt
     time_resolution = 'seconds'
     cadence = 1
@@ -39,23 +38,25 @@ class Simulator(net.SelectServer):
             cfg_file_path = os.path.join(os.path.dirname(__file__), cfg_file_path)
         with open(cfg_file_path, 'r') as cfg_file:
             self.cfg = SimConfig.load(cfg_file.read())
+        self.peers: dict[str, PeerMovement] = {}
         self.start_time = self.cfg.time
-        self.peers: dict[str, Peer] = {}
-        for peer_info in self.cfg.peers:
-            self.peers[peer_info.uuid] = Peer(self.max_time_steps, self.cadence, peer_info.path)
         self.state = SimState()
         self.pre_state: dict[int, tuple[GeoPosition, float, Map, Matrix]] = {}
         self.tick = 0
         self.precompute_network()
 
     def precompute_network(self):
+        self.pre_state = {}
+        self.peers = {}
+        for peer_info in self.cfg.peers:
+            self.peers[peer_info.uuid] = PeerMovement(self.max_time_steps, self.cadence, peer_info.path)
         for tick in range(0, self.max_time_steps):
             mapp: Map = {}
             matrix: Matrix = {}
             max_dist = 0
             for peer in self.cfg.peers:
                 mapp[peer.uuid] = self.peers[peer.uuid].move(tick)  # position
-            # all must move first
+            # all must move first before looping for connectivity
             for peer in self.cfg.peers:
                 matrix[peer.uuid] = {}
                 for other in self.cfg.peers:
@@ -90,7 +91,7 @@ class Simulator(net.SelectServer):
         except net.ReceiveError:
             return None
         seq_num, steps = struct.unpack(self.seq_fmt, seq_data)
-        if steps > 0:
+        if steps > 0:  # new resolution
             self.max_time_steps = steps
             self.precompute_network()
         self.send_state(seq_num, sock)
@@ -110,6 +111,8 @@ class Simulator(net.SelectServer):
 
 
 if __name__ == '__main__':
+    from .peer.dash_config import create_config
+
     sim_config = create_config('full')
     try:
         Simulator(sim_config, 120).run(8778)

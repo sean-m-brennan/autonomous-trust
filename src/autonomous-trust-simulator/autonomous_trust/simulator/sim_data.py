@@ -3,7 +3,7 @@ from typing import Optional
 
 from autonomous_trust.core.config import Configuration
 from .peer.position import Position, GeoPosition
-from .peer.peer import PeerData
+from .peer.peer import PeerInfo
 
 
 Matrix = dict[str, dict[str, bool]]
@@ -39,11 +39,11 @@ class SimState(Configuration):
 
 
 class SimConfig(Configuration):
-    """Just the scenario"""
+    """Just the sim scenario"""
     def __init__(self, **kwargs):
         super().__init__()
         self.time: datetime = kwargs['time']
-        self.peers: list[PeerData] = kwargs['peers']
+        self.peers: list[PeerInfo] = kwargs['peers']
 
     @classmethod
     def load(cls, data: str) -> 'SimConfig':

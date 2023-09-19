@@ -122,7 +122,9 @@ class GeoPosition(Position):
         super().__init__(lat, lon, alt)
         self.lat = float(lat)
         self.lon = float(lon)
-        self.alt = float(alt)
+        self.alt = alt
+        if alt is not None:
+            self.alt = float(alt)
 
     def convert(self, cls):
         """Convert to UTM"""
