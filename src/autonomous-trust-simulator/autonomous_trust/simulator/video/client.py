@@ -1,12 +1,10 @@
-import struct
 from typing import Optional
 
 import cv2
 import imutils
 import numpy as np
-#from flask_socketio import SocketIO
 
-from .. import net_util as net
+from ..radio import networking as net
 from .noise import Noise, add_noise
 from .serial import deserialize
 from .server import VideoSource
@@ -30,6 +28,7 @@ class VideoRcvr(net.Client):
         noise = add_noise(Noise.GAUSSIAN, None, self.image_shape), 100
 
         if self.connected:
+            # FIXME use (indirect) AT networking instead
             try:
                 (_, fast_encoding), data = self.recv_all()
             except (net.ReceiveFormatError, OSError, AttributeError):
