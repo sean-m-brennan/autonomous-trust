@@ -9,10 +9,10 @@ from flask import Flask
 import plotly.graph_objects as go
 import plotly.colors as colors
 
-from ...sim_data import SimState
-from ...dash_components.util import DashComponent
-from ..position import GeoPosition
-from ..daq import Cohort
+from .util import DashComponent
+from ..peer.position import GeoPosition
+from ..peer.daq import Cohort
+
 
 Coord = namedtuple('Coord', 'lat lon')
 
@@ -40,7 +40,7 @@ class DynamicMap(DashComponent):
         self.skip_trace = False
         self.following: str = ''
         self.center = None
-        self.state: SimState
+        self.state: Cohort
         self.update_display = True
 
         @self.app.callback(Output('graph', 'figure'),

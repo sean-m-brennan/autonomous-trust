@@ -5,8 +5,8 @@ from dash import Dash, html, dcc, Output, Input
 import dash_bootstrap_components as dbc
 from dash.exceptions import PreventUpdate
 
-from ..daq import Cohort
-from ...dash_components.util import DashComponent
+from ..peer.daq import Cohort
+from .util import DashComponent
 
 
 class TimerTitle(DashComponent):

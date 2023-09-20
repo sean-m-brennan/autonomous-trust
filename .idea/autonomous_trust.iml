@@ -12,6 +12,7 @@
       <sourceFolder url="file://$MODULE_DIR$/src/autonomous-trust/tests.local" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/src/autonomous-trust-simulator" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/tools/sim" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/src/autonomous-trust-services" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/.tox" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/py" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/.pytest_cache" />

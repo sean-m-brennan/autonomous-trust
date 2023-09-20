@@ -6,7 +6,7 @@ from flask import Flask, Response
 import dash
 from dash import Dash, html
 
-from ..dash_components.util import DashComponent
+from autonomous_trust.inspector.dash_components.util import DashComponent
 from .client import VideoRcvr
 from .server import VideoSource
 
@@ -14,7 +14,7 @@ from .server import VideoSource
 class VideoFeed(DashComponent):
     queues = []
 
-    def __init__(self, app: Dash, server: Flask, number: int = None, video_size=320):
+    def __init__(self, app: Dash, server: Flask, number: int = None, video_size=320, rcvr_cls: type = VideoRcvr):
         super().__init__(app, server)
         self.server = server
         self.number = ''
@@ -23,7 +23,7 @@ class VideoFeed(DashComponent):
             self.number = str(number)
             self.index = number - 1
         self.queues.append(Queue())
-        self.client = VideoRcvr(size=video_size, callback=self.frame_to_queue(self.index))
+        self.client = rcvr_cls(size=video_size, callback=self.frame_to_queue(self.index))
         self._halt = False
 
         if len(self.queues) == 1:

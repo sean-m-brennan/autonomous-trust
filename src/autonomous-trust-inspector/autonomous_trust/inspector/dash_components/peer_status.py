@@ -6,10 +6,12 @@ from dash import Dash, html, dcc, Output, Input
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 
-from ...dash_components.util import make_icon, DashComponent, IconSize
-from ...video.dash_components import VideoFeed
-from ..position import GeoPosition
-from ..daq import PeerDataAcq
+from autonomous_trust.services.video.dash_components import VideoFeed
+from autonomous_trust.services.video import VideoRcvr
+
+from .util import make_icon, DashComponent, IconSize
+from ..peer.position import GeoPosition
+from ..peer.daq import PeerDataAcq
 from .dynamic_map import DynamicMap
 
 
@@ -23,10 +25,11 @@ class PeerStatus(DashComponent):
                 }
     icon_height = 40
 
-    def __init__(self, app: Dash, server: Flask, peer: PeerDataAcq, mapp: DynamicMap):
+    def __init__(self, app: Dash, server: Flask, peer: PeerDataAcq, mapp: DynamicMap,
+                 feed_cls: type = VideoRcvr):
         super().__init__(app, server)
         self.peer = peer
-        self.feed = VideoFeed(self.app, self.server, self.count + 1)
+        self.feed = VideoFeed(self.app, self.server, self.count + 1, rcvr_cls=feed_cls)
         self.idx = int(PeerStatus.count)
         PeerStatus.count += 1
 

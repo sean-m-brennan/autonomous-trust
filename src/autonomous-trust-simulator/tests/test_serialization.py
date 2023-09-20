@@ -3,7 +3,7 @@ from uuid import uuid4
 
 from autonomous_trust.simulator.peer.path import BezierData, PathData, Variability, EllipseData, LineData, BeziergonData
 from autonomous_trust.simulator.peer.peer import PeerInfo
-from autonomous_trust.simulator.peer.position import GeoPosition, UTMPosition
+from autonomous_trust.inspector.peer.position import GeoPosition, UTMPosition
 from autonomous_trust.simulator.radio.iface import Antenna, NetInterface
 from autonomous_trust.simulator.sim_data import SimConfig
 
