@@ -1,9 +1,9 @@
 from dash import Dash, html
 from flask import Flask
 
-from ..daq import Cohort
+from autonomous_trust.simulator.dash_components import SimulationControls, SimulationInterface
+from ..peer.daq import Cohort
 from . import DynamicMap, TimerTitle
-from ...dash_components import SimulationControls, SimulationInterface
 
 
 if __name__ == '__main__':

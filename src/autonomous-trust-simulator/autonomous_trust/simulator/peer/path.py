@@ -4,8 +4,8 @@ from datetime import datetime
 from typing import Optional
 
 from autonomous_trust.core.config.configuration import Configuration
-from .position import UTMPosition
-from ..serial import SerializableEnum
+from autonomous_trust.inspector.peer.position import UTMPosition
+from ..serialize import SerializableEnum
 
 
 class Variability(SerializableEnum):

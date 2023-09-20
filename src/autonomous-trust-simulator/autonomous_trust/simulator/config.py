@@ -2,11 +2,12 @@ from datetime import datetime, timedelta
 from uuid import uuid4
 import os
 
-from .path import BezierData, PathData, Variability, EllipseData
-from .peer import PeerInfo
-from .position import GeoPosition, UTMPosition
-from ..radio.iface import Antenna, NetInterface
-from ..sim_data import SimConfig
+from autonomous_trust.inspector.peer.position import GeoPosition, UTMPosition
+
+from .peer.path import BezierData, PathData, Variability, EllipseData
+from .peer.peer import PeerInfo
+from .radio.iface import Antenna, NetInterface
+from .sim_data import SimConfig
 
 
 def create_config(which):
