@@ -2,9 +2,10 @@ from flask import Flask
 from dash import Dash, html, dcc, Output, Input, ctx
 import dash_bootstrap_components as dbc
 
-from ..peer.daq import Cohort
-from ..peer.dash_components.dynamic_map import DynamicMap
-from .util import make_icon, DashComponent
+from autonomous_trust.inspector.peer.daq import Cohort
+from autonomous_trust.inspector.dash_components.util import make_icon, DashComponent
+from autonomous_trust.inspector.dash_components.dynamic_map import DynamicMap
+
 from .sim_iface import SimulationInterface
 
 

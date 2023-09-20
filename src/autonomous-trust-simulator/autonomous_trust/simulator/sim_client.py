@@ -3,7 +3,7 @@ import struct
 import threading
 from typing import Optional, Callable
 
-from . import net_util as net
+from . import sim_net as net
 from .sim_data import SimState
 
 

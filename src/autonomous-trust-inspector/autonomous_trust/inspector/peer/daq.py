@@ -2,8 +2,8 @@ import threading
 from datetime import datetime
 from queue import Queue, Empty
 
-from .position import Position
-from ..sim_client import SimClient, SimSync
+from autonomous_trust.inspector.peer.position import Position
+from autonomous_trust.simulator.sim_client import SimClient, SimSync  # FIXME remove
 
 
 class PeerDataAcq(object):
