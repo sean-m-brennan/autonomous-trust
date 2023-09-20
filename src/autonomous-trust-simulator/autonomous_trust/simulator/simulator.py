@@ -6,11 +6,11 @@ import sys
 import time
 from datetime import timedelta
 
+from autonomous_trust.inspector.peer.position import GeoPosition, UTMPosition
 from .peer.peer import PeerMovement
-from .peer.position import GeoPosition, UTMPosition
 from .sim_data import SimConfig, SimState, Map, Matrix
 from .sim_client import SimClient
-from . import net_util as net
+from . import sim_net as net
 
 
 class Simulator(net.SelectServer):
@@ -111,7 +111,7 @@ class Simulator(net.SelectServer):
 
 
 if __name__ == '__main__':
-    from .peer.dash_config import create_config
+    from .config import create_config
 
     sim_config = create_config('full')
     try:

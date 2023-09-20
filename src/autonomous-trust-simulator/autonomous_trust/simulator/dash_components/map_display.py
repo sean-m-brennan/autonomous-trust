@@ -5,10 +5,11 @@ from flask import Flask
 from dash import Dash, html, Output, Input
 import dash_bootstrap_components as dbc
 
-from .peer.daq import Cohort
-from autonomous_trust.simulator.dash_components.sim_iface import SimulationInterface
-from .peer.dash_components import TimerTitle, DynamicMap, PeerStatus
-from .dash_components import SimulationControls
+from autonomous_trust.inspector.peer.daq import Cohort
+from autonomous_trust.inspector.dash_components import TimerTitle, DynamicMap, PeerStatus
+from autonomous_trust.services.video import VideoRcvr
+
+from . import SimulationControls, SimulationInterface
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.WARNING)  # reduce callback noise from Flask
@@ -16,7 +17,7 @@ log.setLevel(logging.WARNING)  # reduce callback noise from Flask
 
 class MapDisplay(object):
     def __init__(self, sim_host: str = '127.0.0.1', sim_port: int = 8778, size: int = 600,
-                 max_resolution: int = 300, style: str = 'dark'):
+                 max_resolution: int = 300, style: str = 'dark', vid_feed_cls: type = VideoRcvr):
         self.server = Flask(__name__)
         self.app = Dash(__name__, server=self.server, external_stylesheets=[dbc.themes.SPACELAB],
                         prevent_initial_callbacks=True, update_title=None)
@@ -29,7 +30,7 @@ class MapDisplay(object):
         sim.register_reset_handler(dyna_map.acquire_initial_conditions)
         self.status = {}
         for pid in cohort.peers:
-            self.status[pid] = PeerStatus(self.app, self.server, cohort.peers[pid], dyna_map)
+            self.status[pid] = PeerStatus(self.app, self.server, cohort.peers[pid], dyna_map, feed_cls=vid_feed_cls)
 
         self.app.layout = html.Div([
             heading.div('Coordinator: Mission #demo'),
@@ -77,7 +78,8 @@ class MapDisplay(object):
 
 
 if __name__ == '__main__':
+    from ..video.client import VideoSimRcvr
     # simulator must be started separately
-    MapDisplay().run()
+    MapDisplay(vid_feed_cls=VideoSimRcvr).run()
 else:
     gunicorn_app = MapDisplay().app

@@ -6,8 +6,8 @@ from typing import Optional
 import cv2
 import imutils
 
-from ..radio import networking as net
-from .serial import serialize
+from autonomous_trust.simulator.radio import networking as net  # FIXME
+from .serialize import serialize
 
 
 class VideoSource(net.Server):
