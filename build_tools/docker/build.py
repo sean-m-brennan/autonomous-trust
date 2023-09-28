@@ -1,0 +1,124 @@
+import glob
+import os
+import subprocess
+from typing import Optional
+
+from ..config import supported_platforms, base_dir, packages, images
+from ..util import GREEN, RESET
+
+
+def get_image_list():
+    import docker as docker_iface
+    client = docker_iface.from_env()
+    return [i.tags[0].split(':')[0] for i in client.images.list() if len(i.tags) > 0]
+
+
+def build(force=False, skip_pkgs=False):
+    subprocess.run(['docker', 'images', 'prune'])
+    if build_pkg_builders(force):
+        if skip_pkgs or build_packages():
+            return build_containers()
+    return False
+
+
+def build_pkg_builders(force: bool = False):
+    src_dir = os.path.join(base_dir, 'src')
+    print(GREEN + "Build package-builder containers" + RESET)
+    # FIXME buildx needs troubleshooting
+    # cmd = ['docker', 'buildx', 'build']
+    cmd = ['docker', 'build']
+    options = ['-t', 'package-builder', '-f', os.path.join(src_dir, 'Dockerfile-build'), src_dir]
+    if 'buildx' in cmd:
+        options = ['--platform', ','.join(supported_platforms)] + options
+    if force:
+        options.insert(0, '--no-cache')
+    p = subprocess.run(cmd + options)
+    if p.returncode != 0:
+        raise RuntimeError('Package-builder container build failed')
+    return True
+
+
+def build_packages():
+    dist_dir = os.path.join(base_dir, 'src', 'dist')
+    if not os.path.exists(dist_dir):
+        os.makedirs(dist_dir, exist_ok=True)
+    if 'package-builder' not in get_image_list():
+        build_pkg_builders()
+    for pkg_name in packages:
+        img_name = images[pkg_name]
+        path = packages[pkg_name]
+
+        # FIXME buildx image naming
+        for platform in supported_platforms:
+            arch = platform.split('/')[-1]
+            img_arch_name = img_name # + '-' + arch ?
+            do_build = False
+            if img_arch_name not in get_image_list():
+                do_build = True
+            else:
+                pkg_search = os.path.join(dist_dir, '*', pkg_name + '-*.tar.bz2')
+                pkgs = glob.glob(pkg_search)
+                pkgs.sort()
+                pkg_time = os.path.getmtime(pkgs[-1])
+                src_time = max(os.path.getmtime(root) for root, _, _ in os.walk(path))
+                if pkg_time < src_time:
+                    do_build = True
+            if do_build:
+                print(GREEN + "Create %s package" % img_name + RESET)
+                cmd = ['docker', 'run', '--rm', '-u', '%d:%d' % (os.getuid(), os.getgid()),
+                       '-v', '%s:%s' % (path, '/build/src'), '-v', '%s:%s' % (dist_dir, '/build/dist'),
+                       '-it', 'package-builder']
+                p = subprocess.run(cmd)
+                if p.returncode != 0:
+                    raise RuntimeError('Package creation for %s failed' % img_name)
+    return True
+
+
+class Container(object):
+    all = 'all'
+    packaged = 'packaged'
+    devel = 'devel'
+    test = 'test'
+
+
+def build_containers(pkg_name: Optional[str] = None, which: Container = Container.all,
+                     debug: bool = False, force: bool = False):
+    src_dir = os.path.join(base_dir, 'src')
+    package_list = [pkg_name]
+    if pkg_name is None:
+        package_list = packages.keys()
+    for pkg_name in package_list:
+        img_name = images[pkg_name]
+        path = packages[pkg_name]
+
+        packaged = ('', src_dir)
+        devel = ('-devel', base_dir)
+        test = ('-test', path)
+        construct_list = [packaged, devel, test]
+        if which == Container.packaged:
+            construct_list = [packaged]
+            if pkg_name not in get_image_list():
+                build_packages()
+        elif which == Container.devel:
+            construct_list = [devel]
+        elif which == Container.test:
+            construct_list = [test]
+            #if pkg_name + '-devel' not in get_image_list():
+            #    construct_list.insert(0, devel)
+
+        cmd = ['docker', 'build']
+        extra = []
+        if force:
+            extra.append('--no-cache')
+        if debug:
+            extra.append('--progress=plain')
+
+        for suffix, context in construct_list:
+            target = img_name + suffix
+            print()
+            print(GREEN + "Build %s container" % target + RESET)
+            options = extra + ['-t', target, '-f', os.path.join(path, 'Dockerfile' + suffix), context]
+            p = subprocess.run(cmd + options)
+            if p.returncode != 0:
+                raise RuntimeError('Build of %s failed' % target)
+    return True

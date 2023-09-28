@@ -2,7 +2,7 @@ import math
 from datetime import datetime
 
 from autonomous_trust.core.config import Configuration
-from autonomous_trust.inspector.peer.position import Position
+from autonomous_trust.services.peer.position import Position
 
 from ..radio.iface import NetInterface, Antenna
 from .path import PathData, Path

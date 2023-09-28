@@ -1,0 +1,30 @@
+name: autonomous_trust
+channels:
+  - conda-forge
+dependencies:
+  - python==3.10
+  - pip
+  - icontract
+  - psutil
+  - pynacl
+  - python-dateutil
+  - ruamel.yaml
+  - aenum
+  - libsass
+  - networkx
+  - quart
+  - numpy
+  - opencv
+  - imutils
+  - geopy
+  - utm
+  - dash==2.6.2
+  - dash-bootstrap-components
+  - dash-daq
+  - flask
+  - absl-py
+  - python-flatbuffers
+  - python-sounddevice
+  - pip:
+      - dash-iconify
+      - mediapipe

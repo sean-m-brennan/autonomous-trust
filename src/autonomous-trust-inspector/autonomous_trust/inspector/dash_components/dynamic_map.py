@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 import plotly.colors as colors
 
 from .util import DashComponent
-from ..peer.position import GeoPosition
+from autonomous_trust.services.peer.position import GeoPosition
 from ..peer.daq import Cohort
 
 
@@ -40,7 +40,7 @@ class DynamicMap(DashComponent):
         self.skip_trace = False
         self.following: str = ''
         self.center = None
-        self.state: Cohort
+        self.state: CohortTracker
         self.update_display = True
 
         @self.app.callback(Output('graph', 'figure'),

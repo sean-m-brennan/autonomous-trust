@@ -1,6 +1,6 @@
 import pytest
 
-from autonomous_trust.inspector.peer.position import GeoPosition, UTMPosition
+from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 
 
 @pytest.fixture

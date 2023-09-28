@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 from autonomous_trust.core.config.configuration import Configuration
-from autonomous_trust.inspector.peer.position import UTMPosition
+from autonomous_trust.services.peer.position import UTMPosition
 from ..serialize import SerializableEnum
 
 

@@ -1,50 +1,65 @@
-from typing import Optional
+import struct
+from queue import Empty, Full
 
 import cv2
 import imutils
-import numpy as np
 
-from .radio import networking as net  # FIXME use (indirect) AT networking instead (pickled!!)
+from autonomous_trust.core import Process, ProcMeta, CfgIds
+from autonomous_trust.core.network import Message
+from autonomous_trust.inspector.peer.daq import Cohort
 from .serialize import deserialize
-from autonomous_trust.services.video.server import VideoSource
+from .server import VideoSource, VideoProtocol
 
 
-def default_display(ref: str, frame: np.ndarray, cadence: int = 1):
-    cv2.imshow('video feed - ' + ref, frame)
-    cv2.waitKey(cadence)
-
-
-class VideoRcvr(net.Client):
+class VideoRcvr(Process, metaclass=ProcMeta,
+                proc_name='video-sink', description='Video image stream consumer'):
     header_fmt = VideoSource.header_fmt
 
-    def __init__(self, callback: [[str, np.ndarray, Optional[int]], None] = default_display,
-                 size: int = 640):
-        super().__init__()
-        self.display_callback = callback
-        self.image_shape = (int(size * 0.5625), size, 3)
+    def __init__(self, configurations, subsystems, log_queue, dependencies, **kwargs):
+        super().__init__(configurations, subsystems, log_queue, dependencies=dependencies)
+        self.cohort: Cohort = kwargs['cohort']
+        self.size = kwargs.get('size', 640)
+        self.encode = kwargs.get('encode', False)
+        self.fast_encoding = kwargs.get('fast_encoding', False)
+        self.servicers = []
+        self.hdr_size = struct.calcsize(self.header_fmt)
+        self.protocol = VideoProtocol(self.name, self.logger, configurations[CfgIds.peers])
+        self.protocol.register_handler(VideoProtocol.video, self.handle_video)
 
-    def get_frame(self, size: Optional[int] = None) -> tuple[Optional[np.ndarray], int]:
-        if self.connected:
+    def handle_video(self, _, message):
+        if message.function == VideoProtocol.video:
             try:
-                (_, fast_encoding), data = self.recv_all()
-            except (net.ReceiveFormatError, OSError, AttributeError):
-                return None, 0
+                uuid = message.from_whom.uuid
+                hdr = message.obj[:self.hdr_size]
+                data = message.obj[self.hdr_size:]
+                (_, fast_encoding) = struct.unpack(self.header_fmt, hdr)
+                frame = deserialize(data, fast_encoding)
+                if frame is not None:
+                    if self.size is not None:
+                        frame = imutils.resize(frame, width=self.size)
+                    if self.encode:
+                        _, frame = cv2.imencode('.jpg', frame)
+                if uuid in self.cohort.peers:
+                    self.cohort.peers[uuid].video_stream.put((frame, 1), block=True, timeout=self.q_cadence)
+            except (Full, Empty):
+                pass
 
-            frame = deserialize(data, fast_encoding)
-            if size is not None:
-                frame = imutils.resize(frame, width=size)
-            return frame, 1
-        return None, 0
+    def process(self, queues, signal):
+        while self.keep_running(signal):
+            for peer in self.protocol.peer_capabilities[VideoSource.capability_name]:
+                if peer not in self.servicers:
+                    self.servicers.append(peer)
+                    msg_obj = self.fast_encoding, self.name
+                    msg = Message(VideoSource.name, VideoProtocol.request, msg_obj, peer)
+                    queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
 
-    def recv_data(self, **kwargs):
-        frame, pause = self.get_frame(kwargs.get('noisy', True), kwargs.get('size', None))
-        if frame is not None:
-            self.image_shape = frame.shape
-            if kwargs.get('encode', False):
-                _, frame = cv2.imencode('.jpg', frame)
-            if self.display_callback is not None:
-                self.display_callback(kwargs.get('name', ''), frame, pause)
-
-
-if __name__ == '__main__':
-    VideoRcvr(size=800).run(server='localhost', port=9999, name='localhost')
+            try:
+                message = queues[self.name].get(block=True, timeout=self.q_cadence)
+            except Empty:
+                message = None
+            if message:
+                if not self.protocol.run_message_handlers(queues, message):
+                    if isinstance(message, Message):
+                        self.logger.error('Unhandled message %s' % message.function)
+                    else:
+                        self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
