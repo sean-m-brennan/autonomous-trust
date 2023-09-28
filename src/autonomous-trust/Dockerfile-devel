@@ -23,12 +23,14 @@ RUN useradd -U user -d /app
 RUN echo "ALL            ALL = (ALL) NOPASSWD: ALL" >>/etc/sudoers
 RUN chmod -R 0777 /opt/conda
 RUN chown -R user:user /app
+RUN mkdir /build
+RUN chown -R user:user /build
 USER user
 
-RUN --mount=type=bind,source=tools,target=/app/.tools --mount=type=cache,target=/opt/conda/pkgs \
-    .tools/trust devel install --environ
-RUN --mount=type=bind,source=tools,target=/app/.tools --mount=type=cache,target=/opt/conda/pkgs \
-    .tools/trust devel install --basic
+COPY --chown=user:user build_tools /build/build_tools
+COPY --chown=user:user bin /build/bin
+RUN --mount=type=cache,target=/opt/conda/pkgs /build/bin/trust-tools devel install --environ
+RUN --mount=type=cache,target=/opt/conda/pkgs /build/bin/trust-tools devel install --basic
 
 
 SHELL ["conda", "run", "--live-stream", "-n", "autonomous_trust", "/bin/bash", "-c"]

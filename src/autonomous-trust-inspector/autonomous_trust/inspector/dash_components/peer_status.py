@@ -1,4 +1,3 @@
-import threading
 from itertools import zip_longest
 
 from flask import Flask
@@ -6,13 +5,11 @@ from dash import Dash, html, dcc, Output, Input
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 
-from autonomous_trust.services.video.dash_components import VideoFeed
-from autonomous_trust.services.video import VideoRcvr
-
 from .util import make_icon, DashComponent, IconSize
-from ..peer.position import GeoPosition
+from autonomous_trust.services.peer.position import GeoPosition
 from ..peer.daq import PeerDataAcq
 from .dynamic_map import DynamicMap
+from .video_feed import VideoFeed
 
 
 class PeerStatus(DashComponent):
@@ -25,13 +22,12 @@ class PeerStatus(DashComponent):
                 }
     icon_height = 40
 
-    def __init__(self, app: Dash, server: Flask, peer: PeerDataAcq, mapp: DynamicMap,
-                 feed_cls: type = VideoRcvr):
+    def __init__(self, app: Dash, server: Flask, peer: PeerDataAcq, mapp: DynamicMap):
         super().__init__(app, server)
         self.peer = peer
-        self.feed = VideoFeed(self.app, self.server, self.count + 1, rcvr_cls=feed_cls)
         self.idx = int(PeerStatus.count)
         PeerStatus.count += 1
+        self.vid_feed = VideoFeed(self.app, self.server, peer, self.count)
 
         self.fig = go.Figure()
         xes, yes = self.update_summary()
@@ -90,11 +86,6 @@ class PeerStatus(DashComponent):
             mapp.following = self.peer.uuid
             return html.Div()
 
-        self.thread = threading.Thread(target=self.feed.run, args=('localhost', 9990 + self.feed.index),
-                                       kwargs={'encode': True})
-        self.thread.start()
-        # atexit.register(self.interrupt)  # FIXME breaks
-
     def update_summary(self):
         xes = list(range(1, len(self.peer.network_history)))
         rev = [sub[::-1] for sub in self.peer.network_history.values()]
@@ -105,10 +96,6 @@ class PeerStatus(DashComponent):
         xes = list(range(len(self.peer.network_history[other.uuid])))
         yes = self.peer.network_history[other.uuid]
         return xes, yes
-
-    def interrupt(self):
-        self.feed.halt = True
-        self.thread.join()
 
     def div(self, width: int = 10, glance: bool = False):
         if glance:
@@ -148,14 +135,13 @@ class PeerStatus(DashComponent):
 
         return html.Div([
             dbc.Modal([
-                dbc.ModalHeader(dbc.ModalTitle('%s #%s' % (self.peer.kind, self.feed.number))),
+                dbc.ModalHeader(dbc.ModalTitle('%s #%s' % (self.peer.kind, self.vid_feed.number))),
                 dbc.ModalBody([
                     dbc.Row([
                         dbc.Col(['%s (%s) - %s' % (self.peer.name, self.peer.nickname, self.peer.uuid)]),
                     ]),
                     dbc.Row([
-                        # FIXME video feed through (trusted) PeerDaq instead
-                        dbc.Col(self.feed.div("%f m above %f, %f" % (pos.alt, pos.lat, pos.lon))),
+                        dbc.Col(self.vid_feed.div("%f m above %f, %f" % (pos.alt, pos.lat, pos.lon))),
                     ]),
                     dbc.Row([
                         # FIXME data feed ??
@@ -166,7 +152,6 @@ class PeerStatus(DashComponent):
                 dbc.ModalFooter(),
             ], id='status-modal-%d' % self.idx,
                 keyboard=False, backdrop="static",
-                fullscreen='md-down',
-                size='xl',
+                fullscreen='md-down', size='xl',
                 is_open=False),
         ])

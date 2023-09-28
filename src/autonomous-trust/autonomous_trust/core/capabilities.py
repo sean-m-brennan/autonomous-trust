@@ -1,4 +1,3 @@
-import sys
 from collections.abc import Mapping
 import multiprocessing
 
@@ -42,7 +41,7 @@ class Capabilities(Mapping):
     def __contains__(self, item):
         return item in self._listing.values()
 
-    def to_list(self):
+    def to_list(self) -> list[str]:
         return [cap.name for cap in self._listing.values()]
 
     def register_ability(self, name, function, arg_names=None, keywords=None):

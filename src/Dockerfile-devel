@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1.3
+
+# Runs a custom AutonomousTrust module from (all) live sources
+
+# Build from repo base dir:
+#    docker build -t autonomous-trust-full-devel  -f src/Dockerfile-devel .
+# For rapid development, run as:
+#    docker run --rm -u $(id -u):$(id -g) -v examples/requestor/requestor.py:/app/requestor.py -e AUTONOMOUS_TRUST_EXE=requestor.py -it autonomous-trust-full-devel
+
+FROM autonomous-trust-devel
+
+WORKDIR /app
+USER user
+
+COPY --chown=user:user src/autonomous-trust/autonomous_trust/core autonomous_trust/core
+COPY --chown=user:user src/autonomous-trust-inspector/autonomous_trust/inspector autonomous_trust/inspector
+COPY --chown=user:user src/autonomous-trust-services/autonomous_trust/services autonomous_trust/services
+COPY --chown=user:user src/autonomous-trust-simulator/autonomous_trust/simulator autonomous_trust/simulator
+
+ARG CONDA_CACHE=/opt/conda/pkgs
+# update and install any new dependencies from environment.yaml
+COPY --chown=user:user build_tools/cfg/environment.yaml /build/build_tools/cfg/environment.yaml
+RUN --mount=type=cache,target=$CONDA_CACHE /build/bin/trust-tools devel update
+
+ENV AUTONOMOUS_TRUST_EXE=""
+CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 $AUTONOMOUS_TRUST_EXE"]
