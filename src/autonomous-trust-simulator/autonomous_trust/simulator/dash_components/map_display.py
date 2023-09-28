@@ -7,7 +7,6 @@ import dash_bootstrap_components as dbc
 
 from autonomous_trust.inspector.peer.daq import Cohort
 from autonomous_trust.inspector.dash_components import TimerTitle, DynamicMap, PeerStatus
-from autonomous_trust.services.video import VideoRcvr
 
 from . import SimulationControls, SimulationInterface
 
@@ -16,21 +15,20 @@ log.setLevel(logging.WARNING)  # reduce callback noise from Flask
 
 
 class MapDisplay(object):
-    def __init__(self, sim_host: str = '127.0.0.1', sim_port: int = 8778, size: int = 600,
-                 max_resolution: int = 300, style: str = 'dark', vid_feed_cls: type = VideoRcvr):
+    def __init__(self, cohort: Cohort, sim_host: str = '127.0.0.1', sim_port: int = 8778,
+                 size: int = 600, max_resolution: int = 300, style: str = 'dark'):
         self.server = Flask(__name__)
         self.app = Dash(__name__, server=self.server, external_stylesheets=[dbc.themes.SPACELAB],
                         prevent_initial_callbacks=True, update_title=None)
 
-        cohort = Cohort([])  # FIXME create PeerDaq objects from ???
         sim = SimulationInterface(sim_host, sim_port, [cohort])
         heading = TimerTitle(self.app, self.server, cohort, with_interval=False)
         dyna_map = DynamicMap(self.app, self.server, cohort, size, style)
         ctrls = SimulationControls(self.app, self.server, sim, cohort, dyna_map, max_resolution, with_interval=False)
         sim.register_reset_handler(dyna_map.acquire_initial_conditions)
         self.status = {}
-        for pid in cohort.peers:
-            self.status[pid] = PeerStatus(self.app, self.server, cohort.peers[pid], dyna_map, feed_cls=vid_feed_cls)
+        for uuid in cohort.peers:
+            self.status[uuid] = PeerStatus(self.app, self.server, cohort.peers[uuid], dyna_map)
 
         self.app.layout = html.Div([
             heading.div('Coordinator: Mission #demo'),
@@ -55,12 +53,6 @@ class MapDisplay(object):
         def update_peers(_):
             if cohort.paused:
                 raise PreventUpdate
-            state = cohort.update()
-            if state is None:
-                return
-            # FIXME where does update happen? PeerDataAcq?
-            #for uuid in state.peers:
-            #    self.status[uuid].update(state.peers[uuid])
             status = list(self.status.values())
             return self.get_status(status, glance=True), self.get_status(status)
 
@@ -75,11 +67,3 @@ class MapDisplay(object):
 
     def run(self, host: str = '127.0.0.1', port: int = 8050):
         self.app.run(host, port)
-
-
-if __name__ == '__main__':
-    from ..video.client import VideoSimRcvr
-    # simulator must be started separately
-    MapDisplay(vid_feed_cls=VideoSimRcvr).run()
-else:
-    gunicorn_app = MapDisplay().app

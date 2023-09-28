@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import pytest
 import matplotlib.pyplot as plt
 
-from autonomous_trust.inspector.peer.position import GeoPosition, UTMPosition
+from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 from autonomous_trust.simulator.peer.path import PathData, Path, Variability
 from autonomous_trust.simulator.peer.path import LineData, BezierData, BeziergonData, EllipseData
 

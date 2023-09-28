@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from uuid import uuid4
 import os
 
-from autonomous_trust.inspector.peer.position import GeoPosition, UTMPosition
+from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 
 from .peer.path import BezierData, PathData, Variability, EllipseData
 from .peer.peer import PeerInfo

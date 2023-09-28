@@ -2,7 +2,7 @@ from dash import Dash, html
 from flask import Flask
 
 from autonomous_trust.simulator.dash_components import SimulationControls, SimulationInterface
-from ..peer.daq import Cohort
+from ..peer.daq import CohortTracker
 from . import DynamicMap, TimerTitle
 
 
@@ -13,7 +13,7 @@ if __name__ == '__main__':
     webserver = Flask(__name__)
     webapp = Dash(__name__, server=webserver,
                   prevent_initial_callbacks=True, update_title=None)
-    cohort = Cohort([])  # FIXME
+    cohort = CohortTracker([])  # FIXME
     heading = TimerTitle(webapp, webserver, cohort, with_interval=False)
     dynamap = DynamicMap(webapp, webserver, cohort)
     sim_iface = SimulationInterface(sync_objects=[cohort])
