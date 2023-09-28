@@ -1,0 +1,85 @@
+# Run with `UID=$(id -u):$(id -g) docker compose up`
+
+version: '3'
+services:
+  simulator:
+    image: autonomous-trust-full-devel:latest
+    volumes:
+      - simulator/scenario.cfg:/app/scenario.cfg
+    user: ${UID}
+    environment:
+      AUTONOMOUS_TRUST_EXE: "-m autonomous_trust.simulator scenario.yaml"
+
+  coordinator:
+    image: autonomous-trust-full-devel:latest
+    volumes:
+      - coordinator/coordinator.py:/app/coordinator.py
+      - coordinator/coordinator.cfg:/app/coordinator.cfg
+    user: ${UID}
+    environment:
+      AUTONOMOUS_TRUST_EXE: "coordinator.py coordinator.cfg"
+    depends_on:
+      - simulator
+
+  participant1:
+    image: autonomous-trust-full-devel:latest
+    volumes:
+      - participant/participant.py:/app/participant.py
+      - participant/participant1.cfg:/app/participant.cfg
+      - participant/var/at/video:/var/at/video
+    user: ${UID}
+    environment:
+      AUTONOMOUS_TRUST_EXE: "participant.py participant.cfg"
+    depends_on:
+      - simulator
+
+  participant2:
+    image: autonomous-trust-full-devel:latest
+    volumes:
+      - participant/participant.py:/app/participant.py
+      - participant/participant2.cfg:/app/participant.cfg
+      - participant/var/at/video:/var/at/video
+    user: ${UID}
+    environment:
+      AUTONOMOUS_TRUST_EXE: "participant.py participant.cfg"
+    depends_on:
+      - simulator
+
+  participant3:
+    image: autonomous-trust-full-devel:latest
+    volumes:
+      - participant/participant.py:/app/participant.py
+      - participant/participant3.cfg:/app/participant.cfg
+      - participant/var/at/video:/var/at/video
+    user: ${UID}
+    environment:
+      AUTONOMOUS_TRUST_EXE: "participant.py participant.cfg"
+    depends_on:
+      - simulator
+
+  participant4:
+    image: autonomous-trust-full-devel:latest
+    volumes:
+      - participant/participant.py:/app/participant.py
+      - participant/participant4.cfg:/app/participant.cfg
+      - participant/var/at/video:/var/at/video
+    user: ${UID}
+    environment:
+      AUTONOMOUS_TRUST_EXE: "participant.py participant.cfg"
+    depends_on:
+      - simulator
+
+  participant5:
+    image: autonomous-trust-full-devel:latest
+    volumes:
+      - participant/participant.py:/app/participant.py
+      - participant/participant5.cfg:/app/participant.cfg
+    user: ${UID}
+    environment:
+      AUTONOMOUS_TRUST_EXE: "participant.py participant.cfg"
+    depends_on:
+      - simulator
+
+    # FIXME more participants
+
+# FIXME define network

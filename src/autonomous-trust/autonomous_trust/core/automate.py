@@ -8,7 +8,7 @@ from logging.handlers import TimedRotatingFileHandler, SysLogHandler
 import traceback
 import queue
 from enum import Enum
-from typing import Union
+from typing import Union, Optional
 import multiprocessing as mp
 from multiprocessing import Pool as ProcessPool
 from multiprocessing.dummy import Pool as ThreadPool
@@ -23,7 +23,7 @@ try:
 except ImportError:
     version = '?.?.?'
 from .config import Configuration, CfgIds, to_yaml_string
-from .processes import Process, LogLevel, ProcessTracker
+from .processes import Process, LogLevel, ProcessTracker, QueueType
 from .identity import Peers
 from .capabilities import Capabilities, Capability
 from .system import PackageHash, queue_cadence, max_concurrency, now
@@ -33,10 +33,9 @@ from .network import Message
 from .reputation import TransactionScore, ReputationProtocol
 
 PoolType = Union[ProcessPool, ThreadPool]
-QueueType = Union[queue.Queue, mp.Queue]
 
 
-def pi(precision):
+def pi(precision):  # intentionally non-trivial, arbitrary precision
     getcontext().prec = precision
     return sum(1/Decimal(16)**k *
                (Decimal(4)/(8*k+1) -
@@ -62,7 +61,7 @@ class AutonomousTrust(Protocol):
     external_feedback = 'extern_in'
 
     # default to production values
-    def __init__(self, multiproc: Union[bool, None] = True, log_level: int = LogLevel.WARNING,
+    def __init__(self, multiproc: Optional[bool] = True, log_level: int = LogLevel.WARNING,
                  logfile: str = None, log_classes: list[str] = None, context: str = Ctx.DEFAULT,
                  testing: bool = False):
         self._stopped_procs = []
@@ -121,18 +120,18 @@ class AutonomousTrust(Protocol):
     def system_dependencies(self) -> list[str]:
         return self._subsystems.names
 
-    def add_worker(self, process: type[Process], dependencies: list[str] = None) -> None:
+    def add_worker(self, process: type[Process], dependencies: list[str] = None, **kwargs) -> None:
         """
-        Adds custom concurrency, must be called in __init__()
+        Adds custom concurrency (Process), must be called in __init__()
         :param process: object derived from autonomous_trust.core.processes.Process
         :param dependencies: list of process names that must precede this one
         :return: None
         """
-        self._additional_workers.append((process, dependencies))
+        self._additional_workers.append((process, dependencies, kwargs))
 
     def autonomous_ability(self, queues: dict[str, QueueType]):
         """
-        Override this to register real services (see add_worker for an alternative).
+        Override this to register real services (Capability).
         :param queues: Interprocess communication queues to each process
         :return: None
         """
@@ -165,7 +164,7 @@ class AutonomousTrust(Protocol):
             return diff
         return 0
 
-    def autonomous_tasking(self, queues):
+    def autonomous_tasking(self, queues: dict[str, QueueType]):
         """
         Override this for assigning tasks
         :param queues: Interprocess communication queues to each process
@@ -212,7 +211,7 @@ class AutonomousTrust(Protocol):
                     for sig in signals.values():
                         sig.put_nowait(Process.sig_quit)
                     break
-                #except Exception as err:
+                #except Exception as err:  # FIXME uncomment or handle otherwise
                 #    self.logger.error(self.name + ':  ' +
                 #                      ''.join(traceback.TracebackException.from_exception(err).format()))
         self.cleanup()
@@ -314,8 +313,8 @@ class AutonomousTrust(Protocol):
                 if sub_sys_cls.cfg_name in self.classes_to_log:
                     suppress = False
                 configs[Process.key].append(sub_sys_cls(configs, self._subsystems, self._output, suppress_log=suppress))
-            for worker_cls, deps in self._additional_workers:
-                configs[Process.key].append(worker_cls(configs, self._subsystems, self._output, deps))
+            for worker_cls, deps, kwargs in self._additional_workers:
+                configs[Process.key].append(worker_cls(configs, self._subsystems, self._output, deps, **kwargs))
         return configs
 
     def _monitor_processes(self, proc_results, show_output=True):
@@ -438,7 +437,7 @@ class AutonomousTrust(Protocol):
                     # FIXME send error result to negotiation
                 del results[key]
 
-    def _random_task(self, queues):
+    def _random_task(self, queues: dict[str, QueueType]):
         cap_list = self.capabilities.to_list()
         cap = Capability(cap_list[random.randint(0, len(cap_list)-1)])
         args = (random.randint(2, 1000000), random.randint(2, 1000000))

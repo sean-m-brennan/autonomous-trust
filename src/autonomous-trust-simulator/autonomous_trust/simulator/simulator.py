@@ -6,7 +6,7 @@ import sys
 import time
 from datetime import timedelta
 
-from autonomous_trust.inspector.peer.position import GeoPosition, UTMPosition
+from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 from .peer.peer import PeerMovement
 from .sim_data import SimConfig, SimState, Map, Matrix
 from .sim_client import SimClient

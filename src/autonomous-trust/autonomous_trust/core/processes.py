@@ -1,20 +1,25 @@
+import multiprocessing as mp
 import os
+import queue
 import sys
 import logging
 import time
 from importlib import import_module
 from io import StringIO
-from queue import Empty
 from collections.abc import Mapping
 from collections import OrderedDict
 
 from enum import IntEnum
+from typing import Union
+
 from ruamel.yaml import YAML
 
 from .config import Configuration
 from .system import cadence, queue_cadence, now
 
 yaml = YAML(typ='safe')
+
+QueueType = Union[queue.Queue, mp.Queue]
 
 
 class ProcessTracker(Mapping):
@@ -153,7 +158,7 @@ class Process(metaclass=ProcMeta):
             self.logger.debug('Quit %s' % self.__class__.__name__)
             if sig == self.sig_quit:
                 running = False
-        except Empty:
+        except queue.Empty:
             pass
         self.loop_start = now()
         return running

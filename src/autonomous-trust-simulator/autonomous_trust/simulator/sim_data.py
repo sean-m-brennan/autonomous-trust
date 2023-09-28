@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 
 from autonomous_trust.core.config import Configuration
-from autonomous_trust.inspector.peer.position import Position, GeoPosition
+from autonomous_trust.services.peer.position import Position, GeoPosition
 from .peer.peer import PeerInfo
 
 

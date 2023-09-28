@@ -31,6 +31,7 @@ core_system = {CfgIds.network: communications,
                CfgIds.reputation: pkg + '.reputation.ReputationProcess',
                }
 max_concurrency = os.cpu_count() * 2
+base_system_deps = core_system.keys()
 
 
 def now():  # FIXME NTP sourced
