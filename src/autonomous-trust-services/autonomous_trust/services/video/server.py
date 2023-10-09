@@ -5,6 +5,7 @@ from queue import Full, Empty
 
 import cv2
 import imutils
+import numpy as np
 
 from autonomous_trust.core import Process, ProcMeta, Configuration, CfgIds
 from autonomous_trust.core.protocol import Protocol
@@ -20,7 +21,7 @@ class VideoProtocol(Protocol):
 
 class VideoSource(Process, metaclass=ProcMeta,
                   proc_name='video-source', description='Video image stream service'):
-    header_fmt = "!Q?"
+    header_fmt = "!Q?Q"
     capability_name = 'video'
 
     def __init__(self, configurations, subsystems, log_queue, dependencies, **kwargs):
@@ -82,8 +83,8 @@ class VideoSource(Process, metaclass=ProcMeta,
                     if frame is not None:
                         quick_info = serialize(frame, True)
                         slow_info = serialize(frame, False)
-                        quick_header = struct.pack(self.header_fmt, len(quick_info), True)
-                        slow_header = struct.pack(self.header_fmt, len(slow_info), False)
+                        quick_header = struct.pack(self.header_fmt, len(quick_info), True, idx)
+                        slow_header = struct.pack(self.header_fmt, len(slow_info), False, idx)
                         for client_id in self.clients:
                             fast_encoding, proc_name, peer = self.clients[client_id]
                             if fast_encoding:
@@ -101,6 +102,6 @@ class VideoSource(Process, metaclass=ProcMeta,
             if vid is not None:
                 vid.release()
 
-    def process_frame(self, frame):
+    def process_frame(self, frame: np.ndarray) -> np.ndarray:
         """Implements frame processing before resizing and shipping. Default: pass-through"""
         return frame

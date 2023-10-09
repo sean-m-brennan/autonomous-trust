@@ -10,6 +10,8 @@ class Network(Configuration):
     multicast_v4_address = '239.0.0.65'
     multicast_v6_address = 'ff00::41e9:dddc:e4c7:e7e7'
     ping = 'ping'
+    stats_req = 'stats_req'
+    stats_resp = 'stats_resp'
 
     def __init__(self, _ip4_cidr, _ip6_cidr, _mac_address, _mcast4_addr, _mcast6_addr, _port=None):
         self._ip4_cidr = _ip4_cidr

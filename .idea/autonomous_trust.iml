@@ -39,6 +39,8 @@
       <excludeFolder url="file://$MODULE_DIR$/unikernel/lib" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/.local" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/.local" />
+      <excludeFolder url="file://$MODULE_DIR$/lib" />
+      <excludeFolder url="file://$MODULE_DIR$/virtenv" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

@@ -1,3 +1,4 @@
+import time
 from queue import Empty
 
 from flask import Flask, Response
@@ -13,32 +14,25 @@ class VideoFeed(DashComponent):
         self.server = server
         self.number = str(number)
         self.peer = peer
-        self._halt = False
+        self.halt = False
 
-        @self.server.route('/video_feed%s' % self.number)
-        def video_feed():
-            return Response(self.rcv(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-    @property
-    def halt(self):
-        return self._halt
-
-    @halt.setter
-    def halt(self, h: bool):
-        self._halt = h
+        self.server.add_url_rule('/video_feed_%s' % self.number, 'video_feed_%s' % self.number,
+                                 lambda: Response(self.rcv(), mimetype='multipart/x-mixed-replace; boundary=frame'))
 
     def rcv(self):
-        while not self._halt:
+        while not self.halt:
             try:
-                frame = self.peer.video_stream.get(block=True).tobytes()
+                idx, frame, cadence = self.peer.video_stream.get()  # speed is determined by source speed
+                frame = frame.tobytes()
             except Empty:
                 continue
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
+            if frame:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
 
     def div(self, title: str, style: dict = None) -> html.Div:
         if style is None:
             style = {'float': 'left', 'padding': 10}
         return html.Div([html.H1(title),
-                         html.Img(src='/video_feed%s' % self.number, id='feed%s' % self.number)],
+                         html.Img(src='/video_feed_%s' % self.number, id='feed_%s' % self.number)],
                         style=style)

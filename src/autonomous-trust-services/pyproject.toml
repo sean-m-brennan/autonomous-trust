@@ -8,8 +8,9 @@ version = "0.1.1"
 description = "AutonomousTrust Services - a collection of AutonomousTrust capabilities"
 authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
 readme = "README.md"
-packages = [{include = "autonomous_trust/services"}]
+packages = [{include = "autonomous_trust"}]
 license = "Proprietary"
+exclude = ["**/__pycache__"]
 
 [project]
 name = "autonomous_trust_services"
@@ -17,6 +18,7 @@ version = "0.1.1"
 
 [tool.poetry.dependencies]
 python = "^3.10"
+#autonomous_trust.core = {path = "../autonomous-trust"}
 autonomous-trust = ">=0.1.1"
 psutil = ">=5.9.5"
 geopy = '>=2.4.0'

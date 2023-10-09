@@ -10,8 +10,10 @@ from .radio.iface import Antenna, NetInterface
 from .sim_data import SimConfig
 
 
-def create_config(which):
-    cfg = os.path.join(os.path.dirname(__file__), 'test.cfg')
+def create_config(which: str, where: str = None):
+    cfg = where
+    if where is None:
+        cfg = os.path.join(os.path.dirname(__file__), 'test.cfg')
     if not os.path.exists(cfg):
         try:
             if which == 'small':

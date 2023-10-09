@@ -5,12 +5,12 @@ from dash import Dash, html, dcc, Output, Input
 import dash_bootstrap_components as dbc
 from dash.exceptions import PreventUpdate
 
-from ..peer.daq import Cohort
+from ..peer.daq import CohortInterface
 from .util import DashComponent
 
 
 class TimerTitle(DashComponent):
-    def __init__(self, app: Dash, server: Flask, cohort: Cohort, with_interval: bool = True):
+    def __init__(self, app: Dash, server: Flask, cohort: CohortInterface, with_interval: bool = True):
         super().__init__(app, server)
         self.with_interval = with_interval
 
@@ -19,10 +19,10 @@ class TimerTitle(DashComponent):
         def update_time(_):
             if cohort.paused:
                 raise PreventUpdate
-            state = cohort.update()
-            if state is None:
+            cohort.update()
+            if cohort.time is None:
                 return
-            return state.time.isoformat(' ').rsplit('.')[0]
+            return cohort.time.isoformat(' ').rsplit('.')[0]
 
     def div(self, title: str):
         additional = []

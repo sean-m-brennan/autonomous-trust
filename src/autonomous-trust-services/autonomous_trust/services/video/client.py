@@ -6,7 +6,6 @@ import imutils
 
 from autonomous_trust.core import Process, ProcMeta, CfgIds
 from autonomous_trust.core.network import Message
-from autonomous_trust.inspector.peer.daq import Cohort
 from .serialize import deserialize
 from .server import VideoSource, VideoProtocol
 
@@ -17,7 +16,7 @@ class VideoRcvr(Process, metaclass=ProcMeta,
 
     def __init__(self, configurations, subsystems, log_queue, dependencies, **kwargs):
         super().__init__(configurations, subsystems, log_queue, dependencies=dependencies)
-        self.cohort: Cohort = kwargs['cohort']
+        self.cohort = kwargs['cohort']
         self.size = kwargs.get('size', 640)
         self.encode = kwargs.get('encode', False)
         self.fast_encoding = kwargs.get('fast_encoding', False)
@@ -32,7 +31,7 @@ class VideoRcvr(Process, metaclass=ProcMeta,
                 uuid = message.from_whom.uuid
                 hdr = message.obj[:self.hdr_size]
                 data = message.obj[self.hdr_size:]
-                (_, fast_encoding) = struct.unpack(self.header_fmt, hdr)
+                (_, fast_encoding, idx) = struct.unpack(self.header_fmt, hdr)
                 frame = deserialize(data, fast_encoding)
                 if frame is not None:
                     if self.size is not None:
@@ -40,7 +39,7 @@ class VideoRcvr(Process, metaclass=ProcMeta,
                     if self.encode:
                         _, frame = cv2.imencode('.jpg', frame)
                 if uuid in self.cohort.peers:
-                    self.cohort.peers[uuid].video_stream.put((frame, 1), block=True, timeout=self.q_cadence)
+                    self.cohort.peers[uuid].video_stream.put((idx, frame, 1), block=True, timeout=self.q_cadence)
             except (Full, Empty):
                 pass
 

@@ -1,0 +1,39 @@
+## conda-build *must* be called in the current directory (src/autonomous-trust-inspector)
+
+{% set toml = load_file_data(os.path.abspath('./pyproject.toml')) %}  # fails early if wrong path
+{% set project = toml.get('project', {}) %}
+{% set name = project.get('name') %}
+{% set version = project.get('version') %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ./
+
+build:
+  noarch: python
+  script: poetry build && {{PYTHON}} -m pip install ./dist/{{ name }}-{{ version }}.tar.gz --no-deps --ignore-installed -vv
+
+
+requirements:
+  build:
+    - python==3.10
+    - pip
+    - poetry
+  host:
+    - python==3.10
+    - pip
+    - poetry
+  run:
+    - python>=3.10
+    - autonomous-trust
+    - numpy>=1.25.2
+    - py-opencv>=4.8.0
+    - imutils>=0.5.4
+    - msgpack-numpy>=0.4.7
+    - psutil>=5.9.5
+    - geopy>=2.4.0
+    - utm>=0.7.0
+#    - mediapipe>=0.10.5  # pip only
