@@ -29,11 +29,11 @@ requirements:
   run:
     - python>=3.10
     - autonomous-trust
-    - aenum>=3.1.11
-    - libsass>=0.22.0
-    - networkx>=3.0
-    - quart>=0.18.3
-    - dash==2.6.2
-    - flask>=2.2.2
-    - dash-bootstrap-components>=1.5.0
-#    - dash-iconify>=0.1.2  # pip only
+    - numpy>=1.25.2
+    - py-opencv>=4.8.0
+    - imutils>=0.5.4
+    - msgpack-numpy>=0.4.7
+    - psutil>=5.9.5
+    - geopy>=2.4.0
+    - utm>=0.7.0
+#    - mediapipe>=0.10.5  # pip only

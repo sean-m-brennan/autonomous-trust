@@ -9,10 +9,9 @@ from flask import Flask
 import plotly.graph_objects as go
 import plotly.colors as colors
 
-from .util import DashComponent
 from autonomous_trust.services.peer.position import GeoPosition
-from ..peer.daq import Cohort
-
+from .util import DashComponent
+from ..peer.daq import CohortInterface
 
 Coord = namedtuple('Coord', 'lat lon')
 
@@ -22,7 +21,7 @@ class DynamicMap(DashComponent):
     max_pitch = 60
     fig_margin = 5
 
-    def __init__(self, app: Dash, server: Flask, cohort: Cohort, size: int = 600, style: str = 'dark'):
+    def __init__(self, app: Dash, server: Flask, cohort: CohortInterface, size: int = 600, style: str = 'dark'):
         super().__init__(app, server)
         self.cohort = cohort
         self.queue = Queue(maxsize=1)
@@ -40,7 +39,6 @@ class DynamicMap(DashComponent):
         self.skip_trace = False
         self.following: str = ''
         self.center = None
-        self.state: CohortTracker
         self.update_display = True
 
         @self.app.callback(Output('graph', 'figure'),
@@ -50,15 +48,15 @@ class DynamicMap(DashComponent):
             if not self.update_display:
                 raise PreventUpdate
             if not self.cohort.paused:
-                self.state = self.cohort.update()
-                if self.state is None:
-                    return
-                self.center = self.state.center.convert(GeoPosition)
+                self.cohort.update()
+                if self.cohort.center is None:
+                    return self.fig
+                self.center = self.cohort.center.convert(GeoPosition)
                 if self.skip_trace:
                     self.skip_trace = False
                 else:
-                    for uuid in self.state.peers:
-                        position = self.state.peers[uuid].position.convert(GeoPosition)
+                    for uuid in self.cohort.peers:
+                        position = self.cohort.peers[uuid].position.convert(GeoPosition)
                         if uuid not in self.coords:
                             self.coords[uuid] = Coord(deque(maxlen=self.trace_len), deque(maxlen=self.trace_len))
                         self.coords[uuid].lat.append(position.x)
@@ -115,17 +113,10 @@ class DynamicMap(DashComponent):
         #  end __init__
 
     def trim_traces(self, num: int):
-        for uuid in self.state.peers:
+        for uuid in self.cohort.peers:
             self.coords[uuid] = Coord(deque(list(self.coords[uuid].lat)[num:-1]),
                                       deque(list(self.coords[uuid].lon)[num:-1]))
         self.skip_trace = True
-
-    def state_to_queue(self):
-        def cb(state):
-            if state is not None:
-                self.queue.put(state, block=True, timeout=None)
-
-        return cb
 
     def div(self):
         return html.Div([
@@ -159,15 +150,14 @@ class DynamicMap(DashComponent):
         self.coords = {}
         self.color_map = {}
 
-        self.state = self.cohort.update(block=True)
-        print(self.state)
-        center = self.state.center.convert(GeoPosition)
+        self.cohort.update()
+        center = self.cohort.center.convert(GeoPosition)
         scatter = go.Scattergeo
         if self.use_mapbox:
             scatter = go.Scattermapbox
             self.z_scale = 12  # TODO: compute, this is tuned for the example config
-        for idx, uuid in enumerate(self.state.peers):
-            position = self.state.peers[uuid].position.convert(GeoPosition)
+        for idx, uuid in enumerate(self.cohort.peers):
+            position = self.cohort.peers[uuid].position.convert(GeoPosition)
             self.color_map[uuid] = colors.qualitative.Light24[idx]
             self.fig.add_trace(scatter(lat=[position.lat], lon=[position.lon],
                                        mode='markers', marker=dict(color=self.color_map[uuid], opacity=.7),

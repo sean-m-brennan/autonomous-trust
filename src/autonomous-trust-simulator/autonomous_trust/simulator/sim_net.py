@@ -21,8 +21,9 @@ class Net(object):
     """Base networking class"""
     header_fmt = '!L'  # max 4GB message size
 
-    def __init__(self, logger: logging.Logger = None):
+    def __init__(self, logger: logging.Logger = None, verbose: bool = False):
         self.logger = logger
+        self.verbose = verbose
         self.halt = False
         self.sock: Optional[socket.socket] = None
 
@@ -37,7 +38,7 @@ class Net(object):
             if len(new_data) == 0:
                 raise ReceiveError
             data += new_data
-        if self.logger is not None:
+        if self.logger is not None and self.verbose:
             self.logger.debug('Recv %s' % data)
         return data
 
@@ -46,13 +47,13 @@ class Net(object):
         offset = 0
         while offset != data_len:
             offset += sock.send(data[offset:])
-        if self.logger is not None:
+        if self.logger is not None and self.verbose:
             self.logger.debug('Send %s' % data)
 
 
 class Client(Net):
     @property
-    def connected(self) -> bool:
+    def is_connected(self) -> bool:
         if self.sock is None:
             return False
         try:
@@ -82,20 +83,31 @@ class Client(Net):
                 self.sock.settimeout(None)
         return True
 
-    def reconnect(self, serv_addr: str, serv_port: int):
+    def reconnect(self, serv_addr: str, serv_port: int, await_server: bool = True):
+        was_connected = False
         while not self.halt:
             if self.sock is None:
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            if not self.connected:
+            if not self.is_connected:
                 try:
                     self.sock.connect((serv_addr, serv_port))
+                    was_connected = not await_server
                     if self.logger is not None:
-                        self.logger.info('Reconnect to %s:%d' % (serv_addr, serv_port))
+                        self.logger.debug('Reconnect to %s:%d' % (serv_addr, serv_port))
                 except ConnectionRefusedError:
-                    pass
-                except OSError:
                     self.sock.close()
                     self.sock = None
+                    if was_connected:
+                        self.halt = True
+                        if self.logger is not None:
+                            self.logger.warning('Connection refused to %s:%d. Halting.' % (serv_addr, serv_port))
+                    elif self.logger is not None:
+                        self.logger.debug('Connection refused to %s:%d' % (serv_addr, serv_port))
+                except OSError as e:
+                    self.sock.close()
+                    self.sock = None
+                    if self.logger is not None:
+                        self.logger.debug('Reconnect failed to %s:%d (%s)' % (serv_addr, serv_port, e))
             time.sleep(0.01)
 
     def decode(self, data: bytes) -> str:
@@ -121,7 +133,8 @@ class Client(Net):
         pass
 
     def run(self, server: str, port: int, **kwargs):
-        thread = threading.Thread(target=self.reconnect, args=(server, port))
+        wait = kwargs.get('await_server', True)
+        thread = threading.Thread(target=self.reconnect, args=(server, port), kwargs=dict(await_server=wait))
         thread.start()
         try:
             while not self.halt:
@@ -150,7 +163,7 @@ class Server(Net):
                 client_socket, (host, port) = self.sock.accept()
                 self.clients.append(client_socket)
                 if self.logger is not None:
-                    self.logger.debug('New client at %s:%d' % (host, port))
+                    self.logger.info('New client at %s:%d' % (host, port))
             except socket.timeout:
                 pass
 
@@ -176,8 +189,8 @@ class Server(Net):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.set_socket_options()
-        self.sock.bind(('0.0.0.0', port))
-        self.sock.listen(5)
+        self.sock.bind(('', port))
+        self.sock.listen(10)
 
         self.listener = threading.Thread(target=self.listen)
         self.listener.start()
@@ -213,7 +226,7 @@ class SelectServer(Server):
                     self.clients.append(client_socket)
                     self.queues[client_socket] = Queue()
                     if self.logger is not None:
-                        self.logger.debug('New client at %s:%d' % (host, port))
+                        self.logger.info('New client at %s:%d' % (host, port))
                 else:
                     data = self.recv_data(sock)
                     if data:
@@ -226,6 +239,8 @@ class SelectServer(Server):
                         self.clients.remove(sock)
                         sock.close()
                         del self.queues[sock]
+                        if self.logger is not None:
+                            self.logger.info('Client disconnected')
             for sock in wr:
                 try:
                     self.queues[sock].get_nowait()
@@ -236,13 +251,15 @@ class SelectServer(Server):
             for sock in err:
                 if sock is self.sock:
                     self.sock.close()
-                    self.halt = True  # FIXME recovery?
+                    self.halt = True
                 else:
                     if sock in outputs:
                         outputs.remove(sock)
                     self.clients.remove(sock)
                     sock.close()
                     del self.queues[sock]
+                    if self.logger is not None:
+                        self.logger.info('Client errored out')
 
     def recv_data(self, sock: socket.socket):
         raise NotImplementedError

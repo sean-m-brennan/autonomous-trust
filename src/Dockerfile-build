@@ -3,7 +3,12 @@
 # User must provide sources, including a meta.yaml file for conda-build
 
 # Create multi-arch containers with: docker buildx build --platform linux/amd64,linux/arm64 --tag package-builder .
-# Run with: docker run --rm -u $(id -u):$(id -g) -v ~/path/to/source:/build/src -v ~/path/to/dist:/build/dist [-it | -d] package-builder:<arch>
+# Run with: docker run --rm -u $(id -u):$(id -g) -v /tmp:/tmp -v ~/path/to/source:/build/src -v ~/path/to/dist:/build/dist [-it | -d] package-builder:<arch>
+
+# TODO This is not working. Likely related to https://github.com/conda/conda-build/issues/1482.
+#      Placeholders are truncated by 28 characters to a length of 190.
+#      Perhaps (quite likely) Docker does indirections similar to encryption.
+#      Mounting does not help, and neither does '--prefix-length 100' in EXTRA_ARGS
 
 ARG ARCH=
 FROM ${ARCH}continuumio/anaconda-pkg-build:master
@@ -23,10 +28,12 @@ ENV PATH="/opt/rust/bin:${PATH}"
 RUN rustup install nightly && rustup default nightly
 
 WORKDIR /build/src
-RUN mkdir /tmp/conda-bld && chmod 777 /tmp/conda-bld
+ENV TEMPDIR=/build
+RUN mkdir $TEMPDIR/conda-bld && chmod 777 $TEMPDIR/conda-bld
 ARG UID=1000
 RUN useradd -U user -u $UID -d /build/src
 RUN mkdir /build/dist
 
-CMD ["/bin/bash", "-c", "conda build -c conda-forge --no-verify --croot /tmp/conda-bld --output-folder /build/dist ."]
+ENV EXTRA_ARGS="--prefix-length 100 --prefix-length-fallback"
+CMD ["/bin/bash", "-c", "conda build -c conda-forge --no-verify $EXTRA_ARGS --croot $TEMPDIR/conda-bld --output-folder /build/dist ."]
 

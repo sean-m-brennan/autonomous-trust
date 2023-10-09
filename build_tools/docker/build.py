@@ -1,9 +1,16 @@
 import glob
 import os
+import shutil
+import site
+import stat
 import subprocess
+import sys
+import threading
+import venv
+from http.server import HTTPServer, CGIHTTPRequestHandler
 from typing import Optional
 
-from ..config import supported_platforms, base_dir, packages, images
+from ..config import supported_platforms, base_dir, packages, images, wheels
 from ..util import GREEN, RESET
 
 
@@ -38,8 +45,67 @@ def build_pkg_builders(force: bool = False):
     return True
 
 
+def build_env_dir(env_dir: str = None, start_server: bool = True, quiet: bool = False):
+    if env_dir is None:
+        env_dir = os.path.join(base_dir, 'virtenv')
+    if not os.path.exists(env_dir):
+        os.makedirs(env_dir, exist_ok=True)
+    build_dist_repo(wheel=True)
+    subprocess.check_call([sys.executable, '-m', 'venv', env_dir])  # venv instead of --target
+
+    if start_server:
+        thread = threading.Thread(target=host_local_pypi)
+        thread.daemon = True
+        thread.start()
+    extra = []
+    if quiet:
+        extra.append('-q')
+    for pkg_name in packages:
+        subprocess.check_call(['pip', 'install', '-I'] + extra + ['--extra-index-url', 'http://127.0.0.1:9000', pkg_name],
+                              env={'PATH': os.path.join(env_dir, 'bin') + os.pathsep + os.environ['PATH']})
+
+
+def host_local_pypi():
+    os.chdir(os.path.join(base_dir, 'src', 'dist', 'pypi-repo'))
+    httpd = HTTPServer(('', 9000), CGIHTTPRequestHandler)
+    httpd.serve_forever()
+
+
+def build_dist_repo(wheel: bool = False, quiet: bool = False):
+    dist_dir = os.path.join(base_dir, 'src', 'dist', 'pypi-repo')
+    if not os.path.exists(dist_dir):
+        os.makedirs(dist_dir, exist_ok=True)
+    host_script = os.path.join(dist_dir, 'host.sh')
+    if not os.path.exists(host_script):
+        with open(host_script, 'w') as script:
+            script.write('#!/bin/sh\npython3 -m http.server 9000\n')
+        st = os.stat(host_script)
+        os.chmod(host_script, st.st_mode | stat.S_IEXEC)
+    pip_config = os.path.join(sys.prefix, 'pip.conf')
+    if not os.path.exists(pip_config):
+        with open(pip_config, 'w') as cfg:
+            cfg.write('[global]\nextra-index-url=http://127.0.0.1:9000\n')
+    for pkg_name in packages:
+        path = packages[pkg_name]
+        img_name = images[pkg_name]
+        fmt = 'sdist'
+        if wheel or img_name in wheels:
+            fmt = 'wheel'
+        cmd = ['poetry', 'build-project', '--with-top-namespace=autonomous_trust', '-C', path, '-f', fmt, '-n']
+        if quiet:
+            cmd += ['-q']
+        p = subprocess.run(cmd)
+        if p.returncode != 0:
+            raise RuntimeError('Package creation for %s failed' % img_name)
+        for source in glob.glob(os.path.join(path, 'dist', '*.tar.gz')) + glob.glob(os.path.join(path, 'dist', '*.whl')):
+            target_dir = os.path.join(dist_dir, img_name)
+            os.makedirs(target_dir, exist_ok=True)
+            target = os.path.join(target_dir, os.path.basename(source))
+            shutil.move(source, target)
+
+
 def build_packages():
-    dist_dir = os.path.join(base_dir, 'src', 'dist')
+    dist_dir = os.path.join(base_dir, 'src', 'dist', 'conda-repo')
     if not os.path.exists(dist_dir):
         os.makedirs(dist_dir, exist_ok=True)
     if 'package-builder' not in get_image_list():

@@ -2,7 +2,7 @@ from flask import Flask
 from dash import Dash, html, dcc, Output, Input, ctx
 import dash_bootstrap_components as dbc
 
-from autonomous_trust.inspector.peer.daq import Cohort
+from autonomous_trust.inspector.peer.daq import CohortInterface
 from autonomous_trust.inspector.dash_components.util import make_icon, DashComponent
 from autonomous_trust.inspector.dash_components.dynamic_map import DynamicMap
 
@@ -10,7 +10,7 @@ from .sim_iface import SimulationInterface
 
 
 class SimulationControls(DashComponent):
-    def __init__(self, app: Dash, server: Flask, sim: SimulationInterface, cohort: Cohort,
+    def __init__(self, app: Dash, server: Flask, sim: SimulationInterface, cohort: CohortInterface,
                  mapp: DynamicMap, max_resolution: int = 300, with_interval: bool = True):
         super().__init__(app, server)
         self.sim = sim
@@ -82,7 +82,7 @@ class SimulationControls(DashComponent):
                            Output('skip-for-btn', 'disabled'),
                            Input('interval', 'n_intervals'))
         def reset_disabled(_):
-            self.sim.update_state()  # only call among all components, for sync
+            self.sim.update()  # this is the only call among all components, for sync
             if self.sim.can_reset:
                 return False, True, True, True, True, True
             return True, False, False, False, False, False

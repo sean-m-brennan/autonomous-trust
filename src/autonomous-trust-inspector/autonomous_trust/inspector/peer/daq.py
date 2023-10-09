@@ -1,3 +1,5 @@
+import logging
+import sys
 from datetime import datetime, timedelta
 from queue import Empty
 
@@ -5,10 +7,9 @@ from autonomous_trust.core import Process, ProcMeta, CfgIds, from_yaml_string, Q
 from autonomous_trust.core.identity import Peers, Identity
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.protocol import Protocol
+from autonomous_trust.services.network_statistics import NetworkStats, NetStatsProtocol, NetStatsSource
+from autonomous_trust.services.peer.metadata import MetadataProtocol, MetadataSource, PeerData
 from autonomous_trust.services.peer.position import Position, GeoPosition
-from autonomous_trust.services.NetworkStatistics import NetStatsProtocol, NetStatsSource
-from autonomous_trust.services.PeerMetadata import MetadataProtocol, MetadataSource, PeerData
-from autonomous_trust.simulator.sim_client import SimSync
 
 
 NullPeerData = lambda: PeerData(datetime.utcfromtimestamp(0), Position(0, 0), '')  # noqa
@@ -16,15 +17,20 @@ NullPeerData = lambda: PeerData(datetime.utcfromtimestamp(0), Position(0, 0), ''
 
 class PeerDataAcq(object):
     """Peer acquired-data store"""
-    def __init__(self, uuid: str, ident: Identity, metadata: PeerData,
+    def __init__(self, uuid: str, ident: Identity, metadata: PeerData, cohort: 'CohortInterface',
                  video_stream: QueueType, data_stream: QueueType):
         self._uuid = uuid
         self._ident = ident
+        self.metadata = metadata
+        self.cohort = cohort
         self.video_stream = video_stream
         self.data_stream = data_stream
 
         self.network_history: dict[str, list[NetworkStats]] = {}
-        self.metadata = metadata
+
+    @property
+    def tick(self):
+        return self.cohort.tick
 
     @property
     def time(self):
@@ -63,18 +69,43 @@ class PeerDataAcq(object):
         return {}
 
 
-class Cohort(SimSync):
+class CohortInterface(object):
+    def __init__(self, log_level: int = logging.INFO, logfile: str = None):
+        self.tick = 0
+        self.paused = False
+        self.peers: dict[str, PeerDataAcq] = {}
+        self.time = datetime.now()
+        self.center = GeoPosition(0, 0)
+
+        self.log_level = log_level
+        self.logfile = logfile
+        if logfile is None:
+            handler = logging.StreamHandler(sys.stdout)
+        else:
+            handler = logging.FileHandler(logfile)
+        prefix = self.__class__.__name__ + ' '
+        handler.setFormatter(logging.Formatter(prefix + '%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
+                                               '%Y-%m-%d %H:%M:%S'))
+        handler.setLevel(log_level)
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.addHandler(handler)
+        self.logger.setLevel(log_level)
+
+    def update(self):
+        raise NotImplementedError
+
+
+class Cohort(CohortInterface):
     epoch = datetime(1970, 1, 1)
 
-    def __init__(self, automaton: AutonomousTrust):
-        super().__init__()
+    def __init__(self, automaton: AutonomousTrust, **kwargs):
+        super().__init__(**kwargs)
         self.automaton = automaton
-        self.peers: dict[str, PeerDataAcq] = {}
 
     def update_group(self, group_ids: dict[str, Identity]):
         for uuid in group_ids:
             if uuid not in self.peers:
-                self.peers[uuid] = PeerDataAcq(uuid, group_ids[uuid], NullPeerData(),
+                self.peers[uuid] = PeerDataAcq(uuid, group_ids[uuid], NullPeerData(), self,
                                                self.automaton.queue_type(), self.automaton.queue_type())
         for uuid in self.peers:
             if uuid not in group_ids:

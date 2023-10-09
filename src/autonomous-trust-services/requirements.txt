@@ -1,6 +1,9 @@
+autonomous-trust
 numpy >= 1.25.2
 opencv-python >= 4.8.0
 imutils >= 0.5.4
 msgpack-numpy >= 0.4.7
 psutil >= 5.9.5
+geopy >= 2.4.0
+utm >= 0.7.0
 mediapipe >= 0.10.5

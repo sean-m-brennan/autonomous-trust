@@ -7,13 +7,14 @@ name = "autonomous_trust_inspector"
 version = "0.1.1"
 description = "AutonomousTrust Inspector - the AutonomousTrust network visualization tool"
 authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
-#readme = "README.md"
-packages = [{include = "autonomous_trust/inspector"}]
+readme = "README.md"
+packages = [{include = "autonomous_trust"}]
 license = "Proprietary"
 include = ['autonomous_trust/inspector/viz/index.html',
     'autonomous_trust/inspector/viz/css/*',
     'autonomous_trust/inspector/viz/js/*',
     'autonomous_trust/inspector/viz/scss/*']
+exclude = ["**/__pycache__"]
 
 [project]
 name = "autonomous_trust_inspector"
@@ -21,21 +22,16 @@ version = "0.1.1"
 
 [tool.poetry.dependencies]
 python = "^3.10"
-autonomous_trust = ">=0.1.1"
-autonomous_trust_services = ">=0.1.1"
-autonomous_trust_simulator = ">=0.1.1"
+#autonomous_trust.core = {path = "../autonomous-trust"}
+autonomous-trust = ">=0.1.1"
+autonomous-trust-services = ">=0.1.1"
 aenum = ">=3.1.11"
 libsass = ">=0.22.0"
 networkx = ">=3.0"
 quart = ">=0.18.3"
-numpy = ">=1.25.2"
-opencv-python = ">=4.8.0"
-imutils = ">=0.5.4"
-msgpack-numpy = ">=0.4.7"
-geopy = '>=2.4.0'
-utm = '>=0.7.0'
-dash = '^2.6.2'
 flask = '>=2.2.2'
-dash-iconify = '>=0.1.2'
+plotly = ">=5.9.0"
+dash = '^2.6.2'
 dash-bootstrap-components = '>=1.5.0'
+dash-iconify = '>=0.1.2'
 
