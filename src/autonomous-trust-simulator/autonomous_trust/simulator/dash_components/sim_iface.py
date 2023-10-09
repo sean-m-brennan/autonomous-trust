@@ -1,16 +1,20 @@
 import atexit
+import logging
 import threading
 import time
-from queue import Queue, Empty
+from queue import Queue
 from typing import Optional, Callable
 
-from ..sim_data import SimState
-from ..sim_client import SimClient, SimSync
+from autonomous_trust.inspector.peer.daq import CohortInterface
+from ..sim_client import SimClient
+from .. import default_port
 
 
-class SimulationInterface(object):
-    def __init__(self, sim_host: str = '127.0.0.1', sim_port: int = 8778, sync_objects: list[SimSync] = None):
-        self.client = SimClient(callback=self.state_to_queue())
+class SimulationInterface(CohortInterface):
+    def __init__(self, sim_host: str = '127.0.0.1', sim_port: int = default_port,
+                 sync_objects: list[CohortInterface] = None, log_level: int = logging.INFO, logfile: str = None):
+        super().__init__(log_level=log_level, logfile=logfile)
+        self.client = SimClient(callback=self.state_to_queue(), logger=self.logger)
         self.queue = Queue(maxsize=1)
         self.state = None
         self.can_reset = False
@@ -49,15 +53,9 @@ class SimulationInterface(object):
                 self.queue.put(state, block=True, timeout=None)
         return cb
 
-    def update_state(self, block: bool = True) -> SimState:
-        """May be called only once per timestep"""
-        if block:
-            self.state = self.queue.get()
-        else:
-            try:
-                self.state = self.queue.get_nowait()
-            except Empty:
-                pass
+    def update(self):
+        """May be called only once per timestep, i.e. synced with UI, synchronizes others"""
+        self.state = self.queue.get()
         for obj in self.sync_objects:
             obj.tick = self.tick
         if self.state.blank:
@@ -71,4 +69,3 @@ class SimulationInterface(object):
             self.reset_handler()
             for obj in self.sync_objects:
                 obj.paused = self.paused
-        return self.state

@@ -11,6 +11,7 @@ from .peer.peer import PeerMovement
 from .sim_data import SimConfig, SimState, Map, Matrix
 from .sim_client import SimClient
 from . import sim_net as net
+from . import default_port, default_steps
 
 
 class Simulator(net.SelectServer):
@@ -19,8 +20,10 @@ class Simulator(net.SelectServer):
     time_resolution = 'seconds'
     cadence = 1
 
-    def __init__(self, cfg_file_path: str, max_time_steps: int = 100, geo: bool = False,
+    def __init__(self, cfg_file_path: str, max_time_steps: int = None, geo: bool = False,
                  log_level: int = logging.INFO, logfile: str = None):
+        if max_time_steps is None:
+            max_time_steps = default_steps
         if logfile is None:
             handler = logging.StreamHandler(sys.stdout)
         else:
@@ -30,12 +33,14 @@ class Simulator(net.SelectServer):
         handler.setLevel(log_level)
         self.logger = logging.getLogger(__name__)
         self.logger.addHandler(handler)
+        self.logger.setLevel(log_level)
         super().__init__(self.logger)
 
         self.max_time_steps = max_time_steps
         self.return_geo = geo
-        if not os.path.isabs(cfg_file_path):
+        if not os.path.exists(cfg_file_path) and not os.path.isabs(cfg_file_path):
             cfg_file_path = os.path.join(os.path.dirname(__file__), cfg_file_path)
+        self.cfg_file = cfg_file_path
         with open(cfg_file_path, 'r') as cfg_file:
             self.cfg = SimConfig.load(cfg_file.read())
         self.peers: dict[str, PeerMovement] = {}
@@ -70,7 +75,6 @@ class Simulator(net.SelectServer):
             center: GeoPosition = mid.convert(GeoPosition)
             self.pre_state[tick] = (center, max_dist, mapp, matrix)
         self.tick = 0
-        self.logger.info('Ready')
 
     def send_state(self, tick, sock: socket.socket):
         cur_time = self.start_time + timedelta(**{self.time_resolution: tick})
@@ -109,13 +113,20 @@ class Simulator(net.SelectServer):
             time.sleep(self.cadence)
         self.halt = True
 
+    def run(self, port: int, **kwargs):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        self.logger.info('Simulation at %s:%d for %s' % (s.getsockname()[0], port, self.cfg_file))
+        s.close()
+        super().run(port, **kwargs)
+
 
 if __name__ == '__main__':
     from .config import create_config
 
     sim_config = create_config('full')
     try:
-        Simulator(sim_config, 120).run(8778)
+        Simulator(sim_config, default_steps).run(default_port)
     finally:
         if os.path.exists(sim_config):
             os.remove(sim_config)

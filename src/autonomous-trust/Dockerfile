@@ -4,8 +4,10 @@
 
 # Prerequisites: (build from repo base dir, context is src)
 #   docker build -t package-builder -f src/Dockerfile-build src
-#   docker run --rm -u $(id -u):$(id -g) -v src/autonomous-trust:/build/src -v src/dist:/build/dist -it package-builder
+#   docker run --rm -u $(id -u):$(id -g) -v $PWD/src/autonomous-trust:/build/src -v $PWD/src/dist/conda-repo:/build/dist -it package-builder
 #   docker build -t autonomous-trust -f src/autonomous-trust/Dockerfile src
+
+# Note: conda cannot build with croot inside Docker, must mount to *unencrypted* host filesystem
 
 FROM continuumio/miniconda3
 

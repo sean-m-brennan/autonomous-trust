@@ -15,6 +15,8 @@ class Cmds(object):
     devel = 'devel'
     network = 'network'
     tag = 'tag'
+    venv = 'venv'
+    distrib = 'distrib'
     docker = 'docker'
     unikernel = 'unikernel'
     test = 'test'
@@ -37,6 +39,10 @@ def main(commands, args):
             pass  # FIXME
         elif name == Cmds.tag:
             tag.git_tag(cmd.level)
+        elif name == Cmds.venv:
+            docker.build.build_env_dir(cmd.env_dir)
+        elif name == Cmds.distrib:
+            docker.build.build_dist_repo(cmd.wheel)
         elif name == Cmds.docker:
             if cmd.function is None:
                 docker.build.build(cmd.force, cmd.skip_pkgs)
@@ -78,6 +84,12 @@ if __name__ == '__main__':
                           [Argument('--level', {'choices': ['major', 'minor', 'patch'], 'required': True,
                                                 'help': 'Level of the version to increment'}),
                            ], 'Increment version, commit, and tag'),
+        Cmds.venv: Command([],
+                           [Argument('--env-dir', {'action': 'store_true', 'help': 'Create venv here'}),
+                           ], 'Build Python venv (for immediate use)'),
+        Cmds.distrib: Command([],
+                              [Argument('--wheel', {'action': 'store_true', 'help': 'Build wheel instead of sdist tarball'}),
+                               ], 'Build Python dist (for pip install)'),
         Cmds.docker: Command(
             [None,  # i.e. all
              Function('builder',

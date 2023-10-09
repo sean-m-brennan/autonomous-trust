@@ -7,12 +7,6 @@ from . import sim_net as net
 from .sim_data import SimState
 
 
-class SimSync(object):
-    def __init__(self):
-        self.tick = 0
-        self.paused = False
-
-
 class SimClient(net.Client):
     seq_fmt = '!LL'
 
@@ -54,11 +48,16 @@ class SimClient(net.Client):
             self._resolution = val
 
     def recv_data(self, **kwargs) -> Optional[SimState]:  # asynchronous
-        if self.connected:
+        if self.is_connected:
             with self.lock:
                 t_data = struct.pack(self.seq_fmt, self._tick, self._resolution)
                 self._tick += self._cadence
-            self.sock.send(t_data)  # query server
+            try:
+                self.sock.send(t_data)  # query server
+            except ConnectionError:
+                if self.logger is not None:
+                    self.logger.info('Lost connection to Simulator')
+                return  # should auto-reconnect
 
             try:
                 hdr, serialized = self.recv_all()

@@ -17,10 +17,9 @@ COPY --chown=user:user src/autonomous-trust-inspector/autonomous_trust/inspector
 COPY --chown=user:user src/autonomous-trust-services/autonomous_trust/services autonomous_trust/services
 COPY --chown=user:user src/autonomous-trust-simulator/autonomous_trust/simulator autonomous_trust/simulator
 
-ARG CONDA_CACHE=/opt/conda/pkgs
 # update and install any new dependencies from environment.yaml
 COPY --chown=user:user build_tools/cfg/environment.yaml /build/build_tools/cfg/environment.yaml
-RUN --mount=type=cache,target=$CONDA_CACHE /build/bin/trust-tools devel update
+RUN --mount=type=cache,target=/opt/conda/pkgs /build/bin/trust-tools devel update
 
 ENV AUTONOMOUS_TRUST_EXE=""
 CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 $AUTONOMOUS_TRUST_EXE"]
