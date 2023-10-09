@@ -10,6 +10,7 @@ from autonomous_trust.services.peer.position import GeoPosition
 from ..peer.daq import PeerDataAcq
 from .dynamic_map import DynamicMap
 from .video_feed import VideoFeed
+from .data_feed import DataFeed
 
 
 class PeerStatus(DashComponent):
@@ -28,7 +29,10 @@ class PeerStatus(DashComponent):
         self.idx = int(PeerStatus.count)
         PeerStatus.count += 1
         self.vid_feed = VideoFeed(self.app, self.server, peer, self.count)
+        self.data_feed = DataFeed(self.app, self.server, peer, self.count)
+        self.data_type = 'Random'  # FIXME from config
 
+        self.net_figs = {}
         self.fig = go.Figure()
         xes, yes = self.update_summary()
         self.fig.add_trace(go.Scatter(x=xes, y=yes))
@@ -38,7 +42,6 @@ class PeerStatus(DashComponent):
                                     margin=dict(l=0, r=0, t=0, b=0),
                                     paper_bgcolor='rgba(0,0,0,0)',
                                     plot_bgcolor='rgba(0,0,0,0)')
-        self.status_open = False
 
         @self.app.callback(Output('micrograph-%d' % self.idx, 'figure'),
                            Input('interval', 'n_intervals'))
@@ -47,7 +50,13 @@ class PeerStatus(DashComponent):
             self.fig.update_traces(go.Scatter(x=x_vals, y=y_vals), overwrite=True)
             return self.fig
 
-        self.net_figs = {}
+        @self.app.callback(Output('follow-target-%d' % self.idx, 'children'),
+                           [Input('follow-btn-%d' % self.idx, 'n_clicks')])
+        def follow_unit(_):
+            mapp.following = self.peer.uuid
+            return html.Div()
+
+        #register_page(__name__, '/peer_status_%d' % self.idx, layout=self.div())  # FIXME
         for idx, other in enumerate(self.peer.others):
             fig = go.Figure()
             self.net_figs[idx] = fig
@@ -55,36 +64,19 @@ class PeerStatus(DashComponent):
             fig.add_trace(go.Scatter(x=xes, y=yes))
 
             @self.app.callback(Output('trust-%d-%d' % (self.idx, idx), 'children'),
-                               Input('interval', 'n_intervals'))
+                               Input('status-interval', 'n_intervals'))
             def update_trust_levels(_):
                 # FIXME gauges?
                 trust = self.peer.trust_matrix()
                 return trust.get(other, 0)
 
             @self.app.callback(Output('net_graph-%d-%d' % (self.idx, idx), 'figure'),
-                               Input('interval', 'n_intervals'))
+                               Input('status-interval', 'n_intervals'))
             def update_net_graph(_):
                 net_fig = self.net_figs[idx]
                 x_vals, y_vals = self.update_net(other)
                 net_fig.update_traces(go.Scatter(x=x_vals, y=y_vals), overwrite=True)
                 return net_fig
-
-        @self.app.callback(Output('status-modal-%d' % self.idx, 'is_open'),
-                           [Input('more-btn-%d' % self.idx, 'n_clicks')])
-        def open_status(more):
-            if more:
-                self.status_open = not self.status_open
-                if self.status_open:
-                    mapp.update_display = False
-                else:
-                    mapp.update_display = True  # FIXME enable on closed
-            return self.status_open
-
-        @self.app.callback(Output('follow-target-%d' % self.idx, 'children'),
-                           [Input('follow-btn-%d' % self.idx, 'n_clicks')])
-        def follow_unit(_):
-            mapp.following = self.peer.uuid
-            return html.Div()
 
     def update_summary(self):
         xes = list(range(1, len(self.peer.network_history)))
@@ -110,10 +102,12 @@ class PeerStatus(DashComponent):
                                 id='follow-btn-%d' % self.idx, color='light'),
                             dcc.Graph(id='micrograph-%d' % self.idx, config=dict(displayModeBar=False),
                                       style=dict(width='65%', height=60)),
-                            dbc.Button(
-                                make_icon('carbon:overflow-menu-vertical',
-                                          size=IconSize.SMALL),
-                                id='more-btn-%d' % self.idx, n_clicks=0, color='rgba(0,0,0,0)')
+                            html.A(
+                                dbc.Button(
+                                    make_icon('carbon:overflow-menu-vertical',
+                                              size=IconSize.SMALL),
+                                    id='more-btn-%d' % self.idx, n_clicks=0, color='rgba(0,0,0,0)'),
+                                href='/peer_status_%d' % self.idx, target="_blank"),
                         ], gap=2, direction="horizontal"),
                     ]),
                 ]),
@@ -134,9 +128,9 @@ class PeerStatus(DashComponent):
             network.append(dbc.Col([dcc.Graph(id='net-graph-%d-%d' % (self.idx, idx))]))
 
         return html.Div([
-            dbc.Modal([
-                dbc.ModalHeader(dbc.ModalTitle('%s #%s' % (self.peer.kind, self.vid_feed.number))),
-                dbc.ModalBody([
+            dcc.Interval(id='status-interval', interval=1000, n_intervals=0),
+            html.Div([
+                dbc.Container([
                     dbc.Row([
                         dbc.Col(['%s (%s) - %s' % (self.peer.name, self.peer.nickname, self.peer.uuid)]),
                     ]),
@@ -144,14 +138,10 @@ class PeerStatus(DashComponent):
                         dbc.Col(self.vid_feed.div("%f m above %f, %f" % (pos.alt, pos.lat, pos.lon))),
                     ]),
                     dbc.Row([
-                        # FIXME data feed ??
+                        dbc.Col(self.data_feed.div("%s data" % self.data_type)),
                     ]),
                     dbc.Row(trust_levels),
                     dbc.Row(network),
                 ]),
-                dbc.ModalFooter(),
-            ], id='status-modal-%d' % self.idx,
-                keyboard=False, backdrop="static",
-                fullscreen='md-down', size='xl',
-                is_open=False),
+            ], id='status-modal-%d' % self.idx),
         ])

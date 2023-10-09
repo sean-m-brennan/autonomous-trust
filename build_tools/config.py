@@ -54,6 +54,7 @@ sources = {'autonomous_trust':
                [(os.path.join(base_dir, 'src', 'autonomous-trust-simulator'), os.path.join(namespace, 'simulator')),
                 (os.path.join(base_dir, 'src', 'autonomous-trust'), os.path.join(namespace, 'core')),
                 (os.path.join(base_dir, 'src', 'autonomous-trust'), os.path.join(namespace, '__main__.py'))]}
+wheels = ['autonomous-trust']
 
 if OS == 'Linux':
     for path in ['/usr/bin/qemu-system-' + ARCH, '/usr/libexec/qemu-kvm']:

@@ -4,7 +4,7 @@ import subprocess
 import shlex
 
 from .iface import NetInterface
-from .. import net_util as net
+from .. import sim_net as net
 from ..peer.peer import PeerConnection
 
 
@@ -150,7 +150,7 @@ class Router(net.Client):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('sim-host', nargs='?', default='localhost')
-    parser.add_argument('sim-port', nargs='?', default=8888)
+    parser.add_argument('sim-port', nargs='?', default=8778)
     args = parser.parse_args()
 
     Router().run(args.sim_host, args.sim_port)

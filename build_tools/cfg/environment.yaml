@@ -14,13 +14,12 @@ dependencies:
   - networkx
   - quart
   - numpy
-  - opencv
+  - opencv-python
   - imutils
   - geopy
   - utm
   - dash==2.6.2
   - dash-bootstrap-components
-  - dash-daq
   - flask
   - absl-py
   - python-flatbuffers

@@ -1,6 +1,7 @@
-import asyncio
 import threading
 import time
+from collections import deque
+from datetime import datetime
 from queue import Empty, Full
 from enum import Enum
 
@@ -36,6 +37,31 @@ class _NetProcMeta(ProcMeta):  # so that subclasses inherit meta args
         cls.default_port = port
 
 
+class NetStat(object):
+    size = 100
+
+    def __init__(self):
+        self.times = deque(maxlen=self.size)
+        self.send = deque(maxlen=self.size)
+        self.send_total = 0
+        self.recv = deque(maxlen=self.size)
+        self.recv_total = 0
+        self.err_out = 0
+        self.err_in = 0
+
+    def sent(self, num_bytes, errors=0):
+        self.times.append(datetime.now())
+        self.send.append(num_bytes)
+        self.send_total += num_bytes
+        self.err_out += errors
+
+    def rcvd(self, num_bytes, errors=0):
+        self.times.append(datetime.now())
+        self.recv.append(num_bytes)
+        self.recv_total += num_bytes
+        self.err_in += errors
+
+
 class NetworkProcess(Process, metaclass=_NetProcMeta):
     """
     Handle requests to send Messages over the network and route incoming Messages to the right process
@@ -46,6 +72,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     net_proto = NetworkProtocol.NONE
     mystery_max_retries = 60  # 30 seconds
     socket_timeout = 0.1
+    unknown_peer = '0'
 
     def __init__(self, configurations, subsystems, log_q, acceptance_func=None, **kwargs):
         super().__init__(configurations, subsystems, log_q, **kwargs)
@@ -65,6 +92,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.pests = {}
         self.protocol = Protocol(self.name, self.logger, configurations[CfgIds.peers])  # noqa
         self.stop = False
+        self.statistics = {}
 
     @property
     def peers(self):
@@ -73,6 +101,32 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     @property
     def group(self):
         return self.protocol.group
+
+    def track_send_stats(self, uuid, num_bytes):
+        if uuid not in self.statistics:
+            self.statistics[uuid] = NetStat()
+        self.statistics[uuid].sent(num_bytes)
+
+    def track_send_error(self, uuid):
+        self.statistics[uuid].sent(0, 1)
+
+    def track_recv_stats(self, uuid, num_bytes, errors=0):
+        if uuid not in self.statistics:
+            self.statistics[uuid] = NetStat()
+        self.statistics[uuid].rcvd(num_bytes, errors)
+
+    def track_recv_error(self):
+        self.statistics[self.unknown_peer].rcvd(0, 1)
+
+    @property
+    def net_stats(self):
+        cumulative = {}
+        for uuid in self.statistics:
+            elapsed = self.statistics[uuid].times[-1] - self.statistics[uuid].times[0]
+            up, down = sum(self.statistics[uuid].send) / elapsed, sum(self.statistics[uuid].recv) / elapsed
+            cumulative[uuid] = (up, down, self.statistics[uuid].send_total, self.statistics[uuid].recv_total,
+                                self.statistics[uuid][2], self.statistics[uuid][3])
+        return cumulative
 
     def send_peer(self, msg, whom):
         raise NotImplementedError
@@ -123,11 +177,17 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 raw_msg, from_addr, from_port = method()
             except TransmissionError as err:
                 self.logger.error('Network: %s' % err)
+                self.track_recv_error()
                 continue
             except TimeoutError:
                 continue
             if raw_msg is not None:
                 msg_queue.append((raw_msg, from_addr))
+                who = self.peers.find_by_address(from_addr)
+                if who is not None:
+                    self.track_recv_stats(who.uuid, len(raw_msg))
+                else:
+                    self.track_recv_stats(self.unknown_peer, len(raw_msg))
             elif from_addr is not None:
                 who = self.peers.find_by_address(from_addr)
                 if who is not None:
@@ -247,7 +307,10 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 if isinstance(message, Message):
                     self.logger.debug('Send network message: %s:%s' % (message.process, message.function))
                     try:
-                        if message.function == Network.ping:
+                        if message.function == Network.stats_req:
+                            msg = Message(CfgIds.network, Network.stats_resp, self.net_stats)
+                            queues[message.process].put(msg, block=True, timeout=self.q_cadence)
+                        elif message.function == Network.ping:
                             try:
                                 stats = ping(message.to_whom.address, count=message.obj)  # noqa
                                 msg = Message(self.name, Network.ping, stats)  # noqa
@@ -258,8 +321,10 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             msg = bytes(message)
                             try:
                                 self.send_any(msg)
+                                self.track_send_stats(self.unknown_peer, len(msg))
                             except TransmissionError as err:
                                 self.logger.error('Network: %s' % err)
+                                self.track_send_error(self.unknown_peer)
                         elif isinstance(message.to_whom, Group):
                             if message.encrypt:
                                 msg = self.group.encrypt(bytes(message), self.group)
@@ -270,8 +335,10 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     continue
                                 try:
                                     self.send_group(msg, addr)
+                                    self.track_send_stats(self.unknown_peer, len(msg))
                                 except TransmissionError as err:
                                     self.logger.error('Network: %s' % err)
+                                    self.track_send_error(self.unknown_peer)
                         else:  # defaults to pseudo-multicast
                             for who in message.to_whom:  # Message ensures this is list  # noqa
                                 address = who.address
@@ -283,8 +350,10 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     msg = bytes(message)
                                 try:
                                     self.send_peer(msg, address)
+                                    self.track_send_stats(who.uuid, len(msg))
                                 except TransmissionError as err:
                                     self.logger.error('Network: %s' % err)
+                                    self.track_send_error(who.uuid)
                     except BrokenPipeError as err:
                         self.logger.error('Network: %s' % err)
                 else:
