@@ -41,12 +41,12 @@ class Configuration(object):
     CFG_PATH = os.path.join('etc', 'at')
     DATA_PATH = os.path.join('var', 'at')
     YAML_PREFIX = u'!Cfg'
-    yaml_file_ext = '.cfg.yml'
+    yaml_file_ext = '.cfg.yaml'
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
 
     @classmethod
     def get_cfg_dir(cls):
-        return os.environ.get(cls.VARIABLE_NAME, os.path.join(os.path.abspath(os.sep), cls.CFG_PATH))
+        return os.path.join(os.environ.get(cls.VARIABLE_NAME, os.path.abspath(os.sep)), cls.CFG_PATH)
 
     @classmethod
     def get_data_dir(cls):

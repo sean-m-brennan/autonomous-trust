@@ -1,12 +1,14 @@
 import os
-import sys
 
-from autonomous_trust.core import AutonomousTrust, LogLevel
-from autonomous_trust.core.config import Configuration, CfgIds, to_yaml_string
+from autonomous_trust.core import AutonomousTrust, LogLevel, CfgIds, to_yaml_string
+from autonomous_trust.core.config import Configuration
+from autonomous_trust.core.config.generate import generate_identity, generate_worker_config
 from autonomous_trust.core.system import queue_cadence
-from autonomous_trust.core.network import Network, Message
+from autonomous_trust.core.network import Message
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.inspector.peer.daq import Cohort, CohortTracker
+from autonomous_trust.services.data.client import DataRcvr
+from autonomous_trust.services.video.client import VideoRecv
 
 from autonomous_trust.simulator.dash_components.map_display import MapDisplay
 from autonomous_trust.simulator.video.client import VideoSimRcvr
@@ -23,7 +25,8 @@ class MissionCoordinator(AutonomousTrust):
         super().__init__(**kwargs)
         self.cohort = Cohort(self)
         self.add_worker(CohortTracker, self.system_dependencies, cohort=self.cohort)
-        self.add_worker(VideoSimRcvr, self.system_dependencies, cohort=self.cohort)
+        self.add_worker(VideoSimRcvr, self.system_dependencies, cohort=self.cohort)  # TODO noise?
+        self.add_worker(DataRcvr, self.system_dependencies, cohort=self.cohort)
 
         self.viz = None
         self.viz_queue = self.queue_type()
@@ -32,34 +35,30 @@ class MissionCoordinator(AutonomousTrust):
         self.viz = MissionVisualizer(self.cohort, finished=self.cleanup)
         self.viz.run()
 
-    #def autonomous_tasking(self, queues):
-    #    if self.tasking_tick(1):  # every 30 sec
-    #        for peer in self.peers.all:
-    #            if peer not in self.data_queues:
-    #                self.data_queues[peer] = self.queue_type()
+    def autonomous_tasking(self, queues):
+        if self.tasking_tick(1):  # every 30 sec
+            for peer in self.peers.all:
+                query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
+                                to_yaml_string((peer, self.proc_name)), self.identity)
+                queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
 
-    #            query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
-    #                            to_yaml_string((peer, self.proc_name)), self.identity)
-    #            queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
-    #           ping = Message(CfgIds.network, Network.ping, 5, peer, return_to=self.name)
-    #            queues[CfgIds.network].put(ping, block=True, timeout=queue_cadence)
-    #    if self.tasking_tick(2, 5.0):  # every 5 sec
-    #       # FIXME peer connections?? (i.e. peers of peers of ...)
-    #       for peer_id in self.latest_reputation:
-    #           self.viz_queue.put((LiveData.reputation, self.latest_reputation[peer_id]),
-    #                                block=True, timeout=queue_cadence)
-    #        for message in list(self.unhandled_messages):
-    #            if message.function == Network.ping:
-    #                self.unhandled_messages.remove(message)
-    #                self.viz_queue.put((LiveData.latencies, message.obj),
-    #                                    block=True, timeout=queue_cadence)
-    #        self._report_unhandled()
+        if self.tasking_tick(2, 5.0):  # every 5 sec
+            for peer_id in self.latest_reputation:
+                msg = Message(self.name, ReputationProtocol.rep_resp, self.latest_reputation[peer_id])
+                queues['daq'].put(msg, block=True, timeout=queue_cadence)
+
+        self._report_unhandled()
 
     def cleanup(self):
         self.viz.halt = True
 
 
 if __name__ == '__main__':
-    cfg_dir = os.path.join(os.path.dirname(__file__))
-    os.environ[Configuration.VARIABLE_NAME] = cfg_dir
+    # There can be only one
+    os.environ[Configuration.VARIABLE_NAME] = os.path.dirname(__file__)
+    cfg_dir = Configuration.get_cfg_dir()
+    os.makedirs(cfg_dir, exist_ok=True)
+    generate_identity(cfg_dir, preserve=True)  # does nothing if files present
+    for cfg_name, klass in ((VideoSimRcvr.name, VideoRecv),):
+        generate_worker_config(cfg_dir, cfg_name, klass)
     MissionCoordinator(log_level=LogLevel.INFO, logfile=Configuration.log_stdout).run_forever()

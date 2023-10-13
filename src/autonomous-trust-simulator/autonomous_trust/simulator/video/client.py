@@ -4,17 +4,20 @@ from queue import Full, Empty
 import cv2
 import imutils
 
+from autonomous_trust.core import ProcMeta
 from autonomous_trust.services.video.serialize import deserialize
 from autonomous_trust.services.video import VideoRcvr
 from autonomous_trust.services.video.server import VideoProtocol
+
 from .noise import Noise, add_noise
 
 
-class VideoSimRcvr(VideoRcvr):
+class VideoSimRcvr(VideoRcvr, metaclass=ProcMeta,
+                   proc_name='video-sink', description='Video image stream consumer'):
     def __init__(self, configurations, subsystems, log_queue, dependencies, **kwargs):
         super().__init__(configurations, subsystems, log_queue, dependencies=dependencies, **kwargs)
         self.noisy = kwargs.get('noisy', False)
-        self.image_shape = (int(self.size * 0.5625), self.size, 3)
+        self.image_shape = (int(self.cfg.size * 0.5625), self.cfg.size, 3)
 
     def handle_video(self, _, message):
         if message.function == VideoProtocol.video:
@@ -26,11 +29,11 @@ class VideoSimRcvr(VideoRcvr):
                 frame = deserialize(data, fast_encoding)
                 if frame is not None:
                     self.image_shape = frame.shape
-                    if self.size is not None:
-                        frame = imutils.resize(frame, width=self.size)
+                    if self.cfg.size is not None:
+                        frame = imutils.resize(frame, width=self.cfg.size)
                     if self.noisy:
                         frame = add_noise(Noise.GAUSSIAN, frame)
-                    if self.encode:
+                    if not self.cfg.raw:
                         _, frame = cv2.imencode('.jpg', frame)
                     msg = idx, frame, 1
                 else:

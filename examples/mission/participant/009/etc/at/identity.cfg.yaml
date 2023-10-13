@@ -1,0 +1,19 @@
+!Cfg:autonomous_trust.core.identity.identity.Identity
+_block_impl: authority
+_encryptor: !Cfg:autonomous_trust.core.identity.encrypt.Encryptor
+  hex_seed: !!binary |
+    YjQxMjQ0ZDBlMmNiZTE0MGViZTUxMWU0NDlhMDA2ZDJkZmQ3ZWZmZTIzZDM0OTY4M2YzNWVlMTRk
+    NmQyNTZjMw==
+  public_only: false
+_fullname: w.a.jones@tekfive.com
+_nickname: ColJones
+_public_only: false
+_rank: 0
+_signature: !Cfg:autonomous_trust.core.identity.sign.Signature
+  hex_seed: !!binary |
+    OWM2YWQ4OTAxZDMxNzUyODI3ZDNlOTlhNjhlM2U4Y2ZkZjY2ZjE5M2MyNjg1YjgyNGEyOTg0ZGJj
+    NDg3ZDEyYw==
+  public_only: false
+_uuid: 0a4dee86-76a5-4db2-bafb-f707832b8625
+address: 172.27.3.2
+petname: Jonesey

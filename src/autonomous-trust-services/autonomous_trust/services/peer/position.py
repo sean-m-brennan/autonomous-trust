@@ -44,6 +44,8 @@ class Position(Configuration):
 
     @classmethod
     def middle(cls, others: list['Position']):
+        if len(others) < 1:
+            return GeoPosition(0, 0, 0)
         if not all([isinstance(pos, type(others[0])) for pos in others]):
             raise RuntimeError('Cannot mix differing Position types')
         if isinstance(others[0], UTMPosition):

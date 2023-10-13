@@ -65,8 +65,8 @@ class SimCohort(CohortInterface):
             self.current_tick = 0
             self.state = None
             return
-        self.time = self.state.time
-        self.center = self.state.center
+        self._time = self.state.time
+        self._center = self.state.center
         for idx, uuid in enumerate(self.state.peers):
             if uuid not in self.peers:
                 # intentionally abusing daq object

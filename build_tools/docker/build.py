@@ -102,6 +102,10 @@ def build_dist_repo(wheel: bool = False, quiet: bool = False):
             os.makedirs(target_dir, exist_ok=True)
             target = os.path.join(target_dir, os.path.basename(source))
             shutil.move(source, target)
+            try:
+                os.rmdir(os.path.join(path, 'dist'))
+            except (OSError, FileNotFoundError):
+                pass
 
 
 def build_packages():
