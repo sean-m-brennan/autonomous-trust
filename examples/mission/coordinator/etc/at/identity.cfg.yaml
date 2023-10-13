@@ -1,0 +1,19 @@
+!Cfg:autonomous_trust.core.identity.identity.Identity
+_block_impl: authority
+_encryptor: !Cfg:autonomous_trust.core.identity.encrypt.Encryptor
+  hex_seed: !!binary |
+    MzQwOTk1Mzg4YTZiYjcxMDQyZjBjZjFiZGVlNDVjNWRlMjY1YjFhZjRmODE2MzY5ZjU5ZjA2OGFm
+    ODc1ZWM3OQ==
+  public_only: false
+_fullname: g.s.patton@tekfive.com
+_nickname: Advisor
+_public_only: false
+_rank: 0
+_signature: !Cfg:autonomous_trust.core.identity.sign.Signature
+  hex_seed: !!binary |
+    ZjhhZTI3NDc3MGQxYjY0ZDZlOTVjYTVjZTI4NGUyODE2Y2Y1ZTVjZTM5ZWY2Mjk4ZGMyMzliMzJj
+    NGYzOTk5YQ==
+  public_only: false
+_uuid: 5a1f27bc-11cd-4376-b81d-b988d69d9a14
+address: 172.27.3.2
+petname: old-blood-n-guts

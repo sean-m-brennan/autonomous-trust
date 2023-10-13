@@ -1,3 +1,4 @@
+import inspect
 import os
 import sys
 import random
@@ -67,7 +68,7 @@ def _subsystems(net_impl):
     return pt
 
 
-def generate_identity(cfg_dir, randomize=False, seed=None, silent=True):
+def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve=False):
     if seed is not None:
         try:
             seed = int(seed)
@@ -114,51 +115,53 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True):
             print('Wrote configs to %s' % cfg_dir)
         return net_cfg, ident_cfg, sub_sys_cfg
 
-    print('Configuring an AutonomousTrust identity')
-    fullname = input('  Fullname (FQDN) [%s]: ' % hostname)
-    if fullname == '':
-        fullname = hostname
-    nickname = input('  Nickname: ')
-    ip4_addr = input('  IP4 address [%s]: ' % ip4_address)
-    if ip4_addr == '':
-        ip4_addr = ip4_address
-    ip6_addr = input('  IP6 address [%s]: ' % ip6_address)
-    if ip6_addr == '':
-        ip6_addr = ip4_address
-    mac_addr = input('  MAC address [%s]: ' % mac_address)
-    if mac_addr == '':
-        mac_addr = mac_address
-    net_impl = input('  Network Implementation [%s]: ' % communications)
-    if net_impl == '':
-        net_impl = communications
+    if not preserve:
+        print('Configuring an AutonomousTrust identity')
+    if not os.path.exists(ident_file) or not preserve:
+        fullname = input('  Fullname (FQDN) [%s]: ' % hostname)
+        if fullname == '':
+            fullname = hostname
+        nickname = input('  Nickname: ')
+    if not os.path.exists(net_file) or not preserve:
+        ip4_addr = input('  IP4 address [%s]: ' % ip4_address)
+        if ip4_addr == '':
+            ip4_addr = ip4_address
+        ip6_addr = input('  IP6 address [%s]: ' % ip6_address)
+        if ip6_addr == '':
+            ip6_addr = ip6_address
+        mac_addr = input('  MAC address [%s]: ' % mac_address)
+        if mac_addr == '':
+            mac_addr = mac_address
+    if not os.path.exists(sub_sys_file) or not preserve:
+        net_impl = input('  Network Implementation [%s]: ' % communications)
+        if net_impl == '':
+            net_impl = communications
 
-    overwrite = True
-    if os.path.exists(net_file):
-        overwrite = False
-        if input('    Write network config to %s [y/N] ' % net_file).lower().startswith('y'):
+    sub_sys_cfg = None
+    if not os.path.exists(net_file) or not preserve:
+        net_cfg = Network.initialize(ip4_addr, ip6_addr, mac_addr)  # noqa
+    else:
+        net_cfg = Network.from_file(net_file)
+    if not os.path.exists(ident_file) or not preserve:
+        ident_cfg = Identity.initialize(fullname, nickname, net_cfg.ip4)  # noqa
+    else:
+        ident_cfg = Identity.from_file(ident_file)
+    if not os.path.exists(sub_sys_file) or not preserve:
+        sub_sys_cfg = _subsystems(net_impl)  # noqa
+
+    for cfg_name, cfg_file, cfg in (('network', net_file, net_cfg),
+                                    ('identity', ident_file, ident_cfg),
+                                    ('subsystem', sub_sys_file, sub_sys_cfg)):
+        if not os.path.exists(cfg_file) or not preserve:
             overwrite = True
-    net_cfg = Network.initialize(ip4_addr, ip6_addr, mac_addr)
-    if overwrite:
-        net_cfg.to_file(net_file)
-        print('Network config written to %s' % net_file)
-    overwrite = True
-    if os.path.exists(ident_file):
-        overwrite = False
-        if input('    Write identity to %s [y/N] ' % ident_file).lower().startswith('y'):
-            overwrite = True
-    ident_cfg = Identity.initialize(fullname, nickname, net_cfg)
-    if overwrite:
-        ident_cfg.to_file(ident_file)
-        print('Identity config written to %s' % ident_file)
-    overwrite = True
-    if os.path.exists(sub_sys_file):
-        overwrite = False
-        if input('    Write subsystem config to %s [y/N] ' % sub_sys_file).lower().startswith('y'):
-            overwrite = True
-    sub_sys_cfg = _subsystems(net_impl)
-    if overwrite:
-        sub_sys_cfg.to_file(sub_sys_file)
-        print('Subsystems config written to %s' % sub_sys_file)
+            if os.path.exists(cfg_file):
+                overwrite = False
+                if input('    Write %s config to %s [y/N] ' % (cfg_name, cfg_file)).lower().startswith('y'):
+                    overwrite = True
+            if overwrite:
+                cfg.to_file(cfg_file)
+                print('%s config written to %s' % (cfg_name.capitalize(), cfg_file))
+
     return net_cfg, ident_cfg, sub_sys_cfg
 
 
@@ -173,3 +176,32 @@ def random_config(base_dir, ident: str = None):
         os.makedirs(cfg_dir, exist_ok=True)
         generate_identity(cfg_dir, randomize=True, seed=ident)
     os.environ[Configuration.VARIABLE_NAME] = cfg_dir
+
+
+def generate_worker_config(cfg_dir, proc_name, cfg_class):
+    cfg_file = os.path.join(cfg_dir, proc_name + Configuration.yaml_file_ext)
+    if not os.path.exists(cfg_file):
+        spec = inspect.getfullargspec(cfg_class.initialize)
+        ann = inspect.get_annotations(cfg_class.initialize)
+        arg_names = spec[0][1:]
+        defaults_list = spec[3]
+        defaults = {}
+        if defaults_list is not None:
+            for idx, name in enumerate(arg_names[-len(defaults_list):]):
+                defaults[name] = defaults_list[idx]
+
+        args = []
+        for idx, name in enumerate(arg_names):
+            if name in defaults:
+                arg = input('  %s [%s]: ' % (name, defaults[name]))
+                if arg == '':
+                    arg = defaults[name]  # type is correct here
+            else:
+                arg = input('  %s: ' % name)
+            if name in ann:
+                arg = ann[name](arg)
+            args.append(arg)
+
+        cfg_obj = cfg_class.initialize(*args)
+        if cfg_obj is not None:
+            cfg_obj.to_file(cfg_file)

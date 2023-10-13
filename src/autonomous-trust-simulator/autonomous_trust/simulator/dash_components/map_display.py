@@ -16,6 +16,13 @@ log.setLevel(logging.WARNING)  # reduce callback noise from Flask
 
 
 class MapDisplay(object):
+    icon_map = {'microdrone': 'carbon:drone',
+                'soldier': 'healthicons: military-worker',
+                'jet': 'fa-solid: fighter-jet',
+                'recon': 'mdi:drone',
+                'base': 'military-camp',
+                }
+
     def __init__(self, cohort: CohortInterface, sim_host: str = '127.0.0.1', sim_port: int = default_port,
                  size: int = 600, max_resolution: int = 300, style: str = 'dark'):
         self.server = Flask(__name__)
@@ -33,7 +40,7 @@ class MapDisplay(object):
         status = {}
         status_by_idx = {}
         for index, uuid in enumerate(cohort.peers.keys()):
-            status[uuid] = PeerStatus(self.app, self.server, cohort.peers[uuid], dyna_map)
+            status[uuid] = PeerStatus(self.app, self.server, cohort.peers[uuid], dyna_map, self.icon_map)
             status_by_idx[index] = status[uuid]
 
         self.app.layout = html.Div([dcc.Location(id="url"),
