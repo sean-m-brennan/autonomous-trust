@@ -19,25 +19,39 @@ class VideoProtocol(Protocol):
     video = 'video'
 
 
+class VideoSrc(Configuration):
+    def __init__(self, path: str, size: int = 320, speed: int = 1):
+        self.path = path
+        self.size = size
+        self.speed = speed
+
+    @classmethod
+    def initialize(cls, path: str, size: int, speed: int):
+        return VideoSrc(path, size, speed)
+
+
 class VideoSource(Process, metaclass=ProcMeta,
                   proc_name='video-source', description='Video image stream service'):
     header_fmt = "!Q?Q"
     capability_name = 'video'
 
-    def __init__(self, configurations, subsystems, log_queue, dependencies, **kwargs):
+    def __init__(self, configurations, subsystems, log_queue, dependencies):
         super().__init__(configurations, subsystems, log_queue, dependencies=dependencies)
-        self.video_path_pattern = kwargs['path']
-        self.size = kwargs.get('size', 640)
-        self.speed = kwargs.get('speed', 1)
-        if not os.path.isabs(self.video_path_pattern):
-            vid_dir = os.path.join(Configuration.get_data_dir(), 'video')
-            self.video_path_pattern = os.path.join(vid_dir, self.video_path_pattern)
+        self.active = self.name in configurations
+        if self.active:
+            video_source: VideoSrc = configurations[self.name]
+            self.video_path_pattern = video_source.path
+            self.size = video_source.size
+            self.speed = video_source.speed
+            if not os.path.isabs(self.video_path_pattern):
+                vid_dir = os.path.join(Configuration.get_data_dir(), 'video')
+                self.video_path_pattern = os.path.join(vid_dir, self.video_path_pattern)
         self.protocol = VideoProtocol(self.name, self.logger, configurations[CfgIds.peers])
         self.protocol.register_handler(VideoProtocol.request, self.handle_requests)
         self.clients: dict[str, tuple[bool, str, Identity]] = {}
 
     def handle_requests(self, _, message):
-        if message.function == VideoProtocol.request:
+        if message.function == VideoProtocol.request and self.active:
             fast_encoding, proc_name = message.obj
             uuid = message.from_whom.uuid
             if uuid not in self.clients:
@@ -61,11 +75,17 @@ class VideoSource(Process, metaclass=ProcMeta,
         for path in sorted(glob.glob(self.video_path_pattern)):
             vid = None
             while self.keep_running(signal):
-                vid = cv2.VideoCapture(path)
+                vid = None
+                if self.active:
+                    vid = cv2.VideoCapture(path)
                 more = True
                 idx = 0
                 while more and self.keep_running(signal):  # more is always True for device (not file)
                     self.process_messages(queues)
+
+                    if not self.active:
+                        self.sleep_until(self.cadence)
+                        continue
 
                     more, frame = vid.read()
                     idx += 1

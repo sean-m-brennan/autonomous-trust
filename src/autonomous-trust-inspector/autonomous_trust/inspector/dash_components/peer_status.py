@@ -15,24 +15,20 @@ from .data_feed import DataFeed
 
 class PeerStatus(DashComponent):
     count = 0
-    icon_map = {'microdrone': 'carbon:drone',
-                'soldier': 'healthicons: military-worker',
-                'jet': 'fa-solid: fighter-jet',
-                'recon': 'mdi:drone',
-                'base': 'military-camp',
-                }
     icon_height = 40
 
-    def __init__(self, app: Dash, server: Flask, peer: PeerDataAcq, mapp: DynamicMap):
+    def __init__(self, app: Dash, server: Flask, peer: PeerDataAcq, mapp: DynamicMap, icons: dict[str, str]):
         super().__init__(app, server)
         self.peer = peer
         self.idx = int(PeerStatus.count)
         PeerStatus.count += 1
         self.vid_feed = VideoFeed(self.app, self.server, peer, self.count)
         self.data_feed = DataFeed(self.app, self.server, peer, self.count)
-        self.data_type = 'Random'  # FIXME from config
+        self.data_type = peer.metadata.data_type
+        self.icon_map = icons
 
         self.net_figs = {}
+        self.trust_figs = {}
         self.fig = go.Figure()
         xes, yes = self.update_summary()
         self.fig.add_trace(go.Scatter(x=xes, y=yes))
@@ -56,26 +52,42 @@ class PeerStatus(DashComponent):
             mapp.following = self.peer.uuid
             return html.Div()
 
-        #register_page(__name__, '/peer_status_%d' % self.idx, layout=self.div())  # FIXME
         for idx, other in enumerate(self.peer.others):
             fig = go.Figure()
-            self.net_figs[idx] = fig
             xes, yes = self.update_net(other)
-            fig.add_trace(go.Scatter(x=xes, y=yes))
+            fig.add_trace(go.Scatter(x=xes, y=yes, name='net-fig-%d' % idx))
+            self.net_figs[idx] = fig
+            gauge = go.Figure()
+            gauge.add_trace(go.Indicator(mode="gauge+number",
+                                         domain={'x': [0, 1], 'y': [0, 1]},
+                                         title={'text': "Trust level"},
+                                         gauge={'axis': {'range': [None, 500]},
+                                                'bar': {'color': "royalblue"},
+                                                'steps': [
+                                                    {'range': [0, 45], 'color': "red"},
+                                                    {'range': [55, 65], 'color': "yellow"},
+                                                    {'range': [65, 100], 'color': "green"}],
+                                                'threshold': {'line': {'color': "white", 'width': 4},
+                                                              'thickness': 0.75,
+                                                              'value': 50}},
+                                         name='trust-gauge-%d' % idx,
+                                         value=0.))
+            self.trust_figs[idx] = gauge
 
             @self.app.callback(Output('trust-%d-%d' % (self.idx, idx), 'children'),
                                Input('status-interval', 'n_intervals'))
             def update_trust_levels(_):
-                # FIXME gauges?
-                trust = self.peer.trust_matrix()
-                return trust.get(other, 0)
+                trust_gauge = self.trust_figs[idx]
+                trust_gauge.update_traces(selector=dict(name='trust-gauge-%d' % idx),
+                                          value=self.peer.reputation, overwrite=True)
+                return trust_gauge
 
             @self.app.callback(Output('net_graph-%d-%d' % (self.idx, idx), 'figure'),
                                Input('status-interval', 'n_intervals'))
             def update_net_graph(_):
                 net_fig = self.net_figs[idx]
                 x_vals, y_vals = self.update_net(other)
-                net_fig.update_traces(go.Scatter(x=x_vals, y=y_vals), overwrite=True)
+                net_fig.update_traces(selector=dict(name='net-fig-%d' % idx), x=x_vals, y=y_vals, overwrite=True)
                 return net_fig
 
     def update_summary(self):

@@ -1,0 +1,7 @@
+!Cfg:autonomous_trust.core.network.network.Network
+_ip4_cidr: 172.27.3.2/24
+_ip6_cidr: fe80::4bda:99ff:a521:a867/64
+_mac_address: 30:23:03:e1:1b:35
+_mcast4_addr: 239.0.0.65
+_mcast6_addr: ff00::41e9:dddc:e4c7:e7e7
+_port: null
