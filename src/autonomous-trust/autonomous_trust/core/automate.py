@@ -302,6 +302,7 @@ class AutonomousTrust(Protocol):
 
         net_cfg = configs[CfgIds.network]
         self.identity = configs[CfgIds.identity]
+        self.identity.address = net_cfg.ip4
         self.peers = configs[CfgIds.peers]
         # FIXME cross-reference addresses, identity.address is as appropriate for net protocol
 
@@ -329,7 +330,7 @@ class AutonomousTrust(Protocol):
                 continue
             if result.ready():
                 try:
-                    result.get(0)
+                    result.get(0)  # FIXME cannot pickle '_thread.lock' object
                 except mp.TimeoutError:
                     pass
                 except KeyboardInterrupt:

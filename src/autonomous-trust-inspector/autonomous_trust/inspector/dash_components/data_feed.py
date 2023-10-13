@@ -17,18 +17,19 @@ class DataFeed(DashComponent):
         self.halt = False
         self.idx = 0
         self.fig = go.Figure()
-        self.fig.add_trace(go.Scatter(x=[float(self.idx)], y=[0.0], mode='lines', name='data_%s' % self.number))
+        self.fig.add_trace(go.Scatter(x=[float(self.idx)], y=[0.0] * peer.metadata.data_channels, mode='lines',
+                                      name='data_%s' % self.number))
 
     def rcv(self):
         while not self.halt:
             try:
-                data = self.peer.data_stream.get()
+                data = self.peer.data_stream.get()  # tuple of floats
             except Empty:
                 continue
             if data:
                 self.idx += 1
                 self.fig.update_traces(selector=dict(name='data_%s' % self.number,
-                                                     x=[float(self.idx)], y=[data], mode='lines'))
+                                                     x=[float(self.idx)], y=data, mode='lines'))
 
     def div(self, title: str, style: dict = None) -> html.Div:
         if style is None:

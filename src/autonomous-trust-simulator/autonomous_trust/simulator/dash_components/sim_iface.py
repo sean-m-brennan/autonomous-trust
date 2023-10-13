@@ -53,7 +53,7 @@ class SimulationInterface(CohortInterface):
                 self.queue.put(state, block=True, timeout=None)
         return cb
 
-    def update(self):
+    def update(self, initial=False):
         """May be called only once per timestep, i.e. synced with UI, synchronizes others"""
         self.state = self.queue.get()
         for obj in self.sync_objects:

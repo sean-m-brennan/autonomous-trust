@@ -7,6 +7,7 @@ from autonomous_trust.core import Process, ProcMeta, CfgIds, from_yaml_string, Q
 from autonomous_trust.core.identity import Peers, Identity
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.protocol import Protocol
+from autonomous_trust.core.reputation import ReputationProtocol
 from autonomous_trust.services.network_statistics import NetworkStats, NetStatsProtocol, NetStatsSource
 from autonomous_trust.services.peer.metadata import MetadataProtocol, MetadataSource, PeerData
 from autonomous_trust.services.peer.position import Position, GeoPosition
@@ -25,8 +26,8 @@ class PeerDataAcq(object):
         self.cohort = cohort
         self.video_stream = video_stream
         self.data_stream = data_stream
-
         self.network_history: dict[str, list[NetworkStats]] = {}
+        self.reputation = 0.
 
     @property
     def tick(self):
@@ -64,18 +65,14 @@ class PeerDataAcq(object):
     def identity(self):
         return self._ident
 
-    def trust_matrix(self):
-        # FIXME compute trust levels per each other
-        return {}
-
 
 class CohortInterface(object):
     def __init__(self, log_level: int = logging.INFO, logfile: str = None):
         self.tick = 0
         self.paused = False
         self.peers: dict[str, PeerDataAcq] = {}
-        self.time = datetime.now()
-        self.center = GeoPosition(0, 0)
+        self._time: datetime = datetime.now()
+        self._center = GeoPosition(0, 0)
 
         self.log_level = log_level
         self.logfile = logfile
@@ -91,6 +88,14 @@ class CohortInterface(object):
         self.logger.addHandler(handler)
         self.logger.setLevel(log_level)
 
+    @property
+    def center(self) -> Position:
+        return self._center
+
+    @property
+    def time(self) -> datetime:
+        return self._time
+
     def update(self):
         raise NotImplementedError
 
@@ -101,6 +106,9 @@ class Cohort(CohortInterface):
     def __init__(self, automaton: AutonomousTrust, **kwargs):
         super().__init__(**kwargs)
         self.automaton = automaton
+
+    def update(self):
+        pass
 
     def update_group(self, group_ids: dict[str, Identity]):
         for uuid in group_ids:
@@ -153,7 +161,7 @@ class CohortTracker(Process, metaclass=ProcMeta,
 
     def handle_stats(self, _, message):
         if message.function == CohortProtocol.stats:
-            data = from_yaml_string(message.obj)  # FIXME 'total'
+            data = from_yaml_string(message.obj)  # FIXME 'total' also
             uuid = message.from_whom.uuid
             if uuid in self.cohort.peers:
                 peer = self.cohort.peers[uuid]
@@ -177,7 +185,12 @@ class CohortTracker(Process, metaclass=ProcMeta,
             except Empty:
                 message = None
             if message:
-                if isinstance(message, Peers):
+                if isinstance(message, Message) and message.function == ReputationProtocol.rep_resp:
+                    rep = message.obj
+                    if rep.peer_id in self.cohort.peers:
+                        peer = self.cohort.peers[rep.peer_id]
+                        peer.reputation = rep.score
+                elif isinstance(message, Peers):
                     peer_idents = {p.uuid: p for p in message.listing.values()}
                     self.cohort.update_group(peer_idents)
                 elif not self.protocol.run_message_handlers(queues, message):

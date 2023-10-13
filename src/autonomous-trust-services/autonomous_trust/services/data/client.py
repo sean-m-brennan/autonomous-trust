@@ -1,9 +1,9 @@
 import struct
 from queue import Empty, Full
 
-from autonomous_trust.core import Process, ProcMeta, CfgIds
+from autonomous_trust.core import Process, ProcMeta, CfgIds, from_yaml_string
+from autonomous_trust.core.network import Message
 from .server import DataSource, DataProtocol
-from ...core.network import Message
 
 
 class DataRcvr(Process, metaclass=ProcMeta,
@@ -22,7 +22,7 @@ class DataRcvr(Process, metaclass=ProcMeta,
         if message.function == DataProtocol.data:
             try:
                 uuid = message.from_whom.uuid
-                data = None  # FIXME
+                data = from_yaml_string(message.obj)
                 if uuid in self.cohort.peers:
                     self.cohort.peers[uuid].data_stream.put(data, block=True, timeout=self.q_cadence)
             except (Full, Empty):
@@ -33,7 +33,7 @@ class DataRcvr(Process, metaclass=ProcMeta,
             for peer in self.protocol.peer_capabilities[DataSource.capability_name]:
                 if peer not in self.servicers:
                     self.servicers.append(peer)
-                    msg_obj = self.fast_encoding, self.name  # FIXME
+                    msg_obj = self.name
                     msg = Message(DataSource.name, DataProtocol.request, msg_obj, peer)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
 

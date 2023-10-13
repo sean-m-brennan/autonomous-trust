@@ -1,0 +1,4 @@
+!Cfg:autonomous_trust.services.video.client.VideoRecv
+fast_encoding: false
+raw: false
+size: 320
