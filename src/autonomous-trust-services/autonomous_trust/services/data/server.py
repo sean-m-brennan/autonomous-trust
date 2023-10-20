@@ -1,7 +1,7 @@
 import warnings
 from queue import Empty, Full
 
-from autonomous_trust.core import Process, ProcMeta, CfgIds, Configuration, to_yaml_string
+from autonomous_trust.core import Process, ProcMeta, CfgIds, to_yaml_string, InitializableConfig
 from autonomous_trust.core.identity import Identity
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.protocol import Protocol
@@ -12,12 +12,12 @@ class DataProtocol(Protocol):
     data = 'data'
 
 
-class DataSrc(Configuration):
+class DataSrc(InitializableConfig):
     def __init__(self, channels: int = 3):
         self.channels = channels
 
     @classmethod
-    def initialize(cls, channels: int):
+    def initialize(cls, channels: int = 3):
         return DataSrc(channels)
 
 

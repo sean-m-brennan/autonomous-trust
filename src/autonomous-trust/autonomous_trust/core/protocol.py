@@ -1,4 +1,6 @@
 import icontract
+
+from .system import QueueType
 from .util import ClassEnumMeta
 from .identity import Group, Peers
 from .network import Message
@@ -20,7 +22,7 @@ class Protocol(object, metaclass=ClassEnumMeta):
 
     @icontract.require(lambda queues: len(queues) > 0)
     @icontract.require(lambda message: message is not None)
-    def run_message_handlers(self, queues: list, message):
+    def run_message_handlers(self, queues: dict[str, QueueType], message: Message):
         if isinstance(message, Group):
             self.group = message
             return True

@@ -1,7 +1,7 @@
 import os
 
-from autonomous_trust import LogLevel
-from autonomous_trust.config.generate import random_config
+from autonomous_trust.core import LogLevel
+from autonomous_trust.core.config.generate import random_config
 
 from .inspector import Inspector
 

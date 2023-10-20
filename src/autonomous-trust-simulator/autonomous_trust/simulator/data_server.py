@@ -6,7 +6,7 @@ from autonomous_trust.services.data.server import DataSource, DataSrc
 
 class SimDataSrc(DataSrc):
     @classmethod
-    def initialize(cls, idx: int, channels: int):
+    def initialize(cls, idx: int = 0, channels: int = 3):
         data_map = {}
         if idx in data_map:
             return SimDataSrc(channels)

@@ -1,4 +1,3 @@
-import time
 from queue import Empty
 
 from flask import Flask, Response

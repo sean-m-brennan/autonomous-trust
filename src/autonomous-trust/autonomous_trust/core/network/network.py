@@ -1,10 +1,10 @@
 import ipaddress
 
-from ..config import Configuration
+from ..config import InitializableConfig
 from ..system import encoding
 
 
-class Network(Configuration):
+class Network(InitializableConfig):
     encoding = encoding
     broadcast = 'anyone'
     multicast_v4_address = '239.0.0.65'
