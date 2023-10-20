@@ -7,7 +7,7 @@ name = "autonomous_trust"
 version = "0.1.1"
 description = "AutonomousTrust - a high-trust cooperative computing framework"
 authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
-readme = "README.md"
+#readme = "README.md"  # FIXME docker looking for /app/README.md
 packages = [{include = "autonomous_trust"}]
 license = "Proprietary"
 exclude = ["**/etc", "**/var", "**/notes", "**/__pycache__"]
