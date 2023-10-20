@@ -152,6 +152,8 @@ class Container(object):
 def build_containers(pkg_name: Optional[str] = None, which: Container = Container.all,
                      debug: bool = False, force: bool = False):
     src_dir = os.path.join(base_dir, 'src')
+    # FIXME ensure registry is running, otherwise start it
+
     package_list = [pkg_name]
     if pkg_name is None:
         package_list = packages.keys()
@@ -189,4 +191,10 @@ def build_containers(pkg_name: Optional[str] = None, which: Container = Containe
             p = subprocess.run(cmd + options)
             if p.returncode != 0:
                 raise RuntimeError('Build of %s failed' % target)
+            p = subprocess.run(['docker', 'tag', target, 'localhost:5000/' + target])
+            if p.returncode != 0:
+                raise RuntimeError('Tag of %s failed' % target)
+            p = subprocess.run(['docker', 'push', 'localhost:5000/' + target])
+            if p.returncode != 0:
+                raise RuntimeError('Push of %s failed' % target)
     return True

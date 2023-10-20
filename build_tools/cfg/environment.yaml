@@ -14,7 +14,7 @@ dependencies:
   - networkx
   - quart
   - numpy
-  - opencv-python
+  - py-opencv
   - imutils
   - geopy
   - utm
