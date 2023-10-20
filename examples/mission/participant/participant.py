@@ -14,7 +14,7 @@ from autonomous_trust.simulator.video.server import SimVideoSrc
 class MissionParticipant(AutonomousTrust):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.add_worker(SimMetadataSource, self.system_dependencies)
+        self.add_worker(SimMetadataSource, self.system_dependencies)  # FIXME SimClient is a problem?
         self.add_worker(NetStatsSource, self.system_dependencies)
         self.add_worker(VideoSource, self.system_dependencies)
         self.add_worker(DataSimSource, self.system_dependencies)
@@ -34,9 +34,9 @@ if __name__ == '__main__':
     if not os.path.exists(dat_dir):
         os.symlink(os.path.join(os.path.dirname(__file__), Configuration.DATA_PATH), dat_dir)
 
-    generate_identity(cfg_dir, preserve=True)  # does nothing if files present
+    generate_identity(cfg_dir, preserve=True, defaults=True)  # does nothing if files present
     for cfg_name, klass in ((SimMetadataSource.name, SimMetadata),
                             (VideoSource.name, SimVideoSrc), (DataSource.name, DataSrc)):
-        generate_worker_config(cfg_dir, cfg_name, klass)
+        generate_worker_config(cfg_dir, cfg_name, klass, True)
 
-    MissionParticipant(log_level=LogLevel.INFO, logfile=Configuration.log_stdout).run_forever()
+    MissionParticipant(log_level=LogLevel.DEBUG, logfile=Configuration.log_stdout).run_forever()

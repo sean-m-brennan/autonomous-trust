@@ -35,7 +35,8 @@ class SimMetadata(Metadata):
         self.port = port
 
     @classmethod
-    def initialize(cls, type_of_peer: str, sim_host: str, sim_port: int = default_port, data_type: str = None, data_channels: int = 0):
+    def initialize(cls, type_of_peer: str, sim_host: str, sim_port: int = default_port,
+                   data_type: str = None, data_channels: int = 0):
         uuid = cls.get_assoc_ident().uuid
         return SimMetadata(sim_host, sim_port, uuid, type_of_peer, data_type, data_channels,
                            PositionSimSource, TimeSimSource)
@@ -50,5 +51,6 @@ class SimMetadataSource(MetadataSource, metaclass=ProcMeta,
         thread.start()
 
     def sim_callback(self, state: SimState):
-        self.cfg.position_source.position = state.peers[self.cfg.uuid]
+        if self.cfg.uuid in state.peers:
+            self.cfg.position_source.position = state.peers[self.cfg.uuid]
         self.cfg.time_source.time = state.time

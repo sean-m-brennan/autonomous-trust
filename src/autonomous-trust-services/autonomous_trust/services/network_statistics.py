@@ -94,7 +94,7 @@ class NetStatsSource(Process, metaclass=ProcMeta,
                     else:
                         self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
 
-            statistics = {'total': NetworkStats(*self.compute_rate(), *self.latest)}
+            statistics = {'total': NetworkStats(*self.compute_rate(), *(self.latest[1:]))}
             try:
                 for peer in self.clients:
                     statistics[peer] = NetworkStats(*self.network_source.acquire(peer))

@@ -8,7 +8,7 @@ from logging.handlers import TimedRotatingFileHandler, SysLogHandler
 import traceback
 import queue
 from enum import Enum
-from typing import Union, Optional
+from typing import Union, Any, Optional
 import multiprocessing as mp
 from multiprocessing import Pool as ProcessPool
 from multiprocessing.dummy import Pool as ThreadPool
@@ -23,10 +23,10 @@ try:
 except ImportError:
     version = '?.?.?'
 from .config import Configuration, CfgIds, to_yaml_string
-from .processes import Process, LogLevel, ProcessTracker, QueueType
+from .processes import Process, LogLevel, ProcessTracker
 from .identity import Peers
 from .capabilities import Capabilities, Capability
-from .system import PackageHash, queue_cadence, max_concurrency, now
+from .system import PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
 from .protocol import Protocol
 from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, NegotiationProtocol
 from .network import Message
@@ -37,11 +37,11 @@ PoolType = Union[ProcessPool, ThreadPool]
 
 def pi(precision):  # intentionally non-trivial, arbitrary precision
     getcontext().prec = precision
-    return sum(1/Decimal(16)**k *
-               (Decimal(4)/(8*k+1) -
-                Decimal(2)/(8*k+4) -
-                Decimal(1)/(8*k+5) -
-                Decimal(1)/(8*k+6)) for k in range(precision))
+    return sum(1 / Decimal(16) ** k *
+               (Decimal(4) / (8 * k + 1) -
+                Decimal(2) / (8 * k + 4) -
+                Decimal(1) / (8 * k + 5) -
+                Decimal(1) / (8 * k + 6)) for k in range(precision))
 
 
 class Ctx(str, Enum):
@@ -53,6 +53,53 @@ class Ctx(str, Enum):
         return str.__str__(self)
 
 
+class PooledQueue(object):
+    def __init__(self, queue_type: type[QueueType]):
+        self.in_use = False
+        self.queue = queue_type()
+
+    def close(self):
+        self.in_use = True
+
+
+class QueuePool(object):
+    """Cannot create multiproc queues after pool is started, so create a reserve pool of them"""
+    pool_size = 128
+
+    def __init__(self, queue_type: type[QueueType]):
+        self._pool: list[PooledQueue] = []
+        for _ in range(self.pool_size):
+            self._pool.append(PooledQueue(queue_type))
+
+    def next(self) -> Optional[QueueType]:
+        for pq in self._pool:
+            if not pq.in_use:
+                pq.in_use = True
+                return pq.queue
+        return None
+
+    def recycle(self, queue: QueueType):
+        for pq in self._pool:
+            if pq.queue is queue:
+                pq.close()
+
+
+__QUEUE_POOL: QueuePool  # created by AutonomousTrust object immediately
+
+
+def create_queue() -> QueueType:
+    global __QUEUE_POOL
+    return __QUEUE_POOL.next()
+
+
+def destroy_queue(queue: QueueType):
+    global __QUEUE_POOL
+    __QUEUE_POOL.recycle(queue)
+
+
+################################################################################
+
+
 class AutonomousTrust(Protocol):
     """
     Creates an AutonomousTrust machine
@@ -61,10 +108,11 @@ class AutonomousTrust(Protocol):
     external_feedback = 'extern_in'
 
     # default to production values
-    def __init__(self, multiproc: Optional[bool] = True, log_level: int = LogLevel.WARNING,
+    def __init__(self, multiproc: bool = True, log_level: int = LogLevel.WARNING,
                  logfile: str = None, log_classes: list[str] = None, context: str = Ctx.DEFAULT,
                  testing: bool = False):
-        self._stopped_procs = []
+        global __QUEUE_POOL
+        self._stopped_procs: list[str] = []
         if multiproc:
             # Multiprocessing
             self._pool_type = ProcessPool
@@ -75,6 +123,7 @@ class AutonomousTrust(Protocol):
             # Threading
             self._pool_type = ThreadPool
             self._queue_type = queue.Queue
+        __QUEUE_POOL = QueuePool(self._queue_type)
 
         self._log_level = log_level
         self.name = self.__class__.__name__
@@ -97,23 +146,23 @@ class AutonomousTrust(Protocol):
         syslog_handler = SysLogHandler(address='/dev/log')
         self._logger.addHandler(syslog_handler)
         super().__init__(CfgIds.main, self._logger, None, None)
-        self.identity = None
+        self.identity = None  # of type Identity
 
         self.capabilities = Capabilities()
         self._output = self.queue_type()  # subsystem logging
         self._subsystems = ProcessTracker()
-        self._additional_workers = []
+        self._additional_workers: list[tuple] = []
         self._my_queue = self.queue_type()
         self.testing = testing
-        self.active_tasks = {}
-        self.active_pids = {}
-        self.last_tick = {}
+        self.active_tasks: dict[str, Task] = {}
+        self.active_pids: dict[str, int] = {}
+        self.last_tick: dict[int, int] = {}
         self.tasking_start = now()
-        self.latest_reputation = {}
-        self.unhandled_messages = []
+        self.latest_reputation: dict[str, Any] = {}
+        self.unhandled_messages: list[Message] = []
 
     @property
-    def queue_type(self) -> type[QueueType]:
+    def queue_type(self):
         return self._queue_type
 
     @property
@@ -144,7 +193,7 @@ class AutonomousTrust(Protocol):
                 if q_name != self.proc_name:
                     queues[q_name].put(self.capabilities, block=True, timeout=queue_cadence)
 
-    def init_tasking(self, queues):
+    def init_tasking(self, queues: dict[str, QueueType]):
         """
         Override this for pre-loop initializations
         :param queues: Interprocess communication queues to each process
@@ -154,7 +203,7 @@ class AutonomousTrust(Protocol):
         if self.testing:
             self.peer_count = len(self.peers.all)  # noqa
 
-    def tasking_tick(self, t_id, period=30.0):
+    def tasking_tick(self, t_id: int, period: float = 30.0):
         mark = (now() - self.tasking_start).total_seconds() / period
         if t_id not in self.last_tick:
             self.last_tick[t_id] = 0
@@ -211,9 +260,9 @@ class AutonomousTrust(Protocol):
                     for sig in signals.values():
                         sig.put_nowait(Process.sig_quit)
                     break
-                #except Exception as err:  # FIXME uncomment or handle otherwise
-                #    self.logger.error(self.name + ':  ' +
-                #                      ''.join(traceback.TracebackException.from_exception(err).format()))
+                except Exception as err:
+                    self.logger.error(self.name + ':  ' +
+                                      ''.join(traceback.TracebackException.from_exception(err).format()))
         self.cleanup()
 
     def run_forever(self, q_in: QueueType = None, q_out: QueueType = None):
@@ -265,11 +314,11 @@ class AutonomousTrust(Protocol):
         print("")
 
     @staticmethod
-    def _get_cfg_type(path):
+    def _get_cfg_type(path: str):
         if path.endswith(Configuration.yaml_file_ext):
             return os.path.basename(path).removesuffix(Configuration.yaml_file_ext)
 
-    def _configure(self, start=True):
+    def _configure(self, start: bool = True):
         # Pull initial state from configuration files
         required = [CfgIds.network, CfgIds.identity, CfgIds.peers]
         defaultable = {CfgIds.peers: Peers, }
@@ -303,8 +352,9 @@ class AutonomousTrust(Protocol):
         net_cfg = configs[CfgIds.network]
         self.identity = configs[CfgIds.identity]
         self.identity.address = net_cfg.ip4
+        if preferred_proto_ver == 6:
+            self.identity.address = net_cfg.ip6
         self.peers = configs[CfgIds.peers]
-        # FIXME cross-reference addresses, identity.address is as appropriate for net protocol
 
         if start:
             # init configured process classes
@@ -318,7 +368,7 @@ class AutonomousTrust(Protocol):
                 configs[Process.key].append(worker_cls(configs, self._subsystems, self._output, deps, **kwargs))
         return configs
 
-    def _monitor_processes(self, proc_results, show_output=True):
+    def _monitor_processes(self, proc_results: dict[str, AsyncResult], show_output: bool = True):
         """
         Should be included in any main-loop override function
         :param proc_results: dict of process names to multiprocessing.pool.AsyncResults
@@ -330,7 +380,8 @@ class AutonomousTrust(Protocol):
                 continue
             if result.ready():
                 try:
-                    result.get(0)  # FIXME cannot pickle '_thread.lock' object
+                    self.logger.debug('Check process %s' % name)
+                    result.get(0)
                 except mp.TimeoutError:
                     pass
                 except KeyboardInterrupt:
@@ -349,7 +400,7 @@ class AutonomousTrust(Protocol):
                 pass
         return True
 
-    def _handle_messages(self, queues, pool, results):
+    def _handle_messages(self, queues: dict[str, QueueType], pool: PoolType, results: dict[str, AsyncResult]):
         if self.external_control in queues:
             try:
                 cmd = queues[self.external_control].get_nowait()
@@ -371,6 +422,7 @@ class AutonomousTrust(Protocol):
             pass
 
         if message is not None:
+            self.logger.debug('Message %s' % type(message))
             if not self.run_message_handlers(queues, message):
                 if isinstance(message, TaskStatus):
                     if message.uuid in self.active_pids:
@@ -394,10 +446,10 @@ class AutonomousTrust(Protocol):
                         pq = self.queue_type()
                         self.logger.debug(self.name + ': Running task')
                         results[task.uuid] = pool.apply_async(capability.execute, (task, pq))
-                        self.active_tasks[task.uuid] = task
+                        self.active_tasks[str(task.uuid)] = task
                         try:
                             pid = pq.get(block=True, timeout=1)
-                            self.active_pids[task.uuid] = pid
+                            self.active_pids[str(task.uuid)] = pid
                         except queue.Empty:
                             self.logger.error(self.name + ': Process failed')  # FIXME more info
                 elif isinstance(message, Message) and message.function == ReputationProtocol.rep_resp:
@@ -408,7 +460,7 @@ class AutonomousTrust(Protocol):
                         peer = self.peers.find_by_uuid(rep.peer_id)
                         if peer:
                             print("%s's current reputation score:\033[31m %s\033[00m" % (peer.nickname, rep.score))
-                    self.latest_reputation[rep.peer_id] = rep
+                    self.latest_reputation[str(rep.peer_id)] = rep
                 else:
                     self.unhandled_messages.append(message)
         return True
@@ -421,26 +473,27 @@ class AutonomousTrust(Protocol):
             else:
                 self.logger.error(self.name + ': Unhandled message of type %s' % message.__class__.__name__)  # noqa
 
-    def _handle_results(self, queues, results):
+    def _handle_results(self, queues: dict[str, QueueType], results: dict[str, AsyncResult]):
         for key in list(results.keys()):
             if results[key].ready():
                 try:
+                    self.logger.debug(self.name + ': %s Task' % key)
                     result = results[key].get()
-                    self.logger.debug(self.name + ': Task completed %s' % result)
+                    self.logger.debug(self.name + ': %s Task completed %s' % (key, result))
                     tr = TaskResult(self.active_tasks[key], result)
                     queues[CfgIds.negotiation].put(tr, block=True, timeout=queue_cadence)
                     tx = TransactionScore(tr.uuid, 0.6)  # FIXME relevant evaluation
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                 except KeyboardInterrupt:
                     pass
-                except Exception:
-                    self.logger.error('Exception processing task')  # FIXME more info
+                except Exception as e:
+                    self.logger.error('Task Exception - ' + traceback.format_exc())
                     # FIXME send error result to negotiation
                 del results[key]
 
     def _random_task(self, queues: dict[str, QueueType]):
         cap_list = self.capabilities.to_list()
-        cap = Capability(cap_list[random.randint(0, len(cap_list)-1)])
+        cap = Capability(cap_list[random.randint(0, len(cap_list) - 1)])
         args = (random.randint(2, 1000000), random.randint(2, 1000000))
         if cap.name == 'pi':
             args = (random.randint(1000, 10000),)

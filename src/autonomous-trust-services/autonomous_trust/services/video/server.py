@@ -7,7 +7,7 @@ import cv2
 import imutils
 import numpy as np
 
-from autonomous_trust.core import Process, ProcMeta, Configuration, CfgIds
+from autonomous_trust.core import Process, ProcMeta, Configuration, CfgIds, InitializableConfig
 from autonomous_trust.core.protocol import Protocol
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.identity import Identity
@@ -19,14 +19,14 @@ class VideoProtocol(Protocol):
     video = 'video'
 
 
-class VideoSrc(Configuration):
+class VideoSrc(InitializableConfig):
     def __init__(self, path: str, size: int = 320, speed: int = 1):
         self.path = path
         self.size = size
         self.speed = speed
 
     @classmethod
-    def initialize(cls, path: str, size: int, speed: int):
+    def initialize(cls, path: str, size: int = 320, speed: int = 1):
         return VideoSrc(path, size, speed)
 
 

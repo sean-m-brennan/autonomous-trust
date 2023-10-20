@@ -1,6 +1,6 @@
 from collections.abc import Iterable
 from enum import Enum
-from typing import Union
+from typing import Union, Optional
 
 
 def _flatten(xs):
@@ -384,7 +384,7 @@ class Tree(object):
                     node = self.root
         node.red = False
 
-    def find(self, key) -> Union[Node, None]:
+    def find(self, key) -> Optional[Node]:
         """
         Find the Node at key
         :param key: int

@@ -21,7 +21,7 @@ class Graphs(object):
         aenum.extend_enum(cls.Implementation, name.upper(), name.lower())
         cls._MAP[name.lower()] = impl_cls
         if is_default:
-            cls._MAP[cls.Implementation.DEFAULT.value] = impl_cls
+            cls._MAP[cls.Implementation.DEFAULT] = impl_cls
 
 
 ####################

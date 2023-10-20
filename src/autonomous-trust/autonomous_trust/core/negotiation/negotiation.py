@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 import heapq
 from enum import Enum
 from queue import Empty
-from typing import Union
+from typing import Union, Optional
 from uuid import UUID, uuid4
 
 import psutil
@@ -167,7 +167,7 @@ class JobQueue(object):
             raise Empty
         return heapq.heappop(self._heap)[2]
 
-    def min(self) -> Union[datetime, None]:
+    def min(self) -> Optional[datetime]:
         """What is the datetime of the next Job"""
         if len(self) > 0:
             return datetime.fromtimestamp(self._heap[0][0])
@@ -184,7 +184,7 @@ class JobQueue(object):
         """How many Jobs occupy the slot this Job would"""
         return len([x for x in self._heap if x[2] == item])
 
-    def find(self, item_id: UUID) -> Union[Job, None]:
+    def find(self, item_id: UUID) -> Optional[Job]:
         """Get the Job with this UUID"""
         for x in self._heap:
             if x[1] == item_id:

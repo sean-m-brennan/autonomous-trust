@@ -6,7 +6,7 @@ from autonomous_trust.services.video.server import VideoSrc
 
 class SimVideoSrc(VideoSrc):
     @classmethod
-    def initialize(cls, idx: int, size: int, speed: int):
+    def initialize(cls, idx: int = 0, size: int = 320, speed: int = 1):
         video_map = {1: 15, 2: 17, 3: 18, 4: 20, 5: 21}
         if idx in video_map.keys():
             path = os.path.join(Configuration.get_data_dir(), 'video',
