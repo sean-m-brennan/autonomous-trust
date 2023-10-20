@@ -30,12 +30,13 @@ class DataRcvr(Process, metaclass=ProcMeta,
 
     def process(self, queues, signal):
         while self.keep_running(signal):
-            for peer in self.protocol.peer_capabilities[DataSource.capability_name]:
-                if peer not in self.servicers:
-                    self.servicers.append(peer)
-                    msg_obj = self.name
-                    msg = Message(DataSource.name, DataProtocol.request, msg_obj, peer)
-                    queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+            if DataSource.capability_name in self.protocol.peer_capabilities:
+                for peer in self.protocol.peer_capabilities[DataSource.capability_name]:
+                    if peer not in self.servicers:
+                        self.servicers.append(peer)
+                        msg_obj = self.name
+                        msg = Message(DataSource.name, DataProtocol.request, msg_obj, peer)
+                        queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
 
             try:
                 message = queues[self.name].get(block=True, timeout=self.q_cadence)

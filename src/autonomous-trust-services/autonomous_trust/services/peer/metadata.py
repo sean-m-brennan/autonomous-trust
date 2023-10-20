@@ -3,7 +3,7 @@ import sys
 from datetime import datetime
 from queue import Empty, Full
 
-from autonomous_trust.core import Process, ProcMeta, CfgIds, Configuration
+from autonomous_trust.core import Process, ProcMeta, CfgIds, Configuration, InitializableConfig
 from autonomous_trust.core.identity import Identity
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.protocol import Protocol
@@ -35,7 +35,7 @@ class PositionSource(object):
         raise NotImplementedError
 
 
-class Metadata(Configuration):
+class Metadata(InitializableConfig):
     def __init__(self, uuid, peer_kind, data_type, data_channels, position_src_class, time_src_class=None):
         self.uuid = uuid
         self.peer_kind = peer_kind
@@ -73,7 +73,8 @@ class Metadata(Configuration):
         return Identity.from_file(cfg_file)
 
     @classmethod
-    def initialize(cls, peer_kind: str, data_type: str, data_channels: int, position_source: PositionSource, time_source: TimeSource = None):
+    def initialize(cls, peer_kind: str, data_type: str, data_channels: int,
+                   position_source: PositionSource, time_source: TimeSource = None):
         uuid = cls.get_assoc_ident().uuid
         return Metadata(uuid, peer_kind, data_type, data_channels, position_source, time_source)
 

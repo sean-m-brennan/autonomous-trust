@@ -33,11 +33,11 @@ def which(cmd, all=False):
 
 
 def sed_on_file(filepath, original, replacement):
-    temp, temp_file = tempfile.mkstemp(text=True)
-    with open(filepath, 'r') as file:
-        for line in file:
-            temp.write(re.sub(original, replacement, line))
-    temp.close()
+    temp_fd, temp_file = tempfile.mkstemp(text=True)
+    with os.fdopen(temp_fd, 'w') as temp:
+        with open(filepath, 'r') as file:
+            for line in file:
+                temp.write(re.sub(original, replacement, line))
     shutil.move(temp_file, filepath)
 
 

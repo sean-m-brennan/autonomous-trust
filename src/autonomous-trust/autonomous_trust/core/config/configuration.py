@@ -109,6 +109,11 @@ yaml.representer.add_multi_representer(Configuration, Configuration.yaml_represe
 yaml.constructor.add_multi_constructor(Configuration.YAML_PREFIX, Configuration.yaml_constructor)
 
 
+class InitializableConfig(Configuration):
+    def initialize(self, *args, **kwargs):
+        raise NotImplementedError
+
+
 class EmptyObject(Configuration):
     pass
 

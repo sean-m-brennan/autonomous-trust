@@ -18,7 +18,8 @@ class SimClient(net.Client):
         self._tick = 0
         self._cadence = 1
         self._resolution = 0
-        self.lock = threading.Lock()
+        # FIXME lock within multiprocessing does not work
+        #self.lock = threading.Lock()
 
     @property
     def tick(self):
@@ -26,7 +27,7 @@ class SimClient(net.Client):
 
     @tick.setter
     def tick(self, val: int):
-        with self.lock:
+        #with self.lock:
             self._tick = val
 
     @property
@@ -35,7 +36,7 @@ class SimClient(net.Client):
 
     @cadence.setter
     def cadence(self, val: int):
-        with self.lock:
+        #with self.lock:
             self._cadence = val
 
     @property
@@ -44,14 +45,14 @@ class SimClient(net.Client):
 
     @resolution.setter
     def resolution(self, val: int):
-        with self.lock:
+        #with self.lock:
             self._resolution = val
 
     def recv_data(self, **kwargs) -> Optional[SimState]:  # asynchronous
         if self.is_connected:
-            with self.lock:
-                t_data = struct.pack(self.seq_fmt, self._tick, self._resolution)
-                self._tick += self._cadence
+            #with self.lock:
+            t_data = struct.pack(self.seq_fmt, self._tick, self._resolution)
+            self._tick += self._cadence
             try:
                 self.sock.send(t_data)  # query server
             except ConnectionError:

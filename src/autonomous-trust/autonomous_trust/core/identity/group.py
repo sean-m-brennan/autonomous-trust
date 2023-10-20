@@ -2,11 +2,11 @@ import uuid as uuid_mod
 
 from nacl.public import Box
 
-from ..config import Configuration
+from ..config import InitializableConfig
 from .encrypt import Encryptor
 
 
-class Group(Configuration):
+class Group(InitializableConfig):
     """
     Group identity details that can be saved to file or transmitted
     """

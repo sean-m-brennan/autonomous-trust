@@ -3,7 +3,8 @@ import sys
 from datetime import datetime, timedelta
 from queue import Empty
 
-from autonomous_trust.core import Process, ProcMeta, CfgIds, from_yaml_string, QueueType, AutonomousTrust
+from autonomous_trust.core import Process, ProcMeta, CfgIds, from_yaml_string, QueueType
+from autonomous_trust.core.automate import create_queue
 from autonomous_trust.core.identity import Peers, Identity
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.protocol import Protocol
@@ -103,9 +104,8 @@ class CohortInterface(object):
 class Cohort(CohortInterface):
     epoch = datetime(1970, 1, 1)
 
-    def __init__(self, automaton: AutonomousTrust, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.automaton = automaton
 
     def update(self):
         pass
@@ -114,7 +114,8 @@ class Cohort(CohortInterface):
         for uuid in group_ids:
             if uuid not in self.peers:
                 self.peers[uuid] = PeerDataAcq(uuid, group_ids[uuid], NullPeerData(), self,
-                                               self.automaton.queue_type(), self.automaton.queue_type())
+                                               create_queue(), create_queue())
+                # FIXME dynamically creating queues is a problem: "Pickling an AuthenticationString object is disallowed for security reasons"
         for uuid in self.peers:
             if uuid not in group_ids:
                 del self.peers[uuid]
@@ -131,7 +132,9 @@ class Cohort(CohortInterface):
         times = []
         for uuid in self.peers:
             times.append(self.peers[uuid].time - self.epoch)
-        return self.epoch + sum(times, timedelta) / len(times)
+        if len(times) < 1:
+            return self.epoch
+        return self.epoch + sum(times, timedelta()) / len(times)
 
 
 class CohortProtocol(Protocol):
@@ -172,13 +175,14 @@ class CohortTracker(Process, metaclass=ProcMeta,
 
     def process(self, queues, signal):
         while self.keep_running(signal):
-            for peer in self.protocol.peer_capabilities['peer-metadata']:
-                if peer not in self.servicers:
-                    self.servicers.append(peer)
-                    msg = Message(MetadataSource.name, MetadataProtocol.request, True, peer)
-                    queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                    msg = Message(NetStatsSource.name, NetStatsProtocol.request, True, peer)
-                    queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+            if 'peer-metadata' in self.protocol.peer_capabilities:
+                for peer in self.protocol.peer_capabilities['peer-metadata']:
+                    if peer not in self.servicers:
+                        self.servicers.append(peer)
+                        msg = Message(MetadataSource.name, MetadataProtocol.request, True, peer)
+                        queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+                        msg = Message(NetStatsSource.name, NetStatsProtocol.request, True, peer)
+                        queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
 
             try:
                 message = queues[self.name].get(block=True, timeout=self.q_cadence)
