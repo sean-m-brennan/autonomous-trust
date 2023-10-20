@@ -1,0 +1,20 @@
+version: '3'
+services:
+  registry:
+    image: registry:2
+    restart: always
+    ports:
+      - "5000:5000"
+    environment:
+      REGISTRY_HTTP_ADDR: "0.0.0.0:5000"
+      REGISTRY_HTTP_TLS_CERTIFICATE: /certs/registry.crt
+      REGISTRY_HTTP_TLS_KEY: /certs/registry.key
+    deploy:
+      placement:
+        constraints:
+          - 'node.role == manager'
+          - 'node.platform.os == linux'
+    volumes:
+      - type: bind
+        source: $DOCKER_ON_DISK/registry
+        target: /var/lib/registry
