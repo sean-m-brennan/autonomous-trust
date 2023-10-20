@@ -6,7 +6,7 @@ import re
 import socket
 import subprocess
 
-from .configuration import Configuration, CfgIds
+from .configuration import Configuration, CfgIds, InitializableConfig
 from ..processes import ProcessTracker
 from ..network import Network, NetworkProtocol
 from ..identity import Identity
@@ -68,7 +68,7 @@ def _subsystems(net_impl):
     return pt
 
 
-def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve=False):
+def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve=False, defaults=False):
     if seed is not None:
         try:
             seed = int(seed)
@@ -123,15 +123,20 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
             fullname = hostname
         nickname = input('  Nickname: ')
     if not os.path.exists(net_file) or not preserve:
-        ip4_addr = input('  IP4 address [%s]: ' % ip4_address)
-        if ip4_addr == '':
+        if defaults:
             ip4_addr = ip4_address
-        ip6_addr = input('  IP6 address [%s]: ' % ip6_address)
-        if ip6_addr == '':
             ip6_addr = ip6_address
-        mac_addr = input('  MAC address [%s]: ' % mac_address)
-        if mac_addr == '':
             mac_addr = mac_address
+        else:
+            ip4_addr = input('  IP4 address [%s]: ' % ip4_address)
+            if ip4_addr == '':
+                ip4_addr = ip4_address
+            ip6_addr = input('  IP6 address [%s]: ' % ip6_address)
+            if ip6_addr == '':
+                ip6_addr = ip6_address
+            mac_addr = input('  MAC address [%s]: ' % mac_address)
+            if mac_addr == '':
+                mac_addr = mac_address
     if not os.path.exists(sub_sys_file) or not preserve:
         net_impl = input('  Network Implementation [%s]: ' % communications)
         if net_impl == '':
@@ -178,24 +183,28 @@ def random_config(base_dir, ident: str = None):
     os.environ[Configuration.VARIABLE_NAME] = cfg_dir
 
 
-def generate_worker_config(cfg_dir, proc_name, cfg_class):
+def generate_worker_config(cfg_dir: str, proc_name: str, cfg_class: type[InitializableConfig], defaults: bool = False):
     cfg_file = os.path.join(cfg_dir, proc_name + Configuration.yaml_file_ext)
     if not os.path.exists(cfg_file):
+        print('Configure %s --' % proc_name)
         spec = inspect.getfullargspec(cfg_class.initialize)
         ann = inspect.get_annotations(cfg_class.initialize)
         arg_names = spec[0][1:]
         defaults_list = spec[3]
-        defaults = {}
+        default_values = {}
         if defaults_list is not None:
             for idx, name in enumerate(arg_names[-len(defaults_list):]):
-                defaults[name] = defaults_list[idx]
+                default_values[name] = defaults_list[idx]
 
         args = []
         for idx, name in enumerate(arg_names):
-            if name in defaults:
-                arg = input('  %s [%s]: ' % (name, defaults[name]))
-                if arg == '':
-                    arg = defaults[name]  # type is correct here
+            if name in default_values:
+                if defaults:
+                    arg = default_values[name]
+                else:
+                    arg = input('  %s [%s]: ' % (name, defaults[name]))
+                    if arg == '':
+                        arg = default_values[name]  # type is correct here
             else:
                 arg = input('  %s: ' % name)
             if name in ann:

@@ -3,14 +3,14 @@ import uuid as uuid_mod
 from nacl.public import Box
 from nacl.encoding import HexEncoder
 
-from ..config import Configuration
+from ..config import Configuration, InitializableConfig
 from ..system import encoding, agreement_impl
 from ..algorithms.agreement import AgreementVoter
 from .sign import Signature
 from .encrypt import Encryptor
 
 
-class Identity(Configuration, AgreementVoter):
+class Identity(InitializableConfig, AgreementVoter):
     """
     Identity details that can be saved to file or transmitted
     """

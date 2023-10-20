@@ -1,4 +1,3 @@
-import multiprocessing as mp
 import os
 import queue
 import sys
@@ -10,7 +9,6 @@ from collections.abc import Mapping
 from collections import OrderedDict
 
 from enum import IntEnum
-from typing import Union
 
 from ruamel.yaml import YAML
 
@@ -18,8 +16,6 @@ from .config import Configuration
 from .system import cadence, queue_cadence, now
 
 yaml = YAML(typ='safe')
-
-QueueType = Union[queue.Queue, mp.Queue]
 
 
 class ProcessTracker(Mapping):

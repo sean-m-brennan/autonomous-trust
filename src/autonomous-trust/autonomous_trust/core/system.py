@@ -1,8 +1,11 @@
+import multiprocessing
 import os
 import pkgutil
+import queue
 import sys
 from traceback import print_tb
 from datetime import datetime
+from typing import Union
 
 from nacl.hash import blake2b
 
@@ -19,6 +22,7 @@ comm_port = 27787
 ping_rcv_port = comm_port + 2
 ping_snd_port = ping_rcv_port + 1
 ntp_port = comm_port + 4
+preferred_proto_ver = 4
 net_cadence = 0.0001
 encoding = 'utf-8'  # FIXME hex?
 cadence = 0.5
@@ -32,6 +36,9 @@ core_system = {CfgIds.network: communications,
                }
 max_concurrency = os.cpu_count() * 2
 base_system_deps = core_system.keys()
+
+
+QueueType = Union[queue.Queue, multiprocessing.Queue]
 
 
 def now():  # FIXME NTP sourced

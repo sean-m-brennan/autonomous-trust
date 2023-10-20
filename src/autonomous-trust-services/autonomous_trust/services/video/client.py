@@ -4,13 +4,13 @@ from queue import Empty, Full
 import cv2
 import imutils
 
-from autonomous_trust.core import Process, ProcMeta, CfgIds, Configuration
+from autonomous_trust.core import Process, ProcMeta, CfgIds, InitializableConfig
 from autonomous_trust.core.network import Message
 from .serialize import deserialize
 from .server import VideoSource, VideoProtocol
 
 
-class VideoRecv(Configuration):
+class VideoRecv(InitializableConfig):
     def __init__(self, size=640, raw=False, fast_encoding=False):
         self.size = size
         self.raw = raw
@@ -54,12 +54,13 @@ class VideoRcvr(Process, metaclass=ProcMeta,
 
     def process(self, queues, signal):
         while self.keep_running(signal):
-            for peer in self.protocol.peer_capabilities[VideoSource.capability_name]:
-                if peer not in self.servicers:
-                    self.servicers.append(peer)
-                    msg_obj = self.cfg.fast_encoding, self.name
-                    msg = Message(VideoSource.name, VideoProtocol.request, msg_obj, peer)
-                    queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+            if VideoSource.capability_name in self.protocol.peer_capabilities:
+                for peer in self.protocol.peer_capabilities[VideoSource.capability_name]:
+                    if peer not in self.servicers:
+                        self.servicers.append(peer)
+                        msg_obj = self.cfg.fast_encoding, self.name
+                        msg = Message(VideoSource.name, VideoProtocol.request, msg_obj, peer)
+                        queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
 
             try:
                 message = queues[self.name].get(block=True, timeout=self.q_cadence)
