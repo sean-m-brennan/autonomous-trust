@@ -12,6 +12,8 @@ class Protocol(object, metaclass=ClassEnumMeta):
         self.proc_name = proc_name
         self.logger = logger
         self.peers = peers
+        if peers is None:
+            self.peers = Peers()
         self.group = group
         self.capabilities = Capabilities()
         self.peer_capabilities = PeerCapabilities()

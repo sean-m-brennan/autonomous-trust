@@ -48,6 +48,7 @@ RUN rm -rf autonomous_trust/etc autonomous_trust/var
 COPY --chown=user:user src/autonomous-trust/pyproject.toml pyproject.toml
 RUN poetry install
 
+ENV AUTONOMOUS_TRUST_ROOT="/"
 ENV AUTONOMOUS_TRUST_ARGS=""
 CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 -m autonomous_trust $AUTONOMOUS_TRUST_ARGS || /bin/bash"]
 

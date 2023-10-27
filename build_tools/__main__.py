@@ -1,6 +1,7 @@
 from .command_parser import CommandParser, Command, Function, Argument
 from .commands import tag, test
 from .config import packages
+from .cfg.validate import validate_packages
 from . import program, util, devel, docker, unikernel
 
 version = util.git_describe()[0]
@@ -35,6 +36,8 @@ def main(commands, args):
                 devel.init(cmd.conda, cmd.environ, cmd.basic, cmd.env_cfg)
             elif cmd.function == 'update':
                 devel.update()
+            elif cmd.function == 'validate':
+                validate_packages()
         elif name == Cmds.network:
             pass  # FIXME
         elif name == Cmds.tag:
@@ -78,6 +81,7 @@ if __name__ == '__main__':
                        Argument('--basic', {'action': 'store_true', 'help': 'skip virtualization (Docker/QEMU/Unikraft'}),
                        ], 'Prepare development environment for use'),
              Function('update', [], 'Update development environment'),
+             Function('validate', [], 'Validate development dependencies'),
              ], [], 'Development environment'),
         Cmds.network: Command([], [], 'Prepare network for Docker/KVM'),
         Cmds.tag: Command([],

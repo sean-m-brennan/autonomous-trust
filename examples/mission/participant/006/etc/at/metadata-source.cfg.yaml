@@ -1,7 +1,7 @@
 !Cfg:autonomous_trust.simulator.peer.peer_metadata.SimMetadata
 data_channels: 0
 data_type: None
-host: 127.0.0.1
+host: simulator
 peer_kind: soldier
 port: 8778
 position_src_class: autonomous_trust.simulator.peer.peer_metadata.PositionSimSource

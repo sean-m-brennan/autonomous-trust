@@ -25,5 +25,6 @@ RUN --mount=source=dist,target=/app/dist \
 COPY --chown=user:user build_tools/cfg/environment.yaml /app/environment.yaml
 RUN --mount=type=cache,target=/opt/conda/pkgs conda env update -n autonomous_trust --file /app/environment.yaml
 
+ENV AUTONOMOUS_TRUST_ROOT="/app"
 ENV AUTONOMOUS_TRUST_EXE=""
 CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 $AUTONOMOUS_TRUST_EXE"]
