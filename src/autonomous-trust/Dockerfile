@@ -35,6 +35,6 @@ RUN pip install pydevd-pycharm
 RUN --mount=source=dist,target=/app/dist \
     conda install -y -c file:///app/dist autonomous_trust && conda clean -afy
 
-#ENV AUTONOMOUS_TRUST_ROOT=/app
+ENV AUTONOMOUS_TRUST_ROOT="/"
 ENV AUTONOMOUS_TRUST_ARGS="--live"
 CMD ["/bin/bash", "-c", "conda run --live-stream -n autonomous_trust python3 -m autonomous_trust $AUTONOMOUS_TRUST_ARGS || /bin/bash"]

@@ -1,0 +1,6 @@
+!Cfg:autonomous_trust.simulator.dash_components.map_display.MapUI
+max_resolution: 300
+sim_host: simulator
+sim_port: 8778
+size: 600
+style: dark

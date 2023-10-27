@@ -16,11 +16,14 @@ dependencies:
   - numpy
   - py-opencv
   - imutils
+  - msgpack-numpy
   - geopy
   - utm
   - dash==2.6.2
   - dash-bootstrap-components
-  - flask
+  - plotly
+  - werkzeug=2.3.7
+  - flask=2.2.2
   - absl-py
   - python-flatbuffers
   - python-sounddevice
