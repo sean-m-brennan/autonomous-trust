@@ -1,7 +1,9 @@
 import logging
 import os
+from logging.handlers import TimedRotatingFileHandler
 
 from dash.exceptions import PreventUpdate
+import dash, flask  # FIXME
 from flask import Flask
 from dash import Dash, html, Output, Input, dcc
 import dash_bootstrap_components as dbc
@@ -46,18 +48,26 @@ class MapDisplay(object):
         cfg_file = os.path.join(Configuration.get_cfg_dir(), self.name + Configuration.yaml_file_ext)
         self.cfg = Configuration.from_file(cfg_file)
 
-    def run(self, host: str = '127.0.0.1', port: int = 8050, debug: bool = None):
+    def run(self, host: str = '0.0.0.0', port: int = 8050, debug: bool = False):
+        logger = logging.getLogger('Dash')
+        logfile = os.path.join(Configuration.get_data_dir(), 'dash_flask.log')
+        handler = TimedRotatingFileHandler(logfile, when="midnight", interval=1, backupCount=5)
+        logger.addHandler(handler)
+        print('Dash v%s with Flask v%s' % (dash.__version__, flask.__version__))  # FIXME
+        logger.warning('Dash v%s with Flask v%s' % (dash.__version__, flask.__version__))
         server = Flask(__name__)
         app = Dash(__name__, server=server, external_stylesheets=[dbc.themes.SPACELAB],
                    title='Autonomous Trust Mission', update_title=None,
                    use_pages=True, pages_folder='',
                    prevent_initial_callbacks=True, suppress_callback_exceptions=True)
+        app.server.logger.addHandler(handler)
 
         sim = SimulationInterface(self.cfg.sim_host, self.cfg.sim_port, [self.cohort],
                                   log_level=self.cohort.log_level, logfile=self.cohort.logfile)
         heading = TimerTitle(app, server, self.cohort, with_interval=False)
         dyna_map = DynamicMap(app, server, self.cohort, self.cfg.size, self.cfg.style)
-        ctrls = SimulationControls(app, server, sim, self.cohort, dyna_map, self.cfg.max_resolution, with_interval=False)
+        ctrls = SimulationControls(app, server, sim, self.cohort, dyna_map, self.cfg.max_resolution,
+                                   with_interval=False)
         sim.register_reset_handler(dyna_map.acquire_initial_conditions)
         status = {}
         status_by_idx = {}
@@ -113,5 +123,4 @@ class MapDisplay(object):
 
         # end __init__
 
-        # def run(self, host: str = '127.0.0.1', port: int = 8050, debug: bool = None):
         app.run(host, port, debug=debug)

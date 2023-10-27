@@ -34,5 +34,6 @@ requirements:
     - numpy>=1.25.2
     - py-opencv>=4.8.0
     - imutils>=0.5.4
+    - flask>=2.2.2
     - dash==2.6.2
     - dash-bootstrap-components>=1.5.0

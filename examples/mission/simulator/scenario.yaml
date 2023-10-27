@@ -4,7 +4,7 @@ peers:
   antenna: !Enumcfg:autonomous_trust.simulator.radio.iface.Antenna PARABOLIC
   data_streams: []
   iface: !Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface LARGE
-  initial_position: &id003 !Cfg:autonomous_trust.inspector.peer.position.UTMPosition
+  initial_position: &id003 !Cfg:autonomous_trust.services.peer.position.UTMPosition
     alt: 5000.0
     easting: 532963.566963942
     northing: 3842637.237710807
@@ -31,7 +31,7 @@ peers:
   antenna: &id006 !Enumcfg:autonomous_trust.simulator.radio.iface.Antenna DIPOLE
   data_streams: []
   iface: &id007 !Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface SMALL
-  initial_position: !Cfg:autonomous_trust.inspector.peer.position.UTMPosition
+  initial_position: !Cfg:autonomous_trust.services.peer.position.UTMPosition
     alt: 183.0
     easting: 538855.2010666144
     northing: 3836492.3010855583
@@ -46,22 +46,22 @@ peers:
     end: *id002
     shape: &id008 !Cfg:autonomous_trust.simulator.peer.path.BezierData
       ctl_pts:
-      - !Cfg:autonomous_trust.inspector.peer.position.UTMPosition
+      - !Cfg:autonomous_trust.services.peer.position.UTMPosition
         alt: 190.0
         easting: 538854.2010666144
         northing: 3842637.237710807
         zone: 16N
-      - !Cfg:autonomous_trust.inspector.peer.position.UTMPosition
+      - !Cfg:autonomous_trust.services.peer.position.UTMPosition
         alt: 190.0
         easting: 532963.566963942
         northing: 3836491.3010855583
         zone: 16N
-      end: !Cfg:autonomous_trust.inspector.peer.position.UTMPosition
+      end: !Cfg:autonomous_trust.services.peer.position.UTMPosition
         alt: 198.0
         easting: 532963.566963942
         northing: 3842637.237710807
         zone: 16N
-      start: !Cfg:autonomous_trust.inspector.peer.position.UTMPosition
+      start: !Cfg:autonomous_trust.services.peer.position.UTMPosition
         alt: 182.0
         easting: 538854.2010666144
         northing: 3836491.3010855583
@@ -74,7 +74,7 @@ peers:
   antenna: *id006
   data_streams: []
   iface: *id007
-  initial_position: !Cfg:autonomous_trust.inspector.peer.position.UTMPosition
+  initial_position: !Cfg:autonomous_trust.services.peer.position.UTMPosition
     alt: 184.0
     easting: 538856.2010666144
     northing: 3836493.3010855583
@@ -96,7 +96,7 @@ peers:
   antenna: *id006
   data_streams: []
   iface: *id007
-  initial_position: !Cfg:autonomous_trust.inspector.peer.position.UTMPosition
+  initial_position: !Cfg:autonomous_trust.services.peer.position.UTMPosition
     alt: 185.0
     easting: 538857.2010666144
     northing: 3836494.3010855583
@@ -118,7 +118,7 @@ peers:
   antenna: *id006
   data_streams: []
   iface: *id007
-  initial_position: !Cfg:autonomous_trust.inspector.peer.position.UTMPosition
+  initial_position: !Cfg:autonomous_trust.services.peer.position.UTMPosition
     alt: 186.0
     easting: 538858.2010666144
     northing: 3836495.3010855583

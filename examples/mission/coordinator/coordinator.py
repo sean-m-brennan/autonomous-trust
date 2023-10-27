@@ -1,4 +1,5 @@
 import os
+import sys
 import threading
 
 from autonomous_trust.core import AutonomousTrust, LogLevel, CfgIds, to_yaml_string
@@ -14,10 +15,12 @@ from autonomous_trust.services.video.client import VideoRecv
 from autonomous_trust.simulator.dash_components.map_display import MapDisplay, MapUI
 from autonomous_trust.simulator.video.client import VideoSimRcvr
 
+import dash, flask
 
 class MissionCoordinator(AutonomousTrust):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._logger.warn('Dash v%s with Flask v%s' % (dash.__version__, flask.__version__))  # FIXME
         self.cohort = Cohort()
         self.add_worker(CohortTracker, self.system_dependencies, cohort=self.cohort)
         self.add_worker(VideoSimRcvr, self.system_dependencies, cohort=self.cohort)  # TODO noise?
@@ -55,7 +58,11 @@ if __name__ == '__main__':
     os.environ[Configuration.VARIABLE_NAME] = os.path.dirname(__file__)
     cfg_dir = Configuration.get_cfg_dir()
     os.makedirs(cfg_dir, exist_ok=True)
-    generate_identity(cfg_dir, preserve=True, defaults=True)  # does nothing if files present
-    for cfg_name, klass in ((VideoSimRcvr.name, VideoRecv), (MapDisplay.name, MapUI)):
-        generate_worker_config(cfg_dir, cfg_name, klass, True)
-    MissionCoordinator(log_level=LogLevel.DEBUG, logfile=Configuration.log_stdout).run_forever()
+    dat_dir = Configuration.get_data_dir()
+    os.makedirs(os.path.dirname(dat_dir), exist_ok=True)
+
+    generate_identity(cfg_dir, preserve=True, defaults=True)  # does nothing if files present (always regen network)
+    if '--setup' in sys.argv:
+        for cfg_name, klass in ((VideoSimRcvr.name, VideoRecv), (MapDisplay.name, MapUI)):
+            generate_worker_config(cfg_dir, cfg_name, klass, True)
+    MissionCoordinator(log_level=LogLevel.DEBUG, logfile=os.path.join(dat_dir, 'coordinator.log')).run_forever()

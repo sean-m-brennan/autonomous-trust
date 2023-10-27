@@ -35,5 +35,6 @@ requirements:
     - quart>=0.18.3
     - dash==2.6.2
     - flask>=2.2.2
+    - plotly>=5.9.0
     - dash-bootstrap-components>=1.5.0
 #    - dash-iconify>=0.1.2  # pip only

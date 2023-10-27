@@ -2,6 +2,8 @@ import os
 import sys
 import platform
 
+REGISTRY_DISK = '/media/user/Backup/docker'
+
 ARCH = platform.machine()
 OS = sys.platform
 
@@ -20,7 +22,12 @@ image_name = "autonomous-trust"
 
 kraft_update_freq_days = 7
 
-network_name = "at-net"
+registry_host = 'autonomous-trust.tekfive.com'
+registry_port = 5000
+swarm_namespace = 'autonomous-trust'
+
+network_name = swarm_namespace + "-net"
+network_cfg_name = "at-net"
 network_type = "macvlan"
 macvlan_bridge = 'macvlan-bridge'
 ipv4_subnet = '172.27.3.0/24'
@@ -56,9 +63,9 @@ sources = {'autonomous_trust':
                 (os.path.join(base_dir, 'src', 'autonomous-trust'), os.path.join(namespace, '__main__.py'))]}
 wheels = ['autonomous-trust']
 
+qemu_system = None
 if OS == 'Linux':
     for path in ['/usr/bin/qemu-system-' + ARCH, '/usr/libexec/qemu-kvm']:
         if os.path.exists(path):
             qemu_system = path
             break
-qemu_system = None
