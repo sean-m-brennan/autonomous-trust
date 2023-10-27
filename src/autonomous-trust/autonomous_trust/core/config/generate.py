@@ -28,17 +28,16 @@ names = [
 
 
 def _get_default_device():
-    ip = subprocess.Popen(['/sbin/ip', 'route'], stdout=subprocess.PIPE)
-    grep = subprocess.Popen(['grep', 'default'], stdin=ip.stdout, stdout=subprocess.PIPE)
-    awk = subprocess.Popen(['awk', "{print $5}"], stdin=grep.stdout, stdout=subprocess.PIPE)
-    out = ''
-    for line in awk.stdout:
-        out += line.decode()
-    return out.strip()
+    route = subprocess.check_output(['/sbin/ip', 'route']).decode().split('\n')[0]
+    if 'default' in route:
+        return route.split()[4]
+    return route.split()[2]
 
 
 def _get_addresses():
     device = _get_default_device()
+    if device == '':
+        device = 'eth0'
     ip4_address = None
     ip6_address = None
     result = subprocess.run(['/sbin/ip', '-o', 'a', 'show', device], shell=False,
@@ -68,7 +67,7 @@ def _subsystems(net_impl):
     return pt
 
 
-def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve=False, defaults=False):
+def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve=False, defaults=False, peers=False):
     if seed is not None:
         try:
             seed = int(seed)

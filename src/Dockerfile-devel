@@ -9,6 +9,9 @@
 
 FROM autonomous-trust-devel
 
+USER root
+RUN apt-get update && apt-get install -y libgl1-mesa-glx
+
 WORKDIR /app
 USER user
 
@@ -21,5 +24,6 @@ COPY --chown=user:user src/autonomous-trust-simulator/autonomous_trust/simulator
 COPY --chown=user:user build_tools/cfg/environment.yaml /build/build_tools/cfg/environment.yaml
 RUN --mount=type=cache,target=/opt/conda/pkgs /build/bin/trust-tools devel update
 
+ENV AUTONOMOUS_TRUST_ROOT="/app"
 ENV AUTONOMOUS_TRUST_EXE=""
 CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 $AUTONOMOUS_TRUST_EXE"]

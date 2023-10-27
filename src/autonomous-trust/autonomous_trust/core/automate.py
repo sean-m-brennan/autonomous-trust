@@ -109,8 +109,8 @@ class AutonomousTrust(Protocol):
 
     # default to production values
     def __init__(self, multiproc: bool = True, log_level: int = LogLevel.WARNING,
-                 logfile: str = None, log_classes: list[str] = None, context: str = Ctx.DEFAULT,
-                 testing: bool = False):
+                 logfile: str = None, log_classes: list[str] = None, syslog: bool = False,
+                 context: str = Ctx.DEFAULT, testing: bool = False):
         global __QUEUE_POOL
         self._stopped_procs: list[str] = []
         if multiproc:
@@ -143,8 +143,9 @@ class AutonomousTrust(Protocol):
         handler.setLevel(log_level)
         self._logger = logging.getLogger(self.name)
         self._logger.addHandler(handler)
-        syslog_handler = SysLogHandler(address='/dev/log')
-        self._logger.addHandler(syslog_handler)
+        if syslog:
+            syslog_handler = SysLogHandler(address='/dev/log')
+            self._logger.addHandler(syslog_handler)
         super().__init__(CfgIds.main, self._logger, None, None)
         self.identity = None  # of type Identity
 

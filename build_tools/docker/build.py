@@ -11,6 +11,9 @@ from typing import Optional
 from ..config import supported_platforms, base_dir, packages, images, wheels
 from ..util import GREEN, RESET
 
+REGISTRY_HOST = 'autonomous-trust.tekfive.com'
+REGISTRY_PORT = 5000
+
 
 def get_image_list():
     import docker as docker_iface
@@ -152,7 +155,7 @@ class Container(object):
 def build_containers(pkg_name: Optional[str] = None, which: Container = Container.all,
                      debug: bool = False, force: bool = False):
     src_dir = os.path.join(base_dir, 'src')
-    # FIXME ensure registry is running, otherwise start it
+    # FIXME ensure registry is running, otherwise start it (`docker compose src/docker-registry.yaml up -d`)
 
     package_list = [pkg_name]
     if pkg_name is None:
@@ -191,10 +194,11 @@ def build_containers(pkg_name: Optional[str] = None, which: Container = Containe
             p = subprocess.run(cmd + options)
             if p.returncode != 0:
                 raise RuntimeError('Build of %s failed' % target)
-            p = subprocess.run(['docker', 'tag', target, 'localhost:5000/' + target])
+            registry = '%s:%d/' % (REGISTRY_HOST, REGISTRY_PORT)
+            p = subprocess.run(['docker', 'tag', target, registry + target])
             if p.returncode != 0:
                 raise RuntimeError('Tag of %s failed' % target)
-            p = subprocess.run(['docker', 'push', 'localhost:5000/' + target])
+            p = subprocess.run(['docker', 'push', registry + target])
             if p.returncode != 0:
                 raise RuntimeError('Push of %s failed' % target)
     return True
