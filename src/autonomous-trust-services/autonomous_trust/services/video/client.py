@@ -18,7 +18,7 @@ class VideoRecv(InitializableConfig):
 
     @classmethod
     def initialize(cls, size: int = 640, raw: bool = False, fast_encoding: bool = False):
-        return VideoRecv(size, raw, fast_encoding)
+        return cls(size, raw, fast_encoding)
 
 
 class VideoRcvr(Process, metaclass=ProcMeta,
@@ -31,7 +31,7 @@ class VideoRcvr(Process, metaclass=ProcMeta,
         self.cfg = configurations[self.name]
         self.servicers = []
         self.hdr_size = struct.calcsize(self.header_fmt)
-        self.protocol = VideoProtocol(self.name, self.logger, configurations[CfgIds.peers])
+        self.protocol = VideoProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(VideoProtocol.video, self.handle_video)
 
     def handle_video(self, _, message):

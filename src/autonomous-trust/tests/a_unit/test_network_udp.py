@@ -1,8 +1,9 @@
 import pytest
 
 from autonomous_trust.core.network.tcp import UDPNetworkProcess
-from autonomous_trust.core.config import Configuration, CfgIds
+from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.automate import AutonomousTrust
+from autonomous_trust.core.system import CfgIds
 
 
 @pytest.mark.skip

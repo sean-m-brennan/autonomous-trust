@@ -84,7 +84,7 @@ class MetadataSource(Process, metaclass=ProcMeta,
     def __init__(self, configurations, subsystems, log_queue, dependencies, **kwargs):
         super().__init__(configurations, subsystems, log_queue, dependencies=dependencies)
         self.cfg = configurations[self.name]
-        self.protocol = MetadataProtocol(self.name, self.logger, configurations[CfgIds.peers])
+        self.protocol = MetadataProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(MetadataProtocol.request, self.handle_requests)
         self.clients: dict[str, tuple[bool, str, Identity]] = {}
 

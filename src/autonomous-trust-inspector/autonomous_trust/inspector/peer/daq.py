@@ -148,7 +148,7 @@ class CohortTracker(Process, metaclass=ProcMeta,
     def __init__(self, configurations, subsystems, log_queue, dependencies, **kwargs):
         super().__init__(configurations, subsystems, log_queue, dependencies=dependencies)
         self.cohort: Cohort = kwargs.get('cohort')
-        self.protocol = CohortProtocol(self.name, self.logger, configurations[CfgIds.peers])
+        self.protocol = CohortProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(CohortProtocol.meta, self.handle_metadata)
         self.protocol.register_handler(CohortProtocol.stats, self.handle_stats)
         self.servicers = []

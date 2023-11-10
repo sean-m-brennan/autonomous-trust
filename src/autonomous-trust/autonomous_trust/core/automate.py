@@ -26,11 +26,11 @@ try:
     from . import __version__ as version
 except ImportError:
     version = '?.?.?'
-from .config import Configuration, CfgIds, to_yaml_string
+from .config import Configuration, to_yaml_string
 from .processes import Process, LogLevel, ProcessTracker
-from .identity import Peers, Group
-from .capabilities import Capabilities, Capability
-from .system import PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
+from .identity import Peers
+from .capabilities import Capabilities, Capability, PeerCapabilities
+from .system import CfgIds, PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
 from .protocol import Protocol
 from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, NegotiationProtocol
 from .network import Message
@@ -127,7 +127,7 @@ class AutonomousTrust(Protocol):
         if syslog:
             syslog_handler = SysLogHandler(address='/dev/log')
             self._logger.addHandler(syslog_handler)
-        super().__init__(CfgIds.main, self._logger, None, None)
+        super().__init__(CfgIds.main, self._logger, None)
         self.identity = None  # of type Identity (can't import)
 
         self.process_names: list[str] = []
@@ -143,6 +143,7 @@ class AutonomousTrust(Protocol):
         self.tasking_start: datetime = now()
         self.latest_reputation: dict[str, Any] = {}
         self.unhandled_messages: list[Message] = []
+        self.peer_count = 0
 
     @property
     def queue_type(self):
@@ -309,11 +310,12 @@ class AutonomousTrust(Protocol):
     def _get_cfg_type(path: str):
         if path.endswith(Configuration.yaml_file_ext):
             return os.path.basename(path).removesuffix(Configuration.yaml_file_ext)
+        return path
 
     def _configure(self, start: bool = True):
         # Pull initial state from configuration files
-        required = [CfgIds.network, CfgIds.identity, CfgIds.peers, CfgIds.group]
-        defaultable = {CfgIds.peers: Peers, CfgIds.group: Group, }
+        required = [CfgIds.network, CfgIds.identity, CfgIds.peers, CfgIds.capabilities]
+        defaultable = {CfgIds.peers: Peers, CfgIds.capabilities: PeerCapabilities, }
 
         configs: ConfigMap = {}
         cfg_dir = Configuration.get_cfg_dir()
@@ -327,7 +329,7 @@ class AutonomousTrust(Protocol):
                 if cfg_name in defaultable:
                     defaultable[cfg_name]().to_file(os.path.join(cfg_dir, cfg_name + Configuration.yaml_file_ext))
                 else:
-                    self.logger.error(self.name + ':  Required %s configuration missing' % cfg_name)
+                    self.logger.error('%s:  Required %s configuration missing' % (self.name, cfg_name))
                     return None
 
         # load configs
@@ -346,8 +348,7 @@ class AutonomousTrust(Protocol):
         self.identity.address = net_cfg.ip4
         if preferred_proto_ver == 6:
             self.identity.address = net_cfg.ip6
-        peers, peer_caps = configs[CfgIds.peers]
-        self.peers = peers
+        self.peers = configs[CfgIds.peers]
 
         if start:
             # init configured process classes
@@ -489,7 +490,7 @@ class AutonomousTrust(Protocol):
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                 except KeyboardInterrupt:
                     pass
-                except Exception as e:
+                except Exception:
                     self.logger.error('Task Exception - ' + traceback.format_exc())
                     # FIXME send error result to negotiation
                 del results[key]

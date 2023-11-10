@@ -31,7 +31,7 @@ class DataSource(Process, metaclass=ProcMeta,
         self.active = self.name in configurations
         if self.active:
             self.cfg = configurations[self.name]
-        self.protocol = DataProtocol(self.name, self.logger, configurations[CfgIds.peers])
+        self.protocol = DataProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(DataProtocol.request, self.handle_requests)
         self.clients: dict[str, tuple[str, Identity]] = {}
 

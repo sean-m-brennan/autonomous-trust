@@ -87,7 +87,7 @@ async def async_ping(host: str, seq_num: int = None, count: int = 1, timeout: fl
     times = {}
     start = now()
     end = now()
-    for seq_num in range(1, count+1):
+    for s_num in range(1, count+1):
         init = now()
         protocol.sendto(data)
         try:
@@ -96,7 +96,7 @@ async def async_ping(host: str, seq_num: int = None, count: int = 1, timeout: fl
             packet = None
         end = now()
         if packet is None:
-            times[seq_num] = None
+            times[s_num] = None
             continue
         data = packet[0]
         protocol.raise_error()
