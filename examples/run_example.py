@@ -137,7 +137,13 @@ def run_example(wrk_dir: str, cluster: ClusterConfig, visualize: bool,
 
 
 if __name__ == '__main__':
-    working_dir = os.path.abspath((os.path.dirname(__file__)))
+    cwd = os.getcwd()
+    lib_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'lib'))
+    os.chdir(lib_dir)
+    os.system('./update.sh')  # FIXME remove
+    os.chdir(cwd)
+
+    working_dir = os.path.abspath(os.path.dirname(__file__))
     examples = [f.name for f in os.scandir(working_dir) if f.is_dir()]
 
     parser = argparse.ArgumentParser()
@@ -146,8 +152,8 @@ if __name__ == '__main__':
     parser.add_argument('--stop', action='store_true', help='stop a running example')
     parser.add_argument('-f', '--compose-file', type=str, help='docker-compose file to run')
     parser.add_argument('--without-swarm', action='store_true', help='start without swarm for debugging')
-    parser.add_argument('--with-host', action='store_true', help='enable direct comms with host')
-    parser.add_argument('--keep-logs', action='store_true', help='do not delete logfiles')
+    parser.add_argument('--clean', action='store_true', help='delete logs')
+    parser.add_argument('--pristine', action='store_true', help='delete network memory')
     args = parser.parse_args()
 
     if args.example not in examples:
@@ -170,9 +176,11 @@ if __name__ == '__main__':
                 cluster_cfg.shutdown()
         except subprocess.CalledProcessError:
             pass
-        delete_files = ['network.cfg.yaml', 'group.cfg.yaml']
-        if not args.keep_logs:
-            delete_files += ['coordinator.log', '"participant*.log"']
+        delete_files = ['network.cfg.yaml']
+        if args.clean or args.pristine:
+            delete_files += ['"coordinator.log*"', '"participant???.log*"', 'simulator.log']
+        if args.pristine:
+            delete_files += ['group.cfg.yaml', 'peers.cfg.yaml', 'reputation.cfg.yaml']
         for cfg_name in delete_files:
             cfg_files = subprocess.getoutput('find %s -name %s' % (working_dir, cfg_name)).strip().split('\n')
             for cfg in cfg_files:

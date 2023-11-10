@@ -2,8 +2,8 @@
 _block_impl: authority
 _encryptor: !Cfg:autonomous_trust.core.identity.encrypt.Encryptor
   hex_seed: !!binary |
-    YjQxMjQ0ZDBlMmNiZTE0MGViZTUxMWU0NDlhMDA2ZDJkZmQ3ZWZmZTIzZDM0OTY4M2YzNWVlMTRk
-    NmQyNTZjMw==
+    MTAyNDRkYTkwYzUzNDZiOTVkZDQyYmYzZmM5ZDhhN2U2ZTJlYmJlYzczZmUxNGQwMjZlYTg2OWMz
+    N2FkOWJhOQ==
   public_only: false
 _fullname: rq86.007@tekfive.com
 _nickname: RQ-86-007
@@ -11,9 +11,9 @@ _public_only: false
 _rank: 0
 _signature: !Cfg:autonomous_trust.core.identity.sign.Signature
   hex_seed: !!binary |
-    OWM2YWQ4OTAxZDMxNzUyODI3ZDNlOTlhNjhlM2U4Y2ZkZjY2ZjE5M2MyNjg1YjgyNGEyOTg0ZGJj
-    NDg3ZDEyYw==
+    MTAyMGVjMDExMWVjMDY0YTMxZmM1MTVmOTZiYTVlYWUwY2FlOTgxOWU3Y2U3YTcyNTdjNzVjYmRi
+    YjQxYTNkOQ==
   public_only: false
-_uuid: 0a4dee86-76a5-4db2-bafb-f707832b8625
-address: 172.27.3.2
+_uuid: 1cb38d6b-7443-48a1-8f87-6f77d9cfea24
+address: 172.27.3.107
 petname: Reco

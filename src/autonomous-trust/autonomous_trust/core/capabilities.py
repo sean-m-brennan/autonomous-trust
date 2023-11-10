@@ -48,10 +48,12 @@ class Capabilities(Mapping):
         self._listing[name] = Capability(name, function, arg_names, keywords)
 
 
-class PeerCapabilities(Mapping):
+class PeerCapabilities(Mapping, Configuration):
     """Mapping of capability names to peer ids"""
-    def __init__(self):
-        self._listing = {}
+    def __init__(self, _listing=None):
+        self._listing = _listing
+        if _listing is None:
+            self._listing = {}
 
     def __len__(self):
         return len(self._listing)

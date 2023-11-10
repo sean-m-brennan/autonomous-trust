@@ -3,17 +3,19 @@ import queue
 import sys
 import logging
 import time
+import traceback
 from importlib import import_module
 from io import StringIO
 from collections.abc import Mapping
 from collections import OrderedDict
 
 from enum import IntEnum
+from typing import Any
 
 from ruamel.yaml import YAML
 
 from .config import Configuration
-from .system import cadence, queue_cadence, now
+from .system import cadence, queue_cadence, now, QueueType
 
 yaml = YAML(typ='safe')
 
@@ -121,8 +123,8 @@ class Process(metaclass=ProcMeta):
     q_cadence = queue_cadence
     exit_timeout = 5
 
-    def __init__(self, configurations, subsystems, log_queue, dependencies=None,
-                 log_level=LogLevel.INFO, suppress_log=False):
+    def __init__(self, configurations: dict[str, Any], subsystems: ProcessTracker, log_queue: QueueType,
+                 dependencies: list[str] = None, log_level=LogLevel.INFO, suppress_log=False):
         self.configs = configurations
         self.subsystems = subsystems
         self.log_queue = log_queue
@@ -146,6 +148,13 @@ class Process(metaclass=ProcMeta):
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+
+    def report_exception(self, exception, function=None):
+        if function is None:
+            function = ':'
+        else:
+            function = ' in ' + function + ':'
+        self.logger.error('%s%s %s\n%s' % (exception.__class__.__name__, function, exception, traceback.format_exc()))
 
     def keep_running(self, signal):
         running = True
@@ -179,6 +188,10 @@ class ProcessLogger(object):
         self.log_queue = log_q
         self.logger = logging.getLogger(name)
         self.suppress = suppress
+
+    def flush(self):
+        if self.logger.handlers:
+            self.logger.handlers[0].flush()
 
     def log(self, level, msg):
         if self.suppress:

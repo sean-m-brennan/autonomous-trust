@@ -72,6 +72,7 @@ class VideoSource(Process, metaclass=ProcMeta,
                         self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
 
     def process(self, queues, signal):
+        self.logger.debug('Video capture')
         for path in sorted(glob.glob(self.video_path_pattern)):
             vid = None
             while self.keep_running(signal):

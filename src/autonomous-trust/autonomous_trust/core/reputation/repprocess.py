@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+import traceback
 from queue import Empty, Full
 from uuid import UUID
 from dataclasses import dataclass
@@ -348,24 +349,28 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def process(self, queues, signal):
         while self.keep_running(signal):
             try:
-                message = queues[self.name].get(block=True, timeout=self.q_cadence)
-            except Empty:
-                message = None
-            if message:
-                if not self.protocol.run_message_handlers(queues, message):
-                    if not self.forward_transaction(queues, message):
-                        if isinstance(message, Message):
-                            self.logger.error('Unhandled message %s' % message.function)
-                        else:
-                            self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
-            self.forward_reputation(queues)
+                try:
+                    message = queues[self.name].get(block=True, timeout=self.q_cadence)
+                except Empty:
+                    message = None
+                if message:
+                    if not self.protocol.run_message_handlers(queues, message):
+                        if not self.forward_transaction(queues, message):
+                            if isinstance(message, Message):
+                                self.logger.error('Unhandled message %s' % message.function)
+                            else:
+                                self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                self.forward_reputation(queues)
 
-            present = now().timestamp()
-            for req in list(self.requests):
-                if present - int(req) > self.expiration:
-                    self.requests.remove(req)
-            for prop in dict(self.proposals):
-                if present - int(prop) > self.expiration:
-                    del self.proposals[prop]
+                present = now().timestamp()
+                for req in list(self.requests):
+                    if present - int(req) > self.expiration:
+                        self.requests.remove(req)
+                for prop in dict(self.proposals):
+                    if present - int(prop) > self.expiration:
+                        del self.proposals[prop]
 
-            self.sleep_until(self.cadence)
+                self.sleep_until(self.cadence)
+            except Exception as err:
+                self.logger.error(err)
+                self.logger.error(traceback.format_exc())

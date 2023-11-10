@@ -6,6 +6,7 @@ import sys
 import time
 from datetime import timedelta
 
+from autonomous_trust.core import Configuration
 from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 from .peer.peer import PeerMovement
 from .sim_data import SimConfig, SimState, Map, Matrix
@@ -21,12 +22,17 @@ class Simulator(net.SelectServer):
     cadence = 1
 
     def __init__(self, cfg_file_path: str, max_time_steps: int = None, geo: bool = False,
-                 log_level: int = logging.INFO, logfile: str = None):
+                 log_level: int = logging.INFO, logfile: str = None, **kwargs):
         if max_time_steps is None:
             max_time_steps = default_steps
         if logfile is None:
             handler = logging.StreamHandler(sys.stdout)
         else:
+            if not os.path.isabs(logfile):
+                cfg_dir = Configuration.get_cfg_dir()
+                if not os.path.exists(cfg_dir):
+                    os.makedirs(cfg_dir, exist_ok=True)
+                logfile = os.path.join(cfg_dir, logfile)
             handler = logging.FileHandler(logfile)
         handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
                                                '%Y-%m-%d %H:%M:%S'))
@@ -34,7 +40,7 @@ class Simulator(net.SelectServer):
         self.logger = logging.getLogger(__name__)
         self.logger.addHandler(handler)
         self.logger.setLevel(log_level)
-        super().__init__(self.logger)
+        super().__init__(self.logger, **kwargs)
 
         self.max_time_steps = max_time_steps
         self.return_geo = geo

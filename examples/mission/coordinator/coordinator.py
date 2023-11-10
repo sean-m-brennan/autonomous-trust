@@ -15,13 +15,11 @@ from autonomous_trust.services.video.client import VideoRecv
 from autonomous_trust.simulator.dash_components.map_display import MapDisplay, MapUI
 from autonomous_trust.simulator.video.client import VideoSimRcvr
 
-import dash, flask
 
 class MissionCoordinator(AutonomousTrust):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._logger.warn('Dash v%s with Flask v%s' % (dash.__version__, flask.__version__))  # FIXME
-        self.cohort = Cohort()
+        self.cohort = Cohort(self.queue_pool)
         self.add_worker(CohortTracker, self.system_dependencies, cohort=self.cohort)
         self.add_worker(VideoSimRcvr, self.system_dependencies, cohort=self.cohort)  # TODO noise?
         self.add_worker(DataRcvr, self.system_dependencies, cohort=self.cohort)
@@ -31,7 +29,7 @@ class MissionCoordinator(AutonomousTrust):
 
     def init_tasking(self, queues):
         self.viz = MapDisplay(self.cohort)
-        self.vthread = threading.Thread(target=self.viz.run)
+        self.vthread = threading.Thread(target=self.viz.run, kwargs={'logger': self.logger})
         self.vthread.start()
 
     def autonomous_tasking(self, queues):

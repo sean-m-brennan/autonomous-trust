@@ -14,6 +14,6 @@ _signature: !Cfg:autonomous_trust.core.identity.sign.Signature
     ZjhhZTI3NDc3MGQxYjY0ZDZlOTVjYTVjZTI4NGUyODE2Y2Y1ZTVjZTM5ZWY2Mjk4ZGMyMzliMzJj
     NGYzOTk5YQ==
   public_only: false
-_uuid: 5a1f27bc-11cd-4376-b81d-b988d69d9a14
-address: 172.27.3.2
+_uuid: ec428f33-6190-4f60-8616-549ecc0b53bb
+address: 172.27.3.112
 petname: old-blood-n-guts

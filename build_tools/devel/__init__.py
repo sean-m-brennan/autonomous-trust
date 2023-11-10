@@ -1,7 +1,6 @@
 import os
 import subprocess
 from ..config import conda_environ_name
-from ..cfg.validate import validate_packages
 
 
 def conda_present():
