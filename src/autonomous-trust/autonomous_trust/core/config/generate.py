@@ -6,12 +6,12 @@ import re
 import socket
 import subprocess
 
-from .configuration import Configuration, CfgIds, InitializableConfig
+from .configuration import Configuration, InitializableConfig
 from .names import random_name
 from ..processes import ProcessTracker
 from ..network import Network, NetworkProtocol
 from ..identity import Identity
-from ..system import communications, core_system
+from ..system import CfgIds, communications, core_system
 
 
 _names = [

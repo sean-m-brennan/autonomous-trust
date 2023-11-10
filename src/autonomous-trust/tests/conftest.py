@@ -6,8 +6,8 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from autonomous_trust.core import AutonomousTrust, Process
-from autonomous_trust.core.config import Configuration, CfgIds
+from autonomous_trust.core import AutonomousTrust, Process, CfgIds
+from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.config.generate import generate_identity
 
 from . import PRESERVE_FILES, TEST_DIR

@@ -52,7 +52,7 @@ class NetStatsSource(Process, metaclass=ProcMeta,
                      proc_name='net-stats-source', description='Network statistics service'):
     def __init__(self, configurations, subsystems, log_queue, dependencies):
         super().__init__(configurations, subsystems, log_queue, dependencies=dependencies)
-        self.protocol = NetStatsProtocol(self.name, self.logger, configurations[CfgIds.peers])
+        self.protocol = NetStatsProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(NetStatsProtocol.request, self.handle_requests)
         self.clients: dict[str, tuple[bool, str, Identity]] = {}
         self.network_source = NetworkSource(self.name, self.q_cadence)

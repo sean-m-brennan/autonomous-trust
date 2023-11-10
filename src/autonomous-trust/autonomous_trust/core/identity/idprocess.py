@@ -13,15 +13,15 @@ from .group import Group
 from .history.history import IdentityHistory
 from ..algorithms.agreement import AgreementProof
 from ..algorithms.impl import AgreementImpl
-from ..config import Configuration, CfgIds, to_yaml_string, from_yaml_string, names
+from ..capabilities import PeerCapabilities
+from ..config import Configuration, to_yaml_string, from_yaml_string, names
 from ..processes import Process, ProcMeta
 from ..network import Message, Network
 from .history import IdentityByWork, IdentityByStake, IdentityByAuthority
 from .history import IdentityObj
 from .protocol import IdentityProtocol
-from ..protocol import PeerHistory
 from ..structures.dag import LinkedStep
-from ..system import encoding, PackageHash, now
+from ..system import CfgIds, encoding, PackageHash, now
 
 
 VoteData = tuple[IdentityObj, AgreementProof, tuple[bytes, bytes]]
@@ -44,7 +44,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     def __init__(self, configurations, subsystems, log_q, **kwargs):
         super().__init__(configurations, subsystems, log_q, dependencies=[CfgIds.network], **kwargs)
         self.identity = configurations[self.cfg_name]
-        self.protocol = IdentityProtocol(self.name, self.logger, configurations[CfgIds.peers])
+        self.protocol = IdentityProtocol(self.name, self.logger, configurations)
         self.peers = self.protocol.peers
         self.group = self.protocol.group
         self.peer_capabilities = self.protocol.peer_capabilities
@@ -79,16 +79,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     def capabilities(self):
         return self.protocol.capabilities
 
-    def _remember_activity(self, queues, name: str, obj: Union[PeerHistory, GroupHistory]):
+    def _remember_activity(self, queues, name: str, obj: Union[Peers, PeerCapabilities, GroupHistory]):
         filename = os.path.join(Configuration.get_cfg_dir(), name + Configuration.yaml_file_ext)
         try:
             with self.lock:  # multiple *threads* may try to save data
-                self.configs[name] = obj[0]
-                with open(filename, 'w') as cfg:
-                    if isinstance(obj[0], Group):
-                        cfg.write(to_yaml_string((obj[0], obj[1].to_dict())))
-                    else:
-                        cfg.write(to_yaml_string((obj[0], obj[1])))
+                if isinstance(obj, Configuration):
+                    self.configs[name] = obj
+                    obj.to_file(filename)
+                else:
+                    self.configs[name] = obj[0]
+                    with open(filename, 'w') as cfg:
+                        if isinstance(obj[0], Group):
+                            cfg.write(to_yaml_string((obj[0], obj[1].to_dict())))
+                        else:
+                            cfg.write(to_yaml_string((obj[0], obj[1])))
 
                 self.update(obj[0], queues)
                 if isinstance(obj[0], Peers):
@@ -110,7 +114,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
 
     def _record_peers(self, queues):
         self.logger.debug('Add peers')
-        self._remember_activity(queues, CfgIds.peers, (self.peers, self.peer_capabilities))
+        self._remember_activity(queues, CfgIds.peers, self.peers)
+        self._remember_activity(queues, CfgIds.peers, self.peer_capabilities)
 
     def acquire_capabilities(self, queues):
         start = now()
@@ -430,10 +435,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.accept:
             self.logger.debug('Received peer acceptance')
-            ident, ph, caps = from_yaml_string(message.obj)  # from self._peer_accepted()
-            if ph != self.package_hash:
+            ident, pkh, caps = from_yaml_string(message.obj)  # from self._peer_accepted()
+            if pkh != self.package_hash:
                 self.logger.error("Counterfeit 'peer'")
                 return True
+            self.peer_potentials[ident.uuid] = caps
             self._add_peer(queues, ident)
             return True
         return False

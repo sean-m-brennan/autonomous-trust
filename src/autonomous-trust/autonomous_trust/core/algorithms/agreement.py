@@ -114,11 +114,11 @@ class AgreementProtocol(VoterTracker):
         approvals = []
         if blob.uuid not in self._votes:
             return False
-        for blob, proof, sig in self._votes[blob.uuid]:
+        for id_obj, proof, sig in self._votes[blob.uuid]:
             if proof.uuid not in voters:
                 continue
             voter = voters[proof.uuid]
             #if voter.verify(proof, sig):  # properly signed proof  # FIXME The signature must be exactly 64 bytes long
-            approvals.append(self._count_vote(blob, proof, voter))
+            approvals.append(self._count_vote(id_obj, proof, voter))
         del self._votes[blob.uuid]
         return self._accumulate_votes(approvals)

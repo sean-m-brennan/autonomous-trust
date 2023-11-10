@@ -9,10 +9,21 @@ from typing import Union
 
 from nacl.hash import blake2b
 
-from .config import CfgIds
 from .algorithms.impl import AgreementImpl
+from .util import ClassEnumMeta
 
 pkg = __name__.rsplit('.', 1)[0]
+
+
+class CfgIds(object, metaclass=ClassEnumMeta):
+    main = 'main'
+    network = 'network'
+    identity = 'identity'
+    peers = 'peers'
+    capabilities = 'peer-capabilities'
+    group = 'group'
+    negotiation = 'negotiation'
+    reputation = 'reputation'
 
 
 # Constants for system tweaking

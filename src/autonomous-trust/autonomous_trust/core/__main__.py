@@ -2,9 +2,9 @@
 
 import argparse
 
-from .system import dev_root_dir
+from .system import dev_root_dir, CfgIds
 from .automate import AutonomousTrust
-from .config import Configuration, CfgIds
+from .config import Configuration
 from .config.generate import random_config
 from .processes import LogLevel
 
