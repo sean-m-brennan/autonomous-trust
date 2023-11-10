@@ -152,10 +152,12 @@ class Client(Net):
 
 
 class Server(Net):
-    def __init__(self, logger: logging.Logger = None):
+    def __init__(self, logger: logging.Logger = None, resolve: bool = False, short: bool = False):
         super().__init__(logger)
         self.clients: list[socket.socket] = []
         self.listener: Optional[threading.Thread] = None
+        self.resolve = resolve
+        self.short = short
 
     def listen(self):
         while not self.halt:
@@ -163,6 +165,10 @@ class Server(Net):
                 client_socket, (host, port) = self.sock.accept()
                 self.clients.append(client_socket)
                 if self.logger is not None:
+                    if self.resolve:
+                        host = socket.gethostbyaddr(host)[0]
+                        if self.short:
+                            host = host[:host.find('.')]
                     self.logger.info('New client at %s:%d' % (host, port))
             except socket.timeout:
                 pass
@@ -210,8 +216,8 @@ class Server(Net):
 
 
 class SelectServer(Server):
-    def __init__(self, logger: logging.Logger = None):
-        super().__init__(logger)
+    def __init__(self, logger: logging.Logger = None, **kwargs):
+        super().__init__(logger, **kwargs)
         self.queues = {}
 
     def listen(self):  # override
@@ -226,6 +232,10 @@ class SelectServer(Server):
                     self.clients.append(client_socket)
                     self.queues[client_socket] = Queue()
                     if self.logger is not None:
+                        if self.resolve:
+                            host = socket.gethostbyaddr(host)[0]
+                            if self.short:
+                                host = host[:host.find('.')]
                         self.logger.info('New client at %s:%d' % (host, port))
                 else:
                     data = self.recv_data(sock)

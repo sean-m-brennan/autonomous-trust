@@ -48,7 +48,7 @@ class IdentityObj(SimplestBlob, Configuration):
         return dict(identity=self.identity, originator=self.originator)
 
 
-class IdentityHistory(StepDAG, VoterTracker):
+class IdentityHistory(StepDAG, VoterTracker):  # FIXME config repr
     """
     Tracks community identity history with provable membership
     A StepDAG of MerkleTree root_hash history, the Merkle leaf-blobs are Identities or Groups
@@ -57,7 +57,7 @@ class IdentityHistory(StepDAG, VoterTracker):
     def __init__(self, myself, peers, log_queue, timeout=0, blacklist=None):
         StepDAG.__init__(self)
         VoterTracker.__init__(self, myself)
-        Configuration.__init__(self)
+        #Configuration.__init__(self)
         self._peers = peers
         self.logger = ProcessLogger(self.__class__.__name__, log_queue)
         self._timeout = timeout
@@ -68,22 +68,24 @@ class IdentityHistory(StepDAG, VoterTracker):
         self._merkle.insert(IdentityObj(self.myself, self._merkle.root_digest))
         self.add_step(LinkedStep(self._merkle.root_digest))  # history tracking
 
+    def to_dict(self):
+        return {'step_dag': self.recite(), 'blacklist': self.blacklist} #, 'merkletree': self._merkle}
+
+    def populate(self, dictionary):
+        self.blacklist = dictionary['blacklist']
+        #self._merkle = dictionary['merkle_tree']
+        self.merge(self.ingest_branch(dictionary['step_dag']))
+
     @property
     def timeout(self):
         return self._timeout
 
-    def upgrade_peer(self, who):
+    def insert_peer(self, who, level=None):
         # FIXME confirm eligibility i.e. uuid, fullname, signature all unique
         if who not in self._peers.all:
             self._merkle.insert(IdentityObj(who, self._merkle.root_digest))
             self.add_step(LinkedStep(self._merkle.root_digest))
-        self._peers.promote(who)
-
-    def downgrade_peer(self, who):
-        self._peers.demote(who)
-        if who not in self._peers:
-            self._merkle.delete(who)
-            self.add_step(LinkedStep(self._merkle.root.digest))
+        self._peers.add(who, level)
 
     def _find_identity(self, identity):
         # FIXME minimum info
@@ -153,6 +155,7 @@ class IdentityHistory(StepDAG, VoterTracker):
         """
         if sig is None:  # FIXME remove this, need sig
             steps = from_yaml_string(steps_msg)
+            return steps
         if self.myself.verify(steps_msg, sig):
             steps = from_yaml_string(steps_msg)
             return steps
