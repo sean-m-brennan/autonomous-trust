@@ -21,3 +21,5 @@ dependencies:
   - pytest-cov
   - go
   - gcc
+  - napkin
+  - pylint

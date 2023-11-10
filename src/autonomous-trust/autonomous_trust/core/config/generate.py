@@ -7,13 +7,14 @@ import socket
 import subprocess
 
 from .configuration import Configuration, CfgIds, InitializableConfig
+from .names import random_name
 from ..processes import ProcessTracker
 from ..network import Network, NetworkProtocol
 from ..identity import Identity
 from ..system import communications, core_system
 
 
-names = [
+_names = [
     'j.h.watson@tekfive.com',
     'a.hastings@tekfive.com',
     'a.goodwin@tekfive.com',
@@ -98,8 +99,8 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         if seed is None:
             seed = random.randint(1, 254)
         # Assume we're running in docker or kvm, so queried addresses work
-        idx = seed % len(names)
-        fullname = names[idx]
+        idx = seed % len(_names)
+        fullname = _names[idx]
         nickname = fullname.split('@')[0].rsplit('.', 1)[1]
         net_cfg = Network.initialize(ip4_address, ip6_address, mac_address)
         ident_cfg = Identity.initialize(fullname, nickname, address)
@@ -117,10 +118,14 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
     if not preserve:
         print('Configuring an AutonomousTrust identity')
     if not os.path.exists(ident_file) or not preserve:
-        fullname = input('  Fullname (FQDN) [%s]: ' % hostname)
-        if fullname == '':
+        try:
+            fullname = input('  Fullname (FQDN) [%s]: ' % hostname)
+            if fullname == '':
+                fullname = hostname
+            nickname = input('  Nickname: ')
+        except EOFError:
             fullname = hostname
-        nickname = input('  Nickname: ')
+            nickname = random_name(sep='', cap=True)
     if not os.path.exists(net_file) or not preserve:
         if defaults:
             ip4_addr = ip4_address
@@ -137,7 +142,10 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
             if mac_addr == '':
                 mac_addr = mac_address
     if not os.path.exists(sub_sys_file) or not preserve:
-        net_impl = input('  Network Implementation [%s]: ' % communications)
+        try:
+            net_impl = input('  Network Implementation [%s]: ' % communications)
+        except EOFError:
+            net_impl = ''
         if net_impl == '':
             net_impl = communications
 
@@ -201,7 +209,7 @@ def generate_worker_config(cfg_dir: str, proc_name: str, cfg_class: type[Initial
                 if defaults:
                     arg = default_values[name]
                 else:
-                    arg = input('  %s [%s]: ' % (name, defaults[name]))
+                    arg = input('  %s [%s]: ' % (name, default_values[name]))
                     if arg == '':
                         arg = default_values[name]  # type is correct here
             else:

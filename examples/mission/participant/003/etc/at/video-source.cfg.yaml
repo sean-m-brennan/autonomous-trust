@@ -1,4 +1,4 @@
 !Cfg:autonomous_trust.services.video.server.VideoSrc
-path: /home/user/Software/autonomous_trust/examples/mission/participant/001/var/at/video/220505_02_MTB_4k_018.mp4
+path: 220505_02_MTB_4k_018.mp4
 size: 320
 speed: 1

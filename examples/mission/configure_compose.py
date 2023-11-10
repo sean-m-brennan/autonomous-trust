@@ -104,6 +104,9 @@ class DockerCompose(object):
                   "\n")
 
     def simulator(self, cfg: TextIO):
+        log_level = 'info'
+        log_file = 'simulator.log'
+        options = '--log %s --log-level %s --resolve-short-name' % (log_file, log_level)
         interact = ''
         if self.interactive:
             interact = '    stdin_open: true\n    tty: true\n    command: bash -c "%s"\n' % self.command
@@ -119,7 +122,7 @@ class DockerCompose(object):
                   "    cap_add:\n" +
                   "      - NET_ADMIN\n" +
                   "    environment:\n" +
-                  "      AUTONOMOUS_TRUST_EXE: \"-m autonomous_trust.simulator scenario.yaml\"\n" +
+                  "      AUTONOMOUS_TRUST_EXE: \"-m autonomous_trust.simulator %s scenario.yaml\"\n" % options +
                   "      AUTONOMOUS_TRUST_ROOT: \"/app\"\n" +
                   "      ROUTER: \"%s\"\n" % self.router +
                   "    deploy:\n" +

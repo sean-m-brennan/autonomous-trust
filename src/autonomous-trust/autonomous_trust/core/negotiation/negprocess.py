@@ -1,3 +1,4 @@
+import traceback
 from queue import Empty, Full
 from datetime import timedelta
 
@@ -261,43 +262,47 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
     def process(self, queues, signal):
         while self.keep_running(signal):
             try:
-                message = queues[self.name].get(block=True, timeout=self.q_cadence)
-            except Empty:
-                message = None
-            if message:
-                if not self.protocol.run_message_handlers(queues, message):
-                    if not self.forward_status(queues, message):
-                        if not self.forward_result(queues, message):
-                            if isinstance(message, tuple) and len(message) > 1 and \
-                                    isinstance(message[1], Capability):
-                                self.peer_capabilities[message[0]] = message[1]
-                            else:
-                                if isinstance(message, Message):
-                                    self.logger.error('Unhandled message %s' % message.function)
+                try:
+                    message = queues[self.name].get(block=True, timeout=self.q_cadence)
+                except Empty:
+                    message = None
+                if message:
+                    if not self.protocol.run_message_handlers(queues, message):
+                        if not self.forward_status(queues, message):
+                            if not self.forward_result(queues, message):
+                                if isinstance(message, tuple) and len(message) > 1 and \
+                                        isinstance(message[1], Capability):
+                                    self.peer_capabilities[message[0]] = message[1]
                                 else:
-                                    self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                                    if isinstance(message, Message):
+                                        self.logger.error('Unhandled message %s' % message.function)
+                                    else:
+                                        self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
 
-            for job in self._get_jobs():  # local jobs
-                try:
-                    queues[CfgIds.main].put(job.task, block=True, timeout=self.q_cadence)
-                    self.logger.debug('Send for execution')
-                except Full:
-                    self.logger.error('process: Main queue full')
+                for job in self._get_jobs():  # local jobs
+                    try:
+                        queues[CfgIds.main].put(job.task, block=True, timeout=self.q_cadence)
+                        self.logger.debug('Send for execution')
+                    except Full:
+                        self.logger.error('process: Main queue full')
 
-            present = now()
-            for task_id in self.my_tasks:  # remote jobs
-                task = self.my_tasks[task_id]
-                params = task.parameters
-                try:
-                    if task not in self.status_pending and \
-                            present > params.when + params.duration + params.timeout:
-                        tx_task = Task(**task.to_dict())
-                        msg = Message(self.name, NegotiationProtocol.status_req,
-                                      tx_task.to_yaml_string(), task.requestor)
-                        queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                        self.logger.debug('Request remote execution status from %s' % task.requestor.nickname)
-                        self.status_pending.append(task)
-                except Full:
-                    self.logger.error('process: Network queue full')
+                present = now()
+                for task_id in self.my_tasks:  # remote jobs
+                    task = self.my_tasks[task_id]
+                    params = task.parameters
+                    try:
+                        if task not in self.status_pending and \
+                                present > params.when + params.duration + params.timeout:
+                            tx_task = Task(**task.to_dict())
+                            msg = Message(self.name, NegotiationProtocol.status_req,
+                                          tx_task.to_yaml_string(), task.requestor)
+                            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+                            self.logger.debug('Request remote execution status from %s' % task.requestor.nickname)
+                            self.status_pending.append(task)
+                    except Full:
+                        self.logger.error('process: Network queue full')
 
-            self.sleep_until(self.cadence)
+                self.sleep_until(self.cadence)
+            except Exception as err:
+                self.logger.error(err)
+                self.logger.error(traceback.format_exc())

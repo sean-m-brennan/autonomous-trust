@@ -16,5 +16,4 @@ def test_add_peer():
     hist = IdentityByAuthority(ident, peers, None, 5)
     for _ in range(10):
         ident = _random_identity()
-        hist.upgrade_peer(ident)
         peers.promote(ident)

@@ -2,8 +2,8 @@
 _block_impl: authority
 _encryptor: !Cfg:autonomous_trust.core.identity.encrypt.Encryptor
   hex_seed: !!binary |
-    YjQxMjQ0ZDBlMmNiZTE0MGViZTUxMWU0NDlhMDA2ZDJkZmQ3ZWZmZTIzZDM0OTY4M2YzNWVlMTRk
-    NmQyNTZjMw==
+    YjI2ODYwZTYwNzFhMzViOTQyMTI3ZjhlZjA2MTRmZGE1MmU4YmU0MDRlZDY1ZDIzMGFkYzU5MTVl
+    ZjJjMWZkMQ==
   public_only: false
 _fullname: rc-1207@tekfive.com
 _nickname: Sev
@@ -11,9 +11,9 @@ _public_only: false
 _rank: 0
 _signature: !Cfg:autonomous_trust.core.identity.sign.Signature
   hex_seed: !!binary |
-    OWM2YWQ4OTAxZDMxNzUyODI3ZDNlOTlhNjhlM2U4Y2ZkZjY2ZjE5M2MyNjg1YjgyNGEyOTg0ZGJj
-    NDg3ZDEyYw==
+    ZmFmMmJkYjhhZDFhMWY3MDViY2IzMzM1YjljY2MyNjQzZDI0OTUxYmI3ZTJjOWE2OGYxOTczYjM0
+    NGYxZDljZA==
   public_only: false
-_uuid: 0a4dee86-76a5-4db2-bafb-f707832b8625
-address: 172.27.3.2
+_uuid: 4767eaf1-92e3-4a64-b04e-6384e60802dc
+address: 172.27.3.104
 petname: Delta-07

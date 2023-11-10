@@ -14,6 +14,7 @@ dependencies:
   - networkx
   - quart
   - numpy
+  - dill
   - py-opencv
   - imutils
   - msgpack-numpy

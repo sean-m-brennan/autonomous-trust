@@ -39,11 +39,55 @@ class IdentityProtocol(Protocol):
 
     Items 3, 4, & 5 are concurrent
     """
-    announce = 'request_access'
-    accept = 'access_granted'
-    history = 'full_history'
-    diff = 'history_diff'
-    propose = 'propose_peer'
-    vote = 'vote_on_peer'
-    confirm = 'peer_accepted'
-    update = 'group_key_update'
+    announce = 'request_access'  # msg.obj <- (identity, package hash, capabilities list) of new node
+    accept = 'access_granted'  # msg.obj <- (identity, package hash, capabilities list) of lead peer
+    history = 'full_history'  # msg.obj <- (list[LinkedSteps], group)
+    diff = 'history_diff'  # msg.obj <- list[LinkedSteps]
+    propose = 'propose_peer'  # msg.obj <- identity
+    vote = 'vote_on_peer'  # msg.obj <- (identityobj, proof, signature)
+    confirm = 'peer_accepted'  # msg.obj <- identityobj
+    update = 'group_key_update'  # msg.obj <- group
+
+
+if __name__ == '__main__':
+    import napkin
+
+    @napkin.seq_diagram()
+    def identity_protocol(c):
+        node = c.object('new_node')
+        peer = c.object('leader')
+        others = c.object('other_peers')
+        with c.group('open'):
+            with node:
+                with peer.announce_identity('identity, hash, capabilities'):
+                    with peer.welcoming_committee():
+                        with c.alt():
+                            with c.choice('new_node amnesia'):
+                                c.note('leader already has new_node identity')
+                                with c.group('encrypted'):
+                                    with others.confirm():
+                                        others.handle_confirm_peer()
+                                with c.choice('else'):
+                                    with c.group('encrypted / group'):
+                                        with peer.vote_collection():
+                                            with others.propose('identity'):
+                                                others.handle_vote_on_peer()
+                                                peer.vote('id, proof, sig')
+                                            peer.count_vote()
+                                        with others.confirm():
+                                            others.handle_confirm_peer()
+                        node.accept('leader identity')
+                node.handle_acceptance().note(callee='others now have new_node identity')
+        with c.group('encrypted / direct'):
+            with peer:
+                node.history('list of dag steps, group')
+            with node:
+                node.receive_history().note(callee="populates others' identities")
+                node.choose_group().note(callee='joins group')
+        with c.group('encrypted / group'):
+            with node:
+                with others.diff('list of dag steps'):
+                    others.handle_history_diff().note(caller='may merge adjacent network')
+
+
+    napkin.generate('plantuml_svg')

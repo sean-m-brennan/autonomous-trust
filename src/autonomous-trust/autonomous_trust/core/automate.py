@@ -1,18 +1,22 @@
 from __future__ import annotations
+
+#import functools
 import os
 import random
 import sys
 import time
 import logging
+from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler, SysLogHandler
 import traceback
 import queue
 from enum import Enum
-from typing import Union, Any, Optional
+from typing import Any, Union
 import multiprocessing as mp
 from multiprocessing import Pool as ProcessPool
 from multiprocessing.dummy import Pool as ThreadPool
 from multiprocessing.pool import AsyncResult  # noqa
+#import dill
 from operator import mul, pow
 from decimal import Decimal, getcontext
 
@@ -24,15 +28,37 @@ except ImportError:
     version = '?.?.?'
 from .config import Configuration, CfgIds, to_yaml_string
 from .processes import Process, LogLevel, ProcessTracker
-from .identity import Peers
+from .identity import Peers, Group
 from .capabilities import Capabilities, Capability
 from .system import PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
 from .protocol import Protocol
 from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, NegotiationProtocol
 from .network import Message
 from .reputation import TransactionScore, ReputationProtocol
+from .queue_pool import QueuePool
 
 PoolType = Union[ProcessPool, ThreadPool]
+
+ConfigMap = dict[str, Any]
+
+
+#dill.Pickler.dumps, dill.Pickler.loads = dill.dumps, dill.loads
+#mp.reduction.ForkingPickler = dill.Pickler
+#mp.reduction.dump = dill.dump
+#mp.queues._ForkingPickler = dill.Pickler
+
+
+##############################
+# Pickle cannnot handle lambdas and closures
+#class EncodedFunction(object):
+#    def __init__(self, f):
+#       self.f = dill.dumps(f)
+
+#    @staticmethod
+#    def apply(f: 'EncodedFunction', *args, **kwargs):
+#       import dill  # reimport, just in case this is not available on the new processes
+#       f = dill.loads(f)  # converts bytes to function
+#       return f(*args, **kwargs)
 
 
 def pi(precision):  # intentionally non-trivial, arbitrary precision
@@ -53,50 +79,6 @@ class Ctx(str, Enum):
         return str.__str__(self)
 
 
-class PooledQueue(object):
-    def __init__(self, queue_type: type[QueueType]):
-        self.in_use = False
-        self.queue = queue_type()
-
-    def close(self):
-        self.in_use = True
-
-
-class QueuePool(object):
-    """Cannot create multiproc queues after pool is started, so create a reserve pool of them"""
-    pool_size = 128
-
-    def __init__(self, queue_type: type[QueueType]):
-        self._pool: list[PooledQueue] = []
-        for _ in range(self.pool_size):
-            self._pool.append(PooledQueue(queue_type))
-
-    def next(self) -> Optional[QueueType]:
-        for pq in self._pool:
-            if not pq.in_use:
-                pq.in_use = True
-                return pq.queue
-        return None
-
-    def recycle(self, queue: QueueType):
-        for pq in self._pool:
-            if pq.queue is queue:
-                pq.close()
-
-
-__QUEUE_POOL: QueuePool  # created by AutonomousTrust object immediately
-
-
-def create_queue() -> QueueType:
-    global __QUEUE_POOL
-    return __QUEUE_POOL.next()
-
-
-def destroy_queue(queue: QueueType):
-    global __QUEUE_POOL
-    __QUEUE_POOL.recycle(queue)
-
-
 ################################################################################
 
 
@@ -111,7 +93,6 @@ class AutonomousTrust(Protocol):
     def __init__(self, multiproc: bool = True, log_level: int = LogLevel.WARNING,
                  logfile: str = None, log_classes: list[str] = None, syslog: bool = False,
                  context: str = Ctx.DEFAULT, testing: bool = False):
-        global __QUEUE_POOL
         self._stopped_procs: list[str] = []
         if multiproc:
             # Multiprocessing
@@ -123,16 +104,16 @@ class AutonomousTrust(Protocol):
             # Threading
             self._pool_type = ThreadPool
             self._queue_type = queue.Queue
-        __QUEUE_POOL = QueuePool(self._queue_type)
+        self.queue_pool: QueuePool = QueuePool(self._queue_type)
 
-        self._log_level = log_level
-        self.name = self.__class__.__name__
+        self._log_level: int = log_level
+        self.name: str = self.__class__.__name__
         if logfile is None:
             logfile = os.path.join(Configuration.get_data_dir(), 'autonomous_trust.log')
         self.classes_to_log = log_classes
         if log_classes is None:
             self.classes_to_log = list(CfgIds)
-        root = logging.getLogger()
+        root: logging.Logger = logging.getLogger()
         root.setLevel(logging.DEBUG)
         if logfile == Configuration.log_stdout:
             handler = logging.StreamHandler(sys.stdout)
@@ -141,24 +122,25 @@ class AutonomousTrust(Protocol):
         handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
                                                '%Y-%m-%d %H:%M:%S'))
         handler.setLevel(log_level)
-        self._logger = logging.getLogger(self.name)
+        self._logger: logging.Logger = logging.getLogger(self.name)
         self._logger.addHandler(handler)
         if syslog:
             syslog_handler = SysLogHandler(address='/dev/log')
             self._logger.addHandler(syslog_handler)
         super().__init__(CfgIds.main, self._logger, None, None)
-        self.identity = None  # of type Identity
+        self.identity = None  # of type Identity (can't import)
 
-        self.capabilities = Capabilities()
-        self._output = self.queue_type()  # subsystem logging
-        self._subsystems = ProcessTracker()
-        self._additional_workers: list[tuple] = []
-        self._my_queue = self.queue_type()
-        self.testing = testing
+        self.process_names: list[str] = []
+        self.capabilities: Capabilities = Capabilities()
+        self._output: QueueType = self.queue_type()  # subsystem logging
+        self._subsystems: ProcessTracker = ProcessTracker()
+        self._additional_workers: list[tuple[type[Process], list[str], dict[str, Any]]] = []
+        self._my_queue: QueueType = self.queue_type()
+        self.testing: bool = testing
         self.active_tasks: dict[str, Task] = {}
         self.active_pids: dict[str, int] = {}
         self.last_tick: dict[int, int] = {}
-        self.tasking_start = now()
+        self.tasking_start: datetime = now()
         self.latest_reputation: dict[str, Any] = {}
         self.unhandled_messages: list[Message] = []
 
@@ -273,7 +255,7 @@ class AutonomousTrust(Protocol):
         """
         os.makedirs(Configuration.get_data_dir(), exist_ok=True)
         configs = self._configure()
-        procs = configs[Process.key]
+        procs: list[Process] = configs[Process.key]
         if self._log_level <= LogLevel.WARNING:
             self._banner()
         self.logger.info(self.name + ':  Package signature %s' % configs[PackageHash.key])
@@ -287,19 +269,20 @@ class AutonomousTrust(Protocol):
         queues = dict(zip(list(map(lambda x: x.name, procs)),
                           [self.queue_type() for _ in range(len(procs))]))
         queues[self.proc_name] = self._my_queue
-        signals = {}
-        results = {}
+        signals: dict[str, QueueType] = {}
+        results: dict[str, AsyncResult] = {}
         with self._pool_type(len(procs)) as pool:
-            for proc in procs:
+            for proc in procs:  # FIXME split system procs from additional
                 self.logger.info(self.name + ':  Starting %s ...' % proc.name)
+                self.process_names.append(proc.name)
                 signals[proc.name] = self.queue_type()
                 results[proc.name] = pool.apply_async(proc.process, (queues, signals[proc.name]))
             if q_in is not None:
                 queues[self.external_control] = q_in  # main loop must watch/process
             if q_out is not None:
                 queues[self.external_feedback] = q_out  # main loop must upload to this
-            pool.close()  # no more tasks
-            self.logger.info(self.name + ':                                          Ready.')
+            pool.close()  # no more system tasks (use separate pool for dynamic tasks)
+            self.logger.info(self.name + ':                                          Ready.')  # FIXME not really ready
 
             self.autonomous_loop(results, queues, signals)
 
@@ -307,6 +290,14 @@ class AutonomousTrust(Protocol):
 
     ####################
     # Protected methods
+
+    #@staticmethod
+    #def _report_success(logger, msg, _):
+    #    logger.debug(msg)
+
+    #@staticmethod
+    #def _report_error(logger, msg, err):
+    #    logger.error(msg % err)
 
     @staticmethod
     def _banner():
@@ -321,10 +312,10 @@ class AutonomousTrust(Protocol):
 
     def _configure(self, start: bool = True):
         # Pull initial state from configuration files
-        required = [CfgIds.network, CfgIds.identity, CfgIds.peers]
-        defaultable = {CfgIds.peers: Peers, }
+        required = [CfgIds.network, CfgIds.identity, CfgIds.peers, CfgIds.group]
+        defaultable = {CfgIds.peers: Peers, CfgIds.group: Group, }
 
-        configs = {}
+        configs: ConfigMap = {}
         cfg_dir = Configuration.get_cfg_dir()
         self._subsystems.from_file(cfg_dir)
 
@@ -355,7 +346,8 @@ class AutonomousTrust(Protocol):
         self.identity.address = net_cfg.ip4
         if preferred_proto_ver == 6:
             self.identity.address = net_cfg.ip6
-        self.peers = configs[CfgIds.peers]
+        peers, peer_caps = configs[CfgIds.peers]
+        self.peers = peers
 
         if start:
             # init configured process classes
@@ -365,6 +357,7 @@ class AutonomousTrust(Protocol):
                 if sub_sys_cls.cfg_name in self.classes_to_log:
                     suppress = False
                 configs[Process.key].append(sub_sys_cls(configs, self._subsystems, self._output, suppress_log=suppress))
+            # FIXME wait for system to be operational before running these??
             for worker_cls, deps, kwargs in self._additional_workers:
                 configs[Process.key].append(worker_cls(configs, self._subsystems, self._output, deps, **kwargs))
         return configs
@@ -401,6 +394,13 @@ class AutonomousTrust(Protocol):
                 pass
         return True
 
+    def _failed_task_cb(self, task: Task):
+        def report_error(err: Exception):
+            self.logger.error('Task %s failed: %s' %
+                              (task.capability.name, '\n'.join(traceback.format_exception(type(err), err))))
+
+        return report_error
+
     def _handle_messages(self, queues: dict[str, QueueType], pool: PoolType, results: dict[str, AsyncResult]):
         if self.external_control in queues:
             try:
@@ -423,7 +423,6 @@ class AutonomousTrust(Protocol):
             pass
 
         if message is not None:
-            self.logger.debug('Message %s' % type(message))
             if not self.run_message_handlers(queues, message):
                 if isinstance(message, TaskStatus):
                     if message.uuid in self.active_pids:
@@ -446,8 +445,8 @@ class AutonomousTrust(Protocol):
                         capability = self.capabilities[task.capability.name]
                         pq = self.queue_type()
                         self.logger.debug(self.name + ': Running task')
-                        results[task.uuid] = pool.apply_async(capability.execute, (task, pq))
                         self.active_tasks[str(task.uuid)] = task
+                        results[task.uuid] = pool.apply_async(capability.execute, (task, pq))
                         try:
                             pid = pq.get(block=True, timeout=1)
                             self.active_pids[str(task.uuid)] = pid
@@ -477,6 +476,9 @@ class AutonomousTrust(Protocol):
     def _handle_results(self, queues: dict[str, QueueType], results: dict[str, AsyncResult]):
         for key in list(results.keys()):
             if results[key].ready():
+                if key in list(self.process_names):
+                    self.logger.error('unexpected termination of process %s' % key)
+                    continue
                 try:
                     self.logger.debug(self.name + ': %s Task' % key)
                     result = results[key].get()
