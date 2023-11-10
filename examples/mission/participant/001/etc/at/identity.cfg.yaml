@@ -2,8 +2,8 @@
 _block_impl: authority
 _encryptor: !Cfg:autonomous_trust.core.identity.encrypt.Encryptor
   hex_seed: !!binary |
-    YjQxMjQ0ZDBlMmNiZTE0MGViZTUxMWU0NDlhMDA2ZDJkZmQ3ZWZmZTIzZDM0OTY4M2YzNWVlMTRk
-    NmQyNTZjMw==
+    OTJjMDk0ZjZlNmMyZDljMDllZDc4N2U2ZTNiNWMwZjQ0ZDc3ZTMwNjBiYjhhNDNmZTY0Mzc3YWVk
+    M2ZjYjcwMQ==
   public_only: false
 _fullname: rc-1138@tekfive.com
 _nickname: Boss
@@ -11,9 +11,9 @@ _public_only: false
 _rank: 0
 _signature: !Cfg:autonomous_trust.core.identity.sign.Signature
   hex_seed: !!binary |
-    OWM2YWQ4OTAxZDMxNzUyODI3ZDNlOTlhNjhlM2U4Y2ZkZjY2ZjE5M2MyNjg1YjgyNGEyOTg0ZGJj
-    NDg3ZDEyYw==
+    ZTM1YWM5MjM3YTEyZWIwODEyZjM3MDY0YzNlODc0MmFiMmRkMDE5ZDM2M2YyYjdhNGYyOTFjMmNl
+    ZjhlMWE4OA==
   public_only: false
-_uuid: 0a4dee86-76a5-4db2-bafb-f707832b8625
-address: 172.27.3.2
+_uuid: af56b7d9-e05b-4d4d-9c75-b6f6b2c76fde
+address: 172.27.3.101
 petname: Delta-38

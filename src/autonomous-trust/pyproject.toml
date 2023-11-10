@@ -10,6 +10,7 @@ authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
 #readme = "README.md"  # FIXME docker looking for /app/README.md
 packages = [{include = "autonomous_trust"}]
 license = "Proprietary"
+include = ["**/adjectives.txt", "**/names.txt"]
 exclude = ["**/etc", "**/var", "**/notes", "**/__pycache__"]
 
 [project]

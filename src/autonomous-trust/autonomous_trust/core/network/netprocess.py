@@ -1,5 +1,6 @@
 import threading
 import time
+import traceback
 from collections import deque
 from datetime import datetime
 from queue import Empty, Full
@@ -257,7 +258,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         try:
             message = Message.parse(msg, from_whom, validate=validate)
         except TypeError:
-            print('Error parsing: %s' % msg)  #FIXME
+            print('Error parsing: %s' % msg)  # FIXME
             return
         from_addr = from_whom
         if isinstance(from_whom, Identity):
@@ -292,116 +293,130 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         threading.Thread(target=self.unknown_receiver, daemon=True).start()
         threading.Thread(target=self.mystery_handler, args=(queues,), daemon=True).start()
         while self.keep_running(signal):
-            if self.diplomat:
-                if self.ping is None:
-                    self.ping = PingServer(self.net_cfg.ip4, self.logger)
-                    self.ping.start()
-            elif self.ping is not None:
-                self.ping.stop()
-                self.ping = None
             try:
-                message = queues[self.name].get(block=True, timeout=self.q_cadence)  # noqa
-            except Empty:
-                message = None
-            if message and not self.protocol.run_message_handlers(queues, message):
-                if isinstance(message, Message):
-                    self.logger.debug('Send network message: %s:%s' % (message.process, message.function))
-                    try:
-                        if message.function == Network.stats_req:
-                            msg = Message(CfgIds.network, Network.stats_resp, self.net_stats)
-                            queues[message.process].put(msg, block=True, timeout=self.q_cadence)
-                        elif message.function == Network.ping:
-                            try:
-                                stats = ping(message.to_whom.address, count=message.obj)  # noqa
-                                msg = Message(self.name, Network.ping, stats)  # noqa
-                                queues[message.return_to].put(msg, block=True, timeout=self.q_cadence)
-                            except TransmissionError as err:
-                                self.logger.error('Network: %s' % err)
-                        elif message.to_whom == Network.broadcast:
-                            msg = bytes(message)
-                            try:
-                                self.send_any(msg)
-                                self.track_send_stats(self.unknown_peer, len(msg))
-                            except TransmissionError as err:
-                                self.logger.error('Network: %s' % err)
-                                self.track_send_error(self.unknown_peer)
-                        elif isinstance(message.to_whom, Group):
-                            if message.encrypt:
-                                msg = self.group.encrypt(bytes(message), self.group)
-                            else:
-                                msg = bytes(message)
-                            for addr in message.to_whom.addresses:
-                                if addr == self.myself.address:
-                                    continue
+                if self.diplomat:
+                    if self.ping is None:
+                        self.ping = PingServer(self.net_cfg.ip4, self.logger)
+                        self.ping.start()
+                elif self.ping is not None:
+                    self.ping.stop()
+                    self.ping = None
+                try:
+                    message = queues[self.name].get(block=True, timeout=self.q_cadence)  # noqa
+                except Empty:
+                    message = None
+                if message and not self.protocol.run_message_handlers(queues, message):
+                    if isinstance(message, Message):
+                        self.logger.debug('Send network message: %s:%s' % (message.process, message.function))
+                        try:
+                            if message.function == Network.stats_req:
+                                msg = Message(CfgIds.network, Network.stats_resp, self.net_stats)
+                                queues[message.process].put(msg, block=True, timeout=self.q_cadence)
+                            elif message.function == Network.ping:
                                 try:
-                                    self.send_group(msg, addr)
+                                    stats = ping(message.to_whom.address, count=message.obj)  # noqa
+                                    msg = Message(self.name, Network.ping, stats)  # noqa
+                                    queues[message.return_to].put(msg, block=True, timeout=self.q_cadence)
+                                except TransmissionError as err:
+                                    self.logger.error('Network: %s' % err)
+                            elif message.to_whom == Network.broadcast:
+                                msg = bytes(message)
+                                try:
+                                    self.send_any(msg)
                                     self.track_send_stats(self.unknown_peer, len(msg))
                                 except TransmissionError as err:
                                     self.logger.error('Network: %s' % err)
                                     self.track_send_error(self.unknown_peer)
-                        else:  # defaults to pseudo-multicast
-                            for who in message.to_whom:  # Message ensures this is list  # noqa
-                                address = who.address
-                                if '/' in address:
-                                    address = address.split('/')[0]
-                                if message.encrypt:
-                                    msg = self.myself.encrypt(bytes(message), who)
+                            elif isinstance(message.to_whom, Group):
+                                if message.encrypt:  # FIXME self.group must be non-None
+                                    msg = self.group.encrypt(bytes(message), self.group)
                                 else:
                                     msg = bytes(message)
-                                try:
-                                    self.send_peer(msg, address)
-                                    self.track_send_stats(who.uuid, len(msg))
-                                except TransmissionError as err:
-                                    self.logger.error('Network: %s' % err)
-                                    self.track_send_error(who.uuid)
-                    except BrokenPipeError as err:
-                        self.logger.error('Network: %s' % err)
-                else:
-                    self.logger.error('Net process recvd message of type %s - Message required. Ignoring.' %
-                                      type(message))
-                    self.logger.debug('Ignored message: %s' % str(message))
-
-            # async recv point-to-point messages
-            if len(self.peer_messages) > 0:
-                raw_msg, from_addr = self.peer_messages.pop(0)
-                peers = self.configs[CfgIds.peers]
-                from_whom = peers.find_by_address(from_addr)
-                if len(peers.all) < 1:
-                    # bootstrapping will not (cannot) be encrypted
-                    try:
-                        self._msg_to_queue(raw_msg, from_addr, queues, 'point-to-point', validate=False)
-                    except UnicodeDecodeError:
-                        self.logger.debug('Out-of-order message detected, retry later')
-                        self.encrypted_messages.append((raw_msg, from_addr))
-                elif from_whom is not None:
-                    decrypt_msg = self.myself.decrypt(raw_msg, from_whom)
-                    self._msg_to_queue(decrypt_msg, from_whom, queues, 'point-to-point')
-                else:
-                    self.logger.error('Recvd transmission from %s - not recognized as a peer. Ignoring.' % from_addr)
-                    self.logger.debug('Ignored message: %s' % str(message))
-
-            # async recv group messages
-            if len(self.group_messages) > 0:
-                if self.group is not None:  # otherwise, skip for now
-                    raw_msg, from_addr = self.group_messages.pop(0)
-                    if from_addr in self.group.addresses:
-                        from_whom = self.peers.find_by_address(from_addr)
-                        try:
-                            decrypt_msg = self.group.decrypt(raw_msg, self.group)
-                            if from_whom is not None:
-                                self._msg_to_queue(decrypt_msg, from_whom, queues, 'group')
-                            else:
-                                self.logger.error('Recvd transmission from %s - not in peers. Ignoring.' % from_addr)
-                                self.logger.debug('Ignored message: %s' % str(message))
-                        except nacl.exceptions.CryptoError:
-                            self.logger.error('CryptoError decrypting message from %s' % from_whom.nickname)
+                                for addr in message.to_whom.addresses:
+                                    if addr == self.myself.address:
+                                        continue
+                                    try:
+                                        self.send_group(msg, addr)
+                                        self.track_send_stats(self.unknown_peer, len(msg))
+                                    except TransmissionError as err:
+                                        self.logger.error('Network: %s' % err)
+                                        self.track_send_error(self.unknown_peer)
+                            else:  # defaults to pseudo-multicast
+                                for who in message.to_whom:  # Message ensures this is list  # noqa
+                                    address = who.address
+                                    if '/' in address:
+                                        address = address.split('/')[0]
+                                    if message.encrypt:
+                                        msg = self.myself.encrypt(bytes(message), who)
+                                    else:
+                                        msg = bytes(message)
+                                    try:
+                                        self.send_peer(msg, address)
+                                        self.track_send_stats(who.uuid, len(msg))
+                                    except TransmissionError as err:
+                                        self.logger.error('Network: %s' % err)
+                                        self.track_send_error(who.uuid)
+                        except BrokenPipeError as err:
+                            self.logger.error('Network: %s' % err)
                     else:
-                        self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
+                        self.logger.error('Net process recvd message of type %s - Message required. Ignoring.' %
+                                          type(message))
                         self.logger.debug('Ignored message: %s' % str(message))
 
-            # async recv stranger messages (separate channel)
-            if len(self.unknown_messages) > 0:
-                raw_msg, from_addr = self.unknown_messages.pop(0)
-                self._msg_to_queue(raw_msg, from_addr, queues, 'multicast', validate=False)
+                # async recv point-to-point messages
+                if len(self.peer_messages) > 0:
+                    raw_msg, from_addr = self.peer_messages.pop(0)
+                    peers = self.configs[CfgIds.peers][0]
+                    from_whom = peers.find_by_address(from_addr)
+                    if len(peers.all) < 1:
+                        # bootstrapping will not (cannot) be encrypted
+                        try:
+                            self._msg_to_queue(raw_msg, from_addr, queues, 'point-to-point', validate=False)
+                        except UnicodeDecodeError:
+                            self.logger.debug('Out-of-order message detected, retry later')
+                            self.encrypted_messages.append((raw_msg, from_addr))
+                    elif from_whom is not None:
+                        try:
+                            decrypt_msg = self.myself.decrypt(raw_msg, from_whom)  # FIXME
+                            self._msg_to_queue(decrypt_msg, from_whom, queues, 'point-to-point')
+                        except Exception:
+                            self.logger.error('Decryption error, msg from %s: %s' % (
+                            from_whom.nickname, traceback.format_exc()))  # FIXME
+                    else:
+                        self.logger.error(
+                            'Recvd transmission from %s - not recognized as a peer. Ignoring.' % from_addr)
+                        self.logger.debug('Ignored message: %s' % str(message))
+
+                # async recv group messages
+                if len(self.group_messages) > 0:
+                    if self.group is not None:  # otherwise, skip for now
+                        raw_msg, from_addr = self.group_messages.pop(0)
+                        if from_addr in self.group.addresses:
+                            from_whom = self.peers.find_by_address(from_addr)
+                            try:
+                                decrypt_msg = self.group.decrypt(raw_msg, self.group)
+                                if from_whom is not None:
+                                    self._msg_to_queue(decrypt_msg, from_whom, queues, 'group')
+                                else:
+                                    self.logger.error(
+                                        'Recvd transmission from %s - not in peers. Ignoring.' % from_addr)
+                                    self.logger.debug('Ignored message: %s' % str(message))
+                            except nacl.exceptions.CryptoError as e:
+                                name = from_addr
+                                if from_whom is not None:
+                                    name = '%s (%s)' % (from_whom.nickname, name)
+                                self.logger.error('CryptoError decrypting message from %s' % name)  # FIXME too often
+                        else:
+                            self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
+                            self.logger.debug('Ignored message: %s' % str(message))
+                            # FIXME ask others in group
+
+                # async recv stranger messages (separate channel)
+                if len(self.unknown_messages) > 0:
+                    raw_msg, from_addr = self.unknown_messages.pop(0)
+                    self._msg_to_queue(raw_msg, from_addr, queues, 'multicast', validate=False)
+            except Exception as err:
+                self.logger.error(err)
+                self.logger.error(traceback.format_exc())
 
         self.stop = True

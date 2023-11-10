@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from queue import Empty
 
 from autonomous_trust.core import Process, ProcMeta, CfgIds, from_yaml_string, QueueType
-from autonomous_trust.core.automate import create_queue
+from autonomous_trust.core.automate import QueuePool
 from autonomous_trust.core.identity import Peers, Identity
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.protocol import Protocol
@@ -14,7 +14,7 @@ from autonomous_trust.services.peer.metadata import MetadataProtocol, MetadataSo
 from autonomous_trust.services.peer.position import Position, GeoPosition
 
 
-NullPeerData = lambda: PeerData(datetime.utcfromtimestamp(0), Position(0, 0), '')  # noqa
+NullPeerData = lambda: PeerData(datetime.utcfromtimestamp(0), Position(0, 0), '', '', 0)  # noqa
 
 
 class PeerDataAcq(object):
@@ -104,8 +104,9 @@ class CohortInterface(object):
 class Cohort(CohortInterface):
     epoch = datetime(1970, 1, 1)
 
-    def __init__(self, **kwargs):
+    def __init__(self, queue_pool: QueuePool, **kwargs):
         super().__init__(**kwargs)
+        self.queue_pool = queue_pool
 
     def update(self):
         pass
@@ -114,7 +115,7 @@ class Cohort(CohortInterface):
         for uuid in group_ids:
             if uuid not in self.peers:
                 self.peers[uuid] = PeerDataAcq(uuid, group_ids[uuid], NullPeerData(), self,
-                                               create_queue(), create_queue())
+                                               self.queue_pool.next(), self.queue_pool.next())
                 # FIXME dynamically creating queues is a problem: "Pickling an AuthenticationString object is disallowed for security reasons"
         for uuid in self.peers:
             if uuid not in group_ids:

@@ -1,3 +1,5 @@
+import random
+import time
 import uuid as uuid_mod
 
 from nacl.public import Box
@@ -119,5 +121,6 @@ class Identity(InitializableConfig, AgreementVoter):
     def initialize(my_name, my_nickname, my_address):
         if '/' in my_address:
             my_address = my_address.split('/')[0]
+        time.sleep(random.random())  # reduce chance of collision
         return Identity(uuid_mod.uuid4(), my_address, my_name, my_nickname,
                         Signature.generate(), Encryptor.generate(), 'me', False)

@@ -2,8 +2,8 @@
 _block_impl: authority
 _encryptor: !Cfg:autonomous_trust.core.identity.encrypt.Encryptor
   hex_seed: !!binary |
-    YjQxMjQ0ZDBlMmNiZTE0MGViZTUxMWU0NDlhMDA2ZDJkZmQ3ZWZmZTIzZDM0OTY4M2YzNWVlMTRk
-    NmQyNTZjMw==
+    MTdmNzUxY2RmMDIzNjhmZTVlOTA1ZGFhMDU3ZjI3MjVjZjIyMjVlNmNlOTU4NzVlNGQ0N2FkNmE4
+    NzdkNzZlMg==
   public_only: false
 _fullname: rc-1140@tekfive.com
 _nickname: Fixer
@@ -11,9 +11,9 @@ _public_only: false
 _rank: 0
 _signature: !Cfg:autonomous_trust.core.identity.sign.Signature
   hex_seed: !!binary |
-    OWM2YWQ4OTAxZDMxNzUyODI3ZDNlOTlhNjhlM2U4Y2ZkZjY2ZjE5M2MyNjg1YjgyNGEyOTg0ZGJj
-    NDg3ZDEyYw==
+    ZjdhZjM4ZmI1N2FmMWJjYTBmMjFlOTM0ZjY5ZDQzZjkwYjcxZGFhMzdhYWJmYWJjNzliYjAwZDE3
+    Yjk0ZTljYQ==
   public_only: false
-_uuid: 0a4dee86-76a5-4db2-bafb-f707832b8625
-address: 172.27.3.2
+_uuid: d595e9ed-5600-473f-b551-8670cbf3796d
+address: 172.27.3.103
 petname: Delta-40

@@ -1,5 +1,7 @@
 import os
+import random
 import sys
+import time
 
 from autonomous_trust.core import AutonomousTrust, Configuration, LogLevel
 from autonomous_trust.core.config.generate import generate_identity, generate_worker_config
@@ -16,9 +18,10 @@ class MissionParticipant(AutonomousTrust):
         super().__init__(**kwargs)
         self.add_worker(SimMetadataSource, self.system_dependencies)  # metadata-source.cfg.yaml
         self.add_worker(NetStatsSource, self.system_dependencies)  # no config
-        if os.path.exists(os.path.join(Configuration.get_cfg_dir(),
-                                       VideoSource.name + Configuration.yaml_file_ext)):
-            self.add_worker(VideoSource, self.system_dependencies)  # video-source.cfg.yaml
+        # FIXME
+        #if os.path.exists(os.path.join(Configuration.get_cfg_dir(),
+        #                               VideoSource.name + Configuration.yaml_file_ext)):
+        #    self.add_worker(VideoSource, self.system_dependencies)  # video-source.cfg.yaml
         if os.path.exists(os.path.join(Configuration.get_cfg_dir(),
                                        DataSimSource.name + Configuration.yaml_file_ext)):
             self.add_worker(DataSimSource, self.system_dependencies)  # data-source.cfg.yaml
@@ -45,5 +48,6 @@ if __name__ == '__main__':
                                 (DataSource.name, DataSrc)):
             generate_worker_config(cfg_dir, cfg_name, klass, True)
 
+    time.sleep(random.randint(10, 120))  # delay up to two minutes, but at least ten seconds
     MissionParticipant(log_level=LogLevel.DEBUG,
                        logfile=os.path.join(dat_dir, 'participant%s.log' % number)).run_forever()

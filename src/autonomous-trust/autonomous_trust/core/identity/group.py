@@ -1,3 +1,5 @@
+import random
+import time
 import uuid as uuid_mod
 
 from nacl.public import Box
@@ -10,9 +12,9 @@ class Group(InitializableConfig):
     """
     Group identity details that can be saved to file or transmitted
     """
-    def __init__(self, _uuid, addresses, _nickname, _encryptor, _public_only=True):
+    def __init__(self, _uuid, _address_map, _nickname, _encryptor, _public_only=True):
         self._uuid = str(_uuid)
-        self.addresses = addresses
+        self._address_map = _address_map
         self._nickname = _nickname
         self._encryptor = _encryptor  # group-shared key
         self._public_only = _public_only
@@ -29,6 +31,16 @@ class Group(InitializableConfig):
     @property
     def nickname(self):
         return self._nickname
+
+    @property
+    def addresses(self):
+        return self._address_map.values()
+
+    def add_address(self, uuid, address):
+        inv = {v: k for k, v in self._address_map.items()}
+        if address in inv and inv[address] != uuid:
+            del self._address_map[inv[address]]  # address collision
+        self._address_map[uuid] = address
 
     @property
     def encryptor(self):
@@ -62,5 +74,6 @@ class Group(InitializableConfig):
         return Group(self.uuid, self.addresses, self.nickname, Encryptor(self.encryptor.publish(), True), True)
 
     @staticmethod
-    def initialize(addresses, our_nickname):
-        return Group(uuid_mod.uuid4(), addresses, our_nickname, Encryptor.generate(), False)
+    def initialize(address_map, our_nickname):
+        time.sleep(random.random())  # reduce chance of collision
+        return Group(uuid_mod.uuid4(), address_map, our_nickname, Encryptor.generate(), False)
