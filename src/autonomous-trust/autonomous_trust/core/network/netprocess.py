@@ -11,9 +11,8 @@ import nacl
 from ..protocol import Protocol
 from ..identity import Identity
 from ..processes import Process, ProcMeta
-from ..config.configuration import CfgIds
 from ..identity import Group
-from ..system import comm_port, net_cadence
+from ..system import CfgIds, comm_port, net_cadence
 from .network import Network
 from .message import Message
 from .ping import PingServer, ping
@@ -81,7 +80,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         port = self.net_cfg.port
         self.port = port
         if port is None:
-            self.port = self.default_port
+            self.port = self.default_port  # noqa
         self.diplomat = True
         self.ping = None
         self.myself = configurations[CfgIds.identity]
@@ -91,7 +90,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.unknown_messages = []
         self.acceptance = acceptance_func
         self.pests = {}
-        self.protocol = Protocol(self.name, self.logger, configurations[CfgIds.peers])  # noqa
+        self.protocol = Protocol(self.name, self.logger, configurations)
         self.stop = False
         self.statistics = {}
 
@@ -366,7 +365,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 # async recv point-to-point messages
                 if len(self.peer_messages) > 0:
                     raw_msg, from_addr = self.peer_messages.pop(0)
-                    peers = self.configs[CfgIds.peers][0]
+                    peers = self.configs[CfgIds.peers]
                     from_whom = peers.find_by_address(from_addr)
                     if len(peers.all) < 1:
                         # bootstrapping will not (cannot) be encrypted

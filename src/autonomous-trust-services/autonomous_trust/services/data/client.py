@@ -15,7 +15,7 @@ class DataRcvr(Process, metaclass=ProcMeta,
         self.cohort = kwargs['cohort']
         self.servicers = []
         self.hdr_size = struct.calcsize(self.header_fmt)
-        self.protocol = DataProtocol(self.name, self.logger, configurations[CfgIds.peers])
+        self.protocol = DataProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(DataProtocol.data, self.handle_data)
 
     def handle_data(self, _, message):

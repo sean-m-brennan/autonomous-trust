@@ -26,16 +26,6 @@ def from_yaml_string(string):
     return yaml.load(sio)
 
 
-class CfgIds(object, metaclass=ClassEnumMeta):
-    main = 'main'
-    network = 'network'
-    identity = 'identity'
-    peers = 'peers'
-    group = 'group'
-    negotiation = 'negotiation'
-    reputation = 'reputation'
-
-
 class Configuration(object):
     VARIABLE_NAME = 'AUTONOMOUS_TRUST_ROOT'
     CFG_PATH = os.path.join('etc', 'at')
