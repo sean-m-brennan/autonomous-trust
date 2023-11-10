@@ -32,5 +32,5 @@ def actuate(num_nodes: int = 2, implementation: str = default_implementation, pl
     elif platform == UPlatform.xen:
         raise NotImplementedError
 
-    for n in range(1, num_nodes + 1):  # FIXME separate terminals
+    for _ in range(1, num_nodes + 1):  # FIXME separate terminals
         subprocess.Popen(command)

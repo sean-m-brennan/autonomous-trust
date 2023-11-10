@@ -5,10 +5,9 @@ from datetime import timedelta
 from ..capabilities import Capability
 from ..network import Message
 from ..processes import Process, ProcMeta
-from ..config import CfgIds
 from .protocol import NegotiationProtocol
 from .negotiation import Job, JobQueue, Task, TaskStatus, TaskTracker, TaskCounter, TaskResult, Status
-from ..system import max_concurrency, now
+from ..system import CfgIds, max_concurrency, now
 
 
 class NegotiationProcess(Process, metaclass=ProcMeta,
@@ -27,7 +26,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         self.confirmed = {}
         self.status_pending = []
         self.max_concurrency = max_cores
-        self.protocol = NegotiationProtocol(self.name, self.logger, configurations[CfgIds.peers])
+        self.protocol = NegotiationProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(NegotiationProtocol.start, self.start_task)
         self.protocol.register_handler(NegotiationProtocol.announce, self.handle_invite)
         self.protocol.register_handler(NegotiationProtocol.response, self.handle_haggle)

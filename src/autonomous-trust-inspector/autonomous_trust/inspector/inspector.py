@@ -1,8 +1,8 @@
 import os
 from queue import Empty
 
-from autonomous_trust.core import AutonomousTrust, Process, ProcMeta, LogLevel
-from autonomous_trust.core.config import Configuration, CfgIds, to_yaml_string
+from autonomous_trust.core import AutonomousTrust, Process, ProcMeta, LogLevel, CfgIds
+from autonomous_trust.core.config import Configuration, to_yaml_string
 from autonomous_trust.core.config.generate import random_config
 from autonomous_trust.core.system import queue_cadence
 from autonomous_trust.core.network import Network, Message

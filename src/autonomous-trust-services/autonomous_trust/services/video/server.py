@@ -46,7 +46,7 @@ class VideoSource(Process, metaclass=ProcMeta,
             if not os.path.isabs(self.video_path_pattern):
                 vid_dir = os.path.join(Configuration.get_data_dir(), 'video')
                 self.video_path_pattern = os.path.join(vid_dir, self.video_path_pattern)
-        self.protocol = VideoProtocol(self.name, self.logger, configurations[CfgIds.peers])
+        self.protocol = VideoProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(VideoProtocol.request, self.handle_requests)
         self.clients: dict[str, tuple[bool, str, Identity]] = {}
 

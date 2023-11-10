@@ -8,10 +8,10 @@ from dataclasses import dataclass
 
 from ..network import Message
 from ..processes import Process, ProcMeta
-from ..config import Configuration, CfgIds, from_yaml_string, to_yaml_string
+from ..config import Configuration, from_yaml_string, to_yaml_string
 from .protocol import ReputationProtocol
 from .reputation import TransactionHistory, Reputation, Reputations, TransactionScore
-from ..system import now, encoding
+from ..system import CfgIds, now, encoding
 
 
 @dataclass
@@ -31,7 +31,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         super().__init__(configurations, subsystems, log_q,
                          dependencies=[CfgIds.network, CfgIds.identity, CfgIds.negotiation], **kwargs)
         self.identity = self.configs[CfgIds.identity]
-        self.protocol = ReputationProtocol(self.name, self.logger, configurations[CfgIds.peers])
+        self.protocol = ReputationProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(ReputationProtocol.request, self.handle_request)
         self.protocol.register_handler(ReputationProtocol.grant, self.handle_grant)
         self.protocol.register_handler(ReputationProtocol.nack, self.handle_nack)
