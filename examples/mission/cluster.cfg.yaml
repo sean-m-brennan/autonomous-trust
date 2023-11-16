@@ -1,4 +1,4 @@
 !Cfg:__main__.ClusterConfig
 manager: 172.27.3.2
 workers:
-- 172.27.3.240
+- me@172.27.3.240

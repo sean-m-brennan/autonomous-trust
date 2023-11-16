@@ -79,7 +79,7 @@ class PingServer(threading.Thread):
                 except OverflowError:
                     data = (1).to_bytes(4, 'big')
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
-                    print('Echo ping to %s:%s' % (host, ping_snd_port))  # FIXME
+                    self.logger.debug('Echo ping to %s:%s' % (host, ping_snd_port))
                     sent = sock.sendto(data, (host, ping_snd_port))
                     if sent == 0:
                         raise RuntimeError("Socket connection broken (no bytes sent)")

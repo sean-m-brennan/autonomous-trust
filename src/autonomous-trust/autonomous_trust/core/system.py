@@ -1,9 +1,10 @@
+import logging
 import multiprocessing
 import os
 import pkgutil
 import queue
 import sys
-from traceback import print_tb
+import traceback
 from datetime import datetime
 from typing import Union
 
@@ -61,6 +62,7 @@ class PackageHash(object):
     excludes = ['viz']
 
     def __init__(self, pkg_path=None, pkg_name=None, debug=False):
+        self.logger = logging.getLogger()
         self.debug = debug
         self.modules = {}
         if pkg_path is None or pkg_name is None:
@@ -81,10 +83,9 @@ class PackageHash(object):
                 self.modules[name] = module_hash
             except (OSError, TypeError):
                 if self.debug:
-                    print('Skipping ', name)
+                    self.logger.error('Skipping ', name)
         self.digest = blake2b(b''.join([dig for dig in self.modules.values()]))
 
     def onerror(self, name):
         if self.debug:
-            print("Error importing module %s" % name)
-            print_tb(sys.exc_info()[2])
+            self.logger.error("Error importing module %s: %s" % (name, traceback.format_exc()))
