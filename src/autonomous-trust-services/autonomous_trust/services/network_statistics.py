@@ -87,10 +87,11 @@ class NetStatsSource(Process, metaclass=ProcMeta,
                 message = None
             if message:
                 if not self.protocol.run_message_handlers(queues, message):
-                    if message.function == Network.stats_resp:
-                        self.network_source.recv(message.obj)
-                    elif isinstance(message, Message):
-                        self.logger.error('Unhandled message %s' % message.function)
+                    if isinstance(message, Message):
+                        if message.function == Network.stats_resp:
+                            self.network_source.recv(message.obj)
+                        else:
+                            self.logger.error('Unhandled message %s' % message.function)
                     else:
                         self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
 

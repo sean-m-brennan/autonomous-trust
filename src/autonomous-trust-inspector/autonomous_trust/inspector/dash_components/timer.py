@@ -31,7 +31,7 @@ class TimerTitle(DashComponent):
         return html.Div(additional + [
             dbc.Row([
                 dbc.Col(html.Div([title], style={'font-size': 'xx-large'}), width=6),
-                dbc.Col(html.Div([datetime.now().replace(second=0).isoformat(' ').rsplit('.')[0]],
+                dbc.Col(html.Div([datetime.now().replace(second=0).isoformat(' ').rsplit('.')[0] + ' UTC'],
                                  id='time', style={'font-size': 'xx-large'}), width=4),
             ], justify='between'),
         ], id='heading')

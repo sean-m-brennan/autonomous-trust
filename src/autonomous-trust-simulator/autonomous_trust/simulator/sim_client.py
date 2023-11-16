@@ -21,6 +21,9 @@ class SimClient(net.Client):
         # FIXME lock within multiprocessing does not work
         #self.lock = threading.Lock()
 
+    def idle(self):
+        self.callback(SimState(blank=True))  # put into paused state
+
     @property
     def tick(self):
         return self._tick

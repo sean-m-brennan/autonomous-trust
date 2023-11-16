@@ -83,9 +83,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         filename = os.path.join(Configuration.get_cfg_dir(), name + Configuration.yaml_file_ext)
         try:
             with self.lock:  # multiple *threads* may try to save data
-                if isinstance(obj, Configuration):
+                if isinstance(obj, Peers) or isinstance(obj, PeerCapabilities):
                     self.configs[name] = obj
                     obj.to_file(filename)
+                    if isinstance(obj, Peers):
+                        self.update(obj, queues)
                 else:
                     self.configs[name] = obj[0]
                     with open(filename, 'w') as cfg:
@@ -93,13 +95,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                             cfg.write(to_yaml_string((obj[0], obj[1].to_dict())))
                         else:
                             cfg.write(to_yaml_string((obj[0], obj[1])))
-
-                self.update(obj[0], queues)
-                if isinstance(obj[0], Peers):
-                    self.update(obj[1], queues)
+                    self.update(obj[0], queues)
+                    #self.update(obj[1], queues)  # FIXME ??
         except Exception as err:
-            self.logger.error(obj)
-            self.logger.error('Error saving %s: %s' % (name, err))  # FIXME expected SCALAR, SEQUENCE-START, MAPPING-START, or ALIAS
+            self.logger.error('Error saving %s for %s: %s' % (name, obj, err))
             try:
                 if os.path.exists(filename) and os.stat(filename).st_size == 0:
                     os.remove(filename)
@@ -115,7 +114,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     def _record_peers(self, queues):
         self.logger.debug('Add peers')
         self._remember_activity(queues, CfgIds.peers, self.peers)
-        self._remember_activity(queues, CfgIds.peers, self.peer_capabilities)
+        self._remember_activity(queues, CfgIds.capabilities, self.peer_capabilities)
 
     def acquire_capabilities(self, queues):
         start = now()
@@ -180,15 +179,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         accepted = group, steps
             try:
                 if accepted != (None, None):
-                    self.group = accepted[0]
+                    self.group, hist = accepted
                     self.logger.debug('Updated group key')
-                    self._record_group(queues)  # FIXME what about peers?
-                    existing = accepted[1]  # FIXME
+                    self._record_group(queues)  # FIXME what about peers? *****************************
+                    existing = hist  # FIXME
                     # existing = self._history.hear(*accepted[1])  # noqa
                     diff: list[LinkedStep] = self._history.catch_up(existing)
+                    # FIXME dag has digests, not peer data, need peers - use history to verify
 
-                    self.logger.debug('Diff %s' % diff)
-                    print('Diff %s' % diff, file=sys.stderr, flush=True)
+                    self.logger.debug('Diff %s' % diff)  # FIXME remove
                     msg_str = to_yaml_string(diff)  # to self.handle_history_diff()
                     message = Message(self.name, IdentityProtocol.diff, msg_str, to_whom=self.group)
                     self.logger.debug('Send history diff')
@@ -299,7 +298,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=blob.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
-        # now send encrypted history;  to self.receive_history()
+        # now send encrypted history (peer identities);  to self.receive_history()  # FIXME this should contain all peer identities
         msg_str = to_yaml_string((self.group, self._history.recite()))
         message = Message(self.name, IdentityProtocol.history, msg_str, to_whom=blob.identity)
         self.logger.debug('Send full history')
@@ -364,7 +363,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             capabilities = self.peer_potentials[identity.uuid]
             self.peer_capabilities.register(identity.uuid, capabilities)
             self._record_peers(queues)
-            del self.peer_potentials[identity.uuid]
+            try:
+                del self.peer_potentials[identity.uuid]
+            except KeyError:
+                pass  # FIXME but, why? This should have thrown above instead
         # FIXME these may not be necessary: (see self.update())
         queues[CfgIds.main].put(self.peer_capabilities, block=True, timeout=self.q_cadence)
         queues[CfgIds.negotiation].put(self.peer_capabilities, block=True, timeout=self.q_cadence)
