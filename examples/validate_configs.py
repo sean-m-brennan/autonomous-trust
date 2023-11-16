@@ -3,7 +3,8 @@ import os
 import sys
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'lib'))
-from autonomous_trust.core.identity import Identity
+from autonomous_trust.core.identity import Identity, Peers
+from autonomous_trust.core.network import Network
 from autonomous_trust.core import from_yaml_string
 
 
@@ -15,6 +16,7 @@ def validate(directory, expected_groups=1, debug=False):
     grp_uuids = {}
     grp_encryptors = {}
     grp_nicknames = {}
+    peer_count = {}
     etc_count = 0
     identity_files = 0
     group_files = 0
@@ -22,7 +24,10 @@ def validate(directory, expected_groups=1, debug=False):
     missing_idents = []
     missing_groups = []
     missing_peers = []
+    addresses = {}
     for root, dirs, files in os.walk(directory):
+        dirs.sort()
+        files.sort()
         if 'etc' in root:
             for d in dirs:
                 if d == 'at':
@@ -33,6 +38,10 @@ def validate(directory, expected_groups=1, debug=False):
                     missing_groups.append(os.path.dirname(root))
                     missing_peers.append(os.path.dirname(root))
             for file in files:
+                if file == 'network.cfg.yaml':
+                    file = os.path.join(os.path.relpath(root, directory), file)
+                    net = Network.from_file(file)
+                    addresses[os.path.dirname(os.path.dirname(root))] = net.ip4
                 if file == 'identity.cfg.yaml':
                     if debug:
                         print(root, file)
@@ -40,6 +49,7 @@ def validate(directory, expected_groups=1, debug=False):
                     identity_files += 1
                     file = os.path.join(os.path.relpath(root, directory), file)
                     ident = Identity.from_file(file)
+                    addresses[os.path.dirname(os.path.dirname(root))] = ident.address
                     if ident.uuid in seen_uuids:
                         prev = seen_uuids[ident.uuid]
                         print('%s has UUID used in %s' % (file, prev))
@@ -89,6 +99,9 @@ def validate(directory, expected_groups=1, debug=False):
                         print(root, file)
                     missing_peers.remove(os.path.dirname(os.path.dirname(root)))
                     peer_files += 1
+                    file = os.path.join(os.path.relpath(root, directory), file)
+                    peers = Peers.from_file(file)
+                    peer_count[os.path.dirname(os.path.dirname(root))] = len(peers.all)
     ident_diff = etc_count - identity_files
     if ident_diff:
         print('Missing %d identity configs: %s' % (ident_diff, ', '.join(missing_idents)))
@@ -103,6 +116,8 @@ def validate(directory, expected_groups=1, debug=False):
     peer_diff = etc_count - peer_files
     if peer_diff:
         print('Missing %d peer configs: %s' % (peer_diff, ', '.join(missing_peers)))
+    for ident, addr in addresses.items():
+        print('%s: %s (%d peers)' % (ident, addr, peer_count.get(ident, 0)))
 
 
 if __name__ == '__main__':

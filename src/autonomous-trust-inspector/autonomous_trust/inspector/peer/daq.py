@@ -70,7 +70,7 @@ class PeerDataAcq(object):
 class CohortInterface(object):
     def __init__(self, log_level: int = logging.INFO, logfile: str = None):
         self.tick = 0
-        self.paused = False
+        self.paused = True  # always start in paused state
         self.peers: dict[str, PeerDataAcq] = {}
         self._time: datetime = datetime.now()
         self._center = GeoPosition(0, 0)

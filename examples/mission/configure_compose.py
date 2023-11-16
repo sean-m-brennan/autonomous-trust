@@ -73,6 +73,7 @@ class DockerCompose(object):
                   "\n")
 
     def coordinator(self, cfg: TextIO):
+        # if using macvlan, cannot be on the same host as the browser
         interact_deps = ''
         if self.interactive:
             interact_deps = '    stdin_open: true\n    tty: true\n    command: bash -c "%s"\n' % self.command
@@ -86,8 +87,8 @@ class DockerCompose(object):
                   "      - %s/coordinator/etc:/app/etc\n" % self.path +
                   "      - %s/coordinator/var:/app/var\n" % self.path +
                   "    user: %s\n" % self.uid +
-                  "    ports:\n" +
-                  "      - \"8050:8050\"\n" +
+                  # "    ports:\n" +
+                  # "      - \"8050:8050\"\n" +
                   "    networks:\n" +
                   "      - %s\n" % self.network_name +
                   "    cap_add:\n" +
@@ -99,7 +100,7 @@ class DockerCompose(object):
                   "      replicas: 1\n" +
                   "      placement:\n" +
                   "        constraints:\n" +
-                  "          - 'node.role == manager'\n" +
+                  "          - 'node.role == worker'\n" +
                   interact_deps +
                   "\n")
 
@@ -127,9 +128,9 @@ class DockerCompose(object):
                   "      ROUTER: \"%s\"\n" % self.router +
                   "    deploy:\n" +
                   "      replicas: 1\n" +
-                  #"      placement:\n" +
-                  #"        constraints:\n" +
-                  #"          - 'node.role == worker'\n" +
+                  # "      placement:\n" +
+                  # "        constraints:\n" +
+                  # "          - 'node.role == worker'\n" +
                   interact +
                   "\n")
 

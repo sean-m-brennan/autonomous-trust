@@ -180,7 +180,7 @@ if __name__ == '__main__':
         if args.clean or args.pristine:
             delete_files += ['"coordinator.log*"', '"participant???.log*"', 'simulator.log']
         if args.pristine:
-            delete_files += ['group.cfg.yaml', 'peers.cfg.yaml', 'reputation.cfg.yaml']
+            delete_files += ['group.cfg.yaml', 'peers.cfg.yaml', 'peer-capabilities.cfg.yaml', 'reputation.cfg.yaml']
         for cfg_name in delete_files:
             cfg_files = subprocess.getoutput('find %s -name %s' % (working_dir, cfg_name)).strip().split('\n')
             for cfg in cfg_files:

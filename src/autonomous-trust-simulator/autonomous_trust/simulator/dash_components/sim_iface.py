@@ -18,7 +18,6 @@ class SimulationInterface(CohortInterface):
         self.queue = Queue(maxsize=1)
         self.state = None
         self.can_reset = False
-        self.paused = False
         self.tick = 0
         self.sync_objects = sync_objects
         if sync_objects is None:
@@ -27,6 +26,7 @@ class SimulationInterface(CohortInterface):
 
         self.thread = threading.Thread(target=self.client.run, args=(sim_host, sim_port))
         self.thread.start()
+        self.client.idle()
         atexit.register(self.interrupt)
 
     def register_reset_handler(self, handler: Optional[Callable]):
