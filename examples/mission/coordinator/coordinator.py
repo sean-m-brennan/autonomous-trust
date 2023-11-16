@@ -1,8 +1,9 @@
+import logging
 import os
 import sys
 import threading
 
-from autonomous_trust.core import AutonomousTrust, LogLevel, CfgIds, to_yaml_string
+from autonomous_trust.core import AutonomousTrust, LogLevel, CfgIds, to_yaml_string, Process, ProcMeta
 from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.config.generate import generate_identity, generate_worker_config
 from autonomous_trust.core.system import queue_cadence
@@ -15,22 +16,42 @@ from autonomous_trust.services.video.client import VideoRecv
 from autonomous_trust.simulator.dash_components.map_display import MapDisplay, MapUI
 from autonomous_trust.simulator.video.client import VideoSimRcvr
 
+THREADED = True
+
+
+class DisplayProcess(Process, MapDisplay, metaclass=ProcMeta,
+                     proc_name='display', description='Website'):
+    def __init__(self, configurations, subsystems, log_q, dependencies, cohort=None):
+        Process.__init__(self, configurations, subsystems, log_q, dependencies=dependencies)
+        MapDisplay.__init__(self, cohort)
+
+    def process(self, queues, signal):
+        self.run(logger=self.logger, debug=(self.cohort.log_level == logging.DEBUG), verbose=True)  # FIXME
+
 
 class MissionCoordinator(AutonomousTrust):
     def __init__(self, **kwargs):
+        if 'silent' not in kwargs:
+            kwargs['silent'] = True
         super().__init__(**kwargs)
         self.cohort = Cohort(self.queue_pool)
         self.add_worker(CohortTracker, self.system_dependencies, cohort=self.cohort)
-        self.add_worker(VideoSimRcvr, self.system_dependencies, cohort=self.cohort)  # TODO noise?
+        self.add_worker(VideoSimRcvr, self.system_dependencies, cohort=self.cohort)  # TODO add noise?
         self.add_worker(DataRcvr, self.system_dependencies, cohort=self.cohort)
+        if not THREADED:
+            self.add_worker(DisplayProcess, self.system_dependencies, cohort=self.cohort)
 
         self.viz = None
         self.vthread = None
 
     def init_tasking(self, queues):
-        self.viz = MapDisplay(self.cohort)
-        self.vthread = threading.Thread(target=self.viz.run, kwargs={'logger': self.logger})
-        self.vthread.start()
+        if THREADED:
+            self.viz = MapDisplay(self.cohort)
+            self.vthread = threading.Thread(target=self.viz.run,
+                                            kwargs={'logger': self.logger,
+                                                    'debug': self.cohort.log_level == logging.DEBUG,
+                                                    'verbose': True})  # FIXME
+            self.vthread.start()
 
     def autonomous_tasking(self, queues):
         if self.tasking_tick(1):  # every 30 sec
@@ -47,8 +68,9 @@ class MissionCoordinator(AutonomousTrust):
         self._report_unhandled()
 
     def cleanup(self):
-        self.viz.halt = True
-        self.vthread.join()
+        if self.viz is not None:
+            self.viz.halt = True
+            self.vthread.join()
 
 
 if __name__ == '__main__':

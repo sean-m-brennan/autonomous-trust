@@ -30,6 +30,7 @@ Implementation of NTP (RFC-1305), and useful NTP-related functions.
 
 
 import datetime
+import logging
 import select
 import socket
 import struct
@@ -514,34 +515,36 @@ def ref_id_to_text(ref_id, stratum=2):
 
 
 class RecvThread(threading.Thread):
-    def __init__(self, sock, task_q):
+    def __init__(self, sock, task_q, logger):
         threading.Thread.__init__(self)
         self.sock = sock
         self.task_q = task_q
+        self.logger = logger
         self.stop = False
 
     def run(self):
         while True:
             if self.stop:
-                print("RecvThread Ended")
+                self.logger.debug("RecvThread Ended")
                 break
             rlist, wlist, elist = select.select([self.sock], [], [], 1)
             if len(rlist) != 0:
-                print("Received %d packets" % len(rlist))
+                self.logger.debug("Received %d packets" % len(rlist))
                 for tempSocket in rlist:
                     try:
                         data, addr = tempSocket.recvfrom(1024)
                         recv_timestamp = system_to_ntp_time(time.time())
                         self.task_q.put((data, addr, recv_timestamp))
                     except socket.error as msg:
-                        print(msg)
+                        self.logger.error(msg)
 
 
 class WorkThread(threading.Thread):
-    def __init__(self, sock, task_q):
+    def __init__(self, sock, task_q, logger):
         threading.Thread.__init__(self)
         self.sock = sock
         self.task_q = task_q
+        self.logger = logger
         self.stop = False
 
     def run(self):
@@ -567,19 +570,22 @@ class WorkThread(threading.Thread):
                 send_packet.recv_timestamp = recv_timestamp
                 send_packet.tx_timestamp = system_to_ntp_time(time.time())
                 self.sock.sendto(send_packet.to_data(), addr)
-                print("Sent to %s:%d" % (addr[0], addr[1]))
+                self.logger.debug("Sent to %s:%d" % (addr[0], addr[1]))
             except queue.Empty:
                 continue
 
 
 class NTPServer(object):
-    def __init__(self):
+    def __init__(self, logger=None):
+        self.logger = logger
+        if logger is None:
+            self.logger = logging.getLogger()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", 123))
-        print("local socket: ", self.sock.getsockname())
+        self.logger.debug("local socket: ", self.sock.getsockname())
         task_q = queue.Queue()
-        self.recvr = RecvThread(self.sock, task_q)
-        self.worker = WorkThread(self.sock, task_q)
+        self.recvr = RecvThread(self.sock, task_q, self.logger)
+        self.worker = WorkThread(self.sock, task_q, self.logger)
 
     def run(self):
         self.recvr.start()
@@ -588,13 +594,13 @@ class NTPServer(object):
             try:
                 time.sleep(0.5)
             except KeyboardInterrupt:
-                print("Exiting...")
+                self.logger.debug("Exiting...")
                 self.recvr.stop = True
                 self.worker.stop = True
                 self.recvr.join()
                 self.worker.join()
                 self.sock.close()
-                print("Exited")
+                self.logger.debug("Exited")
                 break
 
 # FIXME test and encrypt/sign

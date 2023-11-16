@@ -256,8 +256,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     def _msg_to_queue(self, msg, from_whom, queues, rcvd_by, validate=True):
         try:
             message = Message.parse(msg, from_whom, validate=validate)
-        except TypeError:
-            print('Error parsing: %s' % msg)  # FIXME
+        except TypeError as err:
+            self.logger.error('Error parsing %s: %s' % (msg, err))
             return
         from_addr = from_whom
         if isinstance(from_whom, Identity):

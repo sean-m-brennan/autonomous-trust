@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-#import functools
 import os
 import random
 import sys
@@ -16,7 +15,6 @@ import multiprocessing as mp
 from multiprocessing import Pool as ProcessPool
 from multiprocessing.dummy import Pool as ThreadPool
 from multiprocessing.pool import AsyncResult  # noqa
-#import dill
 from operator import mul, pow
 from decimal import Decimal, getcontext
 
@@ -40,25 +38,6 @@ from .queue_pool import QueuePool
 PoolType = Union[ProcessPool, ThreadPool]
 
 ConfigMap = dict[str, Any]
-
-
-#dill.Pickler.dumps, dill.Pickler.loads = dill.dumps, dill.loads
-#mp.reduction.ForkingPickler = dill.Pickler
-#mp.reduction.dump = dill.dump
-#mp.queues._ForkingPickler = dill.Pickler
-
-
-##############################
-# Pickle cannnot handle lambdas and closures
-#class EncodedFunction(object):
-#    def __init__(self, f):
-#       self.f = dill.dumps(f)
-
-#    @staticmethod
-#    def apply(f: 'EncodedFunction', *args, **kwargs):
-#       import dill  # reimport, just in case this is not available on the new processes
-#       f = dill.loads(f)  # converts bytes to function
-#       return f(*args, **kwargs)
 
 
 def pi(precision):  # intentionally non-trivial, arbitrary precision
@@ -92,7 +71,7 @@ class AutonomousTrust(Protocol):
     # default to production values
     def __init__(self, multiproc: bool = True, log_level: int = LogLevel.WARNING,
                  logfile: str = None, log_classes: list[str] = None, syslog: bool = False,
-                 context: str = Ctx.DEFAULT, testing: bool = False):
+                 context: str = Ctx.DEFAULT, testing: bool = False, silent: bool = False):
         self._stopped_procs: list[str] = []
         if multiproc:
             # Multiprocessing
@@ -137,6 +116,7 @@ class AutonomousTrust(Protocol):
         self._additional_workers: list[tuple[type[Process], list[str], dict[str, Any]]] = []
         self._my_queue: QueueType = self.queue_type()
         self.testing: bool = testing
+        self.silent = silent
         self.active_tasks: dict[str, Task] = {}
         self.active_pids: dict[str, int] = {}
         self.last_tick: dict[int, int] = {}
@@ -144,6 +124,10 @@ class AutonomousTrust(Protocol):
         self.latest_reputation: dict[str, Any] = {}
         self.unhandled_messages: list[Message] = []
         self.peer_count = 0
+
+    def print(self, str):
+        if not self.silent:
+            print(str)
 
     @property
     def queue_type(self):
@@ -292,19 +276,10 @@ class AutonomousTrust(Protocol):
     ####################
     # Protected methods
 
-    #@staticmethod
-    #def _report_success(logger, msg, _):
-    #    logger.debug(msg)
-
-    #@staticmethod
-    #def _report_error(logger, msg, err):
-    #    logger.error(msg % err)
-
-    @staticmethod
-    def _banner():
-        print("")
-        print("You are using\033[94m AutonomousTrust\033[00m v%s from\033[96m TekFive\033[00m." % version)
-        print("")
+    def _banner(self):
+        self.print("")
+        self.print("You are using\033[94m AutonomousTrust\033[00m v%s from\033[96m TekFive\033[00m." % version)
+        self.print("")
 
     @staticmethod
     def _get_cfg_type(path: str):
@@ -456,11 +431,11 @@ class AutonomousTrust(Protocol):
                 elif isinstance(message, Message) and message.function == ReputationProtocol.rep_resp:
                     rep = message.obj
                     if rep.peer_id == self.identity.uuid:
-                        print('My current reputation score:\033[31m %s\033[00m' % rep.score)
+                        self.print('My current reputation score:\033[31m %s\033[00m' % rep.score)
                     else:
                         peer = self.peers.find_by_uuid(rep.peer_id)
                         if peer:
-                            print("%s's current reputation score:\033[31m %s\033[00m" % (peer.nickname, rep.score))
+                            self.print("%s's current reputation score:\033[31m %s\033[00m" % (peer.nickname, rep.score))
                     self.latest_reputation[str(rep.peer_id)] = rep
                 else:
                     self.unhandled_messages.append(message)

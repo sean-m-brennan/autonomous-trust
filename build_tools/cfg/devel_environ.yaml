@@ -2,11 +2,11 @@ name: autonomous_trust
 channels:
   - conda-forge
 dependencies:
-  - python==3.10
+  - python==3.10.*
   - poetry
   - maturin
   - docker-py
-  - gitpython
+  - gitpython>=3.1.35
   - mercurial-app
   - pexpect
   - rsync
@@ -16,7 +16,7 @@ dependencies:
   - pandoc
   - beautifulsoup4
   - pytest
-  - pytest-aiohttp
+  - pytest-aiohttp>=3.8.6
   - pytest-asyncio
   - pytest-cov
   - go

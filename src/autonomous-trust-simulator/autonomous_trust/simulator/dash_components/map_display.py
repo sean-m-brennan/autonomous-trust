@@ -44,9 +44,10 @@ class MapDisplay(object):
         cfg_file = os.path.join(Configuration.get_cfg_dir(), self.name + Configuration.yaml_file_ext)
         self.cfg = Configuration.from_file(cfg_file)
 
-    def run(self, host: str = '0.0.0.0', port: int = 8050, logger: logging.Logger = None, debug: bool = False):
-        log = logging.getLogger('werkzeug')
-        log.setLevel(logging.WARNING)  # reduce useless callback noise from Flask
+    def run(self, host: str = '0.0.0.0', port: int = 8050, logger: logging.Logger = None,
+            debug: bool = False, verbose: bool = False):
+        if not verbose:
+            logging.getLogger('werkzeug').setLevel(logging.WARNING)  # reduce useless callback noise from Flask
 
         if logger is not None:
             logger.info('Dash v%s with Flask v%s' % (dash.__version__, flask.__version__))
@@ -55,9 +56,10 @@ class MapDisplay(object):
                         title='Autonomous Trust Mission', update_title=None,
                         use_pages=True, pages_folder='',
                         prevent_initial_callbacks=True, suppress_callback_exceptions=True)
-        if logger is not None:
+        if isinstance(logger, logging.Logger):
             for handler in logger.handlers:
                 app.server.logger.addHandler(handler)
+        app.use_reloader = False
 
         sim = SimulationInterface(self.cfg.sim_host, self.cfg.sim_port, [self.cohort],
                                   log_level=self.cohort.log_level, logfile=self.cohort.logfile)
