@@ -152,6 +152,19 @@ def run_example(wrk_dir: str, cluster: ClusterConfig, visualize: bool,
                                tools.config.swarm_namespace])
 
 
+def clean(clean, pristine):
+    delete_files = ['network.cfg.yaml']
+    if clean or pristine:
+        delete_files += ['"coordinator.log*"', '"participant???.log*"', 'simulator.log']
+    if pristine:
+        delete_files += ['group.cfg.yaml', 'peers.cfg.yaml', 'peer-capabilities.cfg.yaml', 'reputation.cfg.yaml']
+    for cfg_name in delete_files:
+        cfg_files = subprocess.getoutput('find %s -name %s' % (working_dir, cfg_name)).strip().split('\n')
+        for cfg in cfg_files:
+            if cfg != '':
+                os.remove(cfg)
+
+
 if __name__ == '__main__':
     cwd = os.getcwd()
     lib_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'lib'))
@@ -181,11 +194,12 @@ if __name__ == '__main__':
     if not os.path.exists(cluster_cfg_file):
         print('Required cluster config file (%s) missing for the %s example' % (cluster_cfg_file, args.example))
         sys.exit(1)
-    cluster_cfg = None
-    try:
-        cluster_cfg = Configuration.from_file(cluster_cfg_file)
-    except Exception:
-        traceback.print_exc()
+
+    if args.clean and not args.stop:
+        clean(args.clean, args.pristine)
+        sys.exit(0)
+
+    cluster_cfg = Configuration.from_file(cluster_cfg_file)
     if args.stop:
         try:
             results = subprocess.check_output(['docker', 'service', 'ls'])
@@ -196,16 +210,7 @@ if __name__ == '__main__':
                 cluster_cfg.shutdown()
         except subprocess.CalledProcessError:
             pass
-        delete_files = ['network.cfg.yaml']
-        if args.clean or args.pristine:
-            delete_files += ['"coordinator.log*"', '"participant???.log*"', 'simulator.log']
-        if args.pristine:
-            delete_files += ['group.cfg.yaml', 'peers.cfg.yaml', 'peer-capabilities.cfg.yaml', 'reputation.cfg.yaml']
-        for cfg_name in delete_files:
-            cfg_files = subprocess.getoutput('find %s -name %s' % (working_dir, cfg_name)).strip().split('\n')
-            for cfg in cfg_files:
-                if cfg != '':
-                    os.remove(cfg)
+        clean(args.clean, args.pristine)
     else:
         cluster_cfg.startup(args.without_swarm)
         run_example(working_dir, cluster_cfg, args.viz, args.compose_file, args.without_swarm)
