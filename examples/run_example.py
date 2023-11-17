@@ -184,7 +184,7 @@ if __name__ == '__main__':
     cluster_cfg = None
     try:
         cluster_cfg = Configuration.from_file(cluster_cfg_file)
-    except RuntimeError:
+    except Exception:
         traceback.print_exc()
     if args.stop:
         try:
