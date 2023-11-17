@@ -79,7 +79,7 @@ if __name__ == '__main__':
     cfg_dir = Configuration.get_cfg_dir()
     os.makedirs(cfg_dir, exist_ok=True)
     dat_dir = Configuration.get_data_dir()
-    os.makedirs(os.path.dirname(dat_dir), exist_ok=True)
+    os.makedirs(dat_dir, exist_ok=True)
 
     generate_identity(cfg_dir, preserve=True, defaults=True)  # does nothing if files present (always regen network)
     if '--setup' in sys.argv:
