@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import sys
+import traceback
 
 base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(base_dir)
@@ -18,6 +19,11 @@ def run(command_line: list[str]):
         subprocess.check_call(command_line)
     except subprocess.CalledProcessError:
         pass
+
+
+def get_worker_device(worker):
+    routes = subprocess.check_output(['ssh', worker, 'ip -o -4 route show']).decode().split('\n')
+    return routes[0].split()[4]
 
 
 class ClusterConfig(Configuration):
@@ -37,7 +43,14 @@ class ClusterConfig(Configuration):
             cfg_name = tools.config.network_cfg_name
             cmd = tools.docker.network.create_network(name=cfg_name, config_only=True, force=True)
             for worker in self.workers:
-                run(['ssh', worker, ' '.join(cmd)])
+                dev = get_worker_device(worker)
+                remote_cmd = []
+                for field in list(cmd):
+                    if field.startswith('parent='):
+                        field = 'parent=' + dev
+                    remote_cmd.append(field)
+                print('%s -> %s' % (worker, ' '.join(remote_cmd)))
+                run(['ssh', worker, ' '.join(remote_cmd)])
 
             try:
                 result = subprocess.check_output(['docker', 'swarm', 'join-token', '-q', 'worker'],
@@ -50,10 +63,11 @@ class ClusterConfig(Configuration):
                         token = line.split()[4]
                         addr = line.split()[5]
                         for worker in self.workers:
+                            print(worker)
                             run(['ssh', worker, 'docker swarm join --token %s %s' % (token, addr)])
                         break
 
-            tools.docker.network.create_network(swarm_scope=with_swarm, config_from=cfg_name, force=True)
+            tools.docker.network.create_network(swarm_scope=with_swarm, config_from=cfg_name, force=True, debug=True)
         elif extern_net:
             tools.docker.network.create_network(swarm_scope=with_swarm, force=True)
 
@@ -65,6 +79,8 @@ class ClusterConfig(Configuration):
             run(['docker', 'service', 'rm', service])
         for worker in self.workers:
             run(['ssh', worker, 'docker', 'swarm', 'leave', '--force'])
+            run(['ssh', worker, 'docker', 'network', 'rm', '--force', tools.config.network_cfg_name])
+            run(['ssh', worker, 'docker', 'network', 'prune', '-f'])
         run(['docker', 'network', 'rm', '--force', tools.config.network_name])
         run(['docker', 'swarm', 'leave', '--force'])
         run(['docker', 'network', 'rm', '--force', tools.config.network_cfg_name])
@@ -165,14 +181,18 @@ if __name__ == '__main__':
     if not os.path.exists(cluster_cfg_file):
         print('Required cluster config file (%s) missing for the %s example' % (cluster_cfg_file, args.example))
         sys.exit(1)
-    cluster_cfg = Configuration.from_file(cluster_cfg_file)
+    cluster_cfg = None
+    try:
+        cluster_cfg = Configuration.from_file(cluster_cfg_file)
+    except RuntimeError:
+        traceback.print_exc()
     if args.stop:
         try:
             results = subprocess.check_output(['docker', 'service', 'ls'])
             if 'swarm-viz' in results.decode():
                 run(['docker', 'service', 'rm', 'swarm-viz'])
             run(['docker', 'service', 'rm', tools.config.swarm_namespace + '_registry'])
-            if not args.without_swarm:
+            if not args.without_swarm and cluster_cfg is not None:
                 cluster_cfg.shutdown()
         except subprocess.CalledProcessError:
             pass
