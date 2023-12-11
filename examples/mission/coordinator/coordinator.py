@@ -26,7 +26,7 @@ class DisplayProcess(Process, MapDisplay, metaclass=ProcMeta,
         MapDisplay.__init__(self, cohort)
 
     def process(self, queues, signal):
-        self.run(logger=self.logger, debug=(self.cohort.log_level == logging.DEBUG), verbose=True)  # FIXME
+        self.run(logger=self.logger, debug=(self.cohort.log_level == logging.DEBUG), verbose=False)
 
 
 class MissionCoordinator(AutonomousTrust):
@@ -50,7 +50,7 @@ class MissionCoordinator(AutonomousTrust):
             self.vthread = threading.Thread(target=self.viz.run,
                                             kwargs={'logger': self.logger,
                                                     'debug': self.cohort.log_level == logging.DEBUG,
-                                                    'verbose': True})  # FIXME
+                                                    'verbose': False})
             self.vthread.start()
 
     def autonomous_tasking(self, queues):
@@ -75,7 +75,7 @@ class MissionCoordinator(AutonomousTrust):
 
 if __name__ == '__main__':
     # There can be only one
-    os.environ[Configuration.VARIABLE_NAME] = os.path.dirname(__file__)
+    os.environ[Configuration.ROOT_VARIABLE_NAME] = os.path.dirname(__file__)
     cfg_dir = Configuration.get_cfg_dir()
     os.makedirs(cfg_dir, exist_ok=True)
     dat_dir = Configuration.get_data_dir()

@@ -24,7 +24,8 @@ try:
     from . import __version__ as version
 except ImportError:
     version = '?.?.?'
-from .config import Configuration, to_yaml_string
+from .config import Configuration, to_yaml_string, ConfigMap
+from .config.discover import get_cfg_type, load_configs
 from .processes import Process, LogLevel, ProcessTracker
 from .identity import Peers
 from .capabilities import Capabilities, Capability, PeerCapabilities
@@ -36,8 +37,6 @@ from .reputation import TransactionScore, ReputationProtocol
 from .queue_pool import QueuePool
 
 PoolType = Union[ProcessPool, ThreadPool]
-
-ConfigMap = dict[str, Any]
 
 
 def pi(precision):  # intentionally non-trivial, arbitrary precision
@@ -281,12 +280,6 @@ class AutonomousTrust(Protocol):
         self.print("You are using\033[94m AutonomousTrust\033[00m v%s from\033[96m TekFive\033[00m." % version)
         self.print("")
 
-    @staticmethod
-    def _get_cfg_type(path: str):
-        if path.endswith(Configuration.yaml_file_ext):
-            return os.path.basename(path).removesuffix(Configuration.yaml_file_ext)
-        return path
-
     def _configure(self, start: bool = True):
         # Pull initial state from configuration files
         required = [CfgIds.network, CfgIds.identity, CfgIds.peers, CfgIds.capabilities]
@@ -298,7 +291,7 @@ class AutonomousTrust(Protocol):
 
         # find missing configs, set defaults
         config_files = os.listdir(cfg_dir)
-        cfg_types = list(map(self._get_cfg_type, config_files))
+        cfg_types = list(map(get_cfg_type, config_files))
         for cfg_name in required:
             if cfg_name not in cfg_types:
                 if cfg_name in defaultable:
@@ -308,15 +301,11 @@ class AutonomousTrust(Protocol):
                     return None
 
         # load configs
-        config_files = [x for x in os.listdir(cfg_dir) if x.endswith(Configuration.yaml_file_ext)]
-        config_paths = list(map(lambda x: os.path.join(cfg_dir, x), config_files))
-        for cfg_file in config_paths:
-            configs[self._get_cfg_type(cfg_file)] = Configuration.from_file(cfg_file)
+        configs = load_configs()
 
         package_hash = PackageHash()
         configs[PackageHash.key] = package_hash.digest
         configs[Process.level] = self._log_level
-        configs[Process.key] = []
 
         net_cfg = configs[CfgIds.network]
         self.identity = configs[CfgIds.identity]

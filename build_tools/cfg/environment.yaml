@@ -12,7 +12,7 @@ dependencies:
   - aenum
   - libsass
   - networkx
-  - quart
+  - quart==0.18.3
   - numpy
   - dill
   - py-opencv
@@ -20,14 +20,21 @@ dependencies:
   - msgpack-numpy
   - geopy
   - utm
-  - dash==2.6.2
+  - dash>=2.9.3<=3.0.0
   - dash-bootstrap-components
+  - more-itertools==9.0.0
+  - jsbeautifier==1.14.3
+  - dash-extensions
   - plotly
-  - werkzeug=2.3.7
-  - flask=2.2.2
+  - werkzeug<=2.2.2
+  - flask<=2.2.2
+  - flask-caching==2.0.2
+  - eventlet
   - absl-py
   - python-flatbuffers
   - python-sounddevice
   - pip:
       - dash-iconify
+      - dash-extensions==0.1.12
       - mediapipe
+      - websocket

@@ -1,37 +1,32 @@
 from datetime import datetime
+from logging import Logger
 
-from flask import Flask
-from dash import Dash, html, dcc, Output, Input
 import dash_bootstrap_components as dbc
-from dash.exceptions import PreventUpdate
 
+from .core import DashControl, DashComponent, html
 from ..peer.daq import CohortInterface
-from .util import DashComponent
 
 
 class TimerTitle(DashComponent):
-    def __init__(self, app: Dash, server: Flask, cohort: CohortInterface, with_interval: bool = True):
-        super().__init__(app, server)
-        self.with_interval = with_interval
+    def __init__(self, ctl: DashControl, cohort: CohortInterface, logger: Logger):
+        super().__init__(ctl.app, ctl.server)
+        self.ctl = ctl
+        self.cohort = cohort
+        self.logger = logger
+        self.cohort.register_updater(self.update_time)
 
-        @self.app.callback(Output('time', 'children'),
-                           Input('interval', 'n_intervals'))
-        def update_time(_):
-            if cohort.paused:
-                raise PreventUpdate
-            cohort.update()
-            if cohort.time is None:
-                return
-            return cohort.time.isoformat(' ').rsplit('.')[0]
+    def update_time(self):
+        if self.cohort.time is not None:
+            self.ctl.emit('update_div_text', ['time', [self.cohort.time.isoformat(' ').rsplit('.')[0] + ' Z']])
 
     def div(self, title: str):
-        additional = []
-        if self.with_interval:
-            additional.append(dcc.Interval(id="interval", interval=1000, n_intervals=0))
-        return html.Div(additional + [
+        font_size_elt = 'font-size'
+        if self.uses_react:
+            font_size_elt = 'fontSize'
+        return html.Div([
             dbc.Row([
-                dbc.Col(html.Div([title], style={'font-size': 'xx-large'}), width=6),
-                dbc.Col(html.Div([datetime.now().replace(second=0).isoformat(' ').rsplit('.')[0] + ' UTC'],
-                                 id='time', style={'font-size': 'xx-large'}), width=4),
+                dbc.Col(html.Div([title], style={font_size_elt: 'xx-large'}), width=6),
+                dbc.Col(html.Div([datetime.now().replace(second=0).isoformat(' ').rsplit('.')[0] + ' Z'],
+                                 id='time', style={font_size_elt: 'xx-large'}), width=4),
             ], justify='between'),
         ], id='heading')

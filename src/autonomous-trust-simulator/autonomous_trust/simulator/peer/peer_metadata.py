@@ -36,9 +36,9 @@ class SimMetadata(Metadata):
 
     @classmethod
     def initialize(cls, type_of_peer: str, sim_host: str, sim_port: int = default_port,
-                   data_type: str = None, data_channels: int = 0):
+                   data_meta: dict[str, int] = None):
         uuid = cls.get_assoc_ident().uuid
-        return SimMetadata(sim_host, sim_port, uuid, type_of_peer, data_type, data_channels,
+        return SimMetadata(sim_host, sim_port, uuid, type_of_peer, data_meta,
                            PositionSimSource, TimeSimSource)
 
 

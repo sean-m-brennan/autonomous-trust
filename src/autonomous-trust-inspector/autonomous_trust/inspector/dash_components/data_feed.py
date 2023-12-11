@@ -1,10 +1,10 @@
 from queue import Empty
 
 from flask import Flask
-from dash import Dash, html, dcc
+from dash import Dash
 from plotly import graph_objects as go
 
-from .util import DashComponent
+from .core import DashComponent, html, dcc
 from ..peer.daq import PeerDataAcq
 
 

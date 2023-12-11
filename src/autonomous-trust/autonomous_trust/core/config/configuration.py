@@ -15,6 +15,7 @@ yaml = YAML(typ='safe')
 yaml.default_flow_style = False
 
 
+
 def to_yaml_string(item):
     sio = StringIO()
     yaml.dump(item, sio)
@@ -27,7 +28,7 @@ def from_yaml_string(string):
 
 
 class Configuration(object):
-    VARIABLE_NAME = 'AUTONOMOUS_TRUST_ROOT'
+    ROOT_VARIABLE_NAME = 'AUTONOMOUS_TRUST_ROOT'
     CFG_PATH = os.path.join('etc', 'at')
     DATA_PATH = os.path.join('var', 'at')
     YAML_PREFIX = u'!Cfg'
@@ -36,7 +37,7 @@ class Configuration(object):
 
     @classmethod
     def get_cfg_dir(cls):
-        return os.path.join(os.environ.get(cls.VARIABLE_NAME, os.path.abspath(os.sep)), cls.CFG_PATH)
+        return os.path.join(os.environ.get(cls.ROOT_VARIABLE_NAME, os.path.abspath(os.sep)), cls.CFG_PATH)
 
     @classmethod
     def get_data_dir(cls):

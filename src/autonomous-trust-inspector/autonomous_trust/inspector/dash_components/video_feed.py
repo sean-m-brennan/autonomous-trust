@@ -3,7 +3,7 @@ from queue import Empty
 from flask import Flask, Response
 from dash import Dash, html
 
-from .util import DashComponent
+from .core import DashComponent
 from ..peer.daq import PeerDataAcq
 
 
@@ -15,6 +15,7 @@ class VideoFeed(DashComponent):
         self.peer = peer
         self.halt = False
 
+        # note: cannot be called once the server is running
         self.server.add_url_rule('/video_feed_%s' % self.number, 'video_feed_%s' % self.number,
                                  lambda: Response(self.rcv(), mimetype='multipart/x-mixed-replace; boundary=frame'))
 

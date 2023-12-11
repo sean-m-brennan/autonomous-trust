@@ -6,28 +6,33 @@ from queue import Queue
 from typing import Optional, Callable
 
 from autonomous_trust.inspector.peer.daq import CohortInterface
+from autonomous_trust.inspector.dash_components.core import DashControl
 from ..sim_client import SimClient
 from .. import default_port
 
 
 class SimulationInterface(CohortInterface):
-    def __init__(self, sim_host: str = '127.0.0.1', sim_port: int = default_port,
+    def __init__(self, dash_info: DashControl, sim_host: str = '127.0.0.1', sim_port: int = default_port,
                  sync_objects: list[CohortInterface] = None, log_level: int = logging.INFO, logfile: str = None):
         super().__init__(log_level=log_level, logfile=logfile)
-        self.client = SimClient(callback=self.state_to_queue(), logger=self.logger)
+        self.tick = 0
+        self.app = dash_info.app
+        self.client = SimClient(callback=self.state_to_queue(), logger=self.logger, passive=False)
+        self.thread = threading.Thread(target=self.client.run, args=(sim_host, sim_port))
         self.queue = Queue(maxsize=1)
         self.state = None
         self.can_reset = False
-        self.tick = 0
         self.sync_objects = sync_objects
         if sync_objects is None:
-            self.sync_objects = []
+            self.sync_objects: list[CohortInterface] = []
         self.reset_handler: Optional[Callable] = lambda: None  # additional work to do at reset, set externally
-
-        self.thread = threading.Thread(target=self.client.run, args=(sim_host, sim_port))
-        self.thread.start()
-        self.client.idle()
         atexit.register(self.interrupt)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.client.halt = True
 
     def register_reset_handler(self, handler: Optional[Callable]):
         self.reset_handler = handler
@@ -42,9 +47,9 @@ class SimulationInterface(CohortInterface):
 
     def interrupt(self):
         self.client.halt = True
-        if self.client.sock is not None:
-            self.client.sock.close()
-        self.thread.join()
+        #if self.client.sock is not None:  # FIXME remove
+        #    self.client.sock.close()
+        #self.thread.join()
 
     def state_to_queue(self):
         def cb(state):
@@ -54,13 +59,14 @@ class SimulationInterface(CohortInterface):
         return cb
 
     def update(self, initial=False):
-        """May be called only once per timestep, i.e. synced with UI, synchronizes others"""
+        """May be called only once per timestep, i.e. synced with UI; does not use state data"""
         self.state = self.queue.get()
         for obj in self.sync_objects:
-            obj.tick = self.tick
+            obj.update()  # FIXME also sync paused
         if self.state.blank:
+            self.logger.debug('Sim update; reset %s' % self.state.blank)
             self.paused = True
-            for obj in self.sync_objects:
+            for obj in self.sync_objects:  # FIXME
                 obj.paused = self.paused
             self.can_reset = True
             while self.paused:
@@ -69,3 +75,6 @@ class SimulationInterface(CohortInterface):
             self.reset_handler()
             for obj in self.sync_objects:
                 obj.paused = self.paused
+
+    def acquire_data(self):
+        pass  # update() is overridden above
