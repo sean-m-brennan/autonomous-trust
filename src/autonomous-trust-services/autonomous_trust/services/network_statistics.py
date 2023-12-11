@@ -10,6 +10,7 @@ from autonomous_trust.core.protocol import Protocol
 
 
 class NetworkStats(Configuration):
+    """up rate, down rate, bytes sent, bytes recvd, errors out, errors in"""
     def __init__(self, up: float, down: float, sent: int, recv: int, err_out: int, err_in: int):
         self.up = up
         self.down = down

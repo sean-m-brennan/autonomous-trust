@@ -1,28 +1,32 @@
-from flask import Flask
-from dash import Dash, html, dcc, Output, Input, ctx
+from logging import Logger
+
 import dash_bootstrap_components as dbc
 
 from autonomous_trust.inspector.peer.daq import CohortInterface
-from autonomous_trust.inspector.dash_components.util import make_icon, DashComponent
-from autonomous_trust.inspector.dash_components.dynamic_map import DynamicMap
+from autonomous_trust.inspector.dash_components import make_icon, DashComponent
+from autonomous_trust.inspector.dash_components import DashControl, html, dcc, Output, Input, ctx
+from autonomous_trust.inspector.dash_components import DynamicMap
 
 from .sim_iface import SimulationInterface
 
 
 class SimulationControls(DashComponent):
-    def __init__(self, app: Dash, server: Flask, sim: SimulationInterface, cohort: CohortInterface,
-                 mapp: DynamicMap, max_resolution: int = 300, with_interval: bool = True):
-        super().__init__(app, server)
+    def __init__(self, dash_info: DashControl, sim: SimulationInterface, cohort: CohortInterface,
+                 logger: Logger, mapp: DynamicMap, max_resolution: int = 300, with_interval: bool = True):
+        super().__init__(dash_info.app, dash_info.server)
         self.sim = sim
         self.cohort = cohort
         self.map = mapp
         self.max_resolution = max_resolution
-        self.with_interval = with_interval
+        self.with_interval = with_interval  # prevents interval div duplication
         self.skip = 5
 
         self.pause_txt = make_icon('solar:pause-linear', 'Pause')
         self.play_txt = make_icon('solar:play-linear', 'Play')
-        self.btn_style = {'font-size': '0.75em', 'width': 100}
+        font_size_elt = 'font-size'
+        if self.uses_react:
+            font_size_elt = 'fontSize'
+        self.btn_style = {font_size_elt: '0.75em', 'width': 100}
         self.play_pause = self.pause_txt
         if self.sim.paused:
             self.play_pause = self.play_txt
@@ -41,23 +45,30 @@ class SimulationControls(DashComponent):
                 if self.sim.tick < 1:
                     self.sim.tick = 0
                 self.map.trim_traces(self.skip)
+                logger.debug('Simulation: skip back')
             elif 'slow-btn' == ctx.triggered_id:
                 self.sim.cadence -= self.skip
                 if self.sim.cadence < 1:
                     self.sim.cadence = 1
+                logger.debug('Simulation: slow')
             elif 'pause-btn' == ctx.triggered_id:
                 self.sim.paused = not self.sim.paused
                 self.cohort.paused = self.sim.paused
+                logger.debug('Simulation: %s' % 'paused' if self.sim.paused else 'play')
             elif 'reset-btn' == ctx.triggered_id:
                 self.sim.paused = False
+                self.cohort.paused = self.sim.paused
+                logger.debug('Simulation: reset')
             elif 'fast-btn' == ctx.triggered_id:
                 self.sim.cadence += self.skip
                 if self.sim.cadence > 20:
                     self.sim.cadence = 20
+                logger.debug('Simulation: fast')
             elif 'skip-for-btn' == ctx.triggered_id:
                 self.sim.tick += self.skip
                 if self.sim.tick > self.sim.resolution:
                     self.sim.tick = self.sim.resolution
+                logger.debug('Simulation: skip forward')
             if self.sim.paused:
                 pause_txt = self.play_txt
             else:
@@ -74,6 +85,7 @@ class SimulationControls(DashComponent):
                 self.sim.resolution = resolution
             return html.Div()
 
+        # FIXME replace with websockets???
         @self.app.callback(Output('reset-btn', 'disabled'),
                            Output('pause-btn', 'disabled'),
                            Output('skip-back-btn', 'disabled'),
@@ -82,12 +94,16 @@ class SimulationControls(DashComponent):
                            Output('skip-for-btn', 'disabled'),
                            Input('interval', 'n_intervals'))
         def reset_disabled(_):
+            # FIXME run update elsewhere?
             self.sim.update()  # this is the only call among all components, for sync
             if self.sim.can_reset:
                 return False, True, True, True, True, True
             return True, False, False, False, False, False
 
     def div(self):
+        text_align_elt = 'text-align'
+        if self.uses_react:
+            text_align_elt = 'textAlign'
         additional = []
         if self.with_interval:
             additional.append(dcc.Interval(id="interval", interval=1000, n_intervals=0))
@@ -114,7 +130,7 @@ class SimulationControls(DashComponent):
             dbc.Row([
                 dbc.Col([
                     dcc.Slider(60, self.max_resolution, 30, value=self.sim.resolution, id='resolution-slider'),
-                    html.Div('Simulation Time Resolution (seconds)', style={'text-align': 'center'}),
+                    html.Div('Simulation Time Resolution (seconds)', style={text_align_elt: 'center'}),
                 ]),
             ]),
         ], id='sim_ctrls')
