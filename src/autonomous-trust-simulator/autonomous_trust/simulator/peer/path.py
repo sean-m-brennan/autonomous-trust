@@ -1,5 +1,6 @@
 import math
 import random
+from abc import ABCMeta, abstractmethod
 from datetime import datetime
 from typing import Optional
 
@@ -29,6 +30,10 @@ class ShapeData(Configuration):
     def __init__(self, start: UTMPosition):
         super().__init__()
         self.start = start
+
+
+class PointData(ShapeData):
+    pass  # alias
 
 
 class LineData(ShapeData):
@@ -70,6 +75,8 @@ class EllipseData(ShapeData):
 # ######### Implementations
 
 class PathShape(object):
+    extra_pts = 5
+
     def __init__(self, num_steps: int, data: ShapeData):
         self.num_steps = num_steps
         self.data = data
@@ -77,6 +84,7 @@ class PathShape(object):
         self.prev_prev: Optional[UTMPosition] = None
         self.points: list[UTMPosition] = [self.start]
         self.closed = False
+        self.distance = 0.
 
     @property
     def start(self) -> UTMPosition:
@@ -87,20 +95,23 @@ class PathShape(object):
         """Normalized proportion for dimensions on path"""
         raise NotImplementedError
 
+    def speed(self, elapsed: float) -> float:
+        return self.distance / elapsed
+
     def closest_point(self, step: int) -> UTMPosition:
         """Find position on the path at this step"""
         if self.closed:
             return self.points[step % len(self.points)]
         return self.points[step]
 
-    def move_along(self, var: Variability, speed: float, step: int, cadence: float) -> UTMPosition:
+    def move_along(self, var: Variability, step: int, cadence: float) -> tuple[UTMPosition, float]:
         pos = self.closest_point(step)
 
         # add speed in proportion in each dimension
-        pos.easting += self.bearing[0] * speed * cadence
-        pos.northing += self.bearing[1] * speed * cadence
-        if pos.alt is not None:
-            pos.alt += self.bearing[2] * speed * cadence
+        #pos.easting += self.bearing[0] * self.speed(cadence) * cadence #* step  # FIXME wrong, was * speed * cadence
+        #pos.northing += self.bearing[1] * self.speed(cadence) * cadence
+        #if pos.alt is not None:
+        #    pos.alt += self.bearing[2] * self.speed(cadence) * cadence
 
         # add in variability
         pos.easting += var()
@@ -108,7 +119,7 @@ class PathShape(object):
         if pos.alt is not None:
             pos.alt += var()
         self.prev = pos
-        return pos
+        return pos, self.speed(cadence)
 
     def get_generic_bearing(self, second_pt: UTMPosition):
         first = self.prev_prev
@@ -129,6 +140,8 @@ class PathShape(object):
 
     @classmethod
     def implement_shape(cls, num_steps: int, data: ShapeData) -> 'PathShape':
+        if data.__class__ == PointData:
+            return PointPath(num_steps, data)  # noqa
         if data.__class__ == LineData:
             return LinePath(num_steps, data)  # noqa
         if data.__class__ == BezierData:
@@ -138,6 +151,21 @@ class PathShape(object):
         if data.__class__ == EllipseData:
             return EllipsePath(num_steps, data)  # noqa
         raise RuntimeError('Invalid shape: %s' % data.__class__.__name__)
+
+
+class PointPath(PathShape):
+    def __init__(self, num_steps: int, data: PointData):
+        super().__init__(num_steps, data)
+        self.points = [self.data.start] * (num_steps + self.extra_pts)
+        self.distance = 0.
+
+    @property
+    def end(self) -> UTMPosition:
+        return self.data.start
+
+    @property
+    def bearing(self) -> tuple[float, float, float]:
+        return random.random(), random.random(), random.random()
 
 
 class LinePath(PathShape):
@@ -151,11 +179,13 @@ class LinePath(PathShape):
         dist = self.start.distance(self.end)
         self.points = [self.start]
         prev = self.start
-        for i in range(1, num_steps+1):
+        for i in range(1, num_steps + 1):
             prev = UTMPosition(prev.zone, prev.easting + dist * self._bearing[0],
                                prev.northing + dist * self._bearing[1],
                                prev.alt + dist * self._bearing[2])
             self.points.append(prev)
+        self.points += [self.end] * self.extra_pts
+        self.distance = self.start.distance(self.end)
 
     @property
     def end(self) -> UTMPosition:
@@ -176,6 +206,12 @@ class BezierPath(PathShape):
             self.ctl_pts.append(self.end)
         self.points += self.de_casteljau(num_steps, self.ctl_pts, self.start)
         self.points.append(self.end)
+        self.points += [self.end] * self.extra_pts
+        self.distance = 0
+        p1 = self.start
+        for p2 in self.points[1:]:
+            self.distance += p1.distance(p2)
+            p1 = p2
 
     @property
     def end(self) -> UTMPosition:
@@ -188,6 +224,7 @@ class BezierPath(PathShape):
     @staticmethod
     def de_casteljau(num_steps: int, ctl_pts: list[UTMPosition], ref: UTMPosition) -> list[UTMPosition]:
         """de Casteljau's algorithm for Bezier curves"""
+
         def lerp(pt1: tuple[float, float], pt2: tuple[float, float], t: float) -> tuple[float, float]:
             x1, y1 = pt1
             x2, y2 = pt2
@@ -195,7 +232,7 @@ class BezierPath(PathShape):
             return x1 * s + x2 * t, y1 * s + y2 * t
 
         points = []
-        for step in range(1, num_steps+1):
+        for step in range(1, num_steps + 1):
             pts: list[tuple[float, float]] = [pt.to_tuple() for pt in ctl_pts]
             t = step / float(num_steps)
             n = len(pts)
@@ -209,9 +246,9 @@ class BezierPath(PathShape):
     def bearing(self) -> tuple[float, float, float]:
         return self.get_generic_bearing(self.ctl_pts[0])
 
-    def move_along(self, var: Variability, speed: float, step: int, cadence: float) -> UTMPosition:
+    def move_along(self, var: Variability, step: int, cadence: float) -> UTMPosition:
         self.prev_prev = self.prev
-        return super().move_along(var, speed, step, cadence)
+        return super().move_along(var, step, cadence)
 
 
 class BeziergonPath(PathShape):
@@ -221,8 +258,13 @@ class BeziergonPath(PathShape):
             self.ctl_pts.insert(0, self.start)
             self.ctl_pts.append(self.start)  # closed, must start and end at same point
         for _ in range(data.loops):
-            self.points += BezierPath.de_casteljau(num_steps//data.loops, self.ctl_pts, self.start)
+            self.points += BezierPath.de_casteljau(num_steps // data.loops, self.ctl_pts, self.start)
         self.closed = True
+        self.distance = 0
+        p1 = self.start
+        for p2 in self.points[1:]:
+            self.distance += p1.distance(p2)
+            p1 = p2
 
     @property
     def ctl_pts(self) -> list[UTMPosition]:
@@ -232,9 +274,9 @@ class BeziergonPath(PathShape):
     def bearing(self) -> tuple[float, float, float]:
         return self.get_generic_bearing(self.ctl_pts[0])
 
-    def move_along(self, var: Variability, speed: float, step: int, cadence: float) -> UTMPosition:
+    def move_along(self, var: Variability, step: int, cadence: float) -> UTMPosition:
         self.prev_prev = self.prev
-        return super().move_along(var, speed, step, cadence)
+        return super().move_along(var, step, cadence)
 
 
 class EllipsePath(PathShape):
@@ -247,7 +289,7 @@ class EllipsePath(PathShape):
         pt_idx = 0
 
         points = []
-        for idx, step in enumerate(range(1, (num_steps // data.loops)+1)):
+        for idx, step in enumerate(range(1, (num_steps // data.loops) + 1)):
             t = t_step * idx + math.radians(self.angle)
             if t < 0:
                 t += 2. * math.pi
@@ -269,6 +311,11 @@ class EllipsePath(PathShape):
             self.points += points
         self.data.start = self.points[0]
         self.closed = True
+        self.distance = 0
+        p1 = self.start
+        for p2 in self.points[1:]:
+            self.distance += p1.distance(p2)
+            p1 = p2
 
     @property
     def center(self) -> UTMPosition:
@@ -301,17 +348,18 @@ class PathData(Configuration):
         self.end = end
         self.shape = shape
         self.variability = variability
-        self.speed = speed
-        self.accel = accel
+        self.speed = speed  # FIXME remove
+        self.accel = accel  # FIXME remove
 
 
 class Path(object):
-    def __init__(self, steps: int, cadence: float, data: PathData):
-        self.steps = steps
+    def __init__(self, num_steps: int, cadence: float, data: PathData, start_time: datetime):
+        self.num_steps = num_steps
         self.cadence = cadence
         self.data = data
-        self.shape_impl = PathShape.implement_shape(steps, self.data.shape)
+        self.sub_steps = int((data.end - data.begin).total_seconds() / self.cadence)  # steps in sub-path
+        self.offset = int((data.begin - start_time).total_seconds() / self.cadence) + 1  # start step for path
+        self.shape_impl = PathShape.implement_shape(num_steps, self.data.shape)
 
     def move_along(self, step: int):
-        cur_speed = self.data.speed + self.data.accel()
-        return self.shape_impl.move_along(self.data.variability, cur_speed, step, self.cadence)
+        return self.shape_impl.move_along(self.data.variability, step, self.cadence)

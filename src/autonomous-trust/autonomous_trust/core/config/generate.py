@@ -178,7 +178,7 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
 
 
 def random_config(base_dir, ident: str = None):
-    if Configuration.VARIABLE_NAME in os.environ:
+    if Configuration.ROOT_VARIABLE_NAME in os.environ:
         cfg_dir = Configuration.get_cfg_dir()
     else:
         cfg_dir = os.path.join(base_dir, Configuration.CFG_PATH)
@@ -187,7 +187,7 @@ def random_config(base_dir, ident: str = None):
     if not os.path.isdir(cfg_dir):
         os.makedirs(cfg_dir, exist_ok=True)
         generate_identity(cfg_dir, randomize=True, seed=ident)
-    os.environ[Configuration.VARIABLE_NAME] = cfg_dir
+    os.environ[Configuration.ROOT_VARIABLE_NAME] = cfg_dir
 
 
 def generate_worker_config(cfg_dir: str, proc_name: str, cfg_class: type[InitializableConfig], defaults: bool = False):

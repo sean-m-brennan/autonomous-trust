@@ -1,9 +1,10 @@
 !Cfg:autonomous_trust.simulator.peer.peer_metadata.SimMetadata
-data_channels: 5
-data_type: audio
+data_meta:
+  audio: 5
+  video: 1
 host: simulator
 peer_kind: microdrone
 port: 8778
 position_src_class: autonomous_trust.simulator.peer.peer_metadata.PositionSimSource
 time_src_class: autonomous_trust.simulator.peer.peer_metadata.TimeSimSource
-uuid: 0a4dee86-76a5-4db2-bafb-f707832b8625
+uuid: af56b7d9-e05b-4d4d-9c75-b6f6b2c76fde

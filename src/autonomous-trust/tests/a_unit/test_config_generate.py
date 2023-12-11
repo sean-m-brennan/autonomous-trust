@@ -16,7 +16,7 @@ hex_seed_regex = r'([0-9A-Fa-f]{86}==)'
 
 
 def test_generate_identity(setup_teardown):
-    net, ident, subsys = generate_identity(os.environ[Configuration.VARIABLE_NAME], True)
+    net, ident, subsys = generate_identity(os.environ[Configuration.ROOT_VARIABLE_NAME], True)
 
     ipv6_cidr_regex = ipv6_regex + cidr_regex
     if INSIDE_DOCKER:

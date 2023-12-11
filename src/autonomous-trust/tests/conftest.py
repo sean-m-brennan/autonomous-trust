@@ -18,7 +18,7 @@ base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 def setup(local_net=False):
     test_dir = os.path.join(TEST_DIR, 'etc/at')
     os.makedirs(test_dir, exist_ok=True)
-    os.environ[Configuration.VARIABLE_NAME] = test_dir
+    os.environ[Configuration.ROOT_VARIABLE_NAME] = test_dir
     generate_identity(test_dir, True)
     if local_net:
         net_cfg_file = os.path.join(test_dir, CfgIds.network + Configuration.yaml_file_ext)

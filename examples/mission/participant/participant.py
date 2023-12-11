@@ -33,7 +33,7 @@ if __name__ == '__main__':
         idx = int(sys.argv[1])
     number = str(idx).zfill(3)
 
-    os.environ[Configuration.VARIABLE_NAME] = os.path.join(os.path.dirname(__file__), number)
+    os.environ[Configuration.ROOT_VARIABLE_NAME] = os.path.join(os.path.dirname(__file__), number)
     cfg_dir = Configuration.get_cfg_dir()
     os.makedirs(cfg_dir, exist_ok=True)
     dat_dir = Configuration.get_data_dir()
@@ -45,7 +45,7 @@ if __name__ == '__main__':
     if '--setup' in sys.argv:
         for cfg_name, klass in ((SimMetadataSource.name, SimMetadata),
                                 (VideoSource.name, SimVideoSrc),
-                                (DataSource.name, DataSrc)):
+                                (DataSource.name, DataSrc)):  # FIXME DataSrc does nothing (see Metadata.data_meta)
             generate_worker_config(cfg_dir, cfg_name, klass, True)
 
     time.sleep(random.randint(10, 120))  # delay up to two minutes, but at least ten seconds
