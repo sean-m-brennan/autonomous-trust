@@ -3,6 +3,7 @@ import asyncio
 import quart
 
 from . import network_graph as ng
+from . import social_graphs  # noqa  required import
 from .middleware import SassASGIMiddleware
 
 default_port = 8000
@@ -43,6 +44,8 @@ class VizServer(object):
                             if msg == impl.value:
                                 graph = ng.Graphs.get_graph(impl.value, size, debug)
                                 print(' * Simulating %s network graph' % msg)
+                    if graph is None:
+                        raise RuntimeError('ERROR: no graph for %s' % msg)
                     if msg == 'done':
                         print(' * Simulation done')
                         break

@@ -14,7 +14,7 @@ if __name__ == '__main__':
         randomize = True
     if '--verbose' in sys.argv:
         silent = False
-    if Configuration.VARIABLE_NAME in os.environ:
+    if Configuration.ROOT_VARIABLE_NAME in os.environ:
         cfg_dir = Configuration.get_cfg_dir()
     else:
         cfg_dir = os.path.abspath(os.path.join(dev_root_dir, Configuration.CFG_PATH))

@@ -3,7 +3,7 @@ channels:
   - conda-forge
 dependencies:
   - python==3.10.*
-  - poetry
+  - poetry>=1.6.1
   - maturin
   - docker-py
   - gitpython>=3.1.35

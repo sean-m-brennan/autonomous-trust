@@ -1,139 +1,413 @@
 !Cfg:autonomous_trust.simulator.sim_data.SimConfig
+end: &id001 !datetime 2023-12-09T00:00:00
 peers:
 - !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: !Enumcfg:autonomous_trust.simulator.radio.iface.Antenna PARABOLIC
-  data_streams: []
-  iface: !Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface LARGE
+  antenna: &id011 !Enumcfg:autonomous_trust.simulator.radio.iface.Antenna DIPOLE
+  data_streams:
+  - video003c01
+  iface: &id012 !Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface SMALL
   initial_position: &id003 !Cfg:autonomous_trust.services.peer.position.UTMPosition
-    alt: 5000.0
-    easting: 532963.566963942
-    northing: 3842637.237710807
+    alt: 197.0
+    easting: 533548.4100504565
+    northing: 3840557.439307108
     zone: 16N
-  initial_time: &id001 !datetime 2023-09-20T13:00:00
-  ip4_addr: 192.168.0.1
-  kind: recon
-  last_seen: &id002 !datetime 2023-09-20T13:55:07.276503
-  path: !Cfg:autonomous_trust.simulator.peer.path.PathData
+  initial_time: &id002 !datetime 2023-12-08T23:00:00
+  ip4_addr: 172.27.3.103
+  kind: microdrone
+  last_seen: *id001
+  nickname: Fixer
+  path_list:
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
     accel: &id004 !Enumcfg:autonomous_trust.simulator.peer.path.Variability UNIFORM
-    begin: *id001
-    end: *id002
+    begin: *id002
+    end: &id005 !datetime 2023-12-08T23:24:00
+    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
+      ctl_pts:
+      - &id010 !Cfg:autonomous_trust.services.peer.position.UTMPosition
+        alt: 196.0
+        easting: 534048.4100504565
+        northing: 3842545.1389517114
+        zone: 16N
+      - &id009 !Cfg:autonomous_trust.services.peer.position.UTMPosition
+        alt: 196.0
+        easting: 532478.5459671372
+        northing: 3840557.439307108
+        zone: 16N
+      end: &id006 !Cfg:autonomous_trust.services.peer.position.UTMPosition
+        alt: 195.0
+        easting: 532978.5459671372
+        northing: 3842545.1389517114
+        zone: 16N
+      start: *id003
+    speed: 2.0
+    variability: &id007 !Enumcfg:autonomous_trust.simulator.peer.path.Variability GAUSSIAN
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id005
+    end: &id008 !datetime 2023-12-08T23:36:00
+    shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
+      start: *id006
+    speed: 2.0
+    variability: *id007
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id008
+    end: *id001
+    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
+      ctl_pts:
+      - *id009
+      - *id010
+      end: *id003
+      start: *id006
+    speed: 2.0
+    variability: *id007
+  signal: -200.0
+  uuid: d595e9ed-5600-473f-b551-8670cbf3796d
+- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
+  antenna: *id011
+  data_streams:
+  - audio001c01
+  - audio001c02
+  - audio001c03
+  - audio001c04
+  - audio001c05
+  - video001c01
+  iface: *id012
+  initial_position: *id003
+  initial_time: *id002
+  ip4_addr: 172.27.3.101
+  kind: microdrone
+  last_seen: *id001
+  nickname: Boss
+  path_list:
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id002
+    end: *id005
+    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
+      ctl_pts:
+      - *id010
+      - *id009
+      end: *id006
+      start: *id003
+    speed: 2.0
+    variability: *id007
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id005
+    end: *id008
+    shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
+      start: *id006
+    speed: 2.0
+    variability: *id007
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id008
+    end: *id001
+    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
+      ctl_pts:
+      - *id009
+      - *id010
+      end: *id003
+      start: *id006
+    speed: 2.0
+    variability: *id007
+  signal: -200.0
+  uuid: af56b7d9-e05b-4d4d-9c75-b6f6b2c76fde
+- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
+  antenna: &id014 !Enumcfg:autonomous_trust.simulator.radio.iface.Antenna PARABOLIC
+  data_streams: []
+  iface: &id015 !Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface LARGE
+  initial_position: &id013 !Cfg:autonomous_trust.services.peer.position.UTMPosition
+    alt: 5000.0
+    easting: 532978.5459671372
+    northing: 3842545.1389517114
+    zone: 16N
+  initial_time: *id002
+  ip4_addr: 172.27.3.108
+  kind: recon
+  last_seen: *id001
+  nickname: RQ-86-008
+  path_list:
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id002
+    end: *id001
     shape: !Cfg:autonomous_trust.simulator.peer.path.EllipseData
       angle: -90.0
-      center: *id003
+      center: *id013
       loops: 3
       semi_major: 1800
       semi_minor: 1200
-    speed: 40.2
-    variability: &id005 !Enumcfg:autonomous_trust.simulator.peer.path.Variability GAUSSIAN
+    speed: 90.2
+    variability: *id007
   signal: -1200.0
-  uuid: df5a182d-852e-4481-bd97-22218e732368
+  uuid: 99603269-984d-4bdb-aedd-9918dd14f4c8
 - !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: &id006 !Enumcfg:autonomous_trust.simulator.radio.iface.Antenna DIPOLE
-  data_streams: []
-  iface: &id007 !Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface SMALL
-  initial_position: !Cfg:autonomous_trust.services.peer.position.UTMPosition
-    alt: 183.0
-    easting: 538855.2010666144
-    northing: 3836492.3010855583
-    zone: 16N
-  initial_time: *id001
-  ip4_addr: 192.168.0.2
+  antenna: *id011
+  data_streams:
+  - video002c01
+  iface: *id012
+  initial_position: *id003
+  initial_time: *id002
+  ip4_addr: 172.27.3.102
   kind: microdrone
-  last_seen: *id002
-  path: !Cfg:autonomous_trust.simulator.peer.path.PathData
+  last_seen: *id001
+  nickname: Scorch
+  path_list:
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
     accel: *id004
-    begin: *id001
-    end: *id002
-    shape: &id008 !Cfg:autonomous_trust.simulator.peer.path.BezierData
+    begin: *id002
+    end: *id005
+    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
       ctl_pts:
-      - !Cfg:autonomous_trust.services.peer.position.UTMPosition
-        alt: 190.0
-        easting: 538854.2010666144
-        northing: 3842637.237710807
-        zone: 16N
-      - !Cfg:autonomous_trust.services.peer.position.UTMPosition
-        alt: 190.0
-        easting: 532963.566963942
-        northing: 3836491.3010855583
-        zone: 16N
-      end: !Cfg:autonomous_trust.services.peer.position.UTMPosition
-        alt: 198.0
-        easting: 532963.566963942
-        northing: 3842637.237710807
-        zone: 16N
-      start: !Cfg:autonomous_trust.services.peer.position.UTMPosition
-        alt: 182.0
-        easting: 538854.2010666144
-        northing: 3836491.3010855583
-        zone: 16N
-    speed: 4.4
-    variability: *id005
-  signal: -200.0
-  uuid: 2ef2a68f-d596-4f4f-a1c5-d5e484eb6786
-- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: *id006
-  data_streams: []
-  iface: *id007
-  initial_position: !Cfg:autonomous_trust.services.peer.position.UTMPosition
-    alt: 184.0
-    easting: 538856.2010666144
-    northing: 3836493.3010855583
-    zone: 16N
-  initial_time: *id001
-  ip4_addr: 192.168.0.3
-  kind: microdrone
-  last_seen: *id002
-  path: !Cfg:autonomous_trust.simulator.peer.path.PathData
+      - *id010
+      - *id009
+      end: *id006
+      start: *id003
+    speed: 2.0
+    variability: *id007
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
     accel: *id004
-    begin: *id001
-    end: *id002
-    shape: *id008
-    speed: 4.3
-    variability: *id005
-  signal: -200.0
-  uuid: 71a2046a-1bf4-4593-a746-a2e6964571de
-- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: *id006
-  data_streams: []
-  iface: *id007
-  initial_position: !Cfg:autonomous_trust.services.peer.position.UTMPosition
-    alt: 185.0
-    easting: 538857.2010666144
-    northing: 3836494.3010855583
-    zone: 16N
-  initial_time: *id001
-  ip4_addr: 192.168.0.4
-  kind: microdrone
-  last_seen: *id002
-  path: !Cfg:autonomous_trust.simulator.peer.path.PathData
+    begin: *id005
+    end: *id008
+    shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
+      start: *id006
+    speed: 2.0
+    variability: *id007
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
     accel: *id004
-    begin: *id001
-    end: *id002
-    shape: *id008
-    speed: 4.5
-    variability: *id005
+    begin: *id008
+    end: *id001
+    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
+      ctl_pts:
+      - *id009
+      - *id010
+      end: *id003
+      start: *id006
+    speed: 2.0
+    variability: *id007
   signal: -200.0
-  uuid: 65c49524-567f-4de9-a87b-2f601b517cf1
+  uuid: c7b2c7f1-572f-464d-8661-a736ddba729a
 - !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: *id006
-  data_streams: []
-  iface: *id007
-  initial_position: !Cfg:autonomous_trust.services.peer.position.UTMPosition
-    alt: 186.0
-    easting: 538858.2010666144
-    northing: 3836495.3010855583
-    zone: 16N
-  initial_time: *id001
-  ip4_addr: 192.168.0.5
+  antenna: *id011
+  data_streams:
+  - comm004c01
+  - comm004c02
+  - comm004c03
+  - comm004c04
+  - comm004c05
+  - comm004c06
+  - comm004c07
+  - comm004c08
+  - comm004c09
+  - comm004c10
+  - video004c01
+  iface: *id012
+  initial_position: *id003
+  initial_time: *id002
+  ip4_addr: 172.27.3.104
   kind: microdrone
-  last_seen: *id002
-  path: !Cfg:autonomous_trust.simulator.peer.path.PathData
+  last_seen: *id001
+  nickname: Sev
+  path_list:
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
     accel: *id004
-    begin: *id001
-    end: *id002
-    shape: *id008
-    speed: 4.1
-    variability: *id005
+    begin: *id002
+    end: *id005
+    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
+      ctl_pts:
+      - *id010
+      - *id009
+      end: *id006
+      start: *id003
+    speed: 2.0
+    variability: *id007
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id005
+    end: *id008
+    shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
+      start: *id006
+    speed: 2.0
+    variability: *id007
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id008
+    end: *id001
+    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
+      ctl_pts:
+      - *id009
+      - *id010
+      end: *id003
+      start: *id006
+    speed: 2.0
+    variability: *id007
   signal: -200.0
-  uuid: 1254216d-8c73-40b4-a8bb-d2617eccf029
-time: *id001
+  uuid: 4767eaf1-92e3-4a64-b04e-6384e60802dc
+- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
+  antenna: *id011
+  data_streams: []
+  iface: *id012
+  initial_position: *id003
+  initial_time: *id002
+  ip4_addr: 172.27.3.106
+  kind: soldier
+  last_seen: *id001
+  nickname: CWONovosel
+  path_list:
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id002
+    end: *id005
+    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
+      ctl_pts:
+      - *id010
+      - *id009
+      end: *id006
+      start: *id003
+    speed: 1.2
+    variability: *id007
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id005
+    end: *id008
+    shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
+      start: *id006
+    speed: 0
+    variability: *id007
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id008
+    end: *id001
+    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
+      ctl_pts:
+      - *id009
+      - *id010
+      end: *id003
+      start: *id006
+    speed: 1.6
+    variability: *id007
+  signal: -200.0
+  uuid: 9ce3e8ef-2767-4063-b8e8-e00efe24cc20
+- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
+  antenna: *id011
+  data_streams:
+  - video005c01
+  iface: *id012
+  initial_position: *id003
+  initial_time: *id002
+  ip4_addr: 172.27.3.105
+  kind: soldier
+  last_seen: *id001
+  nickname: SGMPayne
+  path_list:
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id002
+    end: *id005
+    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
+      ctl_pts:
+      - *id010
+      - *id009
+      end: *id006
+      start: *id003
+    speed: 1.2
+    variability: *id007
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id005
+    end: *id008
+    shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
+      start: *id006
+    speed: 0
+    variability: *id007
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id008
+    end: *id001
+    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
+      ctl_pts:
+      - *id009
+      - *id010
+      end: *id003
+      start: *id006
+    speed: 1.6
+    variability: *id007
+  signal: -200.0
+  uuid: fc69acad-797a-4e63-be98-2f00ea26dffa
+- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
+  antenna: *id014
+  data_streams:
+  - comm007c01
+  - comm007c02
+  - comm007c03
+  - comm007c04
+  - comm007c05
+  - comm007c06
+  - comm007c07
+  - comm007c08
+  - comm007c09
+  - comm007c10
+  - comm007c11
+  - comm007c12
+  - comm007c13
+  - comm007c14
+  - comm007c15
+  - comm007c16
+  - comm007c17
+  - comm007c18
+  - comm007c19
+  - comm007c20
+  iface: *id015
+  initial_position: *id013
+  initial_time: *id002
+  ip4_addr: 172.27.3.107
+  kind: recon
+  last_seen: *id001
+  nickname: RQ-86-007
+  path_list:
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id002
+    end: *id001
+    shape: !Cfg:autonomous_trust.simulator.peer.path.EllipseData
+      angle: 90.0
+      center: *id013
+      loops: 3
+      semi_major: 1200
+      semi_minor: -1800
+    speed: 90.2
+    variability: *id007
+  signal: -1200.0
+  uuid: 1cb38d6b-7443-48a1-8f87-6f77d9cfea24
+- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
+  antenna: !Enumcfg:autonomous_trust.simulator.radio.iface.Antenna YAGI
+  data_streams: []
+  iface: *id015
+  initial_position: &id017 !Cfg:autonomous_trust.services.peer.position.UTMPosition
+    alt: 400.0
+    easting: 550009.4806139951
+    northing: 3842621.8774011643
+    zone: 16N
+  initial_time: &id016 !datetime 2023-12-08T23:21:00
+  ip4_addr: 172.27.3.109
+  kind: jet
+  last_seen: *id001
+  nickname: ColJones
+  path_list:
+  - !Cfg:autonomous_trust.simulator.peer.path.PathData
+    accel: *id004
+    begin: *id016
+    end: *id001
+    shape: !Cfg:autonomous_trust.simulator.peer.path.EllipseData
+      angle: 135.0
+      center: *id017
+      loops: 1
+      semi_major: 18000
+      semi_minor: 480
+    speed: 203.4
+    variability: *id007
+  signal: -1200.0
+  uuid: b305dc70-b39d-4150-aafa-2bfb7fe4dc58
+start: *id002

@@ -106,11 +106,11 @@ def test_serialization(configs):
         assert cfg == cfg2
 
 
-def path_tester(cfg, locs, confirm):
+def path_tester(cfg, locs, times, confirm):
     prev, _ = locs
     path_data = PathData.from_yaml_string(cfg)
     assert cfg == path_data.to_yaml_string()
-    path = Path(steps, cadence, path_data)
+    path = Path(steps, cadence, path_data, times[0])
     pts = []
     for step in range(1, steps+1):
         pos = path.move_along(step)
@@ -120,19 +120,19 @@ def path_tester(cfg, locs, confirm):
     return pts
 
 
-def test_line_path(line_cfg, locations):
+def test_line_path(line_cfg, locations, times):
     def confirm(_, prev, pos):
         assert prev.easting > pos.easting
         assert prev.northing < pos.northing
 
     start, end = locations
     pts = [start]
-    pts += path_tester(line_cfg, locations, confirm)
+    pts += path_tester(line_cfg, locations, times, confirm)
     pts.append(end)
     plot_shape(pts, start, end)
 
 
-def test_bezier_path(bezier_cfg, locations):
+def test_bezier_path(bezier_cfg, locations, times):
     def confirm(step, prev, pos):
         if step != 11:  # 11 is on cusp
             assert prev.easting > pos.easting
@@ -140,13 +140,13 @@ def test_bezier_path(bezier_cfg, locations):
 
     start, end = locations
     pts = [start]
-    pts += path_tester(bezier_cfg, locations, confirm)
+    pts += path_tester(bezier_cfg, locations, times, confirm)
     pts.append(end)
     path = PathData.from_yaml_string(bezier_cfg)
     plot_shape(pts, path.shape.start, path.shape.end, path.shape.ctl_pts)
 
 
-def test_beziergon_path(beziergon_cfg, locations):
+def test_beziergon_path(beziergon_cfg, locations, times):
     def confirm(step, prev, pos):
         loop = step // (steps // loops)
         start = loop * (steps // loops)
@@ -163,12 +163,12 @@ def test_beziergon_path(beziergon_cfg, locations):
 
     start, _ = locations
     pts = [start]
-    pts += path_tester(beziergon_cfg, locations, confirm)
+    pts += path_tester(beziergon_cfg, locations, times, confirm)
     path = PathData.from_yaml_string(beziergon_cfg)
     plot_shape(pts, path.shape.start, extras=path.shape.ctl_pts)
 
 
-def test_ellipse_path(ellipse_cfg, locations):
+def test_ellipse_path(ellipse_cfg, locations, times):
     def confirm(step, prev, pos):
         loop = step // (steps // loops)
         start = loop * (steps // loops)
@@ -192,6 +192,6 @@ def test_ellipse_path(ellipse_cfg, locations):
             assert prev.northing < pos.northing
 
     start, _ = locations
-    pts = path_tester(ellipse_cfg, locations, confirm)
+    pts = path_tester(ellipse_cfg, locations, times, confirm)
     path = PathData.from_yaml_string(ellipse_cfg)
     plot_shape(pts, path.shape.center, extras=[path.shape.start])

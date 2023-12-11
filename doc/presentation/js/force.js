@@ -1,1 +1,1 @@
-../../../autonomous_trust/viz/js/force.js
+../../../src/autonomous-trust-inspector/autonomous_trust/inspector/viz/js/force.js

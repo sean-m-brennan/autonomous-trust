@@ -1,7 +1,9 @@
 import logging
 import sys
+from collections import deque
 from datetime import datetime, timedelta
-from queue import Empty
+from queue import Empty, Queue
+from typing import Callable
 
 from autonomous_trust.core import Process, ProcMeta, CfgIds, from_yaml_string, QueueType
 from autonomous_trust.core.automate import QueuePool
@@ -14,11 +16,13 @@ from autonomous_trust.services.peer.metadata import MetadataProtocol, MetadataSo
 from autonomous_trust.services.peer.position import Position, GeoPosition
 
 
-NullPeerData = lambda: PeerData(datetime.utcfromtimestamp(0), Position(0, 0), '', '', 0)  # noqa
+NullPeerData = lambda: PeerData(datetime.utcfromtimestamp(0), Position(0, 0), 0., '', '', 0)  # noqa
 
 
 class PeerDataAcq(object):
     """Peer acquired-data store"""
+    max_history = 20
+
     def __init__(self, uuid: str, ident: Identity, metadata: PeerData, cohort: 'CohortInterface',
                  video_stream: QueueType, data_stream: QueueType):
         self._uuid = uuid
@@ -27,12 +31,9 @@ class PeerDataAcq(object):
         self.cohort = cohort
         self.video_stream = video_stream
         self.data_stream = data_stream
-        self.network_history: dict[str, list[NetworkStats]] = {}
-        self.reputation = 0.
-
-    @property
-    def tick(self):
-        return self.cohort.tick
+        self.active = True
+        self.network_history: dict[str, deque[NetworkStats]] = {}
+        self.reputation_history: deque[float] = deque(maxlen=self.max_history)
 
     @property
     def time(self):
@@ -69,8 +70,7 @@ class PeerDataAcq(object):
 
 class CohortInterface(object):
     def __init__(self, log_level: int = logging.INFO, logfile: str = None):
-        self.tick = 0
-        self.paused = True  # always start in paused state
+        self.paused = False #True  # always start in paused state  FIXME!
         self.peers: dict[str, PeerDataAcq] = {}
         self._time: datetime = datetime.now()
         self._center = GeoPosition(0, 0)
@@ -88,6 +88,8 @@ class CohortInterface(object):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.logger.addHandler(handler)
         self.logger.setLevel(log_level)
+        self.updaters: list[Callable[[], None]] = []
+        self.browser_connected = 0
 
     @property
     def center(self) -> Position:
@@ -97,7 +99,27 @@ class CohortInterface(object):
     def time(self) -> datetime:
         return self._time
 
-    def update(self):
+    def register_updater(self, updater: Callable[[], None]):
+        self.updaters.append(updater)
+
+    def deregister_updater(self, updater: Callable[[], None]):
+        self.updaters.remove(updater)
+
+    def update(self, initial: bool = False):
+        if initial:
+            self.acquire_data()
+        elif self.browser_connected > 0 and not self.paused:
+            self.acquire_data()
+            for updater in self.updaters:
+                updater()
+
+    def acquire_data(self):
+        raise NotImplementedError
+
+    def start(self):
+        raise NotImplementedError
+
+    def stop(self):
         raise NotImplementedError
 
 
@@ -108,8 +130,11 @@ class Cohort(CohortInterface):
         super().__init__(**kwargs)
         self.queue_pool = queue_pool
 
-    def update(self):
+    def start(self):
         pass
+
+    def acquire_data(self):
+        pass  # FIXME trouble??
 
     def update_group(self, group_ids: dict[str, Identity]):
         for uuid in group_ids:

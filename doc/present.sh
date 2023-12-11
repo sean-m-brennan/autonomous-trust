@@ -1,19 +1,20 @@
 #!/bin/bash
 
 this_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-src_dir=${this_dir}/../src
+base_dir=${this_dir}/..
 
-source ${src_dir}/trust/conda/init_conda
+# FIXME no longer exits
+#source ${base_dir}/trust/conda/init_conda
 
 # Enable job control
 set -m
 
 port=8888
 
-activate_conda autonomous_trust
+#activate_conda autonomous_trust
 
-export PYTHONPATH=${src_dir}/inspector
-python3 -m autonomous_inspector.viz --directory "$PWD"/doc/presentation --port $port &
+export PYTHONPATH=${base_dir}
+python3 -m autonomous_trust.inspector.viz --directory "${base_dir}"/doc/presentation --port $port &
 sim_pid=$!
 sleep 1
 xdg-open http://localhost:$port

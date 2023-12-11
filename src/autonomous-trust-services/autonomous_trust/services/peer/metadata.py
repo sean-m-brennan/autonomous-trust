@@ -11,9 +11,10 @@ from .position import Position
 
 
 class PeerData(Configuration):
-    def __init__(self, time, position, kind, data_type, data_channels):
+    def __init__(self, time, position, speed, kind, data_type, data_channels):
         self.time = time
         self.position = position
+        self.speed = speed
         self.kind = kind
         self.data_type = data_type
         self.data_channels = data_channels
@@ -31,16 +32,16 @@ class TimeSource(object):
 
 
 class PositionSource(object):
-    def acquire(self) -> Position:
+    def acquire(self) -> tuple[Position, float]:
         raise NotImplementedError
 
 
 class Metadata(InitializableConfig):
-    def __init__(self, uuid, peer_kind, data_type, data_channels, position_src_class, time_src_class=None):
+    def __init__(self, uuid: str, peer_kind: str, data_meta: dict[str, int],
+                 position_src_class: type, time_src_class: type = None):
         self.uuid = uuid
         self.peer_kind = peer_kind
-        self.data_type = data_type
-        self.data_channels = data_channels
+        self.data_meta = data_meta
         self.position_src_class = self.class_to_name(position_src_class)
         if time_src_class is None:
             self.time_src_class = self.class_to_name(TimeSource)
@@ -73,10 +74,10 @@ class Metadata(InitializableConfig):
         return Identity.from_file(cfg_file)
 
     @classmethod
-    def initialize(cls, peer_kind: str, data_type: str, data_channels: int,
-                   position_source: PositionSource, time_source: TimeSource = None):
+    def initialize(cls, peer_kind: str, data_meta: dict[str, int],
+                   position_source: type, time_source: type = None):
         uuid = cls.get_assoc_ident().uuid
-        return Metadata(uuid, peer_kind, data_type, data_channels, position_source, time_source)
+        return Metadata(uuid, peer_kind, data_meta, position_source, time_source)
 
 
 class MetadataSource(Process, metaclass=ProcMeta,
@@ -110,8 +111,8 @@ class MetadataSource(Process, metaclass=ProcMeta,
                         self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
 
             time = self.cfg.time_source.acquire()
-            position = self.cfg.position_source.acquire()
-            obj = PeerData(time, position, self.cfg.peer_kind,
+            position, speed = self.cfg.position_source.acquire()
+            obj = PeerData(time, position, speed, self.cfg.peer_kind,
                            self.cfg.data_type, self.cfg.data_channels).to_yaml_string()
             for peer in self.clients:
                 msg = Message('daq', MetadataProtocol.metadata, obj, peer)
