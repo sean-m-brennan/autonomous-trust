@@ -1,5 +1,5 @@
 !Cfg:autonomous_trust.simulator.sim_data.SimConfig
-end: &id001 !datetime 2023-12-09T00:00:00
+end: &id001 !datetime 2023-12-12T13:00:00
 peers:
 - !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
   antenna: &id011 !Enumcfg:autonomous_trust.simulator.radio.iface.Antenna DIPOLE
@@ -11,7 +11,7 @@ peers:
     easting: 533548.4100504565
     northing: 3840557.439307108
     zone: 16N
-  initial_time: &id002 !datetime 2023-12-08T23:00:00
+  initial_time: &id002 !datetime 2023-12-12T12:00:00
   ip4_addr: 172.27.3.103
   kind: microdrone
   last_seen: *id001
@@ -20,7 +20,7 @@ peers:
   - !Cfg:autonomous_trust.simulator.peer.path.PathData
     accel: &id004 !Enumcfg:autonomous_trust.simulator.peer.path.Variability UNIFORM
     begin: *id002
-    end: &id005 !datetime 2023-12-08T23:24:00
+    end: &id005 !datetime 2023-12-12T12:24:00
     shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
       ctl_pts:
       - &id010 !Cfg:autonomous_trust.services.peer.position.UTMPosition
@@ -44,7 +44,7 @@ peers:
   - !Cfg:autonomous_trust.simulator.peer.path.PathData
     accel: *id004
     begin: *id005
-    end: &id008 !datetime 2023-12-08T23:36:00
+    end: &id008 !datetime 2023-12-12T12:33:00
     shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
       start: *id006
     speed: 2.0
@@ -390,7 +390,7 @@ peers:
     easting: 550009.4806139951
     northing: 3842621.8774011643
     zone: 16N
-  initial_time: &id016 !datetime 2023-12-08T23:21:00
+  initial_time: &id016 !datetime 2023-12-12T12:21:40
   ip4_addr: 172.27.3.109
   kind: jet
   last_seen: *id001

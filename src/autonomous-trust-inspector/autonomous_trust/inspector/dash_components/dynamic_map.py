@@ -11,7 +11,6 @@ from autonomous_trust.services.peer.position import GeoPosition
 from .core import DashControl, DashComponent, html, dcc, Output, Input, ctx
 from ..peer.daq import CohortInterface
 
-
 Coord = namedtuple('Coord', 'lat lon')
 
 
@@ -22,7 +21,7 @@ class DynamicMap(DashComponent):
     default_scale = 10000
 
     def __init__(self, ctl: DashControl, cohort: CohortInterface, logger: Logger, size: int = 600, style: str = 'dark'):
-        super().__init__(ctl.app, ctl.server)
+        super().__init__(ctl.app)
         self.ctl = ctl
         self.cohort = cohort
         self.logger = logger
@@ -44,28 +43,30 @@ class DynamicMap(DashComponent):
         self.following: str = ''
         self.center = None
         self.initialized = False
+        self.peer_tracker: dict[str, bool] = {}
 
-        @self.app.callback(Output('map-slider-target', 'children'),
-                           Input('pitch-slider', 'value'),
-                           Input('bearing-slider', 'value'),
-                           prevent_initial_call=True)
+        @ctl.callback(Output('map-slider-target', 'children'),
+                      [Input('pitch-slider', 'value'),
+                       Input('bearing-slider', 'value')],
+                      # prevent_initial_call=True
+                      )
         def handle_sliders(pitch, bearing):
             if 'pitch-slider' == ctx.triggered_id:
                 self.pitch = pitch
             elif 'bearing-slider' == ctx.triggered_id:
                 self.bearing = bearing
-            return html.Div()
+            return ''
 
-        @self.app.callback(Output('div-null', 'children'),
-                           Input('map-graph', 'relayoutData'))
-        def get_map_scale(relayout):
-            if relayout is not None:
+        @ctl.callback(Output('map-scale-target', 'children'),
+                      [Input('map-graph', 'relayoutData')])
+        def get_map_scale(relay_out):
+            if relay_out is not None:
                 if self.use_mapbox:
-                    if 'mapbox.zoom' in relayout:
-                        self.z_scale = relayout['mapbox.zoom']
+                    if 'mapbox.zoom' in relay_out:
+                        self.z_scale = relay_out['mapbox.zoom']
                 else:
-                    if 'geo.projection.scale' in relayout:
-                        self.z_scale = relayout['geo.projection.scale']
+                    if 'geo.projection.scale' in relay_out:
+                        self.z_scale = relay_out['geo.projection.scale']
             return ''
 
         self.basic_layout = dict(showlegend=False, autosize=False, hovermode='closest',
@@ -90,18 +91,24 @@ class DynamicMap(DashComponent):
         if self.skip_trace:
             self.skip_trace = False
         else:
-            for uuid in self.cohort.peers:
+            for idx, uuid in enumerate(self.cohort.peers):
                 if not self.cohort.peers[uuid].active:
+                    self.peer_tracker[uuid] = False
                     continue
                 position = self.cohort.peers[uuid].position.convert(GeoPosition)
                 if uuid not in self.coords:
                     self.coords[uuid] = Coord(deque(maxlen=self.trace_len), deque(maxlen=self.trace_len))
                 self.coords[uuid].lat.append(position.x)
                 self.coords[uuid].lon.append(position.y)
-                self.fig.update_traces(selector=dict(name=uuid), mode='lines', overwrite=True,
-                                       lat=list(self.coords[uuid].lat), lon=list(self.coords[uuid].lon))
-                self.fig.update_traces(selector=dict(name='mark-%s' % uuid), mode='markers', overwrite=True,
-                                       lat=[self.coords[uuid].lat[-1]], lon=[self.coords[uuid].lon[-1]])
+                if uuid in self.peer_tracker and self.peer_tracker[uuid] is True:
+                    # traces already created
+                    self.fig.update_traces(selector=dict(name=uuid), mode='lines', overwrite=True,
+                                           lat=list(self.coords[uuid].lat), lon=list(self.coords[uuid].lon))
+                    self.fig.update_traces(selector=dict(name='mark-%s' % uuid), mode='markers', overwrite=True,
+                                           lat=[self.coords[uuid].lat[-1]], lon=[self.coords[uuid].lon[-1]])
+                else:
+                    self.add_traces(idx, uuid)
+                    self.peer_tracker[uuid] = True
                 if self.following == uuid:
                     # FIXME disable previous marker
                     self.center = GeoPosition(self.coords[uuid].lat[-1], self.coords[uuid].lon[-1])
@@ -118,16 +125,19 @@ class DynamicMap(DashComponent):
                                                         zoom=self.z_scale,
                                                         pitch=self.pitch,
                                                         bearing=self.bearing,
-                                                        ),),
+                                                        ), ),
                                        True)
             else:
                 self.fig.update_layout(dict(**self.basic_layout,
                                             geo=dict(center=dict(lat=self.center.lat, lon=self.center.lon),
                                                      projection=dict(scale=self.z_scale),
-                                                     ),),
+                                                     ), ),
                                        True)
-        config = dict(displayModeBar=False)
-        self.ctl.emit('update_graph_figure', ['map-graph', self.fig.to_dict(), config])
+        if self.ctl.legacy:
+            config = dict(displayModeBar=False)
+            self.ctl.emit('update_figure', ['map-graph', self.fig.to_dict(), config])
+        else:
+            self.ctl.push_mods({'map-graph': {'figure': self.fig.to_dict()}})
 
     def trim_traces(self, num: int):
         for uuid in self.cohort.peers:
@@ -139,7 +149,8 @@ class DynamicMap(DashComponent):
 
     def div(self):
         return html.Div([
-            html.Div(id='div-null', style={'display': 'none'}),
+            html.Div(id='map-scale-target', style={'display': 'none'}),
+            html.Div(id='map-slider-target', style={'display': 'none'}),
             dbc.Row([
                 dbc.Col([
                     dbc.Stack([
@@ -148,7 +159,8 @@ class DynamicMap(DashComponent):
                             dcc.Slider(0, self.max_pitch, 5, value=self.pitch,
                                        id='pitch-slider', vertical=True, verticalHeight=self.height),
                         ]),
-                        dcc.Graph(id='map-graph', figure=self.fig, config=dict(displayModeBar=False),),
+                        dcc.Graph(id='map-graph', figure=self.fig, config=dict(displayModeBar=False),
+                                  animate=True),
                     ], direction="horizontal"),
                 ]),
             ]),
@@ -162,34 +174,40 @@ class DynamicMap(DashComponent):
             ]),
         ])
 
+    def add_traces(self, idx, uuid):
+        position = self.cohort.peers[uuid].position.convert(GeoPosition)
+        scatter = go.Scattergeo
+        if self.use_mapbox:
+            scatter = go.Scattermapbox
+        self.color_map[uuid] = colors.qualitative.Light24[idx]
+        self.fig.add_trace(scatter(lat=[position.lat], lon=[position.lon],
+                                   mode='markers', marker=dict(color=self.color_map[uuid], opacity=.7),
+                                   name='mark-%s' % uuid))
+        self.fig.add_trace(scatter(lat=[position.lat], lon=[position.lon],
+                                   mode='lines', line=dict(color=self.color_map[uuid], width=3),
+                                   name=uuid))
+        self.fig.add_trace(scatter(lat=[0], lon=[0],
+                                   mode='markers', marker=dict(color='white', size=5, opacity=.5),
+                                   name='follow-%s' % uuid))
+
     def acquire_initial_conditions(self):
         # reset
         self.fig = go.Figure()
-        self.coords = {}
-        self.color_map = {}
+        self.coords: dict[str, GeoPosition] = {}
+        self.color_map: dict[str, str] = {}
 
         self.cohort.update(initial=True)  # FIXME initial - must not run components
         self.logger.debug('Initialize map: %d peers' % len(self.cohort.peers))
         center = self.cohort.center.convert(GeoPosition)
-        scatter = go.Scattergeo
         if self.use_mapbox:
-            scatter = go.Scattermapbox
             self.z_scale = 14  # TODO: compute, this is tuned for the example config
         for idx, uuid in enumerate(self.cohort.peers):
             if self.cohort.peers[uuid].active:
-                position = self.cohort.peers[uuid].position.convert(GeoPosition)
-            else:
-                position = GeoPosition(0., 0., 0.)  # hide it
-            self.color_map[uuid] = colors.qualitative.Light24[idx]
-            self.fig.add_trace(scatter(lat=[position.lat], lon=[position.lon],
-                                       mode='markers', marker=dict(color=self.color_map[uuid], opacity=.7),
-                                       name='mark-%s' % uuid))
-            self.fig.add_trace(scatter(lat=[position.lat], lon=[position.lon],
-                                       mode='lines', line=dict(color=self.color_map[uuid], width=3),
-                                       name=uuid))
-            self.fig.add_trace(scatter(lat=[0], lon=[0],
-                                       mode='markers', marker=dict(color='white', size=5, opacity=.5),
-                                       name='follow-%s' % uuid))
+                self.peer_tracker[uuid] = True
+                self.add_traces(idx, uuid)
+            else:  # FIXME insert at update instead
+                self.peer_tracker[uuid] = False
+                #position = GeoPosition(0., 0., 0.)  # hide it
         if self.use_mapbox:
             self.fig.update_layout(**self.basic_layout,
                                    mapbox=dict(accesstoken=self.mapbox_token,
@@ -209,7 +227,10 @@ class DynamicMap(DashComponent):
                                             ),
                                    )
         if self.initialized:  # i.e. a reset
-            config = dict(displayModeBar=False)
-            if self.use_mapbox:
-                config['mapboxtoken'] = self.mapbox_token
-            self.ctl.emit('new_graph_figure', ['map-graph', self.fig.to_dict(), config])
+            if self.ctl.legacy:
+                config = dict(displayModeBar=False)
+                if self.use_mapbox:
+                    config['mapboxtoken'] = self.mapbox_token
+                self.ctl.emit('update_figure', ['map-graph', self.fig.to_dict(), config])
+            else:
+                self.ctl.push_mods({'map-graph': {'figure': self.fig.to_dict()}})

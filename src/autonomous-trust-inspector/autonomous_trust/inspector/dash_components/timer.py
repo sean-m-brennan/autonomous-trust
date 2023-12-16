@@ -9,7 +9,7 @@ from ..peer.daq import CohortInterface
 
 class TimerTitle(DashComponent):
     def __init__(self, ctl: DashControl, cohort: CohortInterface, logger: Logger):
-        super().__init__(ctl.app, ctl.server)
+        super().__init__(ctl.app)
         self.ctl = ctl
         self.cohort = cohort
         self.logger = logger
@@ -17,7 +17,7 @@ class TimerTitle(DashComponent):
 
     def update_time(self):
         if self.cohort.time is not None:
-            self.ctl.emit('update_div_text', ['time', [self.cohort.time.isoformat(' ').rsplit('.')[0] + ' Z']])
+            self.ctl.push_mods({'time': {'children': [self.cohort.time.isoformat(' ').rsplit('.')[0] + ' Z']}})
 
     def div(self, title: str):
         font_size_elt = 'font-size'
