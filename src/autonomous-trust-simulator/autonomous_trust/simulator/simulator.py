@@ -110,6 +110,8 @@ class Simulator(net.SelectServer):
             if self.precompute:
                 state = SimState(cur_time, *self.pre_state[tick])
             else:
+                if tick > self.max_time_steps:
+                    raise KeyError
                 state = SimState(cur_time, *self.compute_step(tick))
             self.active_len = len(state.active)
         except KeyError as e:
@@ -138,7 +140,7 @@ class Simulator(net.SelectServer):
         pass  # do nothing
 
     def process(self, **kwargs):  # synchronous alternative
-        while not self.halt and self.tick < self.max_time_steps:
+        while not self.halt: # and self.tick < self.max_time_steps:  # FIXME continuous
             if not isinstance(self, net.SelectServer):
                 for client_socket in self.clients:
                     self.send_state(self.tick, client_socket)

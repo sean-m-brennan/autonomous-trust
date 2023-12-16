@@ -10,7 +10,7 @@ from ..peer.daq import PeerDataAcq
 
 class DataFeed(DashComponent):
     def __init__(self, app: Dash, server: Flask, peer: PeerDataAcq, number: int):
-        super().__init__(app, server)
+        super().__init__(app)
         self.server = server
         self.number = str(number)
         self.peer = peer
@@ -35,6 +35,6 @@ class DataFeed(DashComponent):
         if style is None:
             style = {'float': 'left', 'padding': 10}
         return html.Div([html.H1(title),
-                         dcc.Graph(id='data_graph', config=dict(displayModeBar=False),
+                         dcc.Graph(id='data_graph_%d' % self.peer.index, config=dict(displayModeBar=False),
                                    style=dict(width='50%', height=320))],
                         style=style)

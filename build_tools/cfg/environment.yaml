@@ -26,7 +26,7 @@ dependencies:
   - jsbeautifier==1.14.3
   - dash-extensions
   - plotly
-  - werkzeug<=2.2.2
+  - werkzeug==2.2.2
   - flask<=2.2.2
   - flask-caching==2.0.2
   - eventlet

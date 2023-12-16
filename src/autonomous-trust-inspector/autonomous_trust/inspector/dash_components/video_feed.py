@@ -9,15 +9,16 @@ from ..peer.daq import PeerDataAcq
 
 class VideoFeed(DashComponent):
     def __init__(self, app: Dash, server: Flask, peer: PeerDataAcq, number: int):
-        super().__init__(app, server)
+        super().__init__(app)
         self.server = server
         self.number = str(number)
         self.peer = peer
         self.halt = False
 
+        # FIXME must be able to dynamically add this?
         # note: cannot be called once the server is running
-        self.server.add_url_rule('/video_feed_%s' % self.number, 'video_feed_%s' % self.number,
-                                 lambda: Response(self.rcv(), mimetype='multipart/x-mixed-replace; boundary=frame'))
+        #self.server.add_url_rule('/video_feed_%s' % self.number, 'video_feed_%s' % self.number,
+        #                         lambda: Response(self.rcv(), mimetype='multipart/x-mixed-replace; boundary=frame'))
 
     def rcv(self):
         while not self.halt:
