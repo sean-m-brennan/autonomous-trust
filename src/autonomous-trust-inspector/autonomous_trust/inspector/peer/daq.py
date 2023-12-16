@@ -23,9 +23,10 @@ class PeerDataAcq(object):
     """Peer acquired-data store"""
     max_history = 20
 
-    def __init__(self, uuid: str, ident: Identity, metadata: PeerData, cohort: 'CohortInterface',
+    def __init__(self, uuid: str, index: int, ident: Identity, metadata: PeerData, cohort: 'CohortInterface',
                  video_stream: QueueType, data_stream: QueueType):
         self._uuid = uuid
+        self.index = index
         self._ident = ident
         self.metadata = metadata
         self.cohort = cohort
@@ -70,7 +71,7 @@ class PeerDataAcq(object):
 
 class CohortInterface(object):
     def __init__(self, log_level: int = logging.INFO, logfile: str = None):
-        self.paused = False #True  # always start in paused state  FIXME!
+        self.paused = True  # always start in paused state
         self.peers: dict[str, PeerDataAcq] = {}
         self._time: datetime = datetime.now()
         self._center = GeoPosition(0, 0)
@@ -137,9 +138,9 @@ class Cohort(CohortInterface):
         pass  # FIXME trouble??
 
     def update_group(self, group_ids: dict[str, Identity]):
-        for uuid in group_ids:
+        for idx, uuid in enumerate(group_ids):
             if uuid not in self.peers:
-                self.peers[uuid] = PeerDataAcq(uuid, group_ids[uuid], NullPeerData(), self,
+                self.peers[uuid] = PeerDataAcq(uuid, idx, group_ids[uuid], NullPeerData(), self,
                                                self.queue_pool.next(), self.queue_pool.next())
                 # FIXME dynamically creating queues is a problem: "Pickling an AuthenticationString object is disallowed for security reasons"
         for uuid in self.peers:

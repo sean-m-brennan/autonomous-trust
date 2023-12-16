@@ -4,20 +4,25 @@ import logging
 import os.path
 import socket
 import threading
+from collections import defaultdict
 from enum import Enum, auto
 from queue import Queue, Empty
 from typing import Callable, Union, Optional
 
 import flask
 import dash
+from dash.development.base_component import Component
 from dash_extensions.enrich import DashProxy, html
 from dash_iconify import DashIconify
+from plotly.basedatatypes import BaseFigure, BasePlotlyType
 from websockets.legacy.server import serve as websocket_serve
 from websockets.legacy.server import WebSocketServerProtocol
 
 
 # for imports:
-from dash_extensions.enrich import dcc, Output, Input, ctx  # noqa
+from dash import Patch  # noqa
+from dash_extensions.enrich import Output, Input, State, ALL, MATCH  # noqa
+from dash_extensions.enrich import dcc, ctx  # noqa
 from dash_extensions import WebSocket  # noqa
 
 
@@ -51,11 +56,9 @@ def make_icon(icon_name: str, text: str = None, color: str = None, size: IconSiz
 class DashComponent(object):
     uses_react = True
 
-    def __init__(self, app: dash.Dash, server: flask.Flask = None):
+    def __init__(self, app: dash.Dash):
         self.app = app  # for callbacks
-        self.server = server  # for URL registration
-        if server is None:
-            self.server = self.app.server
+        self.server = self.app.server  # for URL registration
 
     def div(self, *args, **kwargs) -> html.Div:
         raise NotImplementedError
@@ -69,8 +72,15 @@ def get_ip_addr():
     return ip
 
 
+class WSClient(object):
+    def __init__(self, sock):  # FIXME get other client info
+        self.socket = sock
+        self.address = sock.remote_address[0]
+
+
 class DashControl(object):
     ws_port = 5005
+    legacy = True
 
     def __init__(self, name: str, title: str, host: str = '0.0.0.0', port: int = 8050,
                  stylesheets: list[str] = None, pages_dir: str = None, logger: logging.Logger = None,
@@ -99,7 +109,8 @@ class DashControl(object):
         self.ws_stop: Optional[asyncio.Future] = None
         self.ws_send_queue = Queue()
         self.websocket_handlers: dict[str, list[Callable]] = {}
-        self.ws_clients: list[WebSocketServerProtocol] = []
+        self.clients: list[WSClient] = []
+        self._client_dir: dict[WebSocketServerProtocol, WSClient] = {}
 
         self.server = flask.Flask(name)
         dash_class = dash.Dash
@@ -109,7 +120,7 @@ class DashControl(object):
                               assets_folder=os.path.join(os.path.dirname(__file__), 'assets'),
                               external_stylesheets=stylesheets, external_scripts=external_scripts,
                               use_pages=pages, pages_folder=pages_dir,
-                              prevent_initial_callbacks=True, suppress_callback_exceptions=True)
+                              )
 
         self.server.logger.log_level = logging.INFO
         self.app.logger.log_level = logging.INFO
@@ -150,9 +161,13 @@ class DashControl(object):
     async def _websocket_handler(self, websocket: WebSocketServerProtocol, path: str):
         async for message in websocket:
             if message == 'connect':
-                self.ws_clients.append(websocket)
+                client = WSClient(websocket)
+                self.clients.append(client)
+                self._client_dir[websocket] = client
             elif message == 'disconnect':
-                self.ws_clients.remove(websocket)
+                client = self._client_dir[websocket]
+                self.clients.remove(client)
+                del self._client_dir[websocket]
             event = message
             data = None
             try:
@@ -170,8 +185,8 @@ class DashControl(object):
             try:
                 while True:
                     message = self.ws_send_queue.get_nowait()
-                    for client in self.ws_clients:
-                        await client.send(message)
+                    for client in self.clients:
+                        await client.socket.send(message)
             except Empty:
                 pass
             await asyncio.sleep(0.1)
@@ -190,18 +205,95 @@ class DashControl(object):
         """Pass-through decorator for callback handler definitions - pull from server"""
         return self.app.callback(*args, **kwargs)
 
+    def callback_shared(self, *args) -> Callable:
+        """Decorator for shared callback handler - pull from server, push out to all browsers"""
+        def decorator(funct):
+            def add_mod(output, ret_val, mods):
+                mod_dict = defaultdict()
+                mod_dict[output.component_id][output.component_property] = ret_val
+                mods.append(mod_dict)
+
+            def reg_input(inpt, fun):
+                msg = inpt.component_id + '_' + inpt.component_property
+                if msg not in self.websocket_handlers:
+                    self.websocket_handlers[msg] = []
+                self.websocket_handlers[msg].append(fun)
+
+            def wrapper():
+                ret_val = funct()
+                mods = []
+                if isinstance(args[0], Output):
+                    add_mod(args[0], ret_val, mods)
+                elif isinstance(args[0], (list, tuple)):
+                    if not isinstance(ret_val, (list, tuple)) or len(ret_val) != len(args[0]):
+                        raise RuntimeError('Non-matching ')  # FIXME err msg
+                    for idx, output in enumerate(args[0]):
+                        if isinstance(output, Output):
+                            add_mod(output, ret_val[idx], mods)
+                        else:
+                            raise RuntimeError('Invalid ')  # FIXME err msg
+                else:
+                    raise RuntimeError('Invalid ')  # FIXME err msg
+                for mod in mods:
+                    self.push_mods(mod)
+                return ret_val
+
+            if isinstance(args[1], Input):
+                reg_input(args[1], wrapper)
+            elif isinstance(args[1], (list, tuple)):
+                for inpt in args[1]:
+                    reg_input(inpt, wrapper)
+        return decorator
+
+    def callback_connect(self) -> Callable:
+        """Decorator for connection callback handler - push from browser"""
+        def decorator(funct):
+            if 'connect' not in self.websocket_handlers:
+                self.websocket_handlers['connect'] = []
+            self.websocket_handlers['connect'].append(lambda x: funct('connect', x))
+            if 'disconnect' not in self.websocket_handlers:
+                self.websocket_handlers['disconnect'] = []
+            self.websocket_handlers['disconnect'].append(lambda x: funct('disconnect', x))
+        return decorator
+
     def clientside_callback(self, clientside_function, *args, **kwargs):
         return self.app.clientside_callback(clientside_function, *args, **kwargs)
 
-    def on(self, message: str, namespace: str = None):
-        """Decorator for websocket event handler definitions - push from browser"""
-        def decorator(funct):
-            if message not in self.websocket_handlers:
-                self.websocket_handlers[message] = []
-            self.websocket_handlers[message].append(funct)
-        return decorator
+    ComponentLike = Union[Component, str, int, float]
+
+    PlotlyTypes = (Component, BaseFigure, BasePlotlyType)
+
+    def _convert_sub_comp(self, value: ComponentLike) -> Optional[Union[dict, list, str, int, float]]:
+        if isinstance(value, list):
+            sub_list = []
+            for sub in value:
+                sub_list.append(self._convert_sub_comp(sub))
+            return sub_list
+        elif isinstance(value, self.PlotlyTypes):
+            obj = value.to_plotly_json()
+            if 'props' in obj:
+                if 'children' in obj['props']:
+                    obj['props']['children'] = self._convert_sub_comp(obj['props']['children'])
+                elif 'figure' in obj['props']:
+                    obj['props']['figure'] = self._convert_sub_comp(obj['props']['figure'])
+            return obj
+        else:
+            return value
+
+    def push_mods(self, mods: dict[str, dict[str, Union[ComponentLike, list[ComponentLike]]]]):
+        """Asynchronous component updating; requires AsyncUpdate in the layout"""
+        props = list()
+        for ident in mods.keys():
+            for prop_id in mods[ident].keys():
+                prop = defaultdict()
+                prop['id'] = ident
+                prop['property'] = prop_id
+                prop['value'] = self._convert_sub_comp(mods[ident][prop_id])
+                props.append(prop)
+        self.emit('modify', props)
 
     def emit(self, event: str, data: Union[str, bytes, list, dict] = None):
+        """Websocket comm to server"""
         message = json.dumps(dict(event=event, data=data))
         self.ws_send_queue.put(message)
 
