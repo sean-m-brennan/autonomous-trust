@@ -94,8 +94,8 @@ def create_config(path: str = None, output_file: str = None, duration: timedelta
     two = UTMPosition(bot.zone, east2, north2, mid.alt)
 
     one_third = start + timedelta(minutes=24)
-    last_minute = start + timedelta(minutes=21)
-    two_thirds = start + timedelta(minutes=36)
+    last_minute = start + timedelta(minutes=21, seconds=40)
+    two_thirds = start + timedelta(minutes=32)
 
     recon_info = [(1800, 1200, -90.), (-1800, 1200, 90.)]
     recon_num = 0
@@ -148,7 +148,6 @@ def create_config(path: str = None, output_file: str = None, duration: timedelta
             peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.nickname, meta_id.address, path_data.shape.start,
                                   aer_sig, Antenna.YAGI, NetInterface.LARGE, last_minute, end, [path_data],
                                   data_streams))
-            # FIXME confirm start, end
 
     config = SimConfig(start=start, end=end, peers=peers)
     config.to_file(output_file)

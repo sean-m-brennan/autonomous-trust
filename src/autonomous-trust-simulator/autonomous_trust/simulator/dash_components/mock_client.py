@@ -20,11 +20,14 @@ Mock cohort, strictly for interactive testing of the UI.
 This file is for the 'false-sim', i.e. autonomous_trust.simulator.dash_components.__main__
 """
 
+def clamp(n, min_n, max_n):
+    return max(min(max_n, n), min_n)
+
 
 class MockIdentity(object):
-    def __init__(self, nickname):
+    def __init__(self, nickname, fullname):
         self.nickname = nickname
-        #self.fullname = fullname
+        self.fullname = fullname
 
 
 class SimCohort(CohortInterface):
@@ -77,16 +80,22 @@ class SimCohort(CohortInterface):
             for idx, uuid in enumerate(self.state.peers):
                 if uuid in self.peers:
                     # FIXME reputation
-                    self.peers[uuid].reputation_history.append(random.random())  # FIXME more calm change
+                    if len(self.peers[uuid].reputation_history) == 0:
+                        self.peers[uuid].reputation_history.append(.5)
+                    else:
+                        prev = self.peers[uuid].reputation_history[-1]
+                        next_val = clamp(prev + (random.uniform(-1., 1,) * .01), 0., 1.)
+                        self.peers[uuid].reputation_history.append(next_val)
                     for uuid2 in self.state.peers:
                         if uuid != uuid2:
-                            if uuid2 not in self.peers[uuid].network_history:
-                                self.peers[uuid].network_history[uuid2] = deque([], PeerDataAcq.max_history)
                             up = random.random() * 100
                             dn = random.random() * 100
-                            sent = random.randint(0, 1000)
-                            rcvd = random.randint(0, 1000)
-                            self.peers[uuid].network_history[uuid2].append(NetworkStats(up, dn, sent, rcvd, 0, 0))
+                            if uuid2 not in self.peers[uuid].network_history:
+                                self.peers[uuid].network_history[uuid2] = deque([], PeerDataAcq.max_history)
+                                self.peers[uuid].network_history[uuid2].append(NetworkStats(up, dn, int(up), int(dn), 0, 0))
+                            else:
+                                prev = self.peers[uuid].network_history[uuid2][-1]
+                                self.peers[uuid].network_history[uuid2].append(NetworkStats(up, dn, prev.sent + int(up), prev.recv + int(dn), 0, 0))
             time.sleep(1)
 
     def acquire_data(self):
@@ -127,7 +136,7 @@ class SimCohort(CohortInterface):
                     thread.start()
                     self.threads.append(thread)
                 peer_data = PeerData(self.state.time, self.state.center, 0., peer_id.kind, 'mock', 1)
-                self.peers[uuid] = PeerDataAcq(uuid, MockIdentity(peer_id.nickname),  # noqa intentional
+                self.peers[uuid] = PeerDataAcq(uuid, idx, MockIdentity(peer_id.nickname, peer_id.nickname),  # noqa intentional
                                                peer_data, self, Queue(), Queue()) #video.queue, data.queue, active)
             self.peers[uuid].active = uuid in self.state.active  # strictly a simulation thing
             self.peers[uuid].metadata.time = self.state.time

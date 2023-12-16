@@ -12,14 +12,16 @@ from .sim_iface import SimulationInterface
 
 class SimulationControls(DashComponent):
     def __init__(self, dash_info: DashControl, sim: SimulationInterface, cohort: CohortInterface,
-                 logger: Logger, mapp: DynamicMap, max_resolution: int = 300, with_interval: bool = True):
-        super().__init__(dash_info.app, dash_info.server)
+                 logger: Logger, mapp: DynamicMap, max_resolution: int = 300):
+        super().__init__(dash_info.app)
+        self.ctl = dash_info
         self.sim = sim
         self.cohort = cohort
         self.map = mapp
         self.max_resolution = max_resolution
-        self.with_interval = with_interval  # prevents interval div duplication
         self.skip = 5
+
+        self.buttons = ['skip-back-btn', 'slow-btn', 'pause-btn', 'fast-btn', 'skip-for-btn']
 
         self.pause_txt = make_icon('solar:pause-linear', 'Pause')
         self.play_txt = make_icon('solar:play-linear', 'Play')
@@ -31,14 +33,15 @@ class SimulationControls(DashComponent):
         if self.sim.paused:
             self.play_pause = self.play_txt
 
-        @self.app.callback(Output('pause-btn', 'children'),
-                           Input('skip-back-btn', 'n_clicks'),
-                           Input('slow-btn', 'n_clicks'),
-                           Input('pause-btn', 'n_clicks'),
-                           Input('reset-btn', 'n_clicks'),
-                           Input('fast-btn', 'n_clicks'),
-                           Input('skip-for-btn', 'n_clicks'),
-                           prevent_initial_call=True)
+        @self.ctl.callback(Output('pause-btn', 'children'),
+                           [Input('skip-back-btn', 'n_clicks'),
+                            Input('slow-btn', 'n_clicks'),
+                            Input('pause-btn', 'n_clicks'),
+                            Input('reset-btn', 'n_clicks'),
+                            Input('fast-btn', 'n_clicks'),
+                            Input('skip-for-btn', 'n_clicks')],
+                           #prevent_initial_call=True
+                           )
         def handle_buttons(_back, _slow, _pause, _reset, _fast, _forward):
             if 'skip-back-btn' == ctx.triggered_id:
                 self.sim.tick -= self.skip
@@ -75,39 +78,36 @@ class SimulationControls(DashComponent):
                 pause_txt = self.pause_txt
             return pause_txt
 
-        @self.app.callback(Output('sim-ctrls-target', 'children'),
-                           Input('resolution-slider', 'value'),
-                           prevent_initial_call=True)
-        def handle_sliders(_pitch, _bearing, resolution):
+        @self.ctl.callback(Output('sim-ctrls-target', 'children'),
+                           [Input('resolution-slider', 'value')],
+                           #prevent_initial_call=True
+                           )
+        def handle_sliders(resolution):
             if 'resolution-slider' == ctx.triggered_id:
                 if self.sim.resolution < resolution:
                     self.map.trim_traces(resolution - self.sim.resolution)
                 self.sim.resolution = resolution
             return html.Div()
 
-        # FIXME replace with websockets???
-        @self.app.callback(Output('reset-btn', 'disabled'),
-                           Output('pause-btn', 'disabled'),
-                           Output('skip-back-btn', 'disabled'),
-                           Output('slow-btn', 'disabled'),
-                           Output('fast-btn', 'disabled'),
-                           Output('skip-for-btn', 'disabled'),
-                           Input('interval', 'n_intervals'))
-        def reset_disabled(_):
-            # FIXME run update elsewhere?
-            self.sim.update()  # this is the only call among all components, for sync
-            if self.sim.can_reset:
-                return False, True, True, True, True, True
-            return True, False, False, False, False, False
+        ## end __init__
+
+    def change_controls(self, disable: bool):
+        self.ctl.push_mods({'reset-btn': {'disabled': not disable}})
+        for button in self.buttons:
+            self.ctl.push_mods({button: {'disabled': disable}})
+
+    def disable_controls(self):
+        self.change_controls(True)
+
+    def enable_controls(self):
+        self.change_controls(False)
 
     def div(self):
         text_align_elt = 'text-align'
         if self.uses_react:
             text_align_elt = 'textAlign'
-        additional = []
-        if self.with_interval:
-            additional.append(dcc.Interval(id="interval", interval=1000, n_intervals=0))
-        return html.Div(additional + [
+        return html.Div([
+            html.Div(id='sim-ctrls-target'),
             dbc.Row([
                 dbc.Col([
                     html.Div([
