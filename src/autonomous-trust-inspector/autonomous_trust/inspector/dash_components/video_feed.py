@@ -1,19 +1,24 @@
+import base64
+import threading
+import time
 from queue import Empty
 
 from flask import Flask, Response
-from dash import Dash, html
 
-from .core import DashComponent
+from .core import DashComponent, DashControl, html
 from ..peer.daq import PeerDataAcq
 
 
 class VideoFeed(DashComponent):
-    def __init__(self, app: Dash, server: Flask, peer: PeerDataAcq, number: int):
-        super().__init__(app)
+    def __init__(self, ctl: DashControl, server: Flask, peer: PeerDataAcq, number: int):
+        super().__init__(ctl.app)
+        self.ctl = ctl
         self.server = server
         self.number = str(number)
         self.peer = peer
         self.halt = False
+        self.img_id = 'feed_%s' % self.number
+        threading.Thread(target=self.rcv).start()
 
         # FIXME must be able to dynamically add this?
         # note: cannot be called once the server is running
@@ -22,18 +27,24 @@ class VideoFeed(DashComponent):
 
     def rcv(self):
         while not self.halt:
+            if self.peer.cohort.paused:
+                time.sleep(0.02)
+                continue
             try:
-                idx, frame, cadence = self.peer.video_stream.get()  # speed is determined by source speed
+                while not self.halt and len(self.peer.video_stream) < 1:
+                    time.sleep(0.02)  # max 50 fps
+                idx, frame, cadence = self.peer.video_stream.pop()
                 frame = frame.tobytes()
-            except Empty:
+            except (Empty, IndexError):
                 continue
             if frame:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
+                print('xmit frame')
+                frame = b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n'
+                self.ctl.emit('video', dict(id=self.img_id, data=frame), binary=True)
+            #    yield (b'--frame\r\n'
+            #           b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
 
     def div(self, title: str, style: dict = None) -> html.Div:
         if style is None:
             style = {'float': 'left', 'padding': 10}
-        return html.Div([html.H1(title),
-                         html.Img(src='/video_feed_%s' % self.number, id='feed_%s' % self.number)],
-                        style=style)
+        return html.Div([html.H1(title), html.Img(id=self.img_id)], style=style)

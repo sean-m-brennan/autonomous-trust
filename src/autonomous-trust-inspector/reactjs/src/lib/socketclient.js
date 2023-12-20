@@ -1,4 +1,7 @@
 import {change_data} from "./dash_modify";
+import {BinaryDataMsg} from "./bindata"
+import {Buffer} from 'buffer';
+
 
 let SocketClient = {
 
@@ -26,6 +29,7 @@ let SocketClient = {
 	connect: function(port=5005) {
 		if (SocketClient.socket == null) {
 			SocketClient.socket = new WebSocket(SocketClient.ws_uri(port));
+            SocketClient.socket.binaryType = "arraybuffer";
 
             SocketClient.socket.onopen = function(_) {
                 SocketClient.socket.send("connect");
@@ -36,7 +40,12 @@ let SocketClient = {
             window.addEventListener("beforeunload", SocketClient.handleWindowBeforeUnload);
 
 			SocketClient.socket.onmessage = function(message) {
-                const obj = JSON.parse(message.data);
+                let obj;
+                try {
+                    obj = JSON.parse(message.data);
+                } catch {
+                    obj = BinaryDataMsg.decode(new Uint8Array(message.data));
+                }
                 switch (obj.event) {
                     case "modify":
                         SocketClient.change(obj.data);
@@ -45,7 +54,10 @@ let SocketClient = {
                         SocketClient.updateGraphFigure(obj.data);
                         break;
                     case "trigger_event":
-                        SocketClient.trigger(obj.data)
+                        SocketClient.trigger(obj.data);
+                        break;
+                    case "video":
+                        SocketClient.recvVideo(obj.elt_id, obj.data);
                         break;
                 }
 			};
@@ -69,6 +81,7 @@ let SocketClient = {
         let element = document.getElementById(info['id']);
         if (element == null) {
             console.info('No DOM element ' + info['id'] + ' exists');
+            return
         }
         let evt = new Event(info['eventType']);
         if (Object.keys(info).length > 2)
@@ -91,13 +104,23 @@ let SocketClient = {
         let cfg = fig_info[2];
         if (document.getElementById(id) == null) {
             console.debug('New plotly figure ' + id)
-            Plotly.newPlot(id, data, layout, cfg)
+            Plotly.newPlot(id, data, layout, cfg)  // We are using Dash, so should not to import Plotly
         } else {
             console.debug('Update plotly figure ' + id)
             Plotly.react(id, data, layout, cfg)
         }
     },
 
+    recvVideo: function(id, data) {
+        let image = document.getElementById(id);
+        if (image == null) {
+            console.info('No DOM element ' + id + ' exists');
+            return
+        }
+        let buffer = Buffer.from(data, 'base64')
+        image.src = URL.createObjectURL(new Blob(buffer))
+        console.log('rcvd img')  // FIXME remove
+    },
 }
 
 export {SocketClient};

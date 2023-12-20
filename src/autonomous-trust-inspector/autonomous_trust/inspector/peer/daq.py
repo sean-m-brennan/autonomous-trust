@@ -3,7 +3,7 @@ import sys
 from collections import deque
 from datetime import datetime, timedelta
 from queue import Empty, Queue
-from typing import Callable
+from typing import Callable, Union
 
 from autonomous_trust.core import Process, ProcMeta, CfgIds, from_yaml_string, QueueType
 from autonomous_trust.core.automate import QueuePool
@@ -18,13 +18,15 @@ from autonomous_trust.services.peer.position import Position, GeoPosition
 
 NullPeerData = lambda: PeerData(datetime.utcfromtimestamp(0), Position(0, 0), 0., '', '', 0)  # noqa
 
+StreamType = Union[QueueType, deque]
+
 
 class PeerDataAcq(object):
     """Peer acquired-data store"""
     max_history = 20
 
     def __init__(self, uuid: str, index: int, ident: Identity, metadata: PeerData, cohort: 'CohortInterface',
-                 video_stream: QueueType, data_stream: QueueType):
+                 video_stream: StreamType, data_stream: StreamType):
         self._uuid = uuid
         self.index = index
         self._ident = ident
