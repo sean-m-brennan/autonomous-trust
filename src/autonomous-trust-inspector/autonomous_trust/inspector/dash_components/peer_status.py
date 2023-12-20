@@ -32,8 +32,8 @@ class PeerStatus(DashComponent):
         self.peer_detail_id = 'peer_status_%d' % self.idx
 
         # FIXME dependent on 'video' in peer.metadata
-        self.vid_feed = VideoFeed(self.app, self.server, peer, self.idx)
-        self.data_feed = DataFeed(self.app, self.server, peer, self.idx)
+        self.vid_feed = VideoFeed(self.ctl, self.server, peer, self.idx)
+        self.data_feed = DataFeed(self.ctl, self.server, peer, self.idx)
         self.data_type = peer.metadata.data_type
 
         self.net_figs = {}
@@ -70,13 +70,8 @@ class PeerStatus(DashComponent):
                       State('offcanvas-%d' % self.idx, 'is_open'))
         def toggle_peer_detail(clicks, is_open):
             if clicks > 0:
-                self.parent.displayed_detail = self.idx
-                print('Detail %d opened' % self.idx)
-                print('Push peer details3')
                 ctl.push_mods({'peer-detail-%d' % self.idx: {'children': self.full_div()}})
                 return not is_open
-            print('Detail %d closed' % self.idx)
-            self.parent.displayed_detail = -1
             return is_open
 
         @ctl.callback(Output('follow-target-%d' % self.idx, 'children'),

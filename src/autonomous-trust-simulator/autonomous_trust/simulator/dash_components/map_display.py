@@ -33,6 +33,7 @@ class MapUI(InitializableConfig):
 
 class MapDisplay(object):
     preload = True
+    pages = True
     name = 'display'
     icon_map = {'microdrone': 'carbon:drone',
                 'soldier': 'healthicons:military-worker',
@@ -91,10 +92,10 @@ class MapDisplay(object):
             if self.preload:
                 for uuid in added:
                     self.ctl.push_mods({self.status[uuid].peer_detail_id:
-                                        {'style': {'display': 'block', 'visibility': 'visible'}}})
+                                            {'style': {'display': 'block', 'visibility': 'visible'}}})
                 for uuid in removed:
                     self.ctl.push_mods({self.status[uuid].peer_detail_id:
-                                        {'style': {'display': 'none', 'visibility': 'hidden'}}})
+                                            {'style': {'display': 'none', 'visibility': 'hidden'}}})
             else:
                 self.ctl.emit('trigger_event', dict(id='overview_trigger', eventType='overview'))
                 self.ctl.emit('trigger_event', dict(id='full_status_trigger', eventType='details'))
@@ -105,7 +106,7 @@ class MapDisplay(object):
             logger = self.cohort.logger
         stylesheets = [dbc.themes.SPACELAB]
         self.ctl = DashControl(__name__, 'Autonomous Trust Mission', host, stylesheets=stylesheets,
-                               #pages_dir='',  # FIXME?
+                               pages_dir='' if self.pages else None,
                                logger=logger, proxied=True, verbose=verbose)
 
         interfaces = [self.cohort]
@@ -164,11 +165,8 @@ class MapDisplay(object):
                                          id='statuses'),  # note: this never shows any children
                             ] + ctrl_elts)
 
-        self.ctl.app.layout = html.Div([dcc.Location(id="url"),
-                                        #page_container,
+        self.ctl.app.layout = html.Div([dcc.Location(id="url", refresh=False),
                                         html.Div([main_div], id="page-content")])
-        # FIXME use dbc.Container instead of Div
-        #app.register_page('forecast', path='/forecast', layout=html.Div(['Forecast Page'])
 
         @self.ctl.callback_connect()
         def connection_change(event, _):
@@ -177,27 +175,28 @@ class MapDisplay(object):
             elif 'disconnect' == event:
                 self.cohort.browser_connected -= 1
 
-        #@self.ctl.callback(Output("page-content", "children"),
-        #                   [Input("url", "pathname")])
-        #def render_page_content(pathname: str):
-        #    if pathname == '/':
-        #       self.ctl.active_page = 'main'
-        #       return main_div
-        #   elif pathname.startswith('/peer_status_'):
-        #       self.ctl.active_page = 'status'
-        #       idx = int(pathname[pathname.rindex('_') + 1:])
-        #       return self.status_by_idx[idx].div()
-        #   elif pathname.startswith('/video_feed_'):
-        #       self.ctl.active_page = 'video'
-        #       idx = int(pathname[pathname.rindex('_') + 1:])
-        #       return html.Div(html.Img(src='/video_feed_%d' % (idx + 1), width=640))
-        #    # If the user tries to reach a different page, return a custom 404 message
-        #    self.ctl.active_page = None
-        #    return html.Div([
-        #       html.H1("404: Not found", className="text-danger"),
-        #       html.Hr(),
-        #        html.P(f"The pathname {pathname} was not recognised..."),
-        #    ], className="p-3 bg-light rounded-3")
+        if self.pages:
+            @self.ctl.callback(Output("page-content", "children"),
+                               Input("url", "pathname"))
+            def render_page_content(pathname: str):
+                if pathname == '/':
+                    self.ctl.active_page = 'main'
+                    return main_div
+                elif pathname.startswith('/peer_status_'):
+                    self.ctl.active_page = 'status'
+                    idx = int(pathname[pathname.rindex('_') + 1:])
+                    return self.status_by_idx[idx].div()
+                elif pathname.startswith('/video_feed_'):
+                    self.ctl.active_page = 'video'
+                    idx = int(pathname[pathname.rindex('_') + 1:])
+                    return html.Div(html.Img(src='/video_feed_%d' % (idx + 1), width=640))
+                # If the user tries to reach a different page, return a custom 404 message
+                self.ctl.active_page = None
+                return html.Div([
+                    html.H1("404: Not found", className="text-danger"),
+                    html.Hr(),
+                    html.P(f"The pathname {pathname} was not recognized..."),
+                ], className="p-3 bg-light rounded-3")
 
         @self.ctl.callback(Output('peer-table', 'children'),
                            Input('overview_trigger', 'triggers'),

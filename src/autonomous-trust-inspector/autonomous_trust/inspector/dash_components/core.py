@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os.path
@@ -18,6 +19,7 @@ from plotly.basedatatypes import BaseFigure, BasePlotlyType
 from websockets.legacy.server import serve as websocket_serve
 from websockets.legacy.server import WebSocketServerProtocol
 
+from .async_update import bin_data_pb2 as BinaryData
 
 # for imports:
 from dash import Patch  # noqa
@@ -74,7 +76,7 @@ def get_ip_addr():
 
 class WSClient(object):
     def __init__(self, sock):  # FIXME get other client info
-        self.socket = sock
+        self.socket: WebSocketServerProtocol = sock
         self.address = sock.remote_address[0]
 
 
@@ -116,10 +118,13 @@ class DashControl(object):
         dash_class = dash.Dash
         if proxied:
             dash_class = DashProxy
+        kwargs = {}
+        if pages:
+            kwargs['suppress_callback_exceptions'] = True
         self.app = dash_class(name, server=self.server, title=title, update_title=None,
                               assets_folder=os.path.join(os.path.dirname(__file__), 'assets'),
                               external_stylesheets=stylesheets, external_scripts=external_scripts,
-                              use_pages=pages, pages_folder=pages_dir,
+                              use_pages=pages, pages_folder=pages_dir, **kwargs
                               )
 
         self.server.logger.log_level = logging.INFO
@@ -154,7 +159,7 @@ class DashControl(object):
         #    for handler in self.inherited_logger.handlers:
         #      logger.addHandler(handler)
         async with websocket_serve(self._websocket_handler, self.server_address[0], self.ws_port,
-                                   loop=self.ws_loop, logger=logger):
+                                   loop=self.ws_loop, logger=logger, compression=None):
             print(' * Serving websockets at ws://%s:%d' % (self.server_address[0], self.ws_port))
             await self.ws_stop
 
@@ -292,9 +297,21 @@ class DashControl(object):
                 props.append(prop)
         self.emit('modify', props)
 
-    def emit(self, event: str, data: Union[str, bytes, list, dict] = None):
+    def emit(self, event: str, data: Union[str, bytes, list, dict] = None, binary: bool = False):
         """Websocket comm to server"""
-        message = json.dumps(dict(event=event, data=data))
+        if binary:
+            bdmsg = BinaryData.BinaryDataMsg()
+            bdmsg.event = event
+            bdmsg.elt_id = data['id']
+            bdmsg.size = len(data['data'])
+            print('Msg ', bdmsg)
+            bdmsg.data = data['data']
+            message: bytes = bdmsg.SerializeToString()
+            #print('Enc ', enc[:40])
+            #message = base64.b64encode(enc)
+            print('B64 ', message[:40])
+        else:
+            message: str = json.dumps(dict(event=event, data=data))
         self.ws_send_queue.put(message)
 
     def run(self, host: str, port: int, **kwargs):
