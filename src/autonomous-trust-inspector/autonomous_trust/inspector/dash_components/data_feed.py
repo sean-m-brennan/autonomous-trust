@@ -1,16 +1,16 @@
 from queue import Empty
 
 from flask import Flask
-from dash import Dash
 from plotly import graph_objects as go
 
-from .core import DashComponent, html, dcc
+from .core import DashComponent, html, dcc, DashControl
 from ..peer.daq import PeerDataAcq
 
 
 class DataFeed(DashComponent):
-    def __init__(self, app: Dash, server: Flask, peer: PeerDataAcq, number: int):
-        super().__init__(app)
+    def __init__(self, ctl: DashControl, server: Flask, peer: PeerDataAcq, number: int):
+        super().__init__(ctl.app)
+        self.ctl = ctl
         self.server = server
         self.number = str(number)
         self.peer = peer

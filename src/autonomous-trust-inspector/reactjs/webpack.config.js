@@ -108,6 +108,9 @@ module.exports = (env, argv) => {
                 filename: '[file].map',
                 exclude: ['async-plotlyjs']
             })
-        ]
+        ],
+        resolve: {
+            fallback: { crypto: "crypto-browserify", stream: "stream-browserify" }
+        }
     }
 };
