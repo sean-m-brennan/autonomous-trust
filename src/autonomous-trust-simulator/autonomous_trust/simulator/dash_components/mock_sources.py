@@ -1,6 +1,7 @@
 import glob
 import random
 import time
+from collections import deque
 from datetime import timedelta, datetime
 from queue import Queue
 
@@ -23,7 +24,7 @@ class SimVideoSource(object):
         self.video_path_pattern = path
         self.size = size
         self.speed = speed
-        self.queue = Queue()
+        self.buffer = deque(maxlen=1)
         self.halt = False
 
     def run(self, extra_process: [[np.ndarray], np.ndarray] = None):
@@ -59,10 +60,11 @@ class SimVideoSource(object):
                     _, frame = cv2.imencode('.jpg', frame)
 
                     if frame is not None:
-                        self.queue.put((idx, frame, 1))
+                        self.buffer.append((idx, frame, 1))
                     time.sleep(1. / self.fps)  # FIXME
 
             if vid is not None:
+                print('no more video')
                 vid.release()
 
 
@@ -70,17 +72,17 @@ class SimDataSource(object):
     cadence = .5
 
     def __init__(self):
-        self.queue = Queue()
+        self.buffer = deque(maxlen=1)
         self.halt = False
 
     def run(self):
         while not self.halt:
             data = random.random()
-            self.queue.put(data)
+            self.buffer.append(data)
             time.sleep(self.cadence)
 
 
-class SimNetSource(NetworkSource):
+class SimNetSource(NetworkSource):  # FIXME unused
     def __init__(self):
         self.prev = {}
         self.last_time = {}

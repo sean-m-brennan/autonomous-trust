@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package autonomoustrust;
+
+message BinaryDataMsg {
+  string event = 1;
+  string elt_id = 2;
+  int32 size = 3;
+  bytes data = 4;
+}

@@ -46,8 +46,8 @@ class SimCohort(CohortInterface):
         self.threads = []
         self.vid_map = {0: 15, 1: 17, 2: 18, 3: 20, 4: 21}
         self.disables = []
-        if disable_video:
-            self.disables.append('video')
+        #if disable_video:
+        #    self.disables.append('video')
         if disable_data:
             self.disables.append('data')
         atexit.register(self.interrupt)
@@ -116,28 +116,33 @@ class SimCohort(CohortInterface):
         for idx, uuid in enumerate(self.state.peers):
             if uuid not in self.peers:
                 peer_id = self.state.peers[uuid]
+                vid_q = deque(maxlen=1)
+                data_q = deque(maxlen=1)
 
                 # intentionally abusing daq object
                 # FIXME merge video and data sources
                 if idx in self.vid_map:
                     vid_dir = os.path.join(os.path.dirname(__file__),
-                                           '../../examples/mission/participant/var/at/video')
+                                           '../../../examples/mission/participant/var/at/video')
                                            #'../../../../examples/mission/participant/var/at/video')
-                    vid = os.path.join(vid_dir, '220505_02_MTB_4k_0%d.mp4' % self.vid_map[idx])
-                    video = SimVideoSource(os.path.abspath(vid))
+                    vid = os.path.abspath(os.path.join(vid_dir, '220505_02_MTB_4k_0%d.mp4' % self.vid_map[idx]))
+                    video = SimVideoSource(vid)
                     if 'video' not in self.disables:
                         self.servers.append(video)
                         thread = threading.Thread(target=video.run)  # FIXME extra processing
                         thread.start()
+                        vid_q = video.buffer
+                        print('serve video %s' % vid)
                         self.threads.append(thread)
                 data = SimDataSource()
                 if 'data' not in self.disables:
                     thread = threading.Thread(target=data.run)
                     thread.start()
+                    data_q = data.buffer
                     self.threads.append(thread)
                 peer_data = PeerData(self.state.time, self.state.center, 0., peer_id.kind, 'mock', 1)
                 self.peers[uuid] = PeerDataAcq(uuid, idx, MockIdentity(peer_id.nickname, peer_id.nickname),  # noqa intentional
-                                               peer_data, self, Queue(), Queue()) #video.queue, data.queue, active)
+                                               peer_data, self, vid_q, data_q)
             self.peers[uuid].active = uuid in self.state.active  # strictly a simulation thing
             self.peers[uuid].metadata.time = self.state.time
             if self.state.peers[uuid].position is not None:
