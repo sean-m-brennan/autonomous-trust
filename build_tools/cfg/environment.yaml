@@ -20,7 +20,7 @@ dependencies:
   - msgpack-numpy
   - geopy
   - utm
-  - dash>=2.9.3<=3.0.0
+  - dash==2.14.2
   - dash-bootstrap-components
   - more-itertools==9.0.0
   - jsbeautifier==1.14.3
