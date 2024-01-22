@@ -1,6 +1,7 @@
 name: autonomous_trust
 channels:
   - conda-forge
+  - forklift
 dependencies:
   - python==3.10.*
   - pip
