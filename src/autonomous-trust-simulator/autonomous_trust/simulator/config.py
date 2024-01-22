@@ -2,7 +2,7 @@ import sys
 from datetime import datetime, timedelta
 import os
 
-from autonomous_trust.services.data.server import DataSrc
+from autonomous_trust.services.data.server import DataConfig
 from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 from autonomous_trust.core.identity import Identity
 
@@ -31,7 +31,7 @@ class MetaIdentity(object):
         data = None
         data_cfg = os.path.join(path, 'data-source.cfg.yaml')
         if os.path.exists(data_cfg):
-            data = DataSrc.from_file(data_cfg)
+            data = DataConfig.from_file(data_cfg)
             #if data.channels != meta.data_meta:  # FIXME either eliminate DataSrc files or remove from Metadata
             #   raise RuntimeError('DataSource and Metadata configs are inconsistent for %s (%s vs %s)' %
             #                      (path, data.channels, meta.data_channels))

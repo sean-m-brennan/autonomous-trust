@@ -1,0 +1,1 @@
+../src/autonomous-trust/autonomous_trust/__main__.py

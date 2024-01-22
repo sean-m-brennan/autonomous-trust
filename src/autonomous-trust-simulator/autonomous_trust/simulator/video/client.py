@@ -5,7 +5,7 @@ import cv2
 import imutils
 
 from autonomous_trust.core import ProcMeta
-from autonomous_trust.services.video.serialize import deserialize
+from autonomous_trust.services.data.serialize import deserialize
 from autonomous_trust.services.video import VideoRcvr
 from autonomous_trust.services.video.server import VideoProtocol
 

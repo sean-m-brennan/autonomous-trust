@@ -6,10 +6,10 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import cv2
 
-from .server import VideoSource
+from .server import VideoProcess
 
 
-class VideoProcessor(VideoSource):
+class VideoProcessor(VideoProcess):
     model_filename = 'efficientdet_lite0.tflite'
     model_url = 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/latest/efficientdet_lite0.tflite'
     TEXT_COLOR = (255, 0, 0)  # red

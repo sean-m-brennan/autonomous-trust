@@ -1,15 +1,16 @@
-import glob
 import random
 import time
 from collections import deque
 from datetime import timedelta, datetime
-from queue import Queue
+from typing import Optional
 
 import cv2
-import imutils
 import numpy as np
 
+from autonomous_trust.inspector.peer.daq import PeerDataAcq
+from autonomous_trust.services.data.server import DataConfig
 from autonomous_trust.services.network_statistics import NetworkSource
+from autonomous_trust.services.video.server import VideoSource
 
 """
 Mock sources, strictly for interactive testing of the UI.
@@ -17,55 +18,34 @@ This file is for the 'false-sim', i.e. autonomous_trust.simulator.dash_component
 """
 
 
-class SimVideoSource(object):
-    fps = 20
-
-    def __init__(self, path: str, size: int = 320, speed: int = 1):
-        self.video_path_pattern = path
-        self.size = size
-        self.speed = speed
+class SimVideoSource(VideoSource):
+    def __init__(self, path: str, size: int = 320, speed: int = 1, fps: int = 20):
+        cfg = DataConfig(path, size, speed, 1)
+        super().__init__(cfg, fps)
         self.buffer = deque(maxlen=1)
         self.halt = False
+        self.peer: Optional[PeerDataAcq] = None
+        self.start: datetime = None
+
+    def connect(self, peer: PeerDataAcq):
+        self.peer = peer
+        self.start = self.peer.time
 
     def run(self, extra_process: [[np.ndarray], np.ndarray] = None):
         if extra_process is None:
             extra_process = lambda x: x
-        for path in sorted(glob.glob(self.video_path_pattern)):
-            vid = None
-            while not self.halt:
-                vid = cv2.VideoCapture(path)
-                frame_count = int(vid.get(cv2.CAP_PROP_FPS) / self.fps)
-                if frame_count < 1:
-                    frame_count = 1
-                more = True
-                idx = 0
-                while more and not self.halt:
-                    frame = None
-                    for _ in range(frame_count):
-                        more, frame = vid.read()
-                        if not more:
-                            break
-                    idx += 1
-                    if frame is None:
-                        more = False
-                        continue
-                    if idx % self.speed > 0:
-                        continue
-
-                    frame = extra_process(frame)
-
-                    if self.size is not None:
-                        frame = imutils.resize(frame, width=self.size)
-
-                    _, frame = cv2.imencode('.jpg', frame)
-
+        prev = 0
+        while not self.halt:
+            if self.peer is not None:
+                elapsed = int((self.peer.time - self.start).total_seconds())
+                if self.peer.active and not self.peer.cohort.paused and prev < elapsed:
+                    print('Elapsed ', elapsed)  # FIXME all are active
+                    more, frame_num, frame = self.next(at_position=elapsed, post_proc=extra_process)
+                    prev = elapsed
                     if frame is not None:
-                        self.buffer.append((idx, frame, 1))
-                    time.sleep(1. / self.fps)  # FIXME
-
-            if vid is not None:
-                print('no more video')
-                vid.release()
+                        _, frame = cv2.imencode('.jpg', frame)
+                        self.buffer.append((frame_num, frame, 1))
+            time.sleep(1. / self.fps)  # FIXME ??
 
 
 class SimDataSource(object):

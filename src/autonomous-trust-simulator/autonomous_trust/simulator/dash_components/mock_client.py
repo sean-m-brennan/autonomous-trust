@@ -121,6 +121,7 @@ class SimCohort(CohortInterface):
 
                 # intentionally abusing daq object
                 # FIXME merge video and data sources
+                video = None
                 if idx in self.vid_map:
                     vid_dir = os.path.join(os.path.dirname(__file__),
                                            '../../../examples/mission/participant/var/at/video')
@@ -143,6 +144,8 @@ class SimCohort(CohortInterface):
                 peer_data = PeerData(self.state.time, self.state.center, 0., peer_id.kind, 'mock', 1)
                 self.peers[uuid] = PeerDataAcq(uuid, idx, MockIdentity(peer_id.nickname, peer_id.nickname),  # noqa intentional
                                                peer_data, self, vid_q, data_q)
+                if video is not None:
+                    video.connect(self.peers[uuid])
             self.peers[uuid].active = uuid in self.state.active  # strictly a simulation thing
             self.peers[uuid].metadata.time = self.state.time
             if self.state.peers[uuid].position is not None:
