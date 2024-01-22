@@ -32,8 +32,8 @@ class PeerStatus(DashComponent):
         self.peer_detail_id = 'peer_status_%d' % self.idx
 
         # FIXME dependent on 'video' in peer.metadata
-        self.vid_feed = VideoFeed(self.ctl, self.server, peer, self.idx)
-        self.data_feed = DataFeed(self.ctl, self.server, peer, self.idx)
+        self.vid_feed = VideoFeed(self.ctl, peer, self.idx)
+        self.data_feed = DataFeed(self.ctl, peer, self.idx)
         self.data_type = peer.metadata.data_type
 
         self.net_figs = {}
@@ -71,7 +71,9 @@ class PeerStatus(DashComponent):
         def toggle_peer_detail(clicks, is_open):
             if clicks > 0:
                 ctl.push_mods({'peer-detail-%d' % self.idx: {'children': self.full_div()}})
+                self.peer.active = True
                 return not is_open
+            self.peer.active = False
             return is_open
 
         @ctl.callback(Output('follow-target-%d' % self.idx, 'children'),

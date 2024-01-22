@@ -3,12 +3,12 @@ from queue import Empty, Full
 
 from autonomous_trust.core import Process, ProcMeta, CfgIds, from_yaml_string
 from autonomous_trust.core.network import Message
-from .server import DataSource, DataProtocol
+from .server import DataProcess, DataProtocol
 
 
 class DataRcvr(Process, metaclass=ProcMeta,
                proc_name='data-sink', description='Data stream consumer'):
-    header_fmt = DataSource.header_fmt
+    header_fmt = DataProcess.header_fmt
 
     def __init__(self, configurations, subsystems, log_queue, dependencies, **kwargs):
         super().__init__(configurations, subsystems, log_queue, dependencies=dependencies)
@@ -30,12 +30,12 @@ class DataRcvr(Process, metaclass=ProcMeta,
 
     def process(self, queues, signal):
         while self.keep_running(signal):
-            if DataSource.capability_name in self.protocol.peer_capabilities:
-                for peer in self.protocol.peer_capabilities[DataSource.capability_name]:
+            if DataProcess.capability_name in self.protocol.peer_capabilities:
+                for peer in self.protocol.peer_capabilities[DataProcess.capability_name]:
                     if peer not in self.servicers:
                         self.servicers.append(peer)
                         msg_obj = self.name
-                        msg = Message(DataSource.name, DataProtocol.request, msg_obj, peer)
+                        msg = Message(DataProcess.name, DataProtocol.request, msg_obj, peer)
                         queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
 
             try:

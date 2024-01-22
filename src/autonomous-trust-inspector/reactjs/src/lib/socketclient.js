@@ -117,6 +117,9 @@ let SocketClient = {
             console.info('No DOM element ' + id + ' exists');
             return
         }
+        //const datauri = new Datauri()
+        //datauri.format('jpeg', image)
+        //image.src = datauri
         let buffer = Buffer.from(data, 'base64')
         image.src = URL.createObjectURL(new Blob(buffer))
         console.log('rcvd img')  // FIXME remove

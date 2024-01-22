@@ -5,9 +5,9 @@ import time
 
 from autonomous_trust.core import AutonomousTrust, Configuration, LogLevel
 from autonomous_trust.core.config.generate import generate_identity, generate_worker_config
-from autonomous_trust.services.data.server import DataSource, DataSrc
+from autonomous_trust.services.data.server import DataProcess, DataConfig
 from autonomous_trust.services.network_statistics import NetStatsSource
-from autonomous_trust.services.video import VideoSource
+from autonomous_trust.services.video import VideoProcess
 from autonomous_trust.simulator.data_server import DataSimSource
 from autonomous_trust.simulator.peer.peer_metadata import SimMetadataSource, SimMetadata
 from autonomous_trust.simulator.video.server import SimVideoSrc
@@ -44,8 +44,8 @@ if __name__ == '__main__':
     generate_identity(cfg_dir, preserve=True, defaults=True)  # does nothing if files present (always regen network)
     if '--setup' in sys.argv:
         for cfg_name, klass in ((SimMetadataSource.name, SimMetadata),
-                                (VideoSource.name, SimVideoSrc),
-                                (DataSource.name, DataSrc)):  # FIXME DataSrc does nothing (see Metadata.data_meta)
+                                (VideoProcess.name, SimVideoSrc),
+                                (DataProcess.name, DataConfig)):  # FIXME DataSrc does nothing (see Metadata.data_meta)
             generate_worker_config(cfg_dir, cfg_name, klass, True)
 
     time.sleep(random.randint(10, 120))  # delay up to two minutes, but at least ten seconds
