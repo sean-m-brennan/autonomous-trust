@@ -12,17 +12,20 @@ class DataProtocol(Protocol):
     data = 'data'
 
 
-class DataSrc(InitializableConfig):
-    def __init__(self, channels: int = 3):
+class DataConfig(InitializableConfig):
+    def __init__(self, device_path: str, frame_size: int = 320, speed: int = 1, channels: int = 1):
+        self.device_path = device_path
+        self.frame_size = frame_size
+        self.speed = speed
         self.channels = channels
 
     @classmethod
-    def initialize(cls, channels: int = 3):
-        return DataSrc(channels)
+    def initialize(cls, device_path: str, frame_size: int = 320, speed: int = 1, channels: int = 1):
+        return DataConfig(device_path, frame_size, speed, channels)
 
 
-class DataSource(Process, metaclass=ProcMeta,
-                 proc_name='data-source', description='Data stream service'):
+class DataProcess(Process, metaclass=ProcMeta,
+                  proc_name='data-source', description='Data stream service'):
     header_fmt = "!Q?Q"
     capability_name = 'data'
 
@@ -30,7 +33,7 @@ class DataSource(Process, metaclass=ProcMeta,
         super().__init__(configurations, subsystems, log_queue, dependencies=dependencies)
         self.active = self.name in configurations
         if self.active:
-            self.cfg = configurations[self.name]
+            self.cfg: DataConfig = configurations[self.name]
         self.protocol = DataProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(DataProtocol.request, self.handle_requests)
         self.clients: dict[str, tuple[str, Identity]] = {}
@@ -66,13 +69,14 @@ class DataSource(Process, metaclass=ProcMeta,
 
             if self.active:
                 data = self.acquire()
-                for client_id in self.clients:
-                    proc_name, peer = self.clients[client_id]
-                    msg_obj = to_yaml_string(data)
-                    msg = Message(proc_name, DataProtocol.data, msg_obj, peer)
-                    try:
-                        queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                    except Full:
-                        pass
+                if data is not None:
+                    for client_id in self.clients:
+                        proc_name, peer = self.clients[client_id]
+                        msg_obj = to_yaml_string(data)
+                        msg = Message(proc_name, DataProtocol.data, msg_obj, peer)
+                        try:
+                            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+                        except Full:
+                            pass
 
             self.sleep_until(self.cadence)

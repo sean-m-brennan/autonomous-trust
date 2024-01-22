@@ -1,10 +1,10 @@
 import os
 
 from autonomous_trust.core import Configuration
-from autonomous_trust.services.video.server import VideoSrc
+from autonomous_trust.services.video.server import VideoConfig
 
 
-class SimVideoSrc(VideoSrc):
+class SimVideoSrc(VideoConfig):
     @classmethod
     def initialize(cls, idx: int = 0, size: int = 320, speed: int = 1):
         video_map = {1: 15, 2: 17, 3: 18, 4: 20, 5: 21}

@@ -5,10 +5,10 @@ import msgpack
 import msgpack_numpy as msg_np
 
 
-def serialize(frame: np.ndarray, fast=False) -> bytes:
+def serialize(data: np.ndarray, fast=False) -> bytes:
     if fast:
-        return pickle.dumps(frame)
-    return msgpack.packb(frame, default=msg_np.encode)
+        return pickle.dumps(data)
+    return msgpack.packb(data, default=msg_np.encode)
 
 
 def deserialize(data: bytes, fast=False) -> np.ndarray:
