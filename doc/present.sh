@@ -1,10 +1,9 @@
 #!/bin/bash
 
 this_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-base_dir=${this_dir}/..
+base_dir=$(cd "${this_dir}/.." && pwd)
 
-# FIXME no longer exits
-#source ${base_dir}/trust/conda/init_conda
+$base_dir/lib/update.sh
 
 # Enable job control
 set -m
