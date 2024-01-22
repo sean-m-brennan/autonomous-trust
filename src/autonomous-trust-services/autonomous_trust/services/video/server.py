@@ -1,128 +1,134 @@
 import glob
 import os.path
 import struct
-from queue import Full, Empty
+from enum import Enum
+from queue import Full
+from typing import Optional, Callable
 
 import cv2
 import imutils
 import numpy as np
 
-from autonomous_trust.core import Process, ProcMeta, Configuration, CfgIds, InitializableConfig
-from autonomous_trust.core.protocol import Protocol
+from autonomous_trust.core import ProcMeta, Configuration, CfgIds
 from autonomous_trust.core.network import Message
-from autonomous_trust.core.identity import Identity
-from .serialize import serialize
+from ..data.serialize import serialize
+from ..data.server import DataConfig, DataProcess, DataProtocol
 
-
-class VideoProtocol(Protocol):
-    request = 'request'
+class VideoProtocol(DataProtocol):  # FIXME remove?
     video = 'video'
 
+class VideoPosition(str, Enum):
+    FRAMES = 'frames'
+    SECONDS = 'seconds'
 
-class VideoSrc(InitializableConfig):
-    def __init__(self, path: str, size: int = 320, speed: int = 1):
-        self.path = path
-        self.size = size
-        self.speed = speed
+class VideoSource(object):
+    """Re-entry capable video daq"""
+    def __init__(self, source: DataConfig, frames_per_second: int = 20, position_metric: VideoPosition = VideoPosition.SECONDS):
+        self.size = source.frame_size
+        self.speed = source.speed
+        self.fps = frames_per_second
+        self.position_metric = position_metric
+        path = source.device_path
+        if not os.path.isabs(path):
+            vid_dir = os.path.join(Configuration.get_data_dir(), 'video')
+            path = os.path.join(vid_dir, path)
+        self.paths = sorted(glob.glob(path))
+        self.path_index = 0
+        self.frame_position = 0
+        self.vid_cap: Optional[cv2.VideoCapture] = None
 
-    @classmethod
-    def initialize(cls, path: str, size: int = 320, speed: int = 1):
-        return VideoSrc(path, size, speed)
+    def next(self, at_position: int = 0, post_proc: Callable[[np.ndarray], np.ndarray] = lambda x: x) -> tuple[bool, int, Optional[np.ndarray]]:
+        if self.vid_cap is None:
+            path = self.paths[self.path_index]
+            self.vid_cap = cv2.VideoCapture(path)
+            self.frame_position = 0
+            if at_position > self.frame_position:
+                self.frame_position = at_position
+                if self.position_metric == VideoPosition.SECONDS:
+                    self.vid_cap.set(cv2.CAP_PROP_POS_MSEC, int(at_position * 1000))
+                else:
+                    self.vid_cap.set(cv2.CAP_PROP_POS_FRAMES, at_position)
+        frame_count = int(self.vid_cap.get(cv2.CAP_PROP_FPS) / self.fps)  # skip frames if fps is too small
+        if frame_count < 1:
+            frame_count = 1
+        frame = None
+        more = True
+        for _ in range(frame_count):
+            more, frame = self.vid_cap.read()
+            if not more:
+                break
+        self.frame_position += 1
+        if frame is None:
+            more = False
+        if not more:
+            self.path_index += 1
+            self.path_index %= len(self.paths)
+            self.vid_cap.release()
+            self.vid_cap = None
+        if frame is None:
+            return more, self.frame_position, None
+        if self.frame_position % self.speed > 0:  # yield no frames if fps is too large
+            return more, self.frame_position, None
+
+        frame = post_proc(frame)
+        if self.size is not None:
+            frame = imutils.resize(frame, width=self.size)
+        return more, self.frame_position, frame
+
+    def disconnect(self):
+        self.vid_cap.release()
+        self.vid_cap = None
+        self.frame_position = 0
 
 
-class VideoSource(Process, metaclass=ProcMeta,
-                  proc_name='video-source', description='Video image stream service'):
-    header_fmt = "!Q?Q"
-    capability_name = 'video'
-
+class VideoProcess(DataProcess, metaclass=ProcMeta,
+                   proc_name='video-source', description='Video image stream service'):
     def __init__(self, configurations, subsystems, log_queue, dependencies):
         super().__init__(configurations, subsystems, log_queue, dependencies=dependencies)
-        self.active = self.name in configurations
         if self.active:
-            video_source: VideoSrc = configurations[self.name]
-            self.video_path_pattern = video_source.path
-            self.size = video_source.size
-            self.speed = video_source.speed
-            if not os.path.isabs(self.video_path_pattern):
-                vid_dir = os.path.join(Configuration.get_data_dir(), 'video')
-                self.video_path_pattern = os.path.join(vid_dir, self.video_path_pattern)
-        self.protocol = VideoProtocol(self.name, self.logger, configurations)
-        self.protocol.register_handler(VideoProtocol.request, self.handle_requests)
-        self.clients: dict[str, tuple[bool, str, Identity]] = {}
+            self.src = VideoSource(self.cfg)
+            self.client_props: dict[str, tuple] = {}
+
+    def process_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Implements frame processing before resizing and shipping. Default: pass-through"""
+        return frame
+
+    def acquire(self):
+        _, frame_num, frame = self.src.next(post_proc=self.process_frame)
+        return frame, frame_num
 
     def handle_requests(self, _, message):
         if message.function == VideoProtocol.request and self.active:
             fast_encoding, proc_name = message.obj
             uuid = message.from_whom.uuid
             if uuid not in self.clients:
-                self.clients[uuid] = fast_encoding, proc_name, message.from_whom
+                self.clients[uuid] = proc_name, message.from_whom
+                self.client_props[uuid] = fast_encoding,
             return True
         return False
 
-    def process_messages(self, queues):
-        try:
-            message = queues[self.name].get(block=True, timeout=self.q_cadence)
-        except Empty:
-            message = None
-        if message:
-            if not self.protocol.run_message_handlers(queues, message):
-                    if isinstance(message, Message):
-                        self.logger.error('Unhandled message %s' % message.function)
-                    else:
-                        self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
-
     def process(self, queues, signal):
-        self.logger.debug('Video capture')
-        for path in sorted(glob.glob(self.video_path_pattern)):
-            vid = None
-            while self.keep_running(signal):
-                vid = None
-                if self.active:
-                    vid = cv2.VideoCapture(path)
-                more = True
-                idx = 0
-                while more and self.keep_running(signal):  # more is always True for device (not file)
-                    self.process_messages(queues)
+        while self.keep_running(signal):
+            self.process_messages(queues)
 
-                    if not self.active:
-                        self.sleep_until(self.cadence)
-                        continue
+            if self.active:
+                frame, index = self.acquire()
+                if frame is not None:
+                    quick_info = serialize(frame, True)
+                    slow_info = serialize(frame, False)
+                    quick_header = struct.pack(self.header_fmt, len(quick_info), True, index)
+                    slow_header = struct.pack(self.header_fmt, len(slow_info), False, index)
+                    for client_id in self.clients:
+                        proc_name, peer = self.clients[client_id]
+                        fast_encoding, = self.client_props[client_id]
+                        if fast_encoding:
+                            msg_obj = quick_header + quick_info
+                        else:
+                            msg_obj = slow_header + slow_info
+                        msg = Message(proc_name, VideoProtocol.video, msg_obj, peer)
+                        try:
+                            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+                        except Full:
+                            pass  # skip this frame
 
-                    more, frame = vid.read()
-                    idx += 1
-                    if frame is None:
-                        more = False
-                        continue
-                    if idx % self.speed > 0:
-                        continue
-
-                    frame = self.process_frame(frame)
-
-                    if self.size is not None:
-                        frame = imutils.resize(frame, width=self.size)
-
-                    if frame is not None:
-                        quick_info = serialize(frame, True)
-                        slow_info = serialize(frame, False)
-                        quick_header = struct.pack(self.header_fmt, len(quick_info), True, idx)
-                        slow_header = struct.pack(self.header_fmt, len(slow_info), False, idx)
-                        for client_id in self.clients:
-                            fast_encoding, proc_name, peer = self.clients[client_id]
-                            if fast_encoding:
-                                msg_obj = quick_header + quick_info
-                            else:
-                                msg_obj = slow_header + slow_info
-                            msg = Message(proc_name, VideoProtocol.video, msg_obj, peer)
-                            try:
-                                queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                            except Full:
-                                pass  # skip this frame
-
-                    # FIXME speed of output
-                    #self.sleep_until(self.cadence)
-            if vid is not None:
-                vid.release()
-
-    def process_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Implements frame processing before resizing and shipping. Default: pass-through"""
-        return frame
+            self.sleep_until(self.cadence)

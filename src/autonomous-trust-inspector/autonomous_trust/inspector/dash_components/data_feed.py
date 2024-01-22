@@ -8,10 +8,9 @@ from ..peer.daq import PeerDataAcq
 
 
 class DataFeed(DashComponent):
-    def __init__(self, ctl: DashControl, server: Flask, peer: PeerDataAcq, number: int):
+    def __init__(self, ctl: DashControl, peer: PeerDataAcq, number: int):
         super().__init__(ctl.app)
         self.ctl = ctl
-        self.server = server
         self.number = str(number)
         self.peer = peer
         self.halt = False

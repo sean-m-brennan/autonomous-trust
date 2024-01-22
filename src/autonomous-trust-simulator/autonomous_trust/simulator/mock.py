@@ -10,7 +10,7 @@ from autonomous_trust.core.queue_pool import QueuePool
 from autonomous_trust.inspector.peer.daq import Cohort, CohortTracker
 from autonomous_trust.services.data.client import DataRcvr
 from autonomous_trust.services.network_statistics import NetStatsSource
-from autonomous_trust.services.video import VideoSource
+from autonomous_trust.services.video import VideoProcess
 from autonomous_trust.simulator.data_server import DataSimSource
 from autonomous_trust.simulator.peer.peer_metadata import SimMetadataSource
 from autonomous_trust.simulator.video.client import VideoSimRcvr

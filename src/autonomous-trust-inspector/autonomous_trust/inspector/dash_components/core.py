@@ -196,7 +196,7 @@ class DashControl(object):
                 pass
             await asyncio.sleep(0.1)
 
-    def serve_websockets(self):
+    def serve_websockets(self):  # FIXME differentiate
         threading.Thread(target=self._websocket_event_loop, daemon=True).start()
         asyncio.run_coroutine_threadsafe(self._websocket_service(), self.ws_loop)
         asyncio.run_coroutine_threadsafe(self._websocket_sender(), self.ws_loop)
@@ -300,16 +300,12 @@ class DashControl(object):
     def emit(self, event: str, data: Union[str, bytes, list, dict] = None, binary: bool = False):
         """Websocket comm to server"""
         if binary:
-            bdmsg = BinaryData.BinaryDataMsg()
+            bdmsg = BinaryData.BinaryDataMsg()  # noqa
             bdmsg.event = event
             bdmsg.elt_id = data['id']
             bdmsg.size = len(data['data'])
-            print('Msg ', bdmsg)
             bdmsg.data = data['data']
             message: bytes = bdmsg.SerializeToString()
-            #print('Enc ', enc[:40])
-            #message = base64.b64encode(enc)
-            print('B64 ', message[:40])
         else:
             message: str = json.dumps(dict(event=event, data=data))
         self.ws_send_queue.put(message)

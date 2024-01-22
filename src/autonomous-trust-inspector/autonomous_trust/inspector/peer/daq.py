@@ -34,7 +34,7 @@ class PeerDataAcq(object):
         self.cohort = cohort
         self.video_stream = video_stream
         self.data_stream = data_stream
-        self.active = True
+        self.active = False
         self.network_history: dict[str, deque[NetworkStats]] = {}
         self.reputation_history: deque[float] = deque(maxlen=self.max_history)
 

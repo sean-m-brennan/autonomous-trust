@@ -35,6 +35,5 @@ dependencies:
   - python-sounddevice
   - pip:
       - dash-iconify
-      - dash-extensions==0.1.12
       - mediapipe
       - websocket
