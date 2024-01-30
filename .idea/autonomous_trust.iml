@@ -41,7 +41,6 @@
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/.local" />
       <excludeFolder url="file://$MODULE_DIR$/lib" />
       <excludeFolder url="file://$MODULE_DIR$/virtenv" />
-      <excludeFolder url="file://$MODULE_DIR$/autonomous_trust" />
       <excludeFolder url="file://$MODULE_DIR$/etc" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/reactjs/R" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/reactjs/deps" />
