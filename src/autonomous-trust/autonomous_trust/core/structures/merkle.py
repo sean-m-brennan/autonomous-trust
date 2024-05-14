@@ -72,7 +72,7 @@ class MerkleTree(Tree, Configuration):
 
     @classmethod
     def sort_key(cls, _):
-        return 1  # unsorted, derived classed might override
+        return 1  # unsorted, derived classes might override
 
     @classmethod
     def get_hash(cls, x: Union[bytes, str]) -> bytes:

@@ -79,7 +79,7 @@ From a developer's point of view, incorporating this framework is more akin to r
 Developers would define a custom knowledge domain, decision-making callbacks, and input-disseminating code, all plugged into our multiprocessing scaffold that configurably handles networking, encryption, identity, reputation and negotiation.
 Deployment can be in the form of relocatable containers or virtual machines, or monolithic embedded kernels tied to specific hardware.
 
-This is intended as distributed, decentralized, independent system-of-systems, so command and control (more like suggest and request) requires trusted interface nodes. 
+This is intended as a distributed, decentralized, independent system-of-systems, so command and control (more like suggest and request) requires trusted interface nodes. 
 Our code base includes facilities for users to visualize and interact with the overall system through such entry points.
 Each (human) user is also peer on the network with a trust rating, thus different users automatically have different reach into the network based on their trustworthiness.
 There are no backdoors, all trust must be earned through interaction.
