@@ -367,7 +367,7 @@ class Tree(object):
                     node.parent.red = True
                     self._rotate(_Direction.right, node.parent)
                     sibling = node.parent.left
-                if not sibling.right.red and not sibling.right.red:
+                if not sibling.left.red and not sibling.right.red:
                     sibling.red = True
                     node = node.parent
                 else:
