@@ -124,9 +124,9 @@ class AutonomousTrust(Protocol):
         self.unhandled_messages: list[Message] = []
         self.peer_count = 0
 
-    def print(self, str):
+    def print(self, string):
         if not self.silent:
-            print(str)
+            print(string)
 
     @property
     def queue_type(self):

@@ -2,18 +2,7 @@ import random
 import time
 import uuid
 
-
-def x(n: int = 4):
-    """Implements a categorical distribution"""
-    r = random.random()
-    for idx, frac in zip(range(n, 1, -1), [((2**i)-1)/(2**i) for i in range(n-1, 0, -1)]):
-        if r > frac:
-            return idx
-    return 1
-
-
-def observables(n: int = 4, s: int = 100000):
-    return [x(n) for _ in range(s)]
+import numpy as np
 
 
 class Ident:
@@ -29,43 +18,69 @@ class Ident:
 
 
 class DataService:
-    n = 4
-
-    def __init__(self):
+    def __init__(self, categories: dict[int, str], size: int = 4):
         self.ident = Ident(self.__class__.__name__)
+        self.categories = categories
+        self.n = size
+        self.data = self.observables(size)
 
-    def report(self):
+    def report(self) -> list[set[int]]:
         raise NotImplementedError
 
-    def send(self):
+    def send_data(self) -> tuple[int, ...]:
+        return tuple(self.data)
+
+    def send_report(self) -> tuple[list[set[int]], Ident, float]:
         start = time.perf_counter()
         result = self.report()
         elapsed = time.perf_counter() - start
         return result, self.ident, elapsed
 
+    @staticmethod
+    def prob(n: int) -> list[float]:
+        p = [1. / (2 ** (i + 1)) for i in range(n-1)]
+        return p + [p[-1]]
+
+    @classmethod
+    def observables(cls, n: int = 4, s: int = 100000, p=None) -> list[int]:
+        """Return category indices sampled from a given distribution"""
+        if p is None:
+            p = cls.prob(n)
+        return np.random.choice(range(1, n + 1), s, p=p)
+
 
 class ExactService(DataService):
     def report(self):
         output = []
-        for x in observables(self.n):
-            output.append({x})
+        for x in self.data:
+            output.append({self.categories[x]})
+        return output
+
+
+class CloseEnoughService(DataService):
+    def report(self):
+        output = []
+        for x in self.data:
+            if x != self.n:
+                output.append({self.categories[x]})
+            output.append({self.categories[x]})
         return output
 
 
 class BlindService(DataService):
     def report(self):
         output = []
-        for _ in range(len(observables(self.n))):
-            output.append({self.n})
+        for _ in range(len(self.data)):
+            output.append({self.categories[self.n]})
         return output
 
 
 class FaultyService(DataService):
     def report(self):
         output = []
-        for x in observables(self.n):
+        for x in self.data:
             if x == self.n or random.random() < 0.2:
-                output.append({x})
+                output.append({self.categories[x]})
             else:
                 continue
         return output
@@ -74,9 +89,21 @@ class FaultyService(DataService):
 class BiasedService(DataService):
     def report(self):
         output = []
-        for x in observables(self.n):
+        for x in self.data:
             if x == 1 or x == self.n:
-                output.append({1, self.n})
+                output.append({self.categories[1]})
+                output.append({self.categories[self.n]})
             else:
-                output.append({x})
+                output.append({self.categories[x]})
         return output
+
+
+class DeceitService(DataService):
+    def report(self):
+        output = []
+        for x in self.data:
+            output.append({self.categories[self.n - x + 1]})
+        return output
+
+
+ALL_SERVICES = [ExactService, CloseEnoughService, BlindService, FaultyService, BiasedService, DeceitService]
