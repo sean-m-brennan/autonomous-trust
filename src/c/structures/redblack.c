@@ -1,9 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <errno.h>
 
 #include "redblack.h"
 #include "array.h"
+
+extern int errno;
 
 enum Direction
 {
@@ -23,13 +26,15 @@ struct rbNode
 {
     int key;
     bool red;
-    tree_data data;
+    tree_data_ptr_t data;
     struct rbNode *parent, *left, *right;
 };
 
-struct rbNode *createNode(tree_data data, int key)
+struct rbNode *createNode(tree_data_ptr_t data, int key)
 {
     struct rbNode *newNode = (struct rbNode *)malloc(sizeof(struct rbNode));
+    if (newNode == NULL)
+        return NULL;
     newNode->data = data;
     newNode->key = key;
     newNode->red = true;
@@ -37,19 +42,23 @@ struct rbNode *createNode(tree_data data, int key)
     return newNode;
 }
 
-struct rbNode *copyNodes(struct rbNode *orig, struct rbNode *parent)
+/*struct rbNode *copyNodes(struct rbNode *orig, struct rbNode *parent)
 {
     if (orig == NULL)
         return NULL;
     struct rbNode *copy = createNode(orig->data, orig->key);
+    if (copy == NULL) {
+        errno = ENOMEM;
+        return copy;
+    }
     copy->red = orig->red;
     copy->left = copyNodes(orig->left, copy);
     copy->right = copyNodes(orig->right, copy);
     copy->parent = parent;
     return copy;
-}
+}*/
 
-struct rbNode *findNode(RedBlackTree *tree, int key)
+struct rbNode *findNode(tree_t *tree, int key)
 {
     struct rbNode *current = tree->root;
     while (current != NULL)
@@ -115,10 +124,24 @@ struct rbNode *nodeMinLeaf(struct rbNode *node)
     return current;
 }
 
+void nodesFree(struct rbNode *node) {
+    if (node->left != NULL)
+        nodesFree(node->left);
+    if (node->right != NULL)
+        nodesFree(node->right);
+    free(node);
+}
+
+
 /**********************/
 // private tree functions
 
-void rotateTree(RedBlackTree *tree, enum Direction dir, struct rbNode *node)
+struct rbTreeStruct {
+    struct rbNode *root;
+    int size;
+};
+
+void rotateTree(tree_t *tree, enum Direction dir, struct rbNode *node)
 {
     enum Direction direction = dir;
     enum Direction counter = opposite_direction(dir);
@@ -138,7 +161,7 @@ void rotateTree(RedBlackTree *tree, enum Direction dir, struct rbNode *node)
     node->parent = pivot;
 }
 
-struct rbNode *recolorInsPartial(RedBlackTree *tree, enum Direction dir, struct rbNode *node)
+struct rbNode *recolorInsPartial(tree_t *tree, enum Direction dir, struct rbNode *node)
 {
     struct rbNode *cousin;
     struct rbNode *sibling;
@@ -173,7 +196,7 @@ struct rbNode *recolorInsPartial(RedBlackTree *tree, enum Direction dir, struct 
     return node;
 }
 
-void recolorInsert(RedBlackTree *tree, struct rbNode *node)
+void recolorInsert(tree_t *tree, struct rbNode *node)
 {
     while (node != tree->root && node->parent->red)
     {
@@ -186,7 +209,7 @@ void recolorInsert(RedBlackTree *tree, struct rbNode *node)
     }
 }
 
-void transplant(RedBlackTree *tree, struct rbNode *u, struct rbNode *v)
+void transplant(tree_t *tree, struct rbNode *u, struct rbNode *v)
 {
     if (u->parent == NULL)
         tree->root = v;
@@ -197,7 +220,7 @@ void transplant(RedBlackTree *tree, struct rbNode *u, struct rbNode *v)
     v->parent = u->parent;
 }
 
-struct rbNode *recolorDelPartial(RedBlackTree *tree, enum Direction dir, struct rbNode *node)
+struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode *node)
 {
     struct rbNode *sibling, *other;
     if (dir == LEFT)
@@ -259,7 +282,7 @@ struct rbNode *recolorDelPartial(RedBlackTree *tree, enum Direction dir, struct 
     }
 }
 
-void recolorDelete(RedBlackTree *tree, struct rbNode *node)
+void recolorDelete(tree_t *tree, struct rbNode *node)
 {
     while (node != tree->root && !node->red)
     {
@@ -274,41 +297,49 @@ void recolorDelete(RedBlackTree *tree, struct rbNode *node)
 /**********************/
 // public tree functions
 
-RedBlackTree *tree_create()
+tree_t *tree_create()
 {
-    RedBlackTree *newTree = (RedBlackTree *)malloc(sizeof(RedBlackTree));
+    tree_t *newTree = (tree_t *)malloc(sizeof(tree_t));
     initTree(newTree);
     return newTree;
 }
 
-void tree_init(RedBlackTree *tree)
+void tree_init(tree_t *tree)
 {
     tree->root = NULL;
     tree->size = 0;
 }
 
-RedBlackTree *tree_copy(RedBlackTree *tree)
-{ // semi-deep copy
-    RedBlackTree *newTree = createTree();
+/*tree_t *tree_copy(tree_t *tree)
+{
+    tree_t *newTree = createTree();
+    if (newTree == NULL)
+        return NULL;
     newTree->root = copyNodes(tree->root, NULL);
+    if (newTree->root == NULL) {
+        free_tree(newTree)  // may be partially built
+        return NULL;
+    }
     newTree->size = tree->size;
     return newTree;
-}
+}*/
 
-tree_data tree_find(RedBlackTree *tree, int key)
+tree_data_ptr_t tree_find(tree_t *tree, int key)
 {
     return findNode(tree, key)->data;
 }
 
-int tree_insert(RedBlackTree *tree, tree_data data)
+int tree_insert_auto_key(tree_t *tree, tree_data_ptr_t data)
 {
     int key = tree->size + 1;
-    return insertion_with_key(tree, data, key);
+    return tree_insert(tree, data, key);
 }
 
-int tree_insert_with_key(RedBlackTree *tree, void *data, int key)
+int tree_insert(tree_t *tree, void *data, int key)
 {
     struct rbNode *node = createNode(data, key);
+    if (node == NULL)
+        return ENOMEM;
     struct rbNode *parent = NULL;
     struct rbNode *current = tree->root;
     while (current != NULL)
@@ -336,7 +367,7 @@ int tree_insert_with_key(RedBlackTree *tree, void *data, int key)
     return 0;
 }
 
-int tree_delete(RedBlackTree *tree, int key)
+int tree_delete(tree_t *tree, int key)
 {
     if (!tree->root)
         return ERBT_EMPTY;
@@ -376,4 +407,10 @@ int tree_delete(RedBlackTree *tree, int key)
         recolorDelete(tree, fix_root);
     tree->size--;
     return 0;
+}
+
+
+void tree_free(tree_t *tree) {
+    nodesFree(tree->root);
+    tree->size = 0;
 }
