@@ -4,27 +4,23 @@
 
 #include "array.h"
 
-inline int max(int a, int b)
+struct arrayStruct
 {
-    return ((a) > (b) ? a : b);
-}
+    array_data_ptr_t *array;
+    size_t size;
+};
 
-inline int min(int a, int b)
-{
-    return ((a) < (b) ? a : b);
-}
-
-void array_init(Array *a, size_t initialSize)
+void array_init(array_t *a)
 {
     a->array = NULL;
     a->size = 0;
 }
 
-int array_insert(Array *a, array_data element)
+int array_append(array_t *a, array_data_ptr_t element)
 {
     int last = a->size;
     a->size++;
-    array_data *new = realloc(a->array, a->size * sizeof(array_data));
+    array_data_ptr_t *new = realloc(a->array, a->size * sizeof(array_data_ptr_t));
     if (a->size > 0 && new == NULL)
         return ENOMEM;
     a->array = new;
@@ -32,7 +28,7 @@ int array_insert(Array *a, array_data element)
     return 0;
 }
 
-int array_find(Array *a, array_data element)
+int array_find(array_t *a, array_data_ptr_t element)
 {
     for (int i = 0; i < a->size; i++)
     {
@@ -42,7 +38,7 @@ int array_find(Array *a, array_data element)
     return -1;
 }
 
-int array_filter(Array *a, bool (*filter)(array_data))
+int array_filter(array_t *a, bool (*filter)(array_data_ptr_t))
 {
     for (int i = 0; i < a->size; i++)
     {
@@ -52,22 +48,23 @@ int array_filter(Array *a, bool (*filter)(array_data))
     return -1;
 }
 
-bool aray_contains(Array *a, array_data element)
+bool aray_contains(array_t *a, array_data_ptr_t element)
 {
     return array_find(a, element) < 0;
 }
 
-int array_get(Array *a, int index, array_data *element)
+array_data_ptr_t *array_get(array_t *a, int index)
 {
     if (index < 0)
         index = a->size + 1 + index;
-    if (index > a->size)
-        return EARR_OOB;
-    *element = a->array[index];
-    return 0;
+    if (index > a->size) {
+        errno = EARR_OOB;
+        return NULL;
+    }
+    return a->array[index];
 }
 
-int array_set(Array *a, int index, array_data element)
+int array_set(array_t *a, int index, array_data_ptr_t element)
 {
     if (index < 0)
         index = a->size + 1 + index;
@@ -77,19 +74,19 @@ int array_set(Array *a, int index, array_data element)
     return 0;
 }
 
-int array_remove(Array *a, array_data element)
+int array_remove(array_t *a, array_data_ptr_t element)
 {
     int index = array_find(a, element);
     if (index < 0)
         return EARR_NOELT;
     size_t n = a->size - (index + 1);
     memmove(a->array + index, a->array + index + 1, n);
-    bzero(a->array + a->size, sizeof(array_data));
+    bzero(a->array + a->size, sizeof(array_data_ptr_t));
     a->size--;
     return 0;
 }
 
-void array_free(Array *a)
+void array_free(array_t *a)
 {
     free(a->array);
     a->array = NULL;

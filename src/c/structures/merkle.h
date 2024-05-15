@@ -1,23 +1,13 @@
 #ifndef MERKLE_H
 #define MERKLE_H
 
-#include "array.h"
-#include "redblack.h"
+struct merkleNode;
 
-typedef struct
-{
-    int digest; // FIXME hash
-    void *blob;
-    char *uuid;
-} MerkleNode;
+typedef struct merkleNode merkle_node_t;
 
-typedef struct
-{
-    RedBlackTree tree;
-    int superHash;
-    Array blobs;
-    Array unique;
-    Array nonUnique;
-} MerkleTree;
+struct merkleTree;
+
+typedef struct merkleTree merkle_tree_t;
+
 
 #endif // MERKLE_H

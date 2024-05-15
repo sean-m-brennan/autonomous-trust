@@ -5,6 +5,7 @@
 /.idea/**/dictionaries
 /.idea/**/shelf
 /.idea/**/sonarlint*
+/.vscode/*
 
 ### Latex ###
 /doc/**/out
@@ -56,3 +57,27 @@ dist
 /src/autonomous-trust/.local
 /src/autonomous-trust-inspector/.local
 /*.log
+
+/src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/assets
+
+/src/autonomous-trust-inspector/reactjs/src/AsyncUpdate.jl
+/src/autonomous-trust-inspector/reactjs/src/jl
+/src/autonomous-trust-inspector/reactjs/man
+/src/autonomous-trust-inspector/reactjs/deps
+/src/autonomous-trust-inspector/reactjs/inst
+/src/autonomous-trust-inspector/reactjs/node_modules
+/src/autonomous-trust-inspector/reactjs/package-lock.json
+/src/autonomous-trust-inspector/reactjs/async_update/AsyncUpdate.py
+/src/autonomous-trust-inspector/reactjs/async_update/Trigger.py
+/src/autonomous-trust-inspector/reactjs/async_update/_imports_.py
+/src/autonomous-trust-inspector/reactjs/async_update/async_update.dev.js
+/src/autonomous-trust-inspector/reactjs/async_update/async_update.dev.js.map
+/src/autonomous-trust-inspector/reactjs/async_update/async_update.min.js.LICENSE.txt
+/src/autonomous-trust-inspector/reactjs/async_update/bin_data_pb2.py
+/src/autonomous-trust-inspector/reactjs/async_update/metadata.json
+/src/autonomous-trust-inspector/reactjs/async_update/package-info.json
+/src/autonomous-trust-inspector/reactjs/R
+/src/autonomous-trust-inspector/reactjs/.Rbuildignore
+/src/autonomous-trust-inspector/reactjs/DESCRIPTION
+/src/autonomous-trust-inspector/reactjs/NAMESPACE
+/src/autonomous-trust-inspector/reactjs/Project.toml
