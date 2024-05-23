@@ -1,19 +1,21 @@
-#ifndef C_CONFIGURATION_H
-#define C_CONFIGURATION_H
+#ifndef CONFIGURATION_H
+#define CONFIGURATION_H
 
 /**
  * @brief Get the config directory
  * 
- * @return const char* 
+ * @param path char[256]
+ * @return int
  */
-const char *get_cfg_dir();
+int get_cfg_dir(char path[]);
 
 /**
  * @brief Get the data directory
  * 
- * @return const char* 
+ * @param path char[256]
+ * @return int
  */
-const char *get_data_dir();
+int get_data_dir(char path[]);
 
 
-#endif // C_CONFIGURATION_H
+#endif // CONFIGURATION_H

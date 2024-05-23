@@ -2,7 +2,7 @@
 #define SIGNATURE_I
 
 #include <stdbool.h>
-#include <sodium/crypto_sign.h>
+#include <sodium.h>
 
 
 typedef struct

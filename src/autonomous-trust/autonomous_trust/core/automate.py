@@ -295,7 +295,7 @@ class AutonomousTrust(Protocol):
         for cfg_name in required:
             if cfg_name not in cfg_types:
                 if cfg_name in defaultable:
-                    defaultable[cfg_name]().to_file(os.path.join(cfg_dir, cfg_name + Configuration.yaml_file_ext))
+                    defaultable[cfg_name]().to_file(os.path.join(cfg_dir, cfg_name + Configuration.file_ext))
                 else:
                     self.logger.error('%s:  Required %s configuration missing' % (self.name, cfg_name))
                     return None

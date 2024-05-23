@@ -75,8 +75,8 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         except ValueError:
             seed = sum([ord(x) for x in seed])
 
-    ident_file = os.path.join(cfg_dir, CfgIds.identity + Configuration.yaml_file_ext)
-    net_file = os.path.join(cfg_dir, CfgIds.network + Configuration.yaml_file_ext)
+    ident_file = os.path.join(cfg_dir, CfgIds.identity + Configuration.file_ext)
+    net_file = os.path.join(cfg_dir, CfgIds.network + Configuration.file_ext)
     sub_sys_file = os.path.join(cfg_dir, ProcessTracker.default_filename)
 
     unqualified_hostname = socket.gethostname()
@@ -191,7 +191,7 @@ def random_config(base_dir, ident: str = None):
 
 
 def generate_worker_config(cfg_dir: str, proc_name: str, cfg_class: type[InitializableConfig], defaults: bool = False):
-    cfg_file = os.path.join(cfg_dir, proc_name + Configuration.yaml_file_ext)
+    cfg_file = os.path.join(cfg_dir, proc_name + Configuration.file_ext)
     if not os.path.exists(cfg_file):
         print('Configure %s --' % proc_name)
         spec = inspect.getfullargspec(cfg_class.initialize)
