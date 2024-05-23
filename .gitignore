@@ -81,3 +81,6 @@ dist
 /src/autonomous-trust-inspector/reactjs/DESCRIPTION
 /src/autonomous-trust-inspector/reactjs/NAMESPACE
 /src/autonomous-trust-inspector/reactjs/Project.toml
+
+
+/src/c/build

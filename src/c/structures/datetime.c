@@ -6,7 +6,6 @@
 #include <unistd.h>
 #include <errno.h>
 #include <math.h>
-//#include <strings.h>
 #include <stdlib.h>
 
 #include "datetime.h"

@@ -32,7 +32,7 @@ class Configuration(object):
     CFG_PATH = os.path.join('etc', 'at')
     DATA_PATH = os.path.join('var', 'at')
     YAML_PREFIX = u'!Cfg'
-    yaml_file_ext = '.cfg.yaml'
+    file_ext = '.cfg.yaml'
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
 
     @classmethod

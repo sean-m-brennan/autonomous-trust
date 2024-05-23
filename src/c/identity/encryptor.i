@@ -2,7 +2,7 @@
 #define ENCRYPTOR_I
 
 #include <stdbool.h>
-#include <sodium/crypto_box.h>
+#include <sodium.h>
 
 
 typedef struct

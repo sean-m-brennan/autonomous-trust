@@ -3,64 +3,75 @@
 
 #include <stdlib.h>
 
-struct identityStruct;
-
-typedef struct identityStruct identity_t;
+typedef struct identity_s identity_t;
 
 typedef struct
 {
     unsigned char *msg;
     unsigned long long len; 
-} message_t;
+} message_t;  // FIXME separate file
 
+/***/
+int identity_create(unsigned char *address, identity_t **ident);
 
 /**
  * @brief 
  * 
  * @param ident 
- * @param msg 
+ * @param pub_copy 
  * @return int 
  */
-int identity_sign(identity_t *ident, message_t *in, message_t *out);
+int identity_publish(const identity_t *ident, identity_t **pub_copy);
 
 /**
  * @brief 
  * 
  * @param ident 
- * @param msg 
- * @param sig 
+ * @param in 
+ * @param out 
  * @return int 
  */
-int identity_verify(identity_t *ident, message_t *in, message_t *out);
+int identity_sign(const identity_t *ident, const message_t *in, message_t *out);
 
 /**
  * @brief 
  * 
  * @param ident 
- * @param msg 
+ * @param in 
+ * @param out 
+ * @return int 
+ */
+int identity_verify(const identity_t *ident, const message_t *in, message_t *out);
+
+/**
+ * @brief 
+ * 
+ * @param ident 
+ * @param in 
  * @param whom 
  * @param nonce 
+ * @param cipher 
  * @return int 
  */
-int identity_encrypt(identity_t *ident, const message_t *in, identity_t *whom, unsigned char *nonce, unsigned char *cipher);
+int identity_encrypt(const identity_t *ident, const message_t *in, const identity_t *whom, const unsigned char *nonce, unsigned char *cipher);
 
 /**
  * @brief 
  * 
  * @param ident 
- * @param msg 
+ * @param cipher 
  * @param whom 
  * @param nonce 
+ * @param out 
  * @return int 
  */
-int identity_decrypt(identity_t *ident, const message_t *cipher, identity_t *whom, unsigned char *nonce, unsigned char *out);
+int identity_decrypt(const identity_t *ident, const message_t *cipher, const identity_t *whom, const unsigned char *nonce, unsigned char *out);
 
 /**
  * @brief 
  * 
  * @param ident 
- * @return identity_t* 
  */
-identity_t *identity_publish(identity_t *ident);
+void identity_free(identity_t *ident);
 
 #endif // IDENTITY_H
