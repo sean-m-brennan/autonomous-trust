@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+import "identity.proto";
+
+message IdentityMap {
+  map<string, Identity> id_by_name = 1;
+}
+
+message Peers {
+  repeated IdentityMap hierarchy = 1;
+  repeated IdentityMap valuation = 2;
+}
