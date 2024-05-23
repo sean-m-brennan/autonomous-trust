@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+message Network {
+  string ip4_cidr = 1;
+  string ip6_cidr = 2;
+  string mac_address = 3;
+  string mcast4_addr = 4;
+  string mcast6_addr = 5;
+  uint32 port = 6;
+}
