@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+import "agreement.proto";
+
+message Encryptor {
+  bytes seed = 1;  // hex encoded
+}
+
+message Signature {
+  bytes seed = 1;  // hex encoded
+}
+
+message Identity {
+  bytes uuid = 1;
+  uint32 rank = 2;
+  string address = 3;
+  string fullname = 4;
+  string nickname = 5;
+  string petname = 6;
+  Signature signature = 7;
+  Encryptor encryptor = 8;
+  bool public_only = 9;
+  AgreementImpl block = 10;
+}
+
+message Group {
+  bytes uuid = 1;
+  map<string, string> address_map = 2;  // Identity UUID to address
+  string nickname = 3;
+  Encryptor encryptor = 4;  // group-shared key
+  bool public_only = 5;
+}

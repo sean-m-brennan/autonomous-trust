@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+enum AgreementImpl {
+    POW = 0;
+    POS = 1;
+    POA = 2;
+};

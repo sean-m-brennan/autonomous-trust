@@ -1,0 +1,5 @@
+syntax = "proto3";
+
+message ProcessTracker {
+  map<string, string> registry = 1;
+}

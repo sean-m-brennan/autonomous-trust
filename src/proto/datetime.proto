@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+message DateTime {
+  uint32 nanosecond = 1;
+  uint32 second = 2;
+  uint32 minute = 3;
+  uint32 hour = 4;
+  uint32 day = 5;  // day of month
+  uint32 month = 6;
+  uint32 year = 7;
+  uint32 weekday = 8;   // day of week, Sunday = 0
+  uint32 day_of_year = 9;   // Jan 1st = 0
+  float utc_offset = 10;
+}
+
+message TimeDelta {
+  sint64 days = 1;
+  uint32 seconds = 2;
+  uint32 nanoseconds = 3;
+}
