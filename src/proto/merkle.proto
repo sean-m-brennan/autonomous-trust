@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+import "google/protobuf/any.proto";
+
+message MerkleNode {
+  // red/black tree node
+  int32 key = 1;
+  MerkleNode parent = 2;
+  MerkleNode left = 3;
+  MerkleNode right = 4;
+  bool red = 5;
+  // merkle node
+  bytes uuid = 6;
+  uint32 digest = 7;
+  google.protobuf.Any blob = 8;
+}
+
+message MerkleTree {
+  // red/black tree
+  MerkleNode root = 1;
+  uint64 size = 2;
+  // merkle tree
+  uint32 superHash = 3;
+}
