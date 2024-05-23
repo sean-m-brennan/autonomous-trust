@@ -3,23 +3,15 @@
 
 typedef void* tree_data_ptr_t;
 
-struct rbTreeStruct;
-
-typedef struct rbTreeStruct tree_t;
+typedef struct rbTree_s tree_t;
 
 /**
-* @brief Memory allocation for a new tree.
-*
-* @return Pointer to new tree (null on error).
-*/
-tree_t *tree_create();
-
-/**
-* @brief Initialization for an existing tree.
-*
-* @param tree Pointer to tree to initialize.
-*/
-void tree_init(tree_t *tree);
+ * @brief Allocation for a new tree.
+ *
+ * @param tree 
+ * @return int Success (0) or error code
+ */
+int tree_create(tree_t **tree_ptr);
 
 /*
 * @brief Semi-deep copy for trees (does not copy the data itself).

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "../structures/datetime.h"
 
@@ -77,11 +78,13 @@ int logger_init_local_time_res(logger_t *logger, log_level_t max_level, const ch
  */
 void logging(logger_t *logger, log_level_t level, const char *srcfile, const size_t line, const char *fmt, ...);
 
-#define log_debug(logger, ...) logging(logger, DEBUG, __FILE__, __LINE__, __VA_ARGS__)
-#define log_info(logger, ...)  logging(logger, INFO, __FILE__, __LINE__, __VA_ARGS__)
-#define log_warn(logger, ...)  logging(logger, WARNING, __FILE__, __LINE__, __VA_ARGS__)
-#define log_error(logger, ...) logging(logger, ERROR, __FILE__, __LINE__, __VA_ARGS__)
-#define log_critical(logger, ...) logging(logger, CRITICAL, __FILE__, __LINE__, __VA_ARGS__)
+#define __FILENAME__ (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
+
+#define log_debug(logger, format, ...) logging(logger, DEBUG, __FILENAME__, __LINE__, format, __VA_ARGS__)
+#define log_info(logger, format, ...)  logging(logger, INFO, __FILENAME__, __LINE__, format, __VA_ARGS__)
+#define log_warn(logger, format, ...)  logging(logger, WARNING, __FILENAME__, __LINE__, format, __VA_ARGS__)
+#define log_error(logger, format, ...) logging(logger, ERROR, __FILENAME__, __LINE__, format, __VA_ARGS__)
+#define log_critical(logger, format, ...) logging(logger, CRITICAL, __FILENAME__, __LINE__, format, __VA_ARGS__)
 
 /**
  * @brief Close the given logger

@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <errno.h>
@@ -28,6 +27,11 @@ struct rbNode
     bool red;
     tree_data_ptr_t data;
     struct rbNode *parent, *left, *right;
+};
+
+struct rbTree_s {
+    struct rbNode *root;
+    int size;
 };
 
 struct rbNode *createNode(tree_data_ptr_t data, int key)
@@ -120,7 +124,7 @@ struct rbNode *nodeMinLeaf(struct rbNode *node)
     while (current->left != NULL)
         current = current->left;
     if (!nodeIsLeaf(current))
-        current = minLeaf(current->right);
+        current = nodeMinLeaf(current->right);
     return current;
 }
 
@@ -135,11 +139,6 @@ void nodesFree(struct rbNode *node) {
 
 /**********************/
 // private tree functions
-
-struct rbTreeStruct {
-    struct rbNode *root;
-    int size;
-};
 
 void rotateTree(tree_t *tree, enum Direction dir, struct rbNode *node)
 {
@@ -237,7 +236,7 @@ struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode
     {
         sibling->red = false;
         node->parent->red = true;
-        rotate(tree, dir, node->parent);
+        rotateTree(tree, dir, node->parent);
         sibling = other;
     }
 
@@ -254,13 +253,13 @@ struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode
             {
                 sibling->left->red = false;
                 sibling->red = true;
-                rotate(tree, opposite_direction(dir), sibling);
+                rotateTree(tree, opposite_direction(dir), sibling);
                 sibling = node->parent->right;
             }
             sibling->red = node->parent->red;
             node->parent->red = false;
             sibling->right->red = false;
-            rotate(tree, dir, node->parent);
+            rotateTree(tree, dir, node->parent);
             node = tree->root;
         }
         else
@@ -269,17 +268,18 @@ struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode
             {
                 sibling->right->red = false;
                 sibling->red = true;
-                rotate(tree, opposite_direction(dir), sibling);
+                rotateTree(tree, opposite_direction(dir), sibling);
                 sibling = node->parent->left;
             }
             sibling->red = node->parent->red;
             node->parent->red = false;
             sibling->left->red = false;
-            rotate(tree, dir, node->parent);
+            rotateTree(tree, dir, node->parent);
             node = tree->root;
         }
         node->red = false;
     }
+    return node;
 }
 
 void recolorDelete(tree_t *tree, struct rbNode *node)
@@ -297,17 +297,14 @@ void recolorDelete(tree_t *tree, struct rbNode *node)
 /**********************/
 // public tree functions
 
-tree_t *tree_create()
+int tree_create(tree_t **tree_ptr)
 {
-    tree_t *newTree = (tree_t *)malloc(sizeof(tree_t));
-    initTree(newTree);
-    return newTree;
-}
-
-void tree_init(tree_t *tree)
-{
-    tree->root = NULL;
-    tree->size = 0;
+    if (tree_ptr == NULL)
+        return EINVAL;
+    *tree_ptr = calloc(1, sizeof(tree_t));
+    if (*tree_ptr == NULL)
+        return ENOMEM;
+    return 0;
 }
 
 /*tree_t *tree_copy(tree_t *tree)
@@ -413,4 +410,5 @@ int tree_delete(tree_t *tree, int key)
 void tree_free(tree_t *tree) {
     nodesFree(tree->root);
     tree->size = 0;
+    free(tree);
 }
