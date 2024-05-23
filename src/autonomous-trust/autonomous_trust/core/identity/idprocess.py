@@ -80,7 +80,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         return self.protocol.capabilities
 
     def _remember_activity(self, queues, name: str, obj: Union[Peers, PeerCapabilities, GroupHistory]):
-        filename = os.path.join(Configuration.get_cfg_dir(), name + Configuration.yaml_file_ext)
+        filename = os.path.join(Configuration.get_cfg_dir(), name + Configuration.file_ext)
         try:
             with self.lock:  # multiple *threads* may try to save data
                 if isinstance(obj, Peers) or isinstance(obj, PeerCapabilities):
@@ -195,7 +195,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 else:
                     from_scratch = True
                     try:
-                        filename = os.path.join(Configuration.get_cfg_dir(), 'group' + Configuration.yaml_file_ext)
+                        filename = os.path.join(Configuration.get_cfg_dir(), 'group' + Configuration.file_ext)
                         if os.path.exists(filename):
                             with open(filename, 'r') as cfg:
                                 self.group, hist_dict = from_yaml_string(cfg.read())

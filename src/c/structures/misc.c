@@ -18,7 +18,7 @@ int bytes_decode(void *in, size_t in_size, void *out, size_t out_size)
 }
 
 int bytes_encode(void *in, void *out, size_t size)
-{ // note: out should be at least 140% larger than in
+{ // note: use base64_output_size() to determine size
     base64_encodestate state;
     base64_init_encodestate(&state);
     base64_encode_block((const char *)in, size, (char *)out, &state);

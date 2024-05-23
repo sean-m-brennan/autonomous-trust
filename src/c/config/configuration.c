@@ -1,5 +1,7 @@
 #include <stdlib.h>
-#include <yaml.h>
+#include <string.h>
+#include <errno.h>
+#include <stdio.h>
 
 #include "configuration.h"
 
@@ -9,10 +11,6 @@ const char CFG_PATH[] = "etc/at";
 
 const char DATA_PATH[] = "var/at";
 
-const char YAML_PREFIX[] = "!Cfg";
-
-const char YML_FILE_EXT[] = ".cfg.yaml";
-
 char *rootDir()
 {
     char *root = getenv(ROOT_ENV_VAR);
@@ -21,23 +19,12 @@ char *rootDir()
     return root;
 }
 
-const char *get_cfg_dir()
+int get_cfg_dir(char path[])
 {
-    const char path[256];
-    snprintf(path, 255, "%s/%s", rootDIR(), CFG_PATH);
-    return path;
+    return snprintf(path, 255, "%s/%s", rootDir(), CFG_PATH);
 }
 
-const char *get_data_dir()
+int get_data_dir(char path[])
 {
-    const char path[256];
-    snprintf(path, 255, "%s/%s", rootDIR(), DATA_PATH);
-    return path;
+    return snprintf(path, 255, "%s/%s", rootDir(), DATA_PATH);
 }
-
-// FIXME representers and constructors
-// datetime
-// timedelta
-// uuid
-// signedmessage
-// decimal

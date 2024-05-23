@@ -322,7 +322,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             rep_score = self._contrite_tit_for_tat(peer)
         self.reputations.update(peer.uuid, rep_score)
         self.reputations.to_file(os.path.join(Configuration.get_cfg_dir(),
-                                              CfgIds.reputation + Configuration.yaml_file_ext))
+                                              CfgIds.reputation + Configuration.file_ext))
         self.requested_reps.append((Reputation(peer.uuid, rep_score), req_proc, requestor))
 
     def handle_reputation_request(self, _, message):
