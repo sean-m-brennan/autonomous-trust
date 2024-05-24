@@ -14,84 +14,99 @@ include_directories(${LIBB64_INCLUDE_DIR})
 find_package(Protobuf REQUIRED)
 include_directories(${Protobuf_INCLUDE_DIRS})
 
-find_path(LIBPROTOBUFC_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c)
-find_library(LIBPROTOBUFC_LIBRARY libprotobuf-c.a)
-include_directories(${LIBPROTOBUFC_INCLUDE_DIR})
+find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c)
+find_library(LIBPROTOBUF_C_LIBRARY libprotobuf-c.a)
+include_directories(${LIBPROTOBUF_C_INCLUDE_DIR})
+find_program(PROTOC_C_EXE protoc-c)
 
-set(DEPENDENCIES ${LIBUUID_LIBRARY} ${LIBB64_LIBRARY} ${LIBPROTOBUF_LIBRARY} ${LIBPROTOBUFC_LIBRARY})
+set(DEPENDENCIES
+        ${LIBUUID_LIBRARY}
+        ${LIBB64_LIBRARY}
+        ${LIBPROTOBUF_LIBRARY}
+        ${LIBPROTOBUF_C_LIBRARY}
+)
 
 add_compile_options(-Wall -Werror -fms-extensions)
 
 set(PROTO_SOURCE_DIR "${CMAKE_SOURCE_DIR}/proto")
-set(PROTO_BINARY_DIR "${CMAKE_SOURCE_DIR}/proto/generated")
+set(PROTO_BINARY_DIR "${CMAKE_SOURCE_DIR}/proto/c")
 
-set(proto_in
-        agreement.proto
-        datetime.proto
-        identity.proto
-        merkle.proto
-        network.proto
-        peers.proto
-        processes.proto
+set(protos
+        autonomous_trust/protobuf/agreement.proto
+        autonomous_trust/protobuf/identity.proto
+        autonomous_trust/protobuf/network.proto
+        autonomous_trust/protobuf/peers.proto
+        autonomous_trust/protobuf/processes.proto
+        autonomous_trust/protobuf/structures/datetime.proto
+        autonomous_trust/protobuf/structures/merkle.proto
 )
 
-set(proto_path "")
-set(proto_src "")
-set(proto_hdr "")
-foreach(proto ${proto_in})
-        set(proto_path ${proto_path} ${PROTO_SOURCE_DIR}/${proto})
-        string(REGEX REPLACE "[.].proto$" ".pb-c.c" a_src ${proto})
-        set(proto_src ${proto_src} "${PROTO_BINARY_DIR}/${a_src}")
-        string(REGEX REPLACE "[.].proto$" ".pb-c.h" a_src ${proto})
-        set(proto_hdr ${proto_hdr} "${PROTO_BINARY_DIR}/${a_src}")
-endforeach()
-
+set(google_protos
+        google/protobuf/duration.proto
+        google/protobuf/descriptor.proto
+        google/protobuf/any.proto
+        google/protobuf/timestamp.proto
+        google/protobuf/source_context.proto
+        google/protobuf/field_mask.proto
+        google/protobuf/api.proto
+        google/protobuf/struct.proto
+        google/protobuf/empty.proto
+        google/protobuf/type.proto
+        google/protobuf/wrappers.proto
+)
 
 set(libsrc
-        autonomous_trust.c
-        processes.c
-        config/configuration.c
-        identity/identity.c
-	#network/network.c
-        structures/array.c
-        structures/datetime.c
-	structures/map.c
-        structures/merkle.c
-        structures/misc.c
-        structures/redblack.c
-        utilities/message.c
-        utilities/logger.c
-        utilities/util.c
+        autonomous_trust/autonomous_trust.c
+        autonomous_trust/config/configuration.c
+        autonomous_trust/config/processes.c
+        autonomous_trust/identity/identity.c
+	#autonomous_trust/network/network.c
+        autonomous_trust/structures/array.c
+        autonomous_trust/structures/datetime.c
+        autonomous_trust/structures/map.c
+        autonomous_trust/structures/merkle.c
+        autonomous_trust/structures/misc.c
+        autonomous_trust/structures/redblack.c
+        autonomous_trust/utilities/message.c
+        autonomous_trust/utilities/logger.c
+        autonomous_trust/utilities/util.c
 )
+include_directories(${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/autonomous_trust)
 
-set(allhdr
-        processes.h
-        config/configuration.h
-        identity/identity.h
-	#network/network.h
-        structures/array.h
-        structes/datetime.h
-	structures/map.h
-        structures/merkle.h
-        structures/redblack.h
-	structures/structures.h
-        utilities/logger.h
-        utilities/util.h
-)
 
-set(PROTOC_C_EXECUTABLE protoc-c)
-add_custom_target(protoc-c-generated-files
-       COMMAND ${CMAKE_COMMAND} -E make_directory ${PROTO_BINARY_DIR}
-       COMMAND ${PROTOC_C_EXECUTABLE} --c_out ${PROTO_BINARY_DIR} -I${PROTOBUF_INCLUDE_DIR} -I${PROTO_SOURCE_DIR} ${proto_in}
-       COMMENT "Running C protocol buffer compiler on ${proto_in}"
-       BYPRODUCTS ${proto_src} ${proto_hdr}
-       SOURCES ${proto_path}
-)
-include_directories(${PROTO_BINARY_DIR})
+function(protoc_c_gen _proto _full_proto _dir)
+        get_filename_component(_base ${_proto} NAME_WE)
+        set(_pb_c_src ${PROTO_BINARY_DIR}/${_dir}/${_base}.pb-c.c)
+        add_custom_command(
+                OUTPUT ${PROTO_BINARY_DIR}/${_dir}/${_base}.pb-c.h ${_pb_c_src}
+                COMMAND ${CMAKE_COMMAND} -E make_directory ${PROTO_BINARY_DIR}/${_dir}
+                COMMAND ${PROTOC_C_EXE} --c_out ${PROTO_BINARY_DIR} -I${PROTOBUF_INCLUDE_DIR} -I${PROTO_SOURCE_DIR} ${_full_proto}
+                COMMENT "Building C protocol buffer C sources from ${_proto}"
+                DEPENDS ${_full_proto} ${LIBPROTOBUF_C_LIBRARY} ${LIBPROTOBUF_LIBRARY} ${PROTOC_C_EXE}
+                VERBATIM
+        )
+        set(proto_c_src ${proto_c_src} ${_pb_c_src} PARENT_SCOPE)
+endfunction()
 
-add_library(autonomous_trust SHARED ${libsrc} ${proto_src})
+foreach(_proto ${protos})
+        get_filename_component(_dir ${_proto} DIRECTORY)
+        set(_fullproto ${PROTO_SOURCE_DIR}/${_proto})
+        protoc_c_gen(${_proto} ${_fullproto} ${_dir})
+endforeach()
 
-add_library(autonomous_trust_static STATIC ${libsrc} ${proto_src})
+foreach(_proto ${google_protos})
+        # assumes relative path (google/protobuf/smthg.proto)
+        get_filename_component(_dir ${_proto} DIRECTORY)
+        set(_fullproto ${Protobuf_INCLUDE_DIRS}/${_proto})
+        protoc_c_gen(${_proto} ${_fullproto} ${_dir})
+endforeach()
+
+include_directories(${PROTO_BINARY_DIR} ${PROTO_BINARY_DIR}/autonomous_trust/protobuf)
+
+
+add_library(autonomous_trust SHARED ${libsrc} ${proto_c_src})
+
+add_library(autonomous_trust_static STATIC ${libsrc} ${proto_c_src})
 set_target_properties(autonomous_trust_static PROPERTIES OUTPUT_NAME autonomous_trust)
 
 

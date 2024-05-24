@@ -1,5 +1,5 @@
 #include <stdio.h>
-#include "../structures/array.h"
+#include "autonomous_trust/structures/array.h"
 
 void testArray()
 {
