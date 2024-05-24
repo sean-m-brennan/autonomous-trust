@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-import "agreement.proto";
+import "autonomous_trust/protobuf/agreement.proto";
 
 message Encryptor {
   bytes seed = 1;  // hex encoded

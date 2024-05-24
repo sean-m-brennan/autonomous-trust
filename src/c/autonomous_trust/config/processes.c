@@ -10,7 +10,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 
-#include "processes.h"
+#include "config/processes.h"
 #include "processes.pb-c.h"
 #include "serialization.h"
 #include "utilities/util.h"
