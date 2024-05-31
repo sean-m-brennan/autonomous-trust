@@ -52,6 +52,11 @@ size_t array_size(array_t *a)
     return a->size;
 }
 
+int array_append(array_t *a, array_data_t element)
+{
+    return array_set(a, a->size, element);
+}
+
 array_data_t array_get(array_t *a, int index)
 {
     if (index < 0)

@@ -2,7 +2,7 @@ import ipaddress
 
 from ..config import InitializableConfig
 from ..system import encoding
-
+from ..protobuf import network_pb2
 
 class Network(InitializableConfig):
     encoding = encoding
@@ -14,6 +14,7 @@ class Network(InitializableConfig):
     stats_resp = 'stats_resp'
 
     def __init__(self, _ip4_cidr, _ip6_cidr, _mac_address, _mcast4_addr, _mcast6_addr, _port=None):
+        super().__init__(network_pb2.Network)
         self._ip4_cidr = _ip4_cidr
         self._ip6_cidr = _ip6_cidr
         self._mac_address = _mac_address

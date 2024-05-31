@@ -3,7 +3,7 @@
 
 #include <stdbool.h>
 #include <sodium.h>
-
+#include "hexlify.i"
 
 typedef struct
 {
@@ -15,9 +15,7 @@ typedef struct
 void encryptor_init(const encryptor_t *encr, const unsigned char *hex_seed, bool public_only) {
     if (public_only) {
         bzero((void*)encr->private, crypto_box_SECRETKEYBYTES);
-        unsigned char seed[crypto_box_PUBLICKEYBYTES * 2];
-        unhexlify(hex_seed, crypto_box_PUBLICKEYBYTES * 2, seed);
-        memcpy((void*)encr->public, seed, crypto_box_PUBLICKEYBYTES);
+        unhexlify(hex_seed, crypto_box_PUBLICKEYBYTES * 2, (unsigned char*)encr->public);
     }
     else {
         unsigned char seed[crypto_box_SEEDBYTES];

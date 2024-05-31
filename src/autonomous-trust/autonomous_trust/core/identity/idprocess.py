@@ -336,7 +336,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # time.sleep(self.cadence) # FIXME invalid
                 threading.Thread(target=self._vote_collection,
                                  args=(queues, id_obj), daemon=True).start()
-                msg_str = id_obj.to_yaml_string()  # to self.handle_vote_on_peer()
+                msg_str = id_obj.to_string()  # to self.handle_vote_on_peer()
                 # FIXME validate
                 message = Message(self.name, IdentityProtocol.propose, msg_str, to_whom=self.group)
                 queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -346,7 +346,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         return False
 
     def _update_group(self, queues, group, level):
-        grp_msg = group.to_yaml_string()  # to self.handle_group_update()
+        grp_msg = group.to_string()  # to self.handle_group_update()
         for to_peer in list(self.peers.hierarchy[level].values()):
             message = Message(self.name, IdentityProtocol.update, grp_msg, to_whom=to_peer)
             queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
