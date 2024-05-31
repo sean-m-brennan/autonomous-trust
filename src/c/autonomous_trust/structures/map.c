@@ -6,7 +6,6 @@
 #include <strings.h>
 
 #include <sodium.h>
-#include <cyaml/cyaml.h>
 
 #include "map.h"
 #include "array.h"
@@ -108,7 +107,7 @@ array_t *map_keys(map_t *map)
     return map->keys;
 }
 
-map_data_t map_get(map_t *map, map_key_t key)
+map_data_t map_get(map_t *map, const map_key_t key)
 {
     size_t index = key2index(map, key);
 
@@ -124,7 +123,7 @@ map_data_t map_get(map_t *map, map_key_t key)
     return NULL;
 }
 
-int map_set(map_t *map, map_key_t key, map_data_t value)
+int map_set(map_t *map, const map_key_t key, const map_data_t value)
 {
     if (value == NULL)
         return EINVAL;

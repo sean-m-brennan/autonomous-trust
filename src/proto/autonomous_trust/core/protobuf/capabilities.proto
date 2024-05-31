@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+message Capability {
+  string name = 1;
+  int32 function = 2; // FIXME
+  repeated string arg_names = 3;
+  repeated string keywords = 4;
+}
+
+message PeerCapabilities {
+  map<string, string> listing = 1;
+}

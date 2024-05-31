@@ -70,7 +70,7 @@ class Metadata(InitializableConfig):
     @staticmethod
     def get_assoc_ident() -> Identity:
         # Assumes root dir is set properly
-        cfg_file = os.path.join(Configuration.get_cfg_dir(), CfgIds.identity + Configuration.yaml_file_ext)
+        cfg_file = os.path.join(Configuration.get_cfg_dir(), CfgIds.identity + Configuration.file_ext)
         return Identity.from_file(cfg_file)
 
     @classmethod
@@ -113,7 +113,7 @@ class MetadataSource(Process, metaclass=ProcMeta,
             time = self.cfg.time_source.acquire()
             position, speed = self.cfg.position_source.acquire()
             obj = PeerData(time, position, speed, self.cfg.peer_kind,
-                           self.cfg.data_type, self.cfg.data_channels).to_yaml_string()
+                           self.cfg.data_type, self.cfg.data_channels).to_string()
             for peer in self.clients:
                 msg = Message('daq', MetadataProtocol.metadata, obj, peer)
                 try:

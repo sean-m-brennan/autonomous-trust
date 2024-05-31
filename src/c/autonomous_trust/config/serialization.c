@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 #include "serialization.h"
 
@@ -26,13 +27,26 @@ ssize_t read_stream_to_buffer(FILE *stream, size_t max_len, uint8_t *out)
     return len;
 }
 
-ssize_t read_file_to_buffer(const char *filename, size_t max_len, uint8_t *out)
+ssize_t streamify_file(const char *filename, bool binary, size_t max_len, uint8_t *out)
 {
-    FILE *stream = fopen(filename, "rb");
+    char *mode = "r";
+    if (binary)
+        mode = "rb";
+    FILE *stream = fopen(filename, mode);
     if (stream == NULL)
         return errno;
 
     return read_stream_to_buffer(stream, max_len, out);
+}
+
+inline ssize_t read_text_file_to_buffer(const char *filename, size_t max_len, uint8_t *out)
+{
+    return streamify_file(filename, false, max_len, out);
+}
+
+inline ssize_t read_file_to_buffer(const char *filename, size_t max_len, uint8_t *out)
+{
+    return streamify_file(filename, true, max_len, out);
 }
 
 ssize_t readable_file_mapping(const char *filename, file_mapping_t *mapping)
@@ -54,7 +68,7 @@ ssize_t readable_file_mapping(const char *filename, file_mapping_t *mapping)
         close(mapping->fd);
         return errno;
     }
-    return mapping->data_len;
+    return 0;
 }
 
 int writeable_file_mapping(const char *filename, file_mapping_t *mapping)

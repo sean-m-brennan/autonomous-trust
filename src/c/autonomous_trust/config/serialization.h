@@ -25,6 +25,15 @@ ssize_t read_stream_to_buffer(FILE *stream, size_t max_length, uint8_t *out);
  */
 ssize_t read_file_to_buffer(const char *filename, size_t max_length, uint8_t *out);
 
+/**
+ * @brief 
+ * 
+ * @param filename 
+ * @param max_len 
+ * @param out 
+ * @return ssize_t 
+ */
+ssize_t read_text_file_to_buffer(const char *filename, size_t max_len, uint8_t *out);
 
 typedef struct {
     int fd;

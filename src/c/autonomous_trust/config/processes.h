@@ -9,15 +9,26 @@
 #include "utilities/logger.h"
 #include "utilities/message.h"
 
-typedef struct tracker_s tracker_t;
+typedef struct {
+    map_t *registry;
+    logger_t *logger;
+} tracker_t;
 
-typedef int (*handler_ptr_t)(map_t *queues, message_t *msg);
+#ifndef PROCESSES_IMPL
+extern const char *default_tracker_filename;
+#endif
+
+typedef struct process_s process_t;
+
+typedef int (*handler_ptr_t)(const process_t *proc, map_t *queues, msgq_key_t signal);
 
 typedef struct
 {
     char *name;
     handler_ptr_t runner;
 } proc_map_t;
+
+
 
 /**
  * @brief All potential process runners *must* be declared using this macro. The name must be unique.
@@ -48,6 +59,14 @@ int tracker_create(logger_t *logger, tracker_t **tracker_ptr);
  * @return int 
  */
 int tracker_from_file(const char *filename, logger_t *logger, tracker_t **tracker_ptr);
+
+/**
+ * @brief 
+ * 
+ * @param config_file 
+ * @return int 
+ */
+int tracker_config(char config_file[]);
 
 /**
  * @brief Register a subsystem process
@@ -84,11 +103,11 @@ void tracker_free(tracker_t *tracker);
 
 /*************************/
 
-typedef struct process_s
+struct process_s
 {
     char impl[256]; // FIXME python class
     char name[256];
-    char cfg_name[256];
+    //char cfg_name[256];  // FIXME ???
     // configuration_t conf;
     map_t *configs;
     tracker_t *subsystems;
@@ -105,7 +124,7 @@ typedef struct process_s
         // capabilities
         // peer capabilities
     } protocol;
-} process_t;
+};
 
 #define NO_UMASK 0x01
 #define NO_CHDIR 0x02
@@ -125,12 +144,29 @@ typedef struct process_s
  * @param log_level
  * @return int
  */
-int process_init(process_t *proc, char *name, char *proc_name, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies);
+int process_init(process_t *proc, char *name, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies);
 
+/**
+ * @brief 
+ * 
+ * @param data_dir 
+ * @param flags 
+ * @return int 
+ */
+int daemonize(char *data_dir, int flags);
+
+/**
+ * @brief 
+ * 
+ * @param proc 
+ * @param func_name 
+ * @param handler 
+ * @return int 
+ */
 int process_register_handler(const process_t *proc, char *func_name, handler_ptr_t handler);
 
 /**
- * @brief
+ * @brief See handler_ptr_t
  *
  * @param proc
  * @param queues

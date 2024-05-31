@@ -21,7 +21,7 @@ def setup(local_net=False):
     os.environ[Configuration.ROOT_VARIABLE_NAME] = test_dir
     generate_identity(test_dir, True)
     if local_net:
-        net_cfg_file = os.path.join(test_dir, CfgIds.network + Configuration.yaml_file_ext)
+        net_cfg_file = os.path.join(test_dir, CfgIds.network + Configuration.file_ext)
         contents = []
         with open(net_cfg_file, 'r') as net:
             for line in net.readlines():
