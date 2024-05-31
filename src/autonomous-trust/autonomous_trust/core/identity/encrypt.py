@@ -2,10 +2,11 @@ from nacl.public import PrivateKey, PublicKey
 from nacl.encoding import HexEncoder
 
 from ..config.configuration import Configuration
-
+from ..protobuf import identity_pb2
 
 class Encryptor(Configuration):
     def __init__(self, hex_seed, public_only=True):
+        super().__init__(identity_pb2.Encryptor)
         self.public_only = public_only
         if public_only:
             self.private = None

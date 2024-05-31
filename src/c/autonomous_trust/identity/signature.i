@@ -3,7 +3,7 @@
 
 #include <stdbool.h>
 #include <sodium.h>
-
+#include "hexlify.i"
 
 typedef struct
 {
@@ -15,9 +15,7 @@ typedef struct
 void signature_init(const signature_t *sig, const unsigned char *hex_seed, bool public_only) {
     if (public_only) {
         bzero((void*)sig->private, crypto_sign_SECRETKEYBYTES);
-        unsigned char seed[crypto_sign_PUBLICKEYBYTES * 2];
-        unhexlify(hex_seed, crypto_sign_PUBLICKEYBYTES * 2, seed);
-        memcpy((void*)sig->public, seed, crypto_sign_PUBLICKEYBYTES);
+        unhexlify(hex_seed, crypto_sign_PUBLICKEYBYTES * 2, (unsigned char*)sig->public);
     }
     else {
         unsigned char seed[crypto_sign_SEEDBYTES];
@@ -25,7 +23,6 @@ void signature_init(const signature_t *sig, const unsigned char *hex_seed, bool 
         crypto_sign_seed_keypair((unsigned char*)sig->public, (unsigned char*)sig->private, seed);
     }
     hexlify(sig->public, crypto_sign_PUBLICKEYBYTES, (unsigned char*)sig->public_hex);
-    free((void*)hex_seed);
 }
 
 unsigned char *signature_publish(const signature_t *sig) {

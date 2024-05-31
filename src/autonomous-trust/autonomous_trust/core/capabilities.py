@@ -2,11 +2,13 @@ from collections.abc import Mapping
 import multiprocessing
 
 from .config import Configuration
+from .protobuf import capabilities_pb2
 
 
 class Capability(Configuration):
     """Name and function"""
     def __init__(self, name, function=None, arg_names=None, keywords=None):
+        super().__init__(capabilities_pb2.Capability)
         self.name = name
         self.function = function  # this will be None for remote handling
         self.arg_names = arg_names
@@ -51,6 +53,7 @@ class Capabilities(Mapping):
 class PeerCapabilities(Mapping, Configuration):
     """Mapping of capability names to peer ids"""
     def __init__(self, _listing=None):
+        super().__init__(capabilities_pb2.PeerCapabilities)
         self._listing = _listing
         if _listing is None:
             self._listing = {}

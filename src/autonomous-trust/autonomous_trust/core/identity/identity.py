@@ -10,7 +10,7 @@ from ..system import encoding, agreement_impl
 from ..algorithms.agreement import AgreementVoter
 from .sign import Signature
 from .encrypt import Encryptor
-
+from ..protobuf import identity_pb2
 
 class Identity(InitializableConfig, AgreementVoter):
     """
@@ -20,7 +20,8 @@ class Identity(InitializableConfig, AgreementVoter):
 
     def __init__(self, _uuid, address, _fullname, _nickname, _signature, _encryptor, petname='',
                  _public_only=True, _rank=0, _block_impl=agreement_impl):
-        super().__init__(str(_uuid), _rank)
+        Configuration.__init__(self, identity_pb2.Identity)
+        AgreementVoter.__init__(self, str(_uuid), _rank)
         self.address = address  # corresponds to one address in Network config
         self._fullname = _fullname
         self._nickname = _nickname
@@ -68,7 +69,7 @@ class Identity(InitializableConfig, AgreementVoter):
         if isinstance(msg, str):
             msg = msg.encode(self.enc)
         elif isinstance(msg, Configuration):
-            msg = msg.to_yaml_string().encode(self.enc)
+            msg = msg.to_string().encode(self.enc)
         if self._public_only or self.signature.private is None:
             raise RuntimeError('Cannot sign a message with another identity (%s is not you)' % self.nickname)
         return self.signature.private.sign(msg, encoder=HexEncoder)
@@ -83,7 +84,7 @@ class Identity(InitializableConfig, AgreementVoter):
         if isinstance(msg, str):
             msg = msg.encode(self.enc)
         elif isinstance(msg, Configuration):
-            msg = msg.to_yaml_string().encode(self.enc)
+            msg = msg.to_string().encode(self.enc)
         if signature is None:  # msg is a tuple
             return self.signature.public.verify(msg, encoder=HexEncoder)
         return self.signature.public.verify(msg, signature, encoder=HexEncoder)

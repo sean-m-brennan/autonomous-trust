@@ -35,15 +35,15 @@ class Message(object):
                 raise RuntimeError('Invalid to_whom arg. Must be an Identity, but got %s' % type(to_whom))
         self.from_whom = from_whom
         self.return_to = return_to
-        if isinstance(obj, str) and obj.startswith(Configuration.YAML_PREFIX):
-            self.obj = Configuration.from_yaml_string(obj)
+        if isinstance(obj, str) and obj.startswith(Configuration.YAML_PREFIX):  # FIXME
+            self.obj = Configuration.from_string(obj)
         # FIXME signing
 
     def __str__(self):
         obj_str = str(self.obj)
         # FIXME signing
         if isinstance(self.obj, Configuration):
-            obj_str = self.obj.to_yaml_string()
+            obj_str = self.obj.to_string()
         return '|'.join([self.process, self.function, obj_str])
 
     def __bytes__(self):

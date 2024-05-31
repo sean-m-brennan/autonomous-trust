@@ -10,6 +10,8 @@ dependencies:
   - pynacl
   - python-dateutil
   - ruamel.yaml
+  - protobuf
+  - libprotobuf
   - aenum
   - libsass
   - networkx
@@ -34,6 +36,11 @@ dependencies:
   - absl-py
   - python-flatbuffers
   - python-sounddevice
+  - cmake
+  - libuuid
+  - libsodium
+  - pdrops::protobuf-c
+  - jansson
   - pip:
       - dash-iconify
       - mediapipe

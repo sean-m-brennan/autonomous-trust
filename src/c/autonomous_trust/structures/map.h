@@ -3,7 +3,7 @@
 
 #include "array.h"
 
-typedef const char *map_key_t;
+typedef char *map_key_t;
 
 typedef void *map_data_t;
 
@@ -40,13 +40,27 @@ size_t map_size(map_t *map);
 array_t *map_keys(map_t *map);
 
 /**
+ * @brief For-each macro; requires array_t *keys, map_t *map, map_key_t key, and map_data_t value to be defined.
+ *
+ */
+#define map_entries_for_each(map, key, value)  \
+    keys = map_keys(map);            \
+    for (int i = 0; i < array_size(keys); i++) \
+    {                                          \
+        key = array_get(keys, i);             \
+        value = map_get(map, #key);
+
+#define map_end_for_each() \
+    }
+
+/**
  * @brief
  *
  * @param map
  * @param key
  * @return map_data_t
  */
-map_data_t map_get(map_t *map, map_key_t key);
+map_data_t map_get(map_t *map, const map_key_t key);
 
 /**
  * @brief
@@ -56,7 +70,7 @@ map_data_t map_get(map_t *map, map_key_t key);
  * @param value
  * @return int
  */
-int map_set(map_t *map, map_key_t key, map_data_t value);
+int map_set(map_t *map, const map_key_t key, const map_data_t value);
 
 /**
  * @brief

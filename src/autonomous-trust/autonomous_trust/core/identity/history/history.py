@@ -99,7 +99,7 @@ class IdentityHistory(StepDAG, VoterTracker):  # FIXME config repr
     def prove_existence(self, item):
         identity_blob = self._find_identity(item)
         if identity_blob is not None:
-            return self._merkle.inclusion_proof(item)  # to yaml?
+            return self._merkle.inclusion_proof(item)  # serialize?
 
     def verify_existence(self, item, proof):
         identity_blob = self._find_identity(item)
@@ -143,7 +143,7 @@ class IdentityHistory(StepDAG, VoterTracker):  # FIXME config repr
         :return: tuple of steps list, signature
         """
         steps = self.recite()
-        # FIXME to yaml
+        # FIXME to serialization
         steps_msg = b''
         sig = self.myself.sign(steps_msg)  # noqa
         return steps_msg, sig

@@ -10,8 +10,11 @@
 #include <unistd.h>
 #include <sys/mman.h>
 
+#include <jansson.h>
+
+#define PROCESSES_IMPL
 #include "config/processes.h"
-#include "processes.pb-c.h"
+#include "protobuf/processes.pb-c.h"
 #include "serialization.h"
 #include "utilities/util.h"
 
@@ -29,7 +32,7 @@ const long cadence = 500000L; // microseconds
 const int output_timeout = 1; // FIXME unused?
 const int exit_timeout = 5;   // FIXME unused?
 
-const char *default_tracker_filename = "subsystems.yaml";
+const char *default_tracker_filename = "subsystems.json";
 
 handler_ptr_t find_process(const char *name)
 {
@@ -53,18 +56,11 @@ int find_process_name(const handler_ptr_t handler, char **name)
     return 0;
 }
 
-struct tracker_s
-{
-    map_t *registry;
-    logger_t *logger;
-};
-
 int tracker_create(logger_t *logger, tracker_t **tracker_ptr)
 {
     *tracker_ptr = calloc(1, sizeof(tracker_t));
     if (*tracker_ptr == NULL)
-        ;
-    return ENOMEM;
+        return ENOMEM;
     tracker_t *tracker = *tracker_ptr;
     int err = map_create(&tracker->registry);
     if (err != 0)
@@ -73,74 +69,81 @@ int tracker_create(logger_t *logger, tracker_t **tracker_ptr)
     return err;
 }
 
+int tracker_to_json(const void *data_struct, json_t **obj_ptr)
+{
+    tracker_t *tracker = (tracker_t *)data_struct;
+    *obj_ptr = json_object();
+    json_t *obj = *obj_ptr;
+    if (obj == NULL)
+        return ENOMEM;
+    array_t *keys = map_keys(tracker->registry);
+    for (int i = 0; i < array_size(keys); i++)
+    {
+        map_key_t key = array_get(keys, i);
+        map_data_t value = map_get(tracker->registry, key);
+        json_t *val_str = json_string(value);
+        if (val_str == NULL)
+        {
+            json_decref(obj);
+            return ENOMEM;
+        }
+        json_object_set(obj, key, val_str);
+        free(val_str);
+    }
+    return 0;
+}
+
+int tracker_from_json(const json_t *obj, void *data_struct)
+{
+    tracker_t *tracker = (tracker_t *)data_struct;
+    const char *key;
+    json_t *value;
+    json_object_foreach((json_t *)obj, key, value)
+    {
+        const char *val_str = json_string_value(value);
+        if (val_str == NULL)
+            return ECFG_BADFMT;
+
+        int err = map_set(tracker->registry, (char *)key, (char *)val_str);
+        if (err != 0)
+            return err;
+    }
+    return 0;
+}
+
+DECLARE_CONFIGURATION(process_tracker, tracker_to_json, tracker_from_json);
+
 int tracker_from_file(const char *filename, logger_t *logger, tracker_t **tracker_ptr)
 {
     int err = tracker_create(logger, tracker_ptr);
-    tracker_t *tracker = *tracker_ptr;
     if (err != 0)
-    {
-        tracker_free(tracker);
         return err;
-    }
+    tracker_t *tracker = *tracker_ptr;
 
-    file_mapping_t mapping;
-    ssize_t data_len = readable_file_mapping(filename, &mapping);
-    if (data_len != 0)
-        return data_len;
+    return read_config_file(filename, tracker); // FIXME error logging?
+}
 
-    ProcessTracker *msg = process_tracker__unpack(NULL, mapping.data_len, mapping.data);
-    if (msg == NULL)
-    {
-        demap_file(&mapping);
-        return ESER_UNPK;
-    }
-    for (unsigned i = 0; i < msg->n_registry; i++)
-    {
-        ProcessTracker__RegistryEntry *entry = msg->registry[i];
-        handler_ptr_t handler = find_process(entry->value);
-        if (handler == NULL)
-            log_error(tracker->logger, "Unable to find process %s", entry->value);
-        if (tracker_register_subsystem(tracker, entry->key, handler) != 0)
-            log_error(tracker->logger, "Unable to register subsystem %s", entry->key);
-    }
-    process_tracker__free_unpacked(msg, NULL);
-    return demap_file(&mapping);
+int tracker_config(char config_file[])
+{
+    get_cfg_dir(config_file);
+    int len = strlen(config_file);
+    strncpy(config_file + len, default_tracker_filename, 256 - len);
+    return len;
 }
 
 int tracker_register_subsystem(const tracker_t *tracker, const char *name, const handler_ptr_t handler)
 {
     // TODO processes plus what else?
-    return map_set(tracker->registry, name, handler);
+    return map_set(tracker->registry, (char *)name, handler);
 }
-
 
 int tracker_to_file(const tracker_t *tracker, const char *filename)
 {
-    ProcessTracker msg = PROCESS_TRACKER__INIT;
-    msg.n_registry = map_size(tracker->registry);
-    msg.registry = calloc(msg.n_registry, sizeof(ProcessTracker__RegistryEntry));
-    array_t *keys = map_keys(tracker->registry);
-    for (size_t i = 0; i < msg.n_registry; i++)
-    {
-        char *impl_name;
-        char *proc_name = array_get(keys, i);
-        handler_ptr_t handler = map_get(tracker->registry, proc_name);
-        if (find_process_name(handler, &impl_name) == 0)
-        {
-            msg.registry[i]->key = proc_name;
-            msg.registry[i]->value = impl_name;
-        }
-    }
-
-    file_mapping_t mapping;
-    mapping.data_len = process_tracker__get_packed_size(&msg);
-    int err = writeable_file_mapping(filename, &mapping);
-    if (err != 0)
-        return err;
-
-    process_tracker__pack(&msg, mapping.data);
-    free(msg.registry);
-    return demap_file(&mapping);
+    config_t cfg = {
+        .name = "process_tracker",
+        .to_json = tracker_to_json,
+        .from_json = tracker_from_json};
+    return write_config_file(&cfg, tracker, filename);
 }
 
 void tracker_free(tracker_t *tracker)
@@ -153,12 +156,14 @@ void tracker_free(tracker_t *tracker)
     }
 }
 
-int process_init(process_t *proc, char *name, char *proc_name, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies)
+/********************/
+
+typedef int (*msg_handler_t)(const process_t *proc, map_t *queues, message_t *msg);
+
+int process_init(process_t *proc, char *name, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies)
 {
-    bzero(proc->cfg_name, 256);
-    memcpy(proc->cfg_name, name, min(strlen(name), 255));
     bzero(proc->name, 256);
-    memcpy(proc->name, proc_name, min(strlen(proc_name), 255));
+    memcpy(proc->name, name, min(strlen(name), 255));
     // FIXME general config load/save
     // configuration_t *cfg = map_get(configurations, proc->cfg_name);
     // memcpy(&proc->conf, cfg, cfg->size);
@@ -193,8 +198,8 @@ bool run_message_handlers(const process_t *proc, map_t *msgq_ids, long msgtype, 
     default:
         if (msg->process == proc->name)
         {
-            handler_ptr_t handler = map_get(proc->protocol.handlers, msg->function);
-            return handler(msgq_ids, msg);
+            msg_handler_t handler = map_get(proc->protocol.handlers, msg->function);
+            return handler(proc, msgq_ids, msg);
         }
     }
     return false;
@@ -279,7 +284,7 @@ bool keep_running(const process_t *proc, int sig_id)
     return true;
 }
 
-inline long timeval_subtract(struct timeval *a, struct timeval *b)
+long timeval_subtract(struct timeval *a, struct timeval *b)
 {
     time_t extra = 0;
     suseconds_t usec = a->tv_usec - b->tv_usec;
@@ -345,7 +350,7 @@ int process_run(const process_t *proc, map_t *queues, msgq_key_t signal)
         sleep_until(proc, cadence);
 
         msgq_buf_t buf;
-        ssize_t err = msgrcv(*((int *)map_get(msgq_ids, proc->name)), &buf, sizeof(message_t), 0, IPC_NOWAIT);
+        ssize_t err = msgrcv(*((int *)map_get(msgq_ids, (char *)proc->name)), &buf, sizeof(message_t), 0, IPC_NOWAIT);
         if (err == -1)
         {
             if (errno == ENOMSG)

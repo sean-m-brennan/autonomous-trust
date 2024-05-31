@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-import "autonomous_trust/protobuf/identity.proto";
+import "autonomous_trust/core/protobuf/identity.proto";
 
 message IdentityMap {
   map<string, Identity> id_by_name = 1;

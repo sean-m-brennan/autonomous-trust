@@ -5,26 +5,38 @@ from datetime import datetime, timedelta
 from dateutil import parser
 from uuid import UUID
 from decimal import Decimal, getcontext
+from enum import Enum
 
-from ruamel.yaml import YAML
+import ruamel.yaml
 from nacl.signing import SignedMessage
 
 from ..util import ClassEnumMeta
 
-yaml = YAML(typ='safe')
+yaml = ruamel.yaml.YAML(typ='safe')
 yaml.default_flow_style = False
 
+
+class SerializeMode(Enum):
+    PROTO = 1
+    YAML = 2
 
 
 def to_yaml_string(item):
     sio = StringIO()
-    yaml.dump(item, sio)
+    if Configuration.mode == SerializeMode.YAML:
+        yaml.dump(item, sio)
+    else:
+        # assumes Message type
+        sio.write(item.SerializeToString())
     return sio.getvalue()
 
 
 def from_yaml_string(string):
     sio = StringIO(string)
-    return yaml.load(sio)
+    if Configuration.mode == SerializeMode.YAML:
+        return yaml.load(sio)
+    #else: #FIXME remove both?
+
 
 
 class Configuration(object):
@@ -32,12 +44,20 @@ class Configuration(object):
     CFG_PATH = os.path.join('etc', 'at')
     DATA_PATH = os.path.join('var', 'at')
     YAML_PREFIX = u'!Cfg'
-    file_ext = '.cfg.yaml'
+    mode = SerializeMode.PROTO
+    file_ext = '.cfg.yaml' if mode == SerializeMode.YAML else '.cfg.pb'  # FIXME protobuf file_ext
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
+
+    def __init__(self, msg_class=None):
+        if msg_class:
+            self.message = msg_class()
 
     @classmethod
     def get_cfg_dir(cls):
-        return os.path.join(os.environ.get(cls.ROOT_VARIABLE_NAME, os.path.abspath(os.sep)), cls.CFG_PATH)
+        root = os.environ.get(cls.ROOT_VARIABLE_NAME, os.path.abspath(os.sep))
+        if not root.endswith(cls.CFG_PATH):
+            return os.path.join(root, cls.CFG_PATH)
+        return root
 
     @classmethod
     def get_data_dir(cls):
@@ -57,22 +77,39 @@ class Configuration(object):
         return '%s(%s)' % (self.__class__.__name__, ', '.join(attrs))
 
     def to_dict(self):
-        return dict(self.__dict__)
+        d = dict(self.__dict__)
+        if 'message' in d:
+            del d['message']
+        return d
 
     @staticmethod
     def yaml_representer(dumper, data):
         return dumper.represent_mapping(data.yaml_tag, data.to_dict())
 
-    def to_stream(self, stream):
-        yaml.dump(self, stream)
+    def sync_to_message(self):
+        raise NotImplementedError
 
-    def to_yaml_string(self):
+    def to_stream(self, stream):
+        if self.mode == SerializeMode.YAML:
+            yaml.dump(self, stream)
+        else:
+            if not self.message.IsInitialized:
+                self.sync_to_message()
+            stream.write(self.message.SerializeToString())
+
+    def to_string(self):
+        return str(self)
+
+    def __str__(self):
         sio = StringIO()
         self.to_stream(sio)
         return sio.getvalue()
 
     def to_file(self, filepath):
-        with open(filepath, 'w') as cfg:
+        mode = 'w'
+        if self.mode == SerializeMode.PROTO:
+            mode = 'wb'
+        with open(filepath, mode) as cfg:
             self.to_stream(cfg)
 
     @staticmethod
@@ -81,19 +118,31 @@ class Configuration(object):
         cls = getattr(sys.modules[modulename], classname)
         return cls(**loader.construct_mapping(node, deep=True))
 
-    @staticmethod
-    def from_stream(stream):
-        return yaml.load(stream)
+    def sync_from_message(self):
+        raise NotImplementedError
 
-    @staticmethod
-    def from_yaml_string(string):
+    @classmethod
+    def from_stream(cls, stream):
+        if cls.mode == SerializeMode.YAML:
+            return yaml.load(stream)
+        else:
+            obj = cls()
+            obj.message.ParseFromString(stream.read())
+            obj.sync_from_message()
+
+    @classmethod
+    def from_yaml_string(cls, string):
+        return cls.from_string(string)
+
+    @classmethod
+    def from_string(cls, string):
         sio = StringIO(string)
-        return Configuration.from_stream(sio)
+        return cls.from_stream(sio)
 
-    @staticmethod
-    def from_file(filepath):
+    @classmethod
+    def from_file(cls, filepath):  # FIXME Configuration.from_file(cfg_file), class is unknown
         with open(filepath, 'rb') as cfg:
-            return Configuration.from_stream(cfg)
+            return cls.from_stream(cfg)
 
 
 yaml.representer.add_multi_representer(Configuration, Configuration.yaml_representer),
