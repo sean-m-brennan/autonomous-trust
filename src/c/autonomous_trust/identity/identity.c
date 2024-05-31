@@ -4,11 +4,13 @@
 
 #include <uuid/uuid.h>
 #include <sodium.h>
+#include <jansson.h>
 
-#include "../algorithms/algorithms.h"
+#include "algorithms/algorithms.h"
 #include "identity.h"
+#include "config/configuration.h"
+#include "config/serialization.h"
 
-#include "hexlify.i"
 #include "signature.i"
 #include "encryptor.i"
 
@@ -81,6 +83,54 @@ int identity_decrypt(const identity_t *ident, const message_t *cipher, const ide
 {
     return crypto_box_open_easy(out, cipher->msg, cipher->len, nonce, whom->encryptor.public, ident->encryptor.private);
 }
+
+int identity_to_json(const void *data_struct, json_t **obj_ptr)
+{
+    identity_t *ident = (identity_t*)data_struct;
+    *obj_ptr = json_object();
+    json_t *obj = *obj_ptr;
+    if (obj == NULL)
+        return ENOMEM;
+    char uuid_str[37] = {0};
+    uuid_unparse(ident->uuid, uuid_str);
+    json_object_set(obj, "uuid", json_string(uuid_str));
+    json_object_set(obj, "rank", json_integer(ident->rank));
+    json_object_set(obj, "address", json_string((char*)ident->address));
+    json_object_set(obj, "fullname", json_string(ident->fullname));
+    json_object_set(obj, "nickname", json_string(ident->nickname));
+    json_object_set(obj, "petname", json_string(ident->petname));
+    json_object_set(obj, "public_only", json_boolean(ident->public_only));
+
+    json_t *sig = json_object();
+    unsigned char *hex = signature_publish(&ident->signature);
+    json_object_set(sig, "hex_seed", json_string((char*)hex));
+    free(hex);
+    json_object_set(obj, "signature", sig);
+
+    json_t *encr = json_object();
+    hex = encryptor_publish(&ident->encryptor);
+    json_object_set(encr, "hex_seed", json_string((char*)hex));
+    free(hex);
+    json_object_set(obj, "encryptor", encr);
+
+    return 0;
+}
+
+int identity_from_json(const json_t *obj, void *data_struct)
+{
+    identity_t *ident = (identity_t*)data_struct;
+    json_t *uuid_j = json_object_get(obj, "uuid");
+    const char *uuid_str = json_string_value(uuid_j);
+    int err = uuid_parse(uuid_str, ident->uuid);
+    if (err < 0)
+        return err;
+    ident->rank = json_integer_value(json_object_get(obj, "rank"));
+    ident->fullname = (char*)json_string_value(json_object_get(obj, "fullname"));
+    // FIXME
+    return 0;
+}
+
+DECLARE_CONFIGURATION(identity, identity_to_json, identity_from_json);
 
 void identity_free(identity_t *ident) {
     free(ident);

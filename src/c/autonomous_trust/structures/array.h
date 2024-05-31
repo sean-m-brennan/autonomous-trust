@@ -61,6 +61,17 @@ bool array_contains(array_t *a, array_data_t element);
 size_t array_size();
 
 /**
+ * @brief For-each macro; requires array_t *array, int index, and array_data_t value to be defined.
+ *
+ */
+#define array_for_each(array, index, value)                 \
+    for (index = 0; index < array_size(array); index++) \
+    {                                                       \
+        value = array_get(array, index);
+
+#define array_end_for_each() \
+    }
+/**
  * @brief Get the element at the given index.
  *
  * @param array Pointer to array.

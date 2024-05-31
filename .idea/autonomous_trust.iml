@@ -13,6 +13,7 @@
       <sourceFolder url="file://$MODULE_DIR$/src/autonomous-trust-simulator" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/tools/sim" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src/autonomous-trust-services" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/src/c" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/.tox" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust-inspector/py" />
       <excludeFolder url="file://$MODULE_DIR$/src/autonomous-trust/.pytest_cache" />
@@ -59,8 +60,5 @@
         <option value="$MODULE_DIR$/src/autonomous-trust/autonomous_trust" />
       </list>
     </option>
-  </component>
-  <component name="SonarLintModuleSettings">
-    <option name="uniqueId" value="d9caf324-7463-4e5a-a95d-4be5177b29cd" />
   </component>
 </module>

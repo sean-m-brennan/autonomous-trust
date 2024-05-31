@@ -20,10 +20,10 @@ class MissionParticipant(AutonomousTrust):
         self.add_worker(NetStatsSource, self.system_dependencies)  # no config
         # FIXME
         #if os.path.exists(os.path.join(Configuration.get_cfg_dir(),
-        #                               VideoSource.name + Configuration.yaml_file_ext)):
+        #                               VideoSource.name + Configuration.file_ext)):
         #    self.add_worker(VideoSource, self.system_dependencies)  # video-source.cfg.yaml
         if os.path.exists(os.path.join(Configuration.get_cfg_dir(),
-                                       DataSimSource.name + Configuration.yaml_file_ext)):
+                                       DataSimSource.name + Configuration.file_ext)):
             self.add_worker(DataSimSource, self.system_dependencies)  # data-source.cfg.yaml
 
 

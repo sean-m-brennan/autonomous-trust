@@ -44,7 +44,7 @@ class MapDisplay(object):
 
     def __init__(self, cohort: CohortInterface, force_local: bool = False, with_sim: bool = True):
         self.cohort = cohort
-        cfg_file = os.path.join(Configuration.get_cfg_dir(), self.name + Configuration.yaml_file_ext)
+        cfg_file = os.path.join(Configuration.get_cfg_dir(), self.name + Configuration.file_ext)
         self.cfg = Configuration.from_file(cfg_file)
         if force_local:
             self.cfg.sim_host = '127.0.0.1'  # for testing

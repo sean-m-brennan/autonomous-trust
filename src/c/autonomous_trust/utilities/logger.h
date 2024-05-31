@@ -6,10 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../structures/datetime.h"
+#include "structures/datetime.h"
 
 typedef enum {
-    DEBUG = 0,
+    DEBUG = 1,
     INFO,
     WARNING,
     ERROR,

@@ -6,6 +6,7 @@ from nacl.public import Box
 
 from ..config import InitializableConfig
 from .encrypt import Encryptor
+from ..protobuf import identity_pb2
 
 
 class Group(InitializableConfig):
@@ -13,6 +14,7 @@ class Group(InitializableConfig):
     Group identity details that can be saved to file or transmitted
     """
     def __init__(self, _uuid, _address_map, _nickname, _encryptor, _public_only=True):
+        super().__init__(identity_pb2.Group)
         self._uuid = str(_uuid)
         self._address_map = _address_map
         self._nickname = _nickname
