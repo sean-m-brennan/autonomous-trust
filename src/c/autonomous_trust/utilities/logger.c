@@ -11,6 +11,7 @@
 #include "../structures/datetime.h"
 
 static const char* log_level_strings[] = {
+    "",
     " [DEBUG]    ",
     " [INFO]     ",
     " [WARNING]  ",
@@ -19,6 +20,7 @@ static const char* log_level_strings[] = {
 };
 
 const char* colors[] = {
+    "",
     TERM_BLUE,
     TERM_GREEN,
     TERM_YELLOW,
@@ -81,5 +83,4 @@ void logging(logger_t *logger, log_level_t level, const char *srcfile, const siz
     va_start(argp, fmt);
     vfprintf(logger->file, fmt, argp);
     va_end(argp);    
-    fprintf(logger->file, "\n");
 }

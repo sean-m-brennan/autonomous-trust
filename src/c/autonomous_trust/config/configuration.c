@@ -9,6 +9,8 @@
 
 #include "configuration.h"
 #include "serialization.h"
+#include "structures/array.h"
+#include "config_table.h"
 
 const char ROOT_ENV_VAR[] = "AUTONOMOUS_TRUST_ROOT";
 
@@ -16,14 +18,11 @@ const char CFG_PATH[] = "etc/at";
 
 const char DATA_PATH[] = "var/at";
 
-extern config_t __start_configuration_table;
-extern config_t __stop_configuration_table;
-
 char *rootDir()
 {
     char *root = getenv(ROOT_ENV_VAR);
     if (root == NULL)
-        root = "/";
+        root = "";
     return root;
 }
 
@@ -37,11 +36,11 @@ int get_data_dir(char path[])
     return snprintf(path, 255, "%s/%s", rootDir(), DATA_PATH);
 }
 
-__attribute__((used)) config_t *find_configuration(const char *name)
+config_t *find_configuration(const char *name)
 {
-    for (config_t *entry = &__start_configuration_table; entry != &__stop_configuration_table; ++entry)
-    {
-        if (strncmp(entry->name, name, strlen(name) == 0))
+    for (int i=0; i<configuration_table_size; i++) {
+        config_t *entry = &configuration_table[i];
+        if (strncmp(entry->name, name, strlen(name)) == 0)
             return entry;
     }
     return NULL;
@@ -62,7 +61,7 @@ int num_config_files(char path[])
     return i;
 }
 
-int all_config_files(char dir[], char **paths)
+int all_config_files(char dir[], array_t *paths)
 {
     DIR *d = opendir(dir);
     if (d == NULL)
@@ -73,14 +72,26 @@ int all_config_files(char dir[], char **paths)
         if (de == NULL)
             break;
         if (de->d_type == DT_REG) {
-            char *dot = strrchr(de->d_name, '.');
-            if (dot && (!strcmp(dot, ".jsn") || !strcmp(dot, ".json"))) {
-                strncpy(paths[i], de->d_name, 256);
+            char *dot = strchr(de->d_name, '.');
+            if (dot && (!strcmp(dot, ".cfg.jsn") || !strcmp(dot, ".cfg.json"))) {
+                char *path = malloc(CFG_PATH_LEN);
+                strncpy(path, de->d_name, CFG_PATH_LEN-1);
+                data_t str_dat = sdat(path);
+                array_append(paths, &str_dat);
                 i++;
             }
         }
     }
     closedir(d);
+    return 0;
+}
+
+int config_absolute_path(const char *path_in, char *path_out)
+{
+    char cfg_dir[256];
+    get_cfg_dir(cfg_dir);
+    if (strncmp(path_in, cfg_dir, strlen(cfg_dir)) != 0)
+        return snprintf(path_out, 255, "%s/%s", cfg_dir, path_in);
     return 0;
 }
 

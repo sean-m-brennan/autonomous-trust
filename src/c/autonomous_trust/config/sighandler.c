@@ -53,7 +53,7 @@ void handle_signal(int signum)
 int init_sig_handling(logger_t *logger)
 {
     _logger = logger;
-    struct sigaction sa;
+    struct sigaction sa = {0};
     sa.sa_handler = handle_signal;
     return sigaction(SIGINT, &sa, NULL);
 }

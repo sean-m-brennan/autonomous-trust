@@ -4,6 +4,8 @@
 #include <sys/msg.h>
 #include <stdbool.h>
 
+#include "structures/map.h"
+
 typedef enum {
     SIGNAL,
     GROUP,
@@ -42,5 +44,24 @@ typedef struct {
 } signal_buf_t;
 
 #define msgq_create(id) msgget(id, 0666 | IPC_CREAT)
+
+/**
+ * @brief Get a message queue key
+ * 
+ * @param subdir A subdirectory of the AT config dir
+ * @param filename An optional filename (otherwise "")
+ * @param id An optional number (otherwise chosen at random)
+ * @return msgq_key_t 
+ */
+msgq_key_t get_msgq_key(const char *subdir, const char *filename, const int id);
+
+/**
+ * @brief 
+ * 
+ * @param map 
+ * @param key 
+ * @return queue_id_t 
+ */
+queue_id_t fetch_msgq(map_t *map, map_key_t key);
 
 #endif // MESSAGE_H

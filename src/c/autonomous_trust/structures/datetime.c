@@ -89,8 +89,8 @@ int datetime_strftime_res(const datetime_t *dt, const char *format, const time_r
 
     int ns = (dt->tm_nsec / nsec_per_sec) * res_cfg.res;
 
-    char fmt[256];
-    strncpy(fmt, format, min(strlen(format), 255));
+    char fmt[256] = {0};
+    strncpy(fmt, format, 255);
     size_t fmt_size = strlen(fmt);
 
     int err = 0;
@@ -107,7 +107,7 @@ int datetime_strftime_res(const datetime_t *dt, const char *format, const time_r
                 fmt[i] = 0;
                 if (prev != NULL)
                 {
-                    len = strftime(s + len, remaining, prev, tm);
+                    len += strftime(s + len, remaining, prev, tm);
                     remaining -= len;
                     if (len == 0 || remaining <= 0)
                     {
@@ -118,10 +118,10 @@ int datetime_strftime_res(const datetime_t *dt, const char *format, const time_r
                     prev = fmt + i + 2;
                 }
                 if (j == 0) // %f - subsecond
-                    len = sprintf(s + len, res_cfg.time_fmt, ns);
+                    len += sprintf(s + len, res_cfg.time_fmt, ns);
                 else if (j == 1 || j == 2) // %z, %Z - timezone offset
-                    len = sprintf(s + len, "%s", tz);
-                remaining -= len;
+                    len += sprintf(s + len, "%s", tz);
+                remaining = max - len;
                 if (len < 0)
                 {
                     err = len;
@@ -139,6 +139,8 @@ int datetime_strftime_res(const datetime_t *dt, const char *format, const time_r
         if (stop)
             break;
     }
+    if (prev == NULL && strlen(s) == 0 && strlen(fmt) > 0)
+        strftime(s, max, fmt, tm);
     return err;
 }
 
