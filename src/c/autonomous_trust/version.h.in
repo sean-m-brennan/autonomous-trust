@@ -1,0 +1,6 @@
+#ifndef VERSION_H
+#define VERSION_H
+
+#cmakedefine VERSION "@REVISION@"
+
+#endif // VERSION_H

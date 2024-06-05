@@ -28,6 +28,10 @@ find_library(LIBPROTOBUF_C_LIBRARY libprotobuf-c.so)
 include_directories(${LIBPROTOBUF_C_INCLUDE_DIR})
 find_program(PROTOC_C_EXE protoc-c)
 
+find_path(LIBPTHREAD_INCLUDE_DIR pthread.h)
+include_directories(${LIBPTHREAD_INCLUDE_DIR})
+
+
 set(DEPENDENCIES
         ${LIBUUID_LIBRARY}
         ${LIBSODIUM_LIBRARY}
@@ -40,16 +44,19 @@ set(DEPENDENCIES
 ####################
 # sources
 
+set(top_src_dir ${CMAKE_SOURCE_DIR}/../..)
+
 set(linker_script ${CMAKE_SOURCE_DIR}/section_link.lds)
 add_compile_options(-Wall -Werror -fms-extensions)
-add_link_options(-Xlinker SHELL:-T${linker_script})
+add_link_options(-pthread)
 
 set(PROTO_SOURCE_DIR "${CMAKE_SOURCE_DIR}/proto")
 set(PROTO_BINARY_DIR "${CMAKE_SOURCE_DIR}/proto/c")
 
 set(protos
-        autonomous_trust/core/protobuf/identity.proto
+        autonomous_trust/core/protobuf/agreement.proto
         autonomous_trust/core/protobuf/capabilities.proto
+        autonomous_trust/core/protobuf/identity.proto
         autonomous_trust/core/protobuf/network.proto
         autonomous_trust/core/protobuf/peers.proto
         autonomous_trust/core/protobuf/processes.proto
@@ -61,15 +68,24 @@ set(google_protos
         google/protobuf/any.proto
 )
 
+set(table_headers_in
+        autonomous_trust/config/config_table.h.in
+        autonomous_trust/processes/process_table.h.in
+)
+
 set(libsrc
         autonomous_trust/autonomous_trust.c
         autonomous_trust/config/configuration.c
-        autonomous_trust/config/processes.c
         autonomous_trust/config/serialization.c
         autonomous_trust/config/sighandler.c
         autonomous_trust/identity/identity.c
-	#autonomous_trust/network/network.c
+        autonomous_trust/identity/id_proc.c
+	autonomous_trust/network/network.c
+	autonomous_trust/network/net_proc.c
+        autonomous_trust/processes/process_tracker.c
+        autonomous_trust/processes/processes.c
         autonomous_trust/structures/array.c
+        autonomous_trust/structures/data.c
         autonomous_trust/structures/datetime.c
         autonomous_trust/structures/map.c
         autonomous_trust/structures/merkle.c
@@ -80,6 +96,43 @@ set(libsrc
 )
 include_directories(${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/autonomous_trust)
 
+####################
+# get latest version
+
+find_package(Git)
+if (GIT_FOUND AND EXISTS "${top_src_dir}/.git")
+        #include(GetGitRevisionDescription)
+        execute_process(COMMAND ${GIT_EXECUTABLE} describe HEAD OUTPUT_VARIABLE TAG OUTPUT_STRIP_TRAILING_WHITESPACE)
+        string(REGEX REPLACE "^v" "" VERSION ${TAG})
+        set(REVISION ${VERSION} CACHE STRING "git tag" FORCE)
+else()
+    message(WARNING "Git not found, cannot set version info")
+    SET(REVISION "unknown")
+endif()
+
+include_directories(${CMAKE_BINARY_DIR})
+configure_file("${CMAKE_SOURCE_DIR}/autonomous_trust/version.h.in" "${CMAKE_BINARY_DIR}/version.h" @ONLY)
+
+####################
+# generate tables headers
+
+function(preprocess _file_in)
+        get_filename_component(_base ${_file_in} NAME_WE)
+        set(_fullpath ${CMAKE_SOURCE_DIR}/${_file_in})
+        set(_header_file ${CMAKE_BINARY_DIR}/${_base}.h)
+        set(_src_dir ${CMAKE_SOURCE_DIR})
+        add_custom_command(
+                OUTPUT ${_header_file}
+                COMMAND python ${CMAKE_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust
+                COMMENT "Preprocessing table header from ${_file_in}"
+                DEPENDS ${_fullpath}
+        )
+        set(table_hdrs ${table_hdrs} ${_header_file} PARENT_SCOPE)
+endfunction()
+
+foreach(_hdr ${table_headers_in})
+        preprocess(${_hdr})
+endforeach()
 
 ####################
 # compile proto files
@@ -142,9 +195,9 @@ add_custom_target(proto_python DEPENDS ${proto_py_src})
 ####################
 # create libraries
 
-add_library(autonomous_trust SHARED ${libsrc} ${proto_c_src})
+add_library(autonomous_trust SHARED ${libsrc} ${proto_c_src} ${table_hdrs})
 
-add_library(autonomous_trust_static STATIC ${libsrc} ${proto_c_src})
+add_library(autonomous_trust_static STATIC ${libsrc} ${proto_c_src} ${table_hdrs})
 set_target_properties(autonomous_trust_static PROPERTIES OUTPUT_NAME autonomous_trust)
 
 
@@ -153,6 +206,7 @@ set_target_properties(autonomous_trust_static PROPERTIES OUTPUT_NAME autonomous_
 
 add_executable(at_example example.c)
 target_link_libraries(at_example PRIVATE autonomous_trust_static ${DEPENDENCIES})
+#target_link_libraries(at_example PRIVATE autonomous_trust ${DEPENDENCIES})
 
 
 ####################

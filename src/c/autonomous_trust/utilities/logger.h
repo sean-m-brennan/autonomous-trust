@@ -80,11 +80,11 @@ void logging(logger_t *logger, log_level_t level, const char *srcfile, const siz
 
 #define __FILENAME__ (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 
-#define log_debug(logger, format, ...) logging(logger, DEBUG, __FILENAME__, __LINE__, format, __VA_ARGS__)
-#define log_info(logger, format, ...)  logging(logger, INFO, __FILENAME__, __LINE__, format, __VA_ARGS__)
-#define log_warn(logger, format, ...)  logging(logger, WARNING, __FILENAME__, __LINE__, format, __VA_ARGS__)
-#define log_error(logger, format, ...) logging(logger, ERROR, __FILENAME__, __LINE__, format, __VA_ARGS__)
-#define log_critical(logger, format, ...) logging(logger, CRITICAL, __FILENAME__, __LINE__, format, __VA_ARGS__)
+#define log_debug(logger, ...) logging(logger, DEBUG, __FILENAME__, __LINE__, __VA_ARGS__)
+#define log_info(logger, ...)  logging(logger, INFO, __FILENAME__, __LINE__, __VA_ARGS__)
+#define log_warn(logger, ...)  logging(logger, WARNING, __FILENAME__, __LINE__, __VA_ARGS__)
+#define log_error(logger, ...) logging(logger, ERROR, __FILENAME__, __LINE__, __VA_ARGS__)
+#define log_critical(logger, ...) logging(logger, CRITICAL, __FILENAME__, __LINE__, __VA_ARGS__)
 
 /**
  * @brief Close the given logger

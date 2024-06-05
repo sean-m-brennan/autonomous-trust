@@ -7,17 +7,8 @@
 
 #include <sodium.h>
 
-#include "map.h"
-#include "array.h"
-
-struct map_s
-{
-    map_item_t *items;
-    size_t length;
-    size_t capacity;
-    array_t *keys;
-    unsigned char hashkey[crypto_shorthash_KEYBYTES];
-};
+#include "map_priv.h"
+#include "array_priv.h"
 
 const size_t GAP = 128; // approximate prime gap
 
@@ -44,14 +35,14 @@ size_t increment_capacity(size_t prev)
 size_t key2index(map_t *map, map_key_t key)
 {
     typedef uint64_t hash_t; // 8 bytes, sync with crypto_shorthash_BYTES size
-    size_t byte_len = crypto_shorthash_BYTES;
+    uint8_t byte_len = crypto_shorthash_BYTES;
 
     unsigned char hash[byte_len];
     crypto_shorthash(hash, (const unsigned char *)key, strlen(key), map->hashkey);
     hash_t hash_int = 0;
-    for (size_t i = byte_len - 1, shift = 0; i >= 0; i--)
+    for (int8_t i = byte_len - 1, shift = 0; i >= 0; i--)
     {
-        hash_int |= hash[i] << shift;
+        hash_int |= hash[i] << shift; // FIXME wrong?
         shift += 8;
     }
     return (size_t)(hash_int & (hash_t)(map->capacity - 1));
@@ -64,7 +55,7 @@ int reindex(map_t *map)
     bzero(map->items, map->capacity * sizeof(map_item_t));
     for (size_t i = 0; i < map->capacity; i++)
     {
-        if (old[i].key[0] != 0 && old[i].value != NULL)
+        if (old[i].key[0] != 0)
         {
             size_t idx = key2index(map, old[i].key);
             map->items[idx] = old[i];
@@ -78,6 +69,19 @@ inline size_t map_size(map_t *map)
     return map->length;
 }
 
+int map_init(map_t *map)
+{
+    map->capacity = increment_capacity(0);
+    map->length = 0;
+    crypto_shorthash_keygen(map->hashkey);
+    array_init(&map->keys);
+    map->alloc = false;
+    map->items = calloc(map->capacity, sizeof(map_item_t));
+    if (map->items == NULL)
+        return ENOMEM;
+    return 0;
+}
+
 int map_create(map_t **map_ptr)
 {
     if (map_ptr == NULL)
@@ -87,43 +91,37 @@ int map_create(map_t **map_ptr)
     if (map == NULL)
         return ENOMEM;
 
-    map->items = calloc(map->capacity, sizeof(map_item_t));
-    if (map->items == NULL)
-    {
-        free(map);
-        return ENOMEM;
-    }
-    map->capacity = increment_capacity(0);
-    map->length = 0;
-    crypto_shorthash_keygen(map->hashkey);
-    int err = array_create(&map->keys);
+    int err = map_init(map);
     if (err != 0)
-        map_free(map);
+        free(map);
+    map->alloc = true;
     return err;
 }
 
 array_t *map_keys(map_t *map)
 {
-    return map->keys;
+    return &map->keys;
 }
 
-map_data_t map_get(map_t *map, const map_key_t key)
+int map_get(map_t *map, const map_key_t key, data_t *value)
 {
     size_t index = key2index(map, key);
 
-    if (!array_contains(map->keys, (void *)key))
-        return NULL;
+    if (!array_contains(&map->keys, (void *)key))
+        return -1;
 
     while (index < map->capacity)
     {
-        if (strcmp(key, map->items[index].key) == 0)
-            return map->items[index].value;
+        if (strcmp(key, map->items[index].key) == 0) {
+            memcpy(value, &map->items[index].value, sizeof(data_t));
+            return 0;
+        }
         index++;
     }
-    return NULL;
+    return -1;
 }
 
-int map_set(map_t *map, const map_key_t key, const map_data_t value)
+int map_set(map_t *map, const map_key_t key, const data_t *value)
 {
     if (value == NULL)
         return EINVAL;
@@ -139,11 +137,11 @@ int map_set(map_t *map, const map_key_t key, const map_data_t value)
 
     size_t index = key2index(map, key);
 
-    while (index < map->capacity)
+    while (index < map->length)
     {
-        if (strcmp(key, map->items[index].key) == 0)
+        if (strcmp(key, map->items[index].key) == 0)  // FIXME Access not within mapped region at address 0x0
         {
-            map->items[index].value = value;
+            memcpy(&map->items[index].value, value, sizeof(data_t));
             return 0;
         }
         index++;
@@ -152,9 +150,11 @@ int map_set(map_t *map, const map_key_t key, const map_data_t value)
     map_key_t key_cpy = strdup(key);
     if (key_cpy == NULL)
         return ENOMEM;
+    // FIXME potential issues
     map->items[index].key = key_cpy;
-    map->items[index].value = value;
-    int err = array_append(map->keys, (void *)key_cpy);
+    memcpy(&map->items[index].value, value, sizeof(data_t));
+    data_t str_dat = sdat(key_cpy);
+    int err = array_append(&map->keys, &str_dat);
     if (err != 0)
         return err;
     map->length++;
@@ -173,8 +173,7 @@ int map_remove(map_t *map, map_key_t key)
 
 void map_free(map_t *map)
 {
-    for (size_t i = 0; i < map->capacity; i++)
-        free((void *)map->items[i].key);
     free(map->items);
-    free(map);
+    if (map->alloc)
+        free(map);
 }

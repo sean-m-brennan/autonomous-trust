@@ -3,14 +3,9 @@
 
 #include <stdbool.h>
 #include <sodium.h>
+#include "identity_priv.h"
 #include "hexlify.i"
 
-typedef struct
-{
-    unsigned char private[crypto_box_SECRETKEYBYTES];
-    unsigned char public[crypto_box_PUBLICKEYBYTES];
-    unsigned char public_hex[crypto_box_PUBLICKEYBYTES * 2];
-} encryptor_t;
 
 void encryptor_init(const encryptor_t *encr, const unsigned char *hex_seed, bool public_only) {
     if (public_only) {
