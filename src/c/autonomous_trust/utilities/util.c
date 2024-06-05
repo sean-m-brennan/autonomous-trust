@@ -1,5 +1,8 @@
 #include <string.h>
 #include <stddef.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <stdio.h>
 
 #include "util.h"
 
@@ -18,4 +21,25 @@ char *strremove(char *str, const char *sub) {
         memmove(q, p, strlen(p) + 1);
     }
     return str;
+}
+
+int makedirs(char *path, mode_t mode)
+{
+    char tmp[256];
+    char *p = NULL;
+
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t len = strlen(tmp);
+    if (tmp[len - 1] == '/')
+        tmp[len - 1] = 0;
+    for (p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            int err = mkdir(tmp, mode);
+            if (err != 0)
+                return err;
+            *p = '/';
+        }
+    }
+    return mkdir(tmp, mode);
 }

@@ -1,0 +1,22 @@
+#ifndef CONFIG_TABLE_H
+#define CONFIG_TABLE_H
+
+#include "config/configuration.h"
+
+#define QUOTE(x) #x
+
+#define DECLARE_CONFIGURATION(config_name, data_size,           \
+                              struct_to_json, struct_from_json) \
+    {                                                           \
+        .name = QUOTE(config_name),                             \
+        .data_len = data_size,                                  \
+        .to_json = struct_to_json,                              \
+        .from_json = struct_from_json,                          \
+        .data_struct = NULL,                                    \
+    },
+
+config_t configuration_table[] = {
+    LIST__DECLARE_CONFIGURATION
+};
+
+#endif // CONFIG_TABLE_H

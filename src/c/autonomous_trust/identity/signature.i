@@ -3,14 +3,9 @@
 
 #include <stdbool.h>
 #include <sodium.h>
+#include "identity_priv.h"
 #include "hexlify.i"
 
-typedef struct
-{
-    unsigned char private[crypto_sign_SECRETKEYBYTES];
-    unsigned char public[crypto_sign_PUBLICKEYBYTES];
-    unsigned char public_hex[crypto_sign_PUBLICKEYBYTES * 2];
-} signature_t;
 
 void signature_init(const signature_t *sig, const unsigned char *hex_seed, bool public_only) {
     if (public_only) {
