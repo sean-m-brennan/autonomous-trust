@@ -33,26 +33,40 @@ size_t increment_capacity(size_t prev)
     return next;
 }
 
-size_t key2index(map_t *map, map_key_t key)  // FIXME crappy - too large
-{
-    /*typedef uint64_t hash_t; // 8 bytes, sync with crypto_shorthash_BYTES size
-    uint8_t byte_len = crypto_shorthash_BYTES;
+typedef uint64_t hash_t;  // size must be synced with crypto_shorthash_BYTES
 
-    unsigned char hash[byte_len];
-    crypto_shorthash(hash, (const unsigned char *)key, strlen(key), map->hashkey);
-    hash_t hash_int = 0;
-    for (int8_t i = byte_len - 1, shift = 0; i >= 0; i--)
-    {
-        hash_int |= hash[i] << shift; // FIXME wrong?
-        shift += 8;
-    }
-    return (size_t)(hash_int % (hash_t)(map->capacity - 1));*/
+hash_t map_hash_key(map_t *map, map_key_t key)
+{
+    union {
+        uint8_t hash_bytes[crypto_shorthash_BYTES];  // i.e. 8 bytes
+        hash_t hash_int;
+    } hash;
+    crypto_shorthash(hash.hash_bytes, (const unsigned char *)key, strlen(key), map->hashkey);
+    return hash.hash_int;
+}
+    
+size_t djb(map_key_t key)
+{
     size_t hash = 5381;
     int c;
     while ((c = *key++)) {
-        hash = ((hash << 5) + hash) + c; // hash * 33 + c
+        hash = ((hash << 5) + hash) + c;
     }
+    return hash;
+}
+
+size_t map_hash2index(map_t *map, hash_t hash)
+{
+#ifdef __SIZEOF_INT128__
+    return (uint64_t)(((__uint128_t)hash * (__uint128_t)(map->capacity - 1)) >> 64);
+#else
     return hash % (map->capacity - 1);
+#endif
+}
+
+size_t map_key2index(map_t *map, map_key_t key)
+{
+    return map_hash2index(map, map_hash_key(map, key));
 }
 
 int reindex(map_t *map)
@@ -66,7 +80,7 @@ int reindex(map_t *map)
     {
         if (old[i].key[0] != 0)
         {
-            size_t idx = key2index(map, old[i].key);
+            size_t idx = map_hash2index(map, old[i].hash);
             map->items[idx] = old[i];
         }
     }
@@ -117,10 +131,7 @@ array_t *map_keys(map_t *map)
 
 int map_get(map_t *map, const map_key_t key, data_t **value)
 {
-    size_t index = key2index(map, key);
-
-    //if (!array_contains(&map->keys, (void *)key))
-    //    return -1;
+    size_t index = map_key2index(map, key);
 
     while (map->items[index].key != NULL)
     {
@@ -146,10 +157,12 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
         map_item_t *items = realloc(map->items, map->capacity * sizeof(map_item_t));
         if (items == NULL)
             return EXCEPTION(ENOMEM);
-        map->items = items; // FIXME rehash?
+        map->items = items;
+        reindex(map);  // ignore error??
     }
 
-    size_t index = key2index(map, key);
+    hash_t hash = map_hash_key(map, key);
+    size_t index = map_hash2index(map, hash);
 
     // if the entry is already here, change it; otherwise find an empty slot nearby (hopefully)
     while (map->items[index].key != NULL)
@@ -172,6 +185,7 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
         return EXCEPTION(ENOMEM);
     // FIXME potential issues
     item->key = key_cpy;  // FIXME ownership?
+    item->hash = hash;
     data_incr(value);
     item->value = value;
     data_t *str_dat = string_data(key_cpy, strlen(key_cpy));
@@ -185,7 +199,7 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
 
 int map_remove(map_t *map, map_key_t key)
 {
-    size_t index = key2index(map, key);
+    size_t index = map_key2index(map, key);
     map->length--;
     size_t tail_len = (map->length - index) * sizeof(map_item_t);
     memmove(map->items + index, map->items + index + 1, tail_len);

@@ -10,7 +10,7 @@
 
 #define CONFIG_IMPL
 
-#include "configuration.h"
+#include "configuration_priv.h"
 #include "structures/array.h"
 #include "utilities/exception.h"
 #include "utilities/util.h"
@@ -78,10 +78,10 @@ int all_config_files(char dir[], array_t *paths)
         if (de->d_type == DT_REG || de->d_type == DT_UNKNOWN) {
             char *dot = strchr(de->d_name, '.');
             if (dot && (!strcmp(dot, ".cfg.jsn") || !strcmp(dot, ".cfg.json"))) {
-                char *path = malloc(CFG_PATH_LEN);
+                char *path = malloc(CFG_PATH_LEN + 1);
                 if (path == NULL)
                     return SYS_EXCEPTION();
-                strncpy(path, de->d_name, CFG_PATH_LEN-1);
+                strncpy(path, de->d_name, CFG_PATH_LEN);
                 data_t *str_dat = string_data(path, strlen(path));
                 int err = array_append(paths, str_dat);
                 if (err != 0)
@@ -96,7 +96,7 @@ int all_config_files(char dir[], array_t *paths)
 
 int config_absolute_path(const char *path_in, char *path_out)
 {
-    char cfg_dir[256];
+    char cfg_dir[CFG_PATH_LEN];
     get_cfg_dir(cfg_dir);  // FIXME error checking?
     if (strncmp(path_in, cfg_dir, strlen(cfg_dir)) != 0) {
         int remain = snprintf(path_out, 255, "%s/%s", cfg_dir, path_in);

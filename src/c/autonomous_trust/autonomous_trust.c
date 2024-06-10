@@ -1,3 +1,19 @@
+/********************
+ *  Copyright 2024 TekFive, Inc. and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdbool.h>
@@ -11,13 +27,12 @@
 #include "utilities/message.h"
 #include "utilities/logger.h"
 #include "config/sighandler.h"
-#include "config/configuration.h"
+#include "config/configuration_priv.h"
 #include "processes/processes.h"
 #include "processes/process_tracker.h"
 #include "structures/array_priv.h"
 #include "structures/map_priv.h"
 #include "config/protobuf_shutdown.h"
-#include "autonomous_trust.h"
 
 #define PROC_NAMELEN 16
 
@@ -72,7 +87,7 @@ int run_autonomous_trust(msgq_key_t q_in, msgq_key_t q_out,
     // setup tracker which loads process implementations to run
     tracker_t tracker;
     tracker_init(&logger, &tracker);
-    char tracker_cfg[CFG_PATH_LEN];
+    char tracker_cfg[CFG_PATH_LEN + 1];
     tracker_config(tracker_cfg);
     read_config_file(tracker_cfg, &tracker);
 
