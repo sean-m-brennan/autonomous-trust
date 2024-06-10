@@ -1,3 +1,19 @@
+/********************
+ *  Copyright 2024 TekFive, Inc. and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
 #ifndef LOGGER_H
 #define LOGGER_H
 
@@ -8,6 +24,10 @@
 
 #include "structures/datetime.h"
 #include "exception.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef enum {
     DEBUG = 1,
@@ -72,7 +92,8 @@ int logger_init_local_time(logger_t *logger, log_level_t max_level, const char *
 int logger_init_local_time_res(logger_t *logger, log_level_t max_level, const char *log_file, time_resolution_t res);
 
 /**
- * @brief Write a formatted string to the log file at the given log level.
+ * @brief Internal, use log_xxx() macros.
+ * @details Write a formatted string to the log file at the given log level.
  *
  * @param level Log level.
  * @param frmt Format message.
@@ -96,5 +117,9 @@ void log_exception(logger_t *logger);//, const char *fmt, ...);
  * @param logger 
  */
 void logger_close(logger_t *logger);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
 #endif  // LOGGER_H

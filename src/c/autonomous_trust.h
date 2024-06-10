@@ -5,12 +5,11 @@
 extern "C" {
 #endif
 
-#define PUBLIC_INTERFACE
-#include "version.h"
-#include "utilities/message.h"
-#include "utilities/logger.h"
-#include "config/configuration.h"
-#include "config/sighandler.h"
+#include "autonomous_trust/version.h"
+#include "autonomous_trust/utilities/message.h"
+#include "autonomous_trust/utilities/logger.h"
+#include "autonomous_trust/config/configuration.h"
+#include "autonomous_trust/config/sighandler.h"
 
 /**
  * @brief 
@@ -31,4 +30,4 @@ int run_autonomous_trust(msgq_key_t q_in, msgq_key_t q_out,
 } // extern "C"
 #endif
 
-#endif // AUTONOMOUS_TRUST_H
+#endif  // AUTONOMOUS_TRUST_H

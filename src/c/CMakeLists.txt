@@ -164,6 +164,14 @@ set(libsrc
     autonomous_trust/utilities/message.c
     autonomous_trust/utilities/util.c
 )
+set(libhdr
+    autonomous_trust.h
+    autonomous_trust/version.h
+    autonomous_trust/utilities/message.h
+    autonomous_trust/utilities/logger.h
+    autonomous_trust/config/configuration.h
+    autonomous_trust/config/sighandler.h
+)
 include_directories(${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/autonomous_trust)
 
 ####################
@@ -182,7 +190,8 @@ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/version.h)
 endif()  
 
 include_directories(${CMAKE_BINARY_DIR})
-configure_file("${CMAKE_SOURCE_DIR}/autonomous_trust/version.h.in" "${CMAKE_BINARY_DIR}/version.h" @ONLY)
+configure_file("${CMAKE_SOURCE_DIR}/autonomous_trust/version.h.in"
+               "${CMAKE_BINARY_DIR}/version.h" @ONLY)
 
 ####################
 # generate tables headers
@@ -266,9 +275,9 @@ add_custom_target(proto_python DEPENDS ${proto_py_src})
 ####################
 # create libraries
 
-add_library(autonomous_trust SHARED ${libsrc} ${proto_c_src} ${table_hdrs})
+add_library(autonomous_trust SHARED ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
 
-add_library(autonomous_trust_static STATIC ${libsrc} ${proto_c_src} ${table_hdrs})
+add_library(autonomous_trust_static STATIC ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
 set_target_properties(autonomous_trust_static PROPERTIES OUTPUT_NAME autonomous_trust)
 
 
@@ -313,3 +322,5 @@ add_test(NAME array_test COMMAND $<TARGET_FILE:array_test>)
 add_test(NAME map_test COMMAND $<TARGET_FILE:map_test>)
 add_test(NAME logger_test COMMAND $<TARGET_FILE:logger_test>)
 add_test(NAME proc_track_test COMMAND $<TARGET_FILE:proc_track_test>)
+
+include(CPack)

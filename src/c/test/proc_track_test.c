@@ -1,7 +1,7 @@
 #include <stdlib.h>
 #include "autonomous_trust/processes/process_tracker.h"
 #include "autonomous_trust/processes/processes.h"
-#include "autonomous_trust/config/configuration.h"
+#include "autonomous_trust/config/configuration_priv.h"
 
 #define DEBUG_TESTS 0
 

@@ -10,6 +10,7 @@ typedef struct
 {
     map_key_t key;
     data_t *value;
+    size_t hash;
 } map_item_t;
 
 typedef struct map_s map_t;
@@ -127,4 +128,4 @@ int map_remove(map_t *map, map_key_t key);
  */
 void map_free(map_t *map);
 
-#endif // MAP_H
+#endif  // MAP_H

@@ -7,6 +7,10 @@
 
 #include "utilities/exception.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
     MILLISECONDS = 1,
     MICROSECONDS,
@@ -52,5 +56,9 @@ int timedelta_to_string(const timedelta_t *td, char *s, size_t max);
 
 #define EDT_FMT 190
 DECLARE_ERROR(EDT_FMT, "String in incorrect format for datetime parsing")
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
 #endif  // DATETIME_H

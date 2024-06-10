@@ -1,7 +1,7 @@
 #ifndef PROCESS_TRACKER_H
 #define PROCESS_TRACKER_H
 
-#include "structures/structures.h"
+#include "structures/map.h"
 #include "utilities/logger.h"
 #include "utilities/message.h"
 #include "config/configuration.h"
