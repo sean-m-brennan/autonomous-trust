@@ -1,0 +1,18 @@
+#ifndef PROCESS_TABLE_H
+#define PROCESS_TABLE_H
+
+#include "processes/process_tracker.h"
+
+#define QUOTE(x) #x
+
+#define DECLARE_PROCESS(type_name, proc_name, run_func) \
+    {                                                   \
+        .type = QUOTE(type_name),                       \
+        .name = QUOTE(proc_name),                       \
+        .runner = run_func,                             \
+    },
+
+proc_map_t process_table[] = {
+    LIST__DECLARE_PROCESS};
+
+#endif // PROCESS_TABLE_H

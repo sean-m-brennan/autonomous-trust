@@ -9,6 +9,7 @@
 
 #include "map_priv.h"
 #include "array_priv.h"
+#include "utilities/exception.h"
 
 const size_t GAP = 128; // approximate prime gap
 
@@ -32,9 +33,9 @@ size_t increment_capacity(size_t prev)
     return next;
 }
 
-size_t key2index(map_t *map, map_key_t key)
+size_t key2index(map_t *map, map_key_t key)  // FIXME crappy - too large
 {
-    typedef uint64_t hash_t; // 8 bytes, sync with crypto_shorthash_BYTES size
+    /*typedef uint64_t hash_t; // 8 bytes, sync with crypto_shorthash_BYTES size
     uint8_t byte_len = crypto_shorthash_BYTES;
 
     unsigned char hash[byte_len];
@@ -45,12 +46,20 @@ size_t key2index(map_t *map, map_key_t key)
         hash_int |= hash[i] << shift; // FIXME wrong?
         shift += 8;
     }
-    return (size_t)(hash_int & (hash_t)(map->capacity - 1));
+    return (size_t)(hash_int % (hash_t)(map->capacity - 1));*/
+    size_t hash = 5381;
+    int c;
+    while ((c = *key++)) {
+        hash = ((hash << 5) + hash) + c; // hash * 33 + c
+    }
+    return hash % (map->capacity - 1);
 }
 
 int reindex(map_t *map)
 {
     map_item_t *old = calloc(map->capacity, sizeof(map_item_t));
+    if (old == NULL)
+        return SYS_EXCEPTION();
     memcpy(old, map->items, map->capacity * sizeof(map_item_t));
     bzero(map->items, map->capacity * sizeof(map_item_t));
     for (size_t i = 0; i < map->capacity; i++)
@@ -61,6 +70,7 @@ int reindex(map_t *map)
             map->items[idx] = old[i];
         }
     }
+    free(old);
     return 0;
 }
 
@@ -78,22 +88,24 @@ int map_init(map_t *map)
     map->alloc = false;
     map->items = calloc(map->capacity, sizeof(map_item_t));
     if (map->items == NULL)
-        return ENOMEM;
+        return EXCEPTION(ENOMEM);
     return 0;
 }
 
 int map_create(map_t **map_ptr)
 {
     if (map_ptr == NULL)
-        return EINVAL;
+        return EXCEPTION(EINVAL);
     *map_ptr = calloc(1, sizeof(map_t));
     map_t *map = *map_ptr;
     if (map == NULL)
-        return ENOMEM;
+        return EXCEPTION(ENOMEM);
 
     int err = map_init(map);
-    if (err != 0)
+    if (err != 0) {
         free(map);
+        return err;
+    }
     map->alloc = true;
     return err;
 }
@@ -103,58 +115,67 @@ array_t *map_keys(map_t *map)
     return &map->keys;
 }
 
-int map_get(map_t *map, const map_key_t key, data_t *value)
+int map_get(map_t *map, const map_key_t key, data_t **value)
 {
     size_t index = key2index(map, key);
 
-    if (!array_contains(&map->keys, (void *)key))
-        return -1;
+    //if (!array_contains(&map->keys, (void *)key))
+    //    return -1;
 
-    while (index < map->capacity)
+    while (map->items[index].key != NULL)
     {
         if (strcmp(key, map->items[index].key) == 0) {
-            memcpy(value, &map->items[index].value, sizeof(data_t));
+            *value = map->items[index].value;
             return 0;
         }
         index++;
+        if (index >= map->capacity)
+            index = 0;
     }
     return -1;
 }
 
-int map_set(map_t *map, const map_key_t key, const data_t *value)
+int map_set(map_t *map, const map_key_t key, data_t *value)
 {
     if (value == NULL)
-        return EINVAL;
+        return EXCEPTION(EINVAL);
 
-    if (map->length >= map->capacity - 1) // always leave room at the end
+    if (map->length >= 3 * map->capacity / 4)
     {
         map->capacity = increment_capacity(map->capacity);
         map_item_t *items = realloc(map->items, map->capacity * sizeof(map_item_t));
         if (items == NULL)
-            return ENOMEM;
+            return EXCEPTION(ENOMEM);
         map->items = items; // FIXME rehash?
     }
 
     size_t index = key2index(map, key);
 
-    while (index < map->length)
+    // if the entry is already here, change it; otherwise find an empty slot nearby (hopefully)
+    while (map->items[index].key != NULL)
     {
-        if (strcmp(key, map->items[index].key) == 0)  // FIXME Access not within mapped region at address 0x0
+        if (strcmp(key, map->items[index].key) == 0)
         {
-            memcpy(&map->items[index].value, value, sizeof(data_t));
+            data_incr(value);
+            map->items[index].value = value;
             return 0;
         }
         index++;
+        if (index >= map->capacity)
+            index = 0;
     }
 
+    // new entry
+    map_item_t *item = &map->items[index];
     map_key_t key_cpy = strdup(key);
     if (key_cpy == NULL)
-        return ENOMEM;
+        return EXCEPTION(ENOMEM);
     // FIXME potential issues
-    map->items[index].key = key_cpy;
-    memcpy(&map->items[index].value, value, sizeof(data_t));
-    data_t str_dat = sdat(key_cpy);
-    int err = array_append(&map->keys, &str_dat);
+    item->key = key_cpy;  // FIXME ownership?
+    data_incr(value);
+    item->value = value;
+    data_t *str_dat = string_data(key_cpy, strlen(key_cpy));
+    int err = array_append(&map->keys, str_dat);
     if (err != 0)
         return err;
     map->length++;

@@ -4,12 +4,13 @@
 #include <stdbool.h>
 #include <sodium.h>
 #include "identity_priv.h"
+#include "utilities/exception.h"
 #include "hexlify.i"
 
 
-void signature_init(const signature_t *sig, const unsigned char *hex_seed, bool public_only) {
+void signature_init(signature_t *sig, const unsigned char *hex_seed, bool public_only) {
     if (public_only) {
-        bzero((void*)sig->private, crypto_sign_SECRETKEYBYTES);
+        bzero(sig->private, crypto_sign_SECRETKEYBYTES);
         unhexlify(hex_seed, crypto_sign_PUBLICKEYBYTES * 2, (unsigned char*)sig->public);
     }
     else {
@@ -21,17 +22,24 @@ void signature_init(const signature_t *sig, const unsigned char *hex_seed, bool 
 }
 
 unsigned char *signature_publish(const signature_t *sig) {
-    unsigned char *hex = (unsigned char*)malloc(crypto_sign_PUBLICKEYBYTES * 2);
+    unsigned char *hex = malloc(crypto_sign_PUBLICKEYBYTES * 2);
+    if (hex == NULL) {
+        EXCEPTION(ENOMEM);
+        return NULL;
+    }
     memcpy(hex, sig->public_hex, crypto_sign_PUBLICKEYBYTES * 2);
     return hex;
 }
 
 unsigned char *signature_generate() {
-    unsigned char *key = (unsigned char*)malloc(crypto_sign_SEEDBYTES);
+    unsigned char key[crypto_sign_SEEDBYTES];
     randombytes(key, crypto_sign_SEEDBYTES);
-    unsigned char *hex = (unsigned char*)malloc(crypto_sign_SEEDBYTES * 2);
+    unsigned char *hex = malloc(crypto_sign_SEEDBYTES * 2);
+    if (hex == NULL) {
+        EXCEPTION(ENOMEM);
+        return NULL;
+    }
     hexlify(key, crypto_sign_SEEDBYTES, hex);
-    free((void*)key);
     return hex;
 }
 

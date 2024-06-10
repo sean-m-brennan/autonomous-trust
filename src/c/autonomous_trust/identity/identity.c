@@ -8,7 +8,7 @@
 
 #include "algorithms/algorithms.h"
 #include "config/configuration.h"
-#include "config/serialization.h"
+#include "utilities/exception.h"
 
 #include "identity_priv.h"
 #include "signature.i"
@@ -24,10 +24,18 @@ int identity_create(unsigned char *address, identity_t **ident)
     *ident = calloc(1, sizeof(identity_t));
     identity_t *identity = *ident;
     if (identity == NULL)
-        return ENOMEM;
+        return EXCEPTION(ENOMEM);
     identity->address = address;
-    signature_init(&(identity->signature), signature_generate(), identity->public_only);
-    encryptor_init(&identity->encryptor, encryptor_generate(), identity->public_only);
+    unsigned char *sseed = signature_generate();
+    if (sseed == NULL)
+        return -1;
+    signature_init(&(identity->signature), sseed, identity->public_only);
+    free(sseed);
+    unsigned char *eseed = encryptor_generate();
+    if (eseed == NULL)
+        return -1;
+    encryptor_init(&identity->encryptor, eseed, identity->public_only);
+    free(eseed);
     uuid_generate((unsigned char *)identity->uuid);
     return 0;
 }
@@ -36,18 +44,26 @@ int identity_publish(const identity_t *ident, identity_t **pub_copy)
 {
     if (ident == NULL)
         return EINVAL;
-    *pub_copy = (identity_t *)malloc(sizeof(identity_t));
+    *pub_copy = malloc(sizeof(identity_t));
     identity_t *newIdent = *pub_copy;
     if (newIdent == NULL)
-        return ENOMEM;
+        return EXCEPTION(ENOMEM);
     memcpy(newIdent->uuid, ident->uuid, sizeof(uuid_t));
     newIdent->address = ident->address;
     newIdent->fullname = ident->fullname;
     newIdent->nickname = ident->nickname;
     newIdent->petname = ident->petname;
     newIdent->public_only = true;
-    signature_init(&newIdent->signature, signature_publish(&ident->signature), true);
-    encryptor_init(&newIdent->encryptor, signature_publish(&ident->signature), true);
+    unsigned char *sseed = signature_publish(&ident->signature);
+    if (sseed == NULL)
+        return -1;
+    signature_init(&newIdent->signature, sseed, true);
+    free(sseed);
+    unsigned char *eseed = encryptor_publish(&ident->encryptor);
+    if (eseed == NULL)
+        return -1;
+    encryptor_init(&newIdent->encryptor, eseed, true);
+    free(eseed);
     return 0;
 }
 

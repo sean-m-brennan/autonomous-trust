@@ -1,9 +1,19 @@
-#ifndef RED_BLACK_TREE_H
-#define RED_BLACK_TREE_H
+#ifndef REDBLACK_H
+#define REDBLACK_H
+
+#include "utilities/exception.h"
 
 typedef void* tree_data_ptr_t;
 
 typedef struct rbTree_s tree_t;
+
+/**
+ * @brief 
+ * 
+ * @param tree 
+ * @return int 
+ */
+int tree_init(tree_t *tree);
 
 /**
  * @brief Allocation for a new tree.
@@ -77,14 +87,20 @@ void tree_free(tree_t *tree);
 */
 #define ERBT_DUP_INS 140
 
+DECLARE_ERROR(ERBT_DUP_INS, "Attempted duplicate insertion into the tree");
+
 /**
 * Error code: empty tree
 */
 #define ERBT_EMPTY 141
+
+DECLARE_ERROR(ERBT_EMPTY, "Item deletion on empty tree");
 
 /**
 * Error code: key not found in tree
 */
 #define ERBT_NO_KEY 142
 
-#endif // RED_BLACK_TREE_H
+DECLARE_ERROR(ERBT_NO_KEY, "No such key found in the tree");
+
+#endif  // REDBLACK_H

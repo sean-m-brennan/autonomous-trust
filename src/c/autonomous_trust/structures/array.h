@@ -5,6 +5,7 @@
 #include <stdbool.h>
 
 #include "data.h"
+#include "utilities/exception.h"
 
 typedef struct array_s array_t;
 
@@ -12,8 +13,9 @@ typedef struct array_s array_t;
  * @brief Initialize an existing array
  *
  * @param a
+ * @return int
  */
-void array_init(array_t *a);
+int array_init(array_t *a);
 
 /**
  * @brief Allocate a new array
@@ -49,7 +51,7 @@ int array_find(array_t *a, data_t *element);
  * @param filter Pointer to function.
  * @return Index of first element that satisfies filter or -1 if none present.
  */
-int array_filter(array_t *a, bool (*filter)(data_t*));
+int array_filter(array_t *a, bool (*filter)(data_t *));
 
 /**
  * @brief Is the given element in the array?
@@ -68,13 +70,20 @@ bool array_contains(array_t *a, data_t *element);
 size_t array_size();
 
 /**
- * @brief For-each macro; requires array_t *array, int index, and data_t value to be defined.
+ * @brief For-each macro
+ * @details requires array_t *array, int index, and data_t value to be defined.
  *
  */
 #define array_for_each(array, index, value)             \
     for (index = 0; index < array_size(array); index++) \
     {                                                   \
-        array_get(array, index, &value);
+        int __attribute__((unused)) errors[1] = {0};    \
+        int _err = array_get(array, index, &value);      \
+        if (_err != 0)                                   \
+        {                                               \
+            errors[0] = _err;                            \
+            continue;                                   \
+        }
 
 #define array_end_for_each }
 
@@ -86,7 +95,7 @@ size_t array_size();
  * @param element Pointer to data
  * @return int Success (0) or not present (-1)
  */
-int array_get(array_t *a, int index, data_t *element);
+int array_get(array_t *a, int index, data_t **element);
 
 /**
  * @brief Set the element at the given index.
@@ -119,9 +128,13 @@ void array_free(array_t *a);
  */
 #define EARR_OOB 150
 
+DECLARE_ERROR(EARR_OOB, "Array index out-of-bounds (beyond the final entry)");
+
 /**
  * Error code: element not present in array
  */
 #define EARR_NOELT 151
 
-#endif // ARRAY_H
+DECLARE_ERROR(EARR_NOELT, "Element not present in array");
+
+#endif  // ARRAY_H

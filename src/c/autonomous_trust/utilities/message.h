@@ -62,6 +62,6 @@ msgq_key_t get_msgq_key(const char *subdir, const char *filename, const int id);
  * @param key 
  * @return queue_id_t 
  */
-queue_id_t fetch_msgq(map_t *map, map_key_t key);
+queue_id_t fetch_msgq(map_t *map, const char *key);
 
-#endif // MESSAGE_H
+#endif  // MESSAGE_H
