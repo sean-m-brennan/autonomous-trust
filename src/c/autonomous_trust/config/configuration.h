@@ -5,15 +5,22 @@
 
 #include <jansson.h>
 
-#include "structures/array.h"
 #include "utilities/exception.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief Paths to config files cannot exceed this length
+ * 
+ */
 #define CFG_PATH_LEN 256
 
 /**
  * @brief Get the config directory
  *
- * @param path char[256]
+ * @param path char[CFG_PATH_LEN]
  * @return int
  */
 int get_cfg_dir(char path[]);
@@ -21,44 +28,10 @@ int get_cfg_dir(char path[]);
 /**
  * @brief Get the data directory
  *
- * @param path char[256]
+ * @param path char[CFG_PATH_LEN]
  * @return int
  */
 int get_data_dir(char path[]);
-
-// #ifndef PUBLIC_INTERFACE
-
-/**
- * @brief
- *
- * @param path
- * @return int
- */
-int num_config_files(char path[]);
-
-/**
- * @brief
- *
- * @param dir
- * @param paths
- * @return int
- */
-int all_config_files(char dir[], array_t *paths);
-
-/**
- * @brief Configuration names cannot exceed this many characters
- *
- */
-#define CFG_NAME_SIZE 128
-
-/**
- * @brief
- *
- * @param path_in
- * @param path_out
- * @return int
- */
-int config_absolute_path(const char *path_in, char *path_out);
 
 /**
  * @brief
@@ -85,6 +58,10 @@ extern size_t configuration_table_size;
 #define _CONCAT_NEXT(x, y) x##y
 #define CONCAT(x, y) _CONCAT_NEXT(x, y)
 
+/**
+ * @brief 
+ * 
+ */
 #define DEFINE_CONFIGURATION(cfg_name, to, from, len, struct_ptr)                    \
     void __attribute__((constructor)) CONCAT(register_configuration_, __COUNTER__)() \
     {                                                                                \
@@ -95,13 +72,6 @@ extern size_t configuration_table_size;
         configuration_table[configuration_table_size].data_struct = struct_ptr;      \
         configuration_table_size++;                                                  \
     }
-/**
- * @brief
- *
- * @param name
- * @return config_t*
- */
-config_t *find_configuration(const char *name) __attribute__((used));
 
 /**
  * @brief
@@ -138,6 +108,8 @@ DECLARE_ERROR(ECFG_NOIMPL, "No config implementation registered for the given na
 
 DECLARE_ERROR(ECFG_BADFMT, "Configuration incorrectly formatted")
 
-// #endif // !PUBLIC_INTERFACE
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
 #endif  // CONFIGURATION_H

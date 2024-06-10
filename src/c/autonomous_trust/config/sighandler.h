@@ -1,6 +1,10 @@
 #ifndef SIGHANDLER_H
 #define SIGHANDLER_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void reread_configs();
 
 void user1_handler();
@@ -18,5 +22,9 @@ extern bool propagate;
  * @return int 
  */
 int init_sig_handling(logger_t *logger);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
 #endif // SIGHANDLER_H

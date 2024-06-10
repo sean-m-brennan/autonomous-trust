@@ -13,7 +13,7 @@
 
 /doc/research
 
-## Generated files
+## Generated documentation
 /doc/presentation/images/*.shape
 /doc/presentation/images/network.png
 /doc/presentation/images/identity.svg
@@ -27,7 +27,6 @@
 /doc/pitch/count.txt
 
 **/__pycache__
-
 **/*.egg-info
 **/.tox
 **/.coverage*
@@ -61,6 +60,7 @@ dist
 
 /src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/assets
 
+# Custom Dash component
 /src/autonomous-trust-inspector/reactjs/src/AsyncUpdate.jl
 /src/autonomous-trust-inspector/reactjs/src/jl
 /src/autonomous-trust-inspector/reactjs/man
@@ -83,9 +83,12 @@ dist
 /src/autonomous-trust-inspector/reactjs/NAMESPACE
 /src/autonomous-trust-inspector/reactjs/Project.toml
 
-
+# C build
 /src/c/build
 /src/c/proto/c
 **/*.pb-c.c
 **/*.pb-c.h
 /src/proto/py
+
+# Generated mission files
+/examples/mission/docker-compose.yaml
