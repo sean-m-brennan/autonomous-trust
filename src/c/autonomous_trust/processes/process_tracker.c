@@ -3,7 +3,7 @@
 #include <jansson.h>
 
 #include "processes/process_tracker_priv.h"
-#include "config/configuration.h"
+#include "config/configuration_priv.h"
 #include "utilities/util.h"
 #include "utilities/exception.h"
 #include "process_table_priv.h"
@@ -176,7 +176,7 @@ int tracker_config(char config_file[])
     get_cfg_dir(config_file);
     strcat(config_file, "/");
     int len = strlen(config_file);
-    strncpy(config_file + len, default_tracker_filename, 255 - len);
+    strncpy(config_file + len, default_tracker_filename, CFG_PATH_LEN - len);
     return len;
 }
 
