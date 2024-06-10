@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <time.h>
 
+#include "utilities/exception.h"
+
 typedef enum {
     MILLISECONDS = 1,
     MICROSECONDS,
@@ -48,5 +50,7 @@ int timedelta_from_string(const char *s, timedelta_t *td);
 
 int timedelta_to_string(const timedelta_t *td, char *s, size_t max);
 
+#define EDT_FMT 190
+DECLARE_ERROR(EDT_FMT, "String in incorrect format for datetime parsing")
 
-#endif // DATETIME_H
+#endif  // DATETIME_H

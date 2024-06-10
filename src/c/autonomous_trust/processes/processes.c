@@ -15,7 +15,6 @@
 #define PROCESSES_IMPL
 #include "processes/processes.h"
 #include "protobuf/processes.pb-c.h"
-#include "config/serialization.h"
 #include "config/configuration.h"
 #include "structures/map_priv.h"
 #include "utilities/util.h"
@@ -45,8 +44,8 @@ int process_init(process_t *proc, char *name, map_t *configurations, tracker_t *
 
 inline int process_register_handler(const process_t *proc, char *func_name, handler_ptr_t handler)
 {
-    data_t h_dat = odat(handler);
-    return map_set(proc->protocol.handlers, func_name, &h_dat);
+    data_t *h_dat = object_ptr_data(handler, sizeof(handler_ptr_t));
+    return map_set(proc->protocol.handlers, func_name, h_dat);
 }
 
 bool run_message_handlers(const process_t *proc, map_t *msgq_ids, long msgtype, message_t *msg)
@@ -68,44 +67,64 @@ bool run_message_handlers(const process_t *proc, map_t *msgq_ids, long msgtype, 
     default:
         if (msg->process == proc->name)
         {
-            data_t h_dat;
-            map_get(proc->protocol.handlers, msg->function, &h_dat);
-            msg_handler_t handler = h_dat.obj;
+            data_t *h_dat;
+            int err = map_get(proc->protocol.handlers, msg->function, &h_dat);
+            if (err != 0)
+                return false;
+            msg_handler_t handler;
+            err = data_object_ptr(h_dat, (void*)&handler);
+            if (err != 0)
+                return false;
             return handler(proc, msgq_ids, msg);
         }
     }
     return false;
 }
 
-int daemonize(char *data_dir, int flags)
+int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
 {
-    int io[2];
-    pipe(io);
+    int io[2] = {0};
+    int err = pipe(io);
+    if (err != 0)
+        return SYS_EXCEPTION();
 
     int pid = fork();
-    if (pid == -1)  // error
-        return -1;
+    if (pid == -1) {
+        close(io[0]);
+        close(io[1]);
+        return SYS_EXCEPTION();
+    }
     if (pid != 0) {  // parent
+        close(io[1]);
         int status;
         waitpid(pid, &status, 0);
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            pid_t gchild;
+            pid_t gchild = -1;
             read(io[0], &gchild, sizeof(int));
+            close(io[0]);
             return gchild;
         }
+        close(io[0]);
         return ECHILD;
     }
+    close(io[0]);
 
-    if (setsid() == -1) // lead new session
-        return -1;
+    if (setsid() == -1) { // lead new session
+        close(io[1]);
+        return SYS_EXCEPTION();
+    }
         
     pid = fork();
-    if (pid == -1)  // error
-        return -1;
+    if (pid == -1) {
+        close(io[1]);
+        return SYS_EXCEPTION();
+    }
     if (pid != 0) {  // parent
         write(io[1], &pid, sizeof(int));
+        close(io[1]);
         _exit(0);
     }
+    close(io[1]);
 
     if (!(flags & NO_UMASK))
         umask(0); // clear
@@ -120,32 +139,40 @@ int daemonize(char *data_dir, int flags)
         int maxfd = sysconf(_SC_OPEN_MAX);
         if (maxfd == -1)
             maxfd = MAX_CLOSE;
-        for (int fd = 0; fd < maxfd; fd++) {
-            if (fd == STDIN_FILENO || fd == STDOUT_FILENO || fd == STDERR_FILENO)
+        for (int f_d = 0; f_d < maxfd; f_d++) {
+            if (f_d == STDIN_FILENO || f_d == STDOUT_FILENO || f_d == STDERR_FILENO)
                 continue;
-            close(fd);
+            close(f_d);
         }
     }
 
     close(STDIN_FILENO);
 
+#if 0 // FIXME
     if (!(flags & NO_STDOUT_REDIRECT & NO_STDERR_REDIRECT))
     {
         // point stdout and/or stderr to /dev/null
-        int fd = open("/dev/null", O_WRONLY);
-        if (fd == -1)
+
+        int f_d = open("/dev/null", O_WRONLY);
+        if (f_d == -1)
             return -1;
         if (!(flags & NO_STDOUT_REDIRECT))
         {
-            if (dup2(fd, STDOUT_FILENO) == -1)
+            if (*fd1 = dup2(f_d, STDOUT_FILENO) == -1)
                 return -1;
+            //*fd1 = f_d;
         }
-        if (!(flags & NO_STDERR_REDIRECT))
+        f_d = open("/dev/null", O_WRONLY);
+        if (f_d == -1)
+            return -1;
+         if (!(flags & NO_STDERR_REDIRECT))
         {
-            if (dup2(fd, STDERR_FILENO) == -1)
+            if (*fd2 = dup2(f_d, STDERR_FILENO) == -1)  // FIXME fd leaks?
                 return -1;
+            //*fd2 = f_d;
         }
     }
+#endif
     return 0;
 }
 
@@ -194,7 +221,9 @@ int process_run(const process_t *proc, map_t *q_keys, msgq_key_t s_key)
     char data_path[256];
     get_data_dir(data_path);
 
-    int err = daemonize(data_path, proc->flags);
+    int fd1 = 0;
+    int fd2 = 0;
+    int err = daemonize(data_path, proc->flags, &fd1, &fd2);
     if (err != 0)
         return err;
 
@@ -206,22 +235,24 @@ int process_run(const process_t *proc, map_t *q_keys, msgq_key_t s_key)
     array_t *keys = map_keys(q_keys);
     for (int i = 0; i < array_size(keys); i++)
     {
-        data_t k_dat;
-        int err = array_get(keys, i, &k_dat);
+        data_t *k_dat;
+        err = array_get(keys, i, &k_dat);
         if (err != 0)
             continue; // FIXME? error
-        map_key_t key = k_dat.str;
-        data_t mk_dat;
+        map_key_t key;
+        data_string_ptr(k_dat, &key);
+        data_t *mk_dat;
         err = map_get(q_keys, key, &mk_dat);
         if (err != 0)
             continue; // FIXME? error
-        msgq_key_t mqk = mk_dat.intgr;
+        msgq_key_t mqk;
+        data_integer(mk_dat, &mqk);
 
         int mq_id = msgget(mqk, 0666 | IPC_CREAT);
         if (mq_id == -1)
             return errno;
-        data_t q_dat = idat(mq_id);
-        err = map_set(&queues, key, &q_dat);
+        data_t *q_dat = integer_data(mq_id);
+        err = map_set(&queues, key, q_dat);
         if (err != 0)
             return err;
     }
@@ -238,28 +269,34 @@ int process_run(const process_t *proc, map_t *q_keys, msgq_key_t s_key)
     {
         sleep_until(proc, cadence);
 
-        msgq_buf_t buf;
+        msgq_buf_t buf = {0};
         queue_id_t q = fetch_msgq(&queues, (char *)proc->name);
         if (q < 0)
             ; // FIXME report error
-        ssize_t err = msgrcv(q, &buf, sizeof(message_t), 0, IPC_NOWAIT);
-        if (err == -1)
+        ssize_t ret = msgrcv(q, &buf, sizeof(message_t), 0, IPC_NOWAIT);
+        if (ret == -1)
         {
             if (errno == ENOMSG)
                 continue;
-            return errno; // FIXME repair?
+            return SYS_EXCEPTION(); // FIXME repair?
         }
         if (!run_message_handlers(proc, &queues, buf.mtype, &buf.info))
         {
             message_t *msg = calloc(1, sizeof(message_t));
+            if (msg == NULL)
+                continue; // FIXME logging
             memcpy(msg, &buf.info, sizeof(message_t));
-            data_t m_dat = odat(msg);
-            array_append(&unprocessed, &m_dat);
+            data_t *m_dat = object_ptr_data(msg, sizeof(message_t));
+            array_append(&unprocessed, m_dat);
         }
         // FIXME post-msg handling activity
     }
     array_free(&unprocessed);
     map_free(&queues);
+    if (fd1 > 0)
+        close(fd1);
+    if (fd2 > 0)
+        close(fd2);
 
     return 0;
 }

@@ -18,10 +18,10 @@ int _remember_activity(const process_t *proc, map_t *queues, message_t *msg, int
         ;
     va_end(argv);*/
 
-    //FIXME update proc->configs with latest data; write to file
-    // for name, q in queues.items():
-    //        if name != self.name:
-    //           q.put(msg, block=True, timeout=self.q_cadence)
+    // FIXME update proc->configs with latest data; write to file
+    //  for name, q in queues.items():
+    //         if name != self.name:
+    //            q.put(msg, block=True, timeout=self.q_cadence)
     return 0;
 }
 /*
@@ -46,10 +46,11 @@ int _acquire_capabilities(const process_t *proc, map_t *queues)
 
 int _announce_identity(const process_t *proc, map_t *queues)
 {
-    // FIXME 
+    // FIXME
     // send network broadcast, no encrypt
     queue_id_t q = fetch_msgq(queues, "network");
-    msgq_buf_t buf;  // announcement msg: identity_publish(), package_hash, capabilities_list
+    msgq_buf_t buf = {0};
+    // FIXME announcement msg: identity_publish(), package_hash, capabilities_list
     msgsnd(q, &buf, sizeof(message_t), buf.mtype);
     return 0;
 }
@@ -135,8 +136,8 @@ bool handle_group_update(const process_t *proc, map_t *queues, message_t *msg)
 
 int identity_run(const process_t *proc, map_t *queues, msgq_key_t signal)
 {
-    //process_register_handler(proc, "diff", handle_history_diff);
-    //process_register_handler(proc, "update", handle_group_update);
+    // process_register_handler(proc, "diff", handle_history_diff);
+    // process_register_handler(proc, "update", handle_group_update);
 
     _acquire_capabilities(proc, queues);
     _announce_identity(proc, queues);
@@ -144,4 +145,4 @@ int identity_run(const process_t *proc, map_t *queues, msgq_key_t signal)
 
     return process_run(proc, queues, signal);
 }
-DECLARE_PROCESS(identity, identity_run);
+DECLARE_PROCESS(identity, id_proc, identity_run);

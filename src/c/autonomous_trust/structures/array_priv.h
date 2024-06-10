@@ -11,7 +11,7 @@ struct array_s
 {
     size_t size;
     bool alloc;
-    data_t *array;
+    data_t **array;
 };
 
-#endif // ARRAY_PRIV_H
+#endif  // ARRAY_PRIV_H

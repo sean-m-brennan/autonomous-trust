@@ -13,8 +13,10 @@
 #include "config/sighandler.h"
 #include "config/configuration.h"
 #include "processes/processes.h"
+#include "processes/process_tracker.h"
 #include "structures/array_priv.h"
 #include "structures/map_priv.h"
+#include "config/protobuf_shutdown.h"
 #include "autonomous_trust.h"
 
 #define PROC_NAMELEN 16
@@ -28,7 +30,7 @@ void user1_handler() { /* do nothing */ }
 
 void user2_handler() { /* do nothing */ }
 
-int set_process_name(char *name_in)
+int set_process_name(const char *name_in)
 {
     char name[PROC_NAMELEN] = {0};
     strncpy(name, name_in, PROC_NAMELEN-1);
@@ -49,16 +51,18 @@ int run_autonomous_trust(msgq_key_t q_in, msgq_key_t q_out,
     char data_dir[256] = {0};
     get_data_dir(data_dir);
 
+    int fd1 = 0;
+    int fd2 = 0;
     int flags = 0;
     if (log_file == NULL)
         flags |= NO_STDERR_REDIRECT;
     if (false) {
-    int pid = daemonize(data_dir, flags);
+    int pid = daemonize(data_dir, flags, &fd1, &fd2);
     if (pid != 0)
         return pid;
     }
 
-    char *name = "AutonomousTrust";
+    const char *name = "AutonomousTrust";
     logger_t logger;
     logger_init(&logger, log_level, log_file);
     log_info(&logger, "You are using\033[94m AutonomousTrust\033[00m v%s from\033[96m TekFive\033[00m.\n", VERSION);
@@ -68,50 +72,54 @@ int run_autonomous_trust(msgq_key_t q_in, msgq_key_t q_out,
     // setup tracker which loads process implementations to run
     tracker_t tracker;
     tracker_init(&logger, &tracker);
-    find_configuration("process_tracker");
     char tracker_cfg[CFG_PATH_LEN];
     tracker_config(tracker_cfg);
     read_config_file(tracker_cfg, &tracker);
 
     // read all other config files (peers, group, etc)
-    map_t *configs;
+    map_t *configs = NULL;
     map_create(&configs);
-    //int count = num_config_files(cfg_dir);
-    array_t config_files;
+    array_t config_files = {0};
     array_init(&config_files);
     all_config_files(cfg_dir, &config_files);
 
-    for (int i = 0; i < array_size(&config_files)/*count*/; i++)
+    for (size_t i = 0; i < array_size(&config_files); i++)
     {
-        data_t str_dat;
+        data_t *str_dat;
         array_get(&config_files, i, &str_dat);
-        char *filepath = str_dat.str;
+        char *filepath;
+        int err = data_string_ptr(str_dat, &filepath);
+        if (err != 0)
+            continue;
         if (filepath == NULL)
             continue;
         char abspath[256];
-        config_absolute_path(filepath, abspath);
+        err = config_absolute_path(filepath, abspath);
+        if (err != 0)
+            continue;
         char *filename = strrchr(filepath, '/');
         if (filename == NULL)
             filename = filepath;
 
         if (strncmp(filename, default_tracker_filename, 256) == 0)
             continue;
-        char cfg_name[256];
+        char cfg_name[256] = {0};
         char *ext = strchr(filename, '.');
-        strncpy(cfg_name, filename, strlen(filename) - strlen(ext));
+        int extlen = 0;
+        if (ext != NULL)
+            extlen = strlen(ext);
+        strncpy(cfg_name, filename, strlen(filename) - extlen);
         config_t *config = find_configuration(cfg_name);
         if (config == NULL) {
             log_error(&logger, "No config for %s\n", cfg_name);
-            //return ENOMEM;  // FIXME wrong error
             continue;
         }
-        // FIXME allocate data_struct
         config->data_struct = malloc(config->data_len);
         if (config->data_struct == NULL)
             return ENOMEM;
         read_config_file(abspath, config->data_struct);  // FIXME error handling
-        data_t ds = odat(config);
-        map_set(configs, cfg_name, &ds);
+        data_t *ds = object_ptr_data(config, sizeof(config_t));
+        map_set(configs, cfg_name, ds);
     }
 
     // master lists of messaging/signalling queue keys (for passing to procs, not the queues themselves)
@@ -120,72 +128,74 @@ int run_autonomous_trust(msgq_key_t q_in, msgq_key_t q_out,
     map_t s_keys;
     map_init(&s_keys);
     array_t *process_names = map_keys(tracker.registry);
-    int idx;
-    data_t name_val;
+    size_t idx;
+    data_t *name_val;
     int p = 0;
     array_for_each(process_names, idx, name_val)
-        char *name = name_val.str;
+        char *pname;
+        data_string_ptr(name_val, &pname);  // FIXME
         msgq_key_t mk = ftok(tracker_cfg, p++);
-        data_t mk_dat = idat(mk);
-        map_set(&q_keys, name, &mk_dat);
+        data_t *mk_dat = integer_data(mk);
+        map_set(&q_keys, (char*)name, mk_dat);
         msgq_key_t mks = ftok(tracker_cfg, p++);
-        data_t mks_dat = idat(mks);
-        map_set(&s_keys, name, &mks_dat);
+        data_t *mks_dat = integer_data(mks);
+        map_set(&s_keys, (char*)name, mks_dat);
     array_end_for_each
 
     // spawn processes per tracker config
-    map_key_t key;
-    data_t run_val;
-    array_t *keys;
+    map_key_t key = NULL;
+    data_t *impl_val = NULL;
     map_t procs;
     map_init(&procs);
-    // FIXME tracker is empty
-    map_entries_for_each(tracker.registry, key, run_val)
-        log_debug(&logger, "Key %s\n", key);  // FIXME
-        handler_ptr_t runner = (handler_ptr_t)run_val.obj;
+    map_entries_for_each(tracker.registry, key, impl_val)  // FIXME wrong
+        char *impl;
+        data_string_ptr(impl_val, &impl);  // FIXME this is null
+        handler_ptr_t runner = find_process(impl);
+        if (runner == NULL) {
+            log_error(&logger, "Invalid runner for %s\n", key);
+            continue;
+        }
         
-        log_info(&logger, "%s:  Starting %s ...", name, key);
+        log_info(&logger, "%s:  Starting %s:%s ...\n", name, key, impl);
         process_t proc;
         process_init(&proc, key, configs, &tracker, &logger, NULL);
-        data_t sig_dat;
+        data_t *sig_dat;
         map_get(&s_keys, key, &sig_dat);
-        log_debug(&logger, "Run %s\n", key);  // FIXME
-        pid_t pid = runner(&proc, &q_keys, sig_dat.intgr);
+        int sig;
+        data_integer(sig_dat, &sig);
+        pid_t pid = runner(&proc, &q_keys, sig);
 
         // record pids for monitoring
         char pid_str[32] = {0};
         snprintf(pid_str, 31, "%d", pid);
-        data_t name_val = sdat(key);
-        map_set(&procs, pid_str, &name_val);
+        data_t *key_val = string_data(key, strlen(key));
+        map_set(&procs, pid_str, key_val);
     map_end_for_each
 
     // message queue keys from the parent process
-    data_t mk_in_dat = idat(q_in);
-    map_set(&q_keys, "extern_in", &mk_in_dat);
-    data_t mk_out_dat = idat(q_out);
-    map_set(&q_keys, "extern_out", &mk_out_dat);
+    data_t *mk_in_dat = integer_data(q_in);
+    map_set(&q_keys, (char*)"extern_in", mk_in_dat);
+    data_t *mk_out_dat = integer_data(q_out);
+    map_set(&q_keys, (char*)"extern_out", mk_out_dat);
 
     // create all message queues/signals from keys (since all processes are spawned)
     map_t signals;
-    map_init(&signals);
-    data_t int_val;
-    map_entries_for_each(&s_keys, key, int_val)
-        msgq_key_t mk = int_val.intgr;
-        msgq_key_t mp = msgq_create(mk);
-        data_t mp_dat = idat(mp);
-        map_set(&signals, key, &mp_dat);
-    map_end_for_each
-
     map_t queues;
-    map_init(&queues);
-    int_val.intgr = 0;  // FIXME?
-    map_entries_for_each(&q_keys, key, int_val)
-        msgq_key_t mk = int_val.intgr;
-        // FIXME mk==0??
-        msgq_key_t mp = msgq_create(mk);
-        data_t mp_dat = idat(mp);
-        map_set(&queues, key, &mp_dat);
-    map_end_for_each
+    map_t *both[] = { &signals, &queues };
+    for (int i=0; i<2; i++) {
+        map_t *map = both[i];
+        map_init(map);
+
+        map_key_t mkey;
+        data_t *int_val;
+        map_entries_for_each(map, mkey, int_val)
+            msgq_key_t mk;
+            data_integer(int_val, &mk);  // FIXME error check
+            msgq_key_t mp = msgq_create(mk);
+            data_t *mp_dat = integer_data(mp);
+            map_set(&signals, key, mp_dat);  // FIXME error check
+        map_end_for_each
+    }
 
     log_info(&logger, "%s:                                          Ready.\n", name);
     size_t active = map_size(&procs);
@@ -194,10 +204,11 @@ int run_autonomous_trust(msgq_key_t q_in, msgq_key_t q_out,
     while (!stop_process)
     {
         // monitor processes for premature termination
-        data_t str_val;
+        data_t *str_val;
         map_entries_for_each(&procs, key, str_val)
             pid_t pid = atoi(key);
-            char *pname = str_val.str;
+            char *pname;
+            data_string_ptr(str_val, &pname);
             int status;
             waitpid(pid, &status, WNOHANG);
             bool terminated = false;
@@ -238,29 +249,31 @@ int run_autonomous_trust(msgq_key_t q_in, msgq_key_t q_out,
 
         bool do_send = false;
         msgq_buf_t result_msg;
+        data_t *int_val = NULL;
         // FIXME get results from internal procs
         map_entries_for_each(&queues, key, int_val)
-            queue_id_t qid = int_val.intgr;
-            ssize_t err = msgrcv(qid, &result_msg, sizeof(message_t), 0, IPC_NOWAIT);
-            if (err == -1)
+            queue_id_t qid;
+            data_integer(int_val, &qid);
+            ssize_t merror = msgrcv(qid, &result_msg, sizeof(message_t), 0, IPC_NOWAIT);
+            if (merror == -1)
             {
                 if (errno != ENOMSG)
                     log_error(&logger, "Messaging error: %s\n", strerror(errno));
             } else {
-                data_t msg_dat = odat(&result_msg);  // FIXME malloc
-                array_append(&unhandled_msgs, &msg_dat);
+                data_t *msg_dat = object_ptr_data(&result_msg, sizeof(message_t));  // FIXME malloc
+                array_append(&unhandled_msgs, msg_dat);
             }
         map_end_for_each
 
         array_t extern_msgs;
         array_init(&extern_msgs);
         int index;
-        data_t msg_dat = {0};
+        data_t *msg_dat;
         array_for_each(&unhandled_msgs, index, msg_dat)
             // FIXME handle msg
-            array_remove(&unhandled_msgs, &msg_dat);
+            array_remove(&unhandled_msgs, msg_dat);
             if (false) {
-                array_append(&extern_msgs, &msg_dat);
+                array_append(&extern_msgs, msg_dat);
                 do_send = true;
             }
         array_end_for_each
@@ -279,12 +292,14 @@ int run_autonomous_trust(msgq_key_t q_in, msgq_key_t q_out,
 
 //signal_quit:
     log_debug(&logger, "Send sig quit\n"); // FIXME
-    data_t q_val;
+    data_t *q_val;
     signal_buf_t sig = { .mtype = SIGNAL, .info = { .signal = {0}, .sig = -1 } };
     strncpy(sig.info.signal, sig_quit, 31);
     map_entries_for_each(&signals, key, q_val)
-        if (q_val.intgr != 0)
-            msgsnd(q_val.intgr, &sig, sizeof(signal_buf_t), 0);
+        int q;
+        data_integer(q_val, &q);
+        if (q != 0)
+            msgsnd(q, &sig, sizeof(signal_buf_t), 0);
     map_end_for_each
 
 //cleanup:
@@ -294,6 +309,11 @@ int run_autonomous_trust(msgq_key_t q_in, msgq_key_t q_out,
     map_free(&s_keys);
     map_free(&q_keys);
     tracker_free(&tracker);
+    if (fd1 > 0)
+        close(fd1);
+    if (fd2 > 0)
+        close(fd2);
+    shutdown_protobuf_library();
 
     return error;
 }

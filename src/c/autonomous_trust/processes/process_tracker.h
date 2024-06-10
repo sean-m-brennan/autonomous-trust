@@ -13,21 +13,34 @@ typedef struct
     bool alloc;
 } tracker_t;
 
-#ifndef PROCESSES_IMPL
-extern const char *default_tracker_filename;
-#endif
-
-typedef struct process_s process_t;  // FIXME why is this defined here?
+typedef struct process_s process_t; // FIXME why is this defined here?
 
 typedef int (*handler_ptr_t)(const process_t *proc, map_t *queues, msgq_key_t signal);
 
 typedef struct
 {
-    char *name;
+    const char *type;
+    const char *name;
     handler_ptr_t runner;
 } proc_map_t;
 
-#define DECLARE_PROCESS(proc_name, run_func)
+#ifndef PROCESSES_IMPL
+extern const char *default_tracker_filename;
+
+extern proc_map_t process_table[];
+extern size_t process_table_size;
+#endif
+
+#define DECLARE_PROCESS(type, proc_name, run_func)
+
+#define DEFINE_PROCESS(t, n, r)                                                \
+    void __attribute__((constructor)) CONCAT(register_process_, __COUNTER__)() \
+    {                                                                          \
+        process_table[process_table_size].type = QUOTE(t);                     \
+        process_table[process_table_size].name = QUOTE(n);                     \
+        process_table[process_table_size].runner = r;                          \
+        process_table_size++;                                                  \
+    }
 
 /**
  * @brief Initialize existing tracker
@@ -69,11 +82,27 @@ int tracker_config(char config_file[]);
  * @brief Register a subsystem process
  *
  * @param tracker
- * @param name
- * @param handler
+ * @param name Type of process
+ * @param impl Name of implementation
  * @return int
  */
-int tracker_register_subsystem(const tracker_t *tracker, const char *name, const handler_ptr_t handler);
+int tracker_register_subsystem(const tracker_t *tracker, const char *name, const char *impl);
+
+/**
+ * @brief
+ *
+ * @param name
+ * @return handler_ptr_t
+ */
+handler_ptr_t find_process(const char *name);
+
+/**
+ * @brief
+ *
+ * @param handler
+ * @return char*
+ */
+char *find_process_name(const handler_ptr_t handler);
 
 /**
  * @brief Save a process tracker to file
@@ -97,5 +126,6 @@ void tracker_free(tracker_t *tracker);
  */
 #define EPROC_NF 170
 
+DECLARE_ERROR(EPROC_NF, "Process not found in process table");
 
-#endif // PROCESS_TRACKER_H
+#endif  // PROCESS_TRACKER_H
