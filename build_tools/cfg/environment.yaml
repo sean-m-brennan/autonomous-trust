@@ -41,6 +41,8 @@ dependencies:
   - libsodium
   - pdrops::protobuf-c
   - jansson
+  - check
+  - cxx-compiler
   - pip:
       - dash-iconify
       - mediapipe

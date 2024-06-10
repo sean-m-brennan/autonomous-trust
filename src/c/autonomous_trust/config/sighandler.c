@@ -35,14 +35,14 @@ void handle_signal(int signum)
         break;
     case SIGILL:
     {
-        char *error = "Stack Overflow";
+        const char *error = "Stack Overflow";
         if (_logger != NULL)
             log_error(_logger, "OS error: %s", error);
     }
     break;
     case SIGFPE:
     {
-        char *error = "Floating-point Exception";
+        const char *error = "Floating-point Exception";
         if (_logger != NULL)
             log_error(_logger, "OS error: %s", error);
     }

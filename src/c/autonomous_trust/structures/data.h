@@ -5,99 +5,80 @@
 #include <stddef.h>
 #include <string.h>
 
-typedef enum
-{
-    INT,
-    UINT,
-    FLOAT,
-    BOOL,
-    STRING,
-    BYTES,
-    OBJECT
-} type_t;
-
-typedef struct data_s
-{
-    type_t type;
-    int (*cmp)(struct data_s*, struct data_s*);
-    size_t size;
-    union
-    {
-        long intgr;
-        unsigned long uintr;
-        double flt_pt;
-        bool bl;
-        char *str;
-        unsigned char *byt;
-        void *obj;
-    };
-} data_t;
+#include "utilities/exception.h"
 
 
-int i_cmp(data_t *a, data_t *b);
-int u_cmp(data_t *a, data_t *b);
-int f_cmp(data_t *a, data_t *b);
-int b_cmp(data_t *a, data_t *b);
-int s_cmp(data_t *a, data_t *b);
-int d_cmp(data_t *a, data_t *b);
-int o_cmp(data_t *a, data_t *b);
+typedef struct data_s data_t;
 
-#define idat(val)     \
-    {                 \
-        .type = INT,  \
-        .intgr = val, \
-        .cmp = i_cmp, \
-        .size = 1,    \
-    }
+typedef char* string_t;
 
-#define udat(val)     \
-    {                 \
-        .type = UINT, \
-        .uintr = val, \
-        .cmp = u_cmp, \
-        .size = 1,    \
-    }
+typedef unsigned char* bytes_t;
 
-#define fdat(val)      \
-    {                  \
-        .type = FLOAT, \
-        .flt_pt = val, \
-        .cmp = f_cmp,  \
-        .size = 1,     \
-    }
+typedef void* ptr_t;
 
-#define bdat(val)     \
-    {                 \
-        .type = BOOL, \
-        .bl = val,    \
-        .cmp = b_cmp, \
-        .size = 1,    \
-    }
+/********************/
+// convert from pod to data_t* (with allocation)
 
-#define sdat(val)            \
-    {                        \
-        .type = STRING,      \
-        .str = val,          \
-        .cmp = s_cmp,        \
-        .size = strlen(val), \
-    }
+data_t *integer_data(int i);
 
-#define ddat(val, len) \
-    {                  \
-        .type = BYTES, \
-        .byt = val,    \
-        .cmp = d_cmp,  \
-        .size = len,   \
-    }
+data_t *l_integer_data(long i);
 
-#define odat(val)       \
-    {                   \
-        .type = OBJECT, \
-        .obj = val,     \
-        .cmp = o_cmp,   \
-        .size = 1,      \
-    }
+data_t *u_integer_data(unsigned int u);
+
+data_t *ul_integer_data(unsigned long u);
+
+data_t *floating_pt_data(float f);
+
+data_t *floating_pt_dbl_data(double f);
+
+data_t *boolean_data(bool b);
+
+data_t *string_data(string_t s, size_t len);
+
+data_t *bytes_data(bytes_t b, size_t len);
+
+data_t *object_ptr_data(ptr_t o, size_t len);
+
+
+/********************/
+// convert from data_t* to pod
+
+int data_integer(data_t *d, int *i_ptr);
+
+int data_l_integer(data_t *d, long *i_ptr);
+
+int data_u_integer(data_t *d, unsigned int *u_ptr);
+
+int data_ul_integer(data_t *d, unsigned long *u_ptr);
+
+int data_floating_pt(data_t *d, float *f_ptr);
+
+int data_floating_pt_dbl(data_t *d, double *f_ptr);
+
+int data_boolean(data_t *d, bool *b_ptr);
+
+int data_string(data_t *d, string_t s, size_t max_len);
+
+int data_string_ptr(data_t *d, string_t *s_ptr);
+
+int data_bytes(data_t *d, bytes_t b, size_t max_len);
+
+int data_bytes_ptr(data_t *d, bytes_t *b_ptr);
+
+int data_object(data_t *d, ptr_t o, size_t max_len);
+
+int data_object_ptr(data_t *d, ptr_t *o_ptr);
+
+
+
+void data_incr(data_t *d);
+
+void data_decr(data_t *d);
+
 
 bool data_equal(data_t *a, data_t *b);
 
-#endif // DATA_H
+#define EDAT_INVL 190
+DECLARE_ERROR(EDAT_INVL, "Invalid data type");
+
+#endif  // DATA_H

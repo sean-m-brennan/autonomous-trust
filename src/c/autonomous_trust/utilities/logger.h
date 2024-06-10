@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "structures/datetime.h"
+#include "exception.h"
 
 typedef enum {
     DEBUG = 1,
@@ -24,6 +25,7 @@ typedef struct {
     bool local_time;
     time_resolution_t resolution;
 } logger_t;
+
 
 /**
  * @brief Initialize a logger. Many simultaneous instances supported per process. Time resolution in milliseconds.
@@ -76,15 +78,17 @@ int logger_init_local_time_res(logger_t *logger, log_level_t max_level, const ch
  * @param frmt Format message.
  * @param ... Variable arguments.
  */
-void logging(logger_t *logger, log_level_t level, const char *srcfile, const size_t line, const char *fmt, ...);
+void _logging(logger_t *logger, log_level_t level, const char *srcfile, const size_t line, const char *fmt, ...);
 
 #define __FILENAME__ (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 
-#define log_debug(logger, ...) logging(logger, DEBUG, __FILENAME__, __LINE__, __VA_ARGS__)
-#define log_info(logger, ...)  logging(logger, INFO, __FILENAME__, __LINE__, __VA_ARGS__)
-#define log_warn(logger, ...)  logging(logger, WARNING, __FILENAME__, __LINE__, __VA_ARGS__)
-#define log_error(logger, ...) logging(logger, ERROR, __FILENAME__, __LINE__, __VA_ARGS__)
-#define log_critical(logger, ...) logging(logger, CRITICAL, __FILENAME__, __LINE__, __VA_ARGS__)
+#define log_debug(logger, ...) _logging(logger, DEBUG, __FILENAME__, __LINE__, __VA_ARGS__)
+#define log_info(logger, ...)  _logging(logger, INFO, __FILENAME__, __LINE__, __VA_ARGS__)
+#define log_warn(logger, ...)  _logging(logger, WARNING, __FILENAME__, __LINE__, __VA_ARGS__)
+#define log_error(logger, ...) _logging(logger, ERROR, __FILENAME__, __LINE__, __VA_ARGS__)
+#define log_critical(logger, ...) _logging(logger, CRITICAL, __FILENAME__, __LINE__, __VA_ARGS__)
+
+void log_exception(logger_t *logger);//, const char *fmt, ...);
 
 /**
  * @brief Close the given logger
@@ -93,4 +97,4 @@ void logging(logger_t *logger, log_level_t level, const char *srcfile, const siz
  */
 void logger_close(logger_t *logger);
 
-#endif // LOGGER_H
+#endif  // LOGGER_H

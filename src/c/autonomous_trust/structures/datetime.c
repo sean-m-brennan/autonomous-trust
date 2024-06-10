@@ -32,6 +32,7 @@ time_res_config_t set_time_resolution(time_resolution_t res)
         config.res = 1000000.0;
         config.time_fmt = ".%06d";
         break;
+    case MILLISECONDS:
     default:
         config.res = 1000.0;
         config.time_fmt = ".%03d";
@@ -40,12 +41,16 @@ time_res_config_t set_time_resolution(time_resolution_t res)
     return config;
 }
 
-float str_to_offset(const char *str)
+int str_to_offset(const char *str, float *offset)  // FIXME different sig for errors
 {
     char s[256] = {0};
     strcpy(s, str);
     char *first = strchr(s, ':');
+    if (first == NULL)
+        return EXCEPTION(EDT_FMT);
     char *second = strrchr(s, ':');
+    if (second == NULL)
+        return EXCEPTION(EDT_FMT);
     first[0] = 0;
     second[0] = 0;
     long hours = strtol(s, NULL, 10);
@@ -55,25 +60,26 @@ float str_to_offset(const char *str)
         long seconds = strtol(second + 1, NULL, 10);
         minutes = (seconds / 60.0) + minutes;
     }
-    return (minutes / 60.0) + hours;
+    *offset = (minutes / 60.0) + hours;
+    return 0;
 }
 
 int offset_to_str(float offset, char *str)
 {
-    char *sign = "";
+    const char *sign = "";
     if (offset >= 0)
         sign = "+";
     float hour;
     float frac = fabsf(modff(offset, &hour));
     int minutes = (int)(60 * frac);
     int seconds = (int)(3600 * (frac - (60.0 / minutes)));
-    char *format = "%s%d:%d";
+    const char *format = "%s%d:%d";
     if (seconds > 0)
         format = "%s%d:%d:%d";
     return sprintf(str, format, sign, (int)hour, minutes, seconds);
 }
 
-char *conversions[] = {"%f", "%z", "%Z"};
+const char *conversions[] = {"%f", "%z", "%Z"};
 size_t c_size = sizeof(conversions) / sizeof(conversions[0]);
 
 int datetime_strftime_res(const datetime_t *dt, const char *format, const time_resolution_t tr, char *s, size_t max)
@@ -182,7 +188,7 @@ int datetime_from_time(time_t time, long nsec, bool local, datetime_t *dt)
     {
         char tz[32] = {0};
         strftime(tz, 31, "%z", tm);
-        dt->tm_tz_offset = str_to_offset(tz);
+        str_to_offset(tz, &dt->tm_tz_offset);
     }
     dt->tm_nsec = nsec;
     dt->tm_utc = !local;

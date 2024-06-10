@@ -1,0 +1,17 @@
+#ifndef ERROR_TABLE_H
+#define ERROR_TABLE_H
+
+#include "utilities/exception.h"
+
+#define ERROR_TABLE_MAX 128
+
+#define DECLARE_ERROR(error_num, error_description) \
+    {                                               \
+        .errnum = error_num,                        \
+        .description = error_description,           \
+    },
+
+exception_info_t error_table[ERROR_TABLE_MAX] = {
+    LIST__DECLARE_ERROR};
+
+#endif // ERROR_TABLE_H

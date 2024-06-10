@@ -5,6 +5,7 @@
 /.idea/**/dictionaries
 /.idea/**/shelf
 /.idea/**/sonarlint*
+/.idea/**/git_toolbox*
 /.vscode/*
 
 ### Latex ###
@@ -85,3 +86,6 @@ dist
 
 /src/c/build
 /src/c/proto/c
+**/*.pb-c.c
+**/*.pb-c.h
+/src/proto/py
