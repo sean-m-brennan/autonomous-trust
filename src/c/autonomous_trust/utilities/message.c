@@ -38,11 +38,15 @@ msgq_key_t get_msgq_key(const char *subdir, const char *filename, const int id)
     return ftok(cfg_path, r_id);
 }
 
-queue_id_t fetch_msgq(map_t *map, map_key_t key)
+queue_id_t fetch_msgq(map_t *map, const char *key)
 {
-    data_t mk_dat = {0};
-    int err = map_get(map, key, &mk_dat);
+    data_t *mk_dat;
+    int err = map_get(map, (char*)key, &mk_dat);
     if (err != 0)
-        return -err;
-    return mk_dat.intgr;
+        return err;
+    int mk = 0;
+    err = data_integer(mk_dat, &mk);
+    if (err != 0)
+        return err;
+    return mk;
 }

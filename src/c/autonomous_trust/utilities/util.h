@@ -3,6 +3,8 @@
 
 #include <sys/types.h>
 
+#include "exception.h"
+
 #define TERM_RESET "\x1B[0m"
 #define TERM_RED "\x1B[31m"
 #define TERM_GREEN "\x1B[32m"
@@ -16,5 +18,27 @@ int max(int a, int b);
 char *strremove(char *str, const char *sub);
 
 int makedirs(char *path, mode_t mode);
+
+int compare_float_precision(float f1, float f2, float, float epsilon);
+
+#define compare_float(f1, f2) \
+    compare_float_precision(f1, f2, 0.00001)
+
+int compare_double_precision(double f1, double f2, double epsilon);
+
+#define compare_double(f1, f2) \
+    compare_double_precision(f1, f2, 0.00001)
+
+/********************/
+// json errors
+
+#define EJSN_OBJ_SET 201
+DECLARE_ERROR(EJSN_OBJ_SET, "JSON error when adding an element to an object");
+
+#define EJSN_ARR_APP 202
+DECLARE_ERROR(EJSN_ARR_APP, "JSON error when appending to an array");
+
+#define EJSN_DUMP 203
+DECLARE_ERROR(EJSN_DUMP, "JSON error dumping to string/file/etc.");
 
 #endif // UTIL_H

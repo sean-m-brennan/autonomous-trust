@@ -1,5 +1,8 @@
 #include <stdlib.h>
-#include "autonomous_trust/structures/redblack.h"
+#include "autonomous_trust/structures/map_priv.h"
+#include "autonomous_trust/config/protobuf_shutdown.h"
+#include "autonomous_trust/utilities/exception.h"
+#include "autonomous_trust/utilities/logger.h"
 
 #define DEBUG_TESTS 0
 
@@ -17,44 +20,26 @@
 #endif
 
 #if DEBUG_TESTS
-void test_red_black_tree()
+void test_map())
 #else
-START_TEST(test_red_black_tree)
+START_TEST(test_map)
 #endif
 {
-    
-    /*int ch, data;
-    while (1) {
-        printf("1. Insertion\t2. Deletion\n");
-        printf("\nEnter your choice:");
-      scanf("%d", &ch);
-      switch (ch) {
-        case 1:
-          printf("Enter the element to insert:");
-          scanf("%d", &data);
-          insertion(data);
-          break;
-        case 2:
-          printf("Enter the element to delete:");
-          scanf("%d", &data);
-          deletion(data);
-          break;
-        default:
-          printf("Not available\n");
-          break;
-      }
-      printf("\n");
-    }*/
+    logger_t logger;
+    ck_assert_ret_ok(logger_init(&logger, DEBUG, NULL));
+
+    // FIXME
+    log_exception(&logger);
 }
 #if !DEBUG_TESTS
 END_TEST
 
 Suite *test_suite(void)
 {
-    Suite *s = suite_create("Red/Black Tree");
+    Suite *s = suite_create("Map");
     TCase *tc_core = tcase_create("Core");
 
-    tcase_add_test(tc_core, test_red_black_tree);
+    tcase_add_test(tc_core, test_map);
     suite_add_tcase(s, tc_core);
 
     return s;
@@ -72,9 +57,10 @@ int main(void)
     return (number_failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 #else
-int main()
+int main(void)
 {
-    test_red_black_tree();
+    testMap();
+    shutdown_protobuf_library();
     return 0;
 }
 #endif

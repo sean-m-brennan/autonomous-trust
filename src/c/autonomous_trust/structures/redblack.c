@@ -2,65 +2,49 @@
 #include <stdbool.h>
 #include <errno.h>
 
-#include "redblack.h"
+#include "redblack_priv.h"
 #include "array.h"
-
-extern int errno;
-
-enum Direction
-{
-    LEFT,
-    RIGHT
-};
 
 enum Direction opposite_direction(enum Direction dir)
 {
     return (enum Direction)(dir + 1) % 2;
-};
+}
 
 /**********************/
 // Red/Black node in tree (private)
 
-struct rbNode
+int createNode(tree_data_ptr_t data, int key, struct rbNode **node_ptr)
 {
-    int key;
-    bool red;
-    tree_data_ptr_t data;
-    struct rbNode *parent, *left, *right;
-};
-
-struct rbTree_s {
-    struct rbNode *root;
-    int size;
-};
-
-struct rbNode *createNode(tree_data_ptr_t data, int key)
-{
-    struct rbNode *newNode = (struct rbNode *)malloc(sizeof(struct rbNode));
-    if (newNode == NULL)
-        return NULL;
-    newNode->data = data;
-    newNode->key = key;
-    newNode->red = true;
-    newNode->parent = newNode->left = newNode->right = NULL;
-    return newNode;
+    *node_ptr = malloc(sizeof(struct rbNode));
+    struct rbNode *node = *node_ptr;
+    if (node == NULL)
+        return EXCEPTION(ENOMEM);
+    node->data = data;
+    node->key = key;
+    node->red = true;
+    node->parent = node->left = node->right = NULL;
+    return 0;
 }
 
-/*struct rbNode *copyNodes(struct rbNode *orig, struct rbNode *parent)
+int copyNodes(struct rbNode *orig, struct rbNode *parent, struct rbNode **child)
 {
     if (orig == NULL)
-        return NULL;
-    struct rbNode *copy = createNode(orig->data, orig->key);
-    if (copy == NULL) {
-        errno = ENOMEM;
-        return copy;
-    }
+        return EXCEPTION(EINVAL);
+    struct rbNode *copy;
+    int err = createNode(orig->data, orig->key, &copy);
+    if (err != 0)
+        return err;
+
     copy->red = orig->red;
-    copy->left = copyNodes(orig->left, copy);
-    copy->right = copyNodes(orig->right, copy);
+    err = copyNodes(orig->left, copy, &copy->left);
+    if (err != 0)
+        return err;
+    err = copyNodes(orig->right, copy, &copy->right);
+    if (err != 0)
+        return err;
     copy->parent = parent;
-    return copy;
-}*/
+    return 0;
+}
 
 struct rbNode *findNode(tree_t *tree, int key)
 {
@@ -297,33 +281,42 @@ void recolorDelete(tree_t *tree, struct rbNode *node)
 /**********************/
 // public tree functions
 
-int tree_create(tree_t **tree_ptr)
+int tree_init(tree_t *tree)
 {
-    if (tree_ptr == NULL)
-        return EINVAL;
-    *tree_ptr = calloc(1, sizeof(tree_t));
-    if (*tree_ptr == NULL)
-        return ENOMEM;
     return 0;
 }
 
-/*tree_t *tree_copy(tree_t *tree)
+int tree_create(tree_t **tree_ptr)
 {
-    tree_t *newTree = createTree();
-    if (newTree == NULL)
-        return NULL;
-    newTree->root = copyNodes(tree->root, NULL);
-    if (newTree->root == NULL) {
-        free_tree(newTree)  // may be partially built
-        return NULL;
+    if (tree_ptr == NULL)
+        return EXCEPTION(EINVAL);
+    *tree_ptr = calloc(1, sizeof(tree_t));
+    if (*tree_ptr == NULL)
+        return EXCEPTION(ENOMEM);
+    return tree_init(*tree_ptr);
+}
+
+int tree_copy(tree_t *orig, tree_t **copy_ptr)
+{
+    int err = tree_create(copy_ptr);
+    if (err != 0)
+        return err;
+    tree_t *copy = *copy_ptr;
+    err = copyNodes(orig->root, NULL, &copy->root);
+    if (err != 0) {
+        tree_free(copy);
+        return err;
     }
-    newTree->size = tree->size;
-    return newTree;
-}*/
+    copy->size = orig->size;
+    return 0;
+}
 
 tree_data_ptr_t tree_find(tree_t *tree, int key)
 {
-    return findNode(tree, key)->data;
+    struct rbNode *node = findNode(tree, key);
+    if (node == NULL)
+        return NULL;
+    return node->data;
 }
 
 int tree_insert_auto_key(tree_t *tree, tree_data_ptr_t data)
@@ -334,11 +327,12 @@ int tree_insert_auto_key(tree_t *tree, tree_data_ptr_t data)
 
 int tree_insert(tree_t *tree, void *data, int key)
 {
-    struct rbNode *node = createNode(data, key);
-    if (node == NULL)
-        return ENOMEM;
-    struct rbNode *parent = NULL;
+    struct rbNode *node;
+    int err = createNode(data, key, &node);
+    if (err != 0)
+        return err;
     struct rbNode *current = tree->root;
+    struct rbNode *parent = current;
     while (current != NULL)
     {
         parent = current;
@@ -349,7 +343,7 @@ int tree_insert(tree_t *tree, void *data, int key)
         else
         {
             free(node);
-            return ERBT_DUP_INS;
+            return EXCEPTION(ERBT_DUP_INS);
         }
     }
     node->parent = parent;
@@ -367,11 +361,11 @@ int tree_insert(tree_t *tree, void *data, int key)
 int tree_delete(tree_t *tree, int key)
 {
     if (!tree->root)
-        return ERBT_EMPTY;
+        return EXCEPTION(ERBT_EMPTY);
 
     struct rbNode *node = tree_find(tree, key);
     if (node == NULL)
-        return ERBT_NO_KEY;
+        return EXCEPTION(ERBT_NO_KEY);
 
     struct rbNode *temp = node;
     bool color = temp->red;

@@ -1,5 +1,5 @@
-#ifndef MAP_PRIV_H
-#define MAP_PRIV_H
+#ifndef MAP_PRIV
+#define MAP_PRIV
 
 #include <stddef.h>
 
@@ -18,4 +18,4 @@ struct map_s
     bool alloc;
 };
 
-#endif // MAP_PRIV_H
+#endif // MAP_PRIV

@@ -9,7 +9,7 @@ typedef char *map_key_t;
 typedef struct
 {
     map_key_t key;
-    data_t value;
+    data_t *value;
 } map_item_t;
 
 typedef struct map_s map_t;
@@ -46,20 +46,50 @@ size_t map_size(map_t *map);
  */
 array_t *map_keys(map_t *map);
 
-/**
- * @brief For-each macro; requires array_t *keys, map_t *map, map_key_t key, and data_t value to be defined.
- *
- */
-#define map_entries_for_each(map, key, value)  \
-    keys = map_keys(map);                      \
-    for (int i = 0; i < array_size(keys); i++) \
-    {                                          \
-        data_t k_dat;                          \
-        array_get(keys, i, &k_dat);            \
-        key = k_dat.str;                       \
-        map_get(map, key, &value);
+// #define CONCAT_IMPL(x, y) x##y
+// #define CONCAT(x, y) CONCAT_IMPL(x, y)
+// #define DYNAVAR2(x) CONCAT(x, __COUNTER__)
+// #define DYNAVAR(x) DYNAVAR2(x)
+// #define MAP_KEYS_VAR DYNAVAR(keys)
 
-#define map_end_for_each }
+#define __MAKE_SYMBOL(name, num) name##num
+#define _MAKE_SYMBOL(name, num) __MAKE_SYMBOL(name, num)
+#define MAKE_SYMBOL(name) _MAKE_SYMBOL(name, __COUNTER__)
+#define MAP_KEYS_VAR MAKE_SYMBOL(_keys_)
+
+/**
+ * @brief For-each macro
+ * @details requires map_t *map, map_key_t key, and data_t *value to be defined.
+ */
+#define map_entries_for_each(map, key, value)                       \
+    {                                                               \
+        array_t *__keys = map_keys(map);                            \
+        for (size_t _incr = 0; _incr < array_size(__keys); _incr++) \
+        {                                                           \
+            int __attribute__((unused)) errors[3] = {0};            \
+            data_t *__k_dat = NULL;                                 \
+            int _err = array_get(__keys, _incr, &__k_dat);           \
+            if (_err != 0)                                           \
+            {                                                       \
+                errors[0] = _err;                                    \
+                continue;                                           \
+            }                                                       \
+            _err = data_string_ptr(__k_dat, &key);                   \
+            if (_err != 0)                                           \
+            {                                                       \
+                errors[1] = _err;                                    \
+                continue;                                           \
+            }                                                       \
+            _err = map_get(map, key, &value);                        \
+            if (_err != 0)                                           \
+            {                                                       \
+                errors[2] = _err;                                    \
+                continue;                                           \
+            }
+
+#define map_end_for_each \
+    }                    \
+    }
 
 /**
  * @brief
@@ -69,7 +99,7 @@ array_t *map_keys(map_t *map);
  * @param value
  * @return int
  */
-int map_get(map_t *map, const map_key_t key, data_t *value);
+int map_get(map_t *map, const map_key_t key, data_t **value);
 
 /**
  * @brief
@@ -79,7 +109,7 @@ int map_get(map_t *map, const map_key_t key, data_t *value);
  * @param value
  * @return int
  */
-int map_set(map_t *map, const map_key_t key, const data_t *value);
+int map_set(map_t *map, const map_key_t key, data_t *value);
 
 /**
  * @brief

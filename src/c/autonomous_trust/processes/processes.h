@@ -60,10 +60,11 @@ int process_init(process_t *proc, char *name, map_t *configurations, tracker_t *
  * 
  * @param data_dir 
  * @param flags 
- * @param skip_fork 
+ * @param fd1 
+ * @param fd2 
  * @return int 
  */
-int daemonize(char *data_dir, int flags);
+int daemonize(char *data_dir, int flags, int *fd1, int *fd2);
 
 /**
  * @brief 
@@ -87,4 +88,4 @@ int process_run(const process_t *proc, map_t *queues, msgq_key_t signal);
 
 void process_free(process_t *proc);
 
-#endif // PROCESSES_H
+#endif  // PROCESSES_H
