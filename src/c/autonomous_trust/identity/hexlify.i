@@ -1,8 +1,5 @@
-#ifndef HEXLIFY_I
-#define HEXLIFY_I
-
 // Copyright (c) 2001-2024 Python Software Foundation; All Rights Reserved
-// Derived from cpython/Python/pystrhex.c and cpython/Modules/binascii.c
+// Derived from CPython repo: cpython/Python/pystrhex.c and cpython/Modules/binascii.c
 
 /*
  * PSF LICENSE AGREEMENT FOR PYTHON 3.12.3
@@ -49,6 +46,9 @@
  * 8. By copying, installing or otherwise using Python 3.12.3, Licensee agrees
  *    to be bound by the terms and conditions of this License Agreement.
  */
+
+#ifndef HEXLIFY_I
+#define HEXLIFY_I
 
 #include <stdlib.h>
 #include <errno.h>
