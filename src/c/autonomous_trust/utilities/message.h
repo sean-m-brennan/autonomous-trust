@@ -17,67 +17,101 @@
 #ifndef MESSAGE_H
 #define MESSAGE_H
 
-#include <sys/msg.h>
 #include <stdbool.h>
 
 #include "structures/map.h"
+#include "msg_types.h"
 
-typedef enum {
-    SIGNAL,
-    GROUP,
-    PEERS,
-    CAPABILITIES,
-    PEER_CAPABILITIES,
-} msg_types_t;
+#define U_SOCK 1
+#define MSG_Q 2
 
-typedef key_t msgq_key_t;
+#ifndef IPC_MSG_IMPL
+#define IPC_MSG_IMPL U_SOCK
+#endif
+
+#if IPC_MSG_IMPL == MSG_Q
+typedef key_t msg_key_t;
 
 typedef int queue_id_t;
 
-typedef struct {
-    char *process;
-    char *function;
-    //obj;  // FIXME
-    char *to_whom;
-    char *from_whom;
-    bool encrypt;
-    char *return_to;
-} message_t;
+#define MSG_KEY_DECL(x) int x
 
-size_t message_size(message_t msg);
+#define data_key(d, i) data_integer(d, &i)
 
-typedef struct {
-    long mtype;
-    message_t info;
-} msgq_buf_t;
+#define key_data(i) integer_data(&i)
 
-typedef struct {
-    long mtype;
-    struct sig_s {
-        char signal[32];
-        int sig;
-    } info;
-} signal_buf_t;
+#elif IPC_MSG_IMPL == U_SOCK
+typedef char *msg_key_t;
 
-#define msgq_create(id) msgget(id, 0666 | IPC_CREAT)
+typedef struct
+{
+    int fd;
+    char name[PROC_NAMELEN]
+} queue_id_t;
+
+#define MSG_KEY_DECL(x) char *x
+
+#define data_key(d, s) data_string_ptr(d, s)
+
+#define key_data(s) string_data(s, strlen(s))
+
+#else
+#error "Invalid IPC messaging implementation: IPC_MSG_IMPL"
+#endif
 
 /**
- * @brief Get a message queue key
- * 
- * @param subdir A subdirectory of the AT config dir
- * @param filename An optional filename (otherwise "")
- * @param id An optional number (otherwise chosen at random)
- * @return msgq_key_t 
+ * @brief
+ *
+ * @param id
+ * @param key
+ * @return int
  */
-msgq_key_t get_msgq_key(const char *subdir, const char *filename, const int id);
+int messaging_new_id(char *id, msg_key_t *key);
 
 /**
- * @brief 
- * 
- * @param map 
- * @param key 
- * @return queue_id_t 
+ * @brief Initialize a message queue
+ *
+ * @param id A message queue id
+ * @return int File descriptor of the open queue
  */
-queue_id_t fetch_msgq(map_t *map, const char *key);
+int messaging_init(msg_key_t id);
 
-#endif  // MESSAGE_H
+/**
+ * @brief Pull an existing queue from storage
+ *
+ * @param map
+ * @param key
+ * @return queue_id_t
+ */
+queue_id_t messaging_fetch_queue(map_t *map, const char *key);
+
+/**
+ * @brief Receive an internal message
+ *
+ * @param qid
+ * @param data
+ * @param data_len
+ * @return int
+ */
+int messaging_recv(queue_id_t qid, generic_msg_t *data);
+
+/**
+ * @brief
+ *
+ * @param type
+ * @return size_t
+ */
+size_t message_size(message_type_t type);
+
+/**
+ * @brief Send a message internally
+ *
+ * @param qid
+ * @param type
+ * @param data
+ * @param data_len
+ * @return int
+ */
+int messaging_send(queue_id_t qid, message_type_t type, void *data);
+
+#endif // MESSAGE_H

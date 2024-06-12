@@ -27,4 +27,4 @@ typedef struct
 } network_config_t;
 
 
-#endif // NETWORK_H
+#endif  // NETWORK_H

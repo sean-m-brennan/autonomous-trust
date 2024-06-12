@@ -17,6 +17,8 @@
 #ifndef SIGHANDLER_H
 #define SIGHANDLER_H
 
+#include "utilities/logger.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

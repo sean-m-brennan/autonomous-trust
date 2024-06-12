@@ -52,8 +52,26 @@ struct identity_s
     block_impl_t block;
 };
 
+struct public_identity_s {
+    uuid_t uuid;
+    unsigned char *address;  // FIXME fixed size
+    char fullname[256];
+    public_signature_t signature;
+    public_encryptor_t encryptor;
+};
+
 int identity_to_json(const void *data_struct, json_t **obj_ptr);
 
 int identity_from_json(const json_t *obj, void *data_struct);
 
-#endif // IDENTITY_PRIV_H
+struct group_s {
+    uuid_t uuid;
+    unsigned char *address;
+    public_encryptor_t encryptor;
+};
+
+int group_to_json(const void *data_struct, json_t **obj_ptr);
+
+int group_from_json(const json_t *obj, void *data_struct);
+
+#endif  // IDENTITY_PRIV_H
