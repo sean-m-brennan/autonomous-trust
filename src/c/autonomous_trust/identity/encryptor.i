@@ -24,16 +24,15 @@
 #include "hexlify.i"
 
 
+void public_encryptor_init(public_encryptor_t *encr, const unsigned char *hex_seed, bool public_only) {
+    unhexlify(hex_seed, crypto_box_PUBLICKEYBYTES * 2, (unsigned char*)encr->public);
+    hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char*)encr->public_hex);
+}
+
 void encryptor_init(encryptor_t *encr, const unsigned char *hex_seed, bool public_only) {
-    if (public_only) {
-        bzero(encr->private, crypto_box_SECRETKEYBYTES);
-        unhexlify(hex_seed, crypto_box_PUBLICKEYBYTES * 2, (unsigned char*)encr->public);
-    }
-    else {
-        unsigned char seed[crypto_box_SEEDBYTES];
-        unhexlify(hex_seed, crypto_box_SEEDBYTES * 2, seed);
-        crypto_box_seed_keypair((unsigned char*)encr->public, (unsigned char*)encr->private, seed);
-    }
+    unsigned char seed[crypto_box_SEEDBYTES];
+    unhexlify(hex_seed, crypto_box_SEEDBYTES * 2, seed);
+    crypto_box_seed_keypair((unsigned char*)encr->public, (unsigned char*)encr->private, seed);
     hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char*)encr->public_hex);
 }
 

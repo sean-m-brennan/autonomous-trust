@@ -22,6 +22,10 @@ message Capability {
   repeated string keywords = 4;
 }
 
+message Capabilities {
+  map<string, string> listing = 1;
+}
+
 message PeerCapabilities {
   map<string, string> listing = 1;
 }

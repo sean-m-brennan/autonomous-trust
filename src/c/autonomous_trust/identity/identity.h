@@ -18,9 +18,39 @@
 #define IDENTITY_H
 
 #include <stdlib.h>
-#include "config/configuration.h"
+
+#include <uuid/uuid.h>
+#include <sodium.h>
 
 typedef struct identity_s identity_t;
+
+typedef struct
+{
+    unsigned char public[crypto_sign_PUBLICKEYBYTES];
+    unsigned char public_hex[crypto_sign_PUBLICKEYBYTES * 2];
+} public_signature_t;
+
+typedef struct
+{
+    unsigned char public[crypto_box_PUBLICKEYBYTES];
+    unsigned char public_hex[crypto_box_PUBLICKEYBYTES * 2];
+} public_encryptor_t;
+
+typedef struct {
+    uuid_t uuid;
+    unsigned char *address;  // FIXME fixed size
+    char fullname[256];
+    public_signature_t signature;
+    public_encryptor_t encryptor;
+} public_identity_t;
+
+typedef struct {
+    uuid_t uuid;
+    unsigned char *address;
+    public_encryptor_t encryptor;
+} group_t;
+
+#define MAX_PEERS 128  // approx Dunbar number
 
 typedef struct
 {
@@ -38,7 +68,7 @@ int identity_create(unsigned char *address, identity_t **ident);
  * @param pub_copy 
  * @return int 
  */
-int identity_publish(const identity_t *ident, identity_t **pub_copy);
+int identity_publish(const identity_t *ident, public_identity_t **pub_copy);
 
 /**
  * @brief 
@@ -58,7 +88,7 @@ int identity_sign(const identity_t *ident, const msg_str_t *in, msg_str_t *out);
  * @param out 
  * @return int 
  */
-int identity_verify(const identity_t *ident, const msg_str_t *in, msg_str_t *out);
+int identity_verify(const public_identity_t *ident, const msg_str_t *in, msg_str_t *out);
 
 /**
  * @brief 
@@ -70,7 +100,7 @@ int identity_verify(const identity_t *ident, const msg_str_t *in, msg_str_t *out
  * @param cipher 
  * @return int 
  */
-int identity_encrypt(const identity_t *ident, const msg_str_t *in, const identity_t *whom, const unsigned char *nonce, unsigned char *cipher);
+int identity_encrypt(const identity_t *ident, const msg_str_t *in, const public_identity_t *whom, const unsigned char *nonce, unsigned char *cipher);
 
 /**
  * @brief 
@@ -82,7 +112,7 @@ int identity_encrypt(const identity_t *ident, const msg_str_t *in, const identit
  * @param out 
  * @return int 
  */
-int identity_decrypt(const identity_t *ident, const msg_str_t *cipher, const identity_t *whom, const unsigned char *nonce, unsigned char *out);
+int identity_decrypt(const identity_t *ident, const msg_str_t *cipher, const public_identity_t *whom, const unsigned char *nonce, unsigned char *out);
 
 /**
  * @brief 
@@ -91,8 +121,5 @@ int identity_decrypt(const identity_t *ident, const msg_str_t *cipher, const ide
  */
 void identity_free(identity_t *ident);
 
-int identity_to_json(const void *data_struct, json_t **obj_ptr);
 
-int identity_from_json(const json_t *obj, void *data_struct);
-
-#endif // IDENTITY_H
+#endif  // IDENTITY_H

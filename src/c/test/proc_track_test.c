@@ -34,12 +34,12 @@
 #define ck_assert_ret_nonzero(x) ck_assert_int_ne(0, x)
 #endif
 
-int first_handle(const process_t *proc, map_t *queues, msgq_key_t signal)
+int first_handle(const process_t *proc, map_t *queues, int signal)
 {
     return 0;
 }
 
-int second_handle(const process_t *proc, map_t *queues, msgq_key_t signal)
+int second_handle(const process_t *proc, map_t *queues, int signal)
 {
     return 0;
 }

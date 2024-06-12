@@ -24,16 +24,15 @@
 #include "hexlify.i"
 
 
+void public_signature_init(public_signature_t *sig, const unsigned char *hex_seed, bool public_only) {
+    unhexlify(hex_seed, crypto_sign_PUBLICKEYBYTES * 2, (unsigned char*)sig->public);
+    hexlify(sig->public, crypto_sign_PUBLICKEYBYTES, (unsigned char*)sig->public_hex);
+}
+
 void signature_init(signature_t *sig, const unsigned char *hex_seed, bool public_only) {
-    if (public_only) {
-        bzero(sig->private, crypto_sign_SECRETKEYBYTES);
-        unhexlify(hex_seed, crypto_sign_PUBLICKEYBYTES * 2, (unsigned char*)sig->public);
-    }
-    else {
-        unsigned char seed[crypto_sign_SEEDBYTES];
-        unhexlify(hex_seed, crypto_sign_SEEDBYTES * 2, seed);
-        crypto_sign_seed_keypair((unsigned char*)sig->public, (unsigned char*)sig->private, seed);
-    }
+    unsigned char seed[crypto_sign_SEEDBYTES];
+    unhexlify(hex_seed, crypto_sign_SEEDBYTES * 2, seed);
+    crypto_sign_seed_keypair((unsigned char*)sig->public, (unsigned char*)sig->private, seed);
     hexlify(sig->public, crypto_sign_PUBLICKEYBYTES, (unsigned char*)sig->public_hex);
 }
 

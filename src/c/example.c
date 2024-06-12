@@ -14,6 +14,7 @@
  *   limitations under the License.
  *******************/
 
+#include <stdio.h>
 #include <stdbool.h>
 #include <signal.h>
 #include <string.h>
@@ -31,44 +32,52 @@ int main(int argc, char *argv[])
 {
     const long cadence = 500000L; // microseconds
 
-    msgq_key_t q_in = get_msgq_key("", "", 0);
-    msgq_key_t q_out = get_msgq_key("", "", 0);
+    logger_t log;
+    logger_init(&log, DEBUG, NULL);
+
+    queue_t q_in;
+    queue_t q_out;
+    if (messaging_new_id((char*)"extern_in", &q_in) != 0)
+        log_exception(&log);
+    if (messaging_new_id((char*)"extern_out", &q_out) != 0)
+        log_exception(&log);
+
     int at_pid = run_autonomous_trust(q_in, q_out, NULL, 0, DEBUG, NULL);
     if (at_pid <= 0)
     {
-        printf("Autonomous Trust (%d) failed to start: %s\n", at_pid, strerror(errno));
+        log_error(&log, "Autonomous Trust (%d) failed to start: %s\n", at_pid, strerror(errno));
         return at_pid;
     }
 
-    msgqnum_t to_at = msgq_create(q_in);
-    msgqnum_t from_at = msgq_create(q_out);
+    queue_id_t to_at = messaging_init(q_in);
+    queue_id_t from_at = messaging_init(q_out);
     init_sig_handling(NULL);
 
-    printf("AT example main (AT at %d)\n", at_pid);
+    log_debug(&log, "AT example main (AT at %d)\n", at_pid);
     bool at_alive = true;
     while (!stop_process)
     {
         int status = 0;
         waitpid(at_pid, &status, WNOHANG);
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            printf("AT exited\n");
+            log_debug(&log, "AT exited\n");
             stop_process = true;
             at_alive = false;
         }
 
-        msgq_buf_t buf;
-        ssize_t err = msgrcv(from_at, &buf, sizeof(message_t), 0, IPC_NOWAIT);
+        generic_msg_t buf;
+        int err = messaging_recv(from_at, &buf);
         if (err == -1)
-        {
-            if (errno != ENOMSG)
-                printf("Messaging error: %s\n", strerror(errno));
+            log_exception(&log);
+        if (err == ENOMSG)
             goto snooze;
-        }
+
         bool do_send = false;
         // react to info
         if (do_send)
         {
-            err = msgsnd(to_at, &buf, sizeof(message_t), buf.mtype);
+            if (messaging_send(to_at, buf.type, &buf) != 0)
+                log_exception(&log);
         }
         // do other things
 
@@ -77,6 +86,6 @@ snooze:
     }
     if (at_alive)
         kill(at_pid, SIGINT);
-    printf("Example exit\n");
+    log_debug(&log, "Example exit\n");
     return 0;
 }
