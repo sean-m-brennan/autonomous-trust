@@ -42,7 +42,7 @@ const char *sig_quit = "quit";
 const long cadence = 500000L; // microseconds
 
 
-typedef bool (*msg_handler_t)(const process_t *proc, map_t *queues, message_t *msg);
+typedef bool (*msg_handler_t)(const process_t *proc, map_t *queues, generic_msg_t *msg);
 
 int process_init(process_t *proc, char *name, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies)
 {
@@ -64,7 +64,7 @@ inline int process_register_handler(const process_t *proc, char *func_name, hand
     return map_set(proc->protocol.handlers, func_name, h_dat);
 }
 
-bool run_message_handlers(const process_t *proc, map_t *msgq_ids, long msgtype, message_t *msg)
+bool run_message_handlers(const process_t *proc, map_t *msgq_ids, long msgtype, generic_msg_t *msg)
 {
     switch (msgtype)
     {
@@ -78,13 +78,14 @@ bool run_message_handlers(const process_t *proc, map_t *msgq_ids, long msgtype, 
         // proc->capabilities = message
         return true;
     case PEER_CAPABILITIES:
-        // pproc->eer_capabilities = message
+        // pproc->peer_capabilities = message
         return true;
     default:
-        if (msg->process == proc->name)
+        net_msg_t *nmsg = &msg->info.net_msg;
+        if (nmsg->process == proc->name)
         {
             data_t *h_dat;
-            int err = map_get(proc->protocol.handlers, msg->function, &h_dat);
+            int err = map_get(proc->protocol.handlers, nmsg->function, &h_dat);
             if (err != 0)
                 return false;
             msg_handler_t handler;
@@ -192,20 +193,26 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
     return 0;
 }
 
-bool keep_running(const process_t *proc, int sig_id)
+bool keep_running(const process_t *proc, int sig_id, logger_t *logger)
 {
-    signal_buf_t buf;
-    gettimeofday((struct timeval *)&proc->start, NULL);
-    ssize_t err = msgrcv(sig_id, &buf, sizeof(struct sig_s), SIGNAL, IPC_NOWAIT);
-    if (err == -1)
-    {
-        if (errno == ENOMSG)
-            return true;
-        // return errno; // FIXME repair?
+    generic_msg_t buf = {0};
+    if (gettimeofday((struct timeval *)&proc->start, NULL) != 0) {
+        SYS_EXCEPTION();
+        log_exception(logger);
     }
-    if (buf.info.signal == sig_quit)
-        return false;
-    // unhandled signal
+    while (buf.type != SIGNAL) {
+        int err = messaging_recv(sig_id, &buf);
+        signal_t *msg = &buf.info.signal;
+        if (err == -1)
+            log_exception(logger);
+        if (err == ENOMSG)
+            return true;
+        if (buf.type != SIGNAL)
+            log_error(logger, "Non-signal message on signal queue: %d", buf.type);
+        else if (msg->descr == sig_quit)
+            return false;
+        log_error(logger, "Unhandled signal: %d - %s", msg->sig, msg->descr);
+    }
     return true;
 }
 
@@ -232,7 +239,7 @@ void sleep_until(const process_t *proc, long how_long)
         usleep(delta);
 }
 
-int process_run(const process_t *proc, map_t *q_keys, msgq_key_t s_key)
+int process_run(const process_t *proc, map_t *q_keys, int s_key, logger_t *logger)
 {
     char data_path[256];
     get_data_dir(data_path);
@@ -261,7 +268,7 @@ int process_run(const process_t *proc, map_t *q_keys, msgq_key_t s_key)
         err = map_get(q_keys, key, &mk_dat);
         if (err != 0)
             continue; // FIXME? error
-        msgq_key_t mqk;
+        int mqk;
         data_integer(mk_dat, &mqk);
 
         int mq_id = msgget(mqk, 0666 | IPC_CREAT);
@@ -281,28 +288,27 @@ int process_run(const process_t *proc, map_t *q_keys, msgq_key_t s_key)
     // handle messages
     array_t unprocessed;
     array_init(&unprocessed);
-    while (keep_running(proc, signal))
+    while (keep_running(proc, signal, logger))
     {
         sleep_until(proc, cadence);
 
-        msgq_buf_t buf = {0};
-        queue_id_t q = fetch_msgq(&queues, (char *)proc->name);
+        queue_id_t q = messaging_fetch_queue(&queues, (char *)proc->name);
         if (q < 0)
             ; // FIXME report error
-        ssize_t ret = msgrcv(q, &buf, sizeof(message_t), 0, IPC_NOWAIT);
-        if (ret == -1)
-        {
-            if (errno == ENOMSG)
+        generic_msg_t buf = {0};
+        err = messaging_recv(q, &buf);
+        if (err == -1)
+            ; // FIXME repair?
+        if (err == ENOMSG)
                 continue;
-            return SYS_EXCEPTION(); // FIXME repair?
-        }
-        if (!run_message_handlers(proc, &queues, buf.mtype, &buf.info))
+        if (!run_message_handlers(proc, &queues, buf.type, &buf))
         {
-            message_t *msg = calloc(1, sizeof(message_t));
+            size_t size = message_size(buf.type);
+            void *msg = calloc(1, size);
             if (msg == NULL)
                 continue; // FIXME logging
-            memcpy(msg, &buf.info, sizeof(message_t));
-            data_t *m_dat = object_ptr_data(msg, sizeof(message_t));
+            memcpy(msg, &buf.info, size);
+            data_t *m_dat = object_ptr_data(msg, size);
             array_append(&unprocessed, m_dat);
         }
         // FIXME post-msg handling activity

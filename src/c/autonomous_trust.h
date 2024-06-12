@@ -38,7 +38,7 @@ extern "C" {
  * @param log_file 
  * @return int 
  */
-int run_autonomous_trust(msgq_key_t q_in, msgq_key_t q_out, 
+int run_autonomous_trust(char *q_in, char *q_out, 
                          void *capabilities, size_t cap_len, // FIXME from config file?
                          log_level_t log_level, char log_file[]);
 

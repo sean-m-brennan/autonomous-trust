@@ -58,11 +58,14 @@ int makedirs(char *path, mode_t mode)
             *p = 0;
             int err = mkdir(tmp, mode);
             if (err != 0)
-                return err;
+                return SYS_EXCEPTION();
             *p = '/';
         }
     }
-    return mkdir(tmp, mode);
+    int err = mkdir(tmp, mode);
+    if (err != 0)
+        return SYS_EXCEPTION();
+    return 0;
 }
 
 #define compare_flt_pt(f1, f2, epsilon)              \
