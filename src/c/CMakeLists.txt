@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.23)
 
 if(DEFINED ENV{CONDA_PREFIX})
     set(CONDA_ROOT $ENV{CONDA_PREFIX} CACHE PATH "Conda base directory")
@@ -116,18 +116,16 @@ set(TEST_DEPENDENCIES
 ####################
 # sources
 
-set(top_src_dir ${CMAKE_SOURCE_DIR}/../..)
+set(top_src_dir ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
-set(PROTO_SOURCE_DIR "${CMAKE_SOURCE_DIR}/proto")
-set(PROTO_BINARY_DIR "${CMAKE_SOURCE_DIR}/proto/c")
+set(PROTO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
+set(PROTO_BINARY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto/c")
 
 set(protos
     autonomous_trust/core/protobuf/agreement.proto
     autonomous_trust/core/protobuf/capabilities.proto
     autonomous_trust/core/protobuf/identity.proto
-    autonomous_trust/core/protobuf/network.proto
     autonomous_trust/core/protobuf/peers.proto
-    autonomous_trust/core/protobuf/processes.proto
     autonomous_trust/core/protobuf/structures/datetime.proto
     autonomous_trust/core/protobuf/structures/merkle.proto
 )
@@ -166,13 +164,20 @@ set(libsrc
 )
 set(libhdr
     autonomous_trust.h
-    autonomous_trust/version.h
-    autonomous_trust/utilities/message.h
-    autonomous_trust/utilities/logger.h
     autonomous_trust/config/configuration.h
     autonomous_trust/config/sighandler.h
+    autonomous_trust/identity/identity.h
+    autonomous_trust/processes/capabilities.h
+    autonomous_trust/structures/array.h
+    autonomous_trust/structures/data.h
+    autonomous_trust/structures/datetime.h
+    autonomous_trust/structures/map.h
+    autonomous_trust/utilities/exception.h
+    autonomous_trust/utilities/logger.h
+    autonomous_trust/utilities/message.h
+    autonomous_trust/utilities/msg_types.h
 )
-include_directories(${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/autonomous_trust)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust)
 
 ####################
 # get latest version
@@ -189,21 +194,28 @@ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/version.h)
     endif()
 endif()  
 
-include_directories(${CMAKE_BINARY_DIR})
-configure_file("${CMAKE_SOURCE_DIR}/autonomous_trust/version.h.in"
-               "${CMAKE_BINARY_DIR}/version.h" @ONLY)
+include_directories(${CMAKE_CURRENT_BINARY_DIR})
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/version.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust/version.h" @ONLY)
+set(genhdr ${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust/version.h)
+foreach(_hdr ${libhdr})
+    configure_file(${_hdr} ${CMAKE_CURRENT_BINARY_DIR}/${_hdr} COPYONLY)
+    set(genhdr ${genhdr} ${CMAKE_CURRENT_BINARY_DIR}/${_hdr})
+endforeach()
+
 
 ####################
 # generate tables headers
 
 function(preprocess _file_in)
     get_filename_component(_base ${_file_in} NAME_WE)
-    set(_fullpath ${CMAKE_SOURCE_DIR}/${_file_in})
-    set(_header_file ${CMAKE_BINARY_DIR}/${_base}.h)
-    set(_src_dir ${CMAKE_SOURCE_DIR})
+    set(_fullpath ${CMAKE_CURRENT_SOURCE_DIR}/${_file_in})
+    set(_header_file ${CMAKE_CURRENT_BINARY_DIR}/${_base}.h)
+    set(_src_dir ${CMAKE_CURRENT_SOURCE_DIR})
     add_custom_command(
         OUTPUT ${_header_file}
-        COMMAND python ${CMAKE_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust
+        COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust
         COMMENT "Preprocessing table header from ${_file_in}"
         DEPENDS ${_fullpath}
     )
@@ -276,9 +288,17 @@ add_custom_target(proto_python DEPENDS ${proto_py_src})
 # create libraries
 
 add_library(autonomous_trust SHARED ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
+target_sources(autonomous_trust PUBLIC ${libsrc}
+    PUBLIC FILE_SET HEADERS
+    BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
+    )
 
 add_library(autonomous_trust_static STATIC ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
 set_target_properties(autonomous_trust_static PROPERTIES OUTPUT_NAME autonomous_trust)
+target_sources(autonomous_trust PUBLIC ${libsrc}
+    PUBLIC FILE_SET HEADERS
+    BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
+    )
 
 
 ####################
@@ -294,7 +314,6 @@ target_link_directories(at_example PRIVATE ${CMAKE_SYSROOT})
 
 ####################
 # tests
-
 
 add_executable(rb_test test/rb_test.c)
 target_link_libraries(rb_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
@@ -322,5 +341,22 @@ add_test(NAME array_test COMMAND $<TARGET_FILE:array_test>)
 add_test(NAME map_test COMMAND $<TARGET_FILE:map_test>)
 add_test(NAME logger_test COMMAND $<TARGET_FILE:logger_test>)
 add_test(NAME proc_track_test COMMAND $<TARGET_FILE:proc_track_test>)
+
+
+####################
+# Packaging
+
+install(TARGETS autonomous_trust 
+        RUNTIME DESTINATION bin
+        LIBRARY DESTINATION lib
+        PUBLIC_HEADER DESTINATION include
+        FILE_SET HEADERS
+        )
+install(TARGETS autonomous_trust_static
+        RUNTIME DESTINATION bin
+        LIBRARY DESTINATION lib
+        PUBLIC_HEADER DESTINATION include
+        FILE_SET HEADERS
+        )
 
 include(CPack)

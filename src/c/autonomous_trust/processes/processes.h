@@ -19,14 +19,13 @@
 
 #include "utilities/message.h"
 #include "config/configuration.h"
-#include "process_tracker.h"
-
+#include "identity/identity_priv.h"
+#include "process_tracker_priv.h"
 
 struct process_s
 {
-    char impl[256]; // FIXME python class
-    char name[256];
-    //char cfg_name[256];  // FIXME ???
+    char name[PROC_NAMELEN];  // category of process, i.e. identity, network, ...
+    char impl[PROC_NAMELEN];  // identifier of implementing function
     config_t conf;
     map_t *configs;
     tracker_t *subsystems;
@@ -37,9 +36,9 @@ struct process_s
     struct
     {
         map_t *handlers;
+        group_t group;
+        public_identity_t peers[MAX_PEERS];
         // FIXME from configs
-        // peers
-        // group
         // capabilities
         // peer capabilities
         int phase;
@@ -100,7 +99,7 @@ int process_register_handler(const process_t *proc, char *func_name, handler_ptr
  * @param signal
  * @return int
  */
-int process_run(const process_t *proc, map_t *queues, msgq_key_t signal);
+int process_run(const process_t *proc, map_t *queues, int signal, logger_t *logger);
 
 void process_free(process_t *proc);
 

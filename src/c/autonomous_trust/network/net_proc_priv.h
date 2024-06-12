@@ -14,17 +14,17 @@
  *   limitations under the License.
  *******************/
 
-#ifndef NET_PROC_H
-#define NET_PROC_H
+#ifndef NET_PROC_PRIV_H
+#define NET_PROC_PRIV_H
 
 #include "processes/processes.h"
 
-int network_udp_ip4_run(const process_t *proc, map_t *queues, msgq_key_t signal);
+int network_udp_ip4_run(const process_t *proc, map_t *queues, int signal, logger_t *logger);
 
-int network_udp_ip6_run(const process_t *proc, map_t *queues, msgq_key_t signal);
+int network_udp_ip6_run(const process_t *proc, map_t *queues, int signal, logger_t *logger);
 
-int network_tcp_ip4_run(const process_t *proc, map_t *queues, msgq_key_t signal);
+int network_tcp_ip4_run(const process_t *proc, map_t *queues, int signal, logger_t *logger);
 
-int network_tcp_ip6_run(const process_t *proc, map_t *queues, msgq_key_t signal);
+int network_tcp_ip6_run(const process_t *proc, map_t *queues, int signal, logger_t *logger);
 
-#endif // NET_PROC_H
+#endif  // NET_PROC_PRIV_H

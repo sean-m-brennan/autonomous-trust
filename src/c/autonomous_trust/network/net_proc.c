@@ -20,42 +20,42 @@
 #include <sys/socket.h>
 #include <netdb.h>
 
-
-
 #include "processes/processes.h"
 #include "utilities/message.h"
 #include "utilities/exception.h"
+#include "utilities/logger.h"
 #include "network.h"
-
 
 const bool use_mcast = false;
 
-typedef struct {
+typedef struct
+{
     int domain;
     int type;
     int protocol;
 } socket_t;
 
-typedef struct {
+typedef struct
+{
     int level;
     int optname;
     const void *optval;
     socklen_t optlen;
 } sock_opts_t;
 
-typedef struct {
+typedef struct
+{
     int recv_ptp;
     int recv_grp;
     int recv_cast;
 } recvrs_t;
 
-
 int _send(socket_t *cfg, char *msg, char *host, int port)
 {
-    //int sock = socket(cfg->domain, cfg->type, cfg->protocol);
-    // encode
-    // connect
-    // send all
+    // int sock = socket(cfg->domain, cfg->type, cfg->protocol);
+    //  encode
+    //  connect
+    //  send all
     return 0;
 }
 
@@ -69,7 +69,7 @@ void network_shutdown(recvrs_t *socks)
         close(socks->recv_ptp);
 }
 
-int network_run(socket_t *cfg, const process_t *proc, map_t *queues, msgq_key_t signal)
+int network_run(socket_t *cfg, const process_t *proc, map_t *queues, int signal, logger_t *logger)
 {
     recvrs_t socks = {0};
     int backlog = 5;
@@ -90,149 +90,221 @@ int network_run(socket_t *cfg, const process_t *proc, map_t *queues, msgq_key_t 
     snprintf(grp_port_str, 31, "%d", net_cfg->port + 1);
 
     int err = getaddrinfo(address, port_str, &hints, &res);
-    if (err != 0) {
+    if (err != 0)
+    {
         if (err == EAI_SYSTEM)
-            return SYS_EXCEPTION();
-        return EXCEPTION(err);
+        {
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
+        }
+        EXCEPTION(err);
+        log_exception(logger);
+        return -1;
     }
     socks.recv_ptp = socket(cfg->domain, cfg->type, cfg->protocol);
     if (socks.recv_ptp == -1)
-        return SYS_EXCEPTION();
+    {
+        SYS_EXCEPTION();
+        log_exception(logger);
+        return -1;
+    }
     err = setsockopt(socks.recv_ptp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int));
-    if (err != 0) {
+    if (err != 0)
+    {
         network_shutdown(&socks);
-        return SYS_EXCEPTION();
+        SYS_EXCEPTION();
+        log_exception(logger);
+        return -1;
     }
     err = bind(socks.recv_ptp, res->ai_addr, res->ai_addrlen);
-    if (err != 0) {
+    if (err != 0)
+    {
         network_shutdown(&socks);
-        return SYS_EXCEPTION();
+        SYS_EXCEPTION();
+        log_exception(logger);
+        return -1;
     }
     err = listen(socks.recv_ptp, backlog);
-    if (err != 0) {
+    if (err != 0)
+    {
         network_shutdown(&socks);
-        return SYS_EXCEPTION();
+        SYS_EXCEPTION();
+        log_exception(logger);
+        return -1;
     }
     freeaddrinfo(res);
 
     err = getaddrinfo(address, grp_port_str, &hints, &res);
-    if (err != 0) {
+    if (err != 0)
+    {
         network_shutdown(&socks);
         if (err == EAI_SYSTEM)
-            return SYS_EXCEPTION();
-        return EXCEPTION(err);
+        {
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
+        }
+        EXCEPTION(err);
+        log_exception(logger);
+        return -1;
     }
     socks.recv_grp = socket(cfg->domain, cfg->type, cfg->protocol);
-    if (socks.recv_grp == -1) {
+    if (socks.recv_grp == -1)
+    {
         network_shutdown(&socks);
-        return SYS_EXCEPTION();
+        SYS_EXCEPTION();
+        log_exception(logger);
+        return -1;
     }
     err = setsockopt(socks.recv_grp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int));
-    if (err != 0) {
+    if (err != 0)
+    {
         network_shutdown(&socks);
-        return SYS_EXCEPTION();
+        SYS_EXCEPTION();
+        log_exception(logger);
+        return -1;
     }
     err = bind(socks.recv_grp, res->ai_addr, res->ai_addrlen);
-    if (err != 0) {
+    if (err != 0)
+    {
         network_shutdown(&socks);
-        return SYS_EXCEPTION();
+        SYS_EXCEPTION();
+        log_exception(logger);
+        return -1;
     }
     err = listen(socks.recv_grp, backlog);
-    if (err != 0) {
+    if (err != 0)
+    {
         network_shutdown(&socks);
-        return SYS_EXCEPTION();
+        SYS_EXCEPTION();
+        log_exception(logger);
+        return -1;
     }
     freeaddrinfo(res);
 
-    if (use_mcast) {
+    if (use_mcast)
+    {
         char *mcast_address = net_cfg->multicast_address;
         err = getaddrinfo(mcast_address, port_str, &hints, &res);
-        if (err != 0) {
+        if (err != 0)
+        {
             network_shutdown(&socks);
             if (err == EAI_SYSTEM)
-                return SYS_EXCEPTION();
-            return EXCEPTION(err);
+            {
+                SYS_EXCEPTION();
+                log_exception(logger);
+                return -1;
+            }
+            EXCEPTION(err);
+            log_exception(logger);
+            return -1;
         }
-        //size_t packet_size = 65527;
-        //int mcast_ttl = 2;
-        //sock_opts_t send_opts = { .level = IPPROTO_IP, .optname = IP_MULTICAST_TTL, .optval = &mcast_ttl, .optlen = sizeof(int) };
+        // size_t packet_size = 65527;
+        // int mcast_ttl = 2;
+        // sock_opts_t send_opts = { .level = IPPROTO_IP, .optname = IP_MULTICAST_TTL, .optval = &mcast_ttl, .optlen = sizeof(int) };
         socks.recv_cast = socket(cfg->domain, SOCK_DGRAM, IPPROTO_UDP);
-        if (socks.recv_cast == -1) {
+        if (socks.recv_cast == -1)
+        {
             network_shutdown(&socks);
-            return SYS_EXCEPTION();
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
         }
         err = setsockopt(socks.recv_cast, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int));
-        if (err != 0) {
+        if (err != 0)
+        {
             network_shutdown(&socks);
-            return SYS_EXCEPTION();
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
         }
         err = bind(socks.recv_cast, res->ai_addr, res->ai_addrlen);
-        if (err != 0) {
+        if (err != 0)
+        {
             network_shutdown(&socks);
-            return SYS_EXCEPTION();
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
         }
-        //setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, req);
+        // setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, req);
         freeaddrinfo(res);
-    } else {
+    }
+    else
+    {
         char *bcast_address = net_cfg->broadcast_address;
         err = getaddrinfo(bcast_address, port_str, &hints, &res);
-        if (err != 0) {
+        if (err != 0)
+        {
             network_shutdown(&socks);
             if (err == EAI_SYSTEM)
-                return SYS_EXCEPTION();
-            return -1; // FIXME EXCEPTION(err);
+            {
+                SYS_EXCEPTION();
+                log_exception(logger);
+            }
+            EXCEPTION(err);
+            log_exception(logger);
+            return -1;
         }
-        //size_t packet_size = 65507;
-        //sock_opts_t send_opts = { .level = SOL_SOCKET, .optname = SO_BROADCAST, .optval = &one, .optlen = sizeof(int) };
+        // size_t packet_size = 65507;
+        // sock_opts_t send_opts = { .level = SOL_SOCKET, .optname = SO_BROADCAST, .optval = &one, .optlen = sizeof(int) };
         socks.recv_cast = socket(cfg->domain, SOCK_DGRAM, IPPROTO_UDP);
-        if (socks.recv_cast == -1) {
+        if (socks.recv_cast == -1)
+        {
             network_shutdown(&socks);
-            return SYS_EXCEPTION();
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
         }
         err = setsockopt(socks.recv_cast, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int));
-        if (err != 0) {
+        if (err != 0)
+        {
             network_shutdown(&socks);
-            return SYS_EXCEPTION();
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
         }
         err = bind(socks.recv_cast, res->ai_addr, res->ai_addrlen);
-        if (err != 0) {
+        if (err != 0)
+        {
             network_shutdown(&socks);
-            return SYS_EXCEPTION();
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
         }
         freeaddrinfo(res);
     }
 
     // register handlers for intern msgs
-    return process_run(proc, queues, signal);
+    return process_run(proc, queues, signal, logger);
 }
-
 
 /**********/
 
-int network_udp_ip4_run(const process_t *proc, map_t *queues, msgq_key_t signal)
+int network_udp_ip4_run(const process_t *proc, map_t *queues, int signal, logger_t *logger)
 {
-    socket_t cfg = { .domain = AF_INET, .type = SOCK_DGRAM, .protocol = IPPROTO_UDP };
-    return network_run(&cfg, proc, queues, signal);
+    socket_t cfg = {.domain = AF_INET, .type = SOCK_DGRAM, .protocol = IPPROTO_UDP};
+    return network_run(&cfg, proc, queues, signal, logger);
 }
 DECLARE_PROCESS(network, udp_net_4, network_udp_ip4_run);
 
-int network_udp_ip6_run(const process_t *proc, map_t *queues, msgq_key_t signal)
+int network_udp_ip6_run(const process_t *proc, map_t *queues, int signal, logger_t *logger)
 {
-    socket_t cfg = { .domain = AF_INET6, .type = SOCK_DGRAM, .protocol = IPPROTO_UDP };
-    return network_run(&cfg, proc, queues, signal);
+    socket_t cfg = {.domain = AF_INET6, .type = SOCK_DGRAM, .protocol = IPPROTO_UDP};
+    return network_run(&cfg, proc, queues, signal, logger);
 }
 DECLARE_PROCESS(network, udp_net_6, network_udp_ip6_run);
 
-int network_tcp_ip4_run(const process_t *proc, map_t *queues, msgq_key_t signal)
+int network_tcp_ip4_run(const process_t *proc, map_t *queues, int signal, logger_t *logger)
 {
-    socket_t cfg = { .domain = AF_INET, .type = SOCK_STREAM, .protocol = 0 };
-    return network_run(&cfg, proc, queues, signal);
+    socket_t cfg = {.domain = AF_INET, .type = SOCK_STREAM, .protocol = 0};
+    return network_run(&cfg, proc, queues, signal, logger);
 }
 DECLARE_PROCESS(network, tcp_net_4, network_tcp_ip4_run);
 
-int network_tcp_ip6_run(const process_t *proc, map_t *queues, msgq_key_t signal)
+int network_tcp_ip6_run(const process_t *proc, map_t *queues, int signal, logger_t *logger)
 {
-    socket_t cfg = { .domain = AF_INET6, .type = SOCK_STREAM, .protocol = 0 };
-    return network_run(&cfg, proc, queues, signal);
+    socket_t cfg = {.domain = AF_INET6, .type = SOCK_STREAM, .protocol = 0};
+    return network_run(&cfg, proc, queues, signal, logger);
 }
 DECLARE_PROCESS(network, tcp_net_6, network_tcp_ip6_run);

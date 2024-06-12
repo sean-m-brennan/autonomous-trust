@@ -21,7 +21,7 @@
 #include "utilities/message.h"
 
 // FIXME message handlers
-int _remember_activity(const process_t *proc, map_t *queues, message_t *msg, int argc, ...)
+int _remember_activity(const process_t *proc, map_t *queues, generic_msg_t *msg, int argc, ...)
 {
     /*va_list argv;
     char *name = {0};
@@ -64,10 +64,10 @@ int _announce_identity(const process_t *proc, map_t *queues)
 {
     // FIXME
     // send network broadcast, no encrypt
-    queue_id_t q = fetch_msgq(queues, "network");
-    msgq_buf_t buf = {0};
+    queue_id_t q = messaging_fetch_queue(queues, "network");
+    generic_msg_t buf = {0}; // FIXME specific
     // FIXME announcement msg: identity_publish(), package_hash, capabilities_list
-    msgsnd(q, &buf, sizeof(message_t), buf.mtype);
+    messaging_send(q, 1, &buf);
     return 0;
 }
 
@@ -150,7 +150,7 @@ bool handle_group_update(const process_t *proc, map_t *queues, message_t *msg)
 }
 */
 
-int identity_run(const process_t *proc, map_t *queues, msgq_key_t signal)
+int identity_run(const process_t *proc, map_t *queues, int signal, logger_t *logger)
 {
     // process_register_handler(proc, "diff", handle_history_diff);
     // process_register_handler(proc, "update", handle_group_update);
@@ -159,6 +159,6 @@ int identity_run(const process_t *proc, map_t *queues, msgq_key_t signal)
     _announce_identity(proc, queues);
     // FIXME chose_group to thread
 
-    return process_run(proc, queues, signal);
+    return process_run(proc, queues, signal, logger);
 }
 DECLARE_PROCESS(identity, id_proc, identity_run);

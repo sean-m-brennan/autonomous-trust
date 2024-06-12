@@ -47,3 +47,4 @@ dependencies:
       - dash-iconify
       - mediapipe
       - websocket
+      - parrot-olympe

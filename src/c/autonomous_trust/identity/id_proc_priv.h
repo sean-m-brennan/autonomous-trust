@@ -14,12 +14,12 @@
  *   limitations under the License.
  *******************/
 
-#ifndef ID_PROC_H
-#define ID_PROC_H
+#ifndef ID_PROC_PRIV_H
+#define ID_PROC_PRIV_H
 
 #include "processes/processes.h"
 
-int identity_run(const process_t *proc, map_t *queues, msgq_key_t signal);
+int identity_run(const process_t *proc, map_t *queues, int signal, logger_t *logger);
 
 
-#endif // ID_PROC_H
+#endif  // ID_PROC_PRIV_H

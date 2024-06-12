@@ -56,29 +56,26 @@ int identity_create(unsigned char *address, identity_t **ident)
     return 0;
 }
 
-int identity_publish(const identity_t *ident, identity_t **pub_copy)
+int identity_publish(const identity_t *ident, public_identity_t **pub_copy)
 {
     if (ident == NULL)
         return EINVAL;
-    *pub_copy = malloc(sizeof(identity_t));
-    identity_t *newIdent = *pub_copy;
+    *pub_copy = malloc(sizeof(public_identity_t));
+    public_identity_t *newIdent = *pub_copy;
     if (newIdent == NULL)
         return EXCEPTION(ENOMEM);
     memcpy(newIdent->uuid, ident->uuid, sizeof(uuid_t));
     newIdent->address = ident->address;
-    newIdent->fullname = ident->fullname;
-    newIdent->nickname = ident->nickname;
-    newIdent->petname = ident->petname;
-    newIdent->public_only = true;
+    strncpy(newIdent->fullname, ident->fullname, 255);
     unsigned char *sseed = signature_publish(&ident->signature);
     if (sseed == NULL)
         return -1;
-    signature_init(&newIdent->signature, sseed, true);
+    public_signature_init(&newIdent->signature, sseed, true);
     free(sseed);
     unsigned char *eseed = encryptor_publish(&ident->encryptor);
     if (eseed == NULL)
         return -1;
-    encryptor_init(&newIdent->encryptor, eseed, true);
+    public_encryptor_init(&newIdent->encryptor, eseed, true);
     free(eseed);
     return 0;
 }
@@ -88,17 +85,17 @@ int identity_sign(const identity_t *ident, const msg_str_t *in, msg_str_t *out)
     return crypto_sign(out->msg, &out->len, in->msg, in->len, ident->signature.private);
 }
 
-int identity_verify(const identity_t *ident, const msg_str_t *in, msg_str_t *out)
+int identity_verify(const public_identity_t *ident, const msg_str_t *in, msg_str_t *out)
 {
     return crypto_sign_open(out->msg, &out->len, in->msg, in->len, ident->signature.public);
 }
 
-int identity_encrypt(const identity_t *ident, const msg_str_t *in, const identity_t *whom, const unsigned char *nonce, unsigned char *cipher)
+int identity_encrypt(const identity_t *ident, const msg_str_t *in, const public_identity_t *whom, const unsigned char *nonce, unsigned char *cipher)
 {
     return crypto_box_easy(cipher, in->msg, in->len, nonce, whom->encryptor.public, ident->encryptor.private);
 }
 
-int identity_decrypt(const identity_t *ident, const msg_str_t *cipher, const identity_t *whom, const unsigned char *nonce, unsigned char *out)
+int identity_decrypt(const identity_t *ident, const msg_str_t *cipher, const public_identity_t *whom, const unsigned char *nonce, unsigned char *out)
 {
     return crypto_box_open_easy(out, cipher->msg, cipher->len, nonce, whom->encryptor.public, ident->encryptor.private);
 }
@@ -121,13 +118,13 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr)
     json_object_set(obj, "public_only", json_boolean(ident->public_only));
 
     json_t *sig = json_object();
-    unsigned char *hex = signature_publish(&ident->signature);
+    unsigned char *hex = signature_publish(&ident->signature);  // encoded
     json_object_set(sig, "hex_seed", json_string((char*)hex));
     free(hex);
     json_object_set(obj, "signature", sig);
 
     json_t *encr = json_object();
-    hex = encryptor_publish(&ident->encryptor);
+    hex = encryptor_publish(&ident->encryptor);  // encoded
     json_object_set(encr, "hex_seed", json_string((char*)hex));
     free(hex);
     json_object_set(obj, "encryptor", encr);
@@ -149,9 +146,9 @@ int identity_from_json(const json_t *obj, void *data_struct)
     ident->petname = (char*)json_string_value(json_object_get(obj, "petname"));
     ident->public_only = json_boolean_value(json_object_get(obj, "public_only"));
     uint8_t *seed = (uint8_t*)json_object_get(json_object_get(obj, "signature"), "hex_seed");
-    signature_init(&ident->signature, seed, ident->public_only);
+    signature_init(&ident->signature, seed, ident->public_only);  // decoded
     seed = (uint8_t*)json_object_get(json_object_get(obj, "encryptor"), "hex_seed");
-    encryptor_init(&ident->encryptor, seed, ident->public_only);
+    encryptor_init(&ident->encryptor, seed, ident->public_only);  // decoded
     return 0;
 }
 

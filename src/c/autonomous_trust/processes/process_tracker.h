@@ -31,7 +31,7 @@ typedef struct
 
 typedef struct process_s process_t; // FIXME why is this defined here?
 
-typedef int (*handler_ptr_t)(const process_t *proc, map_t *queues, msgq_key_t signal);
+typedef int (*handler_ptr_t)(const process_t *proc, map_t *queues, int signal, logger_t *logger);
 
 typedef struct
 {
