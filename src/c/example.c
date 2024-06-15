@@ -35,23 +35,22 @@ int main(int argc, char *argv[])
     logger_t log;
     logger_init(&log, DEBUG, NULL);
 
-    queue_t q_in;
-    queue_t q_out;
-    if (messaging_new_id((char*)"extern_in", &q_in) != 0)
-        log_exception(&log);
-    if (messaging_new_id((char*)"extern_out", &q_out) != 0)
+    char *q_out = (char*)"extern_to_at";
+    char *q_in = (char*)"at_to_extern";
+    queue_t from_at;
+    if (messaging_init(q_in, &from_at) != 0)
         log_exception(&log);
 
-    int at_pid = run_autonomous_trust(q_in, q_out, NULL, 0, DEBUG, NULL);
+    // queue names are in reverse order (out here is in there)
+    int at_pid = run_autonomous_trust(q_out, q_in, NULL, 0, DEBUG, NULL);
     if (at_pid <= 0)
     {
         log_error(&log, "Autonomous Trust (%d) failed to start: %s\n", at_pid, strerror(errno));
         return at_pid;
     }
 
-    queue_id_t to_at = messaging_init(q_in);
-    queue_id_t from_at = messaging_init(q_out);
     init_sig_handling(NULL);
+    messaging_assign(&from_at);
 
     log_debug(&log, "AT example main (AT at %d)\n", at_pid);
     bool at_alive = true;
@@ -66,7 +65,7 @@ int main(int argc, char *argv[])
         }
 
         generic_msg_t buf;
-        int err = messaging_recv(from_at, &buf);
+        int err = messaging_recv(&buf);
         if (err == -1)
             log_exception(&log);
         if (err == ENOMSG)
@@ -76,7 +75,7 @@ int main(int argc, char *argv[])
         // react to info
         if (do_send)
         {
-            if (messaging_send(to_at, buf.type, &buf) != 0)
+            if (messaging_send(q_out, buf.type, &buf) != 0)
                 log_exception(&log);
         }
         // do other things

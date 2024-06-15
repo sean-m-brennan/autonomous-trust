@@ -15,7 +15,6 @@
  *******************/
 
 #include <string.h>
-#include <strings.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -30,9 +29,10 @@
 
 #define PROCESSES_IMPL
 #include "processes/processes.h"
-#include "protobuf/processes.pb-c.h"
+//#include "protobuf/processes.pb-c.h"
 #include "config/configuration.h"
 #include "structures/map_priv.h"
+#include "utilities/msg_types_priv.h"
 #include "utilities/util.h"
 
 #define MAX_CLOSE 8192
@@ -42,12 +42,12 @@ const char *sig_quit = "quit";
 const long cadence = 500000L; // microseconds
 
 
-typedef bool (*msg_handler_t)(const process_t *proc, map_t *queues, generic_msg_t *msg);
+typedef bool (*msg_handler_t)(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 
 int process_init(process_t *proc, char *name, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies)
 {
-    bzero(proc->name, 256);
-    memcpy(proc->name, name, min(strlen(name), 255));
+    memset(proc->name, 0, PROC_NAME_LEN);
+    memcpy(proc->name, name, PROC_NAME_LEN-1);
     // FIXME general config load/save
     // configuration_t *cfg = map_get(configurations, proc->cfg_name);
     // memcpy(&proc->conf, cfg, cfg->size);
@@ -64,18 +64,15 @@ inline int process_register_handler(const process_t *proc, char *func_name, hand
     return map_set(proc->protocol.handlers, func_name, h_dat);
 }
 
-bool run_message_handlers(const process_t *proc, map_t *msgq_ids, long msgtype, generic_msg_t *msg)
+bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, generic_msg_t *msg)
 {
     switch (msgtype)
     {
     case GROUP:
-        // proc->group = message
+        proc->protocol.group = msg->info.group;
         return true;
-    case PEERS:
-        // proc->peers = message
-        return true;
-    case CAPABILITIES:
-        // proc->capabilities = message
+    case PEER:
+        memcpy(&proc->protocol.peers[proc->protocol.num_peers++], &msg->info.peer, sizeof(public_identity_t));
         return true;
     case PEER_CAPABILITIES:
         // pproc->peer_capabilities = message
@@ -92,7 +89,7 @@ bool run_message_handlers(const process_t *proc, map_t *msgq_ids, long msgtype, 
             err = data_object_ptr(h_dat, (void*)&handler);
             if (err != 0)
                 return false;
-            return handler(proc, msgq_ids, msg);
+            return handler(proc, queues, msg);
         }
     }
     return false;
@@ -193,7 +190,7 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
     return 0;
 }
 
-bool keep_running(const process_t *proc, int sig_id, logger_t *logger)
+bool keep_running(const process_t *proc, queue_t *sig_q, logger_t *logger)
 {
     generic_msg_t buf = {0};
     if (gettimeofday((struct timeval *)&proc->start, NULL) != 0) {
@@ -201,7 +198,7 @@ bool keep_running(const process_t *proc, int sig_id, logger_t *logger)
         log_exception(logger);
     }
     while (buf.type != SIGNAL) {
-        int err = messaging_recv(sig_id, &buf);
+        int err = messaging_recv_on(sig_q, &buf);
         signal_t *msg = &buf.info.signal;
         if (err == -1)
             log_exception(logger);
@@ -239,7 +236,7 @@ void sleep_until(const process_t *proc, long how_long)
         usleep(delta);
 }
 
-int process_run(const process_t *proc, map_t *q_keys, int s_key, logger_t *logger)
+int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     char data_path[256];
     get_data_dir(data_path);
@@ -250,58 +247,31 @@ int process_run(const process_t *proc, map_t *q_keys, int s_key, logger_t *logge
     if (err != 0)
         return err;
 
-    // establish connections to queues, signal
-    map_t queues;
-    err = map_init(&queues);
-    if (err != 0)
-        return err;
-    array_t *keys = map_keys(q_keys);
-    for (int i = 0; i < array_size(keys); i++)
-    {
-        data_t *k_dat;
-        err = array_get(keys, i, &k_dat);
-        if (err != 0)
-            continue; // FIXME? error
-        map_key_t key;
-        data_string_ptr(k_dat, &key);
-        data_t *mk_dat;
-        err = map_get(q_keys, key, &mk_dat);
-        if (err != 0)
-            continue; // FIXME? error
-        int mqk;
-        data_integer(mk_dat, &mqk);
-
-        int mq_id = msgget(mqk, 0666 | IPC_CREAT);
-        if (mq_id == -1)
-            return errno;
-        data_t *q_dat = integer_data(mq_id);
-        err = map_set(&queues, key, q_dat);
-        if (err != 0)
-            return err;
-    }
-    int signal = msgget(s_key, 0666 | IPC_CREAT);
-    if (signal == -1)
-        return errno;
+    // FIXME message_init
+    queue_t my_q;
+    if (messaging_init(proc->name, &my_q) != 0)
+        log_exception(logger);
+    messaging_assign(&my_q);
+    queue_t sig_q;
+    if (messaging_init(signal, &sig_q) != 0)
+        log_exception(logger);
 
     // FIXME pre-loop activity
 
     // handle messages
     array_t unprocessed;
     array_init(&unprocessed);
-    while (keep_running(proc, signal, logger))
+    while (keep_running(proc, &sig_q, logger))
     {
         sleep_until(proc, cadence);
 
-        queue_id_t q = messaging_fetch_queue(&queues, (char *)proc->name);
-        if (q < 0)
-            ; // FIXME report error
         generic_msg_t buf = {0};
-        err = messaging_recv(q, &buf);
+        err = messaging_recv(&buf);
         if (err == -1)
             ; // FIXME repair?
         if (err == ENOMSG)
                 continue;
-        if (!run_message_handlers(proc, &queues, buf.type, &buf))
+        if (!run_message_handlers(proc, queues, buf.type, &buf))
         {
             size_t size = message_size(buf.type);
             void *msg = calloc(1, size);
@@ -314,7 +284,7 @@ int process_run(const process_t *proc, map_t *q_keys, int s_key, logger_t *logge
         // FIXME post-msg handling activity
     }
     array_free(&unprocessed);
-    map_free(&queues);
+    array_free(queues);
     if (fd1 > 0)
         close(fd1);
     if (fd2 > 0)

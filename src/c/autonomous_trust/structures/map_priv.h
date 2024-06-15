@@ -23,6 +23,7 @@
 
 #include "map.h"
 #include "array_priv.h"
+#include "structures/map.pb-c.h"
 
 struct map_s
 {
@@ -33,5 +34,14 @@ struct map_s
     unsigned char hashkey[crypto_shorthash_KEYBYTES];
     bool alloc;
 };
+
+
+int proto_map_sync_out(map_t *map, AutonomousTrust__Core__Structures__DataMap *dmap);
+
+void proto_map_free_out_sync(AutonomousTrust__Core__Structures__DataMap *dmap);
+
+int proto_map_sync_in(AutonomousTrust__Core__Structures__DataMap *dmap, map_t *map);
+
+void proto_map_free_in_sync(map_t *map);
 
 #endif // MAP_PRIV

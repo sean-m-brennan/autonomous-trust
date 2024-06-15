@@ -31,7 +31,7 @@ typedef struct
 
 typedef struct process_s process_t; // FIXME why is this defined here?
 
-typedef int (*handler_ptr_t)(const process_t *proc, map_t *queues, int signal, logger_t *logger);
+typedef int (*handler_ptr_t)(process_t *proc, array_t *queues, char *signal, logger_t *logger);
 
 typedef struct
 {
@@ -140,8 +140,7 @@ void tracker_free(tracker_t *tracker);
  * @brief Error code: process not found in process table (see DECLARE_PROCESS)
  *
  */
-#define EPROC_NF 170
-
+#define EPROC_NF 205
 DECLARE_ERROR(EPROC_NF, "Process not found in process table");
 
 #endif  // PROCESS_TRACKER_H

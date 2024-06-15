@@ -28,8 +28,8 @@
 #define TERM_BLUE "\x1B[34m"
 #define TERM_PURPLE "\x1B[35m"
 
-int min(int a, int b);
-int max(int a, int b);
+long min(long a, long b);
+long max(long a, long b);
 
 char *strremove(char *str, const char *sub);
 
@@ -45,6 +45,8 @@ int compare_double_precision(double f1, double f2, double epsilon);
 #define compare_double(f1, f2) \
     compare_double_precision(f1, f2, 0.00001)
 
+#define PROC_NAME_LEN 64
+
 /********************/
 // json errors
 
@@ -57,4 +59,4 @@ DECLARE_ERROR(EJSN_ARR_APP, "JSON error when appending to an array");
 #define EJSN_DUMP 203
 DECLARE_ERROR(EJSN_DUMP, "JSON error dumping to string/file/etc.");
 
-#endif // UTIL_H
+#endif  // UTIL_H

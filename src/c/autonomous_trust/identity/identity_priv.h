@@ -24,54 +24,43 @@
 #include "algorithms/algorithms.h"
 #include "identity/identity.h"
 
-typedef struct
-{
-    unsigned char private[crypto_sign_SECRETKEYBYTES];
-    unsigned char public[crypto_sign_PUBLICKEYBYTES];
-    unsigned char public_hex[crypto_sign_PUBLICKEYBYTES * 2];
-} signature_t;
-
-typedef struct
-{
-    unsigned char private[crypto_box_SECRETKEYBYTES];
-    unsigned char public[crypto_box_PUBLICKEYBYTES];
-    unsigned char public_hex[crypto_box_PUBLICKEYBYTES * 2];
-} encryptor_t;
 
 struct identity_s
 {
-    uuid_t uuid;
+    public_identity_t;
     int rank;
-    unsigned char *address;
-    char *fullname;
-    char *nickname;
-    char *petname;
-    signature_t signature;
-    encryptor_t encryptor;
-    bool public_only;
+    char nickname[NAME_LEN];
+    char petname[NAME_LEN];
     block_impl_t block;
-};
-
-struct public_identity_s {
-    uuid_t uuid;
-    unsigned char *address;  // FIXME fixed size
-    char fullname[256];
-    public_signature_t signature;
-    public_encryptor_t encryptor;
 };
 
 int identity_to_json(const void *data_struct, json_t **obj_ptr);
 
 int identity_from_json(const json_t *obj, void *data_struct);
 
-struct group_s {
-    uuid_t uuid;
-    unsigned char *address;
-    public_encryptor_t encryptor;
-};
-
 int group_to_json(const void *data_struct, json_t **obj_ptr);
 
 int group_from_json(const json_t *obj, void *data_struct);
+
+void hexlify(const unsigned char *buf, size_t len, unsigned char *result);
+
+int unhexlify(const unsigned char *buf, size_t len, unsigned char *result);
+
+void public_signature_init(signature_t *sig, const unsigned char *hex_seed);
+
+void signature_init(signature_t *sig, const unsigned char *hex_seed);
+
+unsigned char *signature_publish(const signature_t *sig);
+
+unsigned char *signature_generate();
+
+void public_encryptor_init(encryptor_t *encr, const unsigned char *hex_seed);
+
+void encryptor_init(encryptor_t *encr, const unsigned char *hex_seed);
+
+unsigned char *encryptor_publish(const encryptor_t *encr);
+
+unsigned char *encryptor_generate();
+
 
 #endif  // IDENTITY_PRIV_H

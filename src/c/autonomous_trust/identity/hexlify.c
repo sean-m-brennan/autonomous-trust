@@ -47,13 +47,14 @@
  *    to be bound by the terms and conditions of this License Agreement.
  */
 
-#ifndef HEXLIFY_I
-#define HEXLIFY_I
+#ifndef HEXLIFY_C
+#define HEXLIFY_C
 
 #include <stdlib.h>
 #include <errno.h>
 
-void hexlify(const unsigned char *buf, size_t len, unsigned char *result) {
+void hexlify(const unsigned char *buf, size_t len, unsigned char *result)
+{
     const char *hexdigits = "0123456789abcdef";
     for (size_t i=0, j=0; i < len; ++i) {
         result[j++] = hexdigits[buf[i] >> 4];
@@ -61,7 +62,8 @@ void hexlify(const unsigned char *buf, size_t len, unsigned char *result) {
     }
 }
 
-int unhexlify(const unsigned char *buf, size_t len, unsigned char *result) {
+int unhexlify(const unsigned char *buf, size_t len, unsigned char *result)
+{
     unsigned char digitvalue[256] = {
         37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37,
         37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37,
@@ -91,4 +93,4 @@ int unhexlify(const unsigned char *buf, size_t len, unsigned char *result) {
     return 0;
 }
 
-#endif // HEXLIFY_I
+#endif // HEXLIFY_C

@@ -22,51 +22,14 @@
 #include "structures/map.h"
 #include "msg_types.h"
 
-#define U_SOCK 1
-#define MSG_Q 2
-
-#ifndef IPC_MSG_IMPL
-#define IPC_MSG_IMPL U_SOCK
-#endif
-
-#if IPC_MSG_IMPL == MSG_Q
-typedef key_t msg_key_t;
-
-typedef int queue_id_t;
-
-#define MSG_KEY_DECL(x) int x
-
-#define data_key(d, i) data_integer(d, &i)
-
-#define key_data(i) integer_data(&i)
-
-#elif IPC_MSG_IMPL == U_SOCK
-typedef char *msg_key_t;
+#define MSG_KEY_LEN PROC_NAME_LEN
+#define MAX_MSG_SIZE 1024  // FIXME
 
 typedef struct
 {
     int fd;
-    char name[PROC_NAMELEN]
-} queue_id_t;
-
-#define MSG_KEY_DECL(x) char *x
-
-#define data_key(d, s) data_string_ptr(d, s)
-
-#define key_data(s) string_data(s, strlen(s))
-
-#else
-#error "Invalid IPC messaging implementation: IPC_MSG_IMPL"
-#endif
-
-/**
- * @brief
- *
- * @param id
- * @param key
- * @return int
- */
-int messaging_new_id(char *id, msg_key_t *key);
+    char key[MSG_KEY_LEN];
+} queue_t;
 
 /**
  * @brief Initialize a message queue
@@ -74,34 +37,31 @@ int messaging_new_id(char *id, msg_key_t *key);
  * @param id A message queue id
  * @return int File descriptor of the open queue
  */
-int messaging_init(msg_key_t id);
+int messaging_init(const char *id, queue_t *queue);
 
 /**
- * @brief Pull an existing queue from storage
- *
- * @param map
- * @param key
- * @return queue_id_t
+ * @brief Identify the queue that belong to this process.
+ * 
+ * @param queue 
  */
-queue_id_t messaging_fetch_queue(map_t *map, const char *key);
+void messaging_assign(queue_t *queue);
+
+/**
+ * @brief Receive a message from a specific queue (usually external)
+ * 
+ * @param q 
+ * @param msg 
+ * @return int 
+ */
+int messaging_recv_on(queue_t *q, generic_msg_t *msg);
 
 /**
  * @brief Receive an internal message
  *
- * @param qid
- * @param data
- * @param data_len
+ * @param data generic_msg_t to load 
  * @return int
  */
-int messaging_recv(queue_id_t qid, generic_msg_t *data);
-
-/**
- * @brief
- *
- * @param type
- * @return size_t
- */
-size_t message_size(message_type_t type);
+int messaging_recv(generic_msg_t *data);
 
 /**
  * @brief Send a message internally
@@ -112,6 +72,9 @@ size_t message_size(message_type_t type);
  * @param data_len
  * @return int
  */
-int messaging_send(queue_id_t qid, message_type_t type, void *data);
+int messaging_send(const char *key, const message_type_t type, generic_msg_t *msg);
 
-#endif // MESSAGE_H
+#define EMSG_NOCONN 204
+DECLARE_ERROR(EMSG_NOCONN, "Attempting to send/recv without a queue (see message_assign())");
+
+#endif  // MESSAGE_H

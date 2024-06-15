@@ -21,11 +21,12 @@
 #include "config/configuration.h"
 #include "identity/identity_priv.h"
 #include "process_tracker_priv.h"
+#include "utilities/util.h"
 
 struct process_s
 {
-    char name[PROC_NAMELEN];  // category of process, i.e. identity, network, ...
-    char impl[PROC_NAMELEN];  // identifier of implementing function
+    char name[PROC_NAME_LEN];  // category of process, i.e. identity, network, ...
+    char impl[PROC_NAME_LEN];  // identifier of implementing function
     config_t conf;
     map_t *configs;
     tracker_t *subsystems;
@@ -38,13 +39,15 @@ struct process_s
         map_t *handlers;
         group_t group;
         public_identity_t peers[MAX_PEERS];
-        // FIXME from configs
-        // capabilities
-        // peer capabilities
+        size_t num_peers;
+        map_t *peer_capabilities;
         int phase;
         array_t *unhandled_messages;
     } protocol;
 };
+
+typedef char* queue_id_t;
+typedef array_t directory_t;
 
 #ifndef PROCESSES_IMPL
 extern const char *sig_quit;
@@ -99,7 +102,7 @@ int process_register_handler(const process_t *proc, char *func_name, handler_ptr
  * @param signal
  * @return int
  */
-int process_run(const process_t *proc, map_t *queues, int signal, logger_t *logger);
+int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
 void process_free(process_t *proc);
 
