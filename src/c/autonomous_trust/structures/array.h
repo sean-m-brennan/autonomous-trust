@@ -42,6 +42,15 @@ int array_init(array_t *a);
 int array_create(array_t **a_ptr);
 
 /**
+ * @brief
+ *
+ * @param a
+ * @param cpy_ptr
+ * @return int
+ */
+int array_copy(array_t *a, array_t *cpy);
+
+/**
  * @brief Append data onto an array.
  *
  * @param array Pointer to array.
@@ -93,11 +102,11 @@ size_t array_size();
 #define array_for_each(array, index, value)             \
     for (index = 0; index < array_size(array); index++) \
     {                                                   \
-        int __attribute__((unused)) errors[1] = {0};    \
-        int _err = array_get(array, index, &value);      \
-        if (_err != 0)                                   \
+        int __attribute__((unused)) a_errors[1] = {0};  \
+        int _a_err = array_get(array, index, &value);   \
+        if (_a_err != 0)                                \
         {                                               \
-            errors[0] = _err;                            \
+            a_errors[0] = _a_err;                       \
             continue;                                   \
         }
 
@@ -142,15 +151,14 @@ void array_free(array_t *a);
 /**
  * Error code: out-of-bounds for indexing
  */
-#define EARR_OOB 150
+#define EARR_OOB 208
 
 DECLARE_ERROR(EARR_OOB, "Array index out-of-bounds (beyond the final entry)");
 
 /**
  * Error code: element not present in array
  */
-#define EARR_NOELT 151
-
+#define EARR_NOELT 209
 DECLARE_ERROR(EARR_NOELT, "Element not present in array");
 
-#endif  // ARRAY_H
+#endif // ARRAY_H

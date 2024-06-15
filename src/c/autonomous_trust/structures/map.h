@@ -83,24 +83,24 @@ array_t *map_keys(map_t *map);
         array_t *__keys = map_keys(map);                            \
         for (size_t _incr = 0; _incr < array_size(__keys); _incr++) \
         {                                                           \
-            int __attribute__((unused)) errors[3] = {0};            \
+            int __attribute__((unused)) m_errors[3] = {0};          \
             data_t *__k_dat = NULL;                                 \
-            int _err = array_get(__keys, _incr, &__k_dat);           \
-            if (_err != 0)                                           \
+            int _m_err = array_get(__keys, _incr, &__k_dat);        \
+            if (_m_err != 0)                                        \
             {                                                       \
-                errors[0] = _err;                                    \
+                m_errors[0] = _m_err;                               \
                 continue;                                           \
             }                                                       \
-            _err = data_string_ptr(__k_dat, &key);                   \
-            if (_err != 0)                                           \
+            _m_err = data_string_ptr(__k_dat, &key);                \
+            if (_m_err != 0)                                        \
             {                                                       \
-                errors[1] = _err;                                    \
+                m_errors[1] = _m_err;                               \
                 continue;                                           \
             }                                                       \
-            _err = map_get(map, key, &value);                        \
-            if (_err != 0)                                           \
+            _m_err = map_get(map, key, &value);                     \
+            if (_m_err != 0)                                        \
             {                                                       \
-                errors[2] = _err;                                    \
+                m_errors[2] = _m_err;                               \
                 continue;                                           \
             }
 
@@ -144,4 +144,4 @@ int map_remove(map_t *map, map_key_t key);
  */
 void map_free(map_t *map);
 
-#endif  // MAP_H
+#endif // MAP_H

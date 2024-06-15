@@ -17,8 +17,8 @@
 #include <stdlib.h>
 
 #include "utilities/exception.h"
+#include "utilities/util.h"
 #include "data_priv.h"
-
 
 #define pod_cmp(a, b) ((a) < (b)) ? -1 : (((a) > (b)) ? 1 : 0)
 
@@ -141,11 +141,13 @@ data_t *object_ptr_data(void *val, size_t len)
     return dat;
 }
 
-void data_incr(data_t *d){
+void data_incr(data_t *d)
+{
     d->ref++;
 }
 
-void data_decr(data_t *d){
+void data_decr(data_t *d)
+{
     d->ref--;
     if (d->ref <= 0)
         free(d);
@@ -161,12 +163,11 @@ int data_l_integer(data_t *d, long *i)
 
 int data_integer(data_t *d, int *i)
 {
-      if (d->type != INT)
+    if (d->type != INT)
         return EXCEPTION(EDAT_INVL);
     *i = (int)d->intgr;
     return 0;
 }
-
 
 int data_ul_integer(data_t *d, unsigned long *u)
 {
@@ -254,4 +255,133 @@ int data_object_ptr(data_t *d, void **o)
         return EXCEPTION(EDAT_INVL);
     *o = d->obj;
     return 0;
+}
+
+int data_sync_out(data_t *data, AutonomousTrust__Core__Structures__Data *pdata)
+{
+    AutonomousTrust__Core__Structures__Data tmp = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA__INIT;
+    memcpy(pdata, &tmp, sizeof(tmp));
+    pdata->size = data->size;
+    switch (data->type)
+    {
+    case INT:
+        pdata->type = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__INT;
+        pdata->dat_case = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA__DAT_INTGR;
+        pdata->intgr = data->intgr;
+        break;
+    case UINT:
+        pdata->type = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__UINT;
+        pdata->dat_case = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA__DAT_UINTR;
+        pdata->uintr = data->uintr;
+        break;
+    case FLOAT:
+        pdata->type = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__FLOAT;
+        pdata->dat_case = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA__DAT_FLT_PT;
+        pdata->flt_pt = data->flt_pt;
+        break;
+    case BOOL:
+        pdata->type = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__BOOL;
+        pdata->dat_case = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA__DAT_BL;
+        pdata->bl = data->bl;
+        break;
+    case STRING:
+        pdata->type = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__STRING;
+        pdata->dat_case = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA__DAT_STR;
+        pdata->str = malloc(data->size);
+        strncpy(pdata->str, data->str, min(strlen(data->str), data->size));
+        break;
+    case BYTES:
+        pdata->type = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__BYTES;
+        pdata->dat_case = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA__DAT_BYT;
+        pdata->byt.len = data->size;
+        pdata->byt.data = malloc(data->size);
+        memcpy(pdata->byt.data, data->byt, data->size);
+        break;
+    case OBJECT:
+        return EXCEPTION(EDAT_SER_OBJ);
+        break;
+    case NONE:
+    default:
+        break;
+    }
+    return 0;
+}
+
+void data_free_out_sync(AutonomousTrust__Core__Structures__Data *pdata)
+{
+    switch (pdata->type)
+    {
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__STRING:
+        free(pdata->str);
+        break;
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__BYTES:
+        free(pdata->byt.data);
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__NONE:
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__INT:
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__UINT:
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__FLOAT:
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__BOOL:
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__OBJECT:
+    case _AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE_IS_INT_SIZE:
+    default:
+        break;
+    }
+}
+
+int data_sync_in(AutonomousTrust__Core__Structures__Data *pdata, data_t *data)
+{
+    data->type = pdata->type;
+    data->size = pdata->size;
+    switch (pdata->type)
+    {
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__INT:
+        data->intgr = pdata->intgr;
+        break;
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__UINT:
+        data->uintr = pdata->uintr;
+        break;
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__FLOAT:
+        data->flt_pt = pdata->flt_pt;
+        break;
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__BOOL:
+        data->bl = pdata->bl;
+        break;
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__STRING:
+        data->str = malloc(pdata->size);
+        strncpy(data->str, pdata->str, min(strlen(pdata->str), pdata->size));
+        break;
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__BYTES:
+        data->byt = malloc(pdata->size);
+        memcpy(data->byt, pdata->byt.data, pdata->size);
+        break;
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__OBJECT:
+        return EXCEPTION(EDAT_SER_OBJ);
+        break;
+    case AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE__NONE:
+    case _AUTONOMOUS_TRUST__CORE__STRUCTURES__DATA_TYPE_IS_INT_SIZE:
+    default:
+        break;
+    }
+    return 0;
+}
+
+void data_free_in_sync(data_t *data)
+{
+    switch (data->type)
+    {
+    case STRING:
+        free(data->str);
+        break;
+    case BYTES:
+        free(data->byt);
+        break;
+    case INT:
+    case UINT:
+    case FLOAT:
+    case BOOL:
+    case OBJECT:
+    case NONE:
+    default:
+        break;
+    }
 }

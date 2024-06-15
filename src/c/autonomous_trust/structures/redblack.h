@@ -101,22 +101,19 @@ void tree_free(tree_t *tree);
 /**
 * Error code: duplicate key on insertion
 */
-#define ERBT_DUP_INS 140
-
+#define ERBT_DUP_INS 211
 DECLARE_ERROR(ERBT_DUP_INS, "Attempted duplicate insertion into the tree");
 
 /**
 * Error code: empty tree
 */
-#define ERBT_EMPTY 141
-
+#define ERBT_EMPTY 212
 DECLARE_ERROR(ERBT_EMPTY, "Item deletion on empty tree");
 
 /**
 * Error code: key not found in tree
 */
-#define ERBT_NO_KEY 142
-
+#define ERBT_NO_KEY 213
 DECLARE_ERROR(ERBT_NO_KEY, "No such key found in the tree");
 
 #endif  // REDBLACK_H

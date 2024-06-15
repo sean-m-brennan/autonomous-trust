@@ -14,29 +14,19 @@
  *   limitations under the License.
  *******************/
 
-#ifndef ARRAY_PRIV_H
-#define ARRAY_PRIV_H
+syntax = "proto3";
 
-#include <stddef.h>
-#include <stdbool.h>
+package autonomous_trust.core.structures;
 
-#include "array.h"
-#include "data_priv.h"
-#include "structures/data.pb-c.h"
+import "autonomous_trust/core/structures/data.proto";
 
-struct array_s
-{
-    size_t size;
-    bool alloc;
-    data_t **array;
-};
+/* NB: yes this is available as map<string, Data>,
+   but then the typing is too specific for a generic implementation */
 
-int proto_repeated_sync_out(array_t *array, AutonomousTrust__Core__Structures__Data **parr, size_t *n);
-
-void proto_repeated_free_out_sync(AutonomousTrust__Core__Structures__Data **parr);
-
-int proto_repeated_sync_in(AutonomousTrust__Core__Structures__Data **parr, size_t n, array_t *array);
-
-void proto_repeated_free_in_sync(array_t *array);
-
-#endif  // ARRAY_PRIV_H
+message DataMap {
+  message DataMapEntry {
+    string key = 1;
+    autonomous_trust.core.structures.Data value = 2;
+  }
+  repeated DataMapEntry map = 1;
+}

@@ -19,7 +19,6 @@
 #include <stdint.h>
 #include <errno.h>
 #include <string.h>
-#include <strings.h>
 
 #include <sodium.h>
 
@@ -49,23 +48,25 @@ size_t increment_capacity(size_t prev)
     return next;
 }
 
-typedef uint64_t hash_t;  // size must be synced with crypto_shorthash_BYTES
+typedef uint64_t hash_t; // size must be synced with crypto_shorthash_BYTES
 
-hash_t map_hash_key(map_t *map, map_key_t key)
+hash_t nacl_hash(map_t *map, map_key_t key)
 {
-    union {
-        uint8_t hash_bytes[crypto_shorthash_BYTES];  // i.e. 8 bytes
+    union
+    {
+        uint8_t hash_bytes[crypto_shorthash_BYTES]; // i.e. 8 bytes
         hash_t hash_int;
     } hash;
     crypto_shorthash(hash.hash_bytes, (const unsigned char *)key, strlen(key), map->hashkey);
     return hash.hash_int;
 }
-    
-size_t djb(map_key_t key)
+
+size_t djb_hash(map_key_t key)
 {
     size_t hash = 5381;
     int c;
-    while ((c = *key++)) {
+    while ((c = *key++))
+    {
         hash = ((hash << 5) + hash) + c;
     }
     return hash;
@@ -82,7 +83,7 @@ size_t map_hash2index(map_t *map, hash_t hash)
 
 size_t map_key2index(map_t *map, map_key_t key)
 {
-    return map_hash2index(map, map_hash_key(map, key));
+    return map_hash2index(map, nacl_hash(map, key));
 }
 
 int reindex(map_t *map)
@@ -91,7 +92,7 @@ int reindex(map_t *map)
     if (old == NULL)
         return SYS_EXCEPTION();
     memcpy(old, map->items, map->capacity * sizeof(map_item_t));
-    bzero(map->items, map->capacity * sizeof(map_item_t));
+    memset(map->items, 0, map->capacity * sizeof(map_item_t));
     for (size_t i = 0; i < map->capacity; i++)
     {
         if (old[i].key[0] != 0)
@@ -132,7 +133,8 @@ int map_create(map_t **map_ptr)
         return EXCEPTION(ENOMEM);
 
     int err = map_init(map);
-    if (err != 0) {
+    if (err != 0)
+    {
         free(map);
         return err;
     }
@@ -151,7 +153,8 @@ int map_get(map_t *map, const map_key_t key, data_t **value)
 
     while (map->items[index].key != NULL)
     {
-        if (strcmp(key, map->items[index].key) == 0) {
+        if (strcmp(key, map->items[index].key) == 0)
+        {
             *value = map->items[index].value;
             return 0;
         }
@@ -174,10 +177,10 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
         if (items == NULL)
             return EXCEPTION(ENOMEM);
         map->items = items;
-        reindex(map);  // ignore error??
+        reindex(map); // ignore error??
     }
 
-    hash_t hash = map_hash_key(map, key);
+    hash_t hash = nacl_hash(map, key);
     size_t index = map_hash2index(map, hash);
 
     // if the entry is already here, change it; otherwise find an empty slot nearby (hopefully)
@@ -200,7 +203,7 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
     if (key_cpy == NULL)
         return EXCEPTION(ENOMEM);
     // FIXME potential issues
-    item->key = key_cpy;  // FIXME ownership?
+    item->key = key_cpy; // FIXME ownership?
     item->hash = hash;
     data_incr(value);
     item->value = value;
@@ -227,4 +230,55 @@ void map_free(map_t *map)
     free(map->items);
     if (map->alloc)
         free(map);
+}
+
+
+int proto_map_sync_out(map_t *map, AutonomousTrust__Core__Structures__DataMap *dmap)
+{
+    size_t size = map_size(map);
+    dmap->map = calloc(size, sizeof(AutonomousTrust__Core__Structures__DataMap__DataMapEntry));
+    dmap->n_map = size;
+
+    char *key;
+    data_t *elt;
+    size_t i = 0;
+    map_entries_for_each(map, key, elt)
+        AutonomousTrust__Core__Structures__DataMap__DataMapEntry *entry = dmap->map[i++];
+        entry->key = key;  // shared, do not free
+        entry->value = malloc(sizeof(AutonomousTrust__Core__Structures__Data));
+        data_sync_out(elt, entry->value);
+    map_end_for_each
+    return 0;
+}
+
+void proto_map_free_out_sync(AutonomousTrust__Core__Structures__DataMap *dmap)
+{
+    free(dmap->map);
+}
+
+int proto_map_sync_in(AutonomousTrust__Core__Structures__DataMap *dmap, map_t *map)
+{
+    for(int i=0; i<dmap->n_map; i++) {
+        data_t *elt = malloc(sizeof(data_t));
+        if (elt == NULL)
+            return EXCEPTION(ENOMEM);
+        char *key = malloc(strlen(dmap->map[i]->key));
+        if (key == NULL)
+            return EXCEPTION(ENOMEM);
+        strcpy(key, dmap->map[i]->key);
+        data_sync_in(dmap->map[i]->value, elt);
+        if (map_set(map, key, elt) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+void proto_map_free_in_sync(map_t *map)
+{
+    char *key;
+    data_t *elt;
+    map_entries_for_each(map, key, elt)
+        data_free_in_sync(elt);
+    map_end_for_each
+    map_free(map);
 }

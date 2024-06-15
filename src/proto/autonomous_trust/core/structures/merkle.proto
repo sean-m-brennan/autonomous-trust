@@ -1,4 +1,3 @@
-syntax = "proto3";
 /********************
  *  Copyright 2024 TekFive, Inc. and contributors
  *
@@ -15,33 +14,29 @@ syntax = "proto3";
  *   limitations under the License.
  *******************/
 
-import "autonomous_trust/core/protobuf/agreement.proto";
+syntax = "proto3";
 
-message Encryptor {
-  bytes seed = 1;  // hex encoded
+package autonomous_trust.core.structures;
+
+import "google/protobuf/any.proto";
+
+message MerkleNode {
+  // red/black tree node
+  int32 key = 1;
+  MerkleNode parent = 2;
+  MerkleNode left = 3;
+  MerkleNode right = 4;
+  bool red = 5;
+  // merkle node
+  bytes uuid = 6;
+  uint32 digest = 7;
+  google.protobuf.Any blob = 8;
 }
 
-message Signature {
-  bytes seed = 1;  // hex encoded
-}
-
-message Identity {
-  bytes uuid = 1;
-  uint32 rank = 2;
-  string address = 3;
-  string fullname = 4;
-  string nickname = 5;
-  string petname = 6;
-  Signature signature = 7;
-  Encryptor encryptor = 8;
-  bool public_only = 9;
-  AgreementImpl block = 10;
-}
-
-message Group {
-  bytes uuid = 1;
-  map<string, string> address_map = 2;  // Identity UUID to address
-  string nickname = 3;
-  Encryptor encryptor = 4;  // group-shared key
-  bool public_only = 5;
+message MerkleTree {
+  // red/black tree
+  MerkleNode root = 1;
+  uint64 size = 2;
+  // merkle tree
+  uint32 superHash = 3;
 }

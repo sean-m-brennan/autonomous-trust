@@ -34,7 +34,7 @@ int array_init(array_t *a)
 
 int array_create(array_t **array_ptr)
 {
-    if (array_ptr == NULL)
+    if (*array_ptr == NULL)
         return EXCEPTION(EINVAL);
     *array_ptr = (array_t *)calloc(1, sizeof(array_t));
     if (*array_ptr == NULL)
@@ -43,6 +43,18 @@ int array_create(array_t **array_ptr)
     int err = array_init(arr);
     arr->alloc = true;
     return err;
+}
+
+int array_copy(array_t *a, array_t *cpy)
+{
+    if (a == NULL)
+        return EXCEPTION(EINVAL);
+    cpy->alloc = false;
+    cpy->array = calloc(a->size, sizeof(data_t));
+    if (cpy->array == NULL)
+        return EXCEPTION(ENOMEM);
+    memcpy(cpy->array, a->array, sizeof(data_t) * a->size);
+    return 0;
 }
 
 int array_find(array_t *a, data_t *element)
@@ -118,7 +130,7 @@ int array_remove(array_t *a, data_t *element)
         return EXCEPTION(EARR_NOELT);
     size_t n = a->size - (index + 1);
     memmove(a->array + index, a->array + index + 1, n);
-    bzero(a->array + a->size, sizeof(data_t));
+    memset(a->array + a->size, 0, sizeof(data_t));
     a->size--;
     return 0;
 }
@@ -132,4 +144,46 @@ void array_free(array_t *a)
     a->size = 0;
     if (a->alloc)
         free(a);
+}
+
+int proto_repeated_sync_out(array_t *array, AutonomousTrust__Core__Structures__Data **parr, size_t *n)
+{
+    parr = calloc(array->size, sizeof(AutonomousTrust__Core__Structures__Data));
+    *n = array->size;
+    for (int i=0; i<array->size; i++) {
+        data_t *elt;
+        if (array_get(array, i, &elt) != 0)
+            return -1;
+        data_sync_out(elt, parr[i]);
+    }
+    return 0;
+}
+
+void proto_repeated_free_out_sync(AutonomousTrust__Core__Structures__Data **parr)
+{
+    free(parr);
+}
+
+int proto_repeated_sync_in(AutonomousTrust__Core__Structures__Data **parr, size_t n, array_t *array)
+{
+    for(int i=0; i<n; i++) {
+        data_t *elt = malloc(sizeof(data_t));
+        if (elt == NULL)
+            return EXCEPTION(ENOMEM);
+        data_sync_in(parr[i], elt);
+        if (array_append(array, elt) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+void proto_repeated_free_in_sync(array_t *array)
+{
+    for(int i=0; i<array->size; i++) {
+        data_t *elt;
+        if (array_get(array, i, &elt) != 0)
+            continue;
+        data_free_in_sync(elt);
+    }
+    array_free(array);
 }

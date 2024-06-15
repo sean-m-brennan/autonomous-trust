@@ -14,11 +14,12 @@
  *   limitations under the License.
  *******************/
 
+#define _XOPEN_SOURCE 700
 #include <stdbool.h>
-#include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <unistd.h>
 
 #include "processes/processes.h"
 #include "utilities/message.h"
@@ -69,7 +70,7 @@ void network_shutdown(recvrs_t *socks)
         close(socks->recv_ptp);
 }
 
-int network_run(socket_t *cfg, const process_t *proc, map_t *queues, int signal, logger_t *logger)
+int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     recvrs_t socks = {0};
     int backlog = 5;
@@ -281,28 +282,28 @@ int network_run(socket_t *cfg, const process_t *proc, map_t *queues, int signal,
 
 /**********/
 
-int network_udp_ip4_run(const process_t *proc, map_t *queues, int signal, logger_t *logger)
+int network_udp_ip4_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     socket_t cfg = {.domain = AF_INET, .type = SOCK_DGRAM, .protocol = IPPROTO_UDP};
     return network_run(&cfg, proc, queues, signal, logger);
 }
 DECLARE_PROCESS(network, udp_net_4, network_udp_ip4_run);
 
-int network_udp_ip6_run(const process_t *proc, map_t *queues, int signal, logger_t *logger)
+int network_udp_ip6_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     socket_t cfg = {.domain = AF_INET6, .type = SOCK_DGRAM, .protocol = IPPROTO_UDP};
     return network_run(&cfg, proc, queues, signal, logger);
 }
 DECLARE_PROCESS(network, udp_net_6, network_udp_ip6_run);
 
-int network_tcp_ip4_run(const process_t *proc, map_t *queues, int signal, logger_t *logger)
+int network_tcp_ip4_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     socket_t cfg = {.domain = AF_INET, .type = SOCK_STREAM, .protocol = 0};
     return network_run(&cfg, proc, queues, signal, logger);
 }
 DECLARE_PROCESS(network, tcp_net_4, network_tcp_ip4_run);
 
-int network_tcp_ip6_run(const process_t *proc, map_t *queues, int signal, logger_t *logger)
+int network_tcp_ip6_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     socket_t cfg = {.domain = AF_INET6, .type = SOCK_STREAM, .protocol = 0};
     return network_run(&cfg, proc, queues, signal, logger);

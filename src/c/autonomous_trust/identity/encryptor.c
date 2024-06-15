@@ -18,27 +18,37 @@
 #define ENCRYPTOR_I
 
 #include <stdbool.h>
+#include <string.h>
+
 #include <sodium.h>
+
 #include "identity_priv.h"
 #include "utilities/exception.h"
-#include "hexlify.i"
 
-
-void public_encryptor_init(public_encryptor_t *encr, const unsigned char *hex_seed, bool public_only) {
-    unhexlify(hex_seed, crypto_box_PUBLICKEYBYTES * 2, (unsigned char*)encr->public);
-    hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char*)encr->public_hex);
+void public_encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
+{
+    encr->proto.hex_seed.data = encr->public_hex;
+    encr->proto.hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
+    memset(encr->private, 0, sizeof(encr->private));
+    unhexlify(hex_seed, crypto_box_PUBLICKEYBYTES * 2, (unsigned char *)encr->public);
+    hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char *)encr->public_hex);
 }
 
-void encryptor_init(encryptor_t *encr, const unsigned char *hex_seed, bool public_only) {
+void encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
+{
+    encr->proto.hex_seed.data = encr->public_hex;
+    encr->proto.hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
     unsigned char seed[crypto_box_SEEDBYTES];
     unhexlify(hex_seed, crypto_box_SEEDBYTES * 2, seed);
-    crypto_box_seed_keypair((unsigned char*)encr->public, (unsigned char*)encr->private, seed);
-    hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char*)encr->public_hex);
+    crypto_box_seed_keypair((unsigned char *)encr->public, (unsigned char *)encr->private, seed);
+    hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char *)encr->public_hex);
 }
 
-unsigned char *encryptor_publish(const encryptor_t *encr) {
+unsigned char *encryptor_publish(const encryptor_t *encr)
+{
     unsigned char *hex = malloc(crypto_box_PUBLICKEYBYTES * 2);
-    if (hex == NULL) {
+    if (hex == NULL)
+    {
         EXCEPTION(ENOMEM);
         return NULL;
     }
@@ -46,11 +56,13 @@ unsigned char *encryptor_publish(const encryptor_t *encr) {
     return hex;
 }
 
-unsigned char *encryptor_generate() {
+unsigned char *encryptor_generate()
+{
     unsigned char key[crypto_box_SEEDBYTES];
     randombytes(key, crypto_box_SEEDBYTES);
     unsigned char *hex = malloc(crypto_box_SEEDBYTES * 2);
-    if (hex == NULL) {
+    if (hex == NULL)
+    {
         EXCEPTION(ENOMEM);
         return NULL;
     }

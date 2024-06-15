@@ -19,12 +19,12 @@
 
 #include "processes/processes.h"
 
-int network_udp_ip4_run(const process_t *proc, map_t *queues, int signal, logger_t *logger);
+int network_udp_ip4_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
-int network_udp_ip6_run(const process_t *proc, map_t *queues, int signal, logger_t *logger);
+int network_udp_ip6_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
-int network_tcp_ip4_run(const process_t *proc, map_t *queues, int signal, logger_t *logger);
+int network_tcp_ip4_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
-int network_tcp_ip6_run(const process_t *proc, map_t *queues, int signal, logger_t *logger);
+int network_tcp_ip6_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
 #endif  // NET_PROC_PRIV_H
