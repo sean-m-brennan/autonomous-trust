@@ -27,11 +27,23 @@
 #include "utilities/exception.h"
 
 #include "identity_priv.h"
-#include "signature.i"
-#include "encryptor.i"
 
+int public_identity_init(public_identity_t *identity)
+{
+    AutonomousTrust__Core__Identity__Identity tmp = AUTONOMOUS_TRUST__CORE__IDENTITY__IDENTITY__INIT;
+    memcpy(&identity->proto, &tmp, sizeof(identity->proto)); // dumb initialization workaround
+    identity->proto.uuid.data = identity->uuid;
+    identity->proto.uuid.len = sizeof(uuid_t);
+    identity->proto.address = identity->address;
+    identity->proto.fullname = identity->fullname;
+    identity->proto.signature->hex_seed.data = identity->signature.public_hex;
+    identity->proto.signature->hex_seed.len = identity->signature.proto.hex_seed.len;
+    identity->proto.encryptor->hex_seed.data = identity->encryptor.public_hex;
+    identity->proto.encryptor->hex_seed.len = identity->encryptor.proto.hex_seed.len;
+    return 0;
+}
 
-int identity_create(unsigned char *address, identity_t **ident)
+int identity_create(char *address, char *fullname, identity_t **ident)
 { // FIXME address + 4 names
     if (sodium_init() < 0)
     {
@@ -41,18 +53,22 @@ int identity_create(unsigned char *address, identity_t **ident)
     identity_t *identity = *ident;
     if (identity == NULL)
         return EXCEPTION(ENOMEM);
-    identity->address = address;
+
     unsigned char *sseed = signature_generate();
     if (sseed == NULL)
         return -1;
-    signature_init(&(identity->signature), sseed, identity->public_only);
+    signature_init(&(identity->signature), sseed);
     free(sseed);
+
     unsigned char *eseed = encryptor_generate();
     if (eseed == NULL)
         return -1;
-    encryptor_init(&identity->encryptor, eseed, identity->public_only);
+    encryptor_init(&identity->encryptor, eseed);
     free(eseed);
+
     uuid_generate((unsigned char *)identity->uuid);
+
+    public_identity_init((public_identity_t *)identity);
     return 0;
 }
 
@@ -64,19 +80,19 @@ int identity_publish(const identity_t *ident, public_identity_t **pub_copy)
     public_identity_t *newIdent = *pub_copy;
     if (newIdent == NULL)
         return EXCEPTION(ENOMEM);
-    memcpy(newIdent->uuid, ident->uuid, sizeof(uuid_t));
-    newIdent->address = ident->address;
-    strncpy(newIdent->fullname, ident->fullname, 255);
+
     unsigned char *sseed = signature_publish(&ident->signature);
     if (sseed == NULL)
         return -1;
-    public_signature_init(&newIdent->signature, sseed, true);
+    public_signature_init(&newIdent->signature, sseed);
     free(sseed);
     unsigned char *eseed = encryptor_publish(&ident->encryptor);
     if (eseed == NULL)
         return -1;
-    public_encryptor_init(&newIdent->encryptor, eseed, true);
+    public_encryptor_init(&newIdent->encryptor, eseed);
     free(eseed);
+
+    public_identity_init(newIdent);
     return 0;
 }
 
@@ -102,7 +118,7 @@ int identity_decrypt(const identity_t *ident, const msg_str_t *cipher, const pub
 
 int identity_to_json(const void *data_struct, json_t **obj_ptr)
 {
-    identity_t *ident = (identity_t*)data_struct;
+    identity_t *ident = (identity_t *)data_struct;
     *obj_ptr = json_object();
     json_t *obj = *obj_ptr;
     if (obj == NULL)
@@ -111,21 +127,20 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr)
     uuid_unparse(ident->uuid, uuid_str);
     json_object_set(obj, "uuid", json_string(uuid_str));
     json_object_set(obj, "rank", json_integer(ident->rank));
-    json_object_set(obj, "address", json_string((char*)ident->address));
+    json_object_set(obj, "address", json_string((char *)ident->address));
     json_object_set(obj, "fullname", json_string(ident->fullname));
     json_object_set(obj, "nickname", json_string(ident->nickname));
     json_object_set(obj, "petname", json_string(ident->petname));
-    json_object_set(obj, "public_only", json_boolean(ident->public_only));
 
     json_t *sig = json_object();
-    unsigned char *hex = signature_publish(&ident->signature);  // encoded
-    json_object_set(sig, "hex_seed", json_string((char*)hex));
+    unsigned char *hex = signature_publish(&ident->signature); // encoded
+    json_object_set(sig, "hex_seed", json_string((char *)hex));
     free(hex);
     json_object_set(obj, "signature", sig);
 
     json_t *encr = json_object();
-    hex = encryptor_publish(&ident->encryptor);  // encoded
-    json_object_set(encr, "hex_seed", json_string((char*)hex));
+    hex = encryptor_publish(&ident->encryptor); // encoded
+    json_object_set(encr, "hex_seed", json_string((char *)hex));
     free(hex);
     json_object_set(obj, "encryptor", encr);
 
@@ -134,26 +149,45 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr)
 
 int identity_from_json(const json_t *obj, void *data_struct)
 {
-    identity_t *ident = (identity_t*)data_struct;
-    json_t *uuid_j = json_object_get(obj, "uuid");
-    const char *uuid_str = json_string_value(uuid_j);
-    int err = uuid_parse(uuid_str, ident->uuid);
-    if (err < 0)
-        return err;
+    identity_t *ident = (identity_t *)data_struct;
+    json_t *uuid_obj = json_object_get(obj, "uuid");
+    const char *uuid_str = json_string_value(uuid_obj);
+    if (uuid_parse(uuid_str, ident->uuid) < 0)
+        return -1;
     ident->rank = json_integer_value(json_object_get(obj, "rank"));
-    ident->fullname = (char*)json_string_value(json_object_get(obj, "fullname"));
-    ident->nickname = (char*)json_string_value(json_object_get(obj, "nickname"));
-    ident->petname = (char*)json_string_value(json_object_get(obj, "petname"));
-    ident->public_only = json_boolean_value(json_object_get(obj, "public_only"));
-    uint8_t *seed = (uint8_t*)json_object_get(json_object_get(obj, "signature"), "hex_seed");
-    signature_init(&ident->signature, seed, ident->public_only);  // decoded
-    seed = (uint8_t*)json_object_get(json_object_get(obj, "encryptor"), "hex_seed");
-    encryptor_init(&ident->encryptor, seed, ident->public_only);  // decoded
+    strncpy(ident->fullname, (char *)json_string_value(json_object_get(obj, "fullname")), sizeof(ident->fullname));
+    strncpy(ident->nickname, (char *)json_string_value(json_object_get(obj, "nickname")), sizeof(ident->nickname));
+    strncpy(ident->petname, (char *)json_string_value(json_object_get(obj, "petname")), sizeof(ident->petname));
+    uint8_t *seed = (uint8_t *)json_object_get(json_object_get(obj, "signature"), "hex_seed");
+    signature_init(&ident->signature, seed); // decoded
+    seed = (uint8_t *)json_object_get(json_object_get(obj, "encryptor"), "hex_seed");
+    encryptor_init(&ident->encryptor, seed); // decoded
+    public_identity_init((public_identity_t *)ident);
     return 0;
 }
 
 DECLARE_CONFIGURATION(identity, sizeof(identity_t), identity_to_json, identity_from_json);
 
-void identity_free(identity_t *ident) {
+int peer_to_proto(const public_identity_t *msg, void **data_ptr, size_t *data_len_ptr)
+{
+    *data_len_ptr = autonomous_trust__core__identity__identity__get_packed_size(&msg->proto);
+    *data_ptr = malloc(*data_len_ptr);
+    if (*data_ptr == NULL)
+        return EXCEPTION(ENOMEM);
+    autonomous_trust__core__identity__identity__pack(&msg->proto, *data_ptr);
+    return 0;
+}
+
+int proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer)
+{
+    AutonomousTrust__Core__Identity__Identity *msg =
+        autonomous_trust__core__identity__identity__unpack(NULL, len, data);
+    memcpy(&peer->proto, msg, sizeof(peer->proto));
+    free(msg);
+    return 0;
+}
+
+void identity_free(identity_t *ident)
+{
     free(ident);
 }

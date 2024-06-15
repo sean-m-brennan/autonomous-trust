@@ -18,23 +18,11 @@
 #define DATA_PRIV_H
 
 #include "data.h"
-
-typedef enum
-{
-    NONE,
-    INT,
-    UINT,
-    FLOAT,
-    BOOL,
-    STRING,
-    BYTES,
-    OBJECT
-} type_t;
+#include "structures/data.pb-c.h"
 
 struct data_s
 {
-    type_t type;
-    int (*cmp)(struct data_s *, struct data_s *);
+    data_type_t type;
     size_t size;
     union
     {
@@ -47,6 +35,46 @@ struct data_s
         void *obj;
     };
     int ref;
+    int (*cmp)(struct data_s *, struct data_s *);
 };
+
+int i_cmp(data_t *a, data_t *b);
+int u_cmp(data_t *a, data_t *b);
+int f_cmp(data_t *a, data_t *b);
+int b_cmp(data_t *a, data_t *b);
+int s_cmp(data_t *a, data_t *b);
+int d_cmp(data_t *a, data_t *b);
+int o_cmp(data_t *a, data_t *b);
+
+#define INT_DATA(i)   \
+    {                 \
+        .type = INT,  \
+        .intgr = i,   \
+        .size = 1,    \
+        .cmp = i_cmp, \
+    }
+
+#define STRING_DATA(s)    \
+    {                     \
+        .type = STRING,   \
+        .str = (char *)s, \
+        .size = 1,        \
+        .cmp = s_cmp,     \
+    }
+
+int data_sync_out(data_t *data, AutonomousTrust__Core__Structures__Data *pdata);
+
+void data_free_out_sync(AutonomousTrust__Core__Structures__Data *pdata);
+
+int data_sync_in(AutonomousTrust__Core__Structures__Data *pdata, data_t *data);
+
+void data_free_in_sync(data_t *data);
+
+
+#define EDAT_SER_OBJ 216
+DECLARE_ERROR(EDAT_SER_OBJ, "Serializing arbitrary data objects not allowed")
+
+#define EDAT_DSER_OBJ 217
+DECLARE_ERROR(EDAT_DSER_OBJ, "De-serializing arbitrary data objects not allowed")
 
 #endif  // DATA_PRIV_H

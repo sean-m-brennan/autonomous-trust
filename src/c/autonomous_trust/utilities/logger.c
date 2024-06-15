@@ -14,9 +14,8 @@
  *   limitations under the License.
  *******************/
 
-#define _GNU_SOURCE
+#define _XOPEN_SOURCE 700
 #include <string.h>
-#include <strings.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <time.h>
@@ -66,7 +65,7 @@ int logger_init_time_res(logger_t *logger, log_level_t max_level, const char *lo
     logger->term = true;
     logger->local_time = false;
     logger->resolution = res;
-    bzero(logger->file_name, 256);
+    memset(logger->file_name, 0, sizeof(logger->file_name));
     if (log_file == NULL)
         logger->file = stderr;
     else

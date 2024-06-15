@@ -14,7 +14,9 @@
  *   limitations under the License.
  *******************/
 
-#define _GNU_SOURCE
+#define _XOPEN_SOURCE 700
+#define _DEFAULT_SOURCE
+#define _GNU_SOURCE  // for pthread_setname_np
 #include <stdio.h>
 #include <stdbool.h>
 #include <errno.h>
@@ -24,14 +26,14 @@
 #include <sys/wait.h>
 #include <string.h>
 
-#include "autonomous_trust/version.h"
+#include "version.h"
 #include "utilities/message.h"
-#include "utilities/msg_types.h"
+#include "utilities/msg_types_priv.h"
 #include "utilities/logger.h"
 #include "config/sighandler.h"
 #include "config/configuration_priv.h"
 #include "processes/processes.h"
-#include "processes/process_tracker.h"
+#include "processes/process_tracker_priv.h"
 #include "structures/array_priv.h"
 #include "structures/map_priv.h"
 #include "config/protobuf_shutdown.h"
@@ -47,8 +49,8 @@ void user2_handler() { /* do nothing */ }
 
 int set_process_name(const char *name_in)
 {
-    char name[PROC_NAMELEN] = {0};
-    strncpy(name, name_in, PROC_NAMELEN-1);
+    char name[PROC_NAME_LEN] = {0};
+    strncpy(name, name_in, PROC_NAME_LEN-1);
     pthread_t tid = pthread_self();
     int err = pthread_setname_np(tid, name);
     if (err != 0)
@@ -134,7 +136,14 @@ int load_configs(char * cfg_dir, map_t *configs, logger_t *logger)
     return num_err;
 }
 
-int register_queues(tracker_t *tracker, const char *main, map_t *q_keys, map_t *s_keys, logger_t *logger)
+#define SIG_NAME_LEN PROC_NAME_LEN + 2
+
+void process_name_to_signal(const char *name, char *sig)
+{
+    snprintf(sig, SIG_NAME_LEN, "%s_s", name);
+}
+
+int register_queues(tracker_t *tracker, const char *main, directory_t *queues, directory_t *signals, logger_t *logger)
 {
     // setup tracker which loads process implementations to run
     if (tracker_init(logger, tracker) != 0) {
@@ -151,14 +160,12 @@ int register_queues(tracker_t *tracker, const char *main, map_t *q_keys, map_t *
         return -1;
     }
         
-        // FIXME not necessary, 
     // master lists of messaging/signalling queue keys
-    // (for passing to procs, not the queues themselves)
-    if (map_init(q_keys) != 0) {
+    if (array_init(queues) != 0) {
         log_exception(logger);
         return -1;
     }
-    if(map_init(s_keys) != 0) {
+    if (array_init(signals) != 0) {
         log_exception(logger);
         return -1;
     }
@@ -167,14 +174,14 @@ int register_queues(tracker_t *tracker, const char *main, map_t *q_keys, map_t *
     data_t *name_val;
     int num_err = 0;
 
-    // also track the main interface process (i.e. this one)
-    MSG_KEY_DECL(mk1);
-    if (messaging_new_id(tracker_cfg, &mk1) != 0) {
+    if (array_copy(process_names, queues) != 0) {
         log_exception(logger);
-        num_err++;
+        return -1;
     }
-    data_t *mk1_dat = key_data(mk1);
-    if (map_set(q_keys, (char*)main, mk1_dat) != 0) {
+
+    // also a queue for the main interface process (i.e. this one)
+    data_t *key_dat = string_data((char*)main, strlen(main));
+    if (array_append(queues, key_dat) != 0) {
         log_exception(logger);
         num_err++;
     }
@@ -187,27 +194,10 @@ int register_queues(tracker_t *tracker, const char *main, map_t *q_keys, map_t *
             continue;
         }
 
-        MSG_KEY_DECL(mk);
-        if (messaging_new_id(tracker_cfg, &mk) != 0) {
-            log_exception(logger);
-            num_err++;
-            continue;
-        }
-        data_t *mk_dat = key_data(mk);
-        if (map_set(q_keys, pname, mk_dat) != 0) {
-            log_exception(logger);
-            num_err++;
-            continue;
-        }
-
-        MSG_KEY_DECL(mks);
-        if (messaging_new_id(tracker_cfg, &mks) != 0) {
-            log_exception(logger);
-            num_err++;
-            continue;
-        }
-        data_t *mks_dat = key_data(mks);
-        if (map_set(s_keys, pname, mks_dat) != 0) {
+        char sname[SIG_NAME_LEN];
+        process_name_to_signal(pname, sname);
+        data_t *s_dat = string_data(sname, sizeof(sname));
+        if (array_append(signals, s_dat) != 0) {
             log_exception(logger);
             num_err++;
             continue;
@@ -216,39 +206,9 @@ int register_queues(tracker_t *tracker, const char *main, map_t *q_keys, map_t *
     return num_err;
 }
 
-int create_local_queues(map_t *both[], logger_t *logger) {
-    // create all message queues/signals from keys (since all processes are spawned)
-    int num_err = 0;
-    for (int i=0; i<2; i++) {
-        map_t *map = both[i];
-        if (map_init(map) != 0) {
-            log_exception(logger);
-            num_err++;
-            continue;
-        }
-        map_key_t mkey;
-        data_t *int_val;
-        map_entries_for_each(map, mkey, int_val)
-            MSG_KEY_DECL(mk);
-            if (data_key(int_val, &mk) != 0) {
-                log_exception(logger);
-                num_err++;
-                continue;
-            }
-            int mp = messaging_init(mk);
-            data_t *mp_dat = integer_data(mp);
-            if (map_set(map, mkey, mp_dat) != 0) {
-                log_exception(logger);
-                num_err++;
-            }
-        map_end_for_each
-    }
-    return num_err;
-}
 
-
-int run_autonomous_trust(msg_key_t q_in, msg_key_t q_out,
-                         void *capabilities, size_t cap_len, // FIXME from config file?
+int run_autonomous_trust(char *q_in, char *q_out,
+                         capability_t *capabilities, size_t cap_len, // FIXME from config file?
                          log_level_t log_level, char log_file[])
 {
     // FIXME pass in/register capabilities
@@ -285,9 +245,9 @@ int run_autonomous_trust(msg_key_t q_in, msg_key_t q_out,
         ;  // FIXME handle partial errors ('required' list?)
 
     tracker_t tracker;
-    map_t q_keys;
-    map_t s_keys;
-    ret = register_queue_ids(&tracker, name, &q_keys, &s_keys, &logger);
+    directory_t queues;
+    directory_t signals;
+    ret = register_queues(&tracker, name, &queues, &signals, &logger);
     if (ret < 0)
         return ret;
     if (ret > 0)
@@ -322,20 +282,11 @@ int run_autonomous_trust(msg_key_t q_in, msg_key_t q_out,
             num_err++;
             continue;
         }
-        data_t *sig_dat;
-        if (map_get(&s_keys, key, &sig_dat) != 0) {
-            log_exception(&logger);
-            num_err++;
-            continue;
-        }
-        int sig;
-        if (data_integer(sig_dat, &sig) != 0) {
-            log_exception(&logger);
-            num_err++;
-            continue;
-        }
-        pid_t pid = runner(&proc, &q_keys, sig, &logger);  // FIXME ensure child does run fnctn
-        // FIXME pass logger to process
+
+        char sig[SIG_NAME_LEN];
+        process_name_to_signal(key, sig);
+
+        pid_t pid = runner(&proc, &queues, sig, &logger);  // FIXME ensure child does run fnctn
 
         // record pids for monitoring
         char pid_str[32] = {0};
@@ -348,17 +299,14 @@ int run_autonomous_trust(msg_key_t q_in, msg_key_t q_out,
     map_end_for_each
     // FIXME deal with partials
 
-    // message queue keys from the parent process
-    data_t *mk_in_dat = key_data(q_in);
-    if (map_set(&q_keys, (char*)"extern_in", mk_in_dat) != 0)
+    queue_t my_q;
+    if (messaging_init(name, &my_q) != 0)
         log_exception(&logger);
-    data_t *mk_out_dat = key_data(q_out);
-    if (map_set(&q_keys, (char*)"extern_out", mk_out_dat) != 0)
+    messaging_assign(&my_q);
+    queue_t extern_q;
+    if (messaging_init(q_in, &my_q) != 0)
         log_exception(&logger);
 
-    map_t signals;
-    map_t queues;
-    ret = create_local_queues((map_t*[]){ &signals, &queues }, &logger);
     
     log_info(&logger, "%s:                                          Ready.\n", name);
     size_t active = map_size(&procs);
@@ -400,8 +348,7 @@ int run_autonomous_trust(msg_key_t q_in, msg_key_t q_out,
 
         // check for extern messages
         generic_msg_t task_msg;
-        queue_id_t extern_in = messaging_fetch_queue(&queues, "extern_in");
-        ret = messaging_recv(extern_in, &task_msg);
+        ret = messaging_recv_on(&extern_q, &task_msg);
         if (ret == -1)
             log_exception(&logger);
         else if (ret == 0) {
@@ -411,28 +358,22 @@ int run_autonomous_trust(msg_key_t q_in, msg_key_t q_out,
             // send task to proper process
         }
 
-        bool do_send = false;
+        // get results from internal procs
         generic_msg_t result_msg;
-        data_t *int_val = NULL;
-        // FIXME get results from internal procs
-        map_entries_for_each(&queues, key, int_val)
-            queue_id_t qid;
-            if (data_integer(int_val, &qid) != 0)
+        ret = messaging_recv(&result_msg);
+        if (ret == -1)
+            log_exception(&logger);
+        else if (ret == 0) {
+            // FIXME convert to struct?
+            data_t *msg_dat = object_ptr_data(&result_msg.info, message_size(result_msg.type));
+            if (array_append(&unhandled_msgs, msg_dat) != 0)
                 log_exception(&logger);
-            ret = messaging_recv(qid, &result_msg);
-            if (ret == -1)
-                log_exception(&logger);
-            else if (ret == 0) {
-                // FIXME convert to struct?
-                data_t *msg_dat = object_ptr_data(&result_msg.info, message_size(result_msg.type));
-                if (array_append(&unhandled_msgs, msg_dat) != 0)
-                    log_exception(&logger);
-            }
-        map_end_for_each
+        }
 
         array_t extern_msgs;
         if (array_init(&extern_msgs) != 0)
             log_exception(&logger);
+        bool do_send = false;
         int index;
         data_t *msg_dat;
         array_for_each(&unhandled_msgs, index, msg_dat)
@@ -448,8 +389,7 @@ int run_autonomous_trust(msg_key_t q_in, msg_key_t q_out,
 
         if (do_send)
         {
-            queue_id_t extern_out = messaging_fetch_queue(&queues, "extern_out");
-            if (messaging_send(extern_out, result_msg.type, &result_msg) != 0)
+            if (messaging_send("extern_out", result_msg.type, &result_msg) != 0)
                 log_exception(&logger);
         }
 
@@ -462,25 +402,22 @@ int run_autonomous_trust(msg_key_t q_in, msg_key_t q_out,
 
 //signal_quit:
     log_debug(&logger, "Send sig quit\n"); // FIXME
-    data_t *q_val;
+    data_t *k_val;
+    int index;
     generic_msg_t sig = { .type = SIGNAL, .info.signal = { .descr = {0}, .sig = -1 } };
     strncpy(sig.info.signal.descr, sig_quit, 31);
-    map_entries_for_each(&signals, key, q_val)
-        int q;
-        if (data_integer(q_val, &q) != 0)
+    array_for_each(&signals, index, k_val)
+        char *skey;
+        if (data_string_ptr(k_val, &skey) != 0)
             log_exception(&logger);
-        if (q != 0) {
-            if (messaging_send(q, SIGNAL, &sig) != 0)
-                log_exception(&logger);
-        }
-    map_end_for_each
+        if (messaging_send(skey, SIGNAL, &sig) != 0)
+            log_exception(&logger);
+    array_end_for_each
 
 //cleanup:
     log_debug(&logger, "Free\n"); // FIXME
-    map_free(&signals);
-    map_free(&queues);
-    map_free(&s_keys);
-    map_free(&q_keys);
+    array_free(&signals);
+    array_free(&queues);
     tracker_free(&tracker);
     if (fd1 > 0)
         close(fd1);

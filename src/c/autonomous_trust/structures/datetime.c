@@ -35,6 +35,43 @@ typedef struct
     const char *time_fmt;
 } time_res_config_t;
 
+int datetime_init(datetime_t *dt)
+{
+    AutonomousTrust__Core__Structures__DateTime tmp = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATE_TIME__INIT;
+    memcpy(&dt->proto, &tmp, sizeof(dt->proto));
+    return 0;
+}
+
+int datetime_sync_out(datetime_t *dt)
+{
+    dt->proto.nanosecond = dt->tm_nsec;
+    dt->proto.second = dt->tm_sec;
+    dt->proto.minute = dt->tm_min;
+    dt->proto.hour = dt->tm_hour;
+    dt->proto.day = dt->tm_mday;
+    dt->proto.month = dt->tm_mon;
+    dt->proto.year = dt->tm_year;
+    dt->proto.weekday = dt->tm_wday;
+    dt->proto.day_of_year = dt->tm_yday;
+    dt->proto.utc_offset = dt->tm_tz_offset;
+    return 0;
+}
+
+int datetime_sync_in(datetime_t *dt)
+{
+    dt->tm_nsec = dt->proto.nanosecond;
+    dt->tm_sec = dt->proto.second;
+    dt->tm_min = dt->proto.minute;
+    dt->tm_hour = dt->proto.hour;
+    dt->tm_mday = dt->proto.day;
+    dt->tm_mon = dt->proto.month;
+    dt->tm_year = dt->proto.year;
+    dt->tm_wday = dt->proto.weekday;
+    dt->tm_yday = dt->proto.day_of_year;
+    dt->tm_tz_offset = dt->proto.utc_offset;
+    return 0;
+}
+
 time_res_config_t set_time_resolution(time_resolution_t res)
 {
     time_res_config_t config = {0};
@@ -221,6 +258,29 @@ int datetime_now(bool local, datetime_t *dt)
     if (err == -1)
         return errno;
     return datetime_from_time(now, ts.tv_nsec, local, dt);
+}
+
+int timedelta_init(timedelta_t *td)
+{
+    AutonomousTrust__Core__Structures__TimeDelta tmp = AUTONOMOUS_TRUST__CORE__STRUCTURES__TIME_DELTA__INIT;
+    memcpy(&td->proto, &tmp, sizeof(td->proto));
+    return 0;
+}
+
+int timedelta_sync_out(timedelta_t *td)
+{
+    td->proto.days = td->days;
+    td->proto.seconds = td->seconds;
+    td->proto.nanoseconds = td->nsecs;
+    return 0;
+}
+
+int timedelta_sync_in(timedelta_t *td)
+{
+    td->days = td->proto.days;
+    td->seconds = td->proto.seconds;
+    td->nsecs = td->proto.nanoseconds;
+    return 0;
 }
 
 int timedelta_from_string(const char *s, timedelta_t *td)

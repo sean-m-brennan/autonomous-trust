@@ -1,4 +1,3 @@
-syntax = "proto3";
 /********************
  *  Copyright 2024 TekFive, Inc. and contributors
  *
@@ -15,21 +14,19 @@ syntax = "proto3";
  *   limitations under the License.
  *******************/
 
-message DateTime {
-  uint32 nanosecond = 1;
-  uint32 second = 2;
-  uint32 minute = 3;
-  uint32 hour = 4;
-  uint32 day = 5;  // day of month
-  uint32 month = 6;
-  uint32 year = 7;
-  uint32 weekday = 8;   // day of week, Sunday = 0
-  uint32 day_of_year = 9;   // Jan 1st = 0
-  float utc_offset = 10;
-}
+syntax = "proto3";
 
-message TimeDelta {
-  sint64 days = 1;
-  uint32 seconds = 2;
-  uint32 nanoseconds = 3;
+package autonomous_trust.core.negotiation;
+
+import "autonomous_trust/core/processes/capabilities.proto";
+import "autonomous_trust/core/structures/datetime.proto";
+import "autonomous_trust/core/structures/data.proto";
+
+message Task {
+  autonomous_trust.core.processes.Capability capability = 1;
+  autonomous_trust.core.structures.DateTime when = 2;
+  autonomous_trust.core.structures.TimeDelta duration = 3;
+  uint64 timeout = 4;
+  repeated autonomous_trust.core.structures.Data args = 5;
+  bool flexible = 6;
 }

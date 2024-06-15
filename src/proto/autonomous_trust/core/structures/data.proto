@@ -1,4 +1,3 @@
-syntax = "proto3";
 /********************
  *  Copyright 2024 TekFive, Inc. and contributors
  *
@@ -15,25 +14,32 @@ syntax = "proto3";
  *   limitations under the License.
  *******************/
 
+syntax = "proto3";
+
+package autonomous_trust.core.structures;
+
 import "google/protobuf/any.proto";
 
-message MerkleNode {
-  // red/black tree node
-  int32 key = 1;
-  MerkleNode parent = 2;
-  MerkleNode left = 3;
-  MerkleNode right = 4;
-  bool red = 5;
-  // merkle node
-  bytes uuid = 6;
-  uint32 digest = 7;
-  google.protobuf.Any blob = 8;
+enum DataType {
+  NONE = 0;
+  INT = 1;
+  UINT = 2;
+  FLOAT = 3;
+  BOOL = 4;
+  STRING = 5;
+  BYTES = 6;
+  OBJECT= 7;
 }
 
-message MerkleTree {
-  // red/black tree
-  MerkleNode root = 1;
+message Data {
+  DataType type = 1;
   uint64 size = 2;
-  // merkle tree
-  uint32 superHash = 3;
+  oneof dat  {
+    int64 intgr = 3;
+    uint64 uintr = 4;
+    double flt_pt = 5;
+    bool bl = 6;
+    string str = 7;
+    bytes byt = 8;
+  };
 }
