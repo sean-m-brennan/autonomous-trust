@@ -19,7 +19,9 @@
 
 #include "processes/processes.h"
 
-int identity_run(const process_t *proc, map_t *queues, int signal, logger_t *logger);
+int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
+#define EID_NOQ 215
+DECLARE_ERROR(EID_NOQ, "Required process queue missing");
 
 #endif  // ID_PROC_PRIV_H

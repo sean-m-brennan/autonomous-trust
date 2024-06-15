@@ -22,104 +22,206 @@
 #include <uuid/uuid.h>
 #include <sodium.h>
 
+#include "identity/identity.pb-c.h"
+
 typedef struct identity_s identity_t;
 
 typedef struct
 {
+    AutonomousTrust__Core__Identity__Signature proto;
+    unsigned char private[crypto_sign_SECRETKEYBYTES];
     unsigned char public[crypto_sign_PUBLICKEYBYTES];
     unsigned char public_hex[crypto_sign_PUBLICKEYBYTES * 2];
-} public_signature_t;
+} signature_t;
 
 typedef struct
 {
+    AutonomousTrust__Core__Identity__Encryptor proto;
+    unsigned char private[crypto_box_SECRETKEYBYTES];
     unsigned char public[crypto_box_PUBLICKEYBYTES];
     unsigned char public_hex[crypto_box_PUBLICKEYBYTES * 2];
-} public_encryptor_t;
+} encryptor_t;
 
-typedef struct {
+#define ADDR_LEN 32 + 1
+#define NAME_LEN 128
+
+typedef struct
+{
+    AutonomousTrust__Core__Identity__Identity proto;
     uuid_t uuid;
-    unsigned char *address;  // FIXME fixed size
-    char fullname[256];
-    public_signature_t signature;
-    public_encryptor_t encryptor;
+    char address[ADDR_LEN];
+    char fullname[NAME_LEN];
+    signature_t signature;
+    encryptor_t encryptor;
 } public_identity_t;
 
-typedef struct {
+typedef struct
+{
+    AutonomousTrust__Core__Identity__Group proto;
     uuid_t uuid;
-    unsigned char *address;
-    public_encryptor_t encryptor;
+    char address[ADDR_LEN];
+    encryptor_t encryptor;
 } group_t;
 
-#define MAX_PEERS 128  // approx Dunbar number
+#define MAX_PEERS 128 // approx Dunbar number
+
+int public_identity_init(public_identity_t *identity);
 
 typedef struct
 {
     unsigned char *msg;
-    unsigned long long len; 
-} msg_str_t;  // FIXME separate file
+    unsigned long long len;
+} msg_str_t; // FIXME separate file
 
 /***/
-int identity_create(unsigned char *address, identity_t **ident);
+int identity_create(char *address, char *fullname, identity_t **ident);
 
 /**
- * @brief 
- * 
- * @param ident 
- * @param pub_copy 
- * @return int 
+ * @brief
+ *
+ * @param ident
+ * @param pub_copy
+ * @return int
  */
 int identity_publish(const identity_t *ident, public_identity_t **pub_copy);
 
 /**
- * @brief 
- * 
- * @param ident 
- * @param in 
- * @param out 
- * @return int 
+ * @brief
+ *
+ * @param ident
+ * @param in
+ * @param out
+ * @return int
  */
 int identity_sign(const identity_t *ident, const msg_str_t *in, msg_str_t *out);
 
 /**
- * @brief 
- * 
- * @param ident 
- * @param in 
- * @param out 
- * @return int 
+ * @brief
+ *
+ * @param ident
+ * @param in
+ * @param out
+ * @return int
  */
 int identity_verify(const public_identity_t *ident, const msg_str_t *in, msg_str_t *out);
 
 /**
- * @brief 
- * 
- * @param ident 
- * @param in 
- * @param whom 
- * @param nonce 
- * @param cipher 
- * @return int 
+ * @brief
+ *
+ * @param ident
+ * @param in
+ * @param whom
+ * @param nonce
+ * @param cipher
+ * @return int
  */
 int identity_encrypt(const identity_t *ident, const msg_str_t *in, const public_identity_t *whom, const unsigned char *nonce, unsigned char *cipher);
 
 /**
- * @brief 
- * 
- * @param ident 
- * @param cipher 
- * @param whom 
- * @param nonce 
- * @param out 
- * @return int 
+ * @brief
+ *
+ * @param ident
+ * @param cipher
+ * @param whom
+ * @param nonce
+ * @param out
+ * @return int
  */
 int identity_decrypt(const identity_t *ident, const msg_str_t *cipher, const public_identity_t *whom, const unsigned char *nonce, unsigned char *out);
 
 /**
- * @brief 
- * 
- * @param ident 
+ * @brief
+ *
+ * @param msg
+ * @param data_ptr
+ * @param data_len_ptr
+ * @return int
+ */
+int peer_to_proto(const public_identity_t *msg, void **data_ptr, size_t *data_len_ptr);
+
+/**
+ * @brief
+ *
+ * @param data
+ * @param len
+ * @param peer
+ * @return int
+ */
+int proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer);
+
+/**
+ * @brief
+ *
+ * @param ident
  */
 void identity_free(identity_t *ident);
 
+/**
+ * @brief
+ *
+ * @param group
+ * @return int
+ */
+int group_init(group_t *group);
 
-#endif  // IDENTITY_H
+/**
+ * @brief
+ *
+ * @param address
+ * @param grp
+ * @return int
+ */
+int group_create(char *address, group_t **grp);
+
+/**
+ * @brief
+ *
+ * @param ident
+ * @param in
+ * @param whom
+ * @param nonce
+ * @param cipher
+ * @return int
+ */
+int group_encrypt(const group_t *ident, const msg_str_t *in, const group_t *whom, const unsigned char *nonce, unsigned char *cipher);
+
+/**
+ * @brief
+ *
+ * @param ident
+ * @param cipher
+ * @param whom
+ * @param nonce
+ * @param out
+ * @return int
+ */
+int group_decrypt(const group_t *ident, const msg_str_t *cipher, const group_t *whom, const unsigned char *nonce, unsigned char *out);
+
+/**
+ * @brief
+ *
+ * @param msg
+ * @param data_ptr
+ * @param data_len_ptr
+ * @return int
+ */
+int group_to_proto(const group_t *msg, void **data_ptr, size_t *data_len_ptr);
+
+/**
+ * @brief
+ *
+ * @param data
+ * @param len
+ * @param group
+ * @return int
+ */
+int proto_to_group(uint8_t *data, size_t len, group_t *group);
+
+/**
+ * @brief
+ *
+ * @param group
+ */
+void group_free(group_t *group);
+
+#endif // IDENTITY_H

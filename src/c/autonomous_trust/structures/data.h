@@ -23,6 +23,18 @@
 
 #include "utilities/exception.h"
 
+typedef enum
+{
+    NONE,
+    INT,
+    UINT,
+    FLOAT,
+    BOOL,
+    STRING,
+    BYTES,
+    OBJECT
+} data_type_t;
+
 
 typedef struct data_s data_t;
 
@@ -94,7 +106,7 @@ void data_decr(data_t *d);
 
 bool data_equal(data_t *a, data_t *b);
 
-#define EDAT_INVL 190
+#define EDAT_INVL 210
 DECLARE_ERROR(EDAT_INVL, "Invalid data type");
 
 #endif  // DATA_H

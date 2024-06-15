@@ -119,15 +119,16 @@ set(TEST_DEPENDENCIES
 set(top_src_dir ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
 set(PROTO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
-set(PROTO_BINARY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto/c")
+set(PROTO_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/protobuf")
 
 set(protos
-    autonomous_trust/core/protobuf/agreement.proto
-    autonomous_trust/core/protobuf/capabilities.proto
-    autonomous_trust/core/protobuf/identity.proto
-    autonomous_trust/core/protobuf/peers.proto
-    autonomous_trust/core/protobuf/structures/datetime.proto
-    autonomous_trust/core/protobuf/structures/merkle.proto
+    autonomous_trust/core/negotiation/task.proto
+    autonomous_trust/core/processes/capabilities.proto
+    autonomous_trust/core/identity/identity.proto
+    autonomous_trust/core/structures/data.proto
+    autonomous_trust/core/structures/datetime.proto
+    autonomous_trust/core/structures/map.proto
+    autonomous_trust/core/structures/merkle.proto
 )
 
 set(google_protos
@@ -137,6 +138,7 @@ set(google_protos
 set(table_headers_in
     autonomous_trust/config/config_table_priv.h.in
     autonomous_trust/processes/process_table_priv.h.in
+    autonomous_trust/processes/capability_table_priv.h.in
     autonomous_trust/utilities/error_table_priv.h.in
 )
 
@@ -145,10 +147,16 @@ set(libsrc
     autonomous_trust/config/configuration.c
     autonomous_trust/config/protobuf_shutdown.cpp
     autonomous_trust/config/sighandler.c
+    autonomous_trust/identity/encryptor.c
+    autonomous_trust/identity/group.c
+    autonomous_trust/identity/hexlify.c
     autonomous_trust/identity/identity.c
     autonomous_trust/identity/id_proc.c
+    autonomous_trust/identity/signature.c
+    autonomous_trust/negotiation/task.c
     autonomous_trust/network/net_proc.c
     autonomous_trust/network/network.c
+    autonomous_trust/processes/capabilities.c
     autonomous_trust/processes/process_tracker.c
     autonomous_trust/processes/processes.c
     autonomous_trust/structures/array.c
@@ -160,6 +168,7 @@ set(libsrc
     autonomous_trust/utilities/exception.c
     autonomous_trust/utilities/logger.c
     autonomous_trust/utilities/message.c
+    autonomous_trust/utilities/msg_types.c
     autonomous_trust/utilities/util.c
 )
 set(libhdr

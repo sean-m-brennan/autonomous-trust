@@ -112,16 +112,14 @@ int write_config_file(const config_t *config, const void *data_struct, const cha
  * @brief
  *
  */
-#define ECFG_NOIMPL 170
-
+#define ECFG_NOIMPL 206
 DECLARE_ERROR(ECFG_NOIMPL, "No config implementation registered for the given name");
 
 /**
  * @brief
  *
  */
-#define ECFG_BADFMT 171
-
+#define ECFG_BADFMT 207
 DECLARE_ERROR(ECFG_BADFMT, "Configuration incorrectly formatted")
 
 #ifdef __cplusplus

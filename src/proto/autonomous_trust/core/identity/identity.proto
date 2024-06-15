@@ -1,4 +1,3 @@
-syntax = "proto3";
 /********************
  *  Copyright 2024 TekFive, Inc. and contributors
  *
@@ -15,17 +14,28 @@ syntax = "proto3";
  *   limitations under the License.
  *******************/
 
-message Capability {
-  string name = 1;
-  int32 function = 2; // FIXME
-  repeated string arg_names = 3;
-  repeated string keywords = 4;
+syntax = "proto3";
+
+package autonomous_trust.core.identity;
+
+message Encryptor {
+  bytes hex_seed = 1;
 }
 
-message Capabilities {
-  map<string, string> listing = 1;
+message Signature {
+  bytes hex_seed = 1;
 }
 
-message PeerCapabilities {
-  map<string, string> listing = 1;
+message Identity {
+  bytes uuid = 1;
+  string address = 2;
+  string fullname = 3;
+  Signature signature = 4;
+  Encryptor encryptor = 5;
+}
+
+message Group {
+  bytes uuid = 1;
+  string address = 2;  // Identity UUID to address
+  Encryptor encryptor = 3;  // group-shared key
 }

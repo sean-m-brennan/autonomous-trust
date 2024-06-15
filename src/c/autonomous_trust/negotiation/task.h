@@ -1,4 +1,3 @@
-syntax = "proto3";
 /********************
  *  Copyright 2024 TekFive, Inc. and contributors
  *
@@ -15,13 +14,18 @@ syntax = "proto3";
  *   limitations under the License.
  *******************/
 
-import "autonomous_trust/core/protobuf/identity.proto";
+#ifndef TASK_H
+#define TASK_H
 
-message IdentityMap {
-  map<string, Identity> id_by_name = 1;
-}
+typedef struct task_s task_t;
 
-message Peers {
-  repeated IdentityMap hierarchy = 1;
-  repeated IdentityMap valuation = 2;
-}
+int task_init(task_t *task);
+
+int task_run(task_t *task);
+
+int task_to_proto(const task_t *msg, size_t size, void **data_ptr, size_t *data_len_ptr);
+
+int proto_to_task(uint8_t *data, size_t len, task_t *task);
+
+
+#endif  // TASK_H

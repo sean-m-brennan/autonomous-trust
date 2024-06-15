@@ -33,179 +33,70 @@
 #include "structures/data.h"
 #include "structures/map.h"
 #include "message.h"
-#include "msg_types.h"
+#include "msg_types_priv.h"
 
-size_t message_size(message_type_t type)
+#define SOCK_PATH_LEN 108
+
+int unix_addr(const char *key, struct sockaddr_un *addr)
 {
-    switch (type)
-    {
-    case SIGNAL:
-        return sizeof(signal_t);
-    case GROUP:
-        return sizeof(group_t);
-    case PEERS:
-        return sizeof(public_identity_t) * MAX_PEERS;
-    case CAPABILITIES:
-        return sizeof(capability_t) * MAX_CAPABILITIES;
-    case PEER_CAPABILITIES:
-        return sizeof(capability_t) * MAX_PEERS * MAX_CAPABILITIES;
-    case NET_MESSAGE:
-        return sizeof(net_msg_t);
-    case TASK: // FIXME
-    default:
-        return 0;
-    }
+    char path[SOCK_PATH_LEN];
+    if (get_data_dir(path) != 0)
+        return SYS_EXCEPTION();
+    strncat(path, key, SOCK_PATH_LEN - strlen(key) - 1);
+
+    addr->sun_family = AF_UNIX;
+    strncpy(addr->sun_path, path, SOCK_PATH_LEN - 1);
+    return 0;
 }
 
-#ifdef MSGQ
-
-static int id_seed = 0;
-static char msg_cfg_path[CFG_PATH_LEN] = {0};
-
-int messaging_fetch_queue(map_t *map, const char *key, queue_id_t *q)
+int messaging_init(const char *id, queue_t *queue)
 {
-    data_t *mk_dat;
-    int err = map_get(map, (char *)key, &mk_dat);
-    if (err != 0)
-        return err;
-    int mk = 0;
-    err = data_integer(mk_dat, &mk);
-    if (err != 0)
-        return err;
-    return mk;
-}
+    strncpy(queue->key, id, MSG_KEY_LEN - 1);
 
+    queue->fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (queue->fd < 0)
+        return SYS_EXCEPTION();
 
-int messaging_new_id(char *id, msg_key_t *key)
-{
-    if (strlen(msg_cfg_path) == 0)
+    struct sockaddr_un local;
+    if (unix_addr(id, &local) != 0)
+        return SYS_EXCEPTION();
+
+    if (unlink(local.sun_path) != 0)
     {
-        int err = get_cfg_dir(msg_cfg_path);
-        if (err < 0)
+        if (errno != ENOENT)
             return SYS_EXCEPTION();
-
-        struct stat st = {0};
-        if (stat(msg_cfg_path, &st) == -1)
-        {
-            err = makedirs(msg_cfg_path, 0700);
-            if (err != 0)
-                return err;
-        }
     }
-    char cfg_path[CFG_PATH_LEN];
-    strncpy(cfg_path, msg_cfg_path, CFG_PATH_LEN);
-    strncat(cfg_path, id, CFG_PATH_LEN - strlen(msg_cfg_path));
+    socklen_t len = strlen(local.sun_path) + sizeof(local.sun_family);
 
-    int r_id = seed;
-    if (seed == 0)
-    {
-        r_id = id_seed++;
-        // srand(time(0));
-        // unsigned int min = (INT_MAX / 2); // do not interfere with user-defined (hopefully)
-        // r_id = (random() % (INT_MAX - min)) + min;
-    }
-    int err = ftok(msg_cfg_path, r_id);
-    if (err != 0)
+    if (bind(queue->fd, (struct sockaddr *)&local, len) != 0)
         return SYS_EXCEPTION();
-    *key = err;
+
     return 0;
 }
 
-queue_id_t messaging_init(msg_key_t id)
+static queue_t *my_q = NULL;
+
+void messaging_assign(queue_t *queue)
 {
-    int fd = msgget(id, 0666 | IPC_CREAT);
-    if (fd < 0)
-        return SYS_EXCEPTION();
-    return fd;
+    my_q = queue;
 }
 
-int messaging_recv(queue_id_t qid, generic_msg_t *data)
+int messaging_recv(generic_msg_t *msg)
 {
-    ssize_t err = msgrcv(qid, data, MAX_MSG_SIZE, 0, IPC_NOWAIT);
-    if (err == -1)
-    {
-        if (errno == ENOMSG)
-            return ENOMSG;
-        return SYS_EXCEPTION();
-    }
-    return 0;
+    if (my_q == NULL)
+        return EXCEPTION(EMSG_NOCONN);
+    return messaging_recv_on(my_q, msg);
 }
 
-int messaging_send(queue_id_t qid, message_type_t type, void *data)
+int messaging_recv_on(queue_t *q, generic_msg_t *msg) //, struct sockaddr_storage *their_addr)
 {
-    int err = msgsnd(qid, data, message_size(type), type);
-    if (err != 0)
-    {
-        if (errno == EAGAIN)
-            return EAGAIN;
-        return SYS_EXCEPTION();
-    }
-    return 0;
-}
-
-// end MSGQ
-#else
-#ifdef U_SOCK
-
-int messaging_fetch_queue(map_t *map, const char *key, queue_id_t *q)
-{
-    data_t *mk_dat;
-    int err = map_get(map, (char *)key, &mk_dat);
-    if (err != 0)
-        return err;
-    int mk = 0;
-    err = data_integer(mk_dat, &mk);
-    if (err != 0)
-        return err;
-    return mk;
-}
-
-
-
-int messaging_new_id(char *id, msg_key_t *key)
-{
-    int err = get_data_dir(*key);
-    if (err < 0)
-        return SYS_EXCEPTION();
-    strncat(*key, id, CFG_PATH_LEN - strlen(*key));
-    return 0;
-}
-
-int messaging_init(msg_key_t id)
-{
-    int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (sock < 0)
-        return SYS_EXCEPTION();
-
-    int incr = 0;
-    while (true) {
-        struct sockaddr_un local;
-        local.sun_family = AF_UNIX;
-        snprintf(local.sun_path, "%s%d", id, incr, sizeof(local.sun_path) - 1);
-        unlink(local.sun_path);
-        socklen_t len = strlen(local.sun_path) + sizeof(local.sun_family);
-
-        int one = 1;
-        if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0)
-            return SYS_EXCEPTION();
-        if (bind(sock, (struct sockaddr *)&local, len) != 0) {
-            incr++;
-            if (incr > 20)
-                return SYS_EXCEPTION();
-        } else
-            break;
-    }
-    return sock;
-}
-
-int messaging_recv(queue_id_t qid, generic_msg_t *msg)
-{
-    // FIXME convert structs to protobuf
 #if TRACK_SENDER
     struct sockaddr_storage their_addr;
     socklen_t addr_len = sizeof(their_addr);
 #endif
-    ssize_t numbytes = recvfrom(qid, msg, sizeof(generic_msg_t), MSG_DONTWAIT,
+
+    uint8_t data[MAX_MSG_SIZE];
+    ssize_t numbytes = recvfrom(q->fd, data, sizeof(data), MSG_DONTWAIT,
 #if TRACK_SENDER
                                 (struct sockaddr *)&their_addr, &addr_len);
 #else
@@ -217,17 +108,28 @@ int messaging_recv(queue_id_t qid, generic_msg_t *msg)
             return EAGAIN;
         return SYS_EXCEPTION();
     }
-    // FIXME convert protobuf to struct
+
+    if (proto_to_generic_msg(data, numbytes, msg) != 0)
+        return -1;
     return 0;
 }
 
-int messaging_send(queue_id_t qid, message_type_t type, void *data)
+int messaging_send(const char *key, const message_type_t type, generic_msg_t *msg)
 {
-    // FIXME convert struct to protobuf
+    if (my_q == NULL)
+        return EXCEPTION(EMSG_NOCONN);
+    void *data;
+    size_t data_len;
+    if (generic_msg_to_proto(msg, &data, &data_len) != 0)
+        return -1;
+
     struct sockaddr_un target;
-    target.sun_family = AF_UNIX;
-    strncpy(target.sun_path, process, PROC_NAMELEN-1);
-    ssize_t numbytes = sendto(qid, data, message_size(type), MSG_DONTWAIT, &target, sizeof(target));
+    if (unix_addr(key, &target) != 0)
+        return SYS_EXCEPTION();
+
+    ssize_t numbytes = sendto(my_q->fd, data, data_len, MSG_DONTWAIT,
+                              (const struct sockaddr *)&target, sizeof(target));
+    free(data);
     if (numbytes < 0)
     {
         if (errno == EAGAIN)
@@ -236,6 +138,3 @@ int messaging_send(queue_id_t qid, message_type_t type, void *data)
     }
     return 0;
 }
-
-#endif // end U_SOCK
-#endif

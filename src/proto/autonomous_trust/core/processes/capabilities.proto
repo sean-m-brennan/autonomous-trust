@@ -1,4 +1,3 @@
-syntax = "proto3";
 /********************
  *  Copyright 2024 TekFive, Inc. and contributors
  *
@@ -15,8 +14,22 @@ syntax = "proto3";
  *   limitations under the License.
  *******************/
 
-enum AgreementImpl {
-    POW = 0;
-    POS = 1;
-    POA = 2;
-};
+syntax = "proto3";
+
+package autonomous_trust.core.processes;
+
+import "autonomous_trust/core/structures/map.proto";
+
+message Capability {
+  string category = 1;
+  string name = 2;
+  autonomous_trust.core.structures.DataMap arg_types = 3;
+}
+
+message PeerCapabilities {
+  message PeerCapacity {
+    string peer = 1;
+    repeated Capability capability = 2;
+  }
+  repeated PeerCapacity listing = 1;  // map<string, list>
+}

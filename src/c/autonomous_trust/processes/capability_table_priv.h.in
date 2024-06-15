@@ -1,0 +1,37 @@
+/********************
+ *  Copyright 2024 TekFive, Inc. and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
+#ifndef CAPABILITY_TABLE_PRIV_H_IN
+#define CAPABILITY_TABLE_PRIV_H_IN
+
+#include "processes/capabilities.h"
+
+#define QUOTE(x) #x
+
+#define DECLARE_CAPABILITY(cap_name, func, args, arg_num) \
+    {                                                     \
+        .name = QUOTE(cap_name),                          \
+        .num_args = data_size,                            \
+        .local = true,                                    \
+        .function = func,                                 \
+        .arguments = args,                                \
+    },
+
+capability_t capability_table[] = {
+    LIST__DECLARE_CAPABILITY
+};
+
+#endif // CAPABILITY_TABLE_PRIV_H_IN
