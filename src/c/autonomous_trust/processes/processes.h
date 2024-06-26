@@ -25,8 +25,8 @@
 
 struct process_s
 {
-    char name[PROC_NAME_LEN];  // category of process, i.e. identity, network, ...
-    char impl[PROC_NAME_LEN];  // identifier of implementing function
+    char name[PROC_NAME_LEN+1];  // category of process, i.e. identity, network, ...
+    char impl[PROC_NAME_LEN+1];  // identifier of implementing function
     config_t conf;
     map_t *configs;
     tracker_t *subsystems;

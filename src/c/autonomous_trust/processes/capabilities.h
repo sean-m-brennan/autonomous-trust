@@ -21,6 +21,8 @@
 #include <stdarg.h>
 
 #include "structures/map.h"
+#include "structures/array.h"
+#include "utilities/util.h"
 
 #define MAX_CAPABILITIES 128 // # processes beyond required core
 
@@ -28,9 +30,23 @@
 
 #define MAX_ARGS 10
 
-typedef struct capability_s capability_t;
+typedef struct {
+    size_t argc;
+    array_t argv;
+    bool alloc;
+} thread_args_t;
 
-int capability_init(capability_t *capability);
+typedef void (*capability_function_t)(thread_args_t);
+
+typedef struct
+{
+    char name[CAP_NAMELEN+1];
+    map_t arguments; // map of name to data_type_t
+    bool local;
+    capability_function_t function;
+} capability_t;
+
+typedef map_t peer_capabilities_matrix_t;   // map of UUID string to array of capabilities
 
 capability_t *find_capability(const char *name);
 

@@ -20,6 +20,7 @@
 #include <stdint.h>
 
 #include "identity/identity.h"
+#include "identity/group.h"
 #include "identity/peers.h"
 #include "processes/capabilities.h"
 #include "negotiation/task.h"
@@ -42,25 +43,37 @@ typedef enum {
  */
 typedef struct
 {
-    char process[PROC_NAME_LEN];
+    char process[PROC_NAME_LEN+1];
     char *function;  //??
     uint8_t *obj;  // FIXME protobuf obj member, needs max size
     size_t len;
     public_identity_t to_whom;
     public_identity_t from_whom;
     bool encrypt;
-    char return_to[PROC_NAME_LEN];
+    char return_to[PROC_NAME_LEN+1];
 } net_msg_t;
 
 #define SIGNAL_LEN 32
 
 typedef struct
 {
-    char descr[SIGNAL_LEN];
+    char descr[SIGNAL_LEN+1];
     int sig;
 } signal_t;
 
-typedef struct generic_msg_s generic_msg_t;
+typedef struct 
+{
+    long type;
+    size_t size;
+    union {
+        signal_t signal;
+        group_t group;
+        public_identity_t peer;
+        peer_capabilities_matrix_t peer_capabilities;
+        task_t task;
+        net_msg_t net_msg;  // FIXME specific protocols instead
+    } info;
+} generic_msg_t;
 
 size_t message_size(message_type_t type);
 

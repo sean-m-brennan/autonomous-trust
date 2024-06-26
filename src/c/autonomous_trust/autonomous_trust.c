@@ -49,7 +49,7 @@ void user2_handler() { /* do nothing */ }
 
 int set_process_name(const char *name_in)
 {
-    char name[PROC_NAME_LEN] = {0};
+    char name[PROC_NAME_LEN+1] = {0};
     strncpy(name, name_in, PROC_NAME_LEN-1);
     pthread_t tid = pthread_self();
     int err = pthread_setname_np(tid, name);
@@ -95,7 +95,7 @@ int load_configs(char * cfg_dir, map_t *configs, logger_t *logger)
             num_err++;
             continue;
         }
-        char abspath[CFG_PATH_LEN];
+        char abspath[CFG_PATH_LEN+1];
         if (config_absolute_path(filepath, abspath) != 0) {
             log_exception(logger);
             num_err++;
@@ -107,12 +107,12 @@ int load_configs(char * cfg_dir, map_t *configs, logger_t *logger)
 
         if (strncmp(filename, default_tracker_filename, CFG_PATH_LEN) == 0)
             continue;  // skip tracker cfg, already loaded
-        char cfg_name[256] = {0};  // FIXME cfg name len
+        char cfg_name[CFG_NAME_SIZE+1] = {0};
         char *ext = strchr(filename, '.');
         int extlen = 0;
         if (ext != NULL)
             extlen = strlen(ext);
-        strncpy(cfg_name, filename, strlen(filename) - extlen);
+        strncpy(cfg_name, filename, min(255, strlen(filename) - extlen));
         config_t *config = find_configuration(cfg_name);
         if (config == NULL) {
             log_error(logger, "No config for %s\n", cfg_name);
@@ -150,12 +150,12 @@ int register_queues(tracker_t *tracker, const char *main, directory_t *queues, d
         log_exception(logger);
         return -1;
     }
-    char tracker_cfg[CFG_PATH_LEN + 1];
-    if (tracker_config(tracker_cfg) != 0) {
+    char tracker_cfg[CFG_PATH_LEN+1];
+    if (tracker_config(tracker_cfg) < 0) {
         log_exception(logger);
         return -1;
     }
-    if (read_config_file(tracker_cfg, &tracker) != 0) {
+    if (read_config_file(tracker_cfg, tracker) != 0) {
         log_exception(logger);
         return -1;
     }
@@ -194,7 +194,7 @@ int register_queues(tracker_t *tracker, const char *main, directory_t *queues, d
             continue;
         }
 
-        char sname[SIG_NAME_LEN];
+        char sname[SIG_NAME_LEN+1];
         process_name_to_signal(pname, sname);
         data_t *s_dat = string_data(sname, sizeof(sname));
         if (array_append(signals, s_dat) != 0) {
@@ -214,9 +214,9 @@ int run_autonomous_trust(char *q_in, char *q_out,
     // FIXME pass in/register capabilities
     const long cadence = 500000L; // microseconds
     int error = 0;
-    char cfg_dir[256] = {0};
+    char cfg_dir[CFG_PATH_LEN+1] = {0};
     get_cfg_dir(cfg_dir);
-    char data_dir[256] = {0};
+    char data_dir[CFG_PATH_LEN+1] = {0};
     get_data_dir(data_dir);
 
     int fd1 = 0;
@@ -231,22 +231,22 @@ int run_autonomous_trust(char *q_in, char *q_out,
     }
 
     const char *name = "AutonomousTrust";
-    logger_t logger;
+    logger_t logger = {0};
     logger_init(&logger, log_level, log_file);  // FIXME quit if logger fails?
     log_info(&logger, "You are using\033[94m AutonomousTrust\033[00m v%s from\033[96m TekFive\033[00m.\n", VERSION);
     if (set_process_name(name) < 0)
         log_exception(&logger);
     
-    map_t configs;
+    map_t configs= {0};
     int ret = load_configs(cfg_dir, &configs, &logger);
     if (ret < 0)
         return ret;
     if (ret > 0)
         ;  // FIXME handle partial errors ('required' list?)
 
-    tracker_t tracker;
-    directory_t queues;
-    directory_t signals;
+    tracker_t tracker = {0};
+    directory_t queues= {0};
+    directory_t signals= {0};
     ret = register_queues(&tracker, name, &queues, &signals, &logger);
     if (ret < 0)
         return ret;
@@ -271,19 +271,19 @@ int run_autonomous_trust(char *q_in, char *q_out,
         }
         handler_ptr_t runner = find_process(impl);
         if (runner == NULL) {
-            log_error(&logger, "Invalid runner for %s\n", key);
+            log_error(&logger, "Invalid runner for %s (%s)\n", key, impl);
             continue;
         }
         
         log_info(&logger, "%s:  Starting %s:%s ...\n", name, key, impl);
-        process_t proc;
+        process_t proc = {0};
         if (process_init(&proc, key, &configs, &tracker, &logger, NULL) != 0) {
-            log_exception(&logger);
+            log_exception(&logger);  // FIXME return value
             num_err++;
             continue;
         }
 
-        char sig[SIG_NAME_LEN];
+        char sig[SIG_NAME_LEN+1] = {0};
         process_name_to_signal(key, sig);
 
         pid_t pid = runner(&proc, &queues, sig, &logger);  // FIXME ensure child does run fnctn
@@ -299,11 +299,11 @@ int run_autonomous_trust(char *q_in, char *q_out,
     map_end_for_each
     // FIXME deal with partials
 
-    queue_t my_q;
+    queue_t my_q = {0};
     if (messaging_init(name, &my_q) != 0)
         log_exception(&logger);
     messaging_assign(&my_q);
-    queue_t extern_q;
+    queue_t extern_q = {0};
     if (messaging_init(q_in, &my_q) != 0)
         log_exception(&logger);
 
@@ -313,19 +313,23 @@ int run_autonomous_trust(char *q_in, char *q_out,
     array_t unhandled_msgs;
     if (array_init(&unhandled_msgs) != 0)
         log_exception(&logger);
+    sleep(3);  // FIXME
     while (!stop_process)
     {
         // monitor processes for early termination
-        data_t *str_val;
+        data_t *str_val = NULL;
         map_entries_for_each(&procs, key, str_val)
             pid_t pid = atoi(key);
-            char *pname;
+            log_debug(&logger, "Check pid %d\n", pid);
+            char *pname = NULL;
             if (data_string_ptr(str_val, &pname) != 0)
                 log_exception(&logger);
-            int status;
-            waitpid(pid, &status, WNOHANG);
+            int status = 0;
+            pid = waitpid(pid, &status, WNOHANG | WUNTRACED);
+            if (pid == 0)
+                continue;
             bool terminated = false;
-            if (WIFEXITED(status)) {
+            if (WIFEXITED(status)) {  // FIXME wrong
                 terminated = true;
                 log_info(&logger, "%s: Process %s exited normally with status %d\n", name, pname, WEXITSTATUS(status));
             }
@@ -347,19 +351,21 @@ int run_autonomous_trust(char *q_in, char *q_out,
         }
 
         // check for extern messages
-        generic_msg_t task_msg;
+        generic_msg_t task_msg = {0};
         ret = messaging_recv_on(&extern_q, &task_msg);
         if (ret == -1)
             log_exception(&logger);
         else if (ret == 0) {
             if (task_msg.type != TASK) {/*error*/}
-            // FIXME handling tasking from extern
-            // parse task
-            // send task to proper process
+            else {
+                // FIXME handling tasking from extern
+                // parse task
+                // send task to proper process
+            }
         }
 
         // get results from internal procs
-        generic_msg_t result_msg;
+        generic_msg_t result_msg = {0};
         ret = messaging_recv(&result_msg);
         if (ret == -1)
             log_exception(&logger);
@@ -370,7 +376,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
                 log_exception(&logger);
         }
 
-        array_t extern_msgs;
+        array_t extern_msgs = {0};
         if (array_init(&extern_msgs) != 0)
             log_exception(&logger);
         bool do_send = false;
@@ -402,20 +408,22 @@ int run_autonomous_trust(char *q_in, char *q_out,
 
 //signal_quit:
     log_debug(&logger, "Send sig quit\n"); // FIXME
-    data_t *k_val;
-    int index;
+    data_t *k_val = NULL;
+    int index = 0;
     generic_msg_t sig = { .type = SIGNAL, .info.signal = { .descr = {0}, .sig = -1 } };
     strncpy(sig.info.signal.descr, sig_quit, 31);
     array_for_each(&signals, index, k_val)
         char *skey;
         if (data_string_ptr(k_val, &skey) != 0)
             log_exception(&logger);
-        if (messaging_send(skey, SIGNAL, &sig) != 0)
+        int err = messaging_send(skey, SIGNAL, &sig);
+        if (err != 0 && err != ENOENT)
             log_exception(&logger);
+        // ignore otherwise
     array_end_for_each
 
 //cleanup:
-    log_debug(&logger, "Free\n"); // FIXME
+    log_debug(&logger, "Shutdown\n"); // FIXME
     array_free(&signals);
     array_free(&queues);
     tracker_free(&tracker);

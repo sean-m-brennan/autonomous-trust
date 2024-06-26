@@ -88,20 +88,26 @@ size_t map_key2index(map_t *map, map_key_t key)
 
 int reindex(map_t *map)
 {
-    map_item_t *old = calloc(map->capacity, sizeof(map_item_t));
-    if (old == NULL)
-        return SYS_EXCEPTION();
-    memcpy(old, map->items, map->capacity * sizeof(map_item_t));
-    memset(map->items, 0, map->capacity * sizeof(map_item_t));
-    for (size_t i = 0; i < map->capacity; i++)
+    size_t old_capacity = map->capacity;
+    map->capacity = increment_capacity(map->capacity);
+    // use calloc for memory zero-initialization
+    map_item_t *items = calloc(map->capacity, sizeof(map_item_t));
+    //map_item_t *items = realloc(map->items, map->capacity * sizeof(map_item_t));
+    if (items == NULL)
+        return EXCEPTION(ENOMEM);
+    memset(items, 0, map->capacity * sizeof(map_item_t));
+    //memset(items + map->capacity, 0, map->capacity * sizeof(map_item_t));
+    for (size_t i = 0; i < old_capacity; i++)
     {
-        if (old[i].key[0] != 0)
+        map_item_t entry = map->items[i];
+        if (entry.key != NULL && entry.key[0] != 0)
         {
-            size_t idx = map_hash2index(map, old[i].hash);
-            map->items[idx] = old[i];
+            size_t idx = map_hash2index(map, entry.hash);
+            items[idx] = entry;
         }
     }
-    free(old);
+    free(map->items);
+    map->items = items;
     return 0;
 }
 
@@ -162,7 +168,7 @@ int map_get(map_t *map, const map_key_t key, data_t **value)
         if (index >= map->capacity)
             index = 0;
     }
-    return -1;
+    return EXCEPTION(EMAP_NOKEY);
 }
 
 int map_set(map_t *map, const map_key_t key, data_t *value)
@@ -172,12 +178,8 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
 
     if (map->length >= 3 * map->capacity / 4)
     {
-        map->capacity = increment_capacity(map->capacity);
-        map_item_t *items = realloc(map->items, map->capacity * sizeof(map_item_t));
-        if (items == NULL)
-            return EXCEPTION(ENOMEM);
-        map->items = items;
-        reindex(map); // ignore error??
+        if (reindex(map) != 0)
+            return -1;
     }
 
     hash_t hash = nacl_hash(map, key);
@@ -233,7 +235,7 @@ void map_free(map_t *map)
 }
 
 
-int proto_map_sync_out(map_t *map, AutonomousTrust__Core__Structures__DataMap *dmap)
+int map_sync_out(map_t *map, AutonomousTrust__Core__Structures__DataMap *dmap)
 {
     size_t size = map_size(map);
     dmap->map = calloc(size, sizeof(AutonomousTrust__Core__Structures__DataMap__DataMapEntry));
@@ -251,12 +253,14 @@ int proto_map_sync_out(map_t *map, AutonomousTrust__Core__Structures__DataMap *d
     return 0;
 }
 
-void proto_map_free_out_sync(AutonomousTrust__Core__Structures__DataMap *dmap)
+void map_proto_free(AutonomousTrust__Core__Structures__DataMap *dmap)
 {
+    for (int i=0; i<dmap->n_map; i++)
+        data_proto_free(dmap->map[i]->value);
     free(dmap->map);
 }
 
-int proto_map_sync_in(AutonomousTrust__Core__Structures__DataMap *dmap, map_t *map)
+int map_sync_in(AutonomousTrust__Core__Structures__DataMap *dmap, map_t *map)
 {
     for(int i=0; i<dmap->n_map; i++) {
         data_t *elt = malloc(sizeof(data_t));
@@ -273,7 +277,7 @@ int proto_map_sync_in(AutonomousTrust__Core__Structures__DataMap *dmap, map_t *m
     return 0;
 }
 
-void proto_map_free_in_sync(map_t *map)
+/*void proto_map_free_in_sync(map_t *map)
 {
     char *key;
     data_t *elt;
@@ -281,4 +285,4 @@ void proto_map_free_in_sync(map_t *map)
         data_free_in_sync(elt);
     map_end_for_each
     map_free(map);
-}
+}*/

@@ -21,18 +21,8 @@
 
 #define DEBUG_TESTS 0
 
-#if DEBUG_TESTS
-#define ck_assert_int_eq(x, y)
-#define ck_assert_int_ne(x, y)
-#define ck_assert_str_eq(x, y)
-#define ck_assert_ptr_nonnull(x)
-#define ck_assert_ret_ok(x) x
-#define ck_assert_ret_nonzero(x) x
-#else
-#include <check.h>
-#define ck_assert_ret_ok(x) ck_assert_int_eq(0, x)
-#define ck_assert_ret_nonzero(x) ck_assert_int_ne(0, x)
-#endif
+#include "test_setup.h"
+
 
 int first_handle(const process_t *proc, map_t *queues, int signal)
 {
@@ -44,11 +34,8 @@ int second_handle(const process_t *proc, map_t *queues, int signal)
     return 0;
 }
 
-#if DEBUG_TESTS
-void test_process_tracker_write_config()
-#else
-START_TEST(test_process_tracker_write_config)
-#endif
+
+DEFINE_TEST(test_process_tracker_write_config)
 {
     const char *expected = "{\"typename\": \"process_tracker\", \"subsystems\": [{\"network\": \"first\"}, {\"identity\": \"second\"}]}";
     const char *filename = "proc_track_test.cfg.json";
@@ -77,15 +64,9 @@ START_TEST(test_process_tracker_write_config)
 
     ck_assert_str_eq(actual, expected);
 }
-#if !DEBUG_TESTS
-END_TEST
-#endif
+END_TEST_DEFINITION()
 
-#if DEBUG_TESTS
-void test_process_tracker_read_config()
-#else
-START_TEST(test_process_tracker_read_config)
-#endif
+DEFINE_TEST(test_process_tracker_read_config)
 {
     const char *config = "{\"typename\": \"process_tracker\", \"subsystems\": [{\"network\": \"first\"}, {\"identity\": \"second\"}]}";
     const char *filename = "proc_track_test.cfg.json";
@@ -106,37 +87,6 @@ START_TEST(test_process_tracker_read_config)
 
     ck_assert_int_eq(2, map_size(tracker.registry));
 }
-#if !DEBUG_TESTS
-END_TEST
+END_TEST_DEFINITION()
 
-Suite *test_suite(void)
-{
-    Suite *s = suite_create("ProcessTracker");
-    TCase *tc_core = tcase_create("Core");
-
-    tcase_add_test(tc_core, test_process_tracker_write_config);
-    tcase_add_test(tc_core, test_process_tracker_read_config);
-    suite_add_tcase(s, tc_core);
-
-    return s;
-}
-
-int main(void)
-{
-    int number_failed;
-    Suite *s = test_suite();
-    SRunner *sr = srunner_create(s);
-
-    srunner_run_all(sr, CK_VERBOSE);
-    number_failed = srunner_ntests_failed(sr);
-    srunner_free(sr);
-    return (number_failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
-}
-#else
-
-int main(void)
-{
-    test_process_tracker_write_config();
-    test_process_tracker_read_config();
-}
-#endif
+RUN_TESTS(ProcessTracker, test_process_tracker_write_config, test_process_tracker_read_config)

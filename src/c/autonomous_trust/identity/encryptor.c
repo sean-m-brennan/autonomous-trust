@@ -27,8 +27,6 @@
 
 void public_encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
 {
-    encr->proto.hex_seed.data = encr->public_hex;
-    encr->proto.hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
     memset(encr->private, 0, sizeof(encr->private));
     unhexlify(hex_seed, crypto_box_PUBLICKEYBYTES * 2, (unsigned char *)encr->public);
     hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char *)encr->public_hex);
@@ -36,8 +34,6 @@ void public_encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
 
 void encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
 {
-    encr->proto.hex_seed.data = encr->public_hex;
-    encr->proto.hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
     unsigned char seed[crypto_box_SEEDBYTES];
     unhexlify(hex_seed, crypto_box_SEEDBYTES * 2, seed);
     crypto_box_seed_keypair((unsigned char *)encr->public, (unsigned char *)encr->private, seed);

@@ -17,15 +17,17 @@
 #ifndef TASK_H
 #define TASK_H
 
-typedef struct task_s task_t;
+#include "processes/capabilities.h"
+#include "structures/datetime.h"
 
-int task_init(task_t *task);
+typedef struct {
+    capability_t capability;
+    datetime_t when;
+    timedelta_t duration;
+    long timeout;
+    thread_args_t;
+} task_t;
 
 int task_run(task_t *task);
-
-int task_to_proto(const task_t *msg, size_t size, void **data_ptr, size_t *data_len_ptr);
-
-int proto_to_task(uint8_t *data, size_t len, task_t *task);
-
 
 #endif  // TASK_H

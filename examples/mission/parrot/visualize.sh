@@ -8,7 +8,7 @@ drone_dir=/opt/parrot-sphinx/usr/share/sphinx/drones
 firmware_url="https://firmware.parrot.com/Versions/${firmware}/pc/%23latest/images/${firmware}-pc.ext2.zip"
 firmware_dir=${firmware}-pc.ext2.zip
 firmware_loc=$firmware_dir
-if [ !-e $firmware_dir ]; then
+if [ ! -e $firmware_dir ]; then
     firmware_loc=$firmware_url
 fi
 
