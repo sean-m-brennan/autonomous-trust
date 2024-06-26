@@ -24,8 +24,10 @@
 #include <math.h>
 #include <stdlib.h>
 
-#include "datetime.h"
+#include "datetime_priv.h"
 #include "../utilities/util.h"
+
+#define MAX_TZ_OFFSET_STR 12
 
 const double nsec_per_sec = 1000000000.0;
 
@@ -35,40 +37,33 @@ typedef struct
     const char *time_fmt;
 } time_res_config_t;
 
-int datetime_init(datetime_t *dt)
+int datetime_sync_out(datetime_t *dt, AutonomousTrust__Core__Structures__DateTime *proto)
 {
-    AutonomousTrust__Core__Structures__DateTime tmp = AUTONOMOUS_TRUST__CORE__STRUCTURES__DATE_TIME__INIT;
-    memcpy(&dt->proto, &tmp, sizeof(dt->proto));
+    proto->nanosecond = dt->tm_nsec;
+    proto->second = dt->tm_sec;
+    proto->minute = dt->tm_min;
+    proto->hour = dt->tm_hour;
+    proto->day = dt->tm_mday;
+    proto->month = dt->tm_mon;
+    proto->year = dt->tm_year;
+    proto->weekday = dt->tm_wday;
+    proto->day_of_year = dt->tm_yday;
+    proto->utc_offset = dt->tm_tz_offset;
     return 0;
 }
 
-int datetime_sync_out(datetime_t *dt)
+int datetime_sync_in(AutonomousTrust__Core__Structures__DateTime *proto, datetime_t *dt)
 {
-    dt->proto.nanosecond = dt->tm_nsec;
-    dt->proto.second = dt->tm_sec;
-    dt->proto.minute = dt->tm_min;
-    dt->proto.hour = dt->tm_hour;
-    dt->proto.day = dt->tm_mday;
-    dt->proto.month = dt->tm_mon;
-    dt->proto.year = dt->tm_year;
-    dt->proto.weekday = dt->tm_wday;
-    dt->proto.day_of_year = dt->tm_yday;
-    dt->proto.utc_offset = dt->tm_tz_offset;
-    return 0;
-}
-
-int datetime_sync_in(datetime_t *dt)
-{
-    dt->tm_nsec = dt->proto.nanosecond;
-    dt->tm_sec = dt->proto.second;
-    dt->tm_min = dt->proto.minute;
-    dt->tm_hour = dt->proto.hour;
-    dt->tm_mday = dt->proto.day;
-    dt->tm_mon = dt->proto.month;
-    dt->tm_year = dt->proto.year;
-    dt->tm_wday = dt->proto.weekday;
-    dt->tm_yday = dt->proto.day_of_year;
-    dt->tm_tz_offset = dt->proto.utc_offset;
+    dt->tm_nsec = proto->nanosecond;
+    dt->tm_sec = proto->second;
+    dt->tm_min = proto->minute;
+    dt->tm_hour = proto->hour;
+    dt->tm_mday = proto->day;
+    dt->tm_mon = proto->month;
+    dt->tm_year = proto->year;
+    dt->tm_wday = proto->weekday;
+    dt->tm_yday = proto->day_of_year;
+    dt->tm_tz_offset = proto->utc_offset;
     return 0;
 }
 
@@ -96,7 +91,7 @@ time_res_config_t set_time_resolution(time_resolution_t res)
 
 int str_to_offset(const char *str, float *offset)  // FIXME different sig for errors
 {
-    char s[256] = {0};
+    char s[MAX_TZ_OFFSET_STR+1] = {0};
     strcpy(s, str);
     char *first = strchr(s, ':');
     if (first == NULL)
@@ -140,7 +135,7 @@ int datetime_strftime_res(const datetime_t *dt, const char *format, const time_r
     time_res_config_t res_cfg = set_time_resolution(tr);
     struct tm *tm = (struct tm *)dt;
 
-    char tz[32] = {0};
+    char tz[MAX_TZ_OFFSET_STR+1] = {0};
     if (dt->tm_utc)
         strcpy(tz, "Z");
     else
@@ -148,7 +143,7 @@ int datetime_strftime_res(const datetime_t *dt, const char *format, const time_r
 
     int ns = (dt->tm_nsec / nsec_per_sec) * res_cfg.res;
 
-    char fmt[256] = {0};
+    char fmt[MAX_DT_STR+1] = {0};
     strncpy(fmt, format, 255);
     size_t fmt_size = strlen(fmt);
 
@@ -260,26 +255,19 @@ int datetime_now(bool local, datetime_t *dt)
     return datetime_from_time(now, ts.tv_nsec, local, dt);
 }
 
-int timedelta_init(timedelta_t *td)
+int timedelta_sync_out(timedelta_t *td, AutonomousTrust__Core__Structures__TimeDelta *proto)
 {
-    AutonomousTrust__Core__Structures__TimeDelta tmp = AUTONOMOUS_TRUST__CORE__STRUCTURES__TIME_DELTA__INIT;
-    memcpy(&td->proto, &tmp, sizeof(td->proto));
+    proto->days = td->days;
+    proto->seconds = td->seconds;
+    proto->nanoseconds = td->nsecs;
     return 0;
 }
 
-int timedelta_sync_out(timedelta_t *td)
+int timedelta_sync_in(AutonomousTrust__Core__Structures__TimeDelta *proto, timedelta_t *td)
 {
-    td->proto.days = td->days;
-    td->proto.seconds = td->seconds;
-    td->proto.nanoseconds = td->nsecs;
-    return 0;
-}
-
-int timedelta_sync_in(timedelta_t *td)
-{
-    td->days = td->proto.days;
-    td->seconds = td->proto.seconds;
-    td->nsecs = td->proto.nanoseconds;
+    td->days = proto->days;
+    td->seconds = proto->seconds;
+    td->nsecs = proto->nanoseconds;
     return 0;
 }
 

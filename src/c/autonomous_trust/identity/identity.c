@@ -28,31 +28,16 @@
 
 #include "identity_priv.h"
 
-int public_identity_init(public_identity_t *identity)
-{
-    AutonomousTrust__Core__Identity__Identity tmp = AUTONOMOUS_TRUST__CORE__IDENTITY__IDENTITY__INIT;
-    memcpy(&identity->proto, &tmp, sizeof(identity->proto)); // dumb initialization workaround
-    identity->proto.uuid.data = identity->uuid;
-    identity->proto.uuid.len = sizeof(uuid_t);
-    identity->proto.address = identity->address;
-    identity->proto.fullname = identity->fullname;
-    identity->proto.signature->hex_seed.data = identity->signature.public_hex;
-    identity->proto.signature->hex_seed.len = identity->signature.proto.hex_seed.len;
-    identity->proto.encryptor->hex_seed.data = identity->encryptor.public_hex;
-    identity->proto.encryptor->hex_seed.len = identity->encryptor.proto.hex_seed.len;
-    return 0;
-}
 
-int identity_create(char *address, char *fullname, identity_t **ident)
-{ // FIXME address + 4 names
-    if (sodium_init() < 0)
-    {
-        exit(-1); // FIXME logging?
-    }
-    *ident = calloc(1, sizeof(identity_t));
-    identity_t *identity = *ident;
-    if (identity == NULL)
-        return EXCEPTION(ENOMEM);
+int identity_init(uuid_t *uuid, char *address, char *fullname, identity_t *identity)
+{
+    if (uuid == NULL)
+        uuid_generate((unsigned char *)identity->uuid);
+    else
+        memcpy(&identity->uuid, uuid, sizeof(uuid_t));
+
+    strncpy(identity->address, address, ADDR_LEN);
+    strncpy(identity->fullname, fullname, NAME_LEN);
 
     unsigned char *sseed = signature_generate();
     if (sseed == NULL)
@@ -66,10 +51,21 @@ int identity_create(char *address, char *fullname, identity_t **ident)
     encryptor_init(&identity->encryptor, eseed);
     free(eseed);
 
-    uuid_generate((unsigned char *)identity->uuid);
-
-    public_identity_init((public_identity_t *)identity);
     return 0;
+}
+
+int identity_create(uuid_t *uuid, char *address, char *fullname, identity_t **ident)
+{ // FIXME address + 4 names
+    if (sodium_init() < 0)
+    {
+        exit(-1); // FIXME logging?
+    }
+    *ident = calloc(1, sizeof(identity_t));
+    identity_t *identity = *ident;
+    if (identity == NULL)
+        return EXCEPTION(ENOMEM);
+
+    return identity_init(uuid, address, fullname, identity);
 }
 
 int identity_publish(const identity_t *ident, public_identity_t **pub_copy)
@@ -92,7 +88,7 @@ int identity_publish(const identity_t *ident, public_identity_t **pub_copy)
     public_encryptor_init(&newIdent->encryptor, eseed);
     free(eseed);
 
-    public_identity_init(newIdent);
+    //public_identity_init(newIdent);
     return 0;
 }
 
@@ -123,7 +119,7 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr)
     json_t *obj = *obj_ptr;
     if (obj == NULL)
         return ENOMEM;
-    char uuid_str[37] = {0};
+    char uuid_str[UUID_STRING_LEN+1] = {0};
     uuid_unparse(ident->uuid, uuid_str);
     json_object_set(obj, "uuid", json_string(uuid_str));
     json_object_set(obj, "rank", json_integer(ident->rank));
@@ -162,19 +158,60 @@ int identity_from_json(const json_t *obj, void *data_struct)
     signature_init(&ident->signature, seed); // decoded
     seed = (uint8_t *)json_object_get(json_object_get(obj, "encryptor"), "hex_seed");
     encryptor_init(&ident->encryptor, seed); // decoded
-    public_identity_init((public_identity_t *)ident);
     return 0;
 }
 
 DECLARE_CONFIGURATION(identity, sizeof(identity_t), identity_to_json, identity_from_json);
 
-int peer_to_proto(const public_identity_t *msg, void **data_ptr, size_t *data_len_ptr)
+int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core__Identity__Identity *proto)
 {
-    *data_len_ptr = autonomous_trust__core__identity__identity__get_packed_size(&msg->proto);
+    AutonomousTrust__Core__Identity__Identity tmp = AUTONOMOUS_TRUST__CORE__IDENTITY__IDENTITY__INIT;
+    memcpy(proto, &tmp, sizeof(tmp)); // dumb initialization workaround
+    proto->uuid.data = identity->uuid;
+    proto->uuid.len = sizeof(uuid_t);
+    proto->address = identity->address;
+    proto->fullname = identity->fullname;
+
+    proto->signature = malloc(sizeof(AutonomousTrust__Core__Identity__Signature));
+    AutonomousTrust__Core__Identity__Signature tmp_s = AUTONOMOUS_TRUST__CORE__IDENTITY__SIGNATURE__INIT;
+    memcpy(proto->signature, &tmp_s, sizeof(tmp_s));
+    proto->signature->hex_seed.data = identity->signature.public_hex;
+    proto->signature->hex_seed.len = crypto_sign_PUBLICKEYBYTES * 2;
+
+    proto->encryptor = malloc(sizeof(AutonomousTrust__Core__Identity__Encryptor));
+    AutonomousTrust__Core__Identity__Encryptor tmp_e = AUTONOMOUS_TRUST__CORE__IDENTITY__ENCRYPTOR__INIT;
+    memcpy(proto->encryptor, &tmp_e, sizeof(tmp_e));
+    proto->encryptor->hex_seed.data = identity->encryptor.public_hex;
+    proto->encryptor->hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
+    return 0;
+}
+
+int public_identity_sync_in(AutonomousTrust__Core__Identity__Identity *proto, public_identity_t *identity)
+{
+    memcpy(&identity->uuid, proto->uuid.data, sizeof(uuid_t));
+    strncpy(identity->address, proto->address, ADDR_LEN);
+    strncpy(identity->fullname, proto->fullname, NAME_LEN);
+    memcpy(identity->signature.public_hex, proto->signature->hex_seed.data, crypto_sign_PUBLICKEYBYTES * 2);
+    memcpy(identity->encryptor.public_hex, proto->encryptor->hex_seed.data, crypto_box_PUBLICKEYBYTES * 2);
+    return 0;
+}
+
+void public_identity_proto_free(AutonomousTrust__Core__Identity__Identity *proto)
+{
+    free(proto->signature);
+    free(proto->encryptor);
+}
+
+int peer_to_proto(public_identity_t *msg, void **data_ptr, size_t *data_len_ptr)
+{
+    AutonomousTrust__Core__Identity__Identity proto;
+    public_identity_sync_out(msg, &proto);
+    *data_len_ptr = autonomous_trust__core__identity__identity__get_packed_size(&proto);
     *data_ptr = malloc(*data_len_ptr);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
-    autonomous_trust__core__identity__identity__pack(&msg->proto, *data_ptr);
+    autonomous_trust__core__identity__identity__pack(&proto, *data_ptr);
+    public_identity_proto_free(&proto);
     return 0;
 }
 
@@ -182,7 +219,7 @@ int proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer)
 {
     AutonomousTrust__Core__Identity__Identity *msg =
         autonomous_trust__core__identity__identity__unpack(NULL, len, data);
-    memcpy(&peer->proto, msg, sizeof(peer->proto));
+    public_identity_sync_in(msg, peer);
     free(msg);
     return 0;
 }

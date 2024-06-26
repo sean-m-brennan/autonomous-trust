@@ -110,8 +110,8 @@ int array_set(array_t *a, int index, data_t *element)
         return EXCEPTION(EARR_OOB);
 
     if (index == a->size) {
-        if (a->size > 0) {
-            size_t new_size = (a->size + 1) * sizeof(data_t*);
+        if (a->size > 0 || a->array == NULL) {
+            size_t new_size = (a->size + 1) * sizeof(data_t);
             data_t **bigger_array = realloc(a->array, new_size);
             if (bigger_array == NULL)
                 return EXCEPTION(ENOMEM);
@@ -146,7 +146,7 @@ void array_free(array_t *a)
         free(a);
 }
 
-int proto_repeated_sync_out(array_t *array, AutonomousTrust__Core__Structures__Data **parr, size_t *n)
+int array_sync_out(array_t *array, AutonomousTrust__Core__Structures__Data **parr, size_t *n)
 {
     parr = calloc(array->size, sizeof(AutonomousTrust__Core__Structures__Data));
     *n = array->size;
@@ -159,12 +159,12 @@ int proto_repeated_sync_out(array_t *array, AutonomousTrust__Core__Structures__D
     return 0;
 }
 
-void proto_repeated_free_out_sync(AutonomousTrust__Core__Structures__Data **parr)
+void array_proto_free(AutonomousTrust__Core__Structures__Data **parr)
 {
     free(parr);
 }
 
-int proto_repeated_sync_in(AutonomousTrust__Core__Structures__Data **parr, size_t n, array_t *array)
+int array_sync_in(AutonomousTrust__Core__Structures__Data **parr, size_t n, array_t *array)
 {
     for(int i=0; i<n; i++) {
         data_t *elt = malloc(sizeof(data_t));
@@ -177,7 +177,7 @@ int proto_repeated_sync_in(AutonomousTrust__Core__Structures__Data **parr, size_
     return 0;
 }
 
-void proto_repeated_free_in_sync(array_t *array)
+/*void proto_repeated_free_in_sync(array_t *array)
 {
     for(int i=0; i<array->size; i++) {
         data_t *elt;
@@ -186,4 +186,4 @@ void proto_repeated_free_in_sync(array_t *array)
         data_free_in_sync(elt);
     }
     array_free(array);
-}
+}*/

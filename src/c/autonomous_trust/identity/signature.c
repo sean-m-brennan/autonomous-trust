@@ -27,8 +27,6 @@
 
 void public_signature_init(signature_t *sig, const unsigned char *hex_seed)
 {
-    sig->proto.hex_seed.data = sig->public_hex;
-    sig->proto.hex_seed.len = crypto_sign_PUBLICKEYBYTES * 2;
     memset(sig->private, 0, sizeof(sig->private));
     unhexlify(hex_seed, crypto_sign_PUBLICKEYBYTES * 2, (unsigned char *)sig->public);
     hexlify(sig->public, crypto_sign_PUBLICKEYBYTES, (unsigned char *)sig->public_hex);
@@ -36,8 +34,6 @@ void public_signature_init(signature_t *sig, const unsigned char *hex_seed)
 
 void signature_init(signature_t *sig, const unsigned char *hex_seed)
 {
-    sig->proto.hex_seed.data = sig->public_hex;
-    sig->proto.hex_seed.len = crypto_sign_PUBLICKEYBYTES * 2;
     unsigned char seed[crypto_sign_SEEDBYTES];
     unhexlify(hex_seed, crypto_sign_SEEDBYTES * 2, seed);
     crypto_sign_seed_keypair((unsigned char *)sig->public, (unsigned char *)sig->private, seed);
@@ -69,5 +65,6 @@ unsigned char *signature_generate()
     hexlify(key, crypto_sign_SEEDBYTES, hex);
     return hex;
 }
+
 
 #endif // SIGNATURE_I

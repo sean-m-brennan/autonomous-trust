@@ -32,7 +32,7 @@ int main(int argc, char *argv[])
 {
     const long cadence = 500000L; // microseconds
 
-    logger_t log;
+    logger_t log  = {0};
     logger_init(&log, DEBUG, NULL);
 
     char *q_out = (char*)"extern_to_at";

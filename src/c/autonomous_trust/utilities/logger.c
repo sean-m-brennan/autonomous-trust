@@ -111,8 +111,8 @@ void _logging(logger_t *logger_ptr, log_level_t level, const char *srcfile, cons
 
     datetime_t now;
     datetime_now(false, &now);
-    char datetime[512] = {0};
-    datetime_strftime_res(&now, iso8601_format, logger->resolution, datetime, 512);
+    char datetime[MAX_DT_STR+1] = {0};
+    datetime_strftime_res(&now, iso8601_format, logger->resolution, datetime, MAX_DT_STR);
     fprintf(logger->file, "%s", datetime);
 
     if (logger->term)
@@ -140,6 +140,16 @@ const char *_custom_errstr(int num)
 
 void log_exception(logger_t *logger)
 {
+    log_exception_extra(logger, "");
+}
+
+void log_exception_extra(logger_t *logger, const char *fmt, ...)
+{
+    if (_exception.errnum == 0) {
+        _logging(logger, ERROR, "?", -1, "Incorrect exception flagging (unexpected return value)");
+        return;
+    }
+
     // FIXME allow for additional formatted char* info
     const char *err_descr = _custom_errstr(_exception.errnum);
     int gai_max = -1;
@@ -148,5 +158,6 @@ void log_exception(logger_t *logger)
         err_descr = gai_strerror(_exception.errnum);
     if (err_descr == NULL)
         err_descr = strerror(_exception.errnum);
-    _logging(logger, ERROR, _exception.file, _exception.line, "%s\n", err_descr);
+    _logging(logger, ERROR, _exception.file, _exception.line, "%s (%d)\n", err_descr, _exception.errnum);
+    _set_exception(0, 0, "");  // clear
 }

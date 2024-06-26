@@ -28,7 +28,7 @@
 typedef struct
 {
     int fd;
-    char key[MSG_KEY_LEN];
+    char key[MSG_KEY_LEN+1];
 } queue_t;
 
 /**

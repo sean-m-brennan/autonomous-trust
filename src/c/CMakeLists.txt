@@ -36,7 +36,9 @@ set(useful_flags
     -fstack-clash-protection
     -fstack-protector
 )
-add_compile_options(-Wall ${warning_as_error} ${useful_warnings} -fms-extensions ${useful_flags} ${sysroot_flag})
+string(REPLACE ";" " " lib_compile_flags
+        "-Wall ${warning_as_error} ${useful_warnings} -fms-extensions ${useful_flags} ${sysroot_flag}")
+add_compile_options(-Wall -fms-extensions)
 add_link_options(-pthread ${sysroot_flag})
 
 
@@ -122,9 +124,13 @@ set(PROTO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
 set(PROTO_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/protobuf")
 
 set(protos
+    autonomous_trust/core/algorithms/agreement.proto
+    autonomous_trust/core/identity/history.proto
+    autonomous_trust/core/identity/identity.proto
+    autonomous_trust/core/identity/protocol.proto
     autonomous_trust/core/negotiation/task.proto
     autonomous_trust/core/processes/capabilities.proto
-    autonomous_trust/core/identity/identity.proto
+    autonomous_trust/core/structures/dag.proto
     autonomous_trust/core/structures/data.proto
     autonomous_trust/core/structures/datetime.proto
     autonomous_trust/core/structures/map.proto
@@ -196,10 +202,10 @@ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/version.h)
     if (GIT_FOUND AND EXISTS "${top_src_dir}/.git")
         execute_process(COMMAND ${GIT_EXECUTABLE} describe HEAD OUTPUT_VARIABLE TAG OUTPUT_STRIP_TRAILING_WHITESPACE)
         string(REGEX REPLACE "^v" "" VERSION ${TAG})
-	set(REVISION ${VERSION} CACHE STRING "git tag" FORCE)
+        set(REVISION ${VERSION} CACHE STRING "git tag" FORCE)
     else()
         message(WARNING "Git not found, cannot set version info")
-	SET(REVISION "unknown")
+        SET(REVISION "unknown")
     endif()
 endif()  
 
@@ -297,13 +303,17 @@ add_custom_target(proto_python DEPENDS ${proto_py_src})
 # create libraries
 
 add_library(autonomous_trust SHARED ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
+set_target_properties(autonomous_trust PROPERTIES COMPILE_FLAGS "${lib_compile_flags}")
 target_sources(autonomous_trust PUBLIC ${libsrc}
     PUBLIC FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
     )
 
 add_library(autonomous_trust_static STATIC ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
-set_target_properties(autonomous_trust_static PROPERTIES OUTPUT_NAME autonomous_trust)
+set_target_properties(autonomous_trust_static PROPERTIES
+    OUTPUT_NAME autonomous_trust
+    COMPILE_FLAGS "${lib_compile_flags}"
+    )
 target_sources(autonomous_trust PUBLIC ${libsrc}
     PUBLIC FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
@@ -316,7 +326,7 @@ target_sources(autonomous_trust PUBLIC ${libsrc}
 add_executable(at_example example.c)
 target_link_libraries(at_example PRIVATE autonomous_trust_static ${DEPENDENCIES})
 #target_link_libraries(at_example PRIVATE autonomous_trust ${DEPENDENCIES})
-target_compile_options(at_example PRIVATE ${sysroot_flag})
+target_compile_options(at_example PRIVATE -Wall ${sysroot_flag})
 target_link_options(at_example PRIVATE ${sysroot_flag})
 target_link_directories(at_example PRIVATE ${CMAKE_SYSROOT})
 
@@ -325,21 +335,27 @@ target_link_directories(at_example PRIVATE ${CMAKE_SYSROOT})
 # tests
 
 add_executable(rb_test test/rb_test.c)
+set_source_files_properties(test/rb_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rb_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
 add_executable(exception_test test/exception_test.c)
+set_source_files_properties(test/exception_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(exception_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
 add_executable(array_test test/array_test.c)
+set_source_files_properties(test/array_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(array_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
 add_executable(map_test test/map_test.c)
+set_source_files_properties(test/map_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(map_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
 add_executable(logger_test test/logging_test.c)
+set_source_files_properties(test/logging_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(logger_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
 add_executable(proc_track_test test/proc_track_test.c)
+set_source_files_properties(test/proc_track_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(proc_track_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
 enable_testing()

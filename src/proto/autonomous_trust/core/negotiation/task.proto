@@ -23,10 +23,10 @@ import "autonomous_trust/core/structures/datetime.proto";
 import "autonomous_trust/core/structures/data.proto";
 
 message Task {
-  autonomous_trust.core.processes.Capability capability = 1;
-  autonomous_trust.core.structures.DateTime when = 2;
-  autonomous_trust.core.structures.TimeDelta duration = 3;
+  processes.Capability capability = 1;
+  structures.DateTime when = 2;
+  structures.TimeDelta duration = 3;
   uint64 timeout = 4;
-  repeated autonomous_trust.core.structures.Data args = 5;
+  repeated structures.Data args = 5;
   bool flexible = 6;
 }

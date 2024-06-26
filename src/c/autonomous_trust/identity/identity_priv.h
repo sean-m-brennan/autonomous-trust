@@ -29,8 +29,8 @@ struct identity_s
 {
     public_identity_t;
     int rank;
-    char nickname[NAME_LEN];
-    char petname[NAME_LEN];
+    char nickname[NAME_LEN+1];
+    char petname[NAME_LEN+1];
     block_impl_t block;
 };
 

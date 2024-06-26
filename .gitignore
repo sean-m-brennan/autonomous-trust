@@ -26,6 +26,8 @@
 /doc/presentation/notes
 /doc/pitch/count.txt
 
+**/attic
+
 **/__pycache__
 **/*.egg-info
 **/.tox

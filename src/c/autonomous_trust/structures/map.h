@@ -19,6 +19,7 @@
 
 #include "array.h"
 #include "data.h"
+#include "utilities/exception.h"
 
 typedef char *map_key_t;
 
@@ -143,5 +144,8 @@ int map_remove(map_t *map, map_key_t key);
  * @param map
  */
 void map_free(map_t *map);
+
+#define EMAP_NOKEY 218
+DECLARE_ERROR(EMAP_NOKEY, "No such key in the map");
 
 #endif // MAP_H
