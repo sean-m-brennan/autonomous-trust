@@ -14,8 +14,8 @@
  *   limitations under the License.
  *******************/
 
-#ifndef MAP_PRIV
-#define MAP_PRIV
+#ifndef MAP_PRIV_H
+#define MAP_PRIV_H
 
 #include <stddef.h>
 
@@ -36,12 +36,12 @@ struct map_s
 };
 
 
-int proto_map_sync_out(map_t *map, AutonomousTrust__Core__Structures__DataMap *dmap);
+int map_sync_out(map_t *map, AutonomousTrust__Core__Structures__DataMap *dmap);
 
-void proto_map_free_out_sync(AutonomousTrust__Core__Structures__DataMap *dmap);
+void map_proto_free(AutonomousTrust__Core__Structures__DataMap *dmap);
 
-int proto_map_sync_in(AutonomousTrust__Core__Structures__DataMap *dmap, map_t *map);
+int map_sync_in(AutonomousTrust__Core__Structures__DataMap *dmap, map_t *map);
 
-void proto_map_free_in_sync(map_t *map);
+//void proto_map_free_in_sync(map_t *map);
 
-#endif // MAP_PRIV
+#endif  // MAP_PRIV_H

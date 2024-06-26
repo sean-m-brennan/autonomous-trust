@@ -49,8 +49,13 @@ int process_init(process_t *proc, char *name, map_t *configurations, tracker_t *
     memset(proc->name, 0, PROC_NAME_LEN);
     memcpy(proc->name, name, PROC_NAME_LEN-1);
     // FIXME general config load/save
-    // configuration_t *cfg = map_get(configurations, proc->cfg_name);
-    // memcpy(&proc->conf, cfg, cfg->size);
+    data_t *cfg_dat;
+    if (map_get(configurations, proc->name, &cfg_dat) != 0)
+        return -1;
+    config_t *cfg;
+    if (data_object_ptr(cfg_dat, (void**)&cfg) != 0)
+        return -1;
+    memcpy(&proc->conf, cfg, sizeof(config_t));
     proc->configs = configurations; // FIXME copy?
     proc->subsystems = subsystems;
     proc->logger = logger;
@@ -83,7 +88,7 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
         {
             data_t *h_dat;
             int err = map_get(proc->protocol.handlers, nmsg->function, &h_dat);
-            if (err != 0)
+            if (err != 0)  // FIXME logging?
                 return false;
             msg_handler_t handler;
             err = data_object_ptr(h_dat, (void*)&handler);
@@ -205,10 +210,11 @@ bool keep_running(const process_t *proc, queue_t *sig_q, logger_t *logger)
         if (err == ENOMSG)
             return true;
         if (buf.type != SIGNAL)
-            log_error(logger, "Non-signal message on signal queue: %d", buf.type);
+            log_error(logger, "Non-signal message on signal queue: %d\n", buf.type);
         else if (msg->descr == sig_quit)
             return false;
-        log_error(logger, "Unhandled signal: %d - %s", msg->sig, msg->descr);
+        else
+            log_error(logger, "Unhandled signal: %d - '%s'\n", msg->sig, msg->descr);
     }
     return true;
 }
@@ -238,7 +244,7 @@ void sleep_until(const process_t *proc, long how_long)
 
 int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
-    char data_path[256];
+    char data_path[MAX_FILENAME+1];
     get_data_dir(data_path);
 
     int fd1 = 0;
@@ -247,6 +253,8 @@ int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_
     if (err != 0)
         return err;
 
+    pid_t pid = getpid();
+    log_debug(logger, "Child pid %d\n", pid);  // FIXME remove
     // FIXME message_init
     queue_t my_q;
     if (messaging_init(proc->name, &my_q) != 0)

@@ -64,11 +64,11 @@ int o_cmp(data_t *a, data_t *b);
 
 int data_sync_out(data_t *data, AutonomousTrust__Core__Structures__Data *pdata);
 
-void data_free_out_sync(AutonomousTrust__Core__Structures__Data *pdata);
+void data_proto_free(AutonomousTrust__Core__Structures__Data *pdata);
 
 int data_sync_in(AutonomousTrust__Core__Structures__Data *pdata, data_t *data);
 
-void data_free_in_sync(data_t *data);
+//void data_free_in_sync(data_t *data);
 
 
 #define EDAT_SER_OBJ 216

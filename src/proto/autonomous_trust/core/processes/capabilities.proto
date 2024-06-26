@@ -23,7 +23,7 @@ import "autonomous_trust/core/structures/map.proto";
 message Capability {
   string category = 1;
   string name = 2;
-  autonomous_trust.core.structures.DataMap arg_types = 3;
+  structures.DataMap arg_types = 3;
 }
 
 message PeerCapabilities {

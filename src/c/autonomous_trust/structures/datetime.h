@@ -22,11 +22,12 @@
 #include <time.h>
 
 #include "utilities/exception.h"
-#include "structures/datetime.pb-c.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define MAX_DT_STR 512
 
 typedef enum {
     MILLISECONDS = 1,
@@ -39,14 +40,7 @@ typedef struct {
     unsigned long tm_nsec;
     float tm_tz_offset;
     bool tm_utc;
-    AutonomousTrust__Core__Structures__DateTime proto;
 } datetime_t;
-
-int datetime_init(datetime_t *dt);
-
-int datetime_sync_out(datetime_t *dt);
-
-int datetime_sync_in(datetime_t *dt);
 
 static const char iso8601_format[] = "%FT%T%f%z";
 
@@ -69,14 +63,7 @@ typedef struct {
     long days;
     unsigned int seconds;
     unsigned int nsecs;
-    AutonomousTrust__Core__Structures__TimeDelta proto;
 } timedelta_t;
-
-int timedelta_init(timedelta_t *timedelta);
-
-int timedelta_sync_out(timedelta_t *td);
-
-int timedelta_sync_in(timedelta_t *td);
 
 // FIXME normalization:
 // timedelta(microseconds=-1) == (days=-1, seconds=86399, ms=999999)

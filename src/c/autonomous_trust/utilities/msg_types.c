@@ -103,7 +103,7 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
 
 int wrap_in_any(message_type_t type, void *data_in, size_t data_in_len, void **data_ptr, size_t *data_len_ptr)
 {
-    Google__Protobuf__Any pb_msg;
+    Google__Protobuf__Any pb_msg = GOOGLE__PROTOBUF__ANY__INIT;
     pb_msg.type_url = message_type_to_string(type);
     pb_msg.value.data = data_in;
     pb_msg.value.len = data_in_len;

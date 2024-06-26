@@ -14,19 +14,19 @@
  *   limitations under the License.
  *******************/
 
-syntax = "proto3";
+#ifndef DATETIME_PRIV_H
+#define DATETIME_PRIV_H
 
-package autonomous_trust.core.negotiation;
+#include "datetime.h"
+#include "structures/datetime.pb-c.h"
 
-import "autonomous_trust/core/processes/capabilities.proto";
-import "autonomous_trust/core/structures/datetime.proto";
-import "autonomous_trust/core/structures/data.proto";
+int datetime_sync_out(datetime_t *dt, AutonomousTrust__Core__Structures__DateTime *proto);
 
-message Task {
-  processes.Capability capability = 1;
-  structures.DateTime when = 2;
-  structures.TimeDelta duration = 3;
-  uint64 timeout = 4;
-  repeated structures.Data args = 5;
-  bool flexible = 6;
-}
+int datetime_sync_in(AutonomousTrust__Core__Structures__DateTime *proto, datetime_t *dt);
+
+
+int timedelta_sync_out(timedelta_t *td, AutonomousTrust__Core__Structures__TimeDelta *proto);
+
+int timedelta_sync_in(AutonomousTrust__Core__Structures__TimeDelta *proto, timedelta_t *td);
+
+#endif  // DATETIME_PRIV_H

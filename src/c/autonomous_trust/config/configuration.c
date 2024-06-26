@@ -113,7 +113,7 @@ int all_config_files(char dir[], array_t *paths)
 
 int config_absolute_path(const char *path_in, char *path_out)
 {
-    char cfg_dir[CFG_PATH_LEN];
+    char cfg_dir[CFG_PATH_LEN+1];
     get_cfg_dir(cfg_dir);  // FIXME error checking?
     if (strncmp(path_in, cfg_dir, strlen(cfg_dir)) != 0) {
         int remain = snprintf(path_out, 255, "%s/%s", cfg_dir, path_in);
@@ -125,7 +125,7 @@ int config_absolute_path(const char *path_in, char *path_out)
 
 int read_config_file(const char *filename, void *data_struct)
 {
-    char typename[CFG_NAME_SIZE] = {0};
+    char typename[CFG_NAME_SIZE+1] = {0};
     json_t *root = json_load_file(filename, 0, NULL);
     if (root == NULL || !json_is_object(root))
         return EXCEPTION(ECFG_BADFMT);
