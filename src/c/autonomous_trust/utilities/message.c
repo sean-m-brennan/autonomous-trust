@@ -39,8 +39,8 @@
 
 int unix_addr(const char *key, struct sockaddr_un *addr)
 {
-    char path[SOCK_PATH_LEN];
-    if (get_data_dir(path) != 0)
+    char path[SOCK_PATH_LEN+1];
+    if (get_data_dir(path) < 0)
         return SYS_EXCEPTION();
     strncat(path, key, SOCK_PATH_LEN - strlen(key) - 1);
 
@@ -59,7 +59,7 @@ int messaging_init(const char *id, queue_t *queue)
 
     struct sockaddr_un local;
     if (unix_addr(id, &local) != 0)
-        return SYS_EXCEPTION();
+        return SYS_EXCEPTION();  // FIXME error success
 
     if (unlink(local.sun_path) != 0)
     {
@@ -105,7 +105,7 @@ int messaging_recv_on(queue_t *q, generic_msg_t *msg) //, struct sockaddr_storag
     if (numbytes < 0)
     {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return EAGAIN;
+            return ENOMSG;
         return SYS_EXCEPTION();
     }
 

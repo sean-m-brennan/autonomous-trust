@@ -1,0 +1,65 @@
+/********************
+ *  Copyright 2024 TekFive, Inc. and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
+syntax = "proto3";
+
+package autonomous_trust.core.identity;
+
+import "autonomous_trust/core/identity/identity.proto";
+import "autonomous_trust/core/identity/history.proto";
+import "autonomous_trust/core/structures/dag.proto";
+import "autonomous_trust/core/processes/capabilities.proto";
+import "autonomous_trust/core/algorithms/agreement.proto";
+
+
+message Announce {  // new node
+  Identity identity = 1;
+  bytes package_hash = 2;
+  repeated processes.Capability capabilities = 3;
+};
+
+message Accept {  // lead peer
+  Identity identity = 1;
+  bytes package_hash = 2;
+  repeated processes.Capability capabilities = 3;
+};
+
+message History {
+  Group group = 1;
+  repeated structures.LinkedStep history = 2;
+};
+
+message HistoryDiff {
+  repeated structures.LinkedStep history = 1;
+};
+
+message ProposePeer {
+  Identity identity = 1;
+};
+
+message Vote {
+  IdBlob obj = 1;
+  algorithms.AgreementProof proof = 2;
+  Signature sig = 3;
+};
+
+message Confirm {
+  IdBlob obj = 1;
+};
+
+message UpdateGroup {
+  Group group = 1;
+};

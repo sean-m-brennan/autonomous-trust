@@ -307,7 +307,7 @@ int data_sync_out(data_t *data, AutonomousTrust__Core__Structures__Data *pdata)
     return 0;
 }
 
-void data_free_out_sync(AutonomousTrust__Core__Structures__Data *pdata)
+void data_proto_free(AutonomousTrust__Core__Structures__Data *pdata)
 {
     switch (pdata->type)
     {
@@ -365,7 +365,7 @@ int data_sync_in(AutonomousTrust__Core__Structures__Data *pdata, data_t *data)
     return 0;
 }
 
-void data_free_in_sync(data_t *data)
+/*void data_free_in_sync(data_t *data)
 {
     switch (data->type)
     {
@@ -384,4 +384,4 @@ void data_free_in_sync(data_t *data)
     default:
         break;
     }
-}
+}*/

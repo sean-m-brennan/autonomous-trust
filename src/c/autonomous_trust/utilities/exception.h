@@ -24,6 +24,8 @@
 extern "C" {
 #endif
 
+#define MAX_FILENAME 256
+
 typedef struct
 {
     int errnum;
@@ -34,7 +36,7 @@ typedef struct
 {
     int errnum;
     size_t line;
-    char file[256];
+    char file[MAX_FILENAME+1];
 } exception_t;
 
 #ifndef EXCEPTION_IMPL

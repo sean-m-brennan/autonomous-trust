@@ -10,7 +10,7 @@ py_marker = '# ******************\n'
 
 
 def py_copy():
-    path = os.path.join(this_dir, 'COPYING')
+    path = os.path.join(this_dir, '..', 'COPYING')
     lines = []
     with open(path, 'r') as f:
         first = True

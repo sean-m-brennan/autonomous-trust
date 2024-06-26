@@ -44,7 +44,7 @@ char *strremove(char *str, const char *sub)
 
 int makedirs(char *path, mode_t mode)
 {
-    char tmp[256];
+    char tmp[MAX_FILENAME+1];
     char *p = NULL;
 
     snprintf(tmp, sizeof(tmp), "%s", path);
