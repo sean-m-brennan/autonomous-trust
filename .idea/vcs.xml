@@ -2,11 +2,10 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/examples/mission/parrot/airsdk-samples" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/examples/mission/parrot/airsdk/build/alchemy" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/examples/mission/parrot/airsdk/build/dragon_build" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/examples/mission/parrot/airsdk/build/dragon_buildext_mission" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/examples/mission/parrot/airsdk/build/dragon_buildext_sign" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/examples/mission/parrot/airsdk/packages/airsdk-samples" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/examples/mission/air/airsdk/build/alchemy" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/examples/mission/air/airsdk/build/dragon_build" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/examples/mission/air/airsdk/build/dragon_buildext_mission" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/examples/mission/air/airsdk/build/dragon_buildext_sign" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/examples/mission/air/airsdk/packages/airsdk-samples" vcs="Git" />
   </component>
 </project>
