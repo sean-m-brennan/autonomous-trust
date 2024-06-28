@@ -1,0 +1,19 @@
+!Cfg:autonomous_trust.core.identity.identity.Identity
+_block_impl: authority
+_encryptor: !Cfg:autonomous_trust.core.identity.encrypt.Encryptor
+  hex_seed: !!binary |
+    MGUwOTY3YmQ4ZjdmMzE2NWExZWY0NDdlOWZjMjM2ZTYzYzdhMjdkOGYxNTk3NWE4ZWExZTMwNjJh
+    MmMyMDIzZA==
+  public_only: false
+_fullname: rc-1262@tekfive.com
+_nickname: Scorch
+_public_only: false
+_rank: 0
+_signature: !Cfg:autonomous_trust.core.identity.sign.Signature
+  hex_seed: !!binary |
+    ZjE0MzAzZjc5M2Y4MTFlYzRkZWExNmNiNjkzYzAwMjdiMTRiNzY1ZDQ5ZTZhZmRhMzM5OWQ3MzAw
+    ZGNlZGQwNw==
+  public_only: false
+_uuid: c7b2c7f1-572f-464d-8661-a736ddba729a
+address: 172.27.3.102
+petname: Delta-62
