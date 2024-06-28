@@ -1,0 +1,10 @@
+!Cfg:autonomous_trust.simulator.peer.peer_metadata.SimMetadata
+data_meta:
+  comm: 10
+  video: 1
+host: simulator
+peer_kind: microdrone
+port: 8778
+position_src_class: autonomous_trust.simulator.peer.peer_metadata.PositionSimSource
+time_src_class: autonomous_trust.simulator.peer.peer_metadata.TimeSimSource
+uuid: 4767eaf1-92e3-4a64-b04e-6384e60802dc
