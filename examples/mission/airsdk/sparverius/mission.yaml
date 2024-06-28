@@ -1,0 +1,63 @@
+api_version: 3
+kind: Mission
+metadata:
+  uid: com.tekfive.missions.sparverius
+  name: sparverius
+  description: Froma very high altitude, the drone keeps all team members in view.
+  version: "0.0.0"
+targets:
+  #Anafi Ai:
+  Anafi Ai Simulator:
+fsup:
+  lang: python
+  depends:
+    - msghub::cv_road
+    - msghub::look_down
+    - msghub::road_following
+guidance:
+  road_following:
+    lang: c++
+    depends:
+      - eigen
+      - libconfig
+      - libconfigreader
+      - libfutils
+      - libguidance-plugin
+      - libmsghub
+      - libparrot-physics
+      - libtelemetry
+      - msghub::road_following
+      - protobuf
+  look_down:
+    lang: python
+  watch_team:
+    lang: python
+msghub:
+  - name: cv_road
+    include_path: sparverius/cv_road
+  - name: look_down
+    include_path: sparverius/guidance/look_down
+  - name: road_following
+    include_path: sparverius/guidance/road_following
+services:
+  cv_road:
+    lang: c++
+    depends:
+      - libconfigreader
+      - libfutils
+      - libmsghub
+      - libtelemetry
+      - libvideo-ipc
+      - libvideo-ipc-client-config
+      - msghub::cv_road
+      - opencv4
+      - protobuf
+  autonomous_trust:
+    lang: c
+    depends:
+      - libautonomous_trust
+      - libuuid
+      - libsodium
+      - libjansson
+      - protobuf
+      - libprotobuf-c
