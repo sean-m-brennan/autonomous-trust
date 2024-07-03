@@ -1,0 +1,8 @@
+!Cfg:autonomous_trust.simulator.peer.peer_metadata.SimMetadata
+data_meta: null
+host: simulator
+peer_kind: jet
+port: 8778
+position_src_class: autonomous_trust.simulator.peer.peer_metadata.PositionSimSource
+time_src_class: autonomous_trust.simulator.peer.peer_metadata.TimeSimSource
+uuid: b305dc70-b39d-4150-aafa-2bfb7fe4dc58

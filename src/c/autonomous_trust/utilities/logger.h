@@ -109,9 +109,13 @@ void _logging(logger_t *logger, log_level_t level, const char *srcfile, const si
 #define log_error(logger, ...) _logging(logger, ERROR, __FILENAME__, __LINE__, __VA_ARGS__)
 #define log_critical(logger, ...) _logging(logger, CRITICAL, __FILENAME__, __LINE__, __VA_ARGS__)
 
-void log_exception(logger_t *logger);
+void _log_exception(logger_t *logger, const char *srcfile, const size_t line);
 
-void log_exception_extra(logger_t *logger, const char *fmt, ...);
+#define log_exception(logger) _log_exception(logger, __FILENAME__, __LINE__)
+
+void _log_exception_extra(logger_t *logger, const char *srcfile, const size_t line, const char *fmt, ...);
+
+#define log_exception_extra(logger, ...) _log_exception_extra(logger, __FILENAME__, __LINE__, __VA_ARGS__)
 
 /**
  * @brief Close the given logger

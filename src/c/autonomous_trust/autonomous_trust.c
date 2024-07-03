@@ -25,6 +25,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <string.h>
+#include <signal.h>
 
 #include "version.h"
 #include "utilities/message.h"
@@ -320,27 +321,35 @@ int run_autonomous_trust(char *q_in, char *q_out,
         data_t *str_val = NULL;
         map_entries_for_each(&procs, key, str_val)
             pid_t pid = atoi(key);
-            log_debug(&logger, "Check pid %d\n", pid);
+            log_debug(&logger, "Check pid %d (%s)\n", pid, key);  // FIXME wrong pid
             char *pname = NULL;
             if (data_string_ptr(str_val, &pname) != 0)
                 log_exception(&logger);
             int status = 0;
-            pid = waitpid(pid, &status, WNOHANG | WUNTRACED);
+            pid = waitpid(pid, &status, WNOHANG | WUNTRACED | WCONTINUED);
             if (pid == 0)
                 continue;
+            if (pid == -1) {
+                SYS_EXCEPTION();
+                log_exception(&logger);
+                continue;
+            }
             bool terminated = false;
             if (WIFEXITED(status)) {  // FIXME wrong
                 terminated = true;
-                log_info(&logger, "%s: Process %s exited normally with status %d\n", name, pname, WEXITSTATUS(status));
+                log_info(&logger, "%s: Process %s exited with status %d\n", name, pname, WEXITSTATUS(status));
             }
             if (WIFSIGNALED(status)) {
                 terminated = true;
                 log_error(&logger, "%s: Process %s terminated by signal %d\n", name, pname, strsignal(WTERMSIG(status)));
             }
-            if (WIFSTOPPED(status))
+            if (WIFSTOPPED(status)) {
                 log_warn(&logger, "%s: Process %s stopped by signal %d\n", name, pname, strsignal(WSTOPSIG(status)));
+                kill(pid, SIGCONT);
+            }
             if (WIFCONTINUED(status))
                 log_warn(&logger, "%s: Process %s continued by signal SIGCONT\n", name, pname);
+            // FIXME restart (limited times)
             if (terminated)
                 active--;
         map_end_for_each

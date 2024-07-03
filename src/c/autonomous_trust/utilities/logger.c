@@ -32,6 +32,11 @@
 
 #define LOGGER_IMPLEMENTATION
 
+#define ERR_INFO_FMT "%s (%d)"
+#define ERR_INFO_LEN (MAX_FILENAME + MAX_INT_STR + 3)
+
+extern exception_t _exception;
+
 logger_t root_logger = {
     .max_level = DEBUG,
     .term = true,
@@ -98,7 +103,7 @@ inline int logger_init_local_time(logger_t *logger, log_level_t max_level, const
     return logger_init_local_time_res(logger, max_level, log_file, MILLISECONDS);
 }
 
-void _logging(logger_t *logger_ptr, log_level_t level, const char *srcfile, const size_t line, const char *fmt, ...)
+void _vlogging(logger_t *logger_ptr, log_level_t level, const char *srcfile, const size_t line, const char *fmt, va_list argp)
 {
     logger_t *logger = logger_ptr;
     if (logger_ptr == NULL)
@@ -121,11 +126,18 @@ void _logging(logger_t *logger_ptr, log_level_t level, const char *srcfile, cons
         fprintf(logger->file, "%-10s", log_level_strings[level]);
 
     fprintf(logger->file, "%s: line %lu: ", srcfile, line);
+
+    vfprintf(logger->file, fmt, argp);
+}
+
+void _logging(logger_t *logger_ptr, log_level_t level, const char *srcfile, const size_t line, const char *fmt, ...)
+{
     va_list argp;
     va_start(argp, fmt);
-    vfprintf(logger->file, fmt, argp);
+    _vlogging(logger_ptr, level, srcfile, line, fmt, argp);
     va_end(argp);
 }
+
 
 const char *_custom_errstr(int num)
 {
@@ -138,19 +150,19 @@ const char *_custom_errstr(int num)
     return NULL;
 }
 
-void log_exception(logger_t *logger)
+
+void _log_exception(logger_t *logger, const char *srcfile, const size_t line)
 {
-    log_exception_extra(logger, "");
+    _log_exception_extra(logger, srcfile, line, "\n");
 }
 
-void log_exception_extra(logger_t *logger, const char *fmt, ...)
+void _log_exception_extra(logger_t *logger, const char *srcfile, const size_t line, const char *fmt, ...)
 {
     if (_exception.errnum == 0) {
         _logging(logger, ERROR, "?", -1, "Incorrect exception flagging (unexpected return value)");
         return;
     }
 
-    // FIXME allow for additional formatted char* info
     const char *err_descr = _custom_errstr(_exception.errnum);
     int gai_max = -1;
     int gai_min = -11;
@@ -158,6 +170,19 @@ void log_exception_extra(logger_t *logger, const char *fmt, ...)
         err_descr = gai_strerror(_exception.errnum);
     if (err_descr == NULL)
         err_descr = strerror(_exception.errnum);
-    _logging(logger, ERROR, _exception.file, _exception.line, "%s (%d)\n", err_descr, _exception.errnum);
+
+    char err_info[ERR_INFO_LEN+1];
+    snprintf(err_info, ERR_INFO_LEN, ERR_INFO_FMT, err_descr, _exception.errnum);
+    const char *addtnl = "\tfrom %s, line %d\n";
+    char *format = malloc(strlen(err_info) + strlen(fmt) + strlen(addtnl) + 1);
+    strcpy(format, err_info);
+    strcat(format, fmt);
+    if (strcmp(srcfile, _exception.file) != 0 || line != _exception.line)
+        strcat(format, addtnl);
+
+    va_list argp;
+    va_start(argp, fmt);
+    _vlogging(logger, ERROR, _exception.file, _exception.line, format, argp);
+    va_end(argp);
     _set_exception(0, 0, "");  // clear
 }

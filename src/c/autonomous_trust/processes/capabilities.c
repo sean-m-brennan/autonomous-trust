@@ -23,8 +23,11 @@
 
 capability_t *find_capability(const char *name)
 {
-    for (int i=0; i<capability_table_size; i++) {
-        capability_t *entry = &capability_table[i];
+    for (int i = 0; i < capability_table_size; i++)
+    {
+        IGNORE_GCC_VER_DIAGNOSTIC(12, -Warray-bounds)
+        capability_t *entry = &(capability_table[i]);
+        END_IGNORE_GCC_DIAGNOSTIC
         if (strncmp(entry->name, name, strlen(name)) == 0)
             return entry;
     }
@@ -82,33 +85,33 @@ int peer_capabilities_sync_out(peer_capabilities_matrix_t *map, AutonomousTrust_
     size_t i = 0;
     map_entries_for_each(map, key, elt)
         AutonomousTrust__Core__Processes__PeerCapabilities__PeerCapacity *entry = proto->listing[i++];
-        entry->peer = key;  // shared, do not free
+    entry->peer = key; // shared, do not free
 
-        void *caps_ptr;
-        if (data_object_ptr(elt, &caps_ptr) != 0)
-            return -1;
-        array_t *caps = caps_ptr;
-        size_t asize = array_size(caps);
-        entry->n_capability = asize;
-        entry->capability = calloc(asize, sizeof(AutonomousTrust__Core__Processes__Capability));
+    void *caps_ptr;
+    if (data_object_ptr(elt, &caps_ptr) != 0)
+        return -1;
+    array_t *caps = caps_ptr;
+    size_t asize = array_size(caps);
+    entry->n_capability = asize;
+    entry->capability = calloc(asize, sizeof(AutonomousTrust__Core__Processes__Capability));
 
-        int index;
-        data_t *cap_dat;
-        array_for_each(caps, index, cap_dat)
-            capability_t *cap;
-            if (data_object_ptr(cap_dat, (void**)&cap) != 0)
-                return -1;
-            capability_sync_out(cap, entry->capability[index]);
-        array_end_for_each
-    map_end_for_each
-    return 0;
+    int index;
+    data_t *cap_dat;
+    array_for_each(caps, index, cap_dat)
+        capability_t *cap;
+    if (data_object_ptr(cap_dat, (void **)&cap) != 0)
+        return -1;
+    capability_sync_out(cap, entry->capability[index]);
+    array_end_for_each
+        map_end_for_each return 0;
 }
 
 void peer_capabilities_proto_free(AutonomousTrust__Core__Processes__PeerCapabilities *proto)
 {
-    for (int i=0; i<proto->n_listing; i++) {
+    for (int i = 0; i < proto->n_listing; i++)
+    {
         AutonomousTrust__Core__Processes__PeerCapabilities__PeerCapacity *entry = proto->listing[i++];
-        for (int j=0; j<entry->n_capability; j++)
+        for (int j = 0; j < entry->n_capability; j++)
             capability_proto_free(entry->capability[j]);
     }
     free(proto->listing);
@@ -129,13 +132,15 @@ int peer_capabilities_to_proto(peer_capabilities_matrix_t *map, void **data_ptr,
 
 int peer_capabilities_sync_in(AutonomousTrust__Core__Processes__PeerCapabilities *proto, peer_capabilities_matrix_t *map)
 {
-    for (int i=0; i<proto->n_listing; i++) {
+    for (int i = 0; i < proto->n_listing; i++)
+    {
         AutonomousTrust__Core__Processes__PeerCapabilities__PeerCapacity *pcaps = proto->listing[i];
         array_t *arr;
         if (array_create(&arr) != 0)
             return -1;
 
-        for (int j=0; j<pcaps->n_capability; j++) {
+        for (int j = 0; j < pcaps->n_capability; j++)
+        {
             capability_t *cap = malloc(sizeof(capability_t));
             if (cap != NULL)
                 return EXCEPTION(ENOMEM);

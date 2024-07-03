@@ -1,0 +1,9 @@
+!Cfg:autonomous_trust.simulator.peer.peer_metadata.SimMetadata
+data_meta:
+  video: 1
+host: simulator
+peer_kind: soldier
+port: 8778
+position_src_class: autonomous_trust.simulator.peer.peer_metadata.PositionSimSource
+time_src_class: autonomous_trust.simulator.peer.peer_metadata.TimeSimSource
+uuid: fc69acad-797a-4e63-be98-2f00ea26dffa
