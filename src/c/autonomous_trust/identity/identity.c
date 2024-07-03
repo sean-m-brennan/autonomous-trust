@@ -151,9 +151,9 @@ int identity_from_json(const json_t *obj, void *data_struct)
     if (uuid_parse(uuid_str, ident->uuid) < 0)
         return -1;
     ident->rank = json_integer_value(json_object_get(obj, "rank"));
-    strncpy(ident->fullname, (char *)json_string_value(json_object_get(obj, "fullname")), sizeof(ident->fullname));
-    strncpy(ident->nickname, (char *)json_string_value(json_object_get(obj, "nickname")), sizeof(ident->nickname));
-    strncpy(ident->petname, (char *)json_string_value(json_object_get(obj, "petname")), sizeof(ident->petname));
+    strncpy(ident->fullname, (char *)json_string_value(json_object_get(obj, "fullname")), sizeof(ident->fullname)-1);
+    strncpy(ident->nickname, (char *)json_string_value(json_object_get(obj, "nickname")), sizeof(ident->nickname)-1);
+    strncpy(ident->petname, (char *)json_string_value(json_object_get(obj, "petname")), sizeof(ident->petname)-1);
     uint8_t *seed = (uint8_t *)json_object_get(json_object_get(obj, "signature"), "hex_seed");
     signature_init(&ident->signature, seed); // decoded
     seed = (uint8_t *)json_object_get(json_object_get(obj, "encryptor"), "hex_seed");

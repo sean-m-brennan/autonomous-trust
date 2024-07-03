@@ -1,0 +1,19 @@
+!Cfg:autonomous_trust.core.identity.identity.Identity
+_block_impl: authority
+_encryptor: !Cfg:autonomous_trust.core.identity.encrypt.Encryptor
+  hex_seed: !!binary |
+    MmJiOTdmYTkwZmFkZWZkNTFjYWM3ZTljMTI4MmExMDFmNGM2MWZlZTM5MWJkOWY0NzA5OTI0NTZm
+    MGJkNjM4Mg==
+  public_only: false
+_fullname: t.p.payne@tekfive.com
+_nickname: SGMPayne
+_public_only: false
+_rank: 0
+_signature: !Cfg:autonomous_trust.core.identity.sign.Signature
+  hex_seed: !!binary |
+    MTIyZTNmNjBjMDU5ZTlhZjc5MDJiY2RjY2ZlYzMxMjZlODRiOTRhZTA3Yzk3ZDM3ZjU4OTBkYTZk
+    NmVmYzljZA==
+  public_only: false
+_uuid: fc69acad-797a-4e63-be98-2f00ea26dffa
+address: 172.27.3.105
+petname: Pain

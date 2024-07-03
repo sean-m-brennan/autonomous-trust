@@ -39,13 +39,15 @@
 
 int unix_addr(const char *key, struct sockaddr_un *addr)
 {
-    char path[SOCK_PATH_LEN+1];
+    char path[SOCK_PATH_LEN] = {};
     if (get_data_dir(path) < 0)
         return SYS_EXCEPTION();
     strncat(path, key, SOCK_PATH_LEN - strlen(key) - 1);
 
     addr->sun_family = AF_UNIX;
-    strncpy(addr->sun_path, path, SOCK_PATH_LEN - 1);
+    IGNORE_GCC_DIAGNOSTIC(-Wstringop-truncation)
+    strncpy(addr->sun_path, path, sizeof(addr->sun_path)-1);
+    END_IGNORE_GCC_DIAGNOSTIC
     return 0;
 }
 
