@@ -5,6 +5,7 @@ if(DEFINED ENV{CONDA_PREFIX})
     set(CMAKE_C_COMPILE_OPTIONS_SYSROOT "--sysroot=")
     set(CMAKE_CXX_COMPILE_OPTIONS_SYSROOT "--sysroot=")
     set(CONDA_SYSROOT ${CONDA_ROOT}/x86_64-conda-linux-gnu/sysroot)
+    set(CMAKE_PREFIX_PATH ${CONDA_SYSROOT})
     #set(CMAKE_SYSROOT ${CONDA_SYSROOT})  # Doesn't work
     set(sysroot_flag --sysroot=${CONDA_SYSROOT})
     message("-- Conda is active; sysroot now at ${CONDA_SYSROOT}")
@@ -76,8 +77,18 @@ else()
 endif()
 
 # protobuf
-find_package(Protobuf REQUIRED)
+find_package(Protobuf REQUIRED)  # paths doesn't work
+#find_path(Protobuf_INCLUDE_DIRS message.h PATH_SUFFIXES google/protobuf PATHS ${CONDA_ROOT})
+#find_library(Protobuf_LIBRARY libprotobuf.so PATHS ${CONDA_ROOT})
 include_directories(${Protobuf_INCLUDE_DIRS})
+#find_program(Protobuf_PROTOC_EXECUTABLE protoc PATHS ${CONDA_ROOT})
+#string(REPLACE "/google/protobuf" "" PROTOBUF_INCLUDE_DIR ${Protobuf_INCLUDE_DIRS})
+#include_directories(${PROTOBUF_INCLUDE_DIR})
+if(Protobuf_LIBRARY)
+    message("-- Found libprotobuf at ${Protobuf_LIBRARY}")
+else()
+    message(FATAL_ERROR "Required dependency libprotobuf not found.")
+endif()
 
 # protobuf-c
 find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c PATHS ${CONDA_ROOT})
@@ -104,6 +115,7 @@ set(DEPENDENCIES
     ${LIBUUID_LIBRARY}
     ${LIBSODIUM_LIBRARY}
     ${Protobuf_LIBRARY}
+    ${LIBPROTOBUF_LIBRARY}
     ${LIBPROTOBUF_C_LIBRARY}
     ${LIBJANSSON_LIBRARY}
     ${CMAKE_THREAD_LIBS_INIT}

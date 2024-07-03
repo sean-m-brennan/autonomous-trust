@@ -25,6 +25,7 @@ extern "C" {
 #endif
 
 #define MAX_FILENAME 256
+#define MAX_INT_STR 11
 
 typedef struct
 {

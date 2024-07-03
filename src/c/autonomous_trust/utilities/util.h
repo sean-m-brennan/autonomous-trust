@@ -20,6 +20,25 @@
 #include <sys/types.h>
 
 #include "exception.h"
+#include "compiler.h"
+
+#if defined __GNUC__
+#define IGNORE_GCC_DIAGNOSTIC(which) \
+    _Pragma("GCC diagnostic push")   \
+        _Pragma(_GCC_DIAGNOSTIC(which))
+
+#define _IGNORE_GCC_DIAGNOSTIC_1(which) IGNORE_GCC_DIAGNOSTIC(which)
+#define _IGNORE_GCC_DIAGNOSTIC_0(which)
+
+#define IGNORE_GCC_VER_DIAGNOSTIC(version, which)   \
+    _GCC_VER_COND(_IGNORE_GCC_DIAGNOSTIC_, version) \
+    (which)
+
+#define END_IGNORE_GCC_DIAGNOSTIC _Pragma("GCC diagnostic pop")
+#else
+#define IGNORE_GCC_DIAGNOSTIC(x)
+#define END_IGNORE_GCC_DIAGNOSTIC
+#endif
 
 #define TERM_RESET "\x1B[0m"
 #define TERM_RED "\x1B[31m"
@@ -59,4 +78,4 @@ DECLARE_ERROR(EJSN_ARR_APP, "JSON error when appending to an array");
 #define EJSN_DUMP 203
 DECLARE_ERROR(EJSN_DUMP, "JSON error dumping to string/file/etc.");
 
-#endif  // UTIL_H
+#endif // UTIL_H
