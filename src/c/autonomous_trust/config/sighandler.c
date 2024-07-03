@@ -63,6 +63,11 @@ void handle_signal(int signum)
             log_error(_logger, "OS error: %s\n", error);
     }
     break;
+    default:
+    {
+        if (_logger != NULL)
+            log_error(_logger, "Unhandled signal: %d\n", signum);
+    }
     }
 }
 

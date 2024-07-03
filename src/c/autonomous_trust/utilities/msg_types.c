@@ -92,7 +92,7 @@ int signal_to_proto(const signal_t *msg, void **data_ptr, size_t *data_len_ptr)
 {
     *data_len_ptr = strlen(msg->descr) + 1;
     *data_ptr = calloc(1, *data_len_ptr);
-    strncpy(*data_ptr, msg->descr, strlen(msg->descr));
+    strcpy(*data_ptr, msg->descr);
     return 0;
 }
 

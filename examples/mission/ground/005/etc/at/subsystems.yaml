@@ -1,0 +1,2 @@
+!!omap [{network: autonomous_trust.core.network.UDPNetworkProcess}, {identity: autonomous_trust.core.identity.IdentityProcess},
+  {negotiation: autonomous_trust.core.negotiation.NegotiationProcess}, {reputation: autonomous_trust.core.reputation.ReputationProcess}]

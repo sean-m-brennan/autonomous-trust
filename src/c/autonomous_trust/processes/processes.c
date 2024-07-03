@@ -35,6 +35,10 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/util.h"
 
+#if !defined(FORK)
+#define FORK 1
+#endif
+
 #define MAX_CLOSE 8192
 
 const char *sig_quit = "quit";
@@ -115,6 +119,7 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
     }
     if (pid != 0) {  // parent
         close(io[1]);
+#if FORK > 1
         int status;
         waitpid(pid, &status, 0);
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
@@ -124,7 +129,11 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
             return gchild;
         }
         close(io[0]);
-        return ECHILD;
+        return EXCEPTION(ECHILD);
+#else
+        close(io[0]);
+        return pid;
+#endif
     }
     close(io[0]);
 
@@ -132,7 +141,8 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
         close(io[1]);
         return SYS_EXCEPTION();
     }
-        
+
+#if FORK > 1        
     pid = fork();
     if (pid == -1) {
         close(io[1]);
@@ -143,6 +153,7 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
         close(io[1]);
         _exit(0);
     }
+#endif
     close(io[1]);
 
     if (!(flags & NO_UMASK))
