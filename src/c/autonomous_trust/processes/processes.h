@@ -34,6 +34,7 @@ struct process_s
     logger_t *logger;
     int flags;
     struct timeval start;
+    handler_ptr_t runner;
     struct
     {
         map_t *handlers;
@@ -45,6 +46,12 @@ struct process_s
         array_t *unhandled_messages;
     } protocol;
 };
+
+#define SIG_NAME_LEN PROC_NAME_LEN + 2
+
+void process_name_to_signal(const char *name, char *sig);
+
+int set_process_name(const char *name_in);
 
 typedef char* queue_id_t;
 typedef array_t directory_t;
@@ -71,7 +78,13 @@ extern const char *sig_quit;
  * @param log_level
  * @return int
  */
-int process_init(process_t *proc, char *name, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies);
+int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies);
+
+int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
+                  map_t *procs, directory_t *queues, logger_t *logger);
+
+int restart_process(pid_t orig, char *pname, map_t *procs, directory_t *queues, logger_t *logger);
+
 
 /**
  * @brief 

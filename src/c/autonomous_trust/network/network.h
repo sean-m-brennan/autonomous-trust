@@ -17,6 +17,12 @@
 #ifndef NETWORK_H
 #define NETWORK_H
 
+#define COMM_PORT 27787
+#define PING_RCV_PORT (COMM_PORT + 2)
+#define PING_SND_PORT (PING_RCV_PORT + 1)
+#define NTP_PORT (COMM_PORT + 4)
+
+
 typedef struct
 {
     /* data from json */

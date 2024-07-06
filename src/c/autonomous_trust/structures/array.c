@@ -146,9 +146,9 @@ void array_free(array_t *a)
         free(a);
 }
 
-int array_sync_out(array_t *array, AutonomousTrust__Core__Structures__Data **parr, size_t *n)
+int array_sync_out(array_t *array, AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t *n)
 {
-    parr = calloc(array->size, sizeof(AutonomousTrust__Core__Structures__Data));
+    parr = calloc(array->size, sizeof(AutonomousTrust__Core__Protobuf__Structures__Data));
     *n = array->size;
     for (int i=0; i<array->size; i++) {
         data_t *elt;
@@ -159,12 +159,12 @@ int array_sync_out(array_t *array, AutonomousTrust__Core__Structures__Data **par
     return 0;
 }
 
-void array_proto_free(AutonomousTrust__Core__Structures__Data **parr)
+void array_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data **parr)
 {
     free(parr);
 }
 
-int array_sync_in(AutonomousTrust__Core__Structures__Data **parr, size_t n, array_t *array)
+int array_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t n, array_t *array)
 {
     for(int i=0; i<n; i++) {
         data_t *elt = malloc(sizeof(data_t));

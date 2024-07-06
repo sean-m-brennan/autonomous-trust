@@ -18,7 +18,7 @@ from collections.abc import Mapping
 import multiprocessing
 
 from .config import Configuration
-from .protobuf import capabilities_pb2
+from .protobuf.processes import capabilities_pb2
 
 
 class Capability(Configuration):

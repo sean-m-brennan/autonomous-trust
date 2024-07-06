@@ -16,20 +16,9 @@
 
 syntax = "proto3";
 
-package autonomous_trust.core.processes;
+package autonomous_trust.core.protobuf.structures;
 
-import "autonomous_trust/core/structures/map.proto";
-
-message Capability {
-  string category = 1;
-  string name = 2;
-  structures.DataMap arg_types = 3;
-}
-
-message PeerCapabilities {
-  message PeerCapacity {
-    string peer = 1;
-    repeated Capability capability = 2;
-  }
-  repeated PeerCapacity listing = 1;  // map<string, list>
-}
+message LinkedStep {
+    bytes uuid = 1;
+    LinkedStep parent = 2;
+};

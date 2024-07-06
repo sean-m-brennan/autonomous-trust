@@ -10,11 +10,11 @@
 #include "capabilities.h"
 
 
-int capability_sync_out(capability_t *capability, AutonomousTrust__Core__Processes__Capability *proto);
+int capability_sync_out(capability_t *capability, AutonomousTrust__Core__Protobuf__Processes__Capability *proto);
 
-void capability_proto_free(AutonomousTrust__Core__Processes__Capability *proto);
+void capability_proto_free(AutonomousTrust__Core__Protobuf__Processes__Capability *proto);
 
-int capability_sync_in(AutonomousTrust__Core__Processes__Capability *proto, capability_t *capability);
+int capability_sync_in(AutonomousTrust__Core__Protobuf__Processes__Capability *proto, capability_t *capability);
 
 int peer_capabilities_to_proto(peer_capabilities_matrix_t *matrix, void **data_ptr, size_t *data_len_ptr);
 

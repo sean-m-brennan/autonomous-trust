@@ -14,18 +14,16 @@
  *   limitations under the License.
  *******************/
 
+#define _GNU_SOURCE  // for pthread_setname_np
 #include <string.h>
-#include <stdio.h>
-#include <unistd.h>
 #include <fcntl.h>
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/msg.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sys/mman.h>
-#include <sys/wait.h>
 #include <sys/time.h>
+#include <pthread.h>
 
 #define PROCESSES_IMPL
 #include "processes/processes.h"
@@ -35,12 +33,6 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/util.h"
 
-#if !defined(FORK)
-#define FORK 1
-#endif
-
-#define MAX_CLOSE 8192
-
 const char *sig_quit = "quit";
 
 const long cadence = 500000L; // microseconds
@@ -48,23 +40,91 @@ const long cadence = 500000L; // microseconds
 
 typedef bool (*msg_handler_t)(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 
-int process_init(process_t *proc, char *name, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies)
+int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies)
 {
     memset(proc->name, 0, PROC_NAME_LEN);
     memcpy(proc->name, name, PROC_NAME_LEN-1);
     // FIXME general config load/save
-    data_t *cfg_dat;
+    config_t *cfg = NULL;
+    data_t *cfg_dat = NULL;
     if (map_get(configurations, proc->name, &cfg_dat) != 0)
         return -1;
-    config_t *cfg;
     if (data_object_ptr(cfg_dat, (void**)&cfg) != 0)
         return -1;
     memcpy(&proc->conf, cfg, sizeof(config_t));
-    proc->configs = configurations; // FIXME copy?
+    proc->configs = configurations;
     proc->subsystems = subsystems;
     proc->logger = logger;
     proc->dependencies = dependencies;
+    proc->runner = runner;
     return map_create(&proc->protocol.handlers); // FIXME protocol from config
+}
+
+int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
+                   map_t *procs, directory_t *queues, logger_t *logger)
+{
+    process_t *proc;
+    if (orig > 0)
+    {
+        char pid_str[32] = {0};
+        snprintf(pid_str, 31, "%d", orig);
+        if (map_remove(procs, pid_str))
+            return -1;
+
+        data_t *proc_val;
+        if (map_get(procs, pname, &proc_val))
+            return -1;
+        if (data_object_ptr(proc_val, (void**)&proc))
+            return -1;
+        log_info(logger, "Restart %s process\n", proc->name);
+    }
+    else
+    {
+        proc = malloc(sizeof(process_t)); // FIXME does this get freed?
+        if (process_init(proc, pname, runner, configs, tracker, logger, NULL) != 0)
+            return -1; // FIXME no such key in the map (EMAP_NOKEY)
+    }
+
+    char sig[SIG_NAME_LEN + 1] = {0};
+    process_name_to_signal(pname, sig);
+
+    pid_t pid = proc->runner(proc, queues, sig, logger); // FIXME ensure child does run fnctn
+
+    // record pids for monitoring
+    char pid_str[32] = {0};
+    snprintf(pid_str, 31, "%d", pid);
+    // data_t *key_val = string_data(pname, strlen(pname));
+    data_t *proc_val = object_ptr_data(proc, sizeof(process_t));
+    if (map_set(procs, pid_str, proc_val) != 0)
+        return -1;
+    return 0;
+}
+
+int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
+                  map_t *procs, directory_t *queues, logger_t *logger)
+{
+    return _process_start(-1, pname, runner, configs, tracker, procs, queues, logger);
+}
+
+int restart_process(pid_t orig, char *pname, map_t *procs, directory_t *queues, logger_t *logger)
+{
+    return _process_start(orig, pname, NULL, NULL, NULL, procs, queues, logger);
+}
+
+void process_name_to_signal(const char *name, char *sig)
+{
+    snprintf(sig, SIG_NAME_LEN, "%s_s", name);
+}
+
+int set_process_name(const char *name_in)
+{
+    char name[PROC_NAME_LEN + 1] = {0};
+    strncpy(name, name_in, PROC_NAME_LEN - 1);
+    pthread_t tid = pthread_self();
+    int err = pthread_setname_np(tid, name);
+    if (err != 0)
+        return EXCEPTION(err);
+    return 0;
 }
 
 inline int process_register_handler(const process_t *proc, char *func_name, handler_ptr_t handler)
@@ -104,107 +164,6 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
     return false;
 }
 
-int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
-{
-    int io[2] = {0};
-    int err = pipe(io);
-    if (err != 0)
-        return SYS_EXCEPTION();
-
-    int pid = fork();
-    if (pid == -1) {
-        close(io[0]);
-        close(io[1]);
-        return SYS_EXCEPTION();
-    }
-    if (pid != 0) {  // parent
-        close(io[1]);
-#if FORK > 1
-        int status;
-        waitpid(pid, &status, 0);
-        if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            pid_t gchild = -1;
-            read(io[0], &gchild, sizeof(int));
-            close(io[0]);
-            return gchild;
-        }
-        close(io[0]);
-        return EXCEPTION(ECHILD);
-#else
-        close(io[0]);
-        return pid;
-#endif
-    }
-    close(io[0]);
-
-    if (setsid() == -1) { // lead new session
-        close(io[1]);
-        return SYS_EXCEPTION();
-    }
-
-#if FORK > 1        
-    pid = fork();
-    if (pid == -1) {
-        close(io[1]);
-        return SYS_EXCEPTION();
-    }
-    if (pid != 0) {  // parent
-        write(io[1], &pid, sizeof(int));
-        close(io[1]);
-        _exit(0);
-    }
-#endif
-    close(io[1]);
-
-    if (!(flags & NO_UMASK))
-        umask(0); // clear
-
-    if (!(flags & NO_CHDIR))
-    {
-        chdir(data_dir);
-    }
-
-    if (!(flags & NO_CLOSE_FILES)) // close all open files
-    {
-        int maxfd = sysconf(_SC_OPEN_MAX);
-        if (maxfd == -1)
-            maxfd = MAX_CLOSE;
-        for (int f_d = 0; f_d < maxfd; f_d++) {
-            if (f_d == STDIN_FILENO || f_d == STDOUT_FILENO || f_d == STDERR_FILENO)
-                continue;
-            close(f_d);
-        }
-    }
-
-    close(STDIN_FILENO);
-
-#if 0 // FIXME
-    if (!(flags & NO_STDOUT_REDIRECT & NO_STDERR_REDIRECT))
-    {
-        // point stdout and/or stderr to /dev/null
-
-        int f_d = open("/dev/null", O_WRONLY);
-        if (f_d == -1)
-            return -1;
-        if (!(flags & NO_STDOUT_REDIRECT))
-        {
-            if (*fd1 = dup2(f_d, STDOUT_FILENO) == -1)
-                return -1;
-            //*fd1 = f_d;
-        }
-        f_d = open("/dev/null", O_WRONLY);
-        if (f_d == -1)
-            return -1;
-         if (!(flags & NO_STDERR_REDIRECT))
-        {
-            if (*fd2 = dup2(f_d, STDERR_FILENO) == -1)  // FIXME fd leaks?
-                return -1;
-            //*fd2 = f_d;
-        }
-    }
-#endif
-    return 0;
-}
 
 bool keep_running(const process_t *proc, queue_t *sig_q, logger_t *logger)
 {

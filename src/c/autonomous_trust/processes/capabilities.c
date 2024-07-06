@@ -34,19 +34,19 @@ capability_t *find_capability(const char *name)
     return NULL;
 }
 
-int capability_sync_out(capability_t *capability, AutonomousTrust__Core__Processes__Capability *proto)
+int capability_sync_out(capability_t *capability, AutonomousTrust__Core__Protobuf__Processes__Capability *proto)
 {
     proto->name = capability->name;
     map_sync_out(&capability->arguments, proto->arg_types);
     return 0;
 }
 
-void capability_proto_free(AutonomousTrust__Core__Processes__Capability *proto)
+void capability_proto_free(AutonomousTrust__Core__Protobuf__Processes__Capability *proto)
 {
     map_proto_free(proto->arg_types);
 }
 
-int capability_sync_in(AutonomousTrust__Core__Processes__Capability *proto, capability_t *capability)
+int capability_sync_in(AutonomousTrust__Core__Protobuf__Processes__Capability *proto, capability_t *capability)
 {
     strncpy(capability->name, proto->name, CAP_NAMELEN);
     map_sync_in(proto->arg_types, &capability->arguments);
@@ -55,36 +55,36 @@ int capability_sync_in(AutonomousTrust__Core__Processes__Capability *proto, capa
 
 int capability_to_proto(capability_t *msg, void **data_ptr, size_t *data_len_ptr)
 {
-    AutonomousTrust__Core__Processes__Capability proto;
+    AutonomousTrust__Core__Protobuf__Processes__Capability proto;
     capability_sync_out(msg, &proto);
-    *data_len_ptr = autonomous_trust__core__processes__capability__get_packed_size(&proto);
+    *data_len_ptr = autonomous_trust__core__protobuf__processes__capability__get_packed_size(&proto);
     *data_ptr = malloc(*data_len_ptr);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
-    autonomous_trust__core__processes__capability__pack(&proto, *data_ptr);
+    autonomous_trust__core__protobuf__processes__capability__pack(&proto, *data_ptr);
     capability_proto_free(&proto);
     return 0;
 }
 
 int proto_to_capability(uint8_t *data, size_t len, capability_t *capability)
 {
-    AutonomousTrust__Core__Processes__Capability *msg =
-        autonomous_trust__core__processes__capability__unpack(NULL, len, data);
+    AutonomousTrust__Core__Protobuf__Processes__Capability *msg =
+        autonomous_trust__core__protobuf__processes__capability__unpack(NULL, len, data);
     capability_sync_in(msg, capability);
     free(msg);
     return 0;
 }
 
-int peer_capabilities_sync_out(peer_capabilities_matrix_t *map, AutonomousTrust__Core__Processes__PeerCapabilities *proto)
+int peer_capabilities_sync_out(peer_capabilities_matrix_t *map, AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities *proto)
 {
     size_t size = map_size(map);
-    proto->listing = calloc(size, sizeof(AutonomousTrust__Core__Structures__DataMap__DataMapEntry));
+    proto->listing = calloc(size, sizeof(AutonomousTrust__Core__Protobuf__Structures__DataMap__DataMapEntry));
     proto->n_listing = size;
     char *key;
     data_t *elt;
     size_t i = 0;
     map_entries_for_each(map, key, elt)
-        AutonomousTrust__Core__Processes__PeerCapabilities__PeerCapacity *entry = proto->listing[i++];
+        AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities__PeerCapacity *entry = proto->listing[i++];
     entry->peer = key; // shared, do not free
 
     void *caps_ptr;
@@ -93,7 +93,7 @@ int peer_capabilities_sync_out(peer_capabilities_matrix_t *map, AutonomousTrust_
     array_t *caps = caps_ptr;
     size_t asize = array_size(caps);
     entry->n_capability = asize;
-    entry->capability = calloc(asize, sizeof(AutonomousTrust__Core__Processes__Capability));
+    entry->capability = calloc(asize, sizeof(AutonomousTrust__Core__Protobuf__Processes__Capability));
 
     int index;
     data_t *cap_dat;
@@ -106,11 +106,11 @@ int peer_capabilities_sync_out(peer_capabilities_matrix_t *map, AutonomousTrust_
         map_end_for_each return 0;
 }
 
-void peer_capabilities_proto_free(AutonomousTrust__Core__Processes__PeerCapabilities *proto)
+void peer_capabilities_proto_free(AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities *proto)
 {
     for (int i = 0; i < proto->n_listing; i++)
     {
-        AutonomousTrust__Core__Processes__PeerCapabilities__PeerCapacity *entry = proto->listing[i++];
+        AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities__PeerCapacity *entry = proto->listing[i++];
         for (int j = 0; j < entry->n_capability; j++)
             capability_proto_free(entry->capability[j]);
     }
@@ -119,22 +119,22 @@ void peer_capabilities_proto_free(AutonomousTrust__Core__Processes__PeerCapabili
 
 int peer_capabilities_to_proto(peer_capabilities_matrix_t *map, void **data_ptr, size_t *data_len_ptr)
 {
-    AutonomousTrust__Core__Processes__PeerCapabilities proto;
+    AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities proto;
     peer_capabilities_sync_out(map, &proto);
-    *data_len_ptr = autonomous_trust__core__processes__peer_capabilities__get_packed_size(&proto);
+    *data_len_ptr = autonomous_trust__core__protobuf__processes__peer_capabilities__get_packed_size(&proto);
     *data_ptr = malloc(*data_len_ptr);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
-    autonomous_trust__core__processes__peer_capabilities__pack(&proto, *data_ptr);
+    autonomous_trust__core__protobuf__processes__peer_capabilities__pack(&proto, *data_ptr);
     peer_capabilities_proto_free(&proto);
     return 0;
 }
 
-int peer_capabilities_sync_in(AutonomousTrust__Core__Processes__PeerCapabilities *proto, peer_capabilities_matrix_t *map)
+int peer_capabilities_sync_in(AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities *proto, peer_capabilities_matrix_t *map)
 {
     for (int i = 0; i < proto->n_listing; i++)
     {
-        AutonomousTrust__Core__Processes__PeerCapabilities__PeerCapacity *pcaps = proto->listing[i];
+        AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities__PeerCapacity *pcaps = proto->listing[i];
         array_t *arr;
         if (array_create(&arr) != 0)
             return -1;
@@ -162,8 +162,8 @@ int peer_capabilities_sync_in(AutonomousTrust__Core__Processes__PeerCapabilities
 
 int proto_to_peer_capabilities(uint8_t *data, size_t len, peer_capabilities_matrix_t *peer_capabilities)
 {
-    AutonomousTrust__Core__Processes__PeerCapabilities *msg =
-        autonomous_trust__core__processes__peer_capabilities__unpack(NULL, len, data);
+    AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities *msg =
+        autonomous_trust__core__protobuf__processes__peer_capabilities__unpack(NULL, len, data);
     peer_capabilities_sync_in(msg, peer_capabilities);
     free(msg);
     return 0;

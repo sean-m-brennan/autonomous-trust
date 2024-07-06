@@ -53,11 +53,11 @@ char *message_type_to_string(message_type_t type)
     case SIGNAL:
         return (char*)"SIGNAL";
     case GROUP:
-        return (char*)autonomous_trust__core__identity__group__descriptor.c_name;
+        return (char*)autonomous_trust__core__protobuf__identity__group__descriptor.c_name;
     case PEER:
-        return (char*)autonomous_trust__core__identity__identity__descriptor.c_name;
+        return (char*)autonomous_trust__core__protobuf__identity__identity__descriptor.c_name;
     case PEER_CAPABILITIES:
-        return (char*)autonomous_trust__core__processes__peer_capabilities__descriptor.c_name;
+        return (char*)autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name;
     case TASK:
         return (char*)"TASK"; // FIXME
     case NET_MESSAGE:
@@ -71,14 +71,14 @@ message_type_t string_to_message_type(const char *str)
 {
     if (strncmp(str, "SIGNAL", strlen("SIGNAL")) == 0)
         return SIGNAL;
-    if (strncmp(str, autonomous_trust__core__identity__group__descriptor.c_name,
-                strlen(autonomous_trust__core__identity__group__descriptor.c_name)) == 0)
+    if (strncmp(str, autonomous_trust__core__protobuf__identity__group__descriptor.c_name,
+                strlen(autonomous_trust__core__protobuf__identity__group__descriptor.c_name)) == 0)
         return GROUP;
-    if (strncmp(str, autonomous_trust__core__identity__identity__descriptor.c_name,
-                strlen(autonomous_trust__core__identity__identity__descriptor.c_name)) == 0)
+    if (strncmp(str, autonomous_trust__core__protobuf__identity__identity__descriptor.c_name,
+                strlen(autonomous_trust__core__protobuf__identity__identity__descriptor.c_name)) == 0)
         return PEER;
-    if (strncmp(str, autonomous_trust__core__processes__peer_capabilities__descriptor.c_name,
-                strlen(autonomous_trust__core__processes__peer_capabilities__descriptor.c_name)) == 0)
+    if (strncmp(str, autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name,
+                strlen(autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name)) == 0)
         return PEER_CAPABILITIES;
     if (strncmp(str, "TASK", strlen("TASK")) == 0) // FIXME
         return TASK;

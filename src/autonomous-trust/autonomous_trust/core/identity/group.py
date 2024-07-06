@@ -22,7 +22,7 @@ from nacl.public import Box
 
 from ..config import InitializableConfig
 from .encrypt import Encryptor
-from ..protobuf import identity_pb2
+from ..protobuf.identity import identity_pb2
 
 
 class Group(InitializableConfig):

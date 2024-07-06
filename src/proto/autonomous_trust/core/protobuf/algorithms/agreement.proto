@@ -16,28 +16,11 @@
 
 syntax = "proto3";
 
-package autonomous_trust.core.structures;
+package autonomous_trust.core.protobuf.algorithms;
 
-enum DataType {
-  NONE = 0;
-  INT = 1;
-  UINT = 2;
-  FLOAT = 3;
-  BOOL = 4;
-  STRING = 5;
-  BYTES = 6;
-  OBJECT= 7;
-}
-
-message Data {
-  DataType type = 1;
-  uint64 size = 2;
-  oneof dat  {
-    int64 intgr = 3;
-    uint64 uintr = 4;
-    double flt_pt = 5;
-    bool bl = 6;
-    string str = 7;
-    bytes byt = 8;
-  };
-}
+message AgreementProof {
+    bytes uuid = 1;
+    bytes digest = 2;  // hash of proposal
+    bool approval = 3;
+    bytes nonce = 4;
+};

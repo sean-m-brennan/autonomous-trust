@@ -32,8 +32,11 @@
 
 #define LOGGER_IMPLEMENTATION
 
-#define ERR_INFO_FMT "%s (%d)"
-#define ERR_INFO_LEN (MAX_FILENAME + MAX_INT_STR + 3)
+#define ERR_INFO_FMT "%s (%s)"
+#define ERR_INFO_LEN (1024 + 64 + 3)
+
+#define ORIGIN_FMT "\tfrom %s, line %ld\n"
+#define ORIGIN_LEN (MAX_FILENAME + MAX_INT_STR + 14)
 
 extern exception_t _exception;
 
@@ -145,6 +148,17 @@ const char *_custom_errstr(int num)
     {
         exception_info_t *entry = &error_table[i];
         if (entry->errnum == num)
+            return entry->errstr;
+    }
+    return NULL;
+}
+
+const char *_custom_errdescr(int num)
+{
+    for (int i = 0; i < error_table_size; i++)
+    {
+        exception_info_t *entry = &error_table[i];
+        if (entry->errnum == num)
             return entry->description;
     }
     return NULL;
@@ -163,21 +177,30 @@ void _log_exception_extra(logger_t *logger, const char *srcfile, const size_t li
         return;
     }
 
-    const char *err_descr = _custom_errstr(_exception.errnum);
+    const char *err_descr = _custom_errdescr(_exception.errnum);
+    const char *err_str = _custom_errstr(_exception.errnum);
     int gai_max = -1;
     int gai_min = -11;
     if (_exception.errnum >= gai_min && _exception.errnum <= gai_max)
         err_descr = gai_strerror(_exception.errnum);
     if (err_descr == NULL)
         err_descr = strerror(_exception.errnum);
+    if (err_str == NULL)
+        err_str = _get_err_str(_exception.errnum);
 
     char err_info[ERR_INFO_LEN+1];
-    snprintf(err_info, ERR_INFO_LEN, ERR_INFO_FMT, err_descr, _exception.errnum);
-    const char *addtnl = "\tfrom %s, line %d\n";
+    snprintf(err_info, ERR_INFO_LEN, ERR_INFO_FMT, err_descr, err_str);
+    bool add_stack = false;
+    char *addtnl = (char*)"";
+    if (strcmp(srcfile, _exception.file) != 0 || line != _exception.line) {
+        add_stack = true;
+        addtnl = malloc(ORIGIN_LEN+1);
+        snprintf(addtnl, ORIGIN_LEN, ORIGIN_FMT, srcfile, line);
+    }
     char *format = malloc(strlen(err_info) + strlen(fmt) + strlen(addtnl) + 1);
     strcpy(format, err_info);
     strcat(format, fmt);
-    if (strcmp(srcfile, _exception.file) != 0 || line != _exception.line)
+    if (add_stack)
         strcat(format, addtnl);
 
     va_list argp;
@@ -185,4 +208,7 @@ void _log_exception_extra(logger_t *logger, const char *srcfile, const size_t li
     _vlogging(logger, ERROR, _exception.file, _exception.line, format, argp);
     va_end(argp);
     _set_exception(0, 0, "");  // clear
+    free(format);
+    if (add_stack)
+        free(addtnl);
 }
