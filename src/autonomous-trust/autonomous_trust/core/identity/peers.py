@@ -15,7 +15,7 @@
 # ******************
 
 from ..config.configuration import Configuration
-from ..protobuf import peers_pb2
+
 
 class Peers(Configuration):
     """
@@ -28,7 +28,7 @@ class Peers(Configuration):
     VALUES = 10
 
     def __init__(self, hierarchy=None, valuation=None):
-        super().__init__(peers_pb2.Peers)
+        #super().__init__(peers_pb2.Peers)
         self.hierarchy = hierarchy
         if hierarchy is None:
             self.hierarchy = [dict({}) for _ in range(self.LEVELS)]

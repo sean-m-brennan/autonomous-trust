@@ -31,11 +31,11 @@ struct array_s
     data_t **array;
 };
 
-int array_sync_out(array_t *array, AutonomousTrust__Core__Structures__Data **parr, size_t *n);
+int array_sync_out(array_t *array, AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t *n);
 
-void array_proto_free(AutonomousTrust__Core__Structures__Data **parr);
+void array_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data **parr);
 
-int array_sync_in(AutonomousTrust__Core__Structures__Data **parr, size_t n, array_t *array);
+int array_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t n, array_t *array);
 
 //void proto_repeated_free_in_sync(array_t *array);
 

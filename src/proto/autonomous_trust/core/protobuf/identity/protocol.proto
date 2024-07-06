@@ -16,13 +16,13 @@
 
 syntax = "proto3";
 
-package autonomous_trust.core.identity;
+package autonomous_trust.core.protobuf.identity;
 
-import "autonomous_trust/core/identity/identity.proto";
-import "autonomous_trust/core/identity/history.proto";
-import "autonomous_trust/core/structures/dag.proto";
-import "autonomous_trust/core/processes/capabilities.proto";
-import "autonomous_trust/core/algorithms/agreement.proto";
+import "autonomous_trust/core/protobuf/algorithms/agreement.proto";
+import "autonomous_trust/core/protobuf/identity/history.proto";
+import "autonomous_trust/core/protobuf/identity/identity.proto";
+import "autonomous_trust/core/protobuf/processes/capabilities.proto";
+import "autonomous_trust/core/protobuf/structures/dag.proto";
 
 
 message Announce {  // new node

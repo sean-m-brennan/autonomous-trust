@@ -18,7 +18,7 @@ from nacl.signing import SigningKey, VerifyKey
 from nacl.encoding import HexEncoder
 
 from ..config.configuration import Configuration
-from ..protobuf import identity_pb2
+from ..protobuf.identity import identity_pb2
 
 class Signature(Configuration):
     def __init__(self, hex_seed, public_only=True):

@@ -36,11 +36,11 @@ struct map_s
 };
 
 
-int map_sync_out(map_t *map, AutonomousTrust__Core__Structures__DataMap *dmap);
+int map_sync_out(map_t *map, AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap);
 
-void map_proto_free(AutonomousTrust__Core__Structures__DataMap *dmap);
+void map_proto_free(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap);
 
-int map_sync_in(AutonomousTrust__Core__Structures__DataMap *dmap, map_t *map);
+int map_sync_in(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap, map_t *map);
 
 //void proto_map_free_in_sync(map_t *map);
 

@@ -20,13 +20,13 @@
 #include "datetime.h"
 #include "structures/datetime.pb-c.h"
 
-int datetime_sync_out(datetime_t *dt, AutonomousTrust__Core__Structures__DateTime *proto);
+int datetime_sync_out(datetime_t *dt, AutonomousTrust__Core__Protobuf__Structures__DateTime *proto);
 
-int datetime_sync_in(AutonomousTrust__Core__Structures__DateTime *proto, datetime_t *dt);
+int datetime_sync_in(AutonomousTrust__Core__Protobuf__Structures__DateTime *proto, datetime_t *dt);
 
 
-int timedelta_sync_out(timedelta_t *td, AutonomousTrust__Core__Structures__TimeDelta *proto);
+int timedelta_sync_out(timedelta_t *td, AutonomousTrust__Core__Protobuf__Structures__TimeDelta *proto);
 
-int timedelta_sync_in(AutonomousTrust__Core__Structures__TimeDelta *proto, timedelta_t *td);
+int timedelta_sync_in(AutonomousTrust__Core__Protobuf__Structures__TimeDelta *proto, timedelta_t *td);
 
 #endif  // DATETIME_PRIV_H

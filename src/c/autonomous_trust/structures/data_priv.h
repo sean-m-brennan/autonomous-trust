@@ -62,11 +62,11 @@ int o_cmp(data_t *a, data_t *b);
         .cmp = s_cmp,     \
     }
 
-int data_sync_out(data_t *data, AutonomousTrust__Core__Structures__Data *pdata);
+int data_sync_out(data_t *data, AutonomousTrust__Core__Protobuf__Structures__Data *pdata);
 
-void data_proto_free(AutonomousTrust__Core__Structures__Data *pdata);
+void data_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data *pdata);
 
-int data_sync_in(AutonomousTrust__Core__Structures__Data *pdata, data_t *data);
+int data_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data *pdata, data_t *data);
 
 //void data_free_in_sync(data_t *data);
 
