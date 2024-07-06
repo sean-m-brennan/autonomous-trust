@@ -16,7 +16,7 @@
 
 syntax = "proto3";
 
-package autonomous_trust.core.structures;
+package autonomous_trust.core.protobuf.structures;
 
 // FIXME this should be an implementation and go away
 

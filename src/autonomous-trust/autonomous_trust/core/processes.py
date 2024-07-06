@@ -32,7 +32,6 @@ from ruamel.yaml import YAML
 
 from .config import Configuration
 from .system import cadence, queue_cadence, now, QueueType
-from .protobuf import processes_pb2
 
 yaml = YAML(typ='safe')
 
@@ -41,7 +40,7 @@ class ProcessTracker(Mapping):
     default_filename = 'subsystems.yaml'
 
     def __init__(self):
-        self.message = processes_pb2.ProcessTracker()
+        #self.message = processes_pb2.ProcessTracker()
         self._classes = []
         self._registry = OrderedDict()
         self._order = []

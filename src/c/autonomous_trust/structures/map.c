@@ -235,32 +235,32 @@ void map_free(map_t *map)
 }
 
 
-int map_sync_out(map_t *map, AutonomousTrust__Core__Structures__DataMap *dmap)
+int map_sync_out(map_t *map, AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap)
 {
     size_t size = map_size(map);
-    dmap->map = calloc(size, sizeof(AutonomousTrust__Core__Structures__DataMap__DataMapEntry));
+    dmap->map = calloc(size, sizeof(AutonomousTrust__Core__Protobuf__Structures__DataMap__DataMapEntry));
     dmap->n_map = size;
 
     char *key;
     data_t *elt;
     size_t i = 0;
     map_entries_for_each(map, key, elt)
-        AutonomousTrust__Core__Structures__DataMap__DataMapEntry *entry = dmap->map[i++];
+        AutonomousTrust__Core__Protobuf__Structures__DataMap__DataMapEntry *entry = dmap->map[i++];
         entry->key = key;  // shared, do not free
-        entry->value = malloc(sizeof(AutonomousTrust__Core__Structures__Data));
+        entry->value = malloc(sizeof(AutonomousTrust__Core__Protobuf__Structures__Data));
         data_sync_out(elt, entry->value);
     map_end_for_each
     return 0;
 }
 
-void map_proto_free(AutonomousTrust__Core__Structures__DataMap *dmap)
+void map_proto_free(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap)
 {
     for (int i=0; i<dmap->n_map; i++)
         data_proto_free(dmap->map[i]->value);
     free(dmap->map);
 }
 
-int map_sync_in(AutonomousTrust__Core__Structures__DataMap *dmap, map_t *map)
+int map_sync_in(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap, map_t *map)
 {
     for(int i=0; i<dmap->n_map; i++) {
         data_t *elt = malloc(sizeof(data_t));

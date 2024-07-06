@@ -16,11 +16,17 @@
 
 syntax = "proto3";
 
-package autonomous_trust.core.algorithms;
+package autonomous_trust.core.protobuf.structures;
 
-message AgreementProof {
-    bytes uuid = 1;
-    bytes digest = 2;  // hash of proposal
-    bool approval = 3;
-    bytes nonce = 4;
-};
+import "autonomous_trust/core/protobuf/structures/data.proto";
+
+/* NB: yes this is available as map<string, Data>,
+   but then the typing is too specific for a generic implementation */
+
+message DataMap {
+  message DataMapEntry {
+    string key = 1;
+    Data value = 2;
+  }
+  repeated DataMapEntry map = 1;
+}

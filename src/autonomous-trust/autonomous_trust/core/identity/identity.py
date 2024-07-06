@@ -26,7 +26,7 @@ from ..system import encoding, agreement_impl
 from ..algorithms.agreement import AgreementVoter
 from .sign import Signature
 from .encrypt import Encryptor
-from ..protobuf import identity_pb2
+from ..protobuf.identity import identity_pb2
 
 class Identity(InitializableConfig, AgreementVoter):
     """

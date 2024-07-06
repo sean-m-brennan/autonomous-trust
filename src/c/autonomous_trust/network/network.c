@@ -14,6 +14,19 @@
  *   limitations under the License.
  *******************/
 
+#include <jansson.h>
 #include "network.h"
 
 // FIXME protobuf between hosts
+
+int network_to_json(const void *data_struct, json_t **obj_ptr)
+{
+    // FIXME
+    return 0;
+}
+
+int network_from_json(const json_t *obj, void *data_struct)
+{
+    // FIXME
+    return 0;
+}

@@ -16,17 +16,20 @@
 
 syntax = "proto3";
 
-package autonomous_trust.core.structures;
+package autonomous_trust.core.protobuf.processes;
 
-import "autonomous_trust/core/structures/data.proto";
+import "autonomous_trust/core/protobuf/structures/map.proto";
 
-/* NB: yes this is available as map<string, Data>,
-   but then the typing is too specific for a generic implementation */
+message Capability {
+  string category = 1;
+  string name = 2;
+  structures.DataMap arg_types = 3;
+}
 
-message DataMap {
-  message DataMapEntry {
-    string key = 1;
-    autonomous_trust.core.structures.Data value = 2;
+message PeerCapabilities {
+  message PeerCapacity {
+    string peer = 1;
+    repeated Capability capability = 2;
   }
-  repeated DataMapEntry map = 1;
+  repeated PeerCapacity listing = 1;  // map<string, list>
 }

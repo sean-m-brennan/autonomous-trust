@@ -18,7 +18,7 @@ import ipaddress
 
 from ..config import InitializableConfig
 from ..system import encoding
-from ..protobuf import network_pb2
+
 
 class Network(InitializableConfig):
     encoding = encoding
