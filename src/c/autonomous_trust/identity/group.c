@@ -96,21 +96,21 @@ int group_from_json(const json_t *obj, void *data_struct)
 
 DECLARE_CONFIGURATION(group, sizeof(group_t), group_to_json, group_from_json);
 
-int group_sync_out(group_t *group, AutonomousTrust__Core__Identity__Group *proto)
+int group_sync_out(group_t *group, AutonomousTrust__Core__Protobuf__Identity__Group *proto)
 {
     proto->uuid.data = group->uuid;
     proto->uuid.len = sizeof(uuid_t);
     proto->address = group->address;
 
-    proto->encryptor = malloc(sizeof(AutonomousTrust__Core__Identity__Encryptor));
-    AutonomousTrust__Core__Identity__Encryptor tmp_e = AUTONOMOUS_TRUST__CORE__IDENTITY__ENCRYPTOR__INIT;
+    proto->encryptor = malloc(sizeof(AutonomousTrust__Core__Protobuf__Identity__Encryptor));
+    AutonomousTrust__Core__Protobuf__Identity__Encryptor tmp_e = AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__ENCRYPTOR__INIT;
     memcpy(proto->encryptor, &tmp_e, sizeof(tmp_e));
     proto->encryptor->hex_seed.data = group->encryptor.public_hex;
     proto->encryptor->hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
     return 0;
 }
 
-int group_sync_in(AutonomousTrust__Core__Identity__Group *proto, group_t *group)
+int group_sync_in(AutonomousTrust__Core__Protobuf__Identity__Group *proto, group_t *group)
 {
     memcpy(group->uuid, proto->uuid.data, sizeof(uuid_t));
     strncpy(group->address, proto->address, ADDR_LEN);
@@ -118,28 +118,28 @@ int group_sync_in(AutonomousTrust__Core__Identity__Group *proto, group_t *group)
     return 0;
 }
 
-void group_proto_free(AutonomousTrust__Core__Identity__Group *proto)
+void group_proto_free(AutonomousTrust__Core__Protobuf__Identity__Group *proto)
 {
     free(proto->encryptor);
 }
 
 int group_to_proto(group_t *msg, void **data_ptr, size_t *data_len_ptr)
 {
-    AutonomousTrust__Core__Identity__Group proto;
+    AutonomousTrust__Core__Protobuf__Identity__Group proto;
     group_sync_out(msg, &proto);
-    *data_len_ptr = autonomous_trust__core__identity__group__get_packed_size(&proto);
+    *data_len_ptr = autonomous_trust__core__protobuf__identity__group__get_packed_size(&proto);
     *data_ptr = malloc(*data_len_ptr);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
-    autonomous_trust__core__identity__group__pack(&proto, *data_ptr);
+    autonomous_trust__core__protobuf__identity__group__pack(&proto, *data_ptr);
     group_proto_free(&proto);
     return 0;
 }
 
 int proto_to_group(uint8_t *data, size_t len, group_t *group)
 {
-    AutonomousTrust__Core__Identity__Group *msg =
-        autonomous_trust__core__identity__group__unpack(NULL, len, data);
+    AutonomousTrust__Core__Protobuf__Identity__Group *msg =
+        autonomous_trust__core__protobuf__identity__group__unpack(NULL, len, data);
     group_sync_in(msg, group);
     free(msg);
     return 0;

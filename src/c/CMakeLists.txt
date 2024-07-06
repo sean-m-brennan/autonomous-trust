@@ -136,17 +136,17 @@ set(PROTO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
 set(PROTO_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/protobuf")
 
 set(protos
-    autonomous_trust/core/algorithms/agreement.proto
-    autonomous_trust/core/identity/history.proto
-    autonomous_trust/core/identity/identity.proto
-    autonomous_trust/core/identity/protocol.proto
-    autonomous_trust/core/negotiation/task.proto
-    autonomous_trust/core/processes/capabilities.proto
-    autonomous_trust/core/structures/dag.proto
-    autonomous_trust/core/structures/data.proto
-    autonomous_trust/core/structures/datetime.proto
-    autonomous_trust/core/structures/map.proto
-    autonomous_trust/core/structures/merkle.proto
+    autonomous_trust/core/protobuf/algorithms/agreement.proto
+    autonomous_trust/core/protobuf/identity/history.proto
+    autonomous_trust/core/protobuf/identity/identity.proto
+    autonomous_trust/core/protobuf/identity/protocol.proto
+    autonomous_trust/core/protobuf/negotiation/task.proto
+    autonomous_trust/core/protobuf/processes/capabilities.proto
+    autonomous_trust/core/protobuf/structures/dag.proto
+    autonomous_trust/core/protobuf/structures/data.proto
+    autonomous_trust/core/protobuf/structures/datetime.proto
+    autonomous_trust/core/protobuf/structures/map.proto
+    autonomous_trust/core/protobuf/structures/merkle.proto
 )
 
 set(google_protos
@@ -175,6 +175,7 @@ set(libsrc
     autonomous_trust/network/net_proc.c
     autonomous_trust/network/network.c
     autonomous_trust/processes/capabilities.c
+    autonomous_trust/processes/daemonize.c
     autonomous_trust/processes/process_tracker.c
     autonomous_trust/processes/processes.c
     autonomous_trust/structures/array.c
@@ -183,6 +184,7 @@ set(libsrc
     autonomous_trust/structures/map.c
     autonomous_trust/structures/merkle.c
     autonomous_trust/structures/redblack.c
+    autonomous_trust/utilities/err_str.c
     autonomous_trust/utilities/exception.c
     autonomous_trust/utilities/logger.c
     autonomous_trust/utilities/message.c
@@ -278,8 +280,7 @@ function(protoc_py_gen _proto _full_proto _dir)
     add_custom_command(
         OUTPUT ${_pb_py_src}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${PROTO_SOURCE_DIR}/py
-        # FIXME discover protoc path
-        COMMAND protoc --python_out=${PROTO_SOURCE_DIR}/py -I${PROTOBUF_INCLUDE_DIR} -I${PROTO_SOURCE_DIR} ${_full_proto}
+        COMMAND ${Protobuf_PROTOC_EXECUTABLE} --python_out=${PROTO_SOURCE_DIR}/py -I${PROTOBUF_INCLUDE_DIR} -I${PROTO_SOURCE_DIR} ${_full_proto}
         COMMAND ${CMAKE_COMMAND} -E touch ${PROTO_SOURCE_DIR}/py/${_dir}/init.py
         COMMENT "Building protocol buffer Python sources from ${_proto}"
         DEPENDS ${_full_proto} ${LIBPROTOBUF_LIBRARY}
@@ -305,7 +306,7 @@ foreach(_proto ${google_protos})
     protoc_c_gen(${_proto} ${_fullproto} ${_dir})
 endforeach()
 
-include_directories(${PROTO_BINARY_DIR} ${PROTO_BINARY_DIR}/autonomous_trust/core)
+include_directories(${PROTO_BINARY_DIR} ${PROTO_BINARY_DIR}/autonomous_trust/core/protobuf)
 
 ## Python will not be built without specifying this target
 add_custom_target(proto_python DEPENDS ${proto_py_src})

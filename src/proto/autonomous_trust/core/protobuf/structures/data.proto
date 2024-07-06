@@ -16,23 +16,28 @@
 
 syntax = "proto3";
 
-package autonomous_trust.core.structures;
+package autonomous_trust.core.protobuf.structures;
 
-message DateTime {
-  uint32 nanosecond = 1;
-  uint32 second = 2;
-  uint32 minute = 3;
-  uint32 hour = 4;
-  uint32 day = 5;  // day of month
-  uint32 month = 6;
-  uint32 year = 7;
-  uint32 weekday = 8;   // day of week, Sunday = 0
-  uint32 day_of_year = 9;   // Jan 1st = 0
-  float utc_offset = 10;
+enum DataType {
+  NONE = 0;
+  INT = 1;
+  UINT = 2;
+  FLOAT = 3;
+  BOOL = 4;
+  STRING = 5;
+  BYTES = 6;
+  OBJECT= 7;
 }
 
-message TimeDelta {
-  sint64 days = 1;
-  uint32 seconds = 2;
-  uint32 nanoseconds = 3;
+message Data {
+  DataType type = 1;
+  uint64 size = 2;
+  oneof dat  {
+    int64 intgr = 3;
+    uint64 uintr = 4;
+    double flt_pt = 5;
+    bool bl = 6;
+    string str = 7;
+    bytes byt = 8;
+  };
 }

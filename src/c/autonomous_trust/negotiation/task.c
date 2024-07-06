@@ -48,17 +48,17 @@ int task_run(task_t *task)
     return 0;
 }
 
-int task_sync_out(task_t *task, AutonomousTrust__Core__Negotiation__Task *proto)
+int task_sync_out(task_t *task, AutonomousTrust__Core__Protobuf__Negotiation__Task *proto)
 {
-    AutonomousTrust__Core__Processes__Capability *cap_proto = malloc(sizeof(AutonomousTrust__Core__Processes__Capability));
+    AutonomousTrust__Core__Protobuf__Processes__Capability *cap_proto = malloc(sizeof(AutonomousTrust__Core__Protobuf__Processes__Capability));
     proto->capability = cap_proto;
     capability_sync_out(&task->capability, proto->capability);
 
-    AutonomousTrust__Core__Structures__DateTime *dt_proto = malloc(sizeof(AutonomousTrust__Core__Structures__DateTime));
+    AutonomousTrust__Core__Protobuf__Structures__DateTime *dt_proto = malloc(sizeof(AutonomousTrust__Core__Protobuf__Structures__DateTime));
     proto->when = dt_proto;
     datetime_sync_out(&task->when, proto->when);
 
-    AutonomousTrust__Core__Structures__TimeDelta *td_proto = malloc(sizeof(AutonomousTrust__Core__Structures__TimeDelta));
+    AutonomousTrust__Core__Protobuf__Structures__TimeDelta *td_proto = malloc(sizeof(AutonomousTrust__Core__Protobuf__Structures__TimeDelta));
     proto->duration = td_proto;
     timedelta_sync_out(&task->duration, proto->duration);
 
@@ -67,7 +67,7 @@ int task_sync_out(task_t *task, AutonomousTrust__Core__Negotiation__Task *proto)
     return 0;
 }
 
-void task_proto_free(AutonomousTrust__Core__Negotiation__Task *proto)
+void task_proto_free(AutonomousTrust__Core__Protobuf__Negotiation__Task *proto)
 {
     capability_proto_free(proto->capability);
     free(proto->capability);
@@ -76,7 +76,7 @@ void task_proto_free(AutonomousTrust__Core__Negotiation__Task *proto)
     array_proto_free(proto->args);
 }
 
-int task_sync_in(AutonomousTrust__Core__Negotiation__Task *proto, task_t *task)
+int task_sync_in(AutonomousTrust__Core__Protobuf__Negotiation__Task *proto, task_t *task)
 {
     capability_sync_in(proto->capability, &task->capability);
     datetime_sync_in(proto->when, &task->when);
@@ -88,21 +88,21 @@ int task_sync_in(AutonomousTrust__Core__Negotiation__Task *proto, task_t *task)
 
 int task_to_proto(task_t *msg, size_t size, void **data_ptr, size_t *data_len_ptr)
 {
-    AutonomousTrust__Core__Negotiation__Task proto;
+    AutonomousTrust__Core__Protobuf__Negotiation__Task proto;
     task_sync_out(msg, &proto);
-    *data_len_ptr = autonomous_trust__core__negotiation__task__get_packed_size(&proto);
+    *data_len_ptr = autonomous_trust__core__protobuf__negotiation__task__get_packed_size(&proto);
     *data_ptr = malloc(*data_len_ptr);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
-    autonomous_trust__core__negotiation__task__pack(&proto, *data_ptr);
+    autonomous_trust__core__protobuf__negotiation__task__pack(&proto, *data_ptr);
     task_proto_free(&proto);
     return 0;
 }
 
 int proto_to_task(uint8_t *data, size_t len, task_t *task)
 {
-    AutonomousTrust__Core__Negotiation__Task *msg =
-        autonomous_trust__core__negotiation__task__unpack(NULL, len, data);
+    AutonomousTrust__Core__Protobuf__Negotiation__Task *msg =
+        autonomous_trust__core__protobuf__negotiation__task__unpack(NULL, len, data);
     task_sync_in(msg, task);
     free(msg);
     return 0;

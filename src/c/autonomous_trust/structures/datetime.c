@@ -37,7 +37,7 @@ typedef struct
     const char *time_fmt;
 } time_res_config_t;
 
-int datetime_sync_out(datetime_t *dt, AutonomousTrust__Core__Structures__DateTime *proto)
+int datetime_sync_out(datetime_t *dt, AutonomousTrust__Core__Protobuf__Structures__DateTime *proto)
 {
     proto->nanosecond = dt->tm_nsec;
     proto->second = dt->tm_sec;
@@ -52,7 +52,7 @@ int datetime_sync_out(datetime_t *dt, AutonomousTrust__Core__Structures__DateTim
     return 0;
 }
 
-int datetime_sync_in(AutonomousTrust__Core__Structures__DateTime *proto, datetime_t *dt)
+int datetime_sync_in(AutonomousTrust__Core__Protobuf__Structures__DateTime *proto, datetime_t *dt)
 {
     dt->tm_nsec = proto->nanosecond;
     dt->tm_sec = proto->second;
@@ -255,7 +255,7 @@ int datetime_now(bool local, datetime_t *dt)
     return datetime_from_time(now, ts.tv_nsec, local, dt);
 }
 
-int timedelta_sync_out(timedelta_t *td, AutonomousTrust__Core__Structures__TimeDelta *proto)
+int timedelta_sync_out(timedelta_t *td, AutonomousTrust__Core__Protobuf__Structures__TimeDelta *proto)
 {
     proto->days = td->days;
     proto->seconds = td->seconds;
@@ -263,7 +263,7 @@ int timedelta_sync_out(timedelta_t *td, AutonomousTrust__Core__Structures__TimeD
     return 0;
 }
 
-int timedelta_sync_in(AutonomousTrust__Core__Structures__TimeDelta *proto, timedelta_t *td)
+int timedelta_sync_in(AutonomousTrust__Core__Protobuf__Structures__TimeDelta *proto, timedelta_t *td)
 {
     td->days = proto->days;
     td->seconds = proto->seconds;

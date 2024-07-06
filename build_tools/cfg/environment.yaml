@@ -10,7 +10,7 @@ dependencies:
   - pynacl
   - python-dateutil
   - ruamel.yaml
-  - protobuf
+  - protobuf>=20.*
   - libprotobuf
   - aenum
   - libsass

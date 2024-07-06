@@ -27,19 +27,21 @@
 
 #include "autonomous_trust.h"
 
-
 int main(int argc, char *argv[])
 {
     const long cadence = 500000L; // microseconds
 
-    logger_t log  = {0};
+    logger_t log = {0};
     logger_init(&log, DEBUG, NULL);
 
-    char *q_out = (char*)"extern_to_at";
-    char *q_in = (char*)"at_to_extern";
+    char *q_out = (char *)"extern_to_at";
+    char *q_in = (char *)"at_to_extern";
     queue_t from_at;
     if (messaging_init(q_in, &from_at) != 0)
         log_exception(&log);
+    //queue_t to_at;
+    //if (messaging_init(q_out, &to_at) != 0)
+    //    log_exception(&log);
 
     // queue names are in reverse order (out here is in there)
     int at_pid = run_autonomous_trust(q_out, q_in, NULL, 0, DEBUG, NULL);
@@ -56,16 +58,25 @@ int main(int argc, char *argv[])
     bool at_alive = true;
     while (!stop_process)
     {
-        int status = 0;
-        waitpid(at_pid, &status, WNOHANG);
-        if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            log_debug(&log, "AT exited\n");
-            stop_process = true;
-            at_alive = false;
+        int err = kill(at_pid, 0);
+        if (err == -1)
+        {
+            if (errno == ESRCH)
+            {
+                log_debug(&log, "AT exited\n");
+                stop_process = true;
+                at_alive = false;
+            }
+            else
+            {
+                SYS_EXCEPTION();
+                log_exception(&log);
+                // FIXME ??
+            }
         }
 
         generic_msg_t buf;
-        int err = messaging_recv(&buf);
+        err = messaging_recv(&buf);
         if (err == -1)
             log_exception(&log);
         if (err == ENOMSG)
@@ -80,7 +91,7 @@ int main(int argc, char *argv[])
         }
         // do other things
 
-snooze:
+    snooze:
         usleep(cadence);
     }
     if (at_alive)

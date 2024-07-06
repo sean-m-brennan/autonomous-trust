@@ -98,6 +98,8 @@ int messaging_recv_on(queue_t *q, generic_msg_t *msg) //, struct sockaddr_storag
 #endif
 
     uint8_t data[MAX_MSG_SIZE];
+    if (q->fd <= 0)
+        return EXCEPTION(ENOTSOCK);  // FIXME Socket operation on non-socket (ENOTSOCK)
     ssize_t numbytes = recvfrom(q->fd, data, sizeof(data), MSG_DONTWAIT,
 #if TRACK_SENDER
                                 (struct sockaddr *)&their_addr, &addr_len);
@@ -106,7 +108,7 @@ int messaging_recv_on(queue_t *q, generic_msg_t *msg) //, struct sockaddr_storag
 #endif
     if (numbytes < 0)
     {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        if (errno == EAGAIN)
             return ENOMSG;
         return SYS_EXCEPTION();
     }

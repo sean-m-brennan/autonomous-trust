@@ -16,11 +16,26 @@
 
 syntax = "proto3";
 
-package autonomous_trust.core.identity;
+package autonomous_trust.core.protobuf.identity;
 
-import "autonomous_trust/core/identity/identity.proto";
+message Encryptor {
+  bytes hex_seed = 1;
+}
 
-message IdBlob {
-    bytes originator = 1;  // uuid
-    Identity identity = 2;
-};
+message Signature {
+  bytes hex_seed = 1;
+}
+
+message Identity {
+  bytes uuid = 1;
+  string address = 2;
+  string fullname = 3;
+  Signature signature = 4;
+  Encryptor encryptor = 5;
+}
+
+message Group {
+  bytes uuid = 1;
+  string address = 2;  // Identity UUID to address
+  Encryptor encryptor = 3;  // group-shared key
+}

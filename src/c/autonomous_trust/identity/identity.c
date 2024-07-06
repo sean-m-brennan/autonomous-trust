@@ -163,30 +163,30 @@ int identity_from_json(const json_t *obj, void *data_struct)
 
 DECLARE_CONFIGURATION(identity, sizeof(identity_t), identity_to_json, identity_from_json);
 
-int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core__Identity__Identity *proto)
+int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core__Protobuf__Identity__Identity *proto)
 {
-    AutonomousTrust__Core__Identity__Identity tmp = AUTONOMOUS_TRUST__CORE__IDENTITY__IDENTITY__INIT;
+    AutonomousTrust__Core__Protobuf__Identity__Identity tmp = AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__IDENTITY__INIT;
     memcpy(proto, &tmp, sizeof(tmp)); // dumb initialization workaround
     proto->uuid.data = identity->uuid;
     proto->uuid.len = sizeof(uuid_t);
     proto->address = identity->address;
     proto->fullname = identity->fullname;
 
-    proto->signature = malloc(sizeof(AutonomousTrust__Core__Identity__Signature));
-    AutonomousTrust__Core__Identity__Signature tmp_s = AUTONOMOUS_TRUST__CORE__IDENTITY__SIGNATURE__INIT;
+    proto->signature = malloc(sizeof(AutonomousTrust__Core__Protobuf__Identity__Signature));
+    AutonomousTrust__Core__Protobuf__Identity__Signature tmp_s = AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__SIGNATURE__INIT;
     memcpy(proto->signature, &tmp_s, sizeof(tmp_s));
     proto->signature->hex_seed.data = identity->signature.public_hex;
     proto->signature->hex_seed.len = crypto_sign_PUBLICKEYBYTES * 2;
 
-    proto->encryptor = malloc(sizeof(AutonomousTrust__Core__Identity__Encryptor));
-    AutonomousTrust__Core__Identity__Encryptor tmp_e = AUTONOMOUS_TRUST__CORE__IDENTITY__ENCRYPTOR__INIT;
+    proto->encryptor = malloc(sizeof(AutonomousTrust__Core__Protobuf__Identity__Encryptor));
+    AutonomousTrust__Core__Protobuf__Identity__Encryptor tmp_e = AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__ENCRYPTOR__INIT;
     memcpy(proto->encryptor, &tmp_e, sizeof(tmp_e));
     proto->encryptor->hex_seed.data = identity->encryptor.public_hex;
     proto->encryptor->hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
     return 0;
 }
 
-int public_identity_sync_in(AutonomousTrust__Core__Identity__Identity *proto, public_identity_t *identity)
+int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity *proto, public_identity_t *identity)
 {
     memcpy(&identity->uuid, proto->uuid.data, sizeof(uuid_t));
     strncpy(identity->address, proto->address, ADDR_LEN);
@@ -196,7 +196,7 @@ int public_identity_sync_in(AutonomousTrust__Core__Identity__Identity *proto, pu
     return 0;
 }
 
-void public_identity_proto_free(AutonomousTrust__Core__Identity__Identity *proto)
+void public_identity_proto_free(AutonomousTrust__Core__Protobuf__Identity__Identity *proto)
 {
     free(proto->signature);
     free(proto->encryptor);
@@ -204,21 +204,21 @@ void public_identity_proto_free(AutonomousTrust__Core__Identity__Identity *proto
 
 int peer_to_proto(public_identity_t *msg, void **data_ptr, size_t *data_len_ptr)
 {
-    AutonomousTrust__Core__Identity__Identity proto;
+    AutonomousTrust__Core__Protobuf__Identity__Identity proto;
     public_identity_sync_out(msg, &proto);
-    *data_len_ptr = autonomous_trust__core__identity__identity__get_packed_size(&proto);
+    *data_len_ptr = autonomous_trust__core__protobuf__identity__identity__get_packed_size(&proto);
     *data_ptr = malloc(*data_len_ptr);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
-    autonomous_trust__core__identity__identity__pack(&proto, *data_ptr);
+    autonomous_trust__core__protobuf__identity__identity__pack(&proto, *data_ptr);
     public_identity_proto_free(&proto);
     return 0;
 }
 
 int proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer)
 {
-    AutonomousTrust__Core__Identity__Identity *msg =
-        autonomous_trust__core__identity__identity__unpack(NULL, len, data);
+    AutonomousTrust__Core__Protobuf__Identity__Identity *msg =
+        autonomous_trust__core__protobuf__identity__identity__unpack(NULL, len, data);
     public_identity_sync_in(msg, peer);
     free(msg);
     return 0;
