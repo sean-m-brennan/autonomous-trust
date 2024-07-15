@@ -1,2 +1,0 @@
-*.mp4 filter=lfs diff=lfs merge=lfs -text
-doc/presentation/images/opte_20221012.0800.png filter=lfs diff=lfs merge=lfs -text
