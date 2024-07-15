@@ -22,6 +22,8 @@
 #include <jansson.h>
 
 #include "utilities/exception.h"
+#include "utilities/logger.h"
+#include "structures/map.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -107,6 +109,10 @@ int read_config_file(const char *filename, void *data_struct);
  * @return int
  */
 int write_config_file(const config_t *config, const void *data_struct, const char *filename);
+
+int load_config(char *filepath, config_t **config, char *cfg_name, logger_t *logger);
+
+int load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger);
 
 /**
  * @brief

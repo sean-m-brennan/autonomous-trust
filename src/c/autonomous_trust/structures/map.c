@@ -90,13 +90,10 @@ int reindex(map_t *map)
 {
     size_t old_capacity = map->capacity;
     map->capacity = increment_capacity(map->capacity);
-    // use calloc for memory zero-initialization
-    map_item_t *items = calloc(map->capacity, sizeof(map_item_t));
-    //map_item_t *items = realloc(map->items, map->capacity * sizeof(map_item_t));
+    map_item_t *items = smrt_create(map->capacity * sizeof(map_item_t));
     if (items == NULL)
         return EXCEPTION(ENOMEM);
     memset(items, 0, map->capacity * sizeof(map_item_t));
-    //memset(items + map->capacity, 0, map->capacity * sizeof(map_item_t));
     for (size_t i = 0; i < old_capacity; i++)
     {
         map_item_t entry = map->items[i];
@@ -106,7 +103,7 @@ int reindex(map_t *map)
             items[idx] = entry;
         }
     }
-    free(map->items);
+    free(map->items); // no deref, force free
     map->items = items;
     return 0;
 }
@@ -123,7 +120,8 @@ int map_init(map_t *map)
     crypto_shorthash_keygen(map->hashkey);
     array_init(&map->keys);
     map->alloc = false;
-    map->items = calloc(map->capacity, sizeof(map_item_t));
+    map->refs = 0;
+    map->items = smrt_create(map->capacity * sizeof(map_item_t));
     if (map->items == NULL)
         return EXCEPTION(ENOMEM);
     return 0;
@@ -133,7 +131,7 @@ int map_create(map_t **map_ptr)
 {
     if (map_ptr == NULL)
         return EXCEPTION(EINVAL);
-    *map_ptr = calloc(1, sizeof(map_t));
+    *map_ptr = smrt_create(sizeof(map_t));
     map_t *map = *map_ptr;
     if (map == NULL)
         return EXCEPTION(ENOMEM);
@@ -141,10 +139,9 @@ int map_create(map_t **map_ptr)
     int err = map_init(map);
     if (err != 0)
     {
-        free(map);
+        smrt_deref(map);
         return err;
     }
-    map->alloc = true;
     return err;
 }
 
@@ -190,7 +187,7 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
     {
         if (strcmp(key, map->items[index].key) == 0)
         {
-            data_incr(value);
+            smrt_ref(value);
             map->items[index].value = value;
             return 0;
         }
@@ -207,7 +204,7 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
     // FIXME potential issues
     item->key = key_cpy; // FIXME ownership?
     item->hash = hash;
-    data_incr(value);
+    smrt_ref(value);
     item->value = value;
     data_t *str_dat = string_data(key_cpy, strlen(key_cpy));
     int err = array_append(&map->keys, str_dat);
@@ -229,11 +226,9 @@ int map_remove(map_t *map, map_key_t key)
 
 void map_free(map_t *map)
 {
-    free(map->items);
-    if (map->alloc)
-        free(map);
+    smrt_deref(map->items);
+    smrt_deref(map);
 }
-
 
 int map_sync_out(map_t *map, AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap)
 {
@@ -246,27 +241,27 @@ int map_sync_out(map_t *map, AutonomousTrust__Core__Protobuf__Structures__DataMa
     size_t i = 0;
     map_entries_for_each(map, key, elt)
         AutonomousTrust__Core__Protobuf__Structures__DataMap__DataMapEntry *entry = dmap->map[i++];
-        entry->key = key;  // shared, do not free
-        entry->value = malloc(sizeof(AutonomousTrust__Core__Protobuf__Structures__Data));
-        data_sync_out(elt, entry->value);
-    map_end_for_each
-    return 0;
+    entry->key = key; // shared, do not free
+    entry->value = malloc(sizeof(AutonomousTrust__Core__Protobuf__Structures__Data));
+    data_sync_out(elt, entry->value);
+    map_end_for_each return 0;
 }
 
 void map_proto_free(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap)
 {
-    for (int i=0; i<dmap->n_map; i++)
+    for (int i = 0; i < dmap->n_map; i++)
         data_proto_free(dmap->map[i]->value);
-    free(dmap->map);
+    smrt_deref(dmap->map);
 }
 
 int map_sync_in(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap, map_t *map)
 {
-    for(int i=0; i<dmap->n_map; i++) {
-        data_t *elt = malloc(sizeof(data_t));
+    for (int i = 0; i < dmap->n_map; i++)
+    {
+        data_t *elt = smrt_create(sizeof(data_t));
         if (elt == NULL)
             return EXCEPTION(ENOMEM);
-        char *key = malloc(strlen(dmap->map[i]->key));
+        char *key = smrt_create(strlen(dmap->map[i]->key));
         if (key == NULL)
             return EXCEPTION(ENOMEM);
         strcpy(key, dmap->map[i]->key);
@@ -277,12 +272,78 @@ int map_sync_in(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap, map_
     return 0;
 }
 
-/*void proto_map_free_in_sync(map_t *map)
+int map_to_json(const void *data_struct, json_t **obj_ptr)
 {
-    char *key;
-    data_t *elt;
-    map_entries_for_each(map, key, elt)
-        data_free_in_sync(elt);
-    map_end_for_each
-    map_free(map);
-}*/
+    const map_t *map = data_struct;
+    *obj_ptr = json_object();
+    json_t *obj = *obj_ptr;
+    if (obj == NULL)
+        return EXCEPTION(ENOMEM);
+
+    json_object_set_new(obj, "length", json_integer(map->length));
+    json_object_set_new(obj, "capacity", json_integer(map->capacity));
+    json_t *hash_arr = json_array();
+    for (int i = 0; i < crypto_shorthash_KEYBYTES; i++)
+    {
+        json_array_append(hash_arr, json_integer(map->hashkey[i]));
+    }
+    json_object_set_new(obj, "hashkey", hash_arr);
+
+    json_t *keys;
+    if (array_to_json(&map->keys, &keys) < 0)
+        return -1;
+    json_object_set_new(obj, "keys", keys);
+
+    json_t *j_arr = json_array();
+    for (int i = 0; i < map->capacity; i++)
+    {
+        json_t *elt;
+        if (strlen(map->items[i].key) == 0)
+            elt = json_null();
+        else
+        {
+            elt = json_object();
+            json_object_set_new(elt, "key", json_string(map->items[i].key));
+            json_t *val;
+            data_to_json(map->items[i].value, &val);
+            json_object_set_new(elt, "value", val);
+            json_object_set_new(elt, "hash", json_integer(map->items[i].hash));
+        }
+        json_array_append(j_arr, elt);
+    }
+    json_object_set_new(obj, "items", j_arr);
+    return 0;
+}
+
+int map_from_json(const json_t *obj, void *data_struct)
+{
+    map_t *map = data_struct;
+    map->length = json_integer_value(json_object_get(obj, "length"));
+    map->capacity = json_integer_value(json_object_get(obj, "capacity"));
+    map->items = smrt_create(map->capacity * sizeof(map_item_t));
+
+    json_t *hash_arr = json_object_get(obj, "hashkey");
+    for (int i = 0; i < crypto_shorthash_KEYBYTES; i++)
+    {
+        map->hashkey[i] = json_integer_value(json_array_get(hash_arr, i));
+    }
+
+    json_t *keys = json_object_get(obj, "keys");
+    if (array_from_json(keys, &map->keys) < 0)
+        return -1;
+
+    json_t *j_arr = json_object_get(obj, "items");
+    for (int i = 0; i < map->capacity; i++)
+    {
+        json_t *elt = json_array_get(j_arr, i);
+        if (!json_is_null(elt))
+        {
+            map->items[i].hash = json_integer_value(json_object_get(elt, "hash"));
+            const char *key = json_string_value(json_object_get(elt, "key"));
+            map->items[i].key = malloc(strlen(key) + 1);
+            strcpy(map->items[i].key, key);
+            data_from_json(json_object_get(elt, "value"), map->items[i].value);
+        }
+    }
+    return 0;
+}

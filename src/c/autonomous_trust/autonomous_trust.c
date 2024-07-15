@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <sys/wait.h>
 #include <string.h>
 #include <signal.h>
@@ -28,22 +29,14 @@
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/logger.h"
-#include "config/sighandler.h"
+#include "utilities/sighandler.h"
 #include "config/configuration_priv.h"
 #include "processes/processes.h"
 #include "processes/process_tracker_priv.h"
 #include "structures/array_priv.h"
 #include "structures/map_priv.h"
-#include "config/protobuf_shutdown.h"
+#include "utilities/protobuf_shutdown.h"
 #include "network/network.h"
-
-#define MAX_CONFIGS 64
-
-static const char *required_configs[] = {
-    "subsystems", "network", "identity", 
-    //"negotitation, "reputation"
-};
-static const int num_req_cfgs = 3;
 
 
 void reread_configs() { /* do nothing */ }
@@ -52,104 +45,6 @@ void user1_handler() { /* do nothing */ }
 
 void user2_handler() { /* do nothing */ }
 
-int load_configs(char *cfg_dir, map_t *configs, logger_t *logger)
-{
-    // read all other config files (peers, group, etc)
-    if (map_init(configs) != 0)
-    {
-        log_exception(logger);
-        return -1;
-    }
-    array_t config_files = {0};
-    if (array_init(&config_files) != 0)
-    {
-        log_exception(logger);
-        return -1;
-    }
-    if (all_config_files(cfg_dir, &config_files) != 0)
-    {
-        log_exception(logger);
-        return -1;
-    }
-    int num_err = 0;
-    int required = num_req_cfgs;
-
-    for (size_t i = 0; i < array_size(&config_files); i++)
-    {
-        data_t *str_dat;
-        if (array_get(&config_files, i, &str_dat) != 0)
-        {
-            log_exception(logger);
-            num_err++;
-            continue;
-        }
-        char *filepath;
-        if (data_string_ptr(str_dat, &filepath) != 0)
-        {
-            log_exception(logger);
-            num_err++;
-            continue;
-        }
-        if (filepath == NULL)
-        {
-            // FIXME log
-            num_err++;
-            continue;
-        }
-        char abspath[CFG_PATH_LEN + 1];
-        if (config_absolute_path(filepath, abspath) != 0)
-        {
-            log_exception(logger);
-            num_err++;
-            continue;
-        }
-        char *filename = strrchr(filepath, '/');
-        if (filename == NULL)
-            filename = filepath;
-
-        if (strncmp(filename, default_tracker_filename, CFG_PATH_LEN) == 0) {
-            required--;
-            continue; // skip tracker cfg, already loaded
-        }
-        char cfg_name[CFG_NAME_SIZE + 1] = {0};
-        char *ext = strchr(filename, '.');
-        int extlen = 0;
-        if (ext != NULL)
-            extlen = strlen(ext);
-        strncpy(cfg_name, filename, min(255, strlen(filename) - extlen));
-        config_t *config = find_configuration(cfg_name);
-        if (config == NULL)
-        {
-            log_error(logger, "No config for %s\n", cfg_name);
-            num_err++;
-            continue;
-        }
-        config->data_struct = malloc(config->data_len);
-        if (config->data_struct == NULL)
-            return EXCEPTION(ENOMEM);
-        if (read_config_file(abspath, config->data_struct) != 0)
-        {
-            log_exception(logger);
-            num_err++;
-            continue;
-        }
-        for (int j=0; j<num_req_cfgs; j++) {
-            if (strncmp(cfg_name, required_configs[j], CFG_NAME_SIZE) == 0) {
-                required--;
-                break;
-            }
-        }
-        data_t *ds = object_ptr_data(config, sizeof(config_t));
-        if (map_set(configs, cfg_name, ds) != 0)
-        {
-            log_exception(logger);
-            num_err++;
-        }
-    }
-    if (required > 0)
-        log_error(logger, "%d required configurations not found\n", required);
-    return num_err;
-}
 
 int register_queues(tracker_t *tracker, const char *main, directory_t *queues, directory_t *signals, logger_t *logger)
 {
@@ -249,9 +144,11 @@ int run_autonomous_trust(char *q_in, char *q_out,
     log_info(&logger, "You are using\033[94m AutonomousTrust\033[00m v%s from\033[96m TekFive\033[00m.\n", VERSION);
     if (set_process_name(name) < 0)
         log_exception(&logger);
+    init_sig_handling(&logger);
+    log_debug(&logger, "AT pid %d\n", getpid());
 
     map_t configs = {0};
-    int ret = load_configs(cfg_dir, &configs, &logger);
+    int ret = load_all_configs(cfg_dir, &configs, &logger);
     if (ret < 0)
         return ret;
     if (ret > 0)
@@ -295,7 +192,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
         log_info(&logger, "%s:  Starting %s:%s ...\n", name, key, impl);
         if (start_process(key, runner, &configs, &tracker, &procs, &queues, &logger))
         {
-            log_exception(&logger);
+            log_exception_extra(&logger, " for process %s:%s\n", name, key);
             num_err++;
         }
     }
@@ -332,7 +229,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
                 {
                     if (restart_process(pid, key, &procs, &queues, &logger))
                     {
-                        log_exception(&logger);  // FIXME No such key in the map (EMAP_NOKEY)
+                        log_exception_extra(&logger, " (key = '%s')\n", key);  // FIXME No such key in the map (EMAP_NOKEY)
                         // FIXME quit trying?
                     }
                 }
@@ -354,9 +251,9 @@ int run_autonomous_trust(char *q_in, char *q_out,
 
         // check for extern messages
         generic_msg_t task_msg = {0};
-        ret = messaging_recv_on(&extern_q, &task_msg);
+        ret = messaging_recv_on(&extern_q, &task_msg, NULL, false);
         if (ret == -1)
-            log_exception(&logger); // FIXME Socket operation on non-socket (ENOTSOCK)
+            log_exception(&logger);
         else if (ret == 0)
         {
             if (task_msg.type != TASK)
@@ -406,14 +303,16 @@ int run_autonomous_trust(char *q_in, char *q_out,
 
             if (do_send)
         {
-            if (messaging_send("extern_out", result_msg.type, &result_msg) != 0)
+            if (messaging_send("extern_out", result_msg.type, &result_msg, false) != 0)
                 log_exception(&logger);
         }
 
         if (usleep(cadence) == -1)
         {
-            SYS_EXCEPTION();
-            log_exception(&logger);
+            if (errno != EINTR) {
+                SYS_EXCEPTION();
+                log_exception(&logger);
+            }
         }
     }
     log_debug(&logger, "%s: Shutdown.\n", name);
@@ -427,12 +326,12 @@ int run_autonomous_trust(char *q_in, char *q_out,
     array_for_each(&signals, index, k_val)
     {
         char *skey;
-        if (data_string_ptr(k_val, &skey) != 0)
+        if (data_string_ptr(k_val, &skey) != 0) {
             log_exception(&logger);
-        err = messaging_send(skey, SIGNAL, &sig);
-        if (err != 0 && err != ENOENT)
-            log_exception(&logger);
-        // ignore otherwise
+            continue;
+        }
+        if (messaging_send(skey, SIGNAL, &sig, true) < 0)  // FIXME ECONNREFUSED
+            log_exception_extra(&logger, " signalling %d - %s\n", index, skey);
     }
     array_end_for_each
 

@@ -33,6 +33,8 @@ extern void user2_handler();
 
 void handle_signal(int signum)
 {
+    if (_logger != NULL)
+        log_debug(_logger, "Recvd signal %d\n", signum);
     switch (signum)
     {
     case SIGINT:

@@ -26,10 +26,12 @@ capability_t *find_capability(const char *name)
     for (int i = 0; i < capability_table_size; i++)
     {
         IGNORE_GCC_VER_DIAGNOSTIC(12, -Warray-bounds)
+        IGNORE_GCC_VER_DIAGNOSTIC(12, -Wstringop-overread)
         capability_t *entry = &(capability_table[i]);
-        END_IGNORE_GCC_DIAGNOSTIC
-        if (strncmp(entry->name, name, strlen(name)) == 0)
+        if (strcmp(entry->name, name) == 0)
             return entry;
+        END_IGNORE_GCC_DIAGNOSTIC
+        END_IGNORE_GCC_DIAGNOSTIC
     }
     return NULL;
 }
@@ -58,7 +60,7 @@ int capability_to_proto(capability_t *msg, void **data_ptr, size_t *data_len_ptr
     AutonomousTrust__Core__Protobuf__Processes__Capability proto;
     capability_sync_out(msg, &proto);
     *data_len_ptr = autonomous_trust__core__protobuf__processes__capability__get_packed_size(&proto);
-    *data_ptr = malloc(*data_len_ptr);
+    *data_ptr = smrt_create(*data_len_ptr);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
     autonomous_trust__core__protobuf__processes__capability__pack(&proto, *data_ptr);
@@ -122,7 +124,7 @@ int peer_capabilities_to_proto(peer_capabilities_matrix_t *map, void **data_ptr,
     AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities proto;
     peer_capabilities_sync_out(map, &proto);
     *data_len_ptr = autonomous_trust__core__protobuf__processes__peer_capabilities__get_packed_size(&proto);
-    *data_ptr = malloc(*data_len_ptr);
+    *data_ptr = smrt_create(*data_len_ptr);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
     autonomous_trust__core__protobuf__processes__peer_capabilities__pack(&proto, *data_ptr);
@@ -141,7 +143,7 @@ int peer_capabilities_sync_in(AutonomousTrust__Core__Protobuf__Processes__PeerCa
 
         for (int j = 0; j < pcaps->n_capability; j++)
         {
-            capability_t *cap = malloc(sizeof(capability_t));
+            capability_t *cap = smrt_create(sizeof(capability_t));
             if (cap != NULL)
                 return EXCEPTION(ENOMEM);
             capability_sync_in(pcaps->capability[j], cap);
@@ -152,7 +154,7 @@ int peer_capabilities_sync_in(AutonomousTrust__Core__Protobuf__Processes__PeerCa
         data_t *arr_dat = object_ptr_data(arr, sizeof(arr));
         if (arr_dat == NULL)
             return EXCEPTION(ENOMEM);
-        char *key = malloc(strlen(pcaps->peer));
+        char *key = smrt_create(strlen(pcaps->peer));
         strcpy(key, pcaps->peer);
         if (map_set(map, key, arr_dat) != 0)
             return -1;

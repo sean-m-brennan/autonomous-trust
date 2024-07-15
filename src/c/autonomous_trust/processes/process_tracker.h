@@ -24,9 +24,9 @@
 
 typedef struct
 {
+    smrt_ptr_t;
     map_t *registry;
     logger_t *logger;
-    bool alloc;
 } tracker_t;
 
 typedef struct process_s process_t; // FIXME why is this defined here?

@@ -25,7 +25,7 @@ extern "C" {
 #include "autonomous_trust/utilities/message.h"
 #include "autonomous_trust/utilities/logger.h"
 #include "autonomous_trust/config/configuration.h"
-#include "autonomous_trust/config/sighandler.h"
+#include "autonomous_trust/utilities/sighandler.h"
 
 /**
  * @brief 

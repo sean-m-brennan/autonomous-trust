@@ -25,8 +25,7 @@
 int array_init(array_t *a)
 {
     a->size = 0;
-    a->alloc = false;
-    a->array = malloc(sizeof(data_t));
+    a->array = smrt_create(sizeof(data_t));
     if (a->array == NULL)
         return EXCEPTION(ENOMEM);
     return 0;
@@ -36,12 +35,11 @@ int array_create(array_t **array_ptr)
 {
     if (*array_ptr == NULL)
         return EXCEPTION(EINVAL);
-    *array_ptr = (array_t *)calloc(1, sizeof(array_t));
+    *array_ptr = smrt_create(sizeof(array_t));
     if (*array_ptr == NULL)
         return EXCEPTION(ENOMEM);
     array_t *arr = *array_ptr;
     int err = array_init(arr);
-    arr->alloc = true;
     return err;
 }
 
@@ -49,8 +47,7 @@ int array_copy(array_t *a, array_t *cpy)
 {
     if (a == NULL)
         return EXCEPTION(EINVAL);
-    cpy->alloc = false;
-    cpy->array = calloc(a->size, sizeof(data_t));
+    cpy->array = smrt_create(a->size * sizeof(data_t));
     if (cpy->array == NULL)
         return EXCEPTION(ENOMEM);
     memcpy(cpy->array, a->array, sizeof(data_t) * a->size);
@@ -112,7 +109,7 @@ int array_set(array_t *a, int index, data_t *element)
     if (index == a->size) {
         if (a->size > 0 || a->array == NULL) {
             size_t new_size = (a->size + 1) * sizeof(data_t);
-            data_t **bigger_array = realloc(a->array, new_size);
+            data_t **bigger_array = smrt_recreate(a->array, new_size);
             if (bigger_array == NULL)
                 return EXCEPTION(ENOMEM);
             a->array = bigger_array;
@@ -138,12 +135,11 @@ int array_remove(array_t *a, data_t *element)
 void array_free(array_t *a)
 {
     for (int i=0; i< a->size; i++)
-        data_decr(a->array[i]);
-    free(a->array);
+        smrt_deref(a->array[i]);
+    smrt_deref(a->array);
     a->array = NULL;
     a->size = 0;
-    if (a->alloc)
-        free(a);
+    smrt_deref(a);
 }
 
 int array_sync_out(array_t *array, AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t *n)
@@ -161,13 +157,13 @@ int array_sync_out(array_t *array, AutonomousTrust__Core__Protobuf__Structures__
 
 void array_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data **parr)
 {
-    free(parr);
+    smrt_deref(parr);
 }
 
 int array_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t n, array_t *array)
 {
     for(int i=0; i<n; i++) {
-        data_t *elt = malloc(sizeof(data_t));
+        data_t *elt = smrt_create(sizeof(data_t));
         if (elt == NULL)
             return EXCEPTION(ENOMEM);
         data_sync_in(parr[i], elt);
@@ -177,13 +173,37 @@ int array_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size
     return 0;
 }
 
-/*void proto_repeated_free_in_sync(array_t *array)
+int array_to_json(const void *data_struct, json_t **obj_ptr)
 {
-    for(int i=0; i<array->size; i++) {
-        data_t *elt;
-        if (array_get(array, i, &elt) != 0)
-            continue;
-        data_free_in_sync(elt);
+    const array_t *array = data_struct;
+    *obj_ptr = json_object();
+    json_t *obj = *obj_ptr;
+    if (obj == NULL)
+        return EXCEPTION(ENOMEM);
+
+    json_object_set(obj, "size", json_integer(array->size));
+    json_t *j_arr = json_array();
+    for (int i=0; i<array->size; i++) {
+        json_t *dat;
+        if (data_to_json(array->array[i], &dat) < 0)
+            return -1;
+        json_array_append_new(j_arr, dat);
     }
-    array_free(array);
-}*/
+    json_object_set_new(obj, "array", j_arr);
+    return 0;
+}
+
+int array_from_json(const json_t *obj, void *data_struct)
+{
+    array_t *array = data_struct;
+    array->size = json_integer_value(json_object_get(obj, "size"));
+    array->array = smrt_create(array->size * sizeof(data_t));
+    json_t *j_arr = json_object_get(obj, "array");
+    for (int i=0; i<array->size; i++) {
+        json_t *elt = json_array_get(j_arr, i);
+        data_from_json(elt, array->array[i]);
+        array->array[i]->alloc = true;
+        array->array[i]->refs = 1;
+    }
+    return 0;
+}

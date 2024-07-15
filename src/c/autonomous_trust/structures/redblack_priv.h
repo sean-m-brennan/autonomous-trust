@@ -18,6 +18,7 @@
 #define REDBLACK_PRIV_H
 
 #include "redblack.h"
+#include "utilities/allocation.h"
 
 enum Direction
 {
@@ -29,6 +30,7 @@ enum Direction opposite_direction(enum Direction dir);
 
 struct rbNode
 {
+    smrt_ptr_t;
     int key;
     bool red;
     tree_data_ptr_t data;
@@ -36,6 +38,7 @@ struct rbNode
 };
 
 struct rbTree_s {
+    smrt_ptr_t;
     struct rbNode *root;
     int size;
 };

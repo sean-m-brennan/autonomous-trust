@@ -54,28 +54,26 @@ char *find_process_name(const handler_ptr_t handler)
 int tracker_init(logger_t *logger, tracker_t *tracker)
 {
     tracker->logger = logger;
-    tracker->alloc = false;
     return map_create(&tracker->registry);
 }
 
 int tracker_create(logger_t *logger, tracker_t **tracker_ptr)
 {
-    *tracker_ptr = calloc(1, sizeof(tracker_t));
+    *tracker_ptr = smrt_create(sizeof(tracker_t));
     if (*tracker_ptr == NULL)
         return EXCEPTION(ENOMEM);
     tracker_t *tracker = *tracker_ptr;
     int err = tracker_init(logger, tracker);
     if (err != 0) {
-        free(tracker);
+        smrt_deref(tracker);
         return err;
     }
-    tracker->alloc = true;
     return err;
 }
 
 int tracker_to_json(const void *data_struct, json_t **obj_ptr)
 {
-    tracker_t *tracker = (tracker_t *)data_struct;
+    const tracker_t *tracker = data_struct;
     *obj_ptr = json_object();
     json_t *top_obj = *obj_ptr;
     if (top_obj == NULL)
@@ -90,6 +88,7 @@ int tracker_to_json(const void *data_struct, json_t **obj_ptr)
     if (err != 0)
         return EXCEPTION(EJSN_OBJ_SET);
     
+    // FIXME use map_to_json instead
     json_t *array_obj = json_array();
     if (array_obj == NULL) {
         json_decref(top_obj);
@@ -140,7 +139,7 @@ int tracker_to_json(const void *data_struct, json_t **obj_ptr)
 
 int tracker_from_json(const json_t *obj, void *data_struct)
 {
-    tracker_t *tracker = (tracker_t *)data_struct;
+    tracker_t *tracker = data_struct;
 
     json_t *array_obj = json_object_get(obj, "subsystems");
     if (array_obj == NULL || !json_is_array(array_obj))
@@ -219,7 +218,6 @@ void tracker_free(tracker_t *tracker)
     {
         if (tracker->registry != NULL)
             map_free(tracker->registry);
-        if (tracker->alloc)
-            free(tracker);
+        smrt_deref(tracker);
     }
 }

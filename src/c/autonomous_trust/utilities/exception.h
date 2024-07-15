@@ -68,7 +68,7 @@ int _set_exception(int err, size_t line, const char *file);
 #define SYS_EXCEPTION() _set_exception(errno, __LINE__, __FILE__)
 
 /**
- * @brief Save indformation related to an arbitrary error for later logging.
+ * @brief Save information related to an arbitrary error for later logging.
  *
  */
 #define EXCEPTION(err) _set_exception(err, __LINE__, __FILE__)

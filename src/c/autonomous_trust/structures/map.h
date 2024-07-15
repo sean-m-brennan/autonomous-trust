@@ -25,6 +25,7 @@ typedef char *map_key_t;
 
 typedef struct
 {
+    smrt_ptr_t;
     map_key_t key;
     data_t *value;
     size_t hash;
