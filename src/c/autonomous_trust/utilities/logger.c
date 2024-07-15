@@ -173,7 +173,7 @@ void _log_exception(logger_t *logger, const char *srcfile, const size_t line)
 void _log_exception_extra(logger_t *logger, const char *srcfile, const size_t line, const char *fmt, ...)
 {
     if (_exception.errnum == 0) {
-        _logging(logger, ERROR, "?", -1, "Incorrect exception flagging (unexpected return value)");
+        _logging(logger, ERROR, "?", -1, "Incorrect exception flagging (unexpected return value)\n");
         return;
     }
 

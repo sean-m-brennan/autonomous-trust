@@ -27,6 +27,14 @@
 
 #include "autonomous_trust.h"
 
+#define LIMITED_RUN
+
+#ifdef LIMITED_RUN
+#define CONTINUE_RUN (loop < 200)
+#else
+#define CONTINUE_RUN true
+#endif
+
 int main(int argc, char *argv[])
 {
     const long cadence = 500000L; // microseconds
@@ -39,9 +47,9 @@ int main(int argc, char *argv[])
     queue_t from_at;
     if (messaging_init(q_in, &from_at) != 0)
         log_exception(&log);
-    //queue_t to_at;
-    //if (messaging_init(q_out, &to_at) != 0)
-    //    log_exception(&log);
+    // queue_t to_at;
+    // if (messaging_init(q_out, &to_at) != 0)
+    //     log_exception(&log);
 
     // queue names are in reverse order (out here is in there)
     int at_pid = run_autonomous_trust(q_out, q_in, NULL, 0, DEBUG, NULL);
@@ -56,8 +64,10 @@ int main(int argc, char *argv[])
 
     log_debug(&log, "AT example main (AT at %d)\n", at_pid);
     bool at_alive = true;
-    while (!stop_process)
+    size_t loop = 0;
+    while (!stop_process && CONTINUE_RUN)
     {
+        loop++;
         int err = kill(at_pid, 0);
         if (err == -1)
         {
@@ -86,7 +96,7 @@ int main(int argc, char *argv[])
         // react to info
         if (do_send)
         {
-            if (messaging_send(q_out, buf.type, &buf) != 0)
+            if (messaging_send(q_out, buf.type, &buf, true) != 0)
                 log_exception(&log);
         }
         // do other things
@@ -95,7 +105,10 @@ int main(int argc, char *argv[])
         usleep(cadence);
     }
     if (at_alive)
+    {
+        log_debug(&log, "SIGINT to %d\n", at_pid);
         kill(at_pid, SIGINT);
+    }
     log_debug(&log, "Example exit\n");
     return 0;
 }

@@ -74,7 +74,7 @@ int _announce_identity(const process_t *proc, directory_t *queues)
     // send network broadcast, no encrypt
     generic_msg_t buf = {0};
     // FIXME announcement msg: identity_publish(), package_hash, capabilities_list
-    messaging_send("network", NET_MESSAGE, &buf);
+    messaging_send("network", NET_MESSAGE, &buf, false);
     return 0;
 }
 

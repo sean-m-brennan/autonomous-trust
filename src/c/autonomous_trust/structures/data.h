@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "utilities/exception.h"
+#include "utilities/allocation.h"
 
 typedef enum
 {
@@ -96,12 +97,6 @@ int data_bytes_ptr(data_t *d, bytes_t *b_ptr);
 int data_object(data_t *d, ptr_t o, size_t max_len);
 
 int data_object_ptr(data_t *d, ptr_t *o_ptr);
-
-
-
-void data_incr(data_t *d);
-
-void data_decr(data_t *d);
 
 
 bool data_equal(data_t *a, data_t *b);

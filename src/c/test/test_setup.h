@@ -33,21 +33,60 @@
 //////////
 
 #if DEBUG_TESTS
-#define ck_assert_int_eq(x, y)
-#define ck_assert_int_ne(x, y)
-#define ck_assert_str_eq(x, y)
-#define ck_assert_ptr_nonnull(x)
-#define ck_assert_ret_ok(x) x
-#define ck_assert_ret_nonzero(x) x
+#define ck_assert_int_eq(x, y)                   \
+    do                                           \
+    {                                            \
+        if (x != y)                              \
+            log_error(NULL, "%d != %d\n", x, y); \
+    } while (0)
+
+#define ck_assert_int_ne(x, y)                   \
+    do                                           \
+    {                                            \
+        if (x == y)                              \
+            log_error(NULL, "%d == %d\n", x, y); \
+    } while (0)
+
+#define ck_assert_str_eq(x, y)                   \
+    do                                           \
+    {                                            \
+        if (strcmp(x, y) != 0)                   \
+            log_error(NULL, "%s != %s\n", x, y); \
+    } while (0)
+
+#define ck_assert_ptr_nonnull(x)               \
+    do                                         \
+    {                                          \
+        if (x == NULL)                         \
+            log_error(NULL, "Null pointer\n"); \
+    } while (0)
+
+#define ck_assert_ret_ok(x)                                        \
+    do                                                             \
+    {                                                              \
+        int rv = x;                                                \
+        if (rv != 0)                                               \
+        {                                                          \
+            log_error(NULL, "Function returned nonzero %d\n", rv); \
+            SYS_EXCEPTION();                                       \
+            log_exception(NULL);                                   \
+        }                                                          \
+    } while (0)
+
+#define ck_assert_ret_nonzero(x)                         \
+    do                                                   \
+    {                                                    \
+        if (x == 0)                                      \
+            log_error(NULL, "Function returned zero\n"); \
+    } while (0)
+
 #else
 #include <check.h>
 #define ck_assert_ret_ok(x) ck_assert_int_eq(0, x)
 #define ck_assert_ret_nonzero(x) ck_assert_int_ne(0, x)
 #endif
 
-#if DEBUG_TESTS
-
-//#define MAIN()
+#if DEBUG_TESTS // libcheck disabled
 
 #define DEFINE_TEST(test_name) \
     void test_name()
@@ -56,7 +95,7 @@
 
 #define ADD_TEST(x) x();
 
-#define RUN_TESTS(suite_name, ...)       \
+#define RUN_TESTS(suite_name, ...)      \
                                         \
     int main()                          \
     {                                   \
@@ -74,12 +113,12 @@
 
 #define ADD_TEST(x) tcase_add_test(tc_core, x);
 
-#define RUN_TESTS(suite_name, ...)                                  \
+#define RUN_TESTS(suite_name, ...)                                 \
     END_TEST                                                       \
                                                                    \
     Suite *test_suite(void)                                        \
     {                                                              \
-        Suite *s = suite_create(#suite_name);                       \
+        Suite *s = suite_create(#suite_name);                      \
         TCase *tc_core = tcase_create("Core");                     \
                                                                    \
         FOR_EACH(ADD_TEST, __VA_ARGS__)                            \
