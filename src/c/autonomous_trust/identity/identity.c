@@ -25,6 +25,7 @@
 #include "algorithms/algorithms.h"
 #include "config/configuration.h"
 #include "utilities/exception.h"
+#include "utilities/util.h"
 
 #include "identity_priv.h"
 
@@ -43,13 +44,13 @@ int identity_init(uuid_t *uuid, char *address, char *fullname, identity_t *ident
     if (sseed == NULL)
         return -1;
     signature_init(&(identity->signature), sseed);
-    free(sseed);
+    smrt_deref(sseed);
 
     unsigned char *eseed = encryptor_generate();
     if (eseed == NULL)
         return -1;
     encryptor_init(&identity->encryptor, eseed);
-    free(eseed);
+    smrt_deref(eseed);
 
     return 0;
 }
@@ -60,7 +61,7 @@ int identity_create(uuid_t *uuid, char *address, char *fullname, identity_t **id
     {
         exit(-1); // FIXME logging?
     }
-    *ident = calloc(1, sizeof(identity_t));
+    *ident = smrt_create(sizeof(identity_t));
     identity_t *identity = *ident;
     if (identity == NULL)
         return EXCEPTION(ENOMEM);
@@ -72,7 +73,7 @@ int identity_publish(const identity_t *ident, public_identity_t **pub_copy)
 {
     if (ident == NULL)
         return EINVAL;
-    *pub_copy = malloc(sizeof(public_identity_t));
+    *pub_copy = smrt_create(sizeof(public_identity_t));
     public_identity_t *newIdent = *pub_copy;
     if (newIdent == NULL)
         return EXCEPTION(ENOMEM);
@@ -81,12 +82,12 @@ int identity_publish(const identity_t *ident, public_identity_t **pub_copy)
     if (sseed == NULL)
         return -1;
     public_signature_init(&newIdent->signature, sseed);
-    free(sseed);
+    smrt_deref(sseed);
     unsigned char *eseed = encryptor_publish(&ident->encryptor);
     if (eseed == NULL)
         return -1;
     public_encryptor_init(&newIdent->encryptor, eseed);
-    free(eseed);
+    smrt_deref(eseed);
 
     //public_identity_init(newIdent);
     return 0;
@@ -114,11 +115,16 @@ int identity_decrypt(const identity_t *ident, const msg_str_t *cipher, const pub
 
 int identity_to_json(const void *data_struct, json_t **obj_ptr)
 {
-    identity_t *ident = (identity_t *)data_struct;
+    const identity_t *ident = data_struct;
     *obj_ptr = json_object();
     json_t *obj = *obj_ptr;
     if (obj == NULL)
-        return ENOMEM;
+        return EXCEPTION(ENOMEM);
+
+    int err = json_object_set_new(obj, "typename", json_string("identity"));
+    if (err != 0)
+        return EXCEPTION(EJSN_OBJ_SET);
+
     char uuid_str[UUID_STRING_LEN+1] = {0};
     uuid_unparse(ident->uuid, uuid_str);
     json_object_set(obj, "uuid", json_string(uuid_str));
@@ -131,13 +137,13 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr)
     json_t *sig = json_object();
     unsigned char *hex = signature_publish(&ident->signature); // encoded
     json_object_set(sig, "hex_seed", json_string((char *)hex));
-    free(hex);
+    smrt_deref(hex);
     json_object_set(obj, "signature", sig);
 
     json_t *encr = json_object();
     hex = encryptor_publish(&ident->encryptor); // encoded
     json_object_set(encr, "hex_seed", json_string((char *)hex));
-    free(hex);
+    smrt_deref(hex);
     json_object_set(obj, "encryptor", encr);
 
     return 0;
@@ -145,7 +151,7 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr)
 
 int identity_from_json(const json_t *obj, void *data_struct)
 {
-    identity_t *ident = (identity_t *)data_struct;
+    identity_t *ident = data_struct;
     json_t *uuid_obj = json_object_get(obj, "uuid");
     const char *uuid_str = json_string_value(uuid_obj);
     if (uuid_parse(uuid_str, ident->uuid) < 0)
@@ -207,7 +213,7 @@ int peer_to_proto(public_identity_t *msg, void **data_ptr, size_t *data_len_ptr)
     AutonomousTrust__Core__Protobuf__Identity__Identity proto;
     public_identity_sync_out(msg, &proto);
     *data_len_ptr = autonomous_trust__core__protobuf__identity__identity__get_packed_size(&proto);
-    *data_ptr = malloc(*data_len_ptr);
+    *data_ptr = smrt_create(*data_len_ptr);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
     autonomous_trust__core__protobuf__identity__identity__pack(&proto, *data_ptr);
@@ -226,5 +232,6 @@ int proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer)
 
 void identity_free(identity_t *ident)
 {
-    free(ident);
+    // FIXME sig, encr
+    smrt_deref(ident);
 }

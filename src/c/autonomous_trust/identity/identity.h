@@ -22,12 +22,14 @@
 #include <uuid/uuid.h>
 #include <sodium.h>
 
+#include "utilities/allocation.h"
 #include "identity/identity.pb-c.h"
 
 typedef struct identity_s identity_t;
 
 typedef struct
 {
+    smrt_ptr_t;
     unsigned char private[crypto_sign_SECRETKEYBYTES];
     unsigned char public[crypto_sign_PUBLICKEYBYTES];
     unsigned char public_hex[crypto_sign_PUBLICKEYBYTES * 2];
@@ -35,6 +37,7 @@ typedef struct
 
 typedef struct
 {
+    smrt_ptr_t;
     unsigned char private[crypto_box_SECRETKEYBYTES];
     unsigned char public[crypto_box_PUBLICKEYBYTES];
     unsigned char public_hex[crypto_box_PUBLICKEYBYTES * 2];
@@ -50,6 +53,7 @@ typedef struct
 
 typedef struct
 {
+    smrt_ptr_t;
     uuid_t uuid;
     char address[ADDR_LEN+1];
     char fullname[NAME_LEN+1];

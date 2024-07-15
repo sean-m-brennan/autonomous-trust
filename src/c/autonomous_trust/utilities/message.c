@@ -27,6 +27,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <arpa/inet.h>
 
 #include "config/configuration.h"
 #include "util.h"
@@ -37,17 +38,20 @@
 
 #define SOCK_PATH_LEN 108
 
+#define htonll(x) ((1 == htonl(1)) ? (x) : (((uint64_t)htonl((x) & 0xFFFFFFFFUL)) << 32) | htonl((uint32_t)((x) >> 32)))
+
+#define ntohll(x) ((1 == ntohl(1)) ? (x) : (((uint64_t)ntohl((x) & 0xFFFFFFFFUL)) << 32) | ntohl((uint32_t)((x) >> 32)))
+
 int unix_addr(const char *key, struct sockaddr_un *addr)
 {
-    char path[SOCK_PATH_LEN] = {};
+    char path[SOCK_PATH_LEN] = {0};
     if (get_data_dir(path) < 0)
         return SYS_EXCEPTION();
-    strncat(path, key, SOCK_PATH_LEN - strlen(key) - 1);
+    path[strlen(path)] = '/';
+    strncat(path, key, SOCK_PATH_LEN - strlen(path) - 1);
 
     addr->sun_family = AF_UNIX;
-    IGNORE_GCC_DIAGNOSTIC(-Wstringop-truncation)
-    strncpy(addr->sun_path, path, sizeof(addr->sun_path)-1);
-    END_IGNORE_GCC_DIAGNOSTIC
+    strcpy(addr->sun_path, path);
     return 0;
 }
 
@@ -61,18 +65,19 @@ int messaging_init(const char *id, queue_t *queue)
 
     struct sockaddr_un local;
     if (unix_addr(id, &local) != 0)
-        return SYS_EXCEPTION();  // FIXME error success
+        return SYS_EXCEPTION();
 
     if (unlink(local.sun_path) != 0)
     {
         if (errno != ENOENT)
             return SYS_EXCEPTION();
     }
-    socklen_t len = strlen(local.sun_path) + sizeof(local.sun_family);
 
-    if (bind(queue->fd, (struct sockaddr *)&local, len) != 0)
+    if (bind(queue->fd, (struct sockaddr *)&local, sizeof(struct sockaddr_un)) != 0)
+    {
+        log_error(NULL, "Bind address %s\n", local.sun_path);
         return SYS_EXCEPTION();
-
+    }
     return 0;
 }
 
@@ -83,45 +88,68 @@ void messaging_assign(queue_t *queue)
     my_q = queue;
 }
 
-int messaging_recv(generic_msg_t *msg)
+int messaging_recv_from(generic_msg_t *msg, struct sockaddr_storage *their_addr, bool blocking)
 {
     if (my_q == NULL)
         return EXCEPTION(EMSG_NOCONN);
-    return messaging_recv_on(my_q, msg);
+    return messaging_recv_on(my_q, msg, their_addr, blocking);
 }
 
-int messaging_recv_on(queue_t *q, generic_msg_t *msg) //, struct sockaddr_storage *their_addr)
+int messaging_recv_on(queue_t *q, generic_msg_t *msg, struct sockaddr_storage *their_addr, bool blocking)
 {
-#if TRACK_SENDER
-    struct sockaddr_storage their_addr;
-    socklen_t addr_len = sizeof(their_addr);
-#endif
-
-    uint8_t data[MAX_MSG_SIZE];
     if (q->fd <= 0)
-        return EXCEPTION(ENOTSOCK);  // FIXME Socket operation on non-socket (ENOTSOCK)
-    ssize_t numbytes = recvfrom(q->fd, data, sizeof(data), MSG_DONTWAIT,
-#if TRACK_SENDER
-                                (struct sockaddr *)&their_addr, &addr_len);
-#else
-                                NULL, NULL);
-#endif
+        return EXCEPTION(ENOTSOCK);
+
+    int flags = 0;
+    if (!blocking)
+        flags = MSG_DONTWAIT;
+    socklen_t addr_len = sizeof(struct sockaddr_storage);
+    socklen_t *len_ptr = &addr_len;
+    if (their_addr == NULL)
+        len_ptr = NULL;
+
+    size_t net_size = 0;
+    ssize_t numbytes = recvfrom(q->fd, &net_size, sizeof(size_t),
+                                flags, (struct sockaddr *)their_addr, len_ptr);
     if (numbytes < 0)
     {
         if (errno == EAGAIN)
             return ENOMSG;
         return SYS_EXCEPTION();
     }
+    size_t data_size = ntohll(net_size);
+    uint8_t *data = malloc(data_size);
+    numbytes = recvfrom(q->fd, data, data_size,
+                        flags, (struct sockaddr *)their_addr, len_ptr);
+    if (numbytes < 0)
+        return SYS_EXCEPTION();
 
     if (proto_to_generic_msg(data, numbytes, msg) != 0)
         return -1;
+    free(data);
     return 0;
 }
 
-int messaging_send(const char *key, const message_type_t type, generic_msg_t *msg)
+int signal_recv(queue_t *q, long *msg_type, signal_t *sig)
+{
+    generic_msg_t buf = {0};
+    int ret = messaging_recv_on(q, &buf, NULL, false);
+    if (ret != 0)
+        return ret;
+    *msg_type = buf.type;
+    if (buf.type != SIGNAL)
+        return -2;
+    memcpy(sig, &buf.info.signal, sizeof(signal_t));
+    return 0;
+}
+
+int messaging_send(const char *key, const message_type_t type, generic_msg_t *msg, bool blocking)
 {
     if (my_q == NULL)
         return EXCEPTION(EMSG_NOCONN);
+    int flags = 0;
+    if (!blocking)
+        flags = MSG_DONTWAIT;
     void *data;
     size_t data_len;
     if (generic_msg_to_proto(msg, &data, &data_len) != 0)
@@ -131,9 +159,18 @@ int messaging_send(const char *key, const message_type_t type, generic_msg_t *ms
     if (unix_addr(key, &target) != 0)
         return SYS_EXCEPTION();
 
-    ssize_t numbytes = sendto(my_q->fd, data, data_len, MSG_DONTWAIT,
-                              (const struct sockaddr *)&target, sizeof(target));
-    free(data);
+    size_t net_size = htonll(data_len);
+    ssize_t numbytes = sendto(my_q->fd, &net_size, sizeof(size_t),
+                              flags, (const struct sockaddr *)&target, sizeof(struct sockaddr_un));
+    if (numbytes < 0)
+    {
+        if (errno == EAGAIN)
+            return EAGAIN;
+        return SYS_EXCEPTION();
+    }
+    numbytes = sendto(my_q->fd, data, data_len,
+                      flags, (const struct sockaddr *)&target, sizeof(struct sockaddr_un));
+    smrt_deref(data);
     if (numbytes < 0)
     {
         if (errno == EAGAIN)
@@ -141,4 +178,19 @@ int messaging_send(const char *key, const message_type_t type, generic_msg_t *ms
         return SYS_EXCEPTION();
     }
     return 0;
+}
+
+void messaging_qclose(queue_t *queue)
+{
+    if (queue == NULL)
+        return;
+    close(queue->fd);
+    struct sockaddr_un local;
+    if (unix_addr(queue->key, &local) == 0)
+        unlink(local.sun_path);
+}
+
+void messaging_close()
+{
+    messaging_qclose(my_q);
 }

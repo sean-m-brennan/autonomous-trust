@@ -42,7 +42,7 @@ void signature_init(signature_t *sig, const unsigned char *hex_seed)
 
 unsigned char *signature_publish(const signature_t *sig)
 {
-    unsigned char *hex = malloc(crypto_sign_PUBLICKEYBYTES * 2);
+    unsigned char *hex = smrt_create(crypto_sign_PUBLICKEYBYTES * 2);
     if (hex == NULL)
     {
         EXCEPTION(ENOMEM);
@@ -56,7 +56,7 @@ unsigned char *signature_generate()
 {
     unsigned char key[crypto_sign_SEEDBYTES];
     randombytes(key, crypto_sign_SEEDBYTES);
-    unsigned char *hex = malloc(crypto_sign_SEEDBYTES * 2);
+    unsigned char *hex = smrt_create(crypto_sign_SEEDBYTES * 2);
     if (hex == NULL)
     {
         EXCEPTION(ENOMEM);

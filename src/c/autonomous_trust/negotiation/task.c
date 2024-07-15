@@ -30,12 +30,11 @@ int task_run(task_t *task)
     if (capability == NULL)
         return -1; // FIXME specific error
 
-    thread_args_t *args = malloc(sizeof(thread_args_t));
+    thread_args_t *args = smrt_create(sizeof(thread_args_t));
     if (args == NULL)
         return EXCEPTION(ENOMEM);
     args->argc = task->argc;
     memcpy(&args->argv, &task->argv, sizeof(args->argv));
-    args->alloc = true;
 
     pthread_t thread;
     int err = pthread_create(&thread, NULL, (pthread_function_t)capability->function, args);
@@ -70,9 +69,9 @@ int task_sync_out(task_t *task, AutonomousTrust__Core__Protobuf__Negotiation__Ta
 void task_proto_free(AutonomousTrust__Core__Protobuf__Negotiation__Task *proto)
 {
     capability_proto_free(proto->capability);
-    free(proto->capability);
-    free(proto->when);
-    free(proto->duration);
+    smrt_deref(proto->capability);
+    smrt_deref(proto->when);
+    smrt_deref(proto->duration);
     array_proto_free(proto->args);
 }
 
@@ -91,7 +90,7 @@ int task_to_proto(task_t *msg, size_t size, void **data_ptr, size_t *data_len_pt
     AutonomousTrust__Core__Protobuf__Negotiation__Task proto;
     task_sync_out(msg, &proto);
     *data_len_ptr = autonomous_trust__core__protobuf__negotiation__task__get_packed_size(&proto);
-    *data_ptr = malloc(*data_len_ptr);
+    *data_ptr = smrt_create(*data_len_ptr);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
     autonomous_trust__core__protobuf__negotiation__task__pack(&proto, *data_ptr);
@@ -104,6 +103,6 @@ int proto_to_task(uint8_t *data, size_t len, task_t *task)
     AutonomousTrust__Core__Protobuf__Negotiation__Task *msg =
         autonomous_trust__core__protobuf__negotiation__task__unpack(NULL, len, data);
     task_sync_in(msg, task);
-    free(msg);
+    smrt_deref(msg);
     return 0;
 }

@@ -14,33 +14,23 @@
  *   limitations under the License.
  *******************/
 
-#ifndef REDBLACK_PRIV_H
-#define REDBLACK_PRIV_H
+#ifndef ALLOCATION_H
+#define ALLOCATION_H
 
-#include "redblack.h"
-#include "utilities/allocation.h"
+#include <stdlib.h>
+#include <stdbool.h>
 
-enum Direction
-{
-    LEFT,
-    RIGHT
-};
+typedef struct {
+    bool alloc;
+    size_t refs;
+} smrt_ptr_t;
 
-enum Direction opposite_direction(enum Direction dir);
+void *smrt_create(size_t size);
 
-struct rbNode
-{
-    smrt_ptr_t;
-    int key;
-    bool red;
-    tree_data_ptr_t data;
-    struct rbNode *parent, *left, *right;
-};
+void *smrt_recreate(void *orig, size_t size);
 
-struct rbTree_s {
-    smrt_ptr_t;
-    struct rbNode *root;
-    int size;
-};
+void smrt_ref(void *ptr);
 
-#endif  // REDBLACK_PRIV_H
+void smrt_deref(void *ptr);
+
+#endif  // ALLOCATION_H

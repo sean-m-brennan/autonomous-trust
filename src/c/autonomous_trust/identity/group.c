@@ -25,6 +25,7 @@
 #include "config/configuration.h"
 #include "group.h"
 #include "identity_priv.h"
+#include "utilities/util.h"
 
 int group_init(uuid_t *uuid, char *address, group_t *group)
 {
@@ -37,13 +38,13 @@ int group_init(uuid_t *uuid, char *address, group_t *group)
     if (eseed == NULL)
         return -1;
     encryptor_init(&group->encryptor, eseed);
-    free(eseed);
+    smrt_deref(eseed);
     return 0;
 }
 
 int group_create(uuid_t *uuid, char *address, group_t **grp)
 {
-    *grp = calloc(1, sizeof(group_t));
+    *grp = smrt_create(sizeof(group_t));
     group_t *group = *grp;
     if (group == NULL)
         return EXCEPTION(ENOMEM);
@@ -63,11 +64,16 @@ int group_decrypt(const group_t *ident, const msg_str_t *cipher, const group_t *
 
 int group_to_json(const void *data_struct, json_t **obj_ptr)
 {
-    group_t *ident = (group_t *)data_struct;
+    const group_t *ident = data_struct;
     *obj_ptr = json_object();
     json_t *obj = *obj_ptr;
     if (obj == NULL)
-        return ENOMEM;
+        return EXCEPTION(ENOMEM);
+ 
+    int err = json_object_set_new(obj, "typename", json_string("group"));
+    if (err != 0)
+        return EXCEPTION(EJSN_OBJ_SET);
+ 
     char uuid_str[UUID_STRING_LEN+1] = {0};
     uuid_unparse(ident->uuid, uuid_str);
     json_object_set(obj, "uuid", json_string(uuid_str));
@@ -76,7 +82,7 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
     json_t *encr = json_object();
     unsigned char *hex = encryptor_publish(&ident->encryptor); // encoded
     json_object_set(encr, "hex_seed", json_string((char *)hex));
-    free(hex);
+    smrt_deref(hex);
     json_object_set(obj, "encryptor", encr);
 
     return 0;
@@ -84,7 +90,7 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
 
 int group_from_json(const json_t *obj, void *data_struct)
 {
-    group_t *group = (group_t *)data_struct;
+    group_t *group = data_struct;
     json_t *uuid_obj = json_object_get(obj, "uuid");
     const char *uuid_str = json_string_value(uuid_obj);
     if (uuid_parse(uuid_str, group->uuid) < 0)
@@ -128,7 +134,7 @@ int group_to_proto(group_t *msg, void **data_ptr, size_t *data_len_ptr)
     AutonomousTrust__Core__Protobuf__Identity__Group proto;
     group_sync_out(msg, &proto);
     *data_len_ptr = autonomous_trust__core__protobuf__identity__group__get_packed_size(&proto);
-    *data_ptr = malloc(*data_len_ptr);
+    *data_ptr = smrt_create(*data_len_ptr);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
     autonomous_trust__core__protobuf__identity__group__pack(&proto, *data_ptr);
@@ -147,5 +153,5 @@ int proto_to_group(uint8_t *data, size_t len, group_t *group)
 
 void group_free(group_t *group)
 {
-    free(group);
+    smrt_deref(group);
 }

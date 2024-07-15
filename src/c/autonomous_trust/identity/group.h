@@ -21,6 +21,7 @@
 
 typedef struct
 {
+    smrt_ptr_t;
     uuid_t uuid;
     char address[ADDR_LEN+1];
     encryptor_t encryptor;

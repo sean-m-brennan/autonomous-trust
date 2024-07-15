@@ -31,15 +31,16 @@
 #define MAX_ARGS 10
 
 typedef struct {
+    smrt_ptr_t;
     size_t argc;
     array_t argv;
-    bool alloc;
 } thread_args_t;
 
 typedef void (*capability_function_t)(thread_args_t);
 
 typedef struct
 {
+    smrt_ptr_t;
     char name[CAP_NAMELEN+1];
     map_t arguments; // map of name to data_type_t
     bool local;

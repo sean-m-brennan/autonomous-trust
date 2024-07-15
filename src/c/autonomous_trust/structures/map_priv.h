@@ -20,6 +20,7 @@
 #include <stddef.h>
 
 #include <sodium.h>
+#include <jansson.h>
 
 #include "map.h"
 #include "array_priv.h"
@@ -27,12 +28,12 @@
 
 struct map_s
 {
+    smrt_ptr_t;
     map_item_t *items;
     size_t length;
     size_t capacity;
     array_t keys;
     unsigned char hashkey[crypto_shorthash_KEYBYTES];
-    bool alloc;
 };
 
 
@@ -42,6 +43,8 @@ void map_proto_free(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap);
 
 int map_sync_in(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap, map_t *map);
 
-//void proto_map_free_in_sync(map_t *map);
+int map_to_json(const void *data_struct, json_t **obj_ptr);
+
+int map_from_json(const json_t *obj, void *data_struct);
 
 #endif  // MAP_PRIV_H

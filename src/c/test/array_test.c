@@ -16,7 +16,7 @@
 
 #include <stdlib.h>
 #include "autonomous_trust/structures/array_priv.h"
-#include "autonomous_trust/config/protobuf_shutdown.h"
+#include "autonomous_trust/utilities/protobuf_shutdown.h"
 #include "autonomous_trust/utilities/util.h"
 #include "autonomous_trust/utilities/logger.h"
 
@@ -82,12 +82,12 @@ DEFINE_TEST(test_array_data)
     ck_assert_ret_ok(data_integer(data, &one));
     ck_assert_int_eq(one, 1);
 
-    data_decr(data1);
-    data_decr(data2);
-    data_decr(data3);
-    data_decr(data4);
-    data_decr(data5);
-    data_decr(data6);
+    smrt_deref(data1);
+    smrt_deref(data2);
+    smrt_deref(data3);
+    smrt_deref(data4);
+    smrt_deref(data5);
+    smrt_deref(data6);
 }
 END_TEST_DEFINITION()
 

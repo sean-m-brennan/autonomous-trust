@@ -19,7 +19,7 @@
 #include <errno.h>
 
 #include "redblack_priv.h"
-#include "array.h"
+#include "array_priv.h"
 
 enum Direction opposite_direction(enum Direction dir)
 {
@@ -31,7 +31,7 @@ enum Direction opposite_direction(enum Direction dir)
 
 int createNode(tree_data_ptr_t data, int key, struct rbNode **node_ptr)
 {
-    *node_ptr = malloc(sizeof(struct rbNode));
+    *node_ptr = smrt_create(sizeof(struct rbNode));
     struct rbNode *node = *node_ptr;
     if (node == NULL)
         return EXCEPTION(ENOMEM);
@@ -133,7 +133,7 @@ void nodesFree(struct rbNode *node) {
         nodesFree(node->left);
     if (node->right != NULL)
         nodesFree(node->right);
-    free(node);
+    smrt_deref(node);
 }
 
 
@@ -306,7 +306,7 @@ int tree_create(tree_t **tree_ptr)
 {
     if (tree_ptr == NULL)
         return EXCEPTION(EINVAL);
-    *tree_ptr = calloc(1, sizeof(tree_t));
+    *tree_ptr = smrt_create(sizeof(tree_t));
     if (*tree_ptr == NULL)
         return EXCEPTION(ENOMEM);
     return tree_init(*tree_ptr);
@@ -358,7 +358,7 @@ int tree_insert(tree_t *tree, void *data, int key)
             current = current->right;
         else
         {
-            free(node);
+            smrt_deref(node);
             return EXCEPTION(ERBT_DUP_INS);
         }
     }
@@ -420,5 +420,5 @@ int tree_delete(tree_t *tree, int key)
 void tree_free(tree_t *tree) {
     nodesFree(tree->root);
     tree->size = 0;
-    free(tree);
+    smrt_deref(tree);
 }
