@@ -17,11 +17,14 @@
 #ifndef DATA_PRIV_H
 #define DATA_PRIV_H
 
+#include <jansson.h>
+
 #include "data.h"
 #include "structures/data.pb-c.h"
 
 struct data_s
 {
+    smrt_ptr_t;
     data_type_t type;
     size_t size;
     union
@@ -34,7 +37,7 @@ struct data_s
         unsigned char *byt;
         void *obj;
     };
-    int ref;
+    //int ref;
     int (*cmp)(struct data_s *, struct data_s *);
 };
 
@@ -68,7 +71,9 @@ void data_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data *pdata);
 
 int data_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data *pdata, data_t *data);
 
-//void data_free_in_sync(data_t *data);
+int data_to_json(const void *data_struct, json_t **obj_ptr);
+
+int data_from_json(const json_t *obj, void *data_struct);
 
 
 #define EDAT_SER_OBJ 216

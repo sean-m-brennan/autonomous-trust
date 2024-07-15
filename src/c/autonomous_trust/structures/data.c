@@ -15,10 +15,12 @@
  *******************/
 
 #include <stdlib.h>
+#include <string.h>
 
 #include "utilities/exception.h"
 #include "utilities/util.h"
 #include "data_priv.h"
+#include "utilities/b64.h"
 
 #define pod_cmp(a, b) ((a) < (b)) ? -1 : (((a) > (b)) ? 1 : 0)
 
@@ -37,14 +39,13 @@ bool data_equal(data_t *a, data_t *b)
 
 data_t *l_integer_data(long val)
 {
-    data_t *dat = calloc(1, sizeof(data_t));
+    data_t *dat = smrt_create(sizeof(data_t));
     if (dat == NULL)
         return dat;
     dat->type = INT;
     dat->intgr = val;
     dat->cmp = i_cmp;
     dat->size = 1;
-    dat->ref = 1;
     return dat;
 }
 
@@ -55,14 +56,13 @@ data_t *integer_data(int val)
 
 data_t *ul_integer_data(unsigned long val)
 {
-    data_t *dat = calloc(1, sizeof(data_t));
+    data_t *dat = smrt_create(sizeof(data_t));
     if (dat == NULL)
         return dat;
     dat->type = UINT;
     dat->uintr = val;
     dat->cmp = u_cmp;
     dat->size = 1;
-    dat->ref = 1;
     return dat;
 }
 
@@ -73,14 +73,13 @@ data_t *u_integer_data(unsigned int val)
 
 data_t *floating_pt_dbl_data(double val)
 {
-    data_t *dat = calloc(1, sizeof(data_t));
+    data_t *dat = smrt_create(sizeof(data_t));
     if (dat == NULL)
         return dat;
     dat->type = FLOAT;
     dat->flt_pt = val;
     dat->cmp = f_cmp;
     dat->size = 1;
-    dat->ref = 1;
     return dat;
 }
 
@@ -91,66 +90,52 @@ data_t *floating_pt_data(float val)
 
 data_t *boolean_data(bool val)
 {
-    data_t *dat = calloc(1, sizeof(data_t));
+    data_t *dat = smrt_create(sizeof(data_t));
     if (dat == NULL)
         return dat;
     dat->type = BOOL;
     dat->bl = val;
     dat->cmp = b_cmp;
     dat->size = 1;
-    dat->ref = 1;
     return dat;
 }
 
 data_t *string_data(char *val, size_t len)
 {
-    data_t *dat = calloc(1, sizeof(data_t));
+    data_t *dat = smrt_create(sizeof(data_t));
     if (dat == NULL)
         return dat;
     dat->type = STRING;
-    dat->str = val; // FIXME
+    dat->size = len;
+    dat->str = calloc(1, len+1);
+    strncpy(dat->str, val, len);
     dat->cmp = s_cmp;
-    dat->size = strlen(val);
-    dat->ref = 1;
     return dat;
 }
 
 data_t *bytes_data(unsigned char *val, size_t len)
 {
-    data_t *dat = calloc(1, sizeof(data_t));
+    data_t *dat = smrt_create(sizeof(data_t));
     if (dat == NULL)
         return dat;
     dat->type = BYTES;
-    dat->byt = val; // FIXME
+    dat->byt = calloc(1, len);
+    memcpy(dat->byt, val, len);
     dat->cmp = d_cmp;
     dat->size = len;
-    dat->ref = 1;
     return dat;
 }
 
 data_t *object_ptr_data(void *val, size_t len)
 {
-    data_t *dat = calloc(1, sizeof(data_t));
+    data_t *dat = smrt_create(sizeof(data_t));
     if (dat == NULL)
         return dat;
     dat->type = OBJECT;
     dat->obj = val;
     dat->cmp = o_cmp;
     dat->size = 1;
-    dat->ref = 1;
     return dat;
-}
-
-void data_incr(data_t *d)
-{
-    d->ref++;
-}
-
-void data_decr(data_t *d)
-{
-    d->ref--;
-    if (d->ref <= 0)
-        free(d);
 }
 
 int data_l_integer(data_t *d, long *i)
@@ -288,6 +273,8 @@ int data_sync_out(data_t *data, AutonomousTrust__Core__Protobuf__Structures__Dat
         pdata->type = AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA_TYPE__STRING;
         pdata->dat_case = AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA__DAT_STR;
         pdata->str = malloc(data->size);
+        if (pdata->str == NULL)
+            return EXCEPTION(ENOMEM);
         strncpy(pdata->str, data->str, min(strlen(data->str), data->size));
         break;
     case BYTES:
@@ -295,6 +282,8 @@ int data_sync_out(data_t *data, AutonomousTrust__Core__Protobuf__Structures__Dat
         pdata->dat_case = AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA__DAT_BYT;
         pdata->byt.len = data->size;
         pdata->byt.data = malloc(data->size);
+        if (pdata->str == NULL)
+            return EXCEPTION(ENOMEM);
         memcpy(pdata->byt.data, data->byt, data->size);
         break;
     case OBJECT:
@@ -365,23 +354,86 @@ int data_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data *pdata, data_
     return 0;
 }
 
-/*void data_free_in_sync(data_t *data)
+int data_to_json(const void *data_struct, json_t **obj_ptr)
 {
+    const data_t *data = data_struct;
+    *obj_ptr = json_object();
+    json_t *obj = *obj_ptr;
+    if (obj == NULL)
+        return EXCEPTION(ENOMEM);
+
+    json_object_set(obj, "type", json_integer(data->type));
+    json_object_set(obj, "size", json_integer(data->size));
     switch (data->type)
     {
+    case INT:
+        json_object_set_new(obj, "dat", json_integer(data->intgr));
+        break;
+    case UINT:
+        json_object_set_new(obj, "dat", json_integer(data->uintr));
+        break;
+    case FLOAT:
+        json_object_set_new(obj, "dat", json_real(data->flt_pt));
+        break;
+    case BOOL:
+        json_object_set_new(obj, "dat", json_boolean(data->bl));
+        break;
     case STRING:
-        free(data->str);
+        json_object_set_new(obj, "dat", json_stringn(data->str, data->size));
         break;
     case BYTES:
-        free(data->byt);
-        break;
-    case INT:
-    case UINT:
-    case FLOAT:
-    case BOOL:
-    case OBJECT:
-    case NONE:
-    default:
+    {
+        size_t enc_size = b64_encoded_len(data->size);
+        char *enc_str = malloc(enc_size);
+        if (enc_str == NULL)
+            return EXCEPTION(ENOMEM);
+        base64_encode(data->byt, data->size, enc_str, enc_size);
+        json_object_set_new(obj, "dat", json_stringn_nocheck(enc_str, enc_size));
         break;
     }
-}*/
+    case NONE:
+    case OBJECT:
+        return EXCEPTION(EINVAL); // neither arbitray objects nor None can be encoded
+    }
+    return 0;
+}
+
+int data_from_json(const json_t *obj, void *data_struct)
+{
+    data_t *data = data_struct;
+    data->type = json_integer_value(json_object_get(obj, "type"));
+    data->size = json_integer_value(json_object_get(obj, "size"));
+    json_t *dat = json_object_get(obj, "dat");
+    switch (data->type)
+    {
+    case INT:
+        data->intgr = json_integer_value(dat);
+        break;
+    case UINT:
+        data->uintr = json_integer_value(dat);
+        break;
+    case FLOAT:
+        data->flt_pt = json_real_value(dat);
+        break;
+    case BOOL:
+        data->bl = json_boolean_value(dat);
+        break;
+    case STRING:
+        data->str = malloc(data->size + 1);
+        strncpy(data->str, json_string_value(dat), data->size);
+        break;
+    case BYTES:
+    {
+        size_t enc_size = json_string_length(dat);
+        const char *enc_str = json_string_value(dat);
+        data->size = b64_decoded_len(enc_size, enc_str[enc_size-1]);
+        data->byt = malloc(data->size);
+        base64_decode(enc_str, enc_size, data->byt, data->size);
+        break;
+    }
+    case NONE:
+    case OBJECT:
+        return EXCEPTION(EINVAL); // neither arbitray objects nor None can be encoded
+    }
+    return 0;
+}

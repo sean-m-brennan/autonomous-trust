@@ -16,7 +16,7 @@
 
 #include <stdlib.h>
 #include "autonomous_trust/structures/map_priv.h"
-#include "autonomous_trust/config/protobuf_shutdown.h"
+#include "autonomous_trust/utilities/protobuf_shutdown.h"
 #include "autonomous_trust/utilities/exception.h"
 #include "autonomous_trust/utilities/logger.h"
 

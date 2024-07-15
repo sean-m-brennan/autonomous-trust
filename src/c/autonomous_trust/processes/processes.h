@@ -25,6 +25,7 @@
 
 struct process_s
 {
+    smrt_ptr_t;
     char name[PROC_NAME_LEN+1];  // category of process, i.e. identity, network, ...
     char impl[PROC_NAME_LEN+1];  // identifier of implementing function
     config_t conf;

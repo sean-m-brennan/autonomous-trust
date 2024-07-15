@@ -14,33 +14,37 @@
  *   limitations under the License.
  *******************/
 
-#ifndef REDBLACK_PRIV_H
-#define REDBLACK_PRIV_H
+#include "allocation.h"
 
-#include "redblack.h"
-#include "utilities/allocation.h"
-
-enum Direction
+void *smrt_create(size_t size)
 {
-    LEFT,
-    RIGHT
-};
+    void *ptr = calloc(1, size);
+    if (ptr == NULL)
+        return ptr;
+    smrt_ptr_t *sptr = ptr;
+    sptr->alloc = true;
+    sptr->refs = 1;
+    return ptr;
+}
 
-enum Direction opposite_direction(enum Direction dir);
-
-struct rbNode
+void *smrt_recreate(void *orig, size_t size)
 {
-    smrt_ptr_t;
-    int key;
-    bool red;
-    tree_data_ptr_t data;
-    struct rbNode *parent, *left, *right;
-};
+    void *ptr = realloc(orig, size);
+    if (ptr == NULL)
+        return ptr;
+    return ptr;
+}
 
-struct rbTree_s {
-    smrt_ptr_t;
-    struct rbNode *root;
-    int size;
-};
+void smrt_ref(void *ptr)
+{
+    smrt_ptr_t *sptr = ptr;
+    sptr->refs++;
+}
 
-#endif  // REDBLACK_PRIV_H
+void smrt_deref(void *ptr)
+{
+    smrt_ptr_t *sptr = ptr;
+    sptr->refs--;
+    if (sptr->alloc && sptr->refs <= 0)
+        free(ptr);
+}

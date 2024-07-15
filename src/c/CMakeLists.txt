@@ -18,6 +18,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_BUILD_TYPE Debug)
+#set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_C_FLAGS_DEBUG "-g -O0")
 
 set(warning_as_error -Werror)
 set(useful_warnings
@@ -163,13 +165,12 @@ set(table_headers_in
 set(libsrc
     autonomous_trust/autonomous_trust.c
     autonomous_trust/config/configuration.c
-    autonomous_trust/config/protobuf_shutdown.cpp
-    autonomous_trust/config/sighandler.c
     autonomous_trust/identity/encryptor.c
     autonomous_trust/identity/group.c
     autonomous_trust/identity/hexlify.c
     autonomous_trust/identity/identity.c
     autonomous_trust/identity/id_proc.c
+    autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
     autonomous_trust/negotiation/task.c
     autonomous_trust/network/net_proc.c
@@ -184,17 +185,20 @@ set(libsrc
     autonomous_trust/structures/map.c
     autonomous_trust/structures/merkle.c
     autonomous_trust/structures/redblack.c
+    autonomous_trust/utilities/allocation.c
+    autonomous_trust/utilities/b64.c
     autonomous_trust/utilities/err_str.c
     autonomous_trust/utilities/exception.c
     autonomous_trust/utilities/logger.c
     autonomous_trust/utilities/message.c
     autonomous_trust/utilities/msg_types.c
+    autonomous_trust/utilities/protobuf_shutdown.cpp
+    autonomous_trust/utilities/sighandler.c
     autonomous_trust/utilities/util.c
 )
 set(libhdr
     autonomous_trust.h
     autonomous_trust/config/configuration.h
-    autonomous_trust/config/sighandler.h
     autonomous_trust/identity/identity.h
     autonomous_trust/processes/capabilities.h
     autonomous_trust/structures/array.h
@@ -205,6 +209,7 @@ set(libhdr
     autonomous_trust/utilities/logger.h
     autonomous_trust/utilities/message.h
     autonomous_trust/utilities/msg_types.h
+    autonomous_trust/utilities/sighandler.h
 )
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust)
 
@@ -347,38 +352,43 @@ target_link_directories(at_example PRIVATE ${CMAKE_SYSROOT})
 ####################
 # tests
 
-add_executable(rb_test test/rb_test.c)
-set_source_files_properties(test/rb_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(rb_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+add_executable(array_test test/array_test.c)
+set_source_files_properties(test/array_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(array_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
 add_executable(exception_test test/exception_test.c)
 set_source_files_properties(test/exception_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(exception_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
-add_executable(array_test test/array_test.c)
-set_source_files_properties(test/array_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(array_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+add_executable(logger_test test/logging_test.c)
+set_source_files_properties(test/logging_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(logger_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
 add_executable(map_test test/map_test.c)
 set_source_files_properties(test/map_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(map_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
-add_executable(logger_test test/logging_test.c)
-set_source_files_properties(test/logging_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(logger_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+add_executable(msg_test test/messaging_test.c)
+set_source_files_properties(test/messaging_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(msg_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
 add_executable(proc_track_test test/proc_track_test.c)
 set_source_files_properties(test/proc_track_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(proc_track_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
+add_executable(rb_test test/rb_test.c)
+set_source_files_properties(test/rb_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rb_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
 enable_testing()
 
-add_test(NAME rb_test COMMAND $<TARGET_FILE:rb_test>)
-add_test(NAME exception_test COMMAND $<TARGET_FILE:exception_test>)
 add_test(NAME array_test COMMAND $<TARGET_FILE:array_test>)
-add_test(NAME map_test COMMAND $<TARGET_FILE:map_test>)
+add_test(NAME exception_test COMMAND $<TARGET_FILE:exception_test>)
 add_test(NAME logger_test COMMAND $<TARGET_FILE:logger_test>)
+add_test(NAME map_test COMMAND $<TARGET_FILE:map_test>)
+add_test(NAME msg_test COMMAND $<TARGET_FILE:msg_test>)
 add_test(NAME proc_track_test COMMAND $<TARGET_FILE:proc_track_test>)
+add_test(NAME rb_test COMMAND $<TARGET_FILE:rb_test>)
 
 
 ####################

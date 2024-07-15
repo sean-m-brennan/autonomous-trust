@@ -59,7 +59,7 @@ char *message_type_to_string(message_type_t type)
     case PEER_CAPABILITIES:
         return (char*)autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name;
     case TASK:
-        return (char*)"TASK"; // FIXME
+        return (char*)autonomous_trust__core__protobuf__negotiation__task__descriptor.c_name;
     case NET_MESSAGE:
         return (char*)"NET_MSG";
     default:
@@ -80,19 +80,21 @@ message_type_t string_to_message_type(const char *str)
     if (strncmp(str, autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name,
                 strlen(autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name)) == 0)
         return PEER_CAPABILITIES;
-    if (strncmp(str, "TASK", strlen("TASK")) == 0) // FIXME
+    if (strncmp(str, autonomous_trust__core__protobuf__negotiation__task__descriptor.c_name,
+                strlen(autonomous_trust__core__protobuf__negotiation__task__descriptor.c_name)) == 0)
         return TASK;
     if (strncmp(str, "NET_MSG", strlen("NET_MSG")) == 0)
         return NET_MESSAGE;
     return 0;
 }
 
-// FIXME
 int signal_to_proto(const signal_t *msg, void **data_ptr, size_t *data_len_ptr)
 {
-    *data_len_ptr = strlen(msg->descr) + 1;
-    *data_ptr = calloc(1, *data_len_ptr);
-    strcpy(*data_ptr, msg->descr);
+    char data_str[1024];
+    sprintf(data_str, "%d-%s", msg->sig, msg->descr);
+    *data_len_ptr = strlen(data_str) + 1;
+    *data_ptr = smrt_create(*data_len_ptr);
+    strcpy(*data_ptr, data_str);
     return 0;
 }
 
@@ -109,14 +111,14 @@ int wrap_in_any(message_type_t type, void *data_in, size_t data_in_len, void **d
     pb_msg.value.len = data_in_len;
 
     *data_len_ptr = google__protobuf__any__get_packed_size(&pb_msg);
-    *data_ptr = malloc(*data_len_ptr);
+    *data_ptr = smrt_create(*data_len_ptr);
     if (*data_ptr == NULL)
     {
-        free(data_in);
+        smrt_deref(data_in);
         return EXCEPTION(ENOMEM);
     }
     google__protobuf__any__pack(&pb_msg, *data_ptr); // FIXME error check
-    free(data_in);
+    smrt_deref(data_in);
     return 0;
 }
 
@@ -168,14 +170,15 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     return wrap_in_any(msg->type, subdata, subdata_len, data, data_len);
 }
 
-// FIXME
 int proto_to_signal(uint8_t *data, size_t len, signal_t *sig)
 {
+    sscanf((const char*)data, "%d-%s", &sig->sig, sig->descr);
     return 0;
 }
 
 int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
 {
+    // FIXME
     return 0;
 }
 
@@ -188,6 +191,8 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         ; // FIXME
 
     message_type_t type = string_to_message_type(pb_msg->type_url);
+    msg->type = type;
+    msg->size = message_size(msg->type);
     switch (type)
     {
     case SIGNAL:

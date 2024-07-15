@@ -42,7 +42,7 @@ void encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
 
 unsigned char *encryptor_publish(const encryptor_t *encr)
 {
-    unsigned char *hex = malloc(crypto_box_PUBLICKEYBYTES * 2);
+    unsigned char *hex = smrt_create(crypto_box_PUBLICKEYBYTES * 2);
     if (hex == NULL)
     {
         EXCEPTION(ENOMEM);
@@ -56,7 +56,7 @@ unsigned char *encryptor_generate()
 {
     unsigned char key[crypto_box_SEEDBYTES];
     randombytes(key, crypto_box_SEEDBYTES);
-    unsigned char *hex = malloc(crypto_box_SEEDBYTES * 2);
+    unsigned char *hex = smrt_create(crypto_box_SEEDBYTES * 2);
     if (hex == NULL)
     {
         EXCEPTION(ENOMEM);

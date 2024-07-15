@@ -18,6 +18,7 @@
 #define MESSAGE_H
 
 #include <stdbool.h>
+#include <sys/socket.h>
 
 #include "structures/map.h"
 #include "msg_types.h"
@@ -35,44 +36,69 @@ typedef struct
  * @brief Initialize a message queue
  *
  * @param id A message queue id
- * @return int File descriptor of the open queue
+ * @param queue Queue object
+ * @return int Success or error
  */
 int messaging_init(const char *id, queue_t *queue);
 
 /**
  * @brief Identify the queue that belong to this process.
  * 
- * @param queue 
+ * @param queue Queue object
  */
 void messaging_assign(queue_t *queue);
 
 /**
  * @brief Receive a message from a specific queue (usually external)
  * 
- * @param q 
- * @param msg 
+ * @param queue Queue object
+ * @param msg Generic message
+ * @param their_addr Sender's info
+ * @param blocking 
  * @return int 
  */
-int messaging_recv_on(queue_t *q, generic_msg_t *msg);
+int messaging_recv_on(queue_t *q, generic_msg_t *msg, struct sockaddr_storage *their_addr, bool blocking);
 
 /**
- * @brief Receive an internal message
- *
- * @param data generic_msg_t to load 
- * @return int
+ * @brief Receive a message from the assigned queue
+ * 
+ * @param data 
+ * @param their_addr 
+ * @param blocking 
+ * @return int 
  */
-int messaging_recv(generic_msg_t *data);
+int messaging_recv_from(generic_msg_t *data, struct sockaddr_storage *their_addr, bool blocking);
+
+/**
+ * @brief 
+ * 
+ */
+#define messaging_recv(data) messaging_recv_from(data, NULL, false)
+
+int signal_recv(queue_t *q, long *msg_type, signal_t * sig);
 
 /**
  * @brief Send a message internally
  *
- * @param qid
+ * @param queue_id
  * @param type
- * @param data
- * @param data_len
+ * @param msg
  * @return int
  */
-int messaging_send(const char *key, const message_type_t type, generic_msg_t *msg);
+int messaging_send(const char *key, const message_type_t type, generic_msg_t *msg, bool blocking);
+
+/**
+ * @brief 
+ * 
+ * @param queue 
+ */
+void messaging_qclose(queue_t *queue);
+
+/**
+ * @brief 
+ * 
+ */
+void messaging_close();
 
 #define EMSG_NOCONN 204
 DECLARE_ERROR(EMSG_NOCONN, "Attempting to send/recv without a queue (see message_assign())");

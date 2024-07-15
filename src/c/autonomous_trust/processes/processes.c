@@ -14,7 +14,7 @@
  *   limitations under the License.
  *******************/
 
-#define _GNU_SOURCE  // for pthread_setname_np
+#define _GNU_SOURCE // for pthread_setname_np
 #include <string.h>
 #include <fcntl.h>
 #include <sys/types.h>
@@ -27,7 +27,7 @@
 
 #define PROCESSES_IMPL
 #include "processes/processes.h"
-//#include "protobuf/processes.pb-c.h"
+// #include "protobuf/processes.pb-c.h"
 #include "config/configuration.h"
 #include "structures/map_priv.h"
 #include "utilities/msg_types_priv.h"
@@ -37,19 +37,18 @@ const char *sig_quit = "quit";
 
 const long cadence = 500000L; // microseconds
 
-
 typedef bool (*msg_handler_t)(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 
 int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies)
 {
     memset(proc->name, 0, PROC_NAME_LEN);
-    memcpy(proc->name, name, PROC_NAME_LEN-1);
+    memcpy(proc->name, name, PROC_NAME_LEN - 1);
     // FIXME general config load/save
     config_t *cfg = NULL;
     data_t *cfg_dat = NULL;
     if (map_get(configurations, proc->name, &cfg_dat) != 0)
         return -1;
-    if (data_object_ptr(cfg_dat, (void**)&cfg) != 0)
+    if (data_object_ptr(cfg_dat, (void **)&cfg) != 0)
         return -1;
     memcpy(&proc->conf, cfg, sizeof(config_t));
     proc->configs = configurations;
@@ -74,13 +73,13 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
         data_t *proc_val;
         if (map_get(procs, pname, &proc_val))
             return -1;
-        if (data_object_ptr(proc_val, (void**)&proc))
+        if (data_object_ptr(proc_val, (void **)&proc))
             return -1;
         log_info(logger, "Restart %s process\n", proc->name);
     }
     else
     {
-        proc = malloc(sizeof(process_t)); // FIXME does this get freed?
+        proc = smrt_create(sizeof(process_t)); // FIXME does this get freed?
         if (process_init(proc, pname, runner, configs, tracker, logger, NULL) != 0)
             return -1; // FIXME no such key in the map (EMAP_NOKEY)
     }
@@ -89,6 +88,11 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
     process_name_to_signal(pname, sig);
 
     pid_t pid = proc->runner(proc, queues, sig, logger); // FIXME ensure child does run fnctn
+    if (pid == -1)
+    {
+        log_error(logger, "Error starting process '%s'\n", pname);
+        return SYS_EXCEPTION();
+    }
 
     // record pids for monitoring
     char pid_str[32] = {0};
@@ -152,10 +156,10 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
         {
             data_t *h_dat;
             int err = map_get(proc->protocol.handlers, nmsg->function, &h_dat);
-            if (err != 0)  // FIXME logging?
+            if (err != 0) // FIXME logging?
                 return false;
             msg_handler_t handler;
-            err = data_object_ptr(h_dat, (void*)&handler);
+            err = data_object_ptr(h_dat, (void *)&handler);
             if (err != 0)
                 return false;
             return handler(proc, queues, msg);
@@ -164,27 +168,28 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
     return false;
 }
 
-
 bool keep_running(const process_t *proc, queue_t *sig_q, logger_t *logger)
 {
-    generic_msg_t buf = {0};
-    if (gettimeofday((struct timeval *)&proc->start, NULL) != 0) {
+    if (gettimeofday((struct timeval *)&proc->start, NULL) != 0)
+    {
         SYS_EXCEPTION();
         log_exception(logger);
     }
-    while (buf.type != SIGNAL) {
-        int err = messaging_recv_on(sig_q, &buf);
-        signal_t *msg = &buf.info.signal;
+    while (1)
+    {
+        signal_t msg = {0};
+        long type = 0;
+        int err = signal_recv(sig_q, &type, &msg);
         if (err == -1)
             log_exception(logger);
-        if (err == ENOMSG)
+        else if (err == -2 && type != SIGNAL)
+            log_error(logger, "Non-signal message on signal queue: %d\n", type);
+        else if (err == ENOMSG)
             return true;
-        if (buf.type != SIGNAL)
-            log_error(logger, "Non-signal message on signal queue: %d\n", buf.type);
-        else if (msg->descr == sig_quit)
+        else if (msg.descr == sig_quit)
             return false;
         else
-            log_error(logger, "Unhandled signal: %d - '%s'\n", msg->sig, msg->descr);
+            log_error(logger, "Unhandled signal: %d - '%s'\n", msg.sig, msg.descr);
     }
     return true;
 }
@@ -214,7 +219,7 @@ void sleep_until(const process_t *proc, long how_long)
 
 int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
-    char data_path[MAX_FILENAME+1];
+    char data_path[MAX_FILENAME + 1];
     get_data_dir(data_path);
 
     int fd1 = 0;
@@ -224,7 +229,7 @@ int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_
         return err;
 
     pid_t pid = getpid();
-    log_debug(logger, "Child pid %d\n", pid);  // FIXME remove
+    log_debug(logger, "Child pid %d\n", pid); // FIXME remove
     // FIXME message_init
     queue_t my_q;
     if (messaging_init(proc->name, &my_q) != 0)
@@ -248,11 +253,11 @@ int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_
         if (err == -1)
             ; // FIXME repair?
         if (err == ENOMSG)
-                continue;
+            continue;
         if (!run_message_handlers(proc, queues, buf.type, &buf))
         {
             size_t size = message_size(buf.type);
-            void *msg = calloc(1, size);
+            void *msg = smrt_create(size);
             if (msg == NULL)
                 continue; // FIXME logging
             memcpy(msg, &buf.info, size);
