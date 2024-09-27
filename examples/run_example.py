@@ -19,7 +19,6 @@ import argparse
 import os
 import subprocess
 import sys
-import traceback
 
 base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(base_dir)
@@ -55,7 +54,7 @@ class ClusterConfig(Configuration):
     def startup(self, without_swarm: bool = False, extern_net: bool = True):
         with_swarm = not without_swarm
         if with_swarm:
-            cfg_name = tools.config.network_cfg_name
+            cfg_name = config.config.network_cfg_name
             cmd = tools.docker.network.create_network(name=cfg_name, config_only=True, force=True)
             for worker in self.workers:
                 dev = get_worker_device(worker)
@@ -87,44 +86,44 @@ class ClusterConfig(Configuration):
             tools.docker.network.create_network(swarm_scope=with_swarm, force=True)
 
     def shutdown(self):
-        result = subprocess.check_output(['docker', 'stack', 'services', tools.config.swarm_namespace],
+        result = subprocess.check_output(['docker', 'stack', 'services', config.config.swarm_namespace],
                                          stderr=subprocess.DEVNULL)
         for line in result.decode().strip().split('\n')[1:]:
             service = line.split()[1]
             run(['docker', 'service', 'rm', service])
         for worker in self.workers:
             run(['ssh', worker, 'docker', 'swarm', 'leave', '--force'])
-            run(['ssh', worker, 'docker', 'network', 'rm', '--force', tools.config.network_cfg_name])
+            run(['ssh', worker, 'docker', 'network', 'rm', '--force', config.config.network_cfg_name])
             run(['ssh', worker, 'docker', 'network', 'prune', '-f'])
-        run(['docker', 'network', 'rm', '--force', tools.config.network_name])
+        run(['docker', 'network', 'rm', '--force', config.config.network_name])
         run(['docker', 'swarm', 'leave', '--force'])
-        run(['docker', 'network', 'rm', '--force', tools.config.network_cfg_name])
+        run(['docker', 'network', 'rm', '--force', config.config.network_cfg_name])
         run(['docker', 'network', 'prune', '-f'])
 
 
 def setup_registry(cluster: ClusterConfig, without_swarm: bool = False):
-    certs_dir = os.path.join(tools.config.REGISTRY_DISK, 'certs')
+    certs_dir = os.path.join(config.config.REGISTRY_DISK, 'certs')
     reg_key = os.path.join(certs_dir, 'registry.key')
     reg_crt = os.path.join(certs_dir, 'registry.crt')
     if not os.path.exists(reg_key) or not os.path.exists(reg_crt):
         subprocess.check_call(['openssl', 'req', 'rsa:4096', '-nodes', '-sha256', '-keyout', reg_key, '-x509',
                                '-days', '365', '-out', 'reg_crt',
-                               '-subj', '"/C=US/ST=AL/L=Huntsville/O=TekFive Inc/CN=%s"' % tools.config.registry_host,
-                               '-addext', '"subjectAltName = DNS:%s"' % tools.config.registry_host])
+                               '-subj', '"/C=US/ST=AL/L=Huntsville/O=TekFive Inc/CN=%s"' % config.config.registry_host,
+                               '-addext', '"subjectAltName = DNS:%s"' % config.config.registry_host])
 
-    docker_certs_dir = '/etc/docker/certs.d/%s:%s' % (tools.config.registry_host, tools.config.registry_port)
+    docker_certs_dir = '/etc/docker/certs.d/%s:%s' % (config.config.registry_host, config.config.registry_port)
     cert = os.path.join(docker_certs_dir, 'ca.crt')
     if not os.path.exists(cert):
         subprocess.check_call(['sudo', 'mkdir', '-p', docker_certs_dir])
         subprocess.check_call(['sudo', 'cp', reg_crt, cert])
     with open('/etc/hosts', 'r') as hosts:
         lines = hosts.read()
-    if tools.config.registry_host not in lines:
+    if config.config.registry_host not in lines:
         subprocess.check_call(['sudo', 'sh', '-c', '"echo \"%s %s\" >> /etc/hosts"' %
-                               (cluster.manager, tools.config.registry_host)])
+                               (cluster.manager, config.config.registry_host)])
         for worker in cluster.workers:
             run(['ssh', worker, '-c', '"echo \"%s %s\" >> /etc/hosts"' %
-                 (worker, tools.config.registry_host)])
+                 (worker, config.config.registry_host)])
 
     registry_compose_file = os.path.abspath(os.path.join(base_dir, 'src', 'docker-registry.yaml'))
     if without_swarm:
@@ -136,7 +135,7 @@ def setup_registry(cluster: ClusterConfig, without_swarm: bool = False):
         if need_registry:
             subprocess.check_call(['docker', 'compose', '-f', registry_compose_file, 'up', '-d'])
     else:
-        result = subprocess.check_output(['docker', 'stack', 'services', tools.config.swarm_namespace],
+        result = subprocess.check_output(['docker', 'stack', 'services', config.config.swarm_namespace],
                                          stderr=subprocess.DEVNULL)
         need_registry = True
         for line in result.decode().strip().split('\n'):
@@ -144,8 +143,8 @@ def setup_registry(cluster: ClusterConfig, without_swarm: bool = False):
                 need_registry = False
         if need_registry:
             subprocess.check_call(['docker', 'stack', 'deploy',
-                                   '--compose-file', registry_compose_file, tools.config.swarm_namespace],
-                                  env={'DOCKER_ROOT': tools.config.REGISTRY_DISK})
+                                   '--compose-file', registry_compose_file, config.config.swarm_namespace],
+                                  env={'DOCKER_ROOT': config.config.REGISTRY_DISK})
 
 
 def run_example(wrk_dir: str, cluster: ClusterConfig, visualize: bool,
@@ -164,7 +163,7 @@ def run_example(wrk_dir: str, cluster: ClusterConfig, visualize: bool,
         subprocess.check_call(['docker', 'compose', '-f', compose_file, 'up'])
     else:
         subprocess.check_call(['docker', 'stack', 'deploy', '--compose-file', compose_file,
-                               tools.config.swarm_namespace])
+                               config.config.swarm_namespace])
 
 
 def clean(clean, pristine):
@@ -220,7 +219,7 @@ if __name__ == '__main__':
             results = subprocess.check_output(['docker', 'service', 'ls'])
             if 'swarm-viz' in results.decode():
                 run(['docker', 'service', 'rm', 'swarm-viz'])
-            run(['docker', 'service', 'rm', tools.config.swarm_namespace + '_registry'])
+            run(['docker', 'service', 'rm', config.config.swarm_namespace + '_registry'])
             if not args.without_swarm and cluster_cfg is not None:
                 cluster_cfg.shutdown()
         except subprocess.CalledProcessError:

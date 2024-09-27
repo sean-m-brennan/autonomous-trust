@@ -28,11 +28,11 @@ class DockerCompose(object):
     num_participants = 9
 
     compose_cfg_version = 3
-    namespace = tools.config.swarm_namespace
-    network_name = tools.config.network_name
+    namespace = config.config.swarm_namespace
+    network_name = config.config.network_name
     router = tools.docker.network.get_default_route_info()[0]
-    registry_host = tools.config.registry_host
-    registry_port = tools.config.registry_port
+    registry_host = config.config.registry_host
+    registry_port = config.config.registry_port
 
     command = 'ls /app/autonomous_trust/core'
 
