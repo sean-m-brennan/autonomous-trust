@@ -26,6 +26,15 @@ How do we implement such an order in the age of unlimited immigration, gay right
 
 ### Human
 
+
+## To Infinity ...
+
+### Space
+
+Why? Because it's there. More importantly, expansion into space provides a new and infinite frontier, an antidote to the current civilizational stagnation we see today. Providing an escape hatch for young men of adventurous spirit - because it's there.
+
+But our current tech is unsustainable, our supply chains tenuous and fragile. Our technology, specifically anything going into space, must be eminently repairable with basic tools and resources through recursive bootstrapping.
+
 [^1]: W. B. Yeats, "The Second Coming", written in 1919 just after the flu pandemic and at the beginning of many years of warfare in his native Ireland. https://en.wikipedia.org/wiki/The_Second_Coming_(poem)
 
 [^2]: Romans 3:23
