@@ -8,17 +8,17 @@
 /doc/research
 
 ## Generated documentation
-/doc/presentation/images/*.shape
-/doc/presentation/images/network.png
-/doc/presentation/images/identity.svg
-/doc/presentation/images/reputation.svg
-/doc/presentation/images/language.svg
-/doc/presentation/images/negotiation.svg
-/doc/presentation/images/optimization.svg
-/doc/presentation/images/prioritization.svg
-/doc/presentation/css/tekfive.css*
-/doc/presentation/notes
-/doc/pitch/count.txt
+/doc/tekfive/presentation/images/*.shape
+/doc/tekfive/presentation/images/network.png
+/doc/tekfive/presentation/images/identity.svg
+/doc/tekfive/presentation/images/reputation.svg
+/doc/tekfive/presentation/images/language.svg
+/doc/tekfive/presentation/images/negotiation.svg
+/doc/tekfive/presentation/images/optimization.svg
+/doc/tekfive/presentation/images/prioritization.svg
+/doc/tekfive/presentation/css/tekfive.css*
+/doc/tekfive/presentation/notes
+/doc/tekfive/pitch/count.txt
 
 **/attic
 
