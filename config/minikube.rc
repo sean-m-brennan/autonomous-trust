@@ -1,0 +1,100 @@
+#!/bin/bash
+# By default this sets up minikube, if sourced (in bash) with the arg --start, it will start minikube too.
+# NB: This file is expected to be sourced
+
+activate=false
+if echo "$@" | grep -- "start" >/dev/null; then
+  activate=true
+fi
+
+minikube_is_alive() {
+    status=$(minikube status | tr '\n\t\r' ' ' 2>&1)
+    if echo "$status" | grep "command not found" >/dev/null; then
+        echo "unavailable"
+        return 0
+    elif echo "$status" | grep "host: Running.*kubelet: Running.*kubeconfig: Configured" >/dev/null; then
+        echo "yes"
+        return 0
+    fi
+    echo "no"
+}
+
+minikube_activate() {
+    echo "Activating local devel environ"
+
+    # Determine this file's directory for correct paths (bash only)
+    here=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+
+    # Do not use normal kubectl config path or normal minikube path
+    if [ ! -f "${here}/.kube" ]; then
+        mkdir -p "${here}/.kube"
+    fi
+    if [ ! -f "${here}/.minikube" ]; then
+        mkdir -p "${here}/.minikube"
+    fi
+    k_cfg="${here}/.kube/config"
+    mk_cfg="${here}/.minikube"
+    if [ "$KUBECONFIG" != "$k_cfg" ]; then
+      export KUBECONFIG_ORIG="$KUBECONFIG"
+    fi
+    export KUBECONFIG="$k_cfg"
+    if [ "$MINIKUBE_HOME" != "$mk_cfg" ]; then
+      export MINIKUBE_HOME_ORIG="$MINIKUBE_HOME"
+    fi
+    export MINIKUBE_HOME="$mk_cfg"
+
+    # Check that minikube is present and running
+    if [ "$(minikube_is_alive)" = "unavailable" ]; then
+        echo "Minikube not installed. See https://minikube.sigs.k8s.io/docs/start/"
+        return 127
+    fi
+    if ! $activate; then
+      return 0
+    fi
+    docker=false
+    if [ "$(minikube_is_alive)" = "no" ]; then
+        if [ "$MINIKUBE_DRIVER" != "" ]; then
+            start_args="$start_args --driver=$MINIKUBE_DRIVER"
+        else
+            docker=true
+            start_args="$start_args --driver=docker"
+        fi
+        if [ "$MINIKUBE_ADDONS" != "" ]; then
+            start_args="$start_args --addons=$MINIKUBE_ADDONS"
+        fi
+        if [ "$MINIKUBE_CPUS" != "" ]; then
+            start_args="$start_args --cpus=$MINIKUBE_CPUS"
+        fi
+        MINIKUBE_IN_STYLE=false minikube start $start_args
+    fi
+    if $docker; then
+        eval "$(minikube docker-env)"
+    fi
+}
+
+minikube_deactivate() {
+    echo "Deactivate local devel environ"
+
+    # Determine this file's directory for correct paths (bash only)
+    here=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+
+    if [ "$(minikube_is_alive)" = "yes" ]; then
+        # Stop minikube node(s)
+        MINIKUBE_IN_STYLE=false minikube stop
+    fi
+
+    # Reset kubeconfig to original or to nothing
+    if [ "$KUBECONFIG_ORIG" != "" ]; then
+        export KUBECONFIG="$KUBECONFIG_ORIG"
+    else
+        unset KUBECONFIG
+    fi
+    if [ "$MINIKUBE_HOME_ORIG" != "" ]; then
+        export MINIKUBE_HOME="$MINIKUBE_HOME_ORIG"
+    else
+        unset MINIKUBE_HOME
+    fi
+}
+
+# Setup minikube for use
+minikube_activate

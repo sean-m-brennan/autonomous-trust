@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ import os
 import sys
 import platform
 
-REGISTRY_DISK = '/media/user/Backup/docker'
+REGISTRY_DISK = '~/Software/.docker.dir'
 
 ARCH = platform.machine()
 OS = sys.platform
@@ -26,7 +26,7 @@ OS = sys.platform
 default_cpu_count = os.cpu_count()
 default_initrd_fs = False
 
-conda_home = os.path.join(os.path.expanduser('~'), '.miniconda3')
+conda_home = os.path.join(os.path.expanduser('~'), '.miniforge3')
 
 qemu_user_prefix = '/opt/qemu-user-static'
 
