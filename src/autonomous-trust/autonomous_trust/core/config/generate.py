@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -18,9 +18,7 @@ import inspect
 import os
 import sys
 import random
-import re
 import socket
-import subprocess
 
 from .configuration import Configuration, InitializableConfig
 from .names import random_name
@@ -42,37 +40,6 @@ _names = [
     'm.archer@tekfive.com',
     'r.lewis@tekfive.com',
 ]
-
-
-def _get_default_device():
-    route = subprocess.check_output(['/sbin/ip', 'route']).decode().split('\n')[0]
-    if 'default' in route:
-        return route.split()[4]
-    return route.split()[2]
-
-
-def _get_addresses():
-    device = _get_default_device()
-    if device == '':
-        device = 'eth0'
-    ip4_address = None
-    ip6_address = None
-    result = subprocess.run(['/sbin/ip', '-o', 'a', 'show', device], shell=False,
-                            capture_output=True, text=True, check=True)
-    for line in result.stdout.split('\n'):
-        if 'inet ' in line:
-            ip4_address = line.split()[3]
-        elif 'inet6' in line:
-            ip6_address = line.split()[3]
-    result = subprocess.run(['/sbin/ip', '-o', 'l', 'show', device], shell=False,
-                            capture_output=True, text=True, check=True)
-    hex_pattern = r'[0-9a-f][0-9a-f]'
-    mac_pattern = r'{hex}:{hex}:{hex}:{hex}:{hex}:{hex}'.format(hex=hex_pattern)
-    match = re.search(r'link/ether (%s)' % mac_pattern, result.stdout)
-    mac_address = match.group(1)
-
-    return ip4_address, ip6_address, mac_address
-
 
 def _subsystems(net_impl):
     pt = ProcessTracker()
@@ -99,7 +66,7 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
     hostname = socket.getfqdn(unqualified_hostname)
     if hostname == 'localhost':
         hostname = unqualified_hostname
-    ip4_address, ip6_address, mac_address = _get_addresses()  # TODO multi-device
+    ip4_address, ip6_address, mac_address = list(Network.get_addresses().values())[:3]  # TODO multi-device
 
     mod, cls = communications.rsplit('.', 1)
     proto_cls = getattr(sys.modules[mod], cls)
@@ -118,6 +85,7 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         idx = seed % len(_names)
         fullname = _names[idx]
         nickname = fullname.split('@')[0].rsplit('.', 1)[1]
+        # FIXME always dynamic
         net_cfg = Network.initialize(ip4_address, ip6_address, mac_address)
         ident_cfg = Identity.initialize(fullname, nickname, address)
         sub_sys_cfg = _subsystems(communications)
@@ -199,7 +167,7 @@ def random_config(base_dir, ident: str = None):
     else:
         cfg_dir = os.path.join(base_dir, Configuration.CFG_PATH)
         if ident is not None:
-            cfg_dir = os.path.join(base_dir, ident, Configuration.CFG_PATH)
+            cfg_dir = os.path.join(base_dir, str(ident), Configuration.CFG_PATH)
     if not os.path.isdir(cfg_dir) or len([f for f in os.listdir(cfg_dir) if f.endswith(Configuration.file_ext)]) == 0:
         os.makedirs(cfg_dir, exist_ok=True)
         generate_identity(cfg_dir, randomize=True, seed=ident)

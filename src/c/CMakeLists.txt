@@ -96,7 +96,7 @@ endif()
 find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c PATHS ${CONDA_ROOT})
 find_library(LIBPROTOBUF_C_LIBRARY libprotobuf-c.so PATHS ${CONDA_ROOT})
 include_directories(${LIBPROTOBUF_C_INCLUDE_DIR})
-find_program(PROTOC_C_EXE protoc-c PATHS ${CONDA_ROOT})
+#find_program(PROTOC_C_EXE protoc-c PATHS ${CONDA_ROOT})
 if(LIBPROTOBUF_C_LIBRARY)
     message("-- Found libprotobuf-c at ${LIBPROTOBUF_C_LIBRARY}")
 else()
@@ -134,7 +134,7 @@ set(TEST_DEPENDENCIES
 
 set(top_src_dir ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
-set(PROTO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
+set(PROTO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/protobuf")
 set(PROTO_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/protobuf")
 
 set(protos
@@ -272,13 +272,14 @@ function(protoc_c_gen _proto _full_proto _dir)
         COMMAND ${CMAKE_COMMAND} -E make_directory ${PROTO_BINARY_DIR}
         COMMAND ${Protobuf_PROTOC_EXECUTABLE} --c_out ${PROTO_BINARY_DIR} -I${PROTOBUF_INCLUDE_DIR} -I${PROTO_SOURCE_DIR} ${_full_proto}
         COMMENT "Building protocol buffer C sources from ${_proto}"
-        DEPENDS ${_full_proto} ${LIBPROTOBUF_C_LIBRARY} ${LIBPROTOBUF_LIBRARY} ${PROTOC_C_EXE}
+        DEPENDS ${_full_proto} ${LIBPROTOBUF_C_LIBRARY} ${LIBPROTOBUF_LIBRARY} # ${PROTOC_C_EXE}
         VERBATIM
     )
     set(proto_c_src ${proto_c_src} ${_pb_c_src} PARENT_SCOPE)
 endfunction()
 
 ## generate a Python source
+# FIXME remove
 function(protoc_py_gen _proto _full_proto _dir)
     get_filename_component(_base ${_proto} NAME_WE)
     set(_pb_py_src ${PROTO_BINARY_DIR}/${_dir}/${_base}.pb2.py)
@@ -299,7 +300,7 @@ foreach(_proto ${protos})
     get_filename_component(_dir ${_proto} DIRECTORY)
     set(_fullproto ${PROTO_SOURCE_DIR}/${_proto})
     protoc_c_gen(${_proto} ${_fullproto} ${_dir})
-    protoc_py_gen(${_proto} ${_fullproto} ${_dir})
+    #protoc_py_gen(${_proto} ${_fullproto} ${_dir})
     set(proto_rel ${proto_rel} proto/${_proto})
 endforeach()
 

@@ -7,17 +7,33 @@
 # For rapid development, run as:
 #    docker run --rm -u $(id -u):$(id -g) -v src/autonomous-trust:/app -it autonomous-trust-devel
 
-FROM continuumio/miniconda3
+FROM condaforge/miniforge3
+
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG CERT_CONTENT
+
+# Propagate proxy settings so conda run subprocesses inherit them
+ENV http_proxy=${http_proxy}
+ENV https_proxy=${https_proxy}
+ENV no_proxy=${no_proxy}
 
 WORKDIR /app
 SHELL ["/bin/bash", "-c"]
-RUN apt-get update && \
-    apt-get install -y build-essential iproute2 iputils-ping iputils-arping iputils-tracepath sudo && \
-    apt-get clean
 
-COPY src/autonomous-trust/entrypoint.sh /bin/entrypoint.sh
-ENV ROUTER="172.17.0.1"
-ENTRYPOINT ["/bin/entrypoint.sh"]
+# Install CA cert for proxy if provided (must happen before any network access)
+RUN if [ -n "$CERT_CONTENT" ]; then \
+      echo "$CERT_CONTENT" > /usr/local/share/ca-certificates/proxy-ca.crt && \
+      cat /usr/local/share/ca-certificates/proxy-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
+      conda config --set ssl_verify /etc/ssl/certs/ca-certificates.crt; \
+    fi
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+RUN apt-get update && \
+    apt-get install -y build-essential mercurial iproute2 iputils-ping iputils-arping iputils-tracepath nfs-common sudo curl jq && \
+    apt-get clean || true
 
 RUN useradd -U user -d /app
 RUN echo "ALL            ALL = (ALL) NOPASSWD: ALL" >>/etc/sudoers
@@ -27,28 +43,31 @@ RUN mkdir /build
 RUN chown -R user:user /build
 USER user
 
-COPY --chown=user:user build_tools /build/build_tools
-COPY --chown=user:user bin /build/bin
-RUN --mount=type=cache,target=/opt/conda/pkgs /build/bin/trust-tools devel install --environ
-RUN --mount=type=cache,target=/opt/conda/pkgs /build/bin/trust-tools devel install --basic
+COPY --chown=user:user tools /build/build_tools
+COPY --chown=user:user config /build/config
+# FIXME replace with proper conda
+RUN --mount=type=cache,target=/opt/conda/pkgs /build/build_tools/toolbox devel install --environ
+RUN --mount=type=cache,target=/opt/conda/pkgs /build/build_tools/toolbox devel install --basic
 
 
 SHELL ["conda", "run", "--live-stream", "-n", "autonomous_trust", "/bin/bash", "-c"]
 RUN pip install pydevd-pycharm
 
-COPY --chown=user:user src/autonomous-trust/.bashrc .bashrc
+#COPY --chown=user:user src/autonomous-trust/.bashrc .bashrc
 COPY --chown=user:user src/autonomous-trust/rust rust
 COPY --chown=user:user src/autonomous-trust/autonomous_trust autonomous_trust
 RUN rm -rf autonomous_trust/etc autonomous_trust/var
 
 # if using rust, swap with lines below
-#COPY --chown=user:user src/autonomous-trust/pyproject.toml.rust-ext pyproject.toml
+#COPY --chown=user:user src/autonomous-trust/rust-project.toml pyproject.toml
 #RUN maturin develop
 
-COPY --chown=user:user src/autonomous-trust/pyproject.toml pyproject.toml
+COPY --chown=user:user src/autonomous-trust/py-project.toml pyproject.toml
 RUN poetry install
 
-ENV AUTONOMOUS_TRUST_ROOT="/"
-ENV AUTONOMOUS_TRUST_ARGS=""
-CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 -m autonomous_trust $AUTONOMOUS_TRUST_ARGS || /bin/bash"]
+ENV POSTMORTEM=true
+ENV AUTONOMOUS_TRUST_ROOT="/app/config"
 
+COPY src/autonomous-trust/entrypoint.sh /bin/entrypoint.sh
+ENV ROUTER="172.17.0.1"
+ENTRYPOINT ["/bin/entrypoint.sh"]

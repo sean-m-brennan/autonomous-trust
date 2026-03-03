@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,29 +14,82 @@
 #   limitations under the License.
 # ******************
 
+import re
 import ipaddress
+import psutil
+import socket
+import subprocess
 
 from ..config import InitializableConfig
 from ..system import encoding
 
+#from ..protobuf import network_pb2
 
 class Network(InitializableConfig):
     encoding = encoding
     broadcast = 'anyone'
-    multicast_v4_address = '239.0.0.65'
+    multicast_v4_address = '239.0.0.65'  # must be setup in OS
     multicast_v6_address = 'ff00::41e9:dddc:e4c7:e7e7'
     ping = 'ping'
     stats_req = 'stats_req'
     stats_resp = 'stats_resp'
 
     def __init__(self, _ip4_cidr, _ip6_cidr, _mac_address, _mcast4_addr, _mcast6_addr, _port=None):
-        super().__init__(network_pb2.Network)
-        self._ip4_cidr = _ip4_cidr
-        self._ip6_cidr = _ip6_cidr
-        self._mac_address = _mac_address
+        #super().__init__(network_pb2.Network)
+        #self._ip4_cidr = _ip4_cidr
+        #self._ip6_cidr = _ip6_cidr
+        #self._mac_address = _mac_address
+        addresses = self.get_addresses()
+        self._ip4_cidr = self.cidr(addresses['ip4'], addresses['ip4_subnet'])
+        self._ip6_cidr = self.cidr(addresses['ip6'], addresses['ip6_subnet'])
+        self._mac_address = addresses['mac']
         self._mcast4_addr = _mcast4_addr
         self._mcast6_addr = _mcast6_addr
         self._port = _port
+
+    @classmethod
+    def _get_default_device(cls):
+        route = subprocess.check_output(['/sbin/ip', 'route']).decode().split('\n')[0]
+        if 'default' in route:
+            return route.split()[4]
+        return route.split()[2]
+
+    @classmethod
+    def get_addresses(cls):
+        device = cls._get_default_device()
+        if device == '':
+            device = 'eth0'
+
+        ip4_address = None
+        ip6_address = None
+        mac_address = None
+        ip4_subnet = None
+        ip6_subnet = None
+        mac_bcast_address = None
+
+        info = psutil.net_if_addrs()[device]
+        for addr in info:
+            if addr.family == socket.AF_INET:
+                ip4_address = addr.address
+                ip4_subnet = addr.netmask
+            if addr.family == socket.AF_INET6:
+                ip6_address = re.sub('%.*$', '', addr.address)
+                ip6_subnet = addr.netmask
+            if addr.family == socket.AF_PACKET:
+                mac_address = addr.address
+                mac_bcast_address = addr.broadcast
+
+        return {'ip4': ip4_address, 'ip6': ip6_address, 'mac': mac_address,
+                'ip4_subnet': ip4_subnet, 'ip6_subnet': ip6_subnet,
+                'mac_bcast': mac_bcast_address}
+
+    @staticmethod
+    def cidr(address, subnet):
+        if address is None:
+            return None
+        if address.startswith('fe80'):
+            return 'fe80::/64'
+        return str(ipaddress.ip_interface('%s/%s' % (address, subnet)))
 
     @property
     def ip4(self):
@@ -44,6 +97,8 @@ class Network(InitializableConfig):
 
     @property
     def ip6(self):
+        if self._ip6_cidr is None:
+            return None
         return self._ip6_cidr.split('/')[0]
 
     @property

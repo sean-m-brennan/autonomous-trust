@@ -2,7 +2,7 @@
 
 this_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 
-export DOCKER_ROOT=/media/user/Backup/docker
+export DOCKER_ROOT=~/Software/.docker.dir
 #nocache="--no-cache"
 nocache=
 

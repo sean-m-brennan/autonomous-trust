@@ -1,3 +1,298 @@
-[
-
-]
+{
+  "project": "autonomous_trust",
+  "doi": [
+    { "citation": "10.1016/0047-2484(92)90081-J" },
+    { "citation": "10.1037/1089-2680.8.2.100" },
+    { "citation": "10.1007/s12110-003-1016-y" },
+    { "citation": "10.1098/rspb.2013.1151" },
+    { "citation": "10.1126/science.7466396" },
+    { "citation": "10.1038/scientificamerican0695-76" },
+    { "citation": "10.2139/ssrn.2109553" },
+    { "citation": "10.3389/fpsyg.2015.01034" },
+    { "citation": "10.1145/358198.358210" }
+  ],
+  "bibjson": {
+    "records": [
+      {
+        "type": "inproceedings",
+        "id": "vestrand2021artificial",
+        "citekey": "vestrand2021artificial",
+        "title": "Artificial Intelligence enabled Dynamic Coalition Architecture for Space Traffic Management",
+        "year": "2021",
+        "booktitle": "Advanced Maui Optical and Space Surveillance Technologies Conference (AMOS 2021)",
+        "month": "September",
+        "author": [
+          {
+            "name": "Vestrand, W. Thomas"
+          },
+          {
+            "name": "Wozniak, Przemek R."
+          },
+          {
+            "name": "Brennan, Sean M."
+          },
+          {
+            "name": "McVay, Troy"
+          },
+          {
+            "name": "Parker, Lucas P."
+          },
+          {
+            "name": "Sandoval, Rebecca Holmes"
+          },
+          {
+            "name": "Sechrest, Yancey H."
+          }
+        ],
+        "link": [
+          {
+            "type": "fulltext_pdf",
+            "url": "https://amostech.com/TechnicalPapers/2021/Poster/Vestrand.pdf"
+          }
+        ]
+      },
+      {
+        "type": "book",
+        "id": "axelrod1997complexity",
+        "citekey": "axelrod1997complexity",
+        "title": "The Complexity of Cooperation: Agent-based Models of Competition and Collaboration",
+        "year": "1997",
+        "series": "Princeton Studies in Complexity",
+        "author": [
+          {
+            "name": "Axelrod, Robert"
+          }
+        ],
+        "publisher": {
+          "name": "Princeton University Press"
+        }
+      },
+      {
+        "type": "techreport",
+        "id": "oasis2019mqtt",
+        "citekey": "oasis2019mqtt",
+        "title": "MQTT Version 5.0",
+        "institution": "Organization for the Advancement of Structured Information Standards",
+        "year": "2019",
+        "month": "March",
+        "author": [
+          {
+            "name": "Banks, Andrew"
+          },
+          {
+            "name": "Briggs, Ed"
+          },
+          {
+            "name": "Borgendale, Ken"
+          },
+          {
+            "name": "Gupta, Rahul"
+          }
+        ]
+      },
+      {
+        "type": "article",
+        "id": "hasan2022privacy",
+        "citekey": "hasan2022privacy",
+        "title": "Privacy-Preserving Reputation Systems Based on Blockchain and Other Cryptographic Building Blocks: A Survey",
+        "year": "2022",
+        "author": [
+          {
+            "name": "Hasan, Omar"
+          },
+          {
+            "name": "Brunie, Lionel"
+          },
+          {
+            "name": "Bertino, Elisa"
+          }
+        ],
+        "journal": {
+          "name": "ACM Computing Surveys (CSUR)",
+          "volume": "55",
+          "pages": "1--37"
+        }
+      },
+      {
+        "type": "book",
+        "id": "anderson2020security",
+        "citekey": "anderson2020security",
+        "title": "Security Engineering: A Guide to Building Dependable Distributed Systems",
+        "year": "2020",
+        "edition": "3rd",
+        "month": "November",
+        "author": [
+          {
+            "name": "Anderson, Ross"
+          }
+        ],
+        "publisher": {
+          "name": "Wiley"
+        }
+      },
+      {
+        "type": "book",
+        "id": "brooks2018cybersecurity",
+        "citekey": "brooks2018cybersecurity",
+        "title": "Cybersecurity Essentials",
+        "year": "2018",
+        "author": [
+          {
+            "name": "Brooks, C.J."
+          },
+          {
+            "name": "Grow, C."
+          },
+          {
+            "name": "Craig, P.A."
+          },
+          {
+            "name": "Short, D."
+          }
+        ],
+        "publisher": {
+          "name": "Wiley"
+        }
+      },
+      {
+        "type": "book",
+        "id": "wittkop2022cybersecurity",
+        "citekey": "wittkop2022cybersecurity",
+        "title": "The Cybersecurity Playbook for Modern Enterprises: An end-to-end guide to preventing data breaches and cyber attacks",
+        "year": "2022",
+        "author": [
+          {
+            "name": "Wittkop, J."
+          }
+        ],
+        "publisher": {
+          "name": "Packt Publishing"
+        }
+      },
+      {
+        "type": "article",
+        "id": "suh2002culture",
+        "citekey": "suh2002culture",
+        "title": "Culture, Identity Consistency, and Subjective Well-Being",
+        "year": "2002",
+        "author": [
+          {
+            "name": "Suh, Eunkook"
+          }
+        ]
+      },
+      {
+        "type": "techreport",
+        "id": "demand2016impact",
+        "citekey": "demand2016impact",
+        "title": "The Impact of Brand Consistency",
+        "institution": "Demand Metric Research Corporation",
+        "year": "2016",
+        "author": [
+          {
+            "name": "Metric, Demand"
+          },
+          {
+            "name": "Lucidpress, "
+          }
+        ]
+      },
+      {
+        "type": "techreport",
+        "id": "claye2013business",
+        "citekey": "claye2013business",
+        "title": "Business branding: Bringing strategy to life",
+        "institution": "McKinsey & Company",
+        "year": "2013",
+        "author": [
+          {
+            "name": "Claye, Agnes"
+          },
+          {
+            "name": "Crawford, Blair"
+          },
+          {
+            "name": "Freundt, Tjark"
+          },
+          {
+            "name": "Lehmann, Sascha"
+          },
+          {
+            "name": "Meyer, Thomas"
+          }
+        ]
+      },
+      {
+        "type": "techreport",
+        "id": "gao2022cybersecurity",
+        "citekey": "gao2022cybersecurity",
+        "title": "Cybersecurity: Federal Response to SolarWinds and Microsoft Exchange Incidents",
+        "institution": "U.S. Government Accountability Office",
+        "year": "2022",
+        "number": "GAO-22-104746",
+        "month": "Jan"
+      },
+      {
+        "type": "techreport",
+        "id": "fireeye2020sunburst",
+        "citekey": "fireeye2020sunburst",
+        "title": "Highly Evasive Attacker Leverages SolarWinds Supply Chain to Compromise Multiple Global Victims With SUNBURST Backdoor",
+        "institution": "FireEye",
+        "year": "2020",
+        "month": "Dec",
+        "link": [
+          {
+            "type": "fulltext_html",
+            "url": "https://www.mandiant.com/resources/blog/evasive-attacker-leverages-solarwinds-supply-chain-compromises-with-sunburst-backdoor"
+          }
+        ]
+      },
+      {
+        "type": "techreport",
+        "id": "marsh1994formalising",
+        "citekey": "marsh1994formalising",
+        "title": "Formalising Trust as a Computational Concept",
+        "institution": "University of Stirling",
+        "year": "1994",
+        "month": "Apr",
+        "author": [
+          {
+            "name": "Marsh, Stephen"
+          }
+        ]
+      },
+      {
+        "type": "article",
+        "id": "granatyr2015trust",
+        "citekey": "granatyr2015trust",
+        "title": "Trust and Reputation Models for Multiagent Systems",
+        "year": "2015",
+        "author": [
+          {
+            "name": "Granatyr, Jones"
+          },
+          {
+            "name": "Botelho, Vanderson"
+          },
+          {
+            "name": "Lessing, Otto Robert"
+          },
+          {
+            "name": "Scalabrin, Edson Em\u00edlio"
+          },
+          {
+            "name": "Barth\u00e8s, Jean-Paul A."
+          },
+          {
+            "name": "Enembreck, Fab\u0157\u0301io"
+          }
+        ],
+        "journal": {
+          "name": "ACM Computing Surveys (CSUR)",
+          "volume": "48",
+          "pages": "1--42"
+        }
+      }
+    ]
+  }
+}
