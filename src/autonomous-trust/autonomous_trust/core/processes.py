@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import json
 import os
 import queue
 import sys
@@ -37,7 +38,7 @@ yaml = YAML(typ='safe')
 
 
 class ProcessTracker(Mapping):
-    default_filename = 'subsystems.yaml'
+    default_filename = 'subsystems.cfg.json'
 
     def __init__(self):
         #self.message = processes_pb2.ProcessTracker()
@@ -87,7 +88,7 @@ class ProcessTracker(Mapping):
 
     def to_file(self, filename=None):
         with open(self._validate_path(filename), 'w') as spec:
-            yaml.dump(self.classes, spec)
+            json.dump(self.classes, spec, indent=2)
 
     def from_yaml_string(self, yml):
         name_dict = yaml.load(yml)
@@ -96,7 +97,9 @@ class ProcessTracker(Mapping):
 
     def from_file(self, filename=None):
         with open(self._validate_path(filename), 'r') as spec:
-            self.from_yaml_string(spec)
+            name_dict = json.load(spec)
+        for cfg, proc in name_dict.items():
+            self.register_subsystem(cfg, proc)
 
     def __getitem__(self, key):
         return self._registry[key]
