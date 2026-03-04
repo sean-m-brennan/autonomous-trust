@@ -7,10 +7,12 @@
 # For rapid development, run as:
 #    docker run --rm -u $(id -u):$(id -g) -v examples/requestor/requestor.py:/app/requestor.py -e AUTONOMOUS_TRUST_EXE=requestor.py -it autonomous-trust-full-devel
 
-FROM autonomous-trust-devel
+ARG REGISTRY_URL
+ARG IMAGE_TAG
+FROM ${REGISTRY_URL}autonomous-trust-devel${IMAGE_TAG}
 
 USER root
-RUN apt-get update && apt-get install -y libgl1-mesa-glx
+RUN apt-get update && apt-get install -y libgl1 libglx-mesa0
 
 WORKDIR /app
 USER user
@@ -21,9 +23,5 @@ COPY --chown=user:user src/autonomous-trust-services/autonomous_trust/services a
 COPY --chown=user:user src/autonomous-trust-simulator/autonomous_trust/simulator autonomous_trust/simulator
 
 # update and install any new dependencies from environment.yaml
-COPY --chown=user:user build_tools/cfg/environment.yaml /build/build_tools/cfg/environment.yaml
-RUN --mount=type=cache,target=/opt/conda/pkgs /build/bin/trust-tools devel update
-
-ENV AUTONOMOUS_TRUST_ROOT="/app"
-ENV AUTONOMOUS_TRUST_EXE=""
-CMD ["sh", "-c", "conda run --live-stream -n autonomous_trust python3 $AUTONOMOUS_TRUST_EXE"]
+COPY --chown=user:user config/cfg/environment.yaml /build/config/cfg/environment.yaml
+RUN --mount=type=cache,target=/opt/conda/pkgs /build/build_tools/toolbox devel update

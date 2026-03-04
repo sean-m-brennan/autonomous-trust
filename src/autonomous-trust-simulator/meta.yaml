@@ -1,6 +1,6 @@
 ## conda-build *must* be called in the current directory (src/autonomous-trust-inspector)
 
-{% set toml = load_file_data(os.path.abspath('./pyproject.toml')) %}  # fails early if wrong path
+{% set toml = load_file_data('./pyproject.toml') %}  # fails early if wrong path
 {% set project = toml.get('project', {}) %}
 {% set name = project.get('name') %}
 {% set version = project.get('version') %}
@@ -14,7 +14,7 @@ source:
 
 build:
   noarch: python
-  script: poetry build && {{PYTHON}} -m pip install ./dist/{{ name }}-{{ version }}.tar.gz --no-deps --ignore-installed -vv
+  script: poetry build -f wheel && python -m pip install ./dist/{{ name }}-{{ version }}-py3-none-any.whl --no-deps --ignore-installed -vv
 
 
 requirements:

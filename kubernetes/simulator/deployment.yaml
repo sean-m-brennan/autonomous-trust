@@ -1,0 +1,56 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: simulator
+  name: simulator
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: simulator
+  serviceName: simulator
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: simulator
+        git-commit-hash: ${GIT_COMMIT}
+        project: AutonomousTrust
+    spec:
+      containers:
+        - env:
+            - name: AUTONOMOUS_TRUST_ROOT
+              value: /app/config/simulator
+            - name: AUTONOMOUS_TRUST_EXE
+              value: "-m autonomous_trust.simulator --log simulator.log --log-level info --resolve-short-name /app/config/simulator/scenario.yaml"
+            - name: ROUTER
+              value: ${ROUTER}
+          image: ${REGISTRY_URL}autonomous-trust-full-devel${IMAGE_TAG}
+          name: simulator
+          securityContext:
+            runAsUser: ${FS_UID}
+            runAsGroup: ${FS_GID}
+            capabilities:
+              add:
+                - NET_ADMIN
+          volumeMounts:
+            - mountPath: /app/autonomous_trust
+              name: simulator-src
+            - mountPath: /app/config
+              name: simulator-cfg
+      restartPolicy: Always
+      securityContext:
+        runAsUser: ${FS_UID}
+        runAsGroup: ${FS_GID}
+        fsGroup: ${FS_GID}
+      volumes:
+        - name: simulator-src
+          persistentVolumeClaim:
+            claimName: source-pvc
+        - name: simulator-cfg
+          persistentVolumeClaim:
+            claimName: config-pvc

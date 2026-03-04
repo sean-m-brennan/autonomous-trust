@@ -1,0 +1,12 @@
+---
+services:
+  ctlptl-registry:
+    image: registry:2
+    ports:
+      - "${REGISTRY_PORT:-5100}:5000"
+    container_name: ctlptl-registry
+    environment:
+      - REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/data
+    restart: unless-stopped
+    volumes:
+      - ./data:/data

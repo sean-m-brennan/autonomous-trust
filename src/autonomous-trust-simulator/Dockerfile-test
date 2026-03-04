@@ -7,7 +7,8 @@
 # Run as:
 #    docker run --rm -u $(id -u):$(id -g) -v src/autonomous-trust-simulator:/app -it autonomous-trust-simulator-test
 
-FROM autonomous-trust-simulator-devel
+ARG REGISTRY_URL
+FROM ${REGISTRY_URL}autonomous-trust-simulator-devel
 
 WORKDIR /app
 USER user
