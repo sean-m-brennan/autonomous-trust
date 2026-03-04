@@ -437,11 +437,11 @@ class AutonomousTrust(Protocol):
                 elif isinstance(message, Message) and message.function == ReputationProtocol.rep_resp:
                     rep = message.obj
                     if rep.peer_id == self.identity.uuid:
-                        self.print('My current reputation score:\033[31m %s\033[00m' % rep.score)
+                        self.print('My current reputation score:\033[32m %s\033[00m' % rep.score)
                     else:
                         peer = self.peers.find_by_uuid(rep.peer_id)
                         if peer:
-                            self.print("%s's current reputation score:\033[31m %s\033[00m" % (peer.nickname, rep.score))
+                            self.print("%s's current reputation score:\033[32m %s\033[00m" % (peer.nickname, rep.score))
                     self.latest_reputation[str(rep.peer_id)] = rep
                 else:
                     self.unhandled_messages.append(message)
