@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-from ..config import Configuration
+from ..config import Configuration, SerializeMode
 from ..identity import Identity, Group
 from .network import Network
 
@@ -51,8 +51,11 @@ class Message(object):
                 raise RuntimeError('Invalid to_whom arg. Must be an Identity, but got %s' % type(to_whom))
         self.from_whom = from_whom
         self.return_to = return_to
-        if isinstance(obj, str) and obj.startswith(Configuration.YAML_PREFIX):  # FIXME
-            self.obj = Configuration.from_string(obj)
+        if isinstance(obj, str):
+            if obj.startswith(Configuration.YAML_PREFIX):
+                self.obj = Configuration.from_string(obj)
+            elif obj.startswith('{') and Configuration.mode == SerializeMode.PROTO:
+                self.obj = Configuration.from_string(obj)
         # FIXME signing
 
     def __str__(self):

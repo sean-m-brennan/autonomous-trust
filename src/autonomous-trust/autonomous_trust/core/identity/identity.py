@@ -32,6 +32,7 @@ class Identity(InitializableConfig, AgreementVoter):
     """
     Identity details that can be saved to file or transmitted
     """
+    _msg_class = identity_pb2.Identity
     enc = encoding
 
     def __init__(self, _uuid, address, _fullname, _nickname, _signature, _encryptor, petname='',
@@ -133,6 +134,33 @@ class Identity(InitializableConfig, AgreementVoter):
         return Identity(self.uuid, self.address, self.fullname, self.nickname,
                         Signature(self.signature.publish(), True), Encryptor(self.encryptor.publish(), True),
                         self.petname, True)
+
+    def sync_to_message(self):
+        self.message.uuid = str(self.uuid).encode('utf-8')
+        self.message.address = self.address
+        self.message.fullname = self._fullname
+        self._signature.message = self.message.signature
+        self._signature.sync_to_message()
+        self._encryptor.message = self.message.encryptor
+        self._encryptor.sync_to_message()
+
+    def sync_from_message(self):
+        self._uuid = self.message.uuid.decode('utf-8')
+        self.address = self.message.address
+        self._fullname = self.message.fullname
+        self._nickname = ''
+        self.petname = ''
+        self._public_only = True
+        self._rank = 0
+        self._block_impl = agreement_impl
+        self._signature = Signature.__new__(Signature)
+        self._signature.message = identity_pb2.Signature()
+        self._signature.message.CopyFrom(self.message.signature)
+        self._signature.sync_from_message()
+        self._encryptor = Encryptor.__new__(Encryptor)
+        self._encryptor.message = identity_pb2.Encryptor()
+        self._encryptor.message.CopyFrom(self.message.encryptor)
+        self._encryptor.sync_from_message()
 
     @staticmethod
     def initialize(my_name, my_nickname, my_address):

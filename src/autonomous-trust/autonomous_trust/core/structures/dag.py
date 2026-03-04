@@ -24,6 +24,7 @@ import string
 
 from ..config import Configuration
 from ..system import now
+from ..protobuf.structures import dag_pb2
 
 class Step(ABC):
     def __init__(self, uuid):  # FIXME
@@ -53,8 +54,11 @@ class LinkedStep(Step, Configuration):
     A link in a DAG
     From any link, can only navigate in a chain back to the root
     """
+    _msg_class = dag_pb2.LinkedStep
+
     def __init__(self, payload=None, uuid: UUID = None, timestamp: datetime = None,
                  parent: Step = None, previous=None):
+        Configuration.__init__(self, dag_pb2.LinkedStep)
         if uuid is None:
             uuid = uuid4()
         super().__init__(uuid)
@@ -76,6 +80,33 @@ class LinkedStep(Step, Configuration):
 
     def to_dict(self):
         return dict(payload=self.payload, uuid=self.uuid, timestamp=self.timestamp)
+
+    def sync_to_message(self):
+        if self.uuid is not None:
+            self.message.uuid = str(self.uuid).encode('utf-8')
+        if self.parent is not None and not isinstance(self.parent, GenesisType):
+            self.parent.sync_to_message()
+            self.message.parent.CopyFrom(self.parent.message)
+
+    def sync_from_message(self):
+        uuid_bytes = self.message.uuid
+        self.uuid = None
+        if uuid_bytes:
+            self.uuid = uuid_bytes.decode('utf-8')
+        self.payload = None
+        self.timestamp = None
+        self.previous = None
+        if self.message.HasField('parent'):
+            self.parent = LinkedStep.__new__(LinkedStep)
+            self.parent.message = dag_pb2.LinkedStep()
+            self.parent.message.CopyFrom(self.message.parent)
+            self.parent.sync_from_message()
+        else:
+            self.parent = Genesis
+        if self.parent is Genesis:
+            self._length = 1
+        else:
+            self._length = len(self.parent)
 
 
 class InvalidBranchError(RuntimeError):
