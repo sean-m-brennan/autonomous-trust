@@ -23,6 +23,7 @@ from ...config import Configuration, from_yaml_string
 from ...processes import ProcessLogger
 from ...system import encoding
 from ..identity import Identity
+from ...protobuf.identity import identity_pb2, history_pb2
 
 
 # FIXME how does a DAG relate to the merkle tree?
@@ -48,8 +49,11 @@ class IdentityObj(SimplestBlob, Configuration):
     """
     Identity encapsulation for transmission
     """
+    _msg_class = history_pb2.IdBlob
+
     def __init__(self, identity, originator: UUID):
-        super().__init__(originator, identity.uuid)
+        Configuration.__init__(self, history_pb2.IdBlob)
+        SimplestBlob.__init__(self, originator, identity.uuid)
         self.identity = identity
 
     @property
@@ -62,6 +66,19 @@ class IdentityObj(SimplestBlob, Configuration):
 
     def to_dict(self):
         return dict(identity=self.identity, originator=self.originator)
+
+    def sync_to_message(self):
+        self.message.originator = str(self.originator).encode('utf-8')
+        self.identity.sync_to_message()
+        self.message.identity.CopyFrom(self.identity.message)
+
+    def sync_from_message(self):
+        self.originator = UUID(self.message.originator.decode('utf-8'))
+        self.identity = object.__new__(Identity)
+        self.identity.message = identity_pb2.Identity()
+        self.identity.message.CopyFrom(self.message.identity)
+        self.identity.sync_from_message()
+        self.uuid = self.identity.uuid
 
 
 class IdentityHistory(StepDAG, VoterTracker):  # FIXME config repr

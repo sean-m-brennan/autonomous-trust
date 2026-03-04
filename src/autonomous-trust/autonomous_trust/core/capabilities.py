@@ -23,6 +23,8 @@ from .protobuf.processes import capabilities_pb2
 
 class Capability(Configuration):
     """Name and function"""
+    _msg_class = capabilities_pb2.Capability
+
     def __init__(self, name, function=None, arg_names=None, keywords=None):
         super().__init__(capabilities_pb2.Capability)
         self.name = name
@@ -40,6 +42,16 @@ class Capability(Configuration):
 
     def to_dict(self):
         return dict(name=self.name)  # TODO more info
+
+    def sync_to_message(self):
+        self.message.name = self.name
+        self.message.category = ''
+
+    def sync_from_message(self):
+        self.name = self.message.name
+        self.function = None
+        self.arg_names = None
+        self.keywords = None
 
 
 class Capabilities(Mapping):
@@ -68,6 +80,8 @@ class Capabilities(Mapping):
 
 class PeerCapabilities(Mapping, Configuration):
     """Mapping of capability names to peer ids"""
+    _msg_class = capabilities_pb2.PeerCapabilities
+
     def __init__(self, _listing=None):
         super().__init__(capabilities_pb2.PeerCapabilities)
         self._listing = _listing
@@ -88,3 +102,30 @@ class PeerCapabilities(Mapping, Configuration):
             if name not in self._listing:
                 self._listing[name] = []
             self._listing[name].append(peer_id)
+
+    def sync_to_message(self):
+        # Invert Python's {cap_name: [peer_ids]} to proto's {peer: [capabilities]}
+        peer_caps = {}
+        for cap_name, peer_ids in self._listing.items():
+            for pid in peer_ids:
+                peer_key = str(pid)
+                if peer_key not in peer_caps:
+                    peer_caps[peer_key] = []
+                peer_caps[peer_key].append(cap_name)
+        del self.message.listing[:]
+        for peer, cap_names in peer_caps.items():
+            entry = self.message.listing.add()
+            entry.peer = peer
+            for cn in cap_names:
+                cap = entry.capability.add()
+                cap.name = cn
+                cap.category = ''
+
+    def sync_from_message(self):
+        # Invert proto's {peer: [capabilities]} back to Python's {cap_name: [peer_ids]}
+        self._listing = {}
+        for entry in self.message.listing:
+            for cap in entry.capability:
+                if cap.name not in self._listing:
+                    self._listing[cap.name] = []
+                self._listing[cap.name].append(entry.peer)
