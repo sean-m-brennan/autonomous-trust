@@ -23,11 +23,13 @@ from autonomous_trust.core import Process, ProcMeta, CfgIds, Configuration, Init
 from autonomous_trust.core.identity import Identity
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.protocol import Protocol
+from autonomous_trust.core.protobuf.services import metadata_pb2
 from .position import Position
 
 
 class PeerData(Configuration):
     def __init__(self, time, position, speed, kind, data_type, data_channels):
+        super().__init__(metadata_pb2.PeerData)
         self.time = time
         self.position = position
         self.speed = speed
