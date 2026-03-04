@@ -15,7 +15,7 @@
     "build:js-dev": "webpack --mode development",
     "build:dev": "npm run build:js-dev && npm run build:backends"
   },
-  "author": "TekFive, Inc. <sean.brennan@tekfive.com>",
+  "author": "Sean M. Brennan <sean.brennan@tekfive.com>",
   "license": "",
   "dependencies": {
     "dash-renderer": "^1.17.1",

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -35,11 +35,14 @@ yaml.default_flow_style = False
 class SerializeMode(Enum):
     PROTO = 1
     YAML = 2
+    PJSON = 3
 
 
 def to_yaml_string(item):
     sio = StringIO()
-    if Configuration.mode == SerializeMode.YAML:
+    if Configuration.mode == SerializeMode.PJSON:
+        pass # FIXME
+    elif Configuration.mode == SerializeMode.YAML:
         yaml.dump(item, sio)
     else:
         # assumes Message type
@@ -60,7 +63,9 @@ class Configuration(object):
     CFG_PATH = os.path.join('etc', 'at')
     DATA_PATH = os.path.join('var', 'at')
     YAML_PREFIX = u'!Cfg'
-    mode = SerializeMode.PROTO
+    # FIXME from config
+    #mode = SerializeMode.PROTO
+    mode = SerializeMode.YAML
     file_ext = '.cfg.yaml' if mode == SerializeMode.YAML else '.cfg.pb'  # FIXME protobuf file_ext
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
 
@@ -112,6 +117,9 @@ class Configuration(object):
             if not self.message.IsInitialized:
                 self.sync_to_message()
             stream.write(self.message.SerializeToString())
+
+    def to_yaml_string(self):
+        return str(self)
 
     def to_string(self):
         return str(self)

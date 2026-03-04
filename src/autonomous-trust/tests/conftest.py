@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import shutil
 import re
 import time
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import pytest
 
@@ -28,6 +29,15 @@ from autonomous_trust.core.config.generate import generate_identity
 
 from . import PRESERVE_FILES, TEST_DIR
 
+_MOCK_ADDRESSES = {
+    'ip4': '192.168.1.100',
+    'ip6': '::1',
+    'mac': '00:11:22:33:44:55',
+    'ip4_subnet': '255.255.255.0',
+    'ip6_subnet': 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+    'mac_bcast': 'ff:ff:ff:ff:ff:ff',
+}
+
 base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 
@@ -35,7 +45,8 @@ def setup(local_net=False):
     test_dir = os.path.join(TEST_DIR, 'etc/at')
     os.makedirs(test_dir, exist_ok=True)
     os.environ[Configuration.ROOT_VARIABLE_NAME] = test_dir
-    generate_identity(test_dir, True)
+    with patch('autonomous_trust.core.network.network.Network.get_addresses', return_value=_MOCK_ADDRESSES):
+        generate_identity(test_dir, True)
     if local_net:
         net_cfg_file = os.path.join(test_dir, CfgIds.network + Configuration.file_ext)
         contents = []

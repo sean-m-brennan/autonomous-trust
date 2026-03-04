@@ -5,35 +5,52 @@
 # Create multi-arch containers with: docker buildx build --platform linux/amd64,linux/arm64 --tag package-builder .
 # Run with: docker run --rm -u $(id -u):$(id -g) -v /tmp:/tmp -v ~/path/to/source:/build/src -v ~/path/to/dist:/build/dist [-it | -d] package-builder:<arch>
 
-# TODO This is not working. Likely related to https://github.com/conda/conda-build/issues/1482.
-#      Placeholders are truncated by 28 characters to a length of 190.
-#      Perhaps (quite likely) Docker does indirections similar to encryption.
-#      Mounting does not help, and neither does '--prefix-length 100' in EXTRA_ARGS
+# Workaround for https://github.com/conda/conda-build/issues/1482:
+# Use short --croot, --no-build-id, and --prefix-length to keep placeholder paths
+# within Docker's filesystem limits. Also use 'python' instead of {{PYTHON}} in meta.yaml.
 
-ARG ARCH=
-FROM ${ARCH}continuumio/anaconda-pkg-build:master
+FROM condaforge/miniforge3
+
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG CERT_CONTENT
+
+ENV http_proxy=${http_proxy}
+ENV https_proxy=${https_proxy}
+ENV no_proxy=${no_proxy}
 
 WORKDIR /build
 SHELL ["/bin/bash", "-c"]
-# Rely on most recent image for updates instead of this:
-# RUN yum update -y && yum clean all
+
+# Install CA cert for proxy if provided (must happen before any network access)
+RUN if [ -n "$CERT_CONTENT" ]; then \
+      echo "$CERT_CONTENT" > /usr/local/share/ca-certificates/proxy-ca.crt && \
+      cat /usr/local/share/ca-certificates/proxy-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
+      conda config --set ssl_verify /etc/ssl/certs/ca-certificates.crt; \
+    fi
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+RUN apt update -y && apt install -y curl build-essential && apt clean
 
 RUN conda update -y -n base conda
 RUN conda config --add channels conda-forge
-RUN conda install -y -n base conda-build conda-verify pip python-build maturin
+RUN conda install -y -n base python=3.10 conda-build conda-verify pip python-build maturin mercurial
+
+WORKDIR /build/src
+ENV TEMPDIR=/build
+RUN mkdir $TEMPDIR/conda-bld && chmod 777 $TEMPDIR/conda-bld
+ARG UID=1000
+RUN useradd -U user -u $UID -d /build/src || usermod -d /build/src $(getent passwd $UID | cut -d: -f1)
+RUN mkdir /build/dist
+RUN mkdir /cb && chmod 777 /cb
 
 ENV CARGO_HOME="/opt/rust"
 RUN curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
 ENV PATH="/opt/rust/bin:${PATH}"
 RUN rustup install nightly && rustup default nightly
 
-WORKDIR /build/src
-ENV TEMPDIR=/build
-RUN mkdir $TEMPDIR/conda-bld && chmod 777 $TEMPDIR/conda-bld
-ARG UID=1000
-RUN useradd -U user -u $UID -d /build/src
-RUN mkdir /build/dist
-
-ENV EXTRA_ARGS="--prefix-length 100 --prefix-length-fallback"
-CMD ["/bin/bash", "-c", "conda build -c conda-forge --no-verify $EXTRA_ARGS --croot $TEMPDIR/conda-bld --output-folder /build/dist ."]
+ENV EXTRA_ARGS="--no-build-id --prefix-length 80 --prefix-length-fallback"
+CMD ["/bin/bash", "-c", "conda build -c conda-forge --no-verify $EXTRA_ARGS --croot /cb --output-folder /build/dist ."]
 

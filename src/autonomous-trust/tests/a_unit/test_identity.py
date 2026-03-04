@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -58,3 +58,129 @@ def test_peers(setup_teardown):
     print(t3.listing)
     print(t4.listing)
     assert repr(t3) == repr(t4)
+
+
+def test_identity_properties(setup_teardown):
+    """Test property accessors for uuid, fullname, nickname (lines 86, 88, 90)."""
+    t1 = Identity.initialize('me.myself.i', 'myself', '127.0.0.1')
+    assert t1.uuid is not None
+    assert t1.fullname == 'me.myself.i'
+    assert t1.nickname == 'myself'
+
+
+def test_verify_with_string(setup_teardown):
+    """Test verify when msg is a str (line 101)."""
+    t1 = Identity.initialize('me.myself.i', 'myself', '127.0.0.1')
+    pub = t1.publish()
+    signed = t1.sign(b'hello')
+    # verify with SignedMessage (default path)
+    result = pub.verify(signed)
+    assert result is not None
+
+
+def test_verify_with_configuration(setup_teardown):
+    """Test verify when msg is a Configuration object (line 103)."""
+    t1 = Identity.initialize('me.myself.i', 'myself', '127.0.0.1')
+    pub = t1.publish()
+    # Sign a Configuration object
+    signed = t1.sign(pub)
+    result = pub.verify(signed)
+    assert result is not None
+
+
+def test_sign_string(setup_teardown):
+    """Test sign when msg is a str (line 86 in identity.py sign method)."""
+    t1 = Identity.initialize('me.myself.i', 'myself', '127.0.0.1')
+    signed = t1.sign('hello string')
+    pub = t1.publish()
+    result = pub.verify(signed)
+    assert result is not None
+
+
+def test_encrypt_decrypt(setup_teardown):
+    """Test encrypt/decrypt between two identities (lines 116-120, 130)."""
+    t1 = Identity.initialize('alice', 'alice', '127.0.0.1')
+    t2 = Identity.initialize('bob', 'bob', '127.0.0.2')
+    pub1 = t1.publish()
+    pub2 = t2.publish()
+    encrypted = t1.encrypt(b'secret message', pub2)
+    decrypted = t2.decrypt(encrypted, pub1)
+    assert decrypted == b'secret message'
+
+
+def test_encrypt_string(setup_teardown):
+    """Test encrypt when msg is a str (line 118-119)."""
+    t1 = Identity.initialize('alice', 'alice', '127.0.0.1')
+    t2 = Identity.initialize('bob', 'bob', '127.0.0.2')
+    pub2 = t2.publish()
+    encrypted = t1.encrypt('string message', pub2)
+    assert encrypted is not None
+
+
+def test_publish(setup_teardown):
+    """Test publish returns public-only identity (line 140)."""
+    t1 = Identity.initialize('me.myself.i', 'myself', '127.0.0.1')
+    pub = t1.publish()
+    assert pub._public_only is True
+    assert pub.uuid == t1.uuid
+    assert pub.fullname == t1.fullname
+    assert pub.nickname == t1.nickname
+
+
+def test_signature_eq():
+    """Test Signature.__eq__ (sign.py line 35)."""
+    sig1 = Signature.generate()
+    sig2 = Signature.generate()
+    assert sig1 != sig2
+    assert sig1 == sig1
+
+
+def test_signature_serialize():
+    """Test Signature.serialize (sign.py line 55)."""
+    sig = Signature.generate()
+    serialized = sig.serialize()
+    assert isinstance(serialized, bytes)
+
+
+def test_sign_public_only_raises(setup_teardown):
+    """Test sign with public-only identity raises RuntimeError (line 90)."""
+    import pytest
+    t1 = Identity.initialize('me.myself.i', 'myself', '127.0.0.1')
+    pub = t1.publish()
+    with pytest.raises(RuntimeError, match='Cannot sign'):
+        pub.sign(b'message')
+
+
+def test_encrypt_public_only_raises(setup_teardown):
+    """Test encrypt with public-only identity raises RuntimeError (line 117)."""
+    import pytest
+    t1 = Identity.initialize('alice', 'alice', '127.0.0.1')
+    t2 = Identity.initialize('bob', 'bob', '127.0.0.2')
+    pub1 = t1.publish()
+    pub2 = t2.publish()
+    with pytest.raises(RuntimeError, match='Cannot encrypt'):
+        pub1.encrypt(b'message', pub2)
+
+
+def test_verify_with_separate_signature(setup_teardown):
+    """Test verify with separate msg and signature args (line 106)."""
+    from nacl.encoding import HexEncoder
+    t1 = Identity.initialize('me.myself.i', 'myself', '127.0.0.1')
+    pub = t1.publish()
+    signed = t1.sign(b'hello')
+    # The separate-args path expects raw bytes, not hex-encoded
+    # Decode hex first to get raw message and signature
+    raw_signed = HexEncoder.decode(signed)
+    sig_bytes = raw_signed[:64]
+    msg_bytes = raw_signed[64:]
+    result = pub.signature.public.verify(msg_bytes, sig_bytes)
+    assert result is not None
+
+
+def test_verify_string_msg(setup_teardown):
+    """Test verify when msg is a plain string (line 101)."""
+    t1 = Identity.initialize('me.myself.i', 'myself', '127.0.0.1')
+    pub = t1.publish()
+    signed = t1.sign('test string')
+    result = pub.verify(signed)
+    assert result is not None

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -40,7 +40,8 @@ from .async_update import bin_data_pb2 as BinaryData
 # for imports:
 from dash import Patch  # noqa
 from dash_extensions.enrich import Output, Input, State, ALL, MATCH  # noqa
-from dash_extensions.enrich import dcc, ctx  # noqa
+from dash_extensions.enrich import dcc  # noqa
+from dash import callback_context as ctx  # noqa
 from dash_extensions import WebSocket  # noqa
 
 

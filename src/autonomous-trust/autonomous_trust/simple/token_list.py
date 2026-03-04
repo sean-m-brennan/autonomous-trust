@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@
 from difflib import SequenceMatcher
 from typing import Union, Callable, Iterable
 
-from contained_list import ContainedList
-from majority import majority
+from .contained_list import ContainedList
+from .majority import majority
 
 
 TokenStruct = dict[int, str]

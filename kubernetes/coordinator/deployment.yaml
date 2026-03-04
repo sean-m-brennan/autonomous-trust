@@ -1,0 +1,56 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: coordinator
+  name: coordinator
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coordinator
+  serviceName: coordinator
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: coordinator
+        git-commit-hash: ${GIT_COMMIT}
+        project: AutonomousTrust
+    spec:
+      containers:
+        - env:
+            - name: AUTONOMOUS_TRUST_ROOT
+              value: /app/config/coordinator
+            - name: AUTONOMOUS_TRUST_EXE
+              value: /app/config/coordinator/coordinator.py
+            - name: ROUTER
+              value: ${ROUTER}
+          image: ${REGISTRY_URL}autonomous-trust-full-devel${IMAGE_TAG}
+          name: coordinator
+          securityContext:
+            runAsUser: ${FS_UID}
+            runAsGroup: ${FS_GID}
+            capabilities:
+              add:
+                - NET_ADMIN
+          volumeMounts:
+            - mountPath: /app/autonomous_trust
+              name: coordinator-src
+            - mountPath: /app/config
+              name: coordinator-cfg
+      restartPolicy: Always
+      securityContext:
+        runAsUser: ${FS_UID}
+        runAsGroup: ${FS_GID}
+        fsGroup: ${FS_GID}
+      volumes:
+        - name: coordinator-src
+          persistentVolumeClaim:
+            claimName: source-pvc
+        - name: coordinator-cfg
+          persistentVolumeClaim:
+            claimName: config-pvc

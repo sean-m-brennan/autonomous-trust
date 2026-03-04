@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@
 import argparse
 import logging
 
-from .simulator import Simulator
 from . import default_steps, default_port
+from .simulator import Simulator
 
 parser = argparse.ArgumentParser()
 parser.add_argument('config')

@@ -55,6 +55,7 @@ dist
 /*.log
 
 /src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/assets
+/src/autonomous-trust/autonomous_trust/core/protobuf
 
 # Custom Dash component
 /src/autonomous-trust-inspector/reactjs/src/AsyncUpdate.jl
@@ -78,6 +79,7 @@ dist
 /src/autonomous-trust-inspector/reactjs/DESCRIPTION
 /src/autonomous-trust-inspector/reactjs/NAMESPACE
 /src/autonomous-trust-inspector/reactjs/Project.toml
+/src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/async_update/
 
 # C build
 /src/c/build
@@ -85,6 +87,9 @@ dist
 **/*.pb-c.c
 **/*.pb-c.h
 /src/proto/py
+
+# Tilt-generated compose file
+/docker-compose.tilt.yaml
 
 # Generated mission files
 /examples/mission/docker-compose.yaml

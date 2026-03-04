@@ -1,0 +1,35 @@
+/********************
+ *  Copyright 2025 Sean M. Brennan and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
+syntax = "proto3";
+
+package autonomous_trust.core.protobuf.processes;
+
+import "autonomous_trust/core/protobuf/structures/map.proto";
+
+message Capability {
+  string category = 1;
+  string name = 2;
+  structures.DataMap arg_types = 3;
+}
+
+message PeerCapabilities {
+  message PeerCapacity {
+    string peer = 1;
+    repeated Capability capability = 2;
+  }
+  repeated PeerCapacity listing = 1;  // map<string, list>
+}

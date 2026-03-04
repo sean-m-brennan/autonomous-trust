@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@
 
 import random
 
-from data_client import DataClient, Algorithm
-from data_service import ALL_SERVICES, Ident, DataService
+from .data_client import DataClient, Algorithm
+from .data_service import ALL_SERVICES, Ident, DataService
 
 
 class Network:
