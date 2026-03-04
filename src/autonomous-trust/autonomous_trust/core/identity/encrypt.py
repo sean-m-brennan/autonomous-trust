@@ -21,6 +21,8 @@ from ..config.configuration import Configuration
 from ..protobuf.identity import identity_pb2
 
 class Encryptor(Configuration):
+    _msg_class = identity_pb2.Encryptor
+
     def __init__(self, hex_seed, public_only=True):
         super().__init__(identity_pb2.Encryptor)
         self.public_only = public_only
@@ -53,3 +55,15 @@ class Encryptor(Configuration):
 
     def serialize(self):  # WARNING: serialization of signature keys is insecure if physically breached
         return self.private.encode(encoder=HexEncoder)
+
+    def sync_to_message(self):
+        if self.public_only:
+            self.message.hex_seed = bytes(self.publish())
+        else:
+            self.message.hex_seed = bytes(self.private.encode(encoder=HexEncoder))
+
+    def sync_from_message(self):
+        hex_seed = self.message.hex_seed
+        self.public_only = True
+        self.private = None
+        self.public = PublicKey(hex_seed, encoder=HexEncoder)
