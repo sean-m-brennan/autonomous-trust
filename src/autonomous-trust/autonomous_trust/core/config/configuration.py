@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import base64
 import os
 import sys
 from io import StringIO
@@ -39,22 +40,18 @@ class SerializeMode(Enum):
 
 
 def to_yaml_string(item):
+    if Configuration.mode == SerializeMode.PROTO and isinstance(item, Configuration) and hasattr(item, 'message') and item._msg_class is not None:
+        return item.to_string()  # uses !PB: prefix
     sio = StringIO()
-    if Configuration.mode == SerializeMode.PJSON:
-        pass # FIXME
-    elif Configuration.mode == SerializeMode.YAML:
-        yaml.dump(item, sio)
-    else:
-        # assumes Message type
-        sio.write(item.SerializeToString())
+    yaml.dump(item, sio)
     return sio.getvalue()
 
 
 def from_yaml_string(string):
-    sio = StringIO(string)
-    if Configuration.mode == SerializeMode.YAML:
-        return yaml.load(sio)
-    #else: #FIXME remove both?
+    if isinstance(string, str) and string.startswith('!PB:'):
+        return Configuration.from_string(string)
+    sio = StringIO(string) if isinstance(string, str) else StringIO(string.decode('utf-8'))
+    return yaml.load(sio)
 
 
 
@@ -63,15 +60,16 @@ class Configuration(object):
     CFG_PATH = os.path.join('etc', 'at')
     DATA_PATH = os.path.join('var', 'at')
     YAML_PREFIX = u'!Cfg'
-    # FIXME from config
-    #mode = SerializeMode.PROTO
-    mode = SerializeMode.YAML
-    file_ext = '.cfg.yaml' if mode == SerializeMode.YAML else '.cfg.pb'  # FIXME protobuf file_ext
+    PROTO_PREFIX = '!PB:'
+    mode = SerializeMode.PROTO
+    file_ext = '.cfg.yaml'  # disk is always YAML regardless of mode
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
+    _msg_class = None  # subclasses with protos override this
 
     def __init__(self, msg_class=None):
-        if msg_class:
-            self.message = msg_class()
+        mc = msg_class or self.__class__._msg_class
+        if mc:
+            self.message = mc()
 
     @classmethod
     def get_cfg_dir(cls):
@@ -111,29 +109,43 @@ class Configuration(object):
         raise NotImplementedError
 
     def to_stream(self, stream):
-        if self.mode == SerializeMode.YAML:
-            yaml.dump(self, stream)
-        else:
-            if not self.message.IsInitialized:
-                self.sync_to_message()
-            stream.write(self.message.SerializeToString())
+        yaml.dump(self, stream)
 
     def to_yaml_string(self):
-        return str(self)
-
-    def to_string(self):
-        return str(self)
-
-    def __str__(self):
         sio = StringIO()
         self.to_stream(sio)
         return sio.getvalue()
 
+    def to_string(self):
+        if self.mode == SerializeMode.PROTO and hasattr(self, 'message') and self._msg_class is not None:
+            self.sync_to_message()
+            class_tag = '%s.%s' % (self.__class__.__module__, self.__class__.__name__)
+            return self.PROTO_PREFIX + class_tag + ':' + base64.b64encode(self.message.SerializeToString()).decode('ascii')
+        sio = StringIO()
+        self.to_stream(sio)
+        return sio.getvalue()
+
+    def __str__(self):
+        return self.to_string()
+
+    def to_wire_bytes(self):
+        if hasattr(self, 'message') and self._msg_class is not None:
+            self.sync_to_message()
+            return self.message.SerializeToString()
+        return self.to_yaml_string().encode('utf-8')
+
+    @classmethod
+    def from_wire_bytes(cls, data):
+        if cls._msg_class is not None:
+            obj = object.__new__(cls)
+            obj.message = cls._msg_class()
+            obj.message.ParseFromString(data)
+            obj.sync_from_message()
+            return obj
+        return cls.from_string(data.decode('utf-8'))
+
     def to_file(self, filepath):
-        mode = 'w'
-        if self.mode == SerializeMode.PROTO:
-            mode = 'wb'
-        with open(filepath, mode) as cfg:
+        with open(filepath, 'w') as cfg:
             self.to_stream(cfg)
 
     @staticmethod
@@ -147,25 +159,35 @@ class Configuration(object):
 
     @classmethod
     def from_stream(cls, stream):
-        if cls.mode == SerializeMode.YAML:
-            return yaml.load(stream)
-        else:
-            obj = cls()
-            obj.message.ParseFromString(stream.read())
-            obj.sync_from_message()
+        return yaml.load(stream)
 
     @classmethod
     def from_yaml_string(cls, string):
-        return cls.from_string(string)
-
-    @classmethod
-    def from_string(cls, string):
         sio = StringIO(string)
         return cls.from_stream(sio)
 
     @classmethod
-    def from_file(cls, filepath):  # FIXME Configuration.from_file(cfg_file), class is unknown
-        with open(filepath, 'rb') as cfg:
+    def from_string(cls, string):
+        if isinstance(string, str) and string.startswith(cls.PROTO_PREFIX):
+            rest = string[len(cls.PROTO_PREFIX):]
+            if ':' in rest:
+                class_tag, b64data = rest.split(':', 1)
+                data = base64.b64decode(b64data)
+                # If called on base Configuration, resolve the actual class
+                if cls is Configuration or cls._msg_class is None:
+                    modulename, classname = class_tag.rsplit('.', 1)
+                    target_cls = getattr(sys.modules[modulename], classname)
+                    return target_cls.from_wire_bytes(data)
+                return cls.from_wire_bytes(data)
+            else:
+                data = base64.b64decode(rest)
+                return cls.from_wire_bytes(data)
+        sio = StringIO(string)
+        return cls.from_stream(sio)
+
+    @classmethod
+    def from_file(cls, filepath):
+        with open(filepath, 'r') as cfg:
             return cls.from_stream(cfg)
 
 
