@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import os
 import random
 import sys
 import time
+import re
 
 from autonomous_trust.core import AutonomousTrust, Configuration, LogLevel
 from autonomous_trust.core.config.generate import generate_identity, generate_worker_config
@@ -46,16 +47,20 @@ class MissionParticipant(AutonomousTrust):
 if __name__ == '__main__':
     idx = 1
     if len(sys.argv) > 1:
-        idx = int(sys.argv[1])
+        print('Got arg of %s' % sys.argv[1])
+        digits = re.findall(r'\d+', sys.argv[1])
+        if len(digits) > 0:
+            idx = int(digits[-1])
     number = str(idx).zfill(3)
 
     os.environ[Configuration.ROOT_VARIABLE_NAME] = os.path.join(os.path.dirname(__file__), number)
     cfg_dir = Configuration.get_cfg_dir()
     os.makedirs(cfg_dir, exist_ok=True)
     dat_dir = Configuration.get_data_dir()
-    os.makedirs(os.path.dirname(dat_dir), exist_ok=True)
-    if not os.path.exists(dat_dir):
-        os.symlink(os.path.join(os.path.dirname(__file__), Configuration.DATA_PATH), dat_dir)
+    os.makedirs(dat_dir, exist_ok=True)
+    #os.makedirs(os.path.dirname(dat_dir), exist_ok=True)
+    #if not os.path.exists(dat_dir):
+    #    os.symlink(os.path.join(os.path.dirname(__file__), Configuration.DATA_PATH), dat_dir)
 
     generate_identity(cfg_dir, preserve=True, defaults=True)  # does nothing if files present (always regen network)
     if '--setup' in sys.argv:

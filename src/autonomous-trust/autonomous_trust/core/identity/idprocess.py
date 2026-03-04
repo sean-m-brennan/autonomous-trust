@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -114,7 +114,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.update(obj[0], queues)
                     #self.update(obj[1], queues)  # FIXME ??
         except Exception as err:
-            self.logger.error('Error saving %s for %s: %s' % (name, obj, err))
+            self.logger.error('Error saving %s for %s: %s' % (name, obj.__class__.__name__, err))
             try:
                 if os.path.exists(filename) and os.stat(filename).st_size == 0:
                     os.remove(filename)
@@ -494,7 +494,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.logger.debug('Received history diff')
             steps = from_yaml_string(message.obj)  # from self.choose_group()
             self._record_group(queues)
-            branch = self._history.ingest_branch(steps, message.from_whom.nickname)
+            name = message.from_whom.nickname
+            if name in self._history.heads:
+                del self._history.heads[name]
+            branch = self._history.ingest_branch(steps, name)
             # FIXME validate
             #self._history.merge(branch)
             return True

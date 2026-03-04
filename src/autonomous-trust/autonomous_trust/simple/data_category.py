@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -19,10 +19,10 @@ import math
 from decimal import Decimal
 from typing import Union, Callable, Iterable
 
-from majority import majority
-from token_list import TokenList, TokenStruct, TokenListClass
-from data_client import DataClient
-from data_service import ALL_SERVICES
+from .majority import majority
+from .token_list import TokenList, TokenStruct, TokenListClass
+from .data_client import DataClient
+from .data_service import ALL_SERVICES
 
 
 class IncompleteSamplingException(RuntimeError):

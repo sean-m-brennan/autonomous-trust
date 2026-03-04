@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -17,10 +17,10 @@
 import os
 
 from autonomous_trust.core import Configuration
-from autonomous_trust.services.video.server import VideoConfig
+from autonomous_trust.services.video.server import VideoSource
 
 
-class SimVideoSrc(VideoConfig):
+class SimVideoSrc(VideoSource):
     @classmethod
     def initialize(cls, idx: int = 0, size: int = 320, speed: int = 1):
         video_map = {1: 15, 2: 17, 3: 18, 4: 20, 5: 21}

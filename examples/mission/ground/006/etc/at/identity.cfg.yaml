@@ -15,5 +15,5 @@ _signature: !Cfg:autonomous_trust.core.identity.sign.Signature
     ZDc2YmNkMQ==
   public_only: false
 _uuid: 9ce3e8ef-2767-4063-b8e8-e00efe24cc20
-address: 172.27.3.106
+address: 10.244.0.7
 petname: Nova

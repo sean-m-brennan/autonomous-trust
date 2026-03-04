@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -42,13 +42,21 @@ class UDPNetworkProcess(NetworkProcess):
     def _init_udp_ptp(self):
         self.recv_ptp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.recv_ptp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.recv_ptp_sock.bind((self.my_address, self.port))
+        try:
+            self.recv_ptp_sock.bind((self.my_address, self.port))
+        except (Exception, OSError) as err:
+            self.logger.error('Failed to bind to %s:%s, detected IP is %s' % (self.my_address, self.port, self.my_ip))
+            raise err
         self.logger.info('Bound peer recv to %s:%s' % (self.my_address, self.port))
 
     def _init_udp_grp(self):
         self.recv_grp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.recv_grp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.recv_grp_sock.bind((self.my_address, self.group_port))
+        try:
+            self.recv_grp_sock.bind((self.my_address, self.group_port))
+        except (Exception, OSError) as err:
+            self.logger.error('Failed to bind to %s:%s, detected IP is %s' % (self.my_address, self.port, self.my_ip))
+            raise err
         self.logger.info('Bound group recv to %s:%s' % (self.my_address, self.group_port))
 
     def _init_mcast(self, use_mcast=False):
@@ -58,7 +66,11 @@ class UDPNetworkProcess(NetworkProcess):
             self.manycast_addr = self.net_cfg.multicast_v4_address
             self.recv_cast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             self.recv_cast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.recv_cast_sock.bind((self.manycast_addr, self.port))
+            try:
+                self.recv_cast_sock.bind((self.manycast_addr, self.port))
+            except (Exception, OSError) as err:
+                self.logger.error('Failed to bind to %s:%s' % (self.manycast_addr, self.port))
+                raise err
             if self.my_address == '0.0.0.0':
                 req = struct.pack("=4sl", socket.inet_aton(self.manycast_addr), socket.INADDR_ANY)
             else:
@@ -71,7 +83,11 @@ class UDPNetworkProcess(NetworkProcess):
             self.manycast_addr = self.net_cfg.ip4_broadcast
             self.recv_cast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             self.recv_cast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.recv_cast_sock.bind((self.manycast_addr, self.port))
+            try:
+                self.recv_cast_sock.bind((self.manycast_addr, self.port))
+            except (Exception, OSError) as err:
+                self.logger.error('Failed to bind to %s:%s' % (self.manycast_addr, self.port))
+                raise err
             self.logger.info('Bound any recv to %s:%s' % self.recv_cast_sock.getsockname())
 
     def _send_udp(self, msg, host, port):

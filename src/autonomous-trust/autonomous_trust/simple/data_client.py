@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@ import uuid
 from collections import Counter, OrderedDict, deque
 from enum import Enum
 
-from token_list import TokenList
-from data_service import Ident, DataService
-from data_eval import distance_hierarchy, exponential_thresholds, linear_thresholds
+from .token_list import TokenList
+from .data_service import Ident, DataService
+from .data_eval import distance_hierarchy, exponential_thresholds, linear_thresholds
 
 
 class Algorithm(str, Enum):

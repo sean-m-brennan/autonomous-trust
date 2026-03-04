@@ -1,7 +1,6 @@
 name: autonomous_trust
 channels:
   - conda-forge
-  - forklift
 dependencies:
   - python==3.10.*
   - pip
@@ -10,8 +9,10 @@ dependencies:
   - pynacl
   - python-dateutil
   - ruamel.yaml
-  - protobuf
-  - libprotobuf
+  - protobuf>=6.31.1
+  - types-protobuf>=6.31.1
+  - libprotobuf>=6.31.1,<6.31.2.0a0
+  - protobuf-c==1.5.2
   - aenum
   - libsass
   - networkx
@@ -28,6 +29,7 @@ dependencies:
   - more-itertools==9.0.0
   - jsbeautifier==1.14.3
   - dash-extensions
+  - dash-iconify
   - plotly
   - werkzeug==2.2.2
   - flask<=2.2.2
@@ -39,12 +41,10 @@ dependencies:
   - cmake
   - libuuid
   - libsodium
-  - pdrops::protobuf-c
   - jansson
   - check
-  - cxx-compiler
+  - websockets
+  - pydantic
   - pip:
-      - dash-iconify
-      - mediapipe
-      - websocket
-      - parrot-olympe
+      #- mediapipe
+      #- parrot-olympe # uses an old version of protobuf

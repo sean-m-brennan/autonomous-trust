@@ -1,0 +1,97 @@
+# Build images with BuildKit (i.e. `docker buildx build ...`)
+# Requires buildx plugin from https://github.com/docker/buildx
+
+def buildkit_build(ref, context, dockerfile=None, dockerfile_contents=None,
+                   live_update=[], build_args={}, build_contexts={}, env={},
+                   extra_deps=[], match_in_env_vars=False, ignore=[],
+                   entrypoint=[], target=None, ssh=None, network=None,
+                   secret=None, extra_tag=None, cache_from=[], cache_to=[],
+                   pull=False, registry_secret=None, image_deps=[],
+                   push=False, tag=None, dry_run=False, disable_push=False,
+                   no_cache=False, output=None, extra_registry=None, image_tag=None):
+    kwargs = {}
+    if live_update != None:
+        kwargs["live_update"] = live_update
+    if match_in_env_vars != None:
+        kwargs["match_in_env_vars"] = match_in_env_vars
+    if ignore != None:
+        kwargs["ignore"] = ignore
+    if entrypoint != None:
+        kwargs["entrypoint"] = entrypoint
+    if tag != None:
+        kwargs["tag"] = tag
+    if len(image_deps) > 0:
+        kwargs["image_deps"] = image_deps
+    if len(env) > 0:
+        kwargs["env"] = env
+    if disable_push:
+        kwargs["disable_push"] = disable_push
+
+    pre_command = ""
+    if dockerfile_contents != None and dockerfile != None:
+        fail("Cannot specify both dockerfile and dockerfile_contents keyword arguments")
+    elif dockerfile != None:
+        dockerfile_path = dockerfile
+    elif dockerfile_contents != None:
+        pre_command += "echo {} | ".format(shlex.quote(dockerfile_contents))
+        dockerfile_path = '-'
+    else:
+        dockerfile_path = context + '/Dockerfile'
+
+    command = ['docker', 'buildx', 'build', '-f', dockerfile_path]
+    for key, val in build_args.items():
+        command += ['--build-arg', '%s=%s' % (key, val)]
+    for key, val in build_contexts.items():
+        command += ['--build-context', '%s=%s' % (key, val)]
+    if target != None:
+        command += ['--target', target]
+    if ssh != None:
+        command += ['--ssh', ssh]
+    if network != None:
+        command += ['--network', network]
+    if secret:
+        if type(secret) == 'string':
+            command += ['--secret', secret]
+        else:
+            for s in secret:
+                command += ['--secret', s]
+    for c in cache_from:
+        command += ['--cache-from', c]
+    for c in cache_to:
+        command += ['--cache-to', c]
+    if pull != None:
+        command += ['--pull']
+    if push != None:
+        command += ['--push']
+    if extra_tag:
+        if type(extra_tag) == 'string':
+            command += ['-t', extra_tag]
+        else:
+            for t in extra_tag:
+                command += ['-t', t]
+    if registry_secret != None:
+        command += ['--registry-secret', registry_secret]
+    deps = [context] + extra_deps
+    if dockerfile_path != '-':
+        deps.append(dockerfile_path)
+    if output != None:
+        command += ['--output', output]
+    if no_cache:
+        command += ['--no-cache']
+
+    command = [shlex.quote(c) for c in command]
+    is_windows = True if os.name == "nt" else False
+    ref_var = '$EXPECTED_REF'
+    if is_windows:
+        ref_var = '%EXPECTED_REF%'
+    command += ['-t', ref_var]
+    command += [shlex.quote(context)]
+    command = pre_command + ' '.join(command)
+    if dry_run:
+        print(command.replace(ref_var, ref))
+    else:
+        custom_build(ref, command, deps, **kwargs)
+    if extra_registry and image_tag:
+        remote_ref = '%s/%s:%s' % (extra_registry, ref, image_tag)
+        return command.replace(ref_var, remote_ref) + ' --no-cache'
+    return None

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -51,8 +51,15 @@ class Message(object):
                 raise RuntimeError('Invalid to_whom arg. Must be an Identity, but got %s' % type(to_whom))
         self.from_whom = from_whom
         self.return_to = return_to
-        if isinstance(obj, str) and obj.startswith(Configuration.YAML_PREFIX):  # FIXME
-            self.obj = Configuration.from_string(obj)
+        if isinstance(obj, str):
+            check = obj.lstrip()
+            if check.startswith('---'):
+                check = check[3:].lstrip()
+            if check.startswith(Configuration.YAML_PREFIX):
+                try:
+                    self.obj = Configuration.from_string(obj)
+                except Exception:
+                    pass  # leave obj as string if deserialization fails
         # FIXME signing
 
     def __str__(self):

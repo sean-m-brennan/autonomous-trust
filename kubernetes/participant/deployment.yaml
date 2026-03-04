@@ -1,0 +1,61 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: participant
+  name: participant
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1 #FIXME ${NUM_PARTICIPANTS}
+  selector:
+    matchLabels:
+      app: participant
+  serviceName: participant
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: participant
+        git-commit-hash: ${GIT_COMMIT}
+        project: AutonomousTrust
+    spec:
+      containers:
+        - env:
+            - name: AUTONOMOUS_TRUST_ROOT
+              value: /app/config/ground
+            - name: AUTONOMOUS_TRUST_EXE
+              value: /app/config/ground/participant.py
+            - name: AUTONOMOUS_TRUST_ARGS
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ROUTER
+              value: ${ROUTER}
+          args: ["$AUTONOMOUS_TRUST_ARGS"]
+          image: ${REGISTRY_URL}autonomous-trust-full-devel${IMAGE_TAG}
+          name: participant
+          securityContext:
+            runAsUser: ${FS_UID}
+            runAsGroup: ${FS_GID}
+            capabilities:
+              add:
+                - NET_ADMIN
+          volumeMounts:
+            - mountPath: /app/autonomous_trust
+              name: participant-src
+            - mountPath: /app/config
+              name: participant-cfg
+      restartPolicy: Always
+      securityContext:
+        runAsUser: ${FS_UID}
+        runAsGroup: ${FS_GID}
+        fsGroup: ${FS_GID}
+      volumes:
+        - name: participant-src
+          persistentVolumeClaim:
+            claimName: source-pvc
+        - name: participant-cfg
+          persistentVolumeClaim:
+            claimName: config-pvc
