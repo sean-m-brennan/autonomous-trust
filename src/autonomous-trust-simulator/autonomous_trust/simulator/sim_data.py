@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Optional
 
 from autonomous_trust.core.config import Configuration
+from autonomous_trust.core.protobuf.simulator import sim_data_pb2
 from autonomous_trust.services.peer.position import Position, GeoPosition
 from .peer.peer import PeerInfo
 
@@ -28,6 +29,7 @@ Matrix = dict[str, dict[str, bool]]
 
 class Ident(Configuration):
     def __init__(self, position: Position, speed: float, kind: str, nickname: str):
+        super().__init__(sim_data_pb2.Ident)
         self.position = position
         self.speed = speed
         self.kind = kind
@@ -44,7 +46,7 @@ class SimState(Configuration):
                  scale: Optional[float] = None, peers: Optional[Map] = None,
                  reachable: Optional[Matrix] = None, active: Optional[list[str]] = None,
                  blank: bool = False):
-        super().__init__()
+        super().__init__(sim_data_pb2.SimState)
         self.time = time
         if time is None:
             self.time = datetime.now()
