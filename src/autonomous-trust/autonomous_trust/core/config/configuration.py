@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import io
 import os
 import sys
 import json
@@ -26,6 +27,7 @@ from decimal import Decimal, getcontext
 from enum import Enum
 
 import ruamel.yaml
+from google.protobuf.json_format import MessageToJson, Parse as ParseJson
 from nacl.signing import SignedMessage
 
 from ..util import ClassEnumMeta
@@ -37,6 +39,11 @@ yaml.default_flow_style = False
 class SerializeMode(Enum):
     PROTO = 1
     YAML = 2
+
+
+class WireFormat(Enum):
+    BINARY = 1
+    JSON = 2
 
 
 def to_yaml_string(item):
@@ -63,11 +70,14 @@ class Configuration(object):
     DATA_PATH = os.path.join('var', 'at')
     YAML_PREFIX = u'!Cfg'
     mode = SerializeMode.PROTO
+    wire_format = WireFormat.JSON
     file_ext = '.cfg.json'
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
+    _msg_class = None
 
     def __init__(self, msg_class=None):
         if msg_class:
+            self._msg_class = msg_class
             self.message = msg_class()
 
     @classmethod
@@ -111,11 +121,17 @@ class Configuration(object):
         if self.mode == SerializeMode.YAML:
             yaml.dump(self, stream)
         else:
-            if not self.message.IsInitialized:
-                self.sync_to_message()
-            stream.write(self.message.SerializeToString())
+            self.sync_to_message()
+            if self.wire_format == WireFormat.BINARY:
+                stream.write(self.message.SerializeToString())
+            else:
+                stream.write(MessageToJson(self.message))
 
     def to_string(self):
+        if self.mode == SerializeMode.PROTO and self.wire_format == WireFormat.BINARY:
+            buf = io.BytesIO()
+            self.to_stream(buf)
+            return buf.getvalue()
         return str(self)
 
     def __str__(self):
@@ -141,9 +157,20 @@ class Configuration(object):
         if cls.mode == SerializeMode.YAML:
             return yaml.load(stream)
         else:
-            obj = cls()
-            obj.message.ParseFromString(stream.read())
+            obj = cls.__new__(cls)
+            msg_class = cls._msg_class
+            if msg_class is None:
+                raise ValueError('No _msg_class defined for %s' % cls.__name__)
+            obj.message = msg_class()
+            data = stream.read()
+            if cls.wire_format == WireFormat.BINARY:
+                obj.message.ParseFromString(data)
+            else:
+                if isinstance(data, bytes):
+                    data = data.decode('utf-8')
+                ParseJson(data, obj.message)
             obj.sync_from_message()
+            return obj
 
     @classmethod
     def from_yaml_string(cls, string):
@@ -151,6 +178,11 @@ class Configuration(object):
 
     @classmethod
     def from_string(cls, string):
+        if cls.mode == SerializeMode.PROTO and cls.wire_format == WireFormat.BINARY:
+            buf = io.BytesIO(string)
+            return cls.from_stream(buf)
+        if isinstance(string, bytes):
+            string = string.decode('utf-8')
         sio = StringIO(string)
         return cls.from_stream(sio)
 

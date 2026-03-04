@@ -20,13 +20,17 @@ from uuid import UUID
 from ..config import Configuration
 from ..structures.merkle import SimplestBlob
 from ..system import encoding
+from ..protobuf.algorithms import agreement_pb2
 
 
 class AgreementProof(Configuration):
     """
     Minimum structure of a provable, transmissible vote
     """
+    _msg_class = agreement_pb2.AgreementProof
+
     def __init__(self, uuid: UUID, digest: bytes, approval: bool, nonce: bytes = None):
+        Configuration.__init__(self, agreement_pb2.AgreementProof)
         self.uuid = uuid  # voter
         self.digest = digest  # hash of proposal
         self.approval = approval  # yea/nay
@@ -34,6 +38,18 @@ class AgreementProof(Configuration):
 
     def __bytes__(self):
         return str(self.uuid).encode(encoding) + self.digest + bytes(self.approval) + self.nonce
+
+    def sync_to_message(self):
+        self.message.uuid = str(self.uuid).encode('utf-8')
+        self.message.digest = self.digest
+        self.message.approval = self.approval
+        self.message.nonce = self.nonce if self.nonce is not None else b''
+
+    def sync_from_message(self):
+        self.uuid = UUID(self.message.uuid.decode('utf-8'))
+        self.digest = self.message.digest
+        self.approval = self.message.approval
+        self.nonce = self.message.nonce if self.message.nonce else None
 
 
 class AgreementVoter(ABC):
