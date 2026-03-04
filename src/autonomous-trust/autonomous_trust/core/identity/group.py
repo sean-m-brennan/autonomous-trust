@@ -29,6 +29,8 @@ class Group(InitializableConfig):
     """
     Group identity details that can be saved to file or transmitted
     """
+    _msg_class = identity_pb2.Group
+
     def __init__(self, _uuid, _address_map, _nickname, _encryptor, _public_only=True):
         super().__init__(identity_pb2.Group)
         self._uuid = str(_uuid)
@@ -90,6 +92,30 @@ class Group(InitializableConfig):
 
     def publish(self):
         return Group(self.uuid, self.addresses, self.nickname, Encryptor(self.encryptor.publish(), True), True)
+
+    def sync_to_message(self):
+        self.message.uuid = str(self._uuid).encode('utf-8')
+        # Proto has a single address string; take first value from map or empty
+        if self._address_map:
+            if isinstance(self._address_map, dict):
+                self.message.address = next(iter(self._address_map.values()), '')
+            else:
+                self.message.address = next(iter(self._address_map), '')
+        else:
+            self.message.address = ''
+        self._encryptor.sync_to_message()
+        self.message.encryptor.CopyFrom(self._encryptor.message)
+
+    def sync_from_message(self):
+        self._uuid = self.message.uuid.decode('utf-8')
+        self._address_map = {}
+        self._nickname = ''
+        self._public_only = True
+        # Reconstruct nested Encryptor
+        self._encryptor = object.__new__(Encryptor)
+        self._encryptor.message = identity_pb2.Encryptor()
+        self._encryptor.message.CopyFrom(self.message.encryptor)
+        self._encryptor.sync_from_message()
 
     @staticmethod
     def initialize(address_map, our_nickname):
