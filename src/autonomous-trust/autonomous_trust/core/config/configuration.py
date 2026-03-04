@@ -16,6 +16,8 @@
 
 import os
 import sys
+import json
+import base64
 from io import StringIO
 from datetime import datetime, timedelta
 from dateutil import parser
@@ -61,7 +63,7 @@ class Configuration(object):
     DATA_PATH = os.path.join('var', 'at')
     YAML_PREFIX = u'!Cfg'
     mode = SerializeMode.PROTO
-    file_ext = '.cfg.yaml' if mode == SerializeMode.YAML else '.cfg.pb'  # FIXME protobuf file_ext
+    file_ext = '.cfg.json'
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
 
     def __init__(self, msg_class=None):
@@ -122,11 +124,8 @@ class Configuration(object):
         return sio.getvalue()
 
     def to_file(self, filepath):
-        mode = 'w'
-        if self.mode == SerializeMode.PROTO:
-            mode = 'wb'
-        with open(filepath, mode) as cfg:
-            self.to_stream(cfg)
+        with open(filepath, 'w') as cfg:
+            json.dump(self, cfg, cls=ConfigJSONEncoder, indent=2)
 
     @staticmethod
     def yaml_constructor(loader, tag_suffix, node):
@@ -156,9 +155,9 @@ class Configuration(object):
         return cls.from_stream(sio)
 
     @classmethod
-    def from_file(cls, filepath):  # FIXME Configuration.from_file(cfg_file), class is unknown
-        with open(filepath, 'rb') as cfg:
-            return cls.from_stream(cfg)
+    def from_file(cls, filepath):
+        with open(filepath, 'r') as cfg:
+            return json.load(cfg, object_hook=config_json_decoder)
 
 
 yaml.representer.add_multi_representer(Configuration, Configuration.yaml_representer),
@@ -237,3 +236,62 @@ def decimal_constructor(loader, node):
 
 yaml.representer.add_representer(Decimal, decimal_representer),
 yaml.constructor.add_constructor(u'!Decimal', decimal_constructor)
+
+
+class ConfigJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Configuration):
+            type_name = obj.__class__.__module__ + '.' + obj.__class__.__name__
+            d = {'__type__': type_name}
+            d.update(obj.to_dict())
+            return d
+        if isinstance(obj, datetime):
+            return {'__type__': 'datetime', '__value__': obj.isoformat('T')}
+        if isinstance(obj, timedelta):
+            return {'__type__': 'timedelta', '__value__': obj.total_seconds()}
+        if isinstance(obj, UUID):
+            return {'__type__': 'UUID', '__value__': str(obj)}
+        if isinstance(obj, Decimal):
+            return {'__type__': 'Decimal', '__value__': str(obj)}
+        if isinstance(obj, bytes):
+            return {'__type__': 'bytes', '__value__': base64.b64encode(obj).decode('ascii')}
+        if isinstance(obj, SignedMessage):
+            return {'__type__': 'signedmessage', '__value__': {
+                'message': base64.b64encode(obj.message).decode('ascii'),
+                'signature': base64.b64encode(obj.signature).decode('ascii'),
+            }}
+        return super().default(obj)
+
+
+def config_json_decoder(dct):
+    if '__type__' not in dct:
+        return dct
+    type_name = dct['__type__']
+    if type_name == 'datetime':
+        return parser.parse(dct['__value__'])
+    if type_name == 'timedelta':
+        return timedelta(seconds=float(dct['__value__']))
+    if type_name == 'UUID':
+        return UUID(dct['__value__'])
+    if type_name == 'Decimal':
+        value = dct['__value__']
+        getcontext().prec = len(value)
+        return Decimal(value)
+    if type_name == 'bytes':
+        return base64.b64decode(dct['__value__'])
+    if type_name == 'signedmessage':
+        val = dct['__value__']
+        sig = base64.b64decode(val['signature'])
+        msg = base64.b64decode(val['message'])
+        return SignedMessage._from_parts(signature=sig, message=msg, combined=sig + msg)
+    if '.' in type_name:
+        module_name, class_name = type_name.rsplit('.', 1)
+        try:
+            module = sys.modules[module_name]
+        except KeyError:
+            from importlib import import_module
+            module = import_module(module_name)
+        cls = getattr(module, class_name)
+        kwargs = {k: v for k, v in dct.items() if k != '__type__'}
+        return cls(**kwargs)
+    return dct

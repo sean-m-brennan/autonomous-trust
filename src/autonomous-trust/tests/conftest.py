@@ -14,9 +14,9 @@
 #   limitations under the License.
 # ******************
 
+import json
 import os
 import shutil
-import re
 import time
 from datetime import datetime, timedelta
 
@@ -38,14 +38,12 @@ def setup(local_net=False):
     generate_identity(test_dir, True)
     if local_net:
         net_cfg_file = os.path.join(test_dir, CfgIds.network + Configuration.file_ext)
-        contents = []
         with open(net_cfg_file, 'r') as net:
-            for line in net.readlines():
-                line = re.sub(r'_ip4_address: \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}.*', '_ip4_address: 127.0.0.1', line)
-                line = re.sub(r'_port: .*', '_port: null', line)
-                contents.append(line)
+            data = json.load(net)
+        data['_ip4_address'] = '127.0.0.1'
+        data['_port'] = None
         with open(net_cfg_file, 'w') as net:
-            net.writelines(contents)
+            json.dump(data, net, indent=2)
 
 
 def teardown():
