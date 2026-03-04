@@ -18,7 +18,7 @@ import uuid
 from collections import OrderedDict
 from typing import Callable
 
-from data_service import Ident
+from .data_service import Ident
 
 
 def exponential_thresholds(index: int, sensitivity: int) -> int:

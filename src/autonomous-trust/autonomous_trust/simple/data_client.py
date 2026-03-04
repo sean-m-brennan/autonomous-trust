@@ -19,9 +19,9 @@ import uuid
 from collections import Counter, OrderedDict, deque
 from enum import Enum
 
-from token_list import TokenList
-from data_service import Ident, DataService
-from data_eval import distance_hierarchy, exponential_thresholds, linear_thresholds
+from .token_list import TokenList
+from .data_service import Ident, DataService
+from .data_eval import distance_hierarchy, exponential_thresholds, linear_thresholds
 
 
 class Algorithm(str, Enum):

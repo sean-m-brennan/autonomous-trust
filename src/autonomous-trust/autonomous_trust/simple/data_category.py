@@ -19,10 +19,10 @@ import math
 from decimal import Decimal
 from typing import Union, Callable, Iterable
 
-from majority import majority
-from token_list import TokenList, TokenStruct, TokenListClass
-from data_client import DataClient
-from data_service import ALL_SERVICES
+from .majority import majority
+from .token_list import TokenList, TokenStruct, TokenListClass
+from .data_client import DataClient
+from .data_service import ALL_SERVICES
 
 
 class IncompleteSamplingException(RuntimeError):

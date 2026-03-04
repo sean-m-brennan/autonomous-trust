@@ -45,7 +45,6 @@ dependencies:
   - check
   - websockets
   - pydantic
-  - cxx-compiler
   - pip:
       #- mediapipe
       #- parrot-olympe # uses an old version of protobuf

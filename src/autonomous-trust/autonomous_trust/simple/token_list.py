@@ -17,8 +17,8 @@
 from difflib import SequenceMatcher
 from typing import Union, Callable, Iterable
 
-from contained_list import ContainedList
-from majority import majority
+from .contained_list import ContainedList
+from .majority import majority
 
 
 TokenStruct = dict[int, str]
