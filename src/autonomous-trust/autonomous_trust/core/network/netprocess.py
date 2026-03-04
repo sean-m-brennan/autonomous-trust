@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import socket
 import threading
 import time
 import traceback
@@ -109,6 +110,20 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.protocol = Protocol(self.name, self.logger, configurations)
         self.stop = False
         self.statistics = {}
+
+    @property
+    def my_ip(self):
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip_address = s.getsockname()[0]
+            return ip_address
+        except Exception:
+            return '127.0.0.1'
+        finally:
+            if s:
+                s.close()
 
     @property
     def peers(self):

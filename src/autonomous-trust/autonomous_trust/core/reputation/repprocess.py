@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -115,7 +115,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         retry = True
         idx = self._paxos_id_index(pax_id[0], pax_id[1])
         start = now()
-        while now() - start < self.protocol_timeout:
+        while (now() - start).total_seconds() < self.protocol_timeout:
             if self.my_requests[idx].count >= len(self.peers.all) // 2:
                 retry = False
                 break
@@ -138,6 +138,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 threading.Thread(target=self._paxos_timeout, args=(queues, (id1, id2, peer_id)), daemon=True).start()
                 return True
             idx = self._paxos_id_index(id1, id2)
+            if idx not in self.my_requests:
+                self.logger.debug('Grant for already-completed request')
+                return True
             self.my_requests[idx].count += 1
             if self.my_requests[idx].count >= len(self.peers.all) // 2:
                 try:

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -52,8 +52,14 @@ class Message(object):
         self.from_whom = from_whom
         self.return_to = return_to
         if isinstance(obj, str):
-            if obj.startswith(Configuration.YAML_PREFIX):
-                self.obj = Configuration.from_string(obj)
+            check = obj.lstrip()
+            if check.startswith('---'):
+                check = check[3:].lstrip()
+            if check.startswith(Configuration.YAML_PREFIX):
+                try:
+                    self.obj = Configuration.from_string(obj)
+                except Exception:
+                    pass  # leave obj as string if deserialization fails
             elif obj.startswith('{') and Configuration.mode == SerializeMode.PROTO:
                 self.obj = Configuration.from_string(obj)
         # FIXME signing

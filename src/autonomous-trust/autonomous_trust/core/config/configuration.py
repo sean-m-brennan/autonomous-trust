@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -39,6 +39,7 @@ yaml.default_flow_style = False
 class SerializeMode(Enum):
     PROTO = 1
     YAML = 2
+    PJSON = 3
 
 
 class WireFormat(Enum):
@@ -69,7 +70,9 @@ class Configuration(object):
     CFG_PATH = os.path.join('etc', 'at')
     DATA_PATH = os.path.join('var', 'at')
     YAML_PREFIX = u'!Cfg'
-    mode = SerializeMode.PROTO
+    # FIXME from config
+    #mode = SerializeMode.PROTO
+    mode = SerializeMode.YAML
     wire_format = WireFormat.JSON
     file_ext = '.cfg.json'
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
@@ -126,6 +129,9 @@ class Configuration(object):
                 stream.write(self.message.SerializeToString())
             else:
                 stream.write(MessageToJson(self.message))
+
+    def to_yaml_string(self):
+        return str(self)
 
     def to_string(self):
         if self.mode == SerializeMode.PROTO and self.wire_format == WireFormat.BINARY:

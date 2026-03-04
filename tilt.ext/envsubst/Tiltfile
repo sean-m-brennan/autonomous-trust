@@ -1,0 +1,56 @@
+# Implements envsubst in multiple modes for tilt.
+# Requires envsubst (the program) to be installed.
+
+def _do_envsubst(txt, only_these_vars=None, debug=0):
+    # Substitute environment variables in a string/blob
+    # return as a blob
+    vars = ''
+    if only_these_vars != None and len(only_these_vars) > 0:
+        vars = "'%s'" % only_these_vars
+    return local('envsubst %s' % vars, echo_off=debug<2, quiet=debug<1,
+                 stdin=str(txt))
+
+def _read_envsubst(src, only_these_vars=None, debug=0):
+    # Read source file, substitute environment variables with values,
+    # return as blob
+    return _do_envsubst(local('cat %s' % src,
+                             echo_off=debug<2, quiet=debug<2), only_these_vars, debug)
+
+def _write_envsubst(src, dst, only_these_vars=None, debug=0):
+    local('echo "%s" >%s' % (str(_read_envsubst(src, only_these_vars, debug)), dst),
+          echo_off=debug<2, quiet=True)  # no output
+
+def envsubst(files, dst=None, replace_tpl=None, only_these_vars=None, debug=0):
+    # Read source file(s), substitute environment variables with values from the current process environment
+    # if src and dst are strings, write source substitutions to dest file
+    # if src is a string, return a blob
+    # if replace_tpl is a tuple of substrings return a blob, joining as necessary for multiple sources
+    if type(files) == 'list':
+        if (type(replace_tpl) == 'tuple' or type(replace_tpl) == 'list') \
+           and len(replace_tpl) == 2:
+            # write to files per replacement tuple
+            for src in files:
+                out = src.replace(replace_tpl[0], replace_tpl[1])
+                _write_envsubst(src, out, only_these_vars, debug)
+        else:  # ignore replace_tpl
+            # return a blob of all manifests
+            all = []
+            for src in files:
+                manifest = str(_read_envsubst(src, only_these_vars, debug))
+                if not manifest.startswith('---'):
+                    manifest = '---\n' + manifest
+                all.append(manifest)
+            return blob('\n'.join(all))
+    elif type(files) == 'string':
+        src = files
+        if type(dst) != 'str':  # ignore dst
+            # return single blob
+            return _read_envsubst(src, only_these_vars, debug)
+        else:
+            # write to dst
+            return _write_envsubst(src, dst, only_these_vars, debug)
+    elif type(files) == 'blob':
+        txt = files
+        # ignore dst
+        # return single blob
+        return _do_envsubst(txt, only_these_vars, debug)

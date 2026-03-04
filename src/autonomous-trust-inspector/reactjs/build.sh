@@ -46,9 +46,14 @@ cd $package_dir/dash_components/assets
 if $devel; then
   ln -sf ../../../../reactjs/async_update/async_update.dev.js
   ln -sf ../../../../reactjs/async_update/async_update.dev.js.map
+  #cp ../../../../reactjs/async_update/async_update.dev.js ./
+  #cp ../../../../reactjs/async_update/async_update.dev.js.map ./
 else
   ln -sf ../../../../reactjs/async_update/async_update.min.js
   ln -sf ../../../../reactjs/async_update/async_update.min.js.map
+  #cp ../../../../reactjs/async_update/async_update.min.js ./
+  #cp ../../../../reactjs/async_update/async_update.min.js.map ./
 fi
 cd ..
 ln -sf ../../../reactjs/async_update
+#cp -r ../../../reactjs/async_update ./

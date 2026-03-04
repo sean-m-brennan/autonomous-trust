@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2025 Sean M. Brennan and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -109,15 +109,15 @@ class AutonomousTrust(Protocol):
             self.classes_to_log = list(CfgIds)
         root: logging.Logger = logging.getLogger()
         root.setLevel(logging.DEBUG)
-        if logfile == Configuration.log_stdout:
-            handler = logging.StreamHandler(sys.stdout)
-        else:
-            handler = TimedRotatingFileHandler(logfile, when="midnight", interval=1, backupCount=5)
-        handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
-                                               '%Y-%m-%d %H:%M:%S'))
-        handler.setLevel(log_level)
         self._logger: logging.Logger = logging.getLogger(self.name)
-        self._logger.addHandler(handler)
+        handlers = [logging.StreamHandler(sys.stdout)]
+        if logfile != Configuration.log_stdout:
+            handlers.append(TimedRotatingFileHandler(logfile, when="midnight", interval=1, backupCount=5))
+        for handler in handlers:
+            handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
+                                                   '%Y-%m-%d %H:%M:%S'))
+            handler.setLevel(log_level)
+            self._logger.addHandler(handler)
         if syslog:
             syslog_handler = SysLogHandler(address='/dev/log')
             self._logger.addHandler(syslog_handler)
@@ -293,7 +293,7 @@ class AutonomousTrust(Protocol):
 
     def _banner(self):
         self.print("")
-        self.print("You are using\033[94m AutonomousTrust\033[00m v%s from\033[96m TekFive\033[00m." % version)
+        self.print("You are using\033[94m AutonomousTrust\033[00m v%s" % version)
         self.print("")
 
     def _configure(self, start: bool = True):
@@ -367,12 +367,13 @@ class AutonomousTrust(Protocol):
                     self._stopped_procs.append(name)
 
         if show_output:
-            # record subprocess outputs, if any
-            try:
-                level, name, msg = self._output.get_nowait()
-                self.logger.log(level, '%s: %s' % (name, msg))
-            except queue.Empty:
-                pass
+            # drain subprocess outputs, if any
+            while True:
+                try:
+                    level, name, msg = self._output.get_nowait()
+                    self.logger.log(level, '%s: %s' % (name, msg))
+                except queue.Empty:
+                    break
         return True
 
     def _failed_task_cb(self, task: Task):
@@ -464,7 +465,7 @@ class AutonomousTrust(Protocol):
                     self.logger.debug(self.name + ': %s Task' % key)
                     result = results[key].get()
                     self.logger.debug(self.name + ': %s Task completed %s' % (key, result))
-                    tr = TaskResult(self.active_tasks[key], result)
+                    tr = TaskResult(self.active_tasks[str(key)], result)
                     queues[CfgIds.negotiation].put(tr, block=True, timeout=queue_cadence)
                     tx = TransactionScore(tr.uuid, 0.6)  # FIXME relevant evaluation
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
@@ -481,6 +482,8 @@ class AutonomousTrust(Protocol):
         args = (random.randint(2, 1000000), random.randint(2, 1000000))
         if cap.name == 'pi':
             args = (random.randint(1000, 10000),)
+        elif cap.name == 'pow':
+            args = (random.randint(2, 100), random.randint(2, 20))
         try:
             task = Task(TaskParameters(cap, args=args), self.identity)
             msg = Message(CfgIds.negotiation, NegotiationProtocol.start, task)

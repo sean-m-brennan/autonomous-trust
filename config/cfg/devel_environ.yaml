@@ -3,11 +3,11 @@ channels:
   - conda-forge
 dependencies:
   - python==3.10.*
-  - poetry>=1.6.1
+  - poetry
   - maturin
   - docker-py
   - gitpython>=3.1.35
-  - mercurial-app
+  #- mercurial
   - pexpect
   - rsync
   - curl
@@ -16,7 +16,7 @@ dependencies:
   - pandoc
   - beautifulsoup4
   - pytest
-  - pytest-aiohttp>=3.8.6
+  - pytest-aiohttp
   - pytest-asyncio
   - pytest-cov
   - go
@@ -24,3 +24,4 @@ dependencies:
   - napkin
   - pylint
   - nodejs
+  - cxx-compiler

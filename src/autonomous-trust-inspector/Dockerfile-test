@@ -7,7 +7,8 @@
 # Run as:
 #    docker run --rm -u $(id -u):$(id -g) -v src/autonomous-trust-inspector:/app -it autonomous-trust-inspector-test
 
-FROM autonomous-trust-inspector-devel
+ARG REGISTRY_URL
+FROM ${REGISTRY_URL}autonomous-trust-inspector-devel
 
 WORKDIR /app
 USER user
