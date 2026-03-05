@@ -30,7 +30,9 @@ from .history.history import IdentityHistory
 from ..algorithms.agreement import AgreementProof
 from ..algorithms.impl import AgreementImpl
 from ..capabilities import PeerCapabilities
+import json
 from ..config import Configuration, to_yaml_string, from_yaml_string, names
+from ..config.configuration import ConfigJSONEncoder
 from ..processes import Process, ProcMeta
 from ..network import Message, Network
 from .history import IdentityByWork, IdentityByStake, IdentityByAuthority
@@ -108,9 +110,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.configs[name] = obj[0]
                     with open(filename, 'w') as cfg:
                         if isinstance(obj[0], Group):
-                            cfg.write(to_yaml_string((obj[0], obj[1].to_dict())))
+                            json.dump((obj[0], obj[1].to_dict()), cfg, cls=ConfigJSONEncoder, indent=2)
                         else:
-                            cfg.write(to_yaml_string((obj[0], obj[1])))
+                            json.dump((obj[0], obj[1]), cfg, cls=ConfigJSONEncoder, indent=2)
                     self.update(obj[0], queues)
                     #self.update(obj[1], queues)  # FIXME ??
         except Exception as err:
@@ -214,7 +216,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         filename = os.path.join(Configuration.get_cfg_dir(), 'group' + Configuration.file_ext)
                         if os.path.exists(filename):
                             with open(filename, 'r') as cfg:
-                                self.group, hist_dict = from_yaml_string(cfg.read())
+                                from ..config.configuration import config_json_decoder
+                                self.group, hist_dict = json.load(cfg, object_hook=config_json_decoder)
                                 self._history.populate(hist_dict)
                                 from_scratch = False
                     except Exception as err:
