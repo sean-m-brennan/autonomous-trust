@@ -9,14 +9,18 @@ cd "$here" || exit 1
 
 # Generate the Protobuf interfaces
 protobuf_src=src/protobuf
-protobuf_py_dir=src/autonomous-trust/
-protobuf_py=$protobuf_py_dir/autonomous_trust/core/_python/protobuf
+protobuf_py_dir=src/autonomous-trust
+protobuf_py=$protobuf_py_dir/autonomous_trust/core/protobuf
 protoc --python_out=$protobuf_py_dir -I $protobuf_src $(find $protobuf_src -name "*.proto")
 leaves=$(find $protobuf_py -type d | sort -r | awk 'index(a,$0)!=1{a=$0;print}' | sort)
 for leaf in $leaves; do
   touch "$leaf/__init__.py"
 done
 touch "$protobuf_py/__init__.py"
+proto_target=$protobuf_py_dir/autonomous_trust/core/_python/protobuf
+mkdir -p $proto_target
+cp -r $protobuf_py/. $proto_target/
+rm -rf $protobuf_py
 
 # Create and extract distros
 rm -rf dist
