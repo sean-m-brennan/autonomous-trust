@@ -123,10 +123,10 @@ set(DEPENDENCIES
     ${CMAKE_THREAD_LIBS_INIT}
 )
 
-set(TEST_DEPENDENCIES
-    ${DEPENDENCIES}
-    ${LIBCHECK_LIBRARY}
-)
+set(TEST_DEPENDENCIES ${DEPENDENCIES})
+if(LIBCHECK_LIBRARY)
+    list(APPEND TEST_DEPENDENCIES ${LIBCHECK_LIBRARY})
+endif()
 
 
 ####################
@@ -164,6 +164,7 @@ set(table_headers_in
 
 set(libsrc
     autonomous_trust/autonomous_trust.c
+    autonomous_trust/algorithms/agreement.c
     autonomous_trust/config/configuration.c
     autonomous_trust/identity/encryptor.c
     autonomous_trust/identity/group.c
@@ -173,6 +174,7 @@ set(libsrc
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
     autonomous_trust/negotiation/task.c
+    autonomous_trust/network/net_message.c
     autonomous_trust/network/net_proc.c
     autonomous_trust/network/network.c
     autonomous_trust/processes/capabilities.c
@@ -180,6 +182,7 @@ set(libsrc
     autonomous_trust/processes/process_tracker.c
     autonomous_trust/processes/processes.c
     autonomous_trust/structures/array.c
+    autonomous_trust/structures/dag.c
     autonomous_trust/structures/data.c
     autonomous_trust/structures/datetime.c
     autonomous_trust/structures/map.c
@@ -198,13 +201,18 @@ set(libsrc
 )
 set(libhdr
     autonomous_trust.h
+    autonomous_trust/algorithms/agreement.h
+    autonomous_trust/algorithms/algorithms.h
     autonomous_trust/config/configuration.h
     autonomous_trust/identity/identity.h
+    autonomous_trust/network/net_message.h
     autonomous_trust/processes/capabilities.h
     autonomous_trust/structures/array.h
+    autonomous_trust/structures/dag.h
     autonomous_trust/structures/data.h
     autonomous_trust/structures/datetime.h
     autonomous_trust/structures/map.h
+    autonomous_trust/structures/merkle.h
     autonomous_trust/utilities/exception.h
     autonomous_trust/utilities/logger.h
     autonomous_trust/utilities/message.h
@@ -381,6 +389,22 @@ add_executable(rb_test test/rb_test.c)
 set_source_files_properties(test/rb_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rb_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
+add_executable(merkle_test test/merkle_test.c)
+set_source_files_properties(test/merkle_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(merkle_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(dag_test test/dag_test.c)
+set_source_files_properties(test/dag_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(dag_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(agreement_test test/agreement_test.c)
+set_source_files_properties(test/agreement_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(agreement_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(net_message_test test/net_message_test.c)
+set_source_files_properties(test/net_message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_message_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
 enable_testing()
 
 add_test(NAME array_test COMMAND $<TARGET_FILE:array_test>)
@@ -390,6 +414,10 @@ add_test(NAME map_test COMMAND $<TARGET_FILE:map_test>)
 add_test(NAME msg_test COMMAND $<TARGET_FILE:msg_test>)
 add_test(NAME proc_track_test COMMAND $<TARGET_FILE:proc_track_test>)
 add_test(NAME rb_test COMMAND $<TARGET_FILE:rb_test>)
+add_test(NAME merkle_test COMMAND $<TARGET_FILE:merkle_test>)
+add_test(NAME dag_test COMMAND $<TARGET_FILE:dag_test>)
+add_test(NAME agreement_test COMMAND $<TARGET_FILE:agreement_test>)
+add_test(NAME net_message_test COMMAND $<TARGET_FILE:net_message_test>)
 
 
 ####################
