@@ -18,7 +18,7 @@ try:
     import importlib.metadata  # noqa
     __version__ = importlib.metadata.version("autonomous_trust")
 except ImportError:
-    __version__ = 0
+    __version__ = '?.?'
 
 from .automate import AutonomousTrust  # noqa
 

@@ -1,17 +1,19 @@
 # Tiltfile for AutonomousTrust multi-node demo
-# Usage: tilt up -- --num-nodes=4 [--exclude-logs=network]
+# Usage: tilt up -- --num-nodes=4 [--exclude-logs=network] [--log-level=debug]
 
 # We only use docker_compose, not k8s -- allow whatever context is active
 allow_k8s_contexts(k8s_context())
 
 config.define_string("num-nodes")
 config.define_string("exclude-logs")
+config.define_string("log-level")
 cfg = config.parse()
 num_nodes = cfg.get("num-nodes", "2")
 exclude_logs = cfg.get("exclude-logs", "network")
+log_level = cfg.get("log-level", "info")
 
 # Generate docker-compose.tilt.yaml for the requested number of nodes
-local("python3 gen_compose.py " + num_nodes + " " + exclude_logs)
+local("python3 gen_compose.py " + num_nodes + " " + exclude_logs + " " + log_level)
 
 # Build args: pass through proxy env vars if set
 build_args = {}
