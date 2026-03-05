@@ -39,10 +39,12 @@ ENTRYPOINT ["/bin/entrypoint.sh"]
 COPY src/autonomous-trust/requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt && pip install protobuf cffi
 
-# Build C library
+# Build C library (src/c/protobuf is a symlink to src/protobuf — copy real dir separately)
+ARG GIT_VERSION="unknown"
 COPY src/c /app/c-src
+COPY src/protobuf /app/c-src/protobuf
 RUN rm -rf /app/c-src/build && mkdir -p /app/c-src/build && cd /app/c-src/build && \
-    CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release && \
+    CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DREVISION="$GIT_VERSION" && \
     make -j$(nproc) && \
     cp libautonomous_trust.so /usr/local/lib/ && \
     ldconfig && \
