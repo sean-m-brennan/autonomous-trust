@@ -41,7 +41,7 @@ class AgreementProof(Configuration):
 
     def sync_to_message(self):
         self.message.uuid = str(self.uuid).encode('utf-8')
-        self.message.digest = self.digest
+        self.message.digest = self.digest if self.digest else b''
         self.message.approval = self.approval
         self.message.nonce = self.nonce if self.nonce is not None else b''
 

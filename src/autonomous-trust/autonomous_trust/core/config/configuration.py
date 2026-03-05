@@ -55,8 +55,9 @@ class Configuration(object):
     _msg_class = None
 
     def __init__(self, msg_class=None):
-        if msg_class:
-            self.message = msg_class()
+        mc = msg_class or self.__class__._msg_class
+        if mc:
+            self.message = mc()
 
     @classmethod
     def get_cfg_dir(cls):
@@ -114,6 +115,25 @@ class Configuration(object):
         sio = StringIO()
         self.to_stream(sio)
         return sio.getvalue()
+
+    def __str__(self):
+        return self.to_string()
+
+    def to_wire_bytes(self):
+        if hasattr(self, 'message') and self._msg_class is not None:
+            self.sync_to_message()
+            return self.message.SerializeToString()
+        return self.to_yaml_string().encode('utf-8')
+
+    @classmethod
+    def from_wire_bytes(cls, data):
+        if cls._msg_class is not None:
+            obj = object.__new__(cls)
+            obj.message = cls._msg_class()
+            obj.message.ParseFromString(data)
+            obj.sync_from_message()
+            return obj
+        return cls.from_string(data.decode('utf-8'))
 
     def to_file(self, filepath):
         with open(filepath, 'w') as cfg:

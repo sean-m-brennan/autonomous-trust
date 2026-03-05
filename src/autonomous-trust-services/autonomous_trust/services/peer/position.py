@@ -21,11 +21,12 @@ from geopy import distance
 import utm
 
 from autonomous_trust.core.config import Configuration
+from autonomous_trust.core.protobuf.services import position_pb2
 
 
 class Position(Configuration):
-    def __init__(self, x: float, y: float, z: Optional[float] = None):
-        super().__init__()
+    def __init__(self, x: float, y: float, z: Optional[float] = None, msg_class=None):
+        super().__init__(msg_class)
         self._x = x
         self._y = y
         self._z = z
@@ -137,7 +138,7 @@ class Position(Configuration):
 class GeoPosition(Position):
     def __init__(self, lat: float, lon: float, alt: Optional[float] = None):
         """Specified in decimal degrees, plus meters for altitude"""
-        super().__init__(lat, lon, alt)
+        super().__init__(lat, lon, alt, msg_class=position_pb2.GeoPosition)
         self.lat = float(lat)
         self.lon = float(lon)
         self.alt = alt
@@ -167,7 +168,7 @@ class UTMPosition(Position):
         reference geo point is the intersection of the UTM zone's central meridian and the equator;
         reference point is at 500000m east, at 0m for the Northern hemisphere, 10000000m for the South
         """
-        super().__init__(easting, northing, alt)
+        super().__init__(easting, northing, alt, msg_class=position_pb2.UTMPosition)
         self.easting = float(easting)
         self.northing = float(northing)
         self.alt = float(alt)

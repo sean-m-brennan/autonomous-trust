@@ -53,7 +53,7 @@ class IdentityObj(SimplestBlob, Configuration):
 
     def __init__(self, identity, originator: UUID):
         Configuration.__init__(self, history_pb2.IdBlob)
-        super().__init__(originator, identity.uuid)
+        SimplestBlob.__init__(self, originator, identity.uuid)
         self.identity = identity
 
     @property
