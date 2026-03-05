@@ -53,7 +53,10 @@ class Message(object):
         self.return_to = return_to
         if isinstance(obj, str):
             check = obj.lstrip()
-            if check.startswith('{') or check.startswith('['):
+            # Only auto-deserialize JSON objects that are Configuration instances
+            # (have "__type__" key). Leave arrays and plain data as strings for
+            # handlers to deserialize explicitly via from_json_string().
+            if check.startswith('{') and '"__type__"' in obj:
                 try:
                     self.obj = Configuration.from_string(obj)
                 except Exception:

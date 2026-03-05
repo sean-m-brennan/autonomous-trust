@@ -98,6 +98,7 @@ class Peers(Configuration):
                 p_list.append(peer)
             if len(p_list) >= n:
                 break
+        return p_list
 
     def add(self, who, level=None):
         if level is None:
