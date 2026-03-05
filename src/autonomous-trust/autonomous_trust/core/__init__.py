@@ -72,13 +72,22 @@ class _BackendRedirector(importlib.abc.MetaPathFinder):
         if fullname in sys.modules:
             return None
 
-        real_name = f'{_CORE_PREFIX}{self._backend}.{suffix}'
-
         self._resolving.add(fullname)
         try:
-            real_spec = importlib.util.find_spec(real_name)
-        except (ModuleNotFoundError, ValueError):
-            return None
+            # Try the selected backend first
+            real_name = f'{_CORE_PREFIX}{self._backend}.{suffix}'
+            try:
+                real_spec = importlib.util.find_spec(real_name)
+            except (ModuleNotFoundError, ValueError):
+                real_spec = None
+
+            # Fall back to _python if not found in native backend
+            if real_spec is None and self._backend != '_python':
+                real_name = f'{_CORE_PREFIX}_python.{suffix}'
+                try:
+                    real_spec = importlib.util.find_spec(real_name)
+                except (ModuleNotFoundError, ValueError):
+                    return None
         finally:
             self._resolving.discard(fullname)
 

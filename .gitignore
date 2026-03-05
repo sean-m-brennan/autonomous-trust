@@ -55,7 +55,7 @@ dist
 /*.log
 
 /src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/assets
-/src/autonomous-trust/autonomous_trust/core/protobuf
+/src/autonomous-trust/autonomous_trust/core/_python/protobuf
 
 # Custom Dash component
 /src/autonomous-trust-inspector/reactjs/src/AsyncUpdate.jl

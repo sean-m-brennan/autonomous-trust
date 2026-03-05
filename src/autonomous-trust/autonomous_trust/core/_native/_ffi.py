@@ -263,7 +263,148 @@ ffi.cdef("""
     int  proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer);
     void identity_free(identity_t *ident);
 
-    /* ---- processes/process_tracker.h (partial) ---- */
+    /* ---- network/network.h ---- */
+    typedef struct {
+        bool alloc; size_t refs;  /* smrt_ptr_t */
+        int port;
+        char mac_address[18];    /* MAC_ADDR_LEN(17) + 1 */
+        char ip4_cidr[20];       /* CIDR4_LEN(19) + 1 */
+        char mcast4_addr[17];    /* IPV4_ADDR_LEN(16) + 1 */
+        char ip6_cidr[51];       /* CIDR6_LEN(50) + 1 */
+        char mcast6_addr[47];    /* IPV6_ADDR_LEN(46) + 1 */
+    } network_config_t;
+
+    int network_to_json(const void *data_struct, void **obj_ptr);
+    int network_from_json(const void *obj, void *data_struct);
+
+    /* ---- network/net_message.h ---- */
+    typedef enum {
+        RECIPIENT_PEER = 0,
+        RECIPIENT_BROADCAST = 1
+    } recipient_type_t;
+
+    typedef struct {
+        recipient_type_t type;
+        union {
+            public_identity_t peer;
+        } target;
+    } net_recipient_t;
+
+    typedef struct {
+        char process[65];        /* PROC_NAME_LEN(64) + 1 */
+        char *function;
+        uint8_t *data;
+        size_t data_len;
+        net_recipient_t to_whom;
+        public_identity_t from_whom;
+        bool encrypt;
+    } net_wire_msg_t;
+
+    int  net_message_to_wire(const net_wire_msg_t *msg,
+                             uint8_t **wire_out, size_t *wire_len);
+    int  net_message_from_wire(const uint8_t *data, size_t len,
+                               const public_identity_t *peer,
+                               net_wire_msg_t *msg_out);
+    void net_wire_msg_free(net_wire_msg_t *msg);
+
+    /* ---- network/ping.h ---- */
+    typedef struct {
+        char host[17];           /* IPV4_ADDR_LEN(16) + 1 */
+        double rtt_ms[4];       /* PING_COUNT */
+        double min_rtt;
+        double max_rtt;
+        double avg_rtt;
+        double loss;
+        int sent;
+        int received;
+    } ping_stats_t;
+
+    int  ping(const char *host, ping_stats_t *stats);
+    int  ping_server_start(void);
+    int  ping_server_stop(void);
+
+    /* ---- processes/capabilities.h ---- */
+    /* thread_args_t and capability_t contain embedded opaque structs
+       (array_t, map_t), so we treat them as opaque and use pointers only. */
+    typedef struct thread_args_s thread_args_t;
+    typedef struct capability_s capability_t;
+
+    capability_t *find_capability(const char *name);
+
+    /* ---- utilities/msg_types.h ---- */
+    typedef enum {
+        SIGNAL = 1,
+        GROUP_MSG,
+        PEER_MSG,
+        PEER_CAPABILITIES_MSG,
+        TASK_MSG,
+        NET_MESSAGE_MSG,
+        TASK_STATUS_MSG,
+        TASK_RESULT_MSG,
+        TRANSACTION_SCORE_MSG
+    } message_type_t;
+
+    typedef struct {
+        char descr[33];          /* SIGNAL_LEN(32) + 1 */
+        int sig;
+    } signal_t;
+
+    typedef struct {
+        char process[65];        /* PROC_NAME_LEN(64) + 1 */
+        char *function;
+        uint8_t *obj;
+        size_t len;
+        public_identity_t to_whom;
+        public_identity_t from_whom;
+        bool encrypt;
+        char return_to[65];
+    } net_msg_t;
+
+    typedef enum {
+        TASK_STATUS_RUNNING = 1,
+        TASK_STATUS_SLEEPING,
+        TASK_STATUS_ZOMBIE,
+        TASK_STATUS_STOPPED,
+        TASK_STATUS_DEAD,
+        TASK_STATUS_PENDING,
+        TASK_STATUS_UNKNOWN
+    } task_status_val_t;
+
+    typedef struct {
+        unsigned char task_uuid[16];
+        unsigned char requestor_uuid[16];
+        task_status_val_t status;
+    } task_status_msg_t;
+
+    typedef struct {
+        unsigned char task_uuid[16];
+        unsigned char requestor_uuid[16];
+        uint8_t *result_data;
+        size_t result_len;
+    } task_result_msg_t;
+
+    typedef struct {
+        unsigned char task_uuid[16];
+        unsigned char peer_uuid[16];
+        double score;
+    } tx_score_msg_t;
+
+    size_t message_size(message_type_t type);
+
+    /* ---- utilities/message.h ---- */
+    typedef struct {
+        int fd;
+        char key[65];            /* MSG_KEY_LEN(64) + 1 */
+    } queue_t;
+
+    int  messaging_init(const char *id, queue_t *queue);
+    void messaging_assign(queue_t *queue);
+    int  messaging_send(const char *key, const message_type_t type,
+                        void *msg, bool blocking);
+    void messaging_qclose(queue_t *queue);
+    void messaging_close(void);
+
+    /* ---- processes/process_tracker.h ---- */
     typedef struct {
         bool alloc; size_t refs;  /* smrt_ptr_t */
         map_t *registry;
@@ -273,6 +414,16 @@ ffi.cdef("""
     int  tracker_init(tracker_t *tracker, logger_t *logger);
     int  tracker_create(tracker_t **tracker_ptr, logger_t *logger);
     void tracker_free(tracker_t *tracker);
+
+    /* ---- processes/processes.h (partial) ---- */
+    typedef struct process_s process_t;  /* opaque */
+
+    typedef int (*handler_ptr_t)(process_t *, array_t *, char *, logger_t *);
+
+    int  start_process(char *pname, handler_ptr_t runner,
+                       map_t *configs, tracker_t *tracker,
+                       map_t *procs, array_t *queues, logger_t *logger);
+    void process_free(process_t *proc);
 
     /* ---- autonomous_trust.h ---- */
     int run_autonomous_trust(char *q_in, char *q_out,
