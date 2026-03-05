@@ -32,8 +32,40 @@ typedef enum {
     PEER,
     PEER_CAPABILITIES,
     TASK,
-    NET_MESSAGE  // generic
+    NET_MESSAGE,  // generic
+    TASK_STATUS,
+    TASK_RESULT,
+    TRANSACTION_SCORE
 } message_type_t;
+
+typedef enum {
+    TASK_STATUS_RUNNING = 1,
+    TASK_STATUS_SLEEPING,
+    TASK_STATUS_ZOMBIE,
+    TASK_STATUS_STOPPED,
+    TASK_STATUS_DEAD,
+    TASK_STATUS_PENDING,
+    TASK_STATUS_UNKNOWN
+} task_status_val_t;
+
+typedef struct {
+    uuid_t task_uuid;
+    uuid_t requestor_uuid;
+    task_status_val_t status;
+} task_status_msg_t;
+
+typedef struct {
+    uuid_t task_uuid;
+    uuid_t requestor_uuid;
+    uint8_t *result_data;
+    size_t result_len;
+} task_result_msg_t;
+
+typedef struct {
+    uuid_t task_uuid;
+    uuid_t peer_uuid;
+    double score;
+} tx_score_msg_t;
 
 /**
  * @brief Network message wrapper
@@ -71,7 +103,10 @@ typedef struct
         public_identity_t peer;
         peer_capabilities_matrix_t peer_capabilities;
         task_t task;
-        net_msg_t net_msg;  // FIXME specific protocols instead
+        net_msg_t net_msg;
+        task_status_msg_t task_status;
+        task_result_msg_t task_result;
+        tx_score_msg_t tx_score;
     } info;
 } generic_msg_t;
 
