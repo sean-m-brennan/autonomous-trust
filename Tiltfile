@@ -1,5 +1,5 @@
 # Tiltfile for AutonomousTrust multi-node demo
-# Usage: tilt up -- --num-nodes=4 [--exclude-logs=network] [--log-level=debug]
+# Usage: tilt up -- --num-nodes=4 [--exclude-logs=network] [--log-level=debug] [--backend=native|python]
 
 # We only use docker_compose, not k8s -- allow whatever context is active
 allow_k8s_contexts(k8s_context())
@@ -7,13 +7,15 @@ allow_k8s_contexts(k8s_context())
 config.define_string("num-nodes")
 config.define_string("exclude-logs")
 config.define_string("log-level")
+config.define_string("backend")
 cfg = config.parse()
 num_nodes = cfg.get("num-nodes", "2")
 exclude_logs = cfg.get("exclude-logs", "network")
 log_level = cfg.get("log-level", "info")
+backend = cfg.get("backend", "native")
 
 # Generate docker-compose.tilt.yaml for the requested number of nodes
-local("python3 gen_compose.py " + num_nodes + " " + exclude_logs + " " + log_level)
+local("python3 gen_compose.py " + num_nodes + " " + exclude_logs + " " + log_level + " " + backend)
 
 # Build args: pass through proxy env vars if set
 build_args = {}
@@ -32,11 +34,17 @@ if not cert_content:
 if cert_content:
     build_args["CERT_CONTENT"] = cert_content
 
+# Select Dockerfile based on backend
+if backend == "native":
+    dockerfile = "src/autonomous-trust/Dockerfile-native"
+else:
+    dockerfile = "src/autonomous-trust/Dockerfile-lite"
+
 # Build the image
 docker_build(
     "autonomous-trust",
     ".",
-    dockerfile="src/autonomous-trust/Dockerfile-lite",
+    dockerfile=dockerfile,
     network="host",
     build_args=build_args,
 )
@@ -48,3 +56,5 @@ docker_compose("docker-compose.tilt.yaml")
 watch_file("src/autonomous-trust/autonomous_trust")
 watch_file("src/autonomous-trust/entrypoint.sh")
 watch_file("src/protobuf")
+if backend == "native":
+    watch_file("src/c")
