@@ -15,7 +15,7 @@ log_level = cfg.get("log-level", "info")
 backend = cfg.get("backend", "native")
 
 # Generate docker-compose.tilt.yaml for the requested number of nodes
-local("python3 gen_compose.py " + num_nodes + " " + exclude_logs + " " + log_level + " " + backend)
+local("python3 gen_compose.py " + num_nodes + " " + exclude_logs + " " + log_level + " " + backend, quiet=True, echo_off=True)
 
 # Build args: pass through proxy env vars if set
 build_args = {}
@@ -28,11 +28,16 @@ for var in ["http_proxy", "https_proxy", "no_proxy"]:
 cert_content = os.getenv("CERT_CONTENT", "")
 if not cert_content:
     cert_path = "/usr/local/share/ca-certificates/proxy-ca.crt"
-    result = str(local("cat " + cert_path + " 2>/dev/null || true", quiet=True))
+    result = str(local("cat " + cert_path + " 2>/dev/null || true", quiet=True, echo_off=True))
     if result.strip():
         cert_content = result.strip()
 if cert_content:
     build_args["CERT_CONTENT"] = cert_content
+
+# Get version from git for C library build
+git_version = str(local("git describe HEAD 2>/dev/null || echo unknown", quiet=True, echo_off=True)).strip()
+git_version = git_version.removeprefix("v")
+build_args["GIT_VERSION"] = git_version
 
 # Select Dockerfile based on backend
 if backend == "native":
