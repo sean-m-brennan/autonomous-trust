@@ -68,7 +68,7 @@ DEFINE_TEST(test_wire_empty_data)
     net_wire_msg_t msg;
     memset(&msg, 0, sizeof(msg));
     strncpy(msg.process, "test", PROC_NAME_LEN);
-    msg.function  = "func";
+    msg.function  = (char *)"func";
     msg.data      = NULL;
     msg.data_len  = 0;
     msg.encrypt   = false;

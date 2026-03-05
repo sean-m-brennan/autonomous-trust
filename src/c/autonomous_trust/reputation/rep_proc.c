@@ -43,11 +43,6 @@ DEFINE_ERROR(EREP_PAXOS, "Paxos consensus error");
 #define STALE_TIMEOUT    300  /* seconds */
 #define MAJORITY(n)      (((n) / 2) + 1)
 
-typedef struct {
-    double score;
-    int grant_count;
-} paxos_tx_count_t;
-
 static struct {
     tx_history_t history;
     reputations_t reputations;
@@ -338,7 +333,7 @@ static bool handle_rep_response(const process_t *proc, directory_t *queues, gene
  * Called when TRANSACTION_SCORE message arrives from negotiation.
  ****************************/
 
-static void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
+static void __attribute__((unused)) _forward_transaction(const process_t *proc, const uuid_t task_uuid,
                                  const uuid_t peer_uuid, double score)
 {
     char task_str[UUID_STRING_LEN + 1];
