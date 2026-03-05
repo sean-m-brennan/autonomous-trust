@@ -80,7 +80,6 @@ class Configuration(object):
 
     def __init__(self, msg_class=None):
         if msg_class:
-            self._msg_class = msg_class
             self.message = msg_class()
 
     @classmethod
