@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # Run everything relative to this script
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

@@ -34,15 +34,18 @@ class Network(InitializableConfig):
     stats_req = 'stats_req'
     stats_resp = 'stats_resp'
 
-    def __init__(self, _ip4_cidr, _ip6_cidr, _mac_address, _mcast4_addr, _mcast6_addr, _port=None, _ip4_address=None):
-        self._ip4_cidr = _ip4_cidr
-        self._ip6_cidr = _ip6_cidr
-        self._mac_address = _mac_address
+    def __init__(self, _ip4_cidr, _ip6_cidr, _mac_address, _mcast4_addr, _mcast6_addr, _port=None):
+        #super().__init__(network_pb2.Network)
+        #self._ip4_cidr = _ip4_cidr
+        #self._ip6_cidr = _ip6_cidr
+        #self._mac_address = _mac_address
+        addresses = self.get_addresses()
+        self._ip4_cidr = self.cidr(addresses['ip4'], addresses['ip4_subnet'])
+        self._ip6_cidr = self.cidr(addresses['ip6'], addresses['ip6_subnet'])
+        self._mac_address = addresses['mac']
         self._mcast4_addr = _mcast4_addr
         self._mcast6_addr = _mcast6_addr
         self._port = _port
-        if _ip4_address is not None:
-            self._ip4_address = _ip4_address
 
     @classmethod
     def _get_default_device(cls):
@@ -86,11 +89,7 @@ class Network(InitializableConfig):
             return None
         if address.startswith('fe80'):
             return 'fe80::/64'
-        try:
-            return str(ipaddress.ip_interface('%s/%s' % (address, subnet)))
-        except ValueError:
-            prefix_len = bin(int(ipaddress.IPv6Address(subnet))).count('1')
-            return str(ipaddress.ip_interface('%s/%d' % (address, prefix_len)))
+        return str(ipaddress.ip_interface('%s/%s' % (address, subnet)))
 
     @property
     def ip4(self):
@@ -125,7 +124,4 @@ class Network(InitializableConfig):
 
     @classmethod
     def initialize(cls, my_ip4, my_ip6, my_mac):
-        addresses = cls.get_addresses()
-        ip4_cidr = cls.cidr(my_ip4, addresses['ip4_subnet'])
-        ip6_cidr = cls.cidr(my_ip6, addresses['ip6_subnet'])
-        return Network(ip4_cidr, ip6_cidr, my_mac, cls.multicast_v4_address, cls.multicast_v6_address, None)
+        return Network(my_ip4, my_ip6, my_mac, cls.multicast_v4_address, cls.multicast_v6_address, None)

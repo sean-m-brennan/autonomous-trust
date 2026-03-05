@@ -338,7 +338,7 @@ static bool handle_rep_response(const process_t *proc, directory_t *queues, gene
  * Called when TRANSACTION_SCORE message arrives from negotiation.
  ****************************/
 
-void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
+static void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
                                  const uuid_t peer_uuid, double score)
 {
     char task_str[UUID_STRING_LEN + 1];

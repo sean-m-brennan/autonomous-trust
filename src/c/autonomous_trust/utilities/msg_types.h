@@ -38,6 +38,24 @@ typedef enum {
     TRANSACTION_SCORE
 } message_type_t;
 
+/**
+ * @brief Network message wrapper
+ * @details Network messages are strictly between net_proc and other processes, 
+ *          and always in packed protobuf format.
+ * 
+ */
+typedef struct
+{
+    char process[PROC_NAME_LEN+1];
+    char *function;  //??
+    uint8_t *obj;  // FIXME protobuf obj member, needs max size
+    size_t len;
+    public_identity_t to_whom;
+    public_identity_t from_whom;
+    bool encrypt;
+    char return_to[PROC_NAME_LEN+1];
+} net_msg_t;
+
 typedef enum {
     TASK_STATUS_RUNNING = 1,
     TASK_STATUS_SLEEPING,
@@ -67,24 +85,6 @@ typedef struct {
     double score;
 } tx_score_msg_t;
 
-/**
- * @brief Network message wrapper
- * @details Network messages are strictly between net_proc and other processes, 
- *          and always in packed protobuf format.
- * 
- */
-typedef struct
-{
-    char process[PROC_NAME_LEN+1];
-    char *function;  //??
-    uint8_t *obj;  // FIXME protobuf obj member, needs max size
-    size_t len;
-    public_identity_t to_whom;
-    public_identity_t from_whom;
-    bool encrypt;
-    char return_to[PROC_NAME_LEN+1];
-} net_msg_t;
-
 #define SIGNAL_LEN 32
 
 typedef struct
@@ -103,7 +103,7 @@ typedef struct
         public_identity_t peer;
         peer_capabilities_matrix_t peer_capabilities;
         task_t task;
-        net_msg_t net_msg;
+        net_msg_t net_msg;  // FIXME specific protocols instead
         task_status_msg_t task_status;
         task_result_msg_t task_result;
         tx_score_msg_t tx_score;

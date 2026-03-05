@@ -62,16 +62,14 @@ int discover_network(net_iface_t *iface)
 
         if (family == AF_INET && !found_ip4)
         {
-            struct sockaddr_in sa;
-            memcpy(&sa, ifa->ifa_addr, sizeof(sa));
-            inet_ntop(AF_INET, &sa.sin_addr, iface->ip4_addr, IPV4_ADDR_LEN);
+            struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+            inet_ntop(AF_INET, &sa->sin_addr, iface->ip4_addr, IPV4_ADDR_LEN);
 
             /* Get netmask for CIDR */
             if (ifa->ifa_netmask != NULL)
             {
-                struct sockaddr_in nm;
-                memcpy(&nm, ifa->ifa_netmask, sizeof(nm));
-                uint32_t mask = ntohl(nm.sin_addr.s_addr);
+                struct sockaddr_in *nm = (struct sockaddr_in *)ifa->ifa_netmask;
+                uint32_t mask = ntohl(nm->sin_addr.s_addr);
                 int bits = 0;
                 while (mask & 0x80000000)
                 {
@@ -90,18 +88,16 @@ int discover_network(net_iface_t *iface)
         }
         else if (family == AF_INET6)
         {
-            struct sockaddr_in6 sa6;
-            memcpy(&sa6, ifa->ifa_addr, sizeof(sa6));
-            inet_ntop(AF_INET6, &sa6.sin6_addr, iface->ip6_addr, IPV6_ADDR_LEN);
+            struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+            inet_ntop(AF_INET6, &sa6->sin6_addr, iface->ip6_addr, IPV6_ADDR_LEN);
 
             if (ifa->ifa_netmask != NULL)
             {
-                struct sockaddr_in6 nm6;
-                memcpy(&nm6, ifa->ifa_netmask, sizeof(nm6));
+                struct sockaddr_in6 *nm6 = (struct sockaddr_in6 *)ifa->ifa_netmask;
                 int bits = 0;
                 for (int i = 0; i < 16; i++)
                 {
-                    uint8_t byte = nm6.sin6_addr.s6_addr[i];
+                    uint8_t byte = nm6->sin6_addr.s6_addr[i];
                     while (byte & 0x80)
                     {
                         bits++;

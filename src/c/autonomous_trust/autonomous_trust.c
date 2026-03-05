@@ -200,7 +200,6 @@ int run_autonomous_trust(char *q_in, char *q_out,
     }
     map_end_for_each
     // FIXME deal with partials
-    (void)num_err;
 
     queue_t my_q = {0};
     if (messaging_init(name, &my_q) != 0)
