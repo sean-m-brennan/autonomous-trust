@@ -6,4 +6,6 @@
 
 #include "config/configuration.h"
 
+config_t *find_configuration(const char *name);
+
 #endif  /* CONFIGURATION_PRIV_H */

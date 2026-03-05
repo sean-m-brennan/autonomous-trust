@@ -107,7 +107,7 @@ bool job_queue_contains(const job_queue_t *q, const uuid_t task_uuid)
 {
     for (int i = 0; i < q->count; i++)
     {
-        if (uuid_compare(q->jobs[i].task.capability.uuid, task_uuid) == 0)
+        if (uuid_compare(q->jobs[i].task.uuid, task_uuid) == 0)
             return true;
     }
     return false;

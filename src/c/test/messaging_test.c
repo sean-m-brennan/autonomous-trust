@@ -77,13 +77,14 @@ DEFINE_TEST(test_messages)
     logger_t log;
     logger_init(&log, INFO, NULL);
 
-    char *mfile = "msgtest";
+    char mfile[] = "msgtest";
 
     config_t *config;
-    ck_assert_ret_ok(load_config("identity.cfg.json", &config, NULL, NULL));
+    char cfg_name[] = "identity.cfg.json";
+    ck_assert_ret_ok(load_config(cfg_name, &config, NULL, NULL));
 
     pid_t pid = fork();
-    ck_assert_int_ne(-1, pid);
+    ck_assert((int)pid != -1);
 
     if (pid == 0) {
         msg_test_snd(mfile, config);

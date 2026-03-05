@@ -14,7 +14,6 @@
  *   limitations under the License.
  *******************/
 
-#include <check.h>
 #include "autonomous_trust/utilities/logger.h"
 
 #define DEBUG_TESTS 1
