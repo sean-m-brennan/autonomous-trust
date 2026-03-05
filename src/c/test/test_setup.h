@@ -80,6 +80,35 @@
             log_error(NULL, "Function returned zero\n"); \
     } while (0)
 
+#define ck_assert(expr)                                        \
+    do                                                         \
+    {                                                          \
+        if (!(expr))                                           \
+            log_error(NULL, "Assertion failed: %s\n", #expr);  \
+    } while (0)
+
+#define ck_assert_ptr_eq(x, y)                                  \
+    do                                                          \
+    {                                                           \
+        if ((x) != (y))                                         \
+            log_error(NULL, "Pointers not equal: %p != %p\n",   \
+                      (void *)(x), (void *)(y));                \
+    } while (0)
+
+#define ck_assert_ptr_null(x)                                   \
+    do                                                          \
+    {                                                           \
+        if ((x) != NULL)                                        \
+            log_error(NULL, "Pointer not null: %p\n", (void *)(x)); \
+    } while (0)
+
+#define ck_abort_msg(...)                              \
+    do                                                 \
+    {                                                  \
+        log_error(NULL, __VA_ARGS__);                  \
+        log_error(NULL, "\n");                         \
+    } while (0)
+
 #else
 #include <check.h>
 #define ck_assert_ret_ok(x) ck_assert_int_eq(0, x)
