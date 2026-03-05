@@ -1,7 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NUM_NODES="${1:-2}"
+# --- Parse arguments ---
+
+BACKEND="native"
+NUM_NODES=""
+POSITIONAL_ARGS=()
+
+usage() {
+    echo "Usage: $0 [--python] [NUM_NODES]"
+    echo ""
+    echo "  --python    Use pure-Python backend (default: native C backend)"
+    echo "  NUM_NODES   Number of peer nodes to start (default: 2)"
+    exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --python)
+            BACKEND="python"
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            usage 1
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+NUM_NODES="${POSITIONAL_ARGS[0]:-2}"
 
 # --- Check prerequisites ---
 
@@ -50,6 +84,18 @@ if [ -f "$CERT_PATH" ]; then
     CERT_CONTENT="$(cat "$CERT_PATH")"
 fi
 
+# --- Select Dockerfile based on backend ---
+
+if [ "$BACKEND" = "native" ]; then
+    DOCKERFILE="src/autonomous-trust/Dockerfile-native"
+    echo "Backend: native (C library via CFFI)"
+else
+    DOCKERFILE="src/autonomous-trust/Dockerfile-lite"
+    echo "Backend: python (pure Python)"
+fi
+
+export AUTONOMOUS_TRUST_BACKEND="$BACKEND"
+
 # --- Launch Tilt ---
 
 cleanup() {
@@ -60,4 +106,4 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Starting AutonomousTrust demo with $NUM_NODES nodes..."
-tilt up -- --num-nodes="$NUM_NODES"
+tilt up -- --num-nodes="$NUM_NODES" --backend="$BACKEND"
