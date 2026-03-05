@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from queue import Empty, Queue
 from typing import Callable, Union
 
-from autonomous_trust.core import Process, ProcMeta, CfgIds, from_yaml_string, QueueType
+from autonomous_trust.core import Process, ProcMeta, CfgIds, from_json_string, QueueType
 from autonomous_trust.core.automate import QueuePool
 from autonomous_trust.core.identity import Peers, Identity
 from autonomous_trust.core.network import Message
@@ -199,7 +199,7 @@ class CohortTracker(Process, metaclass=ProcMeta,
 
     def handle_metadata(self, _, message):
         if message.function == CohortProtocol.meta:
-            metadata = from_yaml_string(message.obj)
+            metadata = from_json_string(message.obj)
             uuid = message.from_whom.uuid
             if uuid in self.cohort.peers:
                 peer = self.cohort.peers[uuid]
@@ -209,7 +209,7 @@ class CohortTracker(Process, metaclass=ProcMeta,
 
     def handle_stats(self, _, message):
         if message.function == CohortProtocol.stats:
-            data = from_yaml_string(message.obj)  # FIXME 'total' also
+            data = from_json_string(message.obj)  # FIXME 'total' also
             uuid = message.from_whom.uuid
             if uuid in self.cohort.peers:
                 peer = self.cohort.peers[uuid]

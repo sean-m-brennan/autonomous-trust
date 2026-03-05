@@ -86,7 +86,7 @@ class SimClient(net.Client):
                         self._tick = 0
                     self.callback(SimState(blank=True))
                     return
-                state = SimState.from_yaml_string(info)
+                state = SimState.from_json_string(info)
                 #self.logger.debug('** Block')  # FIXME
                 self.callback(state)
                 #self.logger.debug('** Unblock')

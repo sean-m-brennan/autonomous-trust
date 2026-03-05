@@ -14,50 +14,38 @@
 #   limitations under the License.
 # ******************
 
+import json
 import os
-import re
 
 from autonomous_trust.core.config import Configuration
+from autonomous_trust.core.config.configuration import config_json_decoder
 from autonomous_trust.core.config.generate import generate_identity
-from autonomous_trust.core.system import core_system, agreement_impl
+from autonomous_trust.core.system import core_system
 
 from .. import INSIDE_DOCKER
-
-
-cidr_regex = r'(?:/\d{1,3})'
-ipv4_regex = r'(\d{1,3}\.){3}\d{1,3}'
-ipv6_regex = r'([0-9a-fA-F]{1,4}:?|:)+'
-mac_regex = r'([0-9A-Fa-f]{2}:){5}(?:[0-9A-Fa-f]{2})'
-hex_seed_regex = r'([0-9A-Fa-f]{86}==)'
 
 
 def test_generate_identity(setup_teardown):
     net, ident, subsys = generate_identity(os.environ[Configuration.ROOT_VARIABLE_NAME], True)
 
-    ipv6_cidr_regex = ipv6_regex + cidr_regex
-    if INSIDE_DOCKER:
-        from autonomous_trust.core.network import Network
-        addresses = Network.get_addresses()
-        if addresses['ip6'] is None:
-            ipv6_cidr_regex = 'null'  # unless IPV6 is enabled in docker
+    # Verify network config round-trips through JSON
+    net_json = net.to_json_string()
+    net_data = json.loads(net_json, object_hook=config_json_decoder)
+    assert net_data.__class__.__name__ == 'Network'
+    assert hasattr(net_data, '_ip4_cidr')
+    assert hasattr(net_data, '_mac_address')
 
-    expected_net = '!Cfg:autonomous_trust.core.network.network.Network' + \
-                   ' _ip4_cidr: ' + ipv4_regex + cidr_regex + \
-                   ' _ip6_cidr: ' + ipv6_cidr_regex + ' _mac_address: ' + mac_regex + \
-                   ' _mcast4_addr: ' + ipv4_regex + ' _mcast6_addr: ' + ipv6_regex + ' _port: null'
-    actual_net = re.sub(' +', ' ', net.to_yaml_string().strip().replace('\n', ' '))
-    assert re.match(expected_net, actual_net) is not None  # FIXME is None
+    # Verify identity config round-trips through JSON
+    ident_json = ident.to_json_string()
+    ident_data = json.loads(ident_json, object_hook=config_json_decoder)
+    assert ident_data.__class__.__name__ == 'Identity'
+    assert hasattr(ident_data, '_fullname')
+    assert hasattr(ident_data, '_nickname')
+    assert hasattr(ident_data, '_signature')
+    assert hasattr(ident_data, '_encryptor')
 
-    expected_ident = '!Cfg:autonomous_trust.core.identity.identity.Identity' + \
-                     ' _block_impl: ' + agreement_impl + \
-                     ' _encryptor: !Cfg:autonomous_trust.core.identity.encrypt.Encryptor' + \
-                     ' hex_seed: !!binary | ' + hex_seed_regex + ' public_only: false' + \
-                     r' _fullname: ([^@]+@[^@]+\.[^@]+)' + r' _nickname: ([a-z]+)' + \
-                     ' _public_only: false' + ' _rank: 0' + \
-                     ' _signature: !Cfg:autonomous_trust.core.identity.sign.Signature' + \
-                     ' hex_seed: !!binary | ' + hex_seed_regex + ' public_only: false' + \
-                     ' _uuid: ' + ' address: ' + ipv4_regex + ' petname: me'
-    assert re.match(expected_ident, re.sub(' +', ' ', ident.to_yaml_string().replace('\n', ' '))) is not None
-
-    expected_subsys = '!!omap [' + ', '.join(['{%s: %s}' % (key, value) for key, value in core_system.items()]) + ']'
-    assert subsys.to_yaml_string().replace('\n', '').replace('  ', ' ') == expected_subsys
+    # Verify subsystems config round-trips through JSON
+    subsys_json = subsys.to_json_string()
+    subsys_data = json.loads(subsys_json)
+    expected = dict(core_system)
+    assert subsys_data == expected

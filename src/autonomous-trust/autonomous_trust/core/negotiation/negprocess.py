@@ -101,7 +101,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             try:
                 for peer in participants:
                     tracker.results[peer.uuid] = None
-                    msg = Message(self.name, NegotiationProtocol.announce, task.to_yaml_string(), peer)
+                    msg = Message(self.name, NegotiationProtocol.announce, task.to_json_string(), peer)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                     self.logger.debug('Sent task to %s' % peer.nickname)
             except Full:
@@ -119,7 +119,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                 self.peers.demote(message.from_whom)
             try:
                 if task.capability not in self.capabilities:
-                    msg = Message(self.name, NegotiationProtocol.refusal, task.to_yaml_string(), message.from_whom)
+                    msg = Message(self.name, NegotiationProtocol.refusal, task.to_json_string(), message.from_whom)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                     self.logger.debug('Remote task refused: not capable')
                 else:
@@ -127,19 +127,19 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     if task.parameters.acceptable():
                         if self._add_task(task):
                             msg = Message(self.name, NegotiationProtocol.acceptance,
-                                          task.to_yaml_string(), message.from_whom)
+                                          task.to_json_string(), message.from_whom)
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                             self.logger.debug('Remote task accepted')
                         else:
                             task.parameters.when = self.task_stack.find_nearest_slot(task)
                             msg = Message(self.name, NegotiationProtocol.response,
-                                          task.to_yaml_string(), message.from_whom)
+                                          task.to_json_string(), message.from_whom)
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                             self.logger.debug('Haggle over remote task timing')
                     else:
                         task.adjust()
                         msg = Message(self.name, NegotiationProtocol.response,
-                                      task.to_yaml_string(), message.from_whom)
+                                      task.to_json_string(), message.from_whom)
                         queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                         self.logger.debug('Haggle over remote task content')
             except Full:
@@ -161,7 +161,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             if task.parameters.flexible:
                 try:
                     alt_task = task  # FIXME address any conflicts in parameters
-                    msg = Message(self.name, NegotiationProtocol.announce, alt_task.to_yaml_string(), message.from_whom)
+                    msg = Message(self.name, NegotiationProtocol.announce, alt_task.to_json_string(), message.from_whom)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                     self.logger.debug('Attempt to resolve haggling')
                 except Full:
@@ -214,7 +214,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             if message.status is not None:
                 try:
                     msg = Message(self.name, NegotiationProtocol.status_resp,
-                                  message.to_yaml_string(), message.requestor)
+                                  message.to_json_string(), message.requestor)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                     self.logger.debug('Local status for forwarding')
                 except Full:
@@ -250,7 +250,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
     def forward_result(self, queues, message):
         if isinstance(message, TaskResult):
             try:
-                msg = Message(self.name, NegotiationProtocol.result, message.to_yaml_string(), message.requestor)
+                msg = Message(self.name, NegotiationProtocol.result, message.to_json_string(), message.requestor)
                 queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                 self.logger.debug('Local result for forwarding')
             except Full:
@@ -310,7 +310,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                                 present > params.when + params.duration + params.timeout:
                             tx_task = Task(**task.to_dict())
                             msg = Message(self.name, NegotiationProtocol.status_req,
-                                          tx_task.to_yaml_string(), task.requestor)
+                                          tx_task.to_json_string(), task.requestor)
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                             self.logger.debug('Request remote execution status from %s' % task.requestor.nickname)
                             self.status_pending.append(task)

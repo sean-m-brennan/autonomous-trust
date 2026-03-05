@@ -40,7 +40,7 @@ try:
     from . import __version__ as version
 except ImportError:
     version = '?.?.?'
-from .config import Configuration, to_yaml_string, ConfigMap
+from .config import Configuration, to_json_string, ConfigMap
 from .config.discover import get_cfg_type, load_configs
 from .processes import Process, LogLevel, ProcessTracker
 from .identity import Peers
@@ -211,7 +211,7 @@ class AutonomousTrust(Protocol):
                     self._random_task(queues)
                     # check my own reputation
                     query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
-                                    to_yaml_string((self.identity, self.proc_name)), self.identity)
+                                    to_json_string((self.identity, self.proc_name)), self.identity)
                     queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
         self._report_unhandled()
 

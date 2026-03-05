@@ -49,6 +49,6 @@ def test_sim_config():
     peer4 = PeerInfo(str(uuid4()), 'drone', '192.168.0.4', path4.shape.start, -200.,
                      Antenna.DIPOLE, NetInterface.SMALL, start, end, path4, [])
     config = SimConfig(time=start, peers=[peer1, peer2, peer3, peer4])
-    s = config.to_yaml_string()
+    s = config.to_json_string()
     config2 = SimConfig.load(s)
     assert repr(config) == repr(config2)
