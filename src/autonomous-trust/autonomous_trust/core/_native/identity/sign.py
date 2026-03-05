@@ -18,8 +18,11 @@
 
 from .._ffi import ffi
 
+# Re-export Python Signature for full API compatibility
+from ..._python.identity.sign import Signature  # noqa: F401
 
-class Signature:
+
+class NativeSignature:
     """Read-only view of a ``signature_t`` embedded in a public identity."""
 
     __slots__ = ('_cdata',)

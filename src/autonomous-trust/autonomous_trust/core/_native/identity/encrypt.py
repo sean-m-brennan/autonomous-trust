@@ -18,8 +18,11 @@
 
 from .._ffi import ffi
 
+# Re-export Python Encryptor for full API compatibility
+from ..._python.identity.encrypt import Encryptor  # noqa: F401
 
-class Encryptor:
+
+class NativeEncryptor:
     """Read-only view of an ``encryptor_t`` embedded in a public identity."""
 
     __slots__ = ('_cdata',)

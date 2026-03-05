@@ -14,6 +14,14 @@
 #   limitations under the License.
 # ******************
 
-from .identity import Identity, PublicIdentity
-from .sign import Signature
-from .encrypt import Encryptor
+# Native C-backed wrappers (available for C interop)
+from .identity import NativeIdentity, PublicIdentity
+
+# Public API: delegate to Python for full API compatibility
+# (Python classes handle generate(), serialization, config, etc.)
+from ..._python.identity.identity import Identity
+from ..._python.identity.peers import Peers
+from ..._python.identity.group import Group
+from ..._python.identity.idprocess import IdentityProcess
+from ..._python.identity.sign import Signature
+from ..._python.identity.encrypt import Encryptor

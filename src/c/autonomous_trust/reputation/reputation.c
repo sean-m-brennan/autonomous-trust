@@ -31,6 +31,14 @@ DEFINE_ERROR(EREP_CHAIN_FULL, "Transaction chain is full");
  * Transaction history
  ****************************/
 
+int tx_history_create(tx_history_t **hist)
+{
+    *hist = calloc(1, sizeof(tx_history_t));
+    if (*hist == NULL)
+        return EXCEPTION(ENOMEM);
+    return tx_history_init(*hist);
+}
+
 int tx_history_init(tx_history_t *hist)
 {
     memset(hist->chain, 0, sizeof(hist->chain));
@@ -38,6 +46,13 @@ int tx_history_init(tx_history_t *hist)
     int err = map_init(&hist->task_map);
     if (err != 0) return err;
     return map_init(&hist->peer_map);
+}
+
+void tx_history_destroy(tx_history_t *hist)
+{
+    if (hist == NULL) return;
+    tx_history_free(hist);
+    free(hist);
 }
 
 /**
@@ -297,9 +312,24 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
  * Reputations map
  ****************************/
 
+int reputations_create(reputations_t **reps)
+{
+    *reps = calloc(1, sizeof(reputations_t));
+    if (*reps == NULL)
+        return EXCEPTION(ENOMEM);
+    return reputations_init(*reps);
+}
+
 int reputations_init(reputations_t *reps)
 {
     return map_init(&reps->scores);
+}
+
+void reputations_destroy(reputations_t *reps)
+{
+    if (reps == NULL) return;
+    reputations_free(reps);
+    free(reps);
 }
 
 int reputations_update(reputations_t *reps, const uuid_t peer_uuid, double score)

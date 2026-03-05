@@ -90,9 +90,11 @@ typedef struct {
     int expected;
 } task_tracker_t;
 
-int task_tracker_init(task_tracker_t *tracker, const uuid_t task_uuid, int expected);
-int task_tracker_set_result(task_tracker_t *tracker, const uuid_t peer_uuid, const uint8_t *data, size_t len);
-int task_tracker_result_count(const task_tracker_t *tracker);
+int  task_tracker_create(task_tracker_t **tracker, const uuid_t task_uuid, int expected);
+int  task_tracker_init(task_tracker_t *tracker, const uuid_t task_uuid, int expected);
+void task_tracker_destroy(task_tracker_t *tracker);
+int  task_tracker_set_result(task_tracker_t *tracker, const uuid_t peer_uuid, const uint8_t *data, size_t len);
+int  task_tracker_result_count(const task_tracker_t *tracker);
 void task_tracker_free(task_tracker_t *tracker);
 
 /****************************
@@ -112,8 +114,10 @@ typedef struct {
     int count;
 } job_queue_t;
 
-int job_queue_init(job_queue_t *q);
-int job_queue_push(job_queue_t *q, const job_t *job);
+int  job_queue_create(job_queue_t **q);
+int  job_queue_init(job_queue_t *q);
+void job_queue_destroy(job_queue_t *q);
+int  job_queue_push(job_queue_t *q, const job_t *job);
 int job_queue_pop(job_queue_t *q, job_t *job);
 int job_queue_min(const job_queue_t *q, job_t *job);
 bool job_queue_contains(const job_queue_t *q, const uuid_t task_uuid);

@@ -425,6 +425,80 @@ ffi.cdef("""
                        map_t *procs, array_t *queues, logger_t *logger);
     void process_free(process_t *proc);
 
+    /* ---- negotiation/task.h ---- */
+    /* task_t contains embedded capability_t (opaque), so treat as opaque */
+    typedef struct task_s task_t;
+
+    typedef struct {
+        task_t *task_ptr;       /* opaque pointer */
+        unsigned char task_uuid[16];
+        int flood_count;
+    } task_counter_t;
+
+    /* task_tracker_t contains embedded map_t (opaque) — treat as opaque */
+    typedef struct task_tracker_s task_tracker_t;
+
+    int  task_tracker_create(task_tracker_t **tracker,
+                             const unsigned char *task_uuid, int expected);
+    int  task_tracker_init(task_tracker_t *tracker,
+                           const unsigned char *task_uuid, int expected);
+    void task_tracker_destroy(task_tracker_t *tracker);
+    int  task_tracker_set_result(task_tracker_t *tracker,
+                                const unsigned char *peer_uuid,
+                                const uint8_t *data, size_t len);
+    int  task_tracker_result_count(const task_tracker_t *tracker);
+    void task_tracker_free(task_tracker_t *tracker);
+
+    /* ---- negotiation/negotiation.h ---- */
+    /* job_queue_t contains embedded task_t with opaque fields */
+    typedef struct job_queue_s job_queue_t;
+
+    int  job_queue_create(job_queue_t **q);
+    int  job_queue_init(job_queue_t *q);
+    void job_queue_destroy(job_queue_t *q);
+    int  job_queue_count(const job_queue_t *q);
+    void job_queue_clear(job_queue_t *q);
+
+    /* ---- reputation/reputation.h ---- */
+    typedef struct {
+        unsigned char task_uuid[16];
+        unsigned char p1_uuid[16];
+        double p1_score;
+        bool p1_set;
+        unsigned char p2_uuid[16];
+        double p2_score;
+        bool p2_set;
+        int index;
+    } transaction_t;
+
+    /* tx_history_t/reputations_t contain embedded maps/arrays — opaque */
+    typedef struct tx_history_s tx_history_t;
+    typedef struct reputations_s reputations_t;
+
+    int  tx_history_create(tx_history_t **hist);
+    int  tx_history_init(tx_history_t *hist);
+    void tx_history_destroy(tx_history_t *hist);
+    int  tx_history_update(tx_history_t *hist, const unsigned char *task_uuid,
+                           const unsigned char *peer_uuid, double score);
+    int  tx_history_len(const tx_history_t *hist);
+    void tx_history_free(tx_history_t *hist);
+
+    int  reputations_create(reputations_t **reps);
+    int  reputations_init(reputations_t *reps);
+    void reputations_destroy(reputations_t *reps);
+    int  reputations_update(reputations_t *reps,
+                            const unsigned char *peer_uuid, double score);
+    int  reputations_get(const reputations_t *reps,
+                         const unsigned char *peer_uuid, double *score);
+    bool reputations_contains(const reputations_t *reps,
+                              const unsigned char *peer_uuid);
+    void reputations_free(reputations_t *reps);
+
+    double reputation_compute(const tx_history_t *hist,
+                              const reputations_t *reps,
+                              const unsigned char *self_uuid,
+                              const unsigned char *peer_uuid);
+
     /* ---- autonomous_trust.h ---- */
     int run_autonomous_trust(char *q_in, char *q_out,
                              void *capabilities, size_t cap_len,

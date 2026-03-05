@@ -33,10 +33,25 @@ DEFINE_ERROR(ENEG_NOTASK, "Task not found");
  * Job queue
  ****************************/
 
+int job_queue_create(job_queue_t **q)
+{
+    *q = calloc(1, sizeof(job_queue_t));
+    if (*q == NULL)
+        return EXCEPTION(ENOMEM);
+    return job_queue_init(*q);
+}
+
 int job_queue_init(job_queue_t *q)
 {
     memset(q, 0, sizeof(job_queue_t));
     return 0;
+}
+
+void job_queue_destroy(job_queue_t *q)
+{
+    if (q == NULL) return;
+    job_queue_clear(q);
+    free(q);
 }
 
 /**
@@ -201,12 +216,27 @@ int job_queue_find_nearest_slot(const job_queue_t *q, time_t duration,
  * Task tracker
  ****************************/
 
+int task_tracker_create(task_tracker_t **tracker, const uuid_t task_uuid, int expected)
+{
+    *tracker = calloc(1, sizeof(task_tracker_t));
+    if (*tracker == NULL)
+        return EXCEPTION(ENOMEM);
+    return task_tracker_init(*tracker, task_uuid, expected);
+}
+
 int task_tracker_init(task_tracker_t *tracker, const uuid_t task_uuid, int expected)
 {
     memset(tracker, 0, sizeof(task_tracker_t));
     uuid_copy(tracker->task_uuid, task_uuid);
     tracker->expected = expected;
     return map_init(&tracker->results);
+}
+
+void task_tracker_destroy(task_tracker_t *tracker)
+{
+    if (tracker == NULL) return;
+    task_tracker_free(tracker);
+    free(tracker);
 }
 
 int task_tracker_set_result(task_tracker_t *tracker, const uuid_t peer_uuid,
