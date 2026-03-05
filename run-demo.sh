@@ -54,6 +54,7 @@ fi
 PROTO_SRC="src/protobuf"
 PROTO_PY_DIR="src/autonomous-trust"
 PROTO_PY="$PROTO_PY_DIR/autonomous_trust/core/protobuf"
+PROTO_TARGET="$PROTO_PY_DIR/autonomous_trust/core/_python/protobuf"
 if [ ! -d "$PROTO_PY" ] || [ -z "$(find "$PROTO_PY" -name '*_pb2.py' 2>/dev/null)" ]; then
     echo "Generating protobuf Python files..."
     protoc --python_out="$PROTO_PY_DIR" -I "$PROTO_SRC" \
@@ -63,6 +64,9 @@ if [ ! -d "$PROTO_PY" ] || [ -z "$(find "$PROTO_PY" -name '*_pb2.py' 2>/dev/null
     find "$PROTO_PY" -type d -exec touch {}/__init__.py \;
     touch "$PROTO_PY/__init__.py"
     echo "Protobuf files generated."
+    mkdir -p $PROTO_TARGET
+    cp -R $PROTO_PY/. $PROTO_TARGET/
+    rm -rf $PROTO_PY
 fi
 
 # --- Detect proxy settings ---
