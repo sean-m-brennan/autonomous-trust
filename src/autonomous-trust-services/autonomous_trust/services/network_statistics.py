@@ -23,11 +23,13 @@ from autonomous_trust.core import Process, ProcMeta, Configuration, CfgIds, to_j
 from autonomous_trust.core.identity import Identity
 from autonomous_trust.core.network import Message, Network
 from autonomous_trust.core.protocol import Protocol
+from autonomous_trust.core.protobuf.services import metadata_pb2
 
 
 class NetworkStats(Configuration):
     """up rate, down rate, bytes sent, bytes recvd, errors out, errors in"""
     def __init__(self, up: float, down: float, sent: int, recv: int, err_out: int, err_in: int):
+        super().__init__(metadata_pb2.NetworkStats)
         self.up = up
         self.down = down
         self.sent = sent

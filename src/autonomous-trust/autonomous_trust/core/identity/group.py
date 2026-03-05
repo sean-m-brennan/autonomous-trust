@@ -95,19 +95,24 @@ class Group(InitializableConfig):
 
     def sync_to_message(self):
         self.message.uuid = str(self._uuid).encode('utf-8')
+        # Proto has a single address string; take first value from map or empty
         if self._address_map:
-            first_addr = next(iter(self._address_map.values()))
-            self.message.address = first_addr
-        self._encryptor.message = self.message.encryptor
+            if isinstance(self._address_map, dict):
+                self.message.address = next(iter(self._address_map.values()), '')
+            else:
+                self.message.address = next(iter(self._address_map), '')
+        else:
+            self.message.address = ''
         self._encryptor.sync_to_message()
+        self.message.encryptor.CopyFrom(self._encryptor.message)
 
     def sync_from_message(self):
         self._uuid = self.message.uuid.decode('utf-8')
-        address = self.message.address
-        self._address_map = {self._uuid: address}
+        self._address_map = {}
         self._nickname = ''
         self._public_only = True
-        self._encryptor = Encryptor.__new__(Encryptor)
+        # Reconstruct nested Encryptor
+        self._encryptor = object.__new__(Encryptor)
         self._encryptor.message = identity_pb2.Encryptor()
         self._encryptor.message.CopyFrom(self.message.encryptor)
         self._encryptor.sync_from_message()
