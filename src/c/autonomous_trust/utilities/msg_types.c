@@ -65,7 +65,7 @@ char *message_type_to_string(message_type_t type)
     case PEER_CAPABILITIES:
         return (char*)autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name;
     case TASK:
-        return (char*)autonomous_trust__core__protobuf__negotiation__task__descriptor.c_name;
+        return (char*)"TASK";  /* task.proto is empty; no descriptor */
     case NET_MESSAGE:
         return (char*)"NET_MSG";
     case TASK_STATUS:
@@ -92,8 +92,7 @@ message_type_t string_to_message_type(const char *str)
     if (strncmp(str, autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name,
                 strlen(autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name)) == 0)
         return PEER_CAPABILITIES;
-    if (strncmp(str, autonomous_trust__core__protobuf__negotiation__task__descriptor.c_name,
-                strlen(autonomous_trust__core__protobuf__negotiation__task__descriptor.c_name)) == 0)
+    if (strncmp(str, "TASK", strlen("TASK")) == 0)
         return TASK;
     if (strncmp(str, "NET_MSG", strlen("NET_MSG")) == 0)
         return NET_MESSAGE;

@@ -319,7 +319,7 @@ void data_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data *pdata)
 
 int data_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data *pdata, data_t *data)
 {
-    data->type = pdata->type;
+    data->type = (data_type_t)pdata->type;
     data->size = pdata->size;
     switch (pdata->type)
     {

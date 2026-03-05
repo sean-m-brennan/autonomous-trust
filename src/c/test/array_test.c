@@ -20,7 +20,7 @@
 #include "autonomous_trust/utilities/util.h"
 #include "autonomous_trust/utilities/logger.h"
 
-#define DEBUG_TESTS 0
+#define DEBUG_TESTS 1
 
 #include "test_setup.h"
 
