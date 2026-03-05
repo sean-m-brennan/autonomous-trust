@@ -145,20 +145,18 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
         proc->protocol.group = msg->info.group;
         return true;
     case PEER:
-        if (proc->protocol.num_peers < MAX_PEERS)
-            memcpy(&proc->protocol.peers[proc->protocol.num_peers++], &msg->info.peer, sizeof(public_identity_t));
+        memcpy(&proc->protocol.peers[proc->protocol.num_peers++], &msg->info.peer, sizeof(public_identity_t));
         return true;
     case PEER_CAPABILITIES:
-        proc->protocol.peer_capabilities = &msg->info.peer_capabilities;
+        // pproc->peer_capabilities = message
         return true;
-    case NET_MESSAGE:
-    {
+    default:
         net_msg_t *nmsg = &msg->info.net_msg;
-        if (strncmp(nmsg->process, proc->name, PROC_NAME_LEN) == 0)
+        if (nmsg->process == proc->name)
         {
             data_t *h_dat;
             int err = map_get(proc->protocol.handlers, nmsg->function, &h_dat);
-            if (err != 0)
+            if (err != 0) // FIXME logging?
                 return false;
             msg_handler_t handler;
             err = data_object_ptr(h_dat, (void *)&handler);
@@ -166,10 +164,6 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
                 return false;
             return handler(proc, queues, msg);
         }
-        break;
-    }
-    default:
-        break;
     }
     return false;
 }

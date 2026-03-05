@@ -34,6 +34,7 @@ extern "C" {
  * 
  */
 #define CFG_PATH_LEN 256
+#define CFG_NAME_SIZE 64
 
 /**
  * @brief Get the config directory

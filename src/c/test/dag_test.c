@@ -39,7 +39,7 @@ END_TEST_DEFINITION()
 DEFINE_TEST(test_linked_step_create)
 {
     linked_step_t *step = NULL;
-    ck_assert_ret_ok(linked_step_create("payload1", NULL, &step));
+    ck_assert_ret_ok(linked_step_create((void *)"payload1", NULL, &step));
     ck_assert_ptr_nonnull(step);
     ck_assert(!uuid_is_null(step->uuid));
     ck_assert_int_eq(step->length, 1);
@@ -47,7 +47,7 @@ DEFINE_TEST(test_linked_step_create)
     ck_assert_str_eq((char *)step->payload, "payload1");
 
     linked_step_t *step2 = NULL;
-    ck_assert_ret_ok(linked_step_create("payload2", (step_t *)step, &step2));
+    ck_assert_ret_ok(linked_step_create((void *)"payload2", (step_t *)step, &step2));
     ck_assert_int_eq(step2->length, 2);
     ck_assert_ptr_eq(step2->parent, (step_t *)step);
 
@@ -78,9 +78,9 @@ DEFINE_TEST(test_dag_add_step)
     ck_assert_ret_ok(step_dag_create(&dag));
 
     linked_step_t *s1 = NULL, *s2 = NULL, *s3 = NULL;
-    ck_assert_ret_ok(linked_step_create("step1", NULL, &s1));
-    ck_assert_ret_ok(linked_step_create("step2", NULL, &s2));
-    ck_assert_ret_ok(linked_step_create("step3", NULL, &s3));
+    ck_assert_ret_ok(linked_step_create((void *)"step1", NULL, &s1));
+    ck_assert_ret_ok(linked_step_create((void *)"step2", NULL, &s2));
+    ck_assert_ret_ok(linked_step_create((void *)"step3", NULL, &s3));
 
     ck_assert_ret_ok(step_dag_add_step(dag, s1, NULL));
     ck_assert_ptr_eq(step_dag_main(dag), s1);

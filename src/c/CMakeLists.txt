@@ -31,9 +31,13 @@ set(useful_warnings
     -Wwrite-strings
     -Wswitch-enum
     -Winit-self
-    -Wuse-after-free 
-    -Wfree-nonheap-object
 )
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    list(APPEND useful_warnings -Wuse-after-free -Wfree-nonheap-object)
+endif()
+if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align)
+endif()
 set(useful_flags
     #-fanalyzer
     -fstack-clash-protection
@@ -41,7 +45,7 @@ set(useful_flags
 )
 string(REPLACE ";" " " lib_compile_flags
         "-Wall ${warning_as_error} ${useful_warnings} -fms-extensions ${useful_flags} ${sysroot_flag}")
-add_compile_options(-Wall -fms-extensions)
+add_compile_options(-Wall -fms-extensions ${useful_warnings} ${warning_as_error} ${useful_flags})
 add_link_options(-pthread ${sysroot_flag})
 
 
@@ -121,6 +125,7 @@ set(DEPENDENCIES
     ${LIBPROTOBUF_C_LIBRARY}
     ${LIBJANSSON_LIBRARY}
     ${CMAKE_THREAD_LIBS_INIT}
+    m
 )
 
 set(TEST_DEPENDENCIES ${DEPENDENCIES})
@@ -174,6 +179,13 @@ set(libsrc
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
     autonomous_trust/negotiation/task.c
+    autonomous_trust/negotiation/negotiation.c
+    autonomous_trust/negotiation/neg_proc.c
+    autonomous_trust/reputation/reputation.c
+    autonomous_trust/reputation/rep_proc.c
+    autonomous_trust/config/generate.c
+    autonomous_trust/network/ping.c
+    autonomous_trust/network/ntp.c
     autonomous_trust/network/net_message.c
     autonomous_trust/network/net_proc.c
     autonomous_trust/network/network.c
@@ -218,6 +230,11 @@ set(libhdr
     autonomous_trust/utilities/message.h
     autonomous_trust/utilities/msg_types.h
     autonomous_trust/utilities/sighandler.h
+    autonomous_trust/negotiation/negotiation.h
+    autonomous_trust/reputation/reputation.h
+    autonomous_trust/config/generate.h
+    autonomous_trust/network/ping.h
+    autonomous_trust/network/ntp.h
 )
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust)
 
@@ -405,6 +422,14 @@ add_executable(net_message_test test/net_message_test.c)
 set_source_files_properties(test/net_message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_message_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
+add_executable(negotiation_test test/negotiation_test.c)
+set_source_files_properties(test/negotiation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(negotiation_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES} m)
+
+add_executable(reputation_test test/reputation_test.c)
+set_source_files_properties(test/reputation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(reputation_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES} m)
+
 enable_testing()
 
 add_test(NAME array_test COMMAND $<TARGET_FILE:array_test>)
@@ -418,6 +443,8 @@ add_test(NAME merkle_test COMMAND $<TARGET_FILE:merkle_test>)
 add_test(NAME dag_test COMMAND $<TARGET_FILE:dag_test>)
 add_test(NAME agreement_test COMMAND $<TARGET_FILE:agreement_test>)
 add_test(NAME net_message_test COMMAND $<TARGET_FILE:net_message_test>)
+add_test(NAME negotiation_test COMMAND $<TARGET_FILE:negotiation_test>)
+add_test(NAME reputation_test COMMAND $<TARGET_FILE:reputation_test>)
 
 
 ####################

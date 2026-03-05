@@ -17,19 +17,14 @@
 #ifndef TASK_H
 #define TASK_H
 
-#include <uuid/uuid.h>
-
 #include "processes/capabilities.h"
 #include "structures/datetime.h"
 
 typedef struct {
-    uuid_t uuid;
-    uuid_t requestor_uuid;
     capability_t capability;
     datetime_t when;
     timedelta_t duration;
     long timeout;
-    bool flexible;
     thread_args_t;
 } task_t;
 
