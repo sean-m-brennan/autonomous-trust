@@ -22,19 +22,14 @@ import logging
 import time
 import traceback
 from importlib import import_module
-from io import StringIO
 from collections.abc import Mapping
 from collections import OrderedDict
 
 from enum import IntEnum
 from typing import Any
 
-from ruamel.yaml import YAML
-
 from .config import Configuration
 from .system import cadence, queue_cadence, now, QueueType
-
-yaml = YAML(typ='safe')
 
 
 class ProcessTracker(Mapping):
@@ -81,19 +76,23 @@ class ProcessTracker(Mapping):
             path = os.path.join(path, self.default_filename)
         return path
 
-    def to_yaml_string(self):
-        sio = StringIO()
-        yaml.dump(self.classes, sio)
-        return sio.getvalue()
+    def to_json_string(self):
+        return json.dumps(self.classes, indent=2)
+
+    # Backward-compat alias
+    to_yaml_string = to_json_string
 
     def to_file(self, filename=None):
         with open(self._validate_path(filename), 'w') as spec:
             json.dump(self.classes, spec, indent=2)
 
-    def from_yaml_string(self, yml):
-        name_dict = yaml.load(yml)
+    def from_json_string(self, data):
+        name_dict = json.loads(data)
         for cfg, proc in name_dict.items():
             self.register_subsystem(cfg, proc)
+
+    # Backward-compat alias
+    from_yaml_string = from_json_string
 
     def from_file(self, filename=None):
         with open(self._validate_path(filename), 'r') as spec:

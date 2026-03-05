@@ -26,19 +26,15 @@ from uuid import UUID
 from decimal import Decimal, getcontext
 from enum import Enum
 
-import ruamel.yaml
 from google.protobuf.json_format import MessageToJson, Parse as ParseJson
 from nacl.signing import SignedMessage
 
 from ..util import ClassEnumMeta
 
-yaml = ruamel.yaml.YAML(typ='safe')
-yaml.default_flow_style = False
-
 
 class SerializeMode(Enum):
     PROTO = 1
-    YAML = 2
+    JSON = 2
     PJSON = 3
 
 
@@ -47,32 +43,12 @@ class WireFormat(Enum):
     JSON = 2
 
 
-def to_yaml_string(item):
-    sio = StringIO()
-    if Configuration.mode == SerializeMode.YAML:
-        yaml.dump(item, sio)
-    else:
-        # assumes Message type
-        sio.write(item.SerializeToString())
-    return sio.getvalue()
-
-
-def from_yaml_string(string):
-    sio = StringIO(string)
-    if Configuration.mode == SerializeMode.YAML:
-        return yaml.load(sio)
-    #else: #FIXME remove both?
-
-
-
 class Configuration(object):
     ROOT_VARIABLE_NAME = 'AUTONOMOUS_TRUST_ROOT'
     CFG_PATH = os.path.join('etc', 'at')
     DATA_PATH = os.path.join('var', 'at')
-    YAML_PREFIX = u'!Cfg'
     # FIXME from config
-    #mode = SerializeMode.PROTO
-    mode = SerializeMode.YAML
+    mode = SerializeMode.JSON
     wire_format = WireFormat.JSON
     file_ext = '.cfg.json'
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
@@ -93,10 +69,6 @@ class Configuration(object):
     def get_data_dir(cls):
         return cls.get_cfg_dir().removesuffix(cls.CFG_PATH) + cls.DATA_PATH
 
-    @property
-    def yaml_tag(self):
-        return '%s:%s.%s' % (Configuration.YAML_PREFIX, self.__class__.__module__, self.__class__.__name__)
-
     def __repr__(self):
         attrs = []
         for k, v in sorted(self.to_dict().items()):
@@ -112,16 +84,12 @@ class Configuration(object):
             del d['message']
         return d
 
-    @staticmethod
-    def yaml_representer(dumper, data):
-        return dumper.represent_mapping(data.yaml_tag, data.to_dict())
-
     def sync_to_message(self):
         raise NotImplementedError
 
     def to_stream(self, stream):
-        if self.mode == SerializeMode.YAML:
-            yaml.dump(self, stream)
+        if self.mode == SerializeMode.JSON:
+            stream.write(json.dumps(self, cls=ConfigJSONEncoder))
         else:
             self.sync_to_message()
             if self.wire_format == WireFormat.BINARY:
@@ -129,8 +97,11 @@ class Configuration(object):
             else:
                 stream.write(MessageToJson(self.message))
 
-    def to_yaml_string(self):
+    def to_json_string(self):
         return str(self)
+
+    # Backward-compat alias
+    to_yaml_string = to_json_string
 
     def to_string(self):
         if self.mode == SerializeMode.PROTO and self.wire_format == WireFormat.BINARY:
@@ -148,19 +119,16 @@ class Configuration(object):
         with open(filepath, 'w') as cfg:
             json.dump(self, cfg, cls=ConfigJSONEncoder, indent=2)
 
-    @staticmethod
-    def yaml_constructor(loader, tag_suffix, node):
-        modulename, classname = tag_suffix[1:].rsplit('.', 1)
-        cls = getattr(sys.modules[modulename], classname)
-        return cls(**loader.construct_mapping(node, deep=True))
-
     def sync_from_message(self):
         raise NotImplementedError
 
     @classmethod
     def from_stream(cls, stream):
-        if cls.mode == SerializeMode.YAML:
-            return yaml.load(stream)
+        if cls.mode == SerializeMode.JSON:
+            data = stream.read()
+            if isinstance(data, bytes):
+                data = data.decode('utf-8')
+            return json.loads(data, object_hook=config_json_decoder)
         else:
             obj = cls.__new__(cls)
             msg_class = cls._msg_class
@@ -178,8 +146,11 @@ class Configuration(object):
             return obj
 
     @classmethod
-    def from_yaml_string(cls, string):
+    def from_json_string(cls, string):
         return cls.from_string(string)
+
+    # Backward-compat alias
+    from_yaml_string = from_json_string
 
     @classmethod
     def from_string(cls, string):
@@ -197,10 +168,6 @@ class Configuration(object):
             return json.load(cfg, object_hook=config_json_decoder)
 
 
-yaml.representer.add_multi_representer(Configuration, Configuration.yaml_representer),
-yaml.constructor.add_multi_constructor(Configuration.YAML_PREFIX, Configuration.yaml_constructor)
-
-
 class InitializableConfig(Configuration):
     def initialize(self, *args, **kwargs):
         raise NotImplementedError
@@ -210,71 +177,6 @@ class EmptyObject(Configuration):
     pass
 
 
-def datetime_representer(dumper, data: datetime):
-    return dumper.represent_scalar(u'!datetime', u'%s' % data.isoformat('T'))
-
-
-def datetime_constructor(loader, node):
-    value = loader.construct_scalar(node)
-    return parser.parse(value)
-
-
-yaml.representer.add_representer(datetime, datetime_representer),
-yaml.constructor.add_constructor(u'!datetime', datetime_constructor)
-
-
-def timedelta_representer(dumper, data: timedelta):
-    return dumper.represent_scalar(u'!timedelta', u'%s' % data.total_seconds())
-
-
-def timedelta_constructor(loader, node):
-    value = loader.construct_scalar(node)
-    return timedelta(seconds=float(value))
-
-
-yaml.representer.add_representer(timedelta, timedelta_representer),
-yaml.constructor.add_constructor(u'!timedelta', timedelta_constructor)
-
-
-def uuid_representer(dumper, data: UUID):
-    return dumper.represent_scalar(u'!UUID', u'%s' % str(data))
-
-
-def uuid_constructor(loader, node):
-    value = loader.construct_scalar(node)
-    return UUID(value)
-
-
-yaml.representer.add_representer(UUID, uuid_representer),
-yaml.constructor.add_constructor(u'!UUID', uuid_constructor)
-
-
-def signedmessage_representer(dumper, data: SignedMessage):
-    return dumper.represent_mapping(u'!signedmessage', dict(message=data.message, signature=data.signature))
-
-
-def signedmessage_constructor(loader, node):
-    return SignedMessage(**loader.construct_mapping(node, deep=True))
-
-
-yaml.representer.add_representer(SignedMessage, signedmessage_representer),
-yaml.constructor.add_constructor(u'!signedmessage', signedmessage_constructor)
-
-
-def decimal_representer(dumper, data: Decimal):
-    return dumper.represent_scalar(u'!Decimal', u'%s' % str(data))
-
-
-def decimal_constructor(loader, node):
-    value = loader.construct_scalar(node)
-    getcontext().prec = len(value)
-    return Decimal(value)
-
-
-yaml.representer.add_representer(Decimal, decimal_representer),
-yaml.constructor.add_constructor(u'!Decimal', decimal_constructor)
-
-
 class ConfigJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, Configuration):
@@ -282,6 +184,9 @@ class ConfigJSONEncoder(json.JSONEncoder):
             d = {'__type__': type_name}
             d.update(obj.to_dict())
             return d
+        if isinstance(obj, Enum):
+            type_name = 'Enumcfg:' + obj.__class__.__module__ + '.' + obj.__class__.__name__
+            return {'__type__': type_name, '__value__': obj.name}
         if isinstance(obj, datetime):
             return {'__type__': 'datetime', '__value__': obj.isoformat('T')}
         if isinstance(obj, timedelta):
@@ -321,6 +226,16 @@ def config_json_decoder(dct):
         sig = base64.b64decode(val['signature'])
         msg = base64.b64decode(val['message'])
         return SignedMessage._from_parts(signature=sig, message=msg, combined=sig + msg)
+    if type_name.startswith('Enumcfg:'):
+        enum_path = type_name[len('Enumcfg:'):]
+        module_name, class_name = enum_path.rsplit('.', 1)
+        try:
+            module = sys.modules[module_name]
+        except KeyError:
+            from importlib import import_module
+            module = import_module(module_name)
+        cls = getattr(module, class_name)
+        return cls[dct['__value__']]
     if '.' in type_name:
         module_name, class_name = type_name.rsplit('.', 1)
         try:
@@ -332,3 +247,17 @@ def config_json_decoder(dct):
         kwargs = {k: v for k, v in dct.items() if k != '__type__'}
         return cls(**kwargs)
     return dct
+
+
+# Module-level serialization functions
+def to_json_string(item):
+    return json.dumps(item, cls=ConfigJSONEncoder)
+
+
+def from_json_string(string):
+    return json.loads(string, object_hook=config_json_decoder)
+
+
+# Backward-compat aliases
+to_yaml_string = to_json_string
+from_yaml_string = from_json_string

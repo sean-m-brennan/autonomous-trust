@@ -79,4 +79,4 @@ class SimConfig(Configuration):
 
     @classmethod
     def load(cls, data: str) -> 'SimConfig':
-        return cls.from_yaml_string(data)
+        return cls.from_json_string(data)

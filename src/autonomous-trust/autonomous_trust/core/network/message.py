@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-from ..config import Configuration, SerializeMode
+from ..config import Configuration
 from ..identity import Identity, Group
 from .network import Network
 
@@ -53,15 +53,11 @@ class Message(object):
         self.return_to = return_to
         if isinstance(obj, str):
             check = obj.lstrip()
-            if check.startswith('---'):
-                check = check[3:].lstrip()
-            if check.startswith(Configuration.YAML_PREFIX):
+            if check.startswith('{') or check.startswith('['):
                 try:
                     self.obj = Configuration.from_string(obj)
                 except Exception:
                     pass  # leave obj as string if deserialization fails
-            elif obj.startswith('{') and Configuration.mode == SerializeMode.PROTO:
-                self.obj = Configuration.from_string(obj)
         # FIXME signing
 
     def __str__(self):

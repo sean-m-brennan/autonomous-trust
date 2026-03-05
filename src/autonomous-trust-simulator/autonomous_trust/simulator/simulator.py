@@ -136,7 +136,7 @@ class Simulator(net.SelectServer):
             return
         if self.return_geo:
             state = state.convert()
-        data = state.to_yaml_string().encode()
+        data = state.to_json_string().encode()
         self.send_all(sock, data)
 
     def recv_data(self, sock: socket.socket):  # asynchronous

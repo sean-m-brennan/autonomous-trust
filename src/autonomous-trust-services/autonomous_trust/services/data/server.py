@@ -17,7 +17,7 @@
 import warnings
 from queue import Empty, Full
 
-from autonomous_trust.core import Process, ProcMeta, CfgIds, to_yaml_string, InitializableConfig
+from autonomous_trust.core import Process, ProcMeta, CfgIds, to_json_string, InitializableConfig
 from autonomous_trust.core.identity import Identity
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.protocol import Protocol
@@ -88,7 +88,7 @@ class DataProcess(Process, metaclass=ProcMeta,
                 if data is not None:
                     for client_id in self.clients:
                         proc_name, peer = self.clients[client_id]
-                        msg_obj = to_yaml_string(data)
+                        msg_obj = to_json_string(data)
                         msg = Message(proc_name, DataProtocol.data, msg_obj, peer)
                         try:
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
