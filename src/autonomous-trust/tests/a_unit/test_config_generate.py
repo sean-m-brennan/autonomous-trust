@@ -24,7 +24,7 @@ from autonomous_trust.core.system import core_system, agreement_impl
 from .. import INSIDE_DOCKER
 
 
-cidr_regex = r'(?:/\d\d?)'
+cidr_regex = r'(?:/\d{1,3})'
 ipv4_regex = r'(\d{1,3}\.){3}\d{1,3}'
 ipv6_regex = r'([0-9a-fA-F]{1,4}:?|:)+'
 mac_regex = r'([0-9A-Fa-f]{2}:){5}(?:[0-9A-Fa-f]{2})'
@@ -36,7 +36,10 @@ def test_generate_identity(setup_teardown):
 
     ipv6_cidr_regex = ipv6_regex + cidr_regex
     if INSIDE_DOCKER:
-        ipv6_cidr_regex = 'null'  # unless IPV6 is enabled in docker
+        from autonomous_trust.core.network import Network
+        addresses = Network.get_addresses()
+        if addresses['ip6'] is None:
+            ipv6_cidr_regex = 'null'  # unless IPV6 is enabled in docker
 
     expected_net = '!Cfg:autonomous_trust.core.network.network.Network' + \
                    ' _ip4_cidr: ' + ipv4_regex + cidr_regex + \
