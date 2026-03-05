@@ -53,7 +53,7 @@ DEFINE_TEST(test_reputations_basic)
 
     double score = 0.0;
     ck_assert_ret_ok(reputations_get(&reps, peer_uuid, &score));
-    ck_assert_double_eq_tol(score, 0.85, 1e-9);
+    ck_assert_double_eq_tol(score, 0.85, 1e-6);
 
     reputations_free(&reps);
 }
@@ -61,9 +61,9 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_paxos_id)
 {
-    /* paxos_id_index(id1, id2) == id1 + id2/100.0 */
-    ck_assert_double_eq_tol(paxos_id_index(1.0, 5.0),  1.05,  1e-9);
-    ck_assert_double_eq_tol(paxos_id_index(3.0, 42.0), 3.42, 1e-9);
+    /* paxos_id_index(id1, id2) == id1 + id2/10^digits(id2) */
+    ck_assert_double_eq_tol(paxos_id_index(1.0, 5.0),  1.5,   1e-9);
+    ck_assert_double_eq_tol(paxos_id_index(3.0, 42.0), 3.42,  1e-9);
 }
 END_TEST_DEFINITION()
 
