@@ -1,4 +1,3 @@
-#!/usr/bin/env -S python3 -m
 # ******************
 #  Copyright 2025 Sean M. Brennan and contributors
 #
@@ -15,7 +14,9 @@
 #   limitations under the License.
 # ******************
 
-from ._python.__main__ import main
+from .automate import AutonomousTrust  # noqa
 
-if __name__ == '__main__':
-    main()
+from .processes import ProcessTracker, Process, ProcMeta, LogLevel
+from .config import Configuration, InitializableConfig, EmptyObject, \
+    to_json_string, from_json_string, to_yaml_string, from_yaml_string
+from .system import CfgIds, QueueType

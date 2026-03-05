@@ -1,4 +1,3 @@
-#!/usr/bin/env -S python3 -m
 # ******************
 #  Copyright 2025 Sean M. Brennan and contributors
 #
@@ -14,8 +13,3 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-
-from ._python.__main__ import main
-
-if __name__ == '__main__':
-    main()

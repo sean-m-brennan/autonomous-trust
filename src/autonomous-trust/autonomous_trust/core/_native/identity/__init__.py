@@ -1,4 +1,3 @@
-#!/usr/bin/env -S python3 -m
 # ******************
 #  Copyright 2025 Sean M. Brennan and contributors
 #
@@ -15,7 +14,6 @@
 #   limitations under the License.
 # ******************
 
-from ._python.__main__ import main
-
-if __name__ == '__main__':
-    main()
+from .identity import Identity, PublicIdentity
+from .sign import Signature
+from .encrypt import Encryptor
