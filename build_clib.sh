@@ -2,7 +2,6 @@
 
 cd src/c || exit 1
 rm -rf build
-mkdir build
+cmake -S . -B build
 cd build || exit 1
-cmake ..
 make
