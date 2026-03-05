@@ -19,7 +19,7 @@
 #include "autonomous_trust/processes/processes.h"
 #include "autonomous_trust/config/configuration_priv.h"
 
-#define DEBUG_TESTS 0
+#define DEBUG_TESTS 1
 
 #include "test_setup.h"
 
