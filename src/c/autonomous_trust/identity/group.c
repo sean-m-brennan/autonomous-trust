@@ -38,7 +38,7 @@ int group_init(uuid_t *uuid, char *address, group_t *group)
     if (eseed == NULL)
         return -1;
     encryptor_init(&group->encryptor, eseed);
-    smrt_deref(eseed);
+    free(eseed);
     return 0;
 }
 
@@ -82,7 +82,7 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
     json_t *encr = json_object();
     unsigned char *hex = encryptor_publish(&ident->encryptor); // encoded
     json_object_set(encr, "hex_seed", json_string((char *)hex));
-    smrt_deref(hex);
+    free(hex);
     json_object_set(obj, "encryptor", encr);
 
     return 0;

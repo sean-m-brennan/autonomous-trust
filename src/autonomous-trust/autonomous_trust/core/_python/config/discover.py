@@ -16,9 +16,9 @@
 
 import os
 
-from autonomous_trust.core.processes import Process
-from autonomous_trust.core.config import Configuration
-from autonomous_trust.core.config import ConfigMap
+from ..processes import Process
+from ..config import Configuration
+from ..config import ConfigMap
 
 
 def get_cfg_type(path: str):

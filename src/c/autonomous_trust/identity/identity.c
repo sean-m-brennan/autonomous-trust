@@ -44,13 +44,13 @@ int identity_init(uuid_t *uuid, char *address, char *fullname, identity_t *ident
     if (sseed == NULL)
         return -1;
     signature_init(&(identity->signature), sseed);
-    smrt_deref(sseed);
+    free(sseed);
 
     unsigned char *eseed = encryptor_generate();
     if (eseed == NULL)
         return -1;
     encryptor_init(&identity->encryptor, eseed);
-    smrt_deref(eseed);
+    free(eseed);
 
     return 0;
 }
@@ -78,18 +78,23 @@ int identity_publish(const identity_t *ident, public_identity_t **pub_copy)
     if (newIdent == NULL)
         return EXCEPTION(ENOMEM);
 
+    memcpy(newIdent->uuid, ident->uuid, sizeof(uuid_t));
+    strncpy(newIdent->address, ident->address, ADDR_LEN);
+    newIdent->address[ADDR_LEN] = '\0';
+    strncpy(newIdent->fullname, ident->fullname, NAME_LEN);
+    newIdent->fullname[NAME_LEN] = '\0';
+
     unsigned char *sseed = signature_publish(&ident->signature);
     if (sseed == NULL)
         return -1;
     public_signature_init(&newIdent->signature, sseed);
-    smrt_deref(sseed);
+    free(sseed);
     unsigned char *eseed = encryptor_publish(&ident->encryptor);
     if (eseed == NULL)
         return -1;
     public_encryptor_init(&newIdent->encryptor, eseed);
-    smrt_deref(eseed);
+    free(eseed);
 
-    //public_identity_init(newIdent);
     return 0;
 }
 
@@ -137,13 +142,13 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr)
     json_t *sig = json_object();
     unsigned char *hex = signature_publish(&ident->signature); // encoded
     json_object_set(sig, "hex_seed", json_string((char *)hex));
-    smrt_deref(hex);
+    free(hex);
     json_object_set(obj, "signature", sig);
 
     json_t *encr = json_object();
     hex = encryptor_publish(&ident->encryptor); // encoded
     json_object_set(encr, "hex_seed", json_string((char *)hex));
-    smrt_deref(hex);
+    free(hex);
     json_object_set(obj, "encryptor", encr);
 
     return 0;
