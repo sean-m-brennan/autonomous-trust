@@ -18,6 +18,7 @@
 #define NETWORK_H
 
 #include <stdint.h>
+#include <jansson.h>
 #include "utilities/allocation.h"
 
 #define COMM_PORT 27787

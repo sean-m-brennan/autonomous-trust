@@ -41,6 +41,12 @@ size_t message_size(message_type_t type)
         return sizeof(net_msg_t);
     case TASK:
         return sizeof(task_t);
+    case TASK_STATUS:
+        return sizeof(task_status_msg_t);
+    case TASK_RESULT:
+        return sizeof(task_result_msg_t);
+    case TRANSACTION_SCORE:
+        return sizeof(tx_score_msg_t);
     default:
         return 0;
     }
@@ -62,6 +68,12 @@ char *message_type_to_string(message_type_t type)
         return (char*)autonomous_trust__core__protobuf__negotiation__task__descriptor.c_name;
     case NET_MESSAGE:
         return (char*)"NET_MSG";
+    case TASK_STATUS:
+        return (char*)"TASK_STATUS";
+    case TASK_RESULT:
+        return (char*)"TASK_RESULT";
+    case TRANSACTION_SCORE:
+        return (char*)"TRANSACTION_SCORE";
     default:
         return (char*)"";
     }
@@ -85,6 +97,12 @@ message_type_t string_to_message_type(const char *str)
         return TASK;
     if (strncmp(str, "NET_MSG", strlen("NET_MSG")) == 0)
         return NET_MESSAGE;
+    if (strncmp(str, "TASK_STATUS", strlen("TASK_STATUS")) == 0)
+        return TASK_STATUS;
+    if (strncmp(str, "TASK_RESULT", strlen("TASK_RESULT")) == 0)
+        return TASK_RESULT;
+    if (strncmp(str, "TRANSACTION_SCORE", strlen("TRANSACTION_SCORE")) == 0)
+        return TRANSACTION_SCORE;
     return 0;
 }
 
@@ -164,6 +182,30 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
             return -1;
         break;
     }
+    case TASK_STATUS:
+    {
+        subdata_len = sizeof(task_status_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.task_status, subdata_len);
+        break;
+    }
+    case TASK_RESULT:
+    {
+        subdata_len = sizeof(task_result_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.task_result, subdata_len);
+        break;
+    }
+    case TRANSACTION_SCORE:
+    {
+        subdata_len = sizeof(tx_score_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.tx_score, subdata_len);
+        break;
+    }
     default:
         return -1;
     }
@@ -207,6 +249,15 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         return proto_to_net_msg(pb_msg->value.data, pb_msg->value.len, &msg->info.net_msg);
     case TASK:
         return proto_to_task(pb_msg->value.data, pb_msg->value.len, &msg->info.task);
+    case TASK_STATUS:
+        memcpy(&msg->info.task_status, pb_msg->value.data, sizeof(task_status_msg_t));
+        return 0;
+    case TASK_RESULT:
+        memcpy(&msg->info.task_result, pb_msg->value.data, sizeof(task_result_msg_t));
+        return 0;
+    case TRANSACTION_SCORE:
+        memcpy(&msg->info.tx_score, pb_msg->value.data, sizeof(tx_score_msg_t));
+        return 0;
     default:
         return -1;
     }
