@@ -21,8 +21,11 @@ Python wrappers for C ``identity_t`` (private) and ``public_identity_t``.
 import uuid as _uuid
 
 from .._ffi import ffi, lib
-from .sign import Signature
-from .encrypt import Encryptor
+from .sign import NativeSignature
+from .encrypt import NativeEncryptor
+
+# Re-export Python Identity for full API compatibility
+from ..._python.identity.identity import Identity  # noqa: F401
 
 # libsodium constants
 _CRYPTO_SIGN_BYTES = 64
@@ -53,12 +56,12 @@ class PublicIdentity:
         return ffi.string(self._ptr.fullname).decode('utf-8')
 
     @property
-    def signature(self) -> Signature:
-        return Signature(_cdata=ffi.addressof(self._ptr, 'signature'))
+    def signature(self) -> NativeSignature:
+        return NativeSignature(_cdata=ffi.addressof(self._ptr, 'signature'))
 
     @property
-    def encryptor(self) -> Encryptor:
-        return Encryptor(_cdata=ffi.addressof(self._ptr, 'encryptor'))
+    def encryptor(self) -> NativeEncryptor:
+        return NativeEncryptor(_cdata=ffi.addressof(self._ptr, 'encryptor'))
 
     def to_proto_bytes(self) -> bytes:
         """Serialize to protobuf binary."""
@@ -89,7 +92,7 @@ class PublicIdentity:
             lib.smrt_deref(self._ptr)
 
 
-class Identity:
+class NativeIdentity:
     """Wrapper around C ``identity_t*`` (contains private keys).
 
     Provides sign, verify, encrypt, and decrypt operations.

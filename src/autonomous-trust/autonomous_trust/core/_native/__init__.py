@@ -36,7 +36,9 @@ from .config import (Configuration, InitializableConfig, EmptyObject,
                      to_json_string, from_json_string,
                      to_yaml_string, from_yaml_string)
 
-# Processes, automate, system — delegate to Python (not yet C-backed)
-from .._python.automate import AutonomousTrust
+# Automate — re-exports Python AutonomousTrust + NativeAutonomousTrust
+from .automate import AutonomousTrust  # noqa: F401
+
+# Processes, system — delegate to Python (not yet C-backed)
 from .._python.processes import ProcessTracker, Process, ProcMeta, LogLevel
 from .._python.system import CfgIds, QueueType

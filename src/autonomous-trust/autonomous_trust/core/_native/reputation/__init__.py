@@ -14,14 +14,14 @@
 #   limitations under the License.
 # ******************
 
-# Native C-backed wrappers (available for C interop)
-from .identity import NativeIdentity, PublicIdentity
+# Native C-backed wrappers
+from .reputation import (
+    ReputationProtocol,
+    TransactionHistory,
+    Reputations,
+    reputation_compute,
+)
 
-# Public API: delegate to Python for full API compatibility
-# (Python classes handle generate(), serialization, config, etc.)
-from ..._python.identity.identity import Identity
-from ..._python.identity.peers import Peers
-from ..._python.identity.group import Group
-from ..._python.identity.idprocess import IdentityProcess
-from ..._python.identity.sign import Signature
-from ..._python.identity.encrypt import Encryptor
+# Delegate to Python for classes without native C wrappers
+from ..._python.reputation.reputation import TransactionScore
+from ..._python.reputation.repprocess import ReputationProcess

@@ -80,7 +80,9 @@ typedef struct {
     map_t         peer_map;   /* uuid_str -> array_t* (list of indices) */
 } tx_history_t;
 
+int  tx_history_create(tx_history_t **hist);
 int  tx_history_init(tx_history_t *hist);
+void tx_history_destroy(tx_history_t *hist);
 int  tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
                        const uuid_t peer_uuid, double score);
 int  tx_history_by_task(const tx_history_t *hist, const uuid_t task_uuid,
@@ -104,7 +106,9 @@ typedef struct {
     map_t scores;   /* uuid_str -> data_t* (float score) */
 } reputations_t;
 
+int  reputations_create(reputations_t **reps);
 int  reputations_init(reputations_t *reps);
+void reputations_destroy(reputations_t *reps);
 int  reputations_update(reputations_t *reps, const uuid_t peer_uuid, double score);
 int  reputations_get(const reputations_t *reps, const uuid_t peer_uuid, double *score);
 bool reputations_contains(const reputations_t *reps, const uuid_t peer_uuid);

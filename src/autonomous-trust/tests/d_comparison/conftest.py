@@ -14,14 +14,22 @@
 #   limitations under the License.
 # ******************
 
-# Native C-backed wrappers (available for C interop)
-from .identity import NativeIdentity, PublicIdentity
+"""Fixtures for native/Python comparison tests."""
 
-# Public API: delegate to Python for full API compatibility
-# (Python classes handle generate(), serialization, config, etc.)
-from ..._python.identity.identity import Identity
-from ..._python.identity.peers import Peers
-from ..._python.identity.group import Group
-from ..._python.identity.idprocess import IdentityProcess
-from ..._python.identity.sign import Signature
-from ..._python.identity.encrypt import Encryptor
+import os
+import pytest
+
+
+def _have_native():
+    """Check if the native C library is available."""
+    try:
+        from autonomous_trust.core._native._ffi import lib  # noqa
+        return True
+    except Exception:
+        return False
+
+
+requires_native = pytest.mark.skipif(
+    not _have_native(),
+    reason="Native C library (libautonomous_trust.so) not available"
+)

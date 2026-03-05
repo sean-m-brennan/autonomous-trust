@@ -14,14 +14,23 @@
 #   limitations under the License.
 # ******************
 
-# Native C-backed wrappers (available for C interop)
-from .identity import NativeIdentity, PublicIdentity
+"""
+Native config module — reuses Python Configuration for serialization,
+adds C-backed directory/loading helpers.
+"""
 
-# Public API: delegate to Python for full API compatibility
-# (Python classes handle generate(), serialization, config, etc.)
-from ..._python.identity.identity import Identity
-from ..._python.identity.peers import Peers
-from ..._python.identity.group import Group
-from ..._python.identity.idprocess import IdentityProcess
-from ..._python.identity.sign import Signature
-from ..._python.identity.encrypt import Encryptor
+# Configuration serialization is pure Python — reuse it directly
+from ..._python.config import (
+    Configuration,
+    InitializableConfig,
+    EmptyObject,
+    SerializeMode,
+    WireFormat,
+    to_json_string,
+    from_json_string,
+    to_yaml_string,
+    from_yaml_string,
+    ConfigMap,
+)
+
+from .configuration import get_cfg_dir, get_data_dir, load_all_configs
