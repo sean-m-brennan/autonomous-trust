@@ -116,8 +116,6 @@ class Configuration(object):
         self.to_stream(sio)
         return sio.getvalue()
 
-    def __str__(self):
-        return self.to_string()
 
     def to_wire_bytes(self):
         if hasattr(self, 'message') and self._msg_class is not None:
