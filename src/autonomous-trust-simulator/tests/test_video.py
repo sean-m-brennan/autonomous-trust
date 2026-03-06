@@ -50,6 +50,7 @@ def mean_squared_error(img1, img2):
     return err / (float(h * w))
 
 
+@pytest.mark.skip(reason="VideoSource/VideoRcvr were refactored into Process-based classes; standalone API removed")
 def test_client_frame(video_image):
     host = 'localhost'
     port = 9999

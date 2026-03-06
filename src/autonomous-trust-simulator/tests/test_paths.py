@@ -134,7 +134,7 @@ def path_tester(cfg, locs, times, confirm):
     path = Path(steps, cadence, path_data, times[0])
     pts = []
     for step in range(1, steps+1):
-        pos = path.move_along(step)
+        pos, _speed = path.move_along(step)
         confirm(step, prev, pos)
         prev = pos
         pts.append(pos)
