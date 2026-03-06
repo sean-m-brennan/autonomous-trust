@@ -4,13 +4,14 @@
 import sys
 
 
-def generate_compose(num_nodes: int, exclude_logs: str = "network") -> str:
+def generate_compose(num_nodes: int, exclude_logs: str = "network", log_level: str = "info") -> str:
     lines = ["services:"]
     for i in range(1, num_nodes + 1):
         delay = (i - 1) * 10
         ip = f"172.27.3.{10 + i}"
         exclude_arg = f"--exclude-logs {exclude_logs}" if exclude_logs else ""
-        args = f"--live --test {exclude_arg}".strip()
+        log_arg = f"--log-level {log_level}" if log_level else ""
+        args = f"--live --test {exclude_arg} {log_arg}".strip()
         lines.extend([
             f"  at-{i}:",
             f"    image: autonomous-trust",
@@ -43,7 +44,8 @@ def generate_compose(num_nodes: int, exclude_logs: str = "network") -> str:
 def main():
     num_nodes = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     exclude_logs = sys.argv[2] if len(sys.argv) > 2 else "network"
-    content = generate_compose(num_nodes, exclude_logs)
+    log_level = sys.argv[3] if len(sys.argv) > 3 else "info"
+    content = generate_compose(num_nodes, exclude_logs, log_level)
     with open("docker-compose.tilt.yaml", "w") as f:
         f.write(content)
     print(f"Generated docker-compose.tilt.yaml for {num_nodes} nodes")

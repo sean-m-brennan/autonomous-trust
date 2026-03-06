@@ -18,7 +18,7 @@ import os
 from queue import Empty
 
 from autonomous_trust.core import AutonomousTrust, Process, ProcMeta, LogLevel, CfgIds
-from autonomous_trust.core.config import Configuration, to_yaml_string
+from autonomous_trust.core.config import Configuration, to_json_string
 from autonomous_trust.core.config.generate import random_config
 from autonomous_trust.core.system import queue_cadence
 from autonomous_trust.core.network import Network, Message
@@ -65,7 +65,7 @@ class Inspector(AutonomousTrust):
         if self.tasking_tick(1):  # every 30 sec
             for peer in self.peers.all:
                 query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
-                                to_yaml_string((peer, self.proc_name)), self.identity)
+                                to_json_string((peer, self.proc_name)), self.identity)
                 queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
                 ping = Message(CfgIds.network, Network.ping, 5, peer, return_to=self.name)
                 queues[CfgIds.network].put(ping, block=True, timeout=queue_cadence)

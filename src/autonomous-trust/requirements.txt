@@ -2,4 +2,3 @@ icontract
 psutil
 pynacl
 python-dateutil
-ruamel.yaml==0.17.32

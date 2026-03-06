@@ -19,7 +19,7 @@ from uuid import UUID
 from ...algorithms.agreement import VoterTracker
 from ...structures.merkle import MerkleTree, SimplestBlob
 from ...structures.dag import StepDAG, LinkedStep
-from ...config import Configuration, from_yaml_string
+from ...config import Configuration, from_json_string
 from ...processes import ProcessLogger
 from ...system import encoding
 from ..identity import Identity
@@ -69,12 +69,12 @@ class IdentityObj(SimplestBlob, Configuration):
 
     def sync_to_message(self):
         self.message.originator = str(self.originator).encode('utf-8')
+        self.identity.message = self.message.identity
         self.identity.sync_to_message()
-        self.message.identity.CopyFrom(self.identity.message)
 
     def sync_from_message(self):
         self.originator = UUID(self.message.originator.decode('utf-8'))
-        self.identity = object.__new__(Identity)
+        self.identity = Identity.__new__(Identity)
         self.identity.message = identity_pb2.Identity()
         self.identity.message.CopyFrom(self.message.identity)
         self.identity.sync_from_message()
@@ -187,10 +187,10 @@ class IdentityHistory(StepDAG, VoterTracker):  # FIXME config repr
         :return: list of steps
         """
         if sig is None:  # FIXME remove this, need sig
-            steps = from_yaml_string(steps_msg)
+            steps = from_json_string(steps_msg)
             return steps
         if self.myself.verify(steps_msg, sig):
-            steps = from_yaml_string(steps_msg)
+            steps = from_json_string(steps_msg)
             return steps
         return None
 

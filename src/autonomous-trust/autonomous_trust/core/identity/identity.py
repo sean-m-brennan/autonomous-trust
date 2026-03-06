@@ -136,34 +136,31 @@ class Identity(InitializableConfig, AgreementVoter):
                         self.petname, True)
 
     def sync_to_message(self):
-        self.message.uuid = str(self._uuid).encode('utf-8')
+        self.message.uuid = str(self.uuid).encode('utf-8')
         self.message.address = self.address
         self.message.fullname = self._fullname
+        self._signature.message = self.message.signature
         self._signature.sync_to_message()
-        self.message.signature.CopyFrom(self._signature.message)
+        self._encryptor.message = self.message.encryptor
         self._encryptor.sync_to_message()
-        self.message.encryptor.CopyFrom(self._encryptor.message)
 
     def sync_from_message(self):
-        self._uuid = uuid_mod.UUID(self.message.uuid.decode('utf-8'))
+        self._uuid = self.message.uuid.decode('utf-8')
         self.address = self.message.address
         self._fullname = self.message.fullname
         self._nickname = ''
         self.petname = ''
         self._public_only = True
+        self._rank = 0
         self._block_impl = agreement_impl
-        # Reconstruct nested Signature
-        self._signature = object.__new__(Signature)
+        self._signature = Signature.__new__(Signature)
         self._signature.message = identity_pb2.Signature()
         self._signature.message.CopyFrom(self.message.signature)
         self._signature.sync_from_message()
-        # Reconstruct nested Encryptor
-        self._encryptor = object.__new__(Encryptor)
+        self._encryptor = Encryptor.__new__(Encryptor)
         self._encryptor.message = identity_pb2.Encryptor()
         self._encryptor.message.CopyFrom(self.message.encryptor)
         self._encryptor.sync_from_message()
-        # AgreementVoter fields
-        AgreementVoter.__init__(self, str(self._uuid), 0)
 
     @staticmethod
     def initialize(my_name, my_nickname, my_address):

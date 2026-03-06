@@ -80,7 +80,7 @@ def line_cfg(locations, times):
     start, end = times
     shape = LineData(t5, uah)
     path = PathData(start, end, shape, Variability.GAUSSIAN, 4.4, Variability.UNIFORM)
-    return path.to_yaml_string()
+    return path.to_json_string()
 
 
 @pytest.fixture
@@ -89,7 +89,7 @@ def bezier_cfg(locations, times, ctl_pts):
     start, end = times
     shape = BezierData(t5, uah, ctl_pts)
     path = PathData(start, end, shape, Variability.GAUSSIAN, 4.4, Variability.UNIFORM)
-    return path.to_yaml_string()
+    return path.to_json_string()
 
 
 @pytest.fixture
@@ -98,7 +98,7 @@ def beziergon_cfg(locations, times, ctl_pts):
     start, end = times
     shape = BeziergonData(t5, ctl_pts, loops)
     path = PathData(start, end, shape, Variability.GAUSSIAN, 4.4, Variability.UNIFORM)
-    return path.to_yaml_string()
+    return path.to_json_string()
 
 
 @pytest.fixture
@@ -107,7 +107,7 @@ def ellipse_cfg(locations, times):
     start, end = times
     shape = EllipseData(uah, 1000, 600, -90., loops)
     path = PathData(start, end, shape, Variability.GAUSSIAN, 4.4, Variability.UNIFORM)
-    return path.to_yaml_string()
+    return path.to_json_string()
 
 
 @pytest.fixture
@@ -117,15 +117,15 @@ def configs(line_cfg, bezier_cfg, beziergon_cfg, ellipse_cfg):
 
 def test_serialization(configs):
     for cfg in configs:
-        path_data = PathData.from_yaml_string(cfg)
-        cfg2 = path_data.to_yaml_string()
+        path_data = PathData.from_json_string(cfg)
+        cfg2 = path_data.to_json_string()
         assert cfg == cfg2
 
 
 def path_tester(cfg, locs, times, confirm):
     prev, _ = locs
-    path_data = PathData.from_yaml_string(cfg)
-    assert cfg == path_data.to_yaml_string()
+    path_data = PathData.from_json_string(cfg)
+    assert cfg == path_data.to_json_string()
     path = Path(steps, cadence, path_data, times[0])
     pts = []
     for step in range(1, steps+1):
@@ -158,7 +158,7 @@ def test_bezier_path(bezier_cfg, locations, times):
     pts = [start]
     pts += path_tester(bezier_cfg, locations, times, confirm)
     pts.append(end)
-    path = PathData.from_yaml_string(bezier_cfg)
+    path = PathData.from_json_string(bezier_cfg)
     plot_shape(pts, path.shape.start, path.shape.end, path.shape.ctl_pts)
 
 
@@ -180,7 +180,7 @@ def test_beziergon_path(beziergon_cfg, locations, times):
     start, _ = locations
     pts = [start]
     pts += path_tester(beziergon_cfg, locations, times, confirm)
-    path = PathData.from_yaml_string(beziergon_cfg)
+    path = PathData.from_json_string(beziergon_cfg)
     plot_shape(pts, path.shape.start, extras=path.shape.ctl_pts)
 
 
@@ -209,5 +209,5 @@ def test_ellipse_path(ellipse_cfg, locations, times):
 
     start, _ = locations
     pts = path_tester(ellipse_cfg, locations, times, confirm)
-    path = PathData.from_yaml_string(ellipse_cfg)
+    path = PathData.from_json_string(ellipse_cfg)
     plot_shape(pts, path.shape.center, extras=[path.shape.start])

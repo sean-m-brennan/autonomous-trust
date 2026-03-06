@@ -169,11 +169,11 @@ def run_example(wrk_dir: str, cluster: ClusterConfig, visualize: bool,
 
 
 def clean(clean, pristine):
-    delete_files = ['network.cfg.yaml']
+    delete_files = ['network.cfg.json']
     if clean or pristine:
         delete_files += ['"coordinator.log*"', '"participant???.log*"', 'simulator.log']
     if pristine:
-        delete_files += ['group.cfg.yaml', 'peers.cfg.yaml', 'peer-capabilities.cfg.yaml', 'reputation.cfg.yaml']
+        delete_files += ['group.cfg.json', 'peers.cfg.json', 'peer-capabilities.cfg.json', 'reputation.cfg.json']
     for cfg_name in delete_files:
         cfg_files = subprocess.getoutput('find %s -name %s' % (working_dir, cfg_name)).strip().split('\n')
         for cfg in cfg_files:
@@ -206,7 +206,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     working_dir = os.path.join(working_dir, str(args.example))
-    cluster_cfg_file = os.path.join(working_dir, 'cluster.cfg.yaml')
+    cluster_cfg_file = os.path.join(working_dir, 'cluster.cfg.json')
     if not os.path.exists(cluster_cfg_file):
         print('Required cluster config file (%s) missing for the %s example' % (cluster_cfg_file, args.example))
         sys.exit(1)

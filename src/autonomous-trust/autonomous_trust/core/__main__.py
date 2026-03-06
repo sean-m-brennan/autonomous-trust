@@ -36,6 +36,9 @@ def main():
                         help='run limited testing application')
     parser.add_argument('--live', action='store_true',
                         help='run in production environ')
+    parser.add_argument('--log-level', type=str, default='info',
+                        choices=['critical', 'error', 'warning', 'info', 'debug', 'verbose'],
+                        help='set logging level (default: info)')
     args = parser.parse_args()
 
     if args.remote_debug is not None:
@@ -51,7 +54,8 @@ def main():
     to_log = None
     if args.exclude_logs is not None:
         to_log = [cls for cls in list(CfgIds) if cls not in args.exclude_logs]
-    AutonomousTrust(multiproc=True, log_level=LogLevel.DEBUG, logfile=Configuration.log_stdout,
+    level = LogLevel[args.log_level.upper()]
+    AutonomousTrust(multiproc=True, log_level=level, logfile=Configuration.log_stdout,
                     log_classes=to_log, testing=args.test).run_forever()
 
 

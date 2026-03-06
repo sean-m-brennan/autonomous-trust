@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from ..network import Message
 from ..processes import Process, ProcMeta
-from ..config import Configuration, from_yaml_string, to_yaml_string
+from ..config import Configuration, from_json_string, to_json_string
 from .protocol import ReputationProtocol
 from .reputation import TransactionHistory, Reputation, Reputations, TransactionScore
 from ..system import CfgIds, now, encoding
@@ -85,7 +85,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_request(self, queues, message):
         if message.function == ReputationProtocol.request:
-            id1, id2, peer_id = from_yaml_string(message.obj)
+            id1, id2, peer_id = from_json_string(message.obj)
             if peer_id in [p.uuid for p in self.peers.all]:
                 try:
                     if self.last_id is None or self.last_id < id1:
@@ -93,7 +93,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                             self.requests.append(self._paxos_id_index(id1, id2))
                             ack = ((id1, id2, peer_id), (self.last_id, len(self.history)), self.last_value)
                             msg = Message(self.name, ReputationProtocol.grant,
-                                          to_yaml_string(ack), message.from_whom)
+                                          to_json_string(ack), message.from_whom)
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                             self.logger.debug('Request granted')
                         else:
@@ -116,19 +116,22 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         idx = self._paxos_id_index(pax_id[0], pax_id[1])
         start = now()
         while (now() - start).total_seconds() < self.protocol_timeout:
+            if idx not in self.my_requests:
+                retry = False  # already completed by handle_grant
+                break
             if self.my_requests[idx].count >= len(self.peers.all) // 2:
                 retry = False
                 break
             time.sleep(self.cadence)
-        if retry:
+        if retry and idx in self.my_requests:
             try:
                 self._start_paxos(queues, self.my_requests[idx].score)
-            except Full:
+            except (Full, KeyError):
                 self.logger.error('paxos_timeout: Network queue full')
 
     def handle_grant(self, queues, message):
         if message.function == ReputationProtocol.grant:
-            (id1, id2, peer_id), (last_id, last_idx), last_val = from_yaml_string(message.obj)
+            (id1, id2, peer_id), (last_id, last_idx), last_val = from_json_string(message.obj)
             if peer_id != self.identity.uuid:  # ignore not-mine
                 self.logger.debug('Grant not for me')
                 return True
@@ -145,7 +148,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if self.my_requests[idx].count >= len(self.peers.all) // 2:
                 try:
                     score = (id1, id2, peer_id), self.my_requests[idx].score
-                    msg = Message(self.name, ReputationProtocol.transaction, to_yaml_string(score), self.group)
+                    msg = Message(self.name, ReputationProtocol.transaction, to_json_string(score), self.group)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                     self.logger.debug('Submit transaction score')
                     if idx in self.backoff:
@@ -167,7 +170,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_nack(self, queues, message):
         if message.function == ReputationProtocol.nack:
-            id1, id2, _ = from_yaml_string(message.obj)
+            id1, id2, _ = from_json_string(message.obj)
             idx = self._paxos_id_index(id1, id2)
             if idx not in self.backoff:
                 self.backoff[idx] = 1
@@ -199,14 +202,14 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         idx = self._paxos_id_index(id1, id2)
         pax_id = (id1, id2, self.identity.uuid)
         self.my_requests[idx] = TxCount(score, 0)
-        pax_msg = Message(self.name, ReputationProtocol.request, to_yaml_string(pax_id), self.group)
+        pax_msg = Message(self.name, ReputationProtocol.request, to_json_string(pax_id), self.group)
         queues[CfgIds.network].put(pax_msg, block=True, timeout=self.q_cadence)
         self.proposals[idx] = score
         self.logger.debug('Start a Paxos round')
 
     def handle_transaction(self, queues, message):
         if message.function == ReputationProtocol.transaction:
-            (id1, id2, peer_id), score = from_yaml_string(message.obj)
+            (id1, id2, peer_id), score = from_json_string(message.obj)
             idx = self._paxos_id_index(id1, id2)
             if idx not in self.requests:
                 return True  # not granted, drop
@@ -216,7 +219,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self.proposals[idx] = score
                 self.logger.debug("Tx to proposals ")
             msg = Message(self.name, ReputationProtocol.accepted,
-                          to_yaml_string((id1, id2, peer_id)), message.from_whom)
+                          to_json_string((id1, id2, peer_id)), message.from_whom)
             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
             return True
         return False
@@ -233,7 +236,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_accepted(self, _, message):
         if message.function == ReputationProtocol.accepted:
-            id1, id2, peer_id = from_yaml_string(message.obj)
+            id1, id2, peer_id = from_json_string(message.obj)
             idx = self._paxos_id_index(id1, id2)
             score = self.proposals[idx]
             self.logger.debug('Tx accepted')
@@ -255,7 +258,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 if isinstance(length, bytes):
                     length = length.decode(encoding)
                 index = int(length)
-                chain = to_yaml_string(self.history.era(index))
+                chain = to_json_string(self.history.era(index))
                 msg = Message(self.name, ReputationProtocol.update, chain, message.from_whom)
                 queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                 self.logger.debug('Sent update')
@@ -266,7 +269,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_update(self, queues, message):
         if message.function == ReputationProtocol.update:
-            self.updates[message.from_whom.uuid] = from_yaml_string(message.obj)
+            self.updates[message.from_whom.uuid] = from_json_string(message.obj)
             up_count = len(self.updates)
             if up_count >= self.num_updates:
                 grouping = []
@@ -281,7 +284,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 grouping.sort(key=len)
                 self.logger.debug(grouping)
                 if len(grouping[-1]) > up_count // 2:
-                    chain = grouping[-1]
+                    chain = grouping[-1][0]  # all entries are identical; use one
                     self.history.catchup(chain)
                     self.logger.debug('Updated')
                 else:
@@ -347,7 +350,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def handle_reputation_request(self, _, message):
         if message.function == ReputationProtocol.rep_req:
             if isinstance(message.obj, str):
-                ident, req_proc = from_yaml_string(message.obj)
+                ident, req_proc = from_json_string(message.obj)
             else:
                 ident, req_proc = message.obj
             threading.Thread(target=self._compute_reputation,

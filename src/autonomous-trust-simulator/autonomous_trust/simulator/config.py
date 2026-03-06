@@ -20,6 +20,7 @@ import os
 
 from autonomous_trust.services.data.server import DataConfig
 from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
+from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.identity import Identity
 
 from .peer.path import PointData, BezierData, PathData, Variability, EllipseData
@@ -39,13 +40,13 @@ class MetaIdentity(object):
 
     @classmethod
     def from_directory(cls, path: str) -> 'MetaIdentity':
-        ident = Identity.from_file(os.path.join(path, 'identity.cfg.yaml'))
-        meta = SimMetadata.from_file(os.path.join(path, 'metadata-source.cfg.yaml'))
+        ident = Identity.from_file(os.path.join(path, 'identity' + Configuration.file_ext))
+        meta = SimMetadata.from_file(os.path.join(path, 'metadata-source' + Configuration.file_ext))
         if ident._uuid != meta.uuid:  # noqa
             raise RuntimeError('Identity and Metadata configs are inconsistent for %s (%s vs %s)' %
                                (path, ident._uuid, meta.uuid))  # noqa
         data = None
-        data_cfg = os.path.join(path, 'data-source.cfg.yaml')
+        data_cfg = os.path.join(path, 'data-source' + Configuration.file_ext)
         if os.path.exists(data_cfg):
             data = DataConfig.from_file(data_cfg)
             #if data.channels != meta.data_meta:  # FIXME either eliminate DataSrc files or remove from Metadata

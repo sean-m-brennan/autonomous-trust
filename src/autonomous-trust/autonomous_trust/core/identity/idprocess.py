@@ -30,7 +30,9 @@ from .history.history import IdentityHistory
 from ..algorithms.agreement import AgreementProof
 from ..algorithms.impl import AgreementImpl
 from ..capabilities import PeerCapabilities
-from ..config import Configuration, to_yaml_string, from_yaml_string, names
+import json
+from ..config import Configuration, to_json_string, from_json_string, names
+from ..config.configuration import ConfigJSONEncoder
 from ..processes import Process, ProcMeta
 from ..network import Message, Network
 from .history import IdentityByWork, IdentityByStake, IdentityByAuthority
@@ -108,9 +110,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.configs[name] = obj[0]
                     with open(filename, 'w') as cfg:
                         if isinstance(obj[0], Group):
-                            cfg.write(to_yaml_string((obj[0], obj[1].to_dict())))
+                            json.dump((obj[0], obj[1].to_dict()), cfg, cls=ConfigJSONEncoder, indent=2)
                         else:
-                            cfg.write(to_yaml_string((obj[0], obj[1])))
+                            json.dump((obj[0], obj[1]), cfg, cls=ConfigJSONEncoder, indent=2)
                     self.update(obj[0], queues)
                     #self.update(obj[1], queues)  # FIXME ??
         except Exception as err:
@@ -160,7 +162,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         try:
             self.logger.debug('Announce myself')
             # to self.welcoming_committee()
-            msg_str = to_yaml_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
+            msg_str = to_json_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
             message = Message(self.name, IdentityProtocol.announce,
                               msg_str, to_whom=Network.broadcast, encrypt=False)
             queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -204,7 +206,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     # FIXME dag has digests, not peer data, need peers - use history to verify
 
                     self.logger.debug('Diff %s' % diff)  # FIXME remove
-                    msg_str = to_yaml_string(diff)  # to self.handle_history_diff()
+                    msg_str = to_json_string(diff)  # to self.handle_history_diff()
                     message = Message(self.name, IdentityProtocol.diff, msg_str, to_whom=self.group)
                     self.logger.debug('Send history diff')
                     queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -214,7 +216,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         filename = os.path.join(Configuration.get_cfg_dir(), 'group' + Configuration.file_ext)
                         if os.path.exists(filename):
                             with open(filename, 'r') as cfg:
-                                self.group, hist_dict = from_yaml_string(cfg.read())
+                                from ..config.configuration import config_json_decoder
+                                self.group, hist_dict = json.load(cfg, object_hook=config_json_decoder)
                                 self._history.populate(hist_dict)
                                 from_scratch = False
                     except Exception as err:
@@ -242,7 +245,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         """
         if message.function == IdentityProtocol.history:
             self.logger.debug('Received existing history')
-            hist_tpl = from_yaml_string(message.obj)  # from self._peer_accepted()
+            hist_tpl = from_json_string(message.obj)  # from self._peer_accepted()
             self.histories.append(hist_tpl)  # see choose_group
             if not self.choosing:
                 threading.Thread(target=self.choose_group, args=(queues,), daemon=True).start()
@@ -261,7 +264,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if message.function == IdentityProtocol.vote:
             obj = message.obj
             if isinstance(obj, str):
-                obj = from_yaml_string(obj)  # from self.vote_response()
+                obj = from_json_string(obj)  # from self.vote_response()
             blob, proof, (msg, sig) = obj
             sig_msg = SignedMessage(sig + msg)
             try:
@@ -310,12 +313,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self._add_peer(queues, blob.identity, amnesia)
 
         # send my identity in the open to enable encryption;  to self.handle_acceptance()
-        msg_str = to_yaml_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
+        msg_str = to_json_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
         message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=blob.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
         # now send encrypted history (peer identities);  to self.receive_history()  # FIXME this should contain all peer identities
-        msg_str = to_yaml_string((self.group, self._history.recite()))
+        msg_str = to_json_string((self.group, self._history.recite()))
         message = Message(self.name, IdentityProtocol.history, msg_str, to_whom=blob.identity)
         self.logger.debug('Send full history')
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -331,7 +334,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.announce:
             try:
-                new_id, ph, caps = from_yaml_string(message.obj)  # from self.announce_identity()
+                new_id, ph, caps = from_json_string(message.obj)  # from self.announce_identity()
                 if new_id == self.identity:
                     self.logger.debug('Should not have received my own announcement')
                     return
@@ -441,7 +444,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if vote[0].uuid == vote[1].uuid:
                 return  # no voting for yourself
             # FIXME handle if I proposed the vote
-            msg_str = to_yaml_string(vote)  # to self.count_vote()
+            msg_str = to_json_string(vote)  # to self.count_vote()
             message = Message(self.name, IdentityProtocol.vote, msg_str, to_whom=self.group)
             self.logger.debug("Send vote")
             queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -453,7 +456,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.accept:
             self.logger.debug('Received peer acceptance')
-            ident, pkh, caps = from_yaml_string(message.obj)  # from self._peer_accepted()
+            ident, pkh, caps = from_json_string(message.obj)  # from self._peer_accepted()
             if pkh != self.package_hash:
                 self.logger.error("Counterfeit 'peer'")
                 return True
@@ -492,7 +495,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.diff:
             self.logger.debug('Received history diff')
-            steps = from_yaml_string(message.obj)  # from self.choose_group()
+            steps = from_json_string(message.obj)  # from self.choose_group()
             self._record_group(queues)
             name = message.from_whom.nickname
             if name in self._history.heads:

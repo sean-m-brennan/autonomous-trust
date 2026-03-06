@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import json
 import os
 import re
 from unittest.mock import patch, MagicMock

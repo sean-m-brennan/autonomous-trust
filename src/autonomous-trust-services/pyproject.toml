@@ -17,7 +17,7 @@ name = "autonomous_trust_services"
 version = "0.1.1"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = "^3.13"
 #autonomous_trust.core = {path = "../autonomous-trust"}
 autonomous-trust = ">=0.1.1"
 psutil = ">=5.9.5"
