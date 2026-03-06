@@ -22,12 +22,12 @@
 # the live cluster.
 #
 # Usage:
-#   ./run-integration-test.sh                  # 4 nodes, default
-#   ./run-integration-test.sh -n 6             # 6 nodes
-#   ./run-integration-test.sh --debug          # debug mode (keeps terminal open)
-#   ./run-integration-test.sh --quick          # skip container rebuild
-#   ./run-integration-test.sh --shell          # drop into bash in test container
-#   ./run-integration-test.sh --force          # rebuild containers + network from scratch
+#   ./test-integration.sh                  # 4 nodes, default
+#   ./test-integration.sh -n 6             # 6 nodes
+#   ./test-integration.sh --debug          # debug mode (keeps terminal open)
+#   ./test-integration.sh --quick          # skip container rebuild
+#   ./test-integration.sh --shell          # drop into bash in test container
+#   ./test-integration.sh --force          # rebuild containers + network from scratch
 
 set -euo pipefail
 
@@ -104,7 +104,7 @@ build_containers() {
         build_args+=(--registry "$REGISTRY_URL")
     fi
 
-    "$SCRIPT_DIR/run-build-docker.sh" "${build_args[@]}" devel test
+    "$SCRIPT_DIR/build-docker.sh" "${build_args[@]}" devel test
 }
 
 # ---------------------------------------------------------------------------
