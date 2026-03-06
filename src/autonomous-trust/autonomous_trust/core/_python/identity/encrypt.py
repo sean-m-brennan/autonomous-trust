@@ -57,7 +57,10 @@ class Encryptor(Configuration):
         return self.private.encode(encoder=HexEncoder)
 
     def sync_to_message(self):
-        self.message.hex_seed = self.publish()
+        if self.public_only:
+            self.message.hex_seed = bytes(self.publish())
+        else:
+            self.message.hex_seed = bytes(self.private.encode(encoder=HexEncoder))
 
     def sync_from_message(self):
         hex_seed = self.message.hex_seed

@@ -107,7 +107,7 @@ cleanup() {
     echo "Shutting down Tilt..."
     tilt down
 }
-trap cleanup EXIT
+trap cleanup INT TERM EXIT
 
 echo "Starting AutonomousTrust demo with $NUM_NODES nodes..."
 tilt up -- --num-nodes="$NUM_NODES" --backend="$BACKEND"

@@ -104,28 +104,28 @@ class PeerCapabilities(Mapping, Configuration):
             self._listing[name].append(peer_id)
 
     def sync_to_message(self):
-        # Invert {cap_name: [peer_ids]} to {peer_id: [cap_names]}
+        # Invert Python's {cap_name: [peer_ids]} to proto's {peer: [capabilities]}
         peer_caps = {}
         for cap_name, peer_ids in self._listing.items():
             for pid in peer_ids:
-                if pid not in peer_caps:
-                    peer_caps[pid] = []
-                peer_caps[pid].append(cap_name)
+                peer_key = str(pid)
+                if peer_key not in peer_caps:
+                    peer_caps[peer_key] = []
+                peer_caps[peer_key].append(cap_name)
         del self.message.listing[:]
-        for peer_id, cap_names in peer_caps.items():
+        for peer, cap_names in peer_caps.items():
             entry = self.message.listing.add()
-            entry.peer = peer_id
+            entry.peer = peer
             for cn in cap_names:
                 cap = entry.capability.add()
                 cap.name = cn
                 cap.category = ''
 
     def sync_from_message(self):
-        # Invert {peer_id: [caps]} back to {cap_name: [peer_ids]}
+        # Invert proto's {peer: [capabilities]} back to Python's {cap_name: [peer_ids]}
         self._listing = {}
         for entry in self.message.listing:
-            peer_id = entry.peer
             for cap in entry.capability:
                 if cap.name not in self._listing:
                     self._listing[cap.name] = []
-                self._listing[cap.name].append(peer_id)
+                self._listing[cap.name].append(entry.peer)

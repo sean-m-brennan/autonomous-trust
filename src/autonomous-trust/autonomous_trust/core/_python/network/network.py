@@ -89,7 +89,18 @@ class Network(InitializableConfig):
             return None
         if address.startswith('fe80'):
             return 'fe80::/64'
-        return str(ipaddress.ip_interface('%s/%s' % (address, subnet)))
+        try:
+            return str(ipaddress.ip_interface('%s/%s' % (address, subnet)))
+        except ValueError:
+            if ':' in str(subnet):
+                try:
+                    # Convert hex netmask to prefix length by counting set bits
+                    addr_int = int(ipaddress.IPv6Address(subnet))
+                    prefix_len = bin(addr_int).count('1')
+                    return str(ipaddress.ip_interface('%s/%d' % (address, prefix_len)))
+                except (ValueError, ipaddress.AddressValueError):
+                    pass
+            return None
 
     @property
     def ip4(self):

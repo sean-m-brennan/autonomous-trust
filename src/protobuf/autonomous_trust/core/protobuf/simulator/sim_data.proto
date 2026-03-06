@@ -1,0 +1,43 @@
+/********************
+ *  Copyright 2025 Sean M. Brennan and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
+syntax = "proto3";
+
+package autonomous_trust.core.protobuf.simulator;
+
+import "autonomous_trust/core/protobuf/structures/datetime.proto";
+import "autonomous_trust/core/protobuf/services/position.proto";
+
+message Ident {
+  services.GeoPosition position = 1;
+  double speed = 2;
+  string kind = 3;
+  string nickname = 4;
+}
+
+message ReachabilityRow {
+  repeated string reachable_peers = 1;
+}
+
+message SimState {
+  structures.DateTime time = 1;
+  services.GeoPosition center = 2;
+  optional double scale = 3;
+  map<string, Ident> peers = 4;
+  map<string, ReachabilityRow> reachable = 5;
+  repeated string active = 6;
+  bool blank = 7;
+}

@@ -61,6 +61,11 @@ class Message(object):
                     self.obj = Configuration.from_string(obj)
                 except Exception:
                     pass  # leave obj as string if deserialization fails
+            elif check.startswith(Configuration.PROTO_PREFIX):
+                try:
+                    self.obj = Configuration.from_string(check)
+                except Exception:
+                    pass  # leave obj as string if deserialization fails
         # FIXME signing
 
     def __str__(self):
