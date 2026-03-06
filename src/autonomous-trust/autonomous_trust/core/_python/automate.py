@@ -423,6 +423,9 @@ class AutonomousTrust(Protocol):
                 elif isinstance(message, TaskResult):
                     task = message
                     self.logger.debug(self.name + ': Task result recvd: %s' % task.result)
+                    zkp_valid = task.verify_proof()
+                    if zkp_valid is False:
+                        self.logger.warning(self.name + ': ZKP verification FAILED for task %s' % task.uuid)
                     tx = TransactionScore(task.uuid, 0.5)  # FIXME relevant evaluation
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                     if self.external_feedback in queues:
@@ -472,6 +475,7 @@ class AutonomousTrust(Protocol):
                     result = results[key].get()
                     self.logger.debug(self.name + ': %s Task completed %s' % (key, result))
                     tr = TaskResult(self.active_tasks[str(key)], result)
+                    tr.generate_proof()
                     queues[CfgIds.negotiation].put(tr, block=True, timeout=queue_cadence)
                     tx = TransactionScore(tr.uuid, 0.6)  # FIXME relevant evaluation
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
