@@ -62,6 +62,7 @@ class LinkedStep(Step, Configuration):
         if uuid is None:
             uuid = uuid4()
         super().__init__(uuid)
+        Configuration.__init__(self, dag_pb2.LinkedStep)
         self.timestamp = timestamp
         if timestamp is None:
             self.timestamp = now()
@@ -84,7 +85,9 @@ class LinkedStep(Step, Configuration):
     def sync_to_message(self):
         if self.uuid is not None:
             self.message.uuid = str(self.uuid).encode('utf-8')
-        if self.parent is not None and not isinstance(self.parent, GenesisType):
+        else:
+            self.message.uuid = b''
+        if self.parent is not None and self.parent is not Genesis:
             self.parent.sync_to_message()
             self.message.parent.CopyFrom(self.parent.message)
 

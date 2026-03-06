@@ -16,8 +16,8 @@
 
 import random
 
-from data_client import DataClient, Algorithm
-from data_service import ALL_SERVICES, Ident, DataService
+from .data_client import DataClient, Algorithm
+from .data_service import ALL_SERVICES, Ident, DataService
 
 
 class Network:
