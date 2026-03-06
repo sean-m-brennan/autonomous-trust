@@ -116,15 +116,21 @@ class Reputation(Configuration):
 
 class Reputations(Configuration):
     def __init__(self, current: dict[UUID, float] = None):
-        self.current = current
         if current is None:
             self.current = {}
+        else:
+            # Convert string keys back to UUIDs (from JSON deserialization)
+            self.current = {UUID(k) if isinstance(k, str) else k: v
+                            for k, v in current.items()}
 
     def __getitem__(self, key):
         return self.current[key]
 
     def __contains__(self, item):
         return item in self.current
+
+    def to_dict(self):
+        return {'current': {str(k): v for k, v in self.current.items()}}
 
     def update(self, peer_id: UUID, score: float):
         self.current[peer_id] = score

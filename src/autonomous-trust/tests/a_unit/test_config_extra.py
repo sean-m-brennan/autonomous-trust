@@ -8,7 +8,7 @@ from nacl.signing import SigningKey
 
 from autonomous_trust.core.config.configuration import (
     Configuration, InitializableConfig, EmptyObject, SerializeMode,
-    to_yaml_string, from_yaml_string, yaml,
+    to_yaml_string, from_yaml_string,
 )
 
 from .. import TEST_DIR
@@ -29,17 +29,11 @@ class NestedCfg(Configuration):
 class TestSerializeMode:
     def test_values(self):
         assert SerializeMode.PROTO.value == 1
-        assert SerializeMode.YAML.value == 2
+        assert SerializeMode.JSON.value == 2
         assert SerializeMode.PJSON.value == 3
 
 
 class TestConfiguration:
-    def test_yaml_tag(self):
-        cfg = SimpleCfg()
-        tag = cfg.yaml_tag
-        assert 'SimpleCfg' in tag
-        assert Configuration.YAML_PREFIX in tag
-
     def test_to_dict(self):
         cfg = SimpleCfg('hello', 99)
         d = cfg.to_dict()
@@ -118,7 +112,7 @@ class TestHelperFunctions:
         assert '1' in s
 
     def test_from_yaml_string_dict(self):
-        s = 'key: value\nnum: 42\n'
+        s = '{"key": "value", "num": 42}'
         result = from_yaml_string(s)
         assert result['key'] == 'value'
 
@@ -155,184 +149,35 @@ class TestHelperFunctions:
 
 class TestInitializableConfig:
     def test_initialize_raises_not_implemented(self):
-        """InitializableConfig.initialize raises NotImplementedError (line 178)."""
         ic = InitializableConfig()
         with pytest.raises(NotImplementedError):
             ic.initialize()
 
     def test_initialize_with_args_raises_not_implemented(self):
-        """InitializableConfig.initialize raises NotImplementedError with any arguments."""
         ic = InitializableConfig()
         with pytest.raises(NotImplementedError):
             ic.initialize('some_name', count=3)
 
     def test_is_configuration_subclass(self):
-        """InitializableConfig is a subclass of Configuration."""
         assert issubclass(InitializableConfig, Configuration)
 
     def test_instance_is_configuration(self):
-        """An InitializableConfig instance is a Configuration."""
         ic = InitializableConfig()
         assert isinstance(ic, Configuration)
 
 
 class TestEmptyObjectExtended:
     def test_to_dict_empty(self):
-        """EmptyObject.to_dict returns an empty dict."""
         eo = EmptyObject()
         assert eo.to_dict() == {}
 
-    def test_yaml_roundtrip(self):
-        """EmptyObject can be serialized to YAML and reconstructed."""
-        orig = Configuration.mode
-        Configuration.mode = SerializeMode.YAML
-        try:
-            eo = EmptyObject()
-            s = eo.to_yaml_string()
-            assert 'EmptyObject' in s
-            result = Configuration.from_yaml_string(s)
-            assert isinstance(result, EmptyObject)
-        finally:
-            Configuration.mode = orig
+    def test_json_roundtrip(self):
+        eo = EmptyObject()
+        s = eo.to_yaml_string()
+        assert 'EmptyObject' in s
+        result = Configuration.from_yaml_string(s)
+        assert isinstance(result, EmptyObject)
 
     def test_repr_contains_classname(self):
-        """EmptyObject repr contains the class name."""
         eo = EmptyObject()
         assert 'EmptyObject' in repr(eo)
-
-
-class TestTimedeltaYAML:
-    def test_roundtrip_positive(self):
-        """timedelta YAML representer + constructor roundtrip (lines 199, 203-204)."""
-        td = timedelta(seconds=42.5)
-        sio = StringIO()
-        yaml.dump({'td': td}, sio)
-        sio.seek(0)
-        result = yaml.load(sio)
-        assert result['td'] == td
-
-    def test_roundtrip_zero(self):
-        """timedelta of zero survives YAML roundtrip."""
-        td = timedelta(seconds=0)
-        sio = StringIO()
-        yaml.dump({'td': td}, sio)
-        sio.seek(0)
-        result = yaml.load(sio)
-        assert result['td'] == td
-
-    def test_roundtrip_large(self):
-        """Large timedelta (days + seconds) survives YAML roundtrip."""
-        td = timedelta(days=3, hours=2, minutes=15, seconds=7)
-        sio = StringIO()
-        yaml.dump({'td': td}, sio)
-        sio.seek(0)
-        result = yaml.load(sio)
-        assert result['td'] == td
-
-    def test_yaml_tag(self):
-        """timedelta YAML output uses the !timedelta tag."""
-        td = timedelta(seconds=10)
-        sio = StringIO()
-        yaml.dump(td, sio)
-        assert '!timedelta' in sio.getvalue()
-
-    def test_total_seconds_preserved(self):
-        """total_seconds() value is preserved through YAML serialization."""
-        td = timedelta(minutes=5, seconds=30)
-        sio = StringIO()
-        yaml.dump(td, sio)
-        sio.seek(0)
-        result = yaml.load(sio)
-        assert result.total_seconds() == td.total_seconds()
-
-
-class TestDecimalYAML:
-    def test_roundtrip_simple(self):
-        """Decimal YAML representer + constructor roundtrip (lines 237, 241-243)."""
-        d = Decimal('3.14159')
-        sio = StringIO()
-        yaml.dump({'d': d}, sio)
-        sio.seek(0)
-        result = yaml.load(sio)
-        assert result['d'] == d
-
-    def test_roundtrip_integer_decimal(self):
-        """Integer Decimal survives YAML roundtrip."""
-        d = Decimal('42')
-        sio = StringIO()
-        yaml.dump({'d': d}, sio)
-        sio.seek(0)
-        result = yaml.load(sio)
-        assert result['d'] == d
-
-    def test_roundtrip_negative(self):
-        """Negative Decimal survives YAML roundtrip."""
-        d = Decimal('-0.001')
-        sio = StringIO()
-        yaml.dump({'d': d}, sio)
-        sio.seek(0)
-        result = yaml.load(sio)
-        assert result['d'] == d
-
-    def test_yaml_tag(self):
-        """Decimal YAML output uses the !Decimal tag."""
-        d = Decimal('1.5')
-        sio = StringIO()
-        yaml.dump(d, sio)
-        assert '!Decimal' in sio.getvalue()
-
-    def test_result_is_decimal_type(self):
-        """Reconstructed value is a Decimal instance, not a float."""
-        d = Decimal('9.99')
-        sio = StringIO()
-        yaml.dump(d, sio)
-        sio.seek(0)
-        result = yaml.load(sio)
-        assert isinstance(result, Decimal)
-
-
-class TestSignedMessageYAML:
-    def test_representer_produces_yaml_tag(self):
-        """signedmessage_representer emits !signedmessage tag (line 225)."""
-        key = SigningKey.generate()
-        signed = key.sign(b'hello world')
-        sio = StringIO()
-        yaml.dump(signed, sio)
-        output = sio.getvalue()
-        assert '!signedmessage' in output
-        assert 'message' in output
-        assert 'signature' in output
-
-    def test_representer_contains_message_bytes(self):
-        """signedmessage_representer includes base64-encoded message bytes."""
-        key = SigningKey.generate()
-        signed = key.sign(b'test payload')
-        sio = StringIO()
-        yaml.dump(signed, sio)
-        output = sio.getvalue()
-        # ruamel.yaml encodes bytes as !!binary; the tag and content should be present
-        assert '!signedmessage' in output
-
-    def test_representer_contains_signature_bytes(self):
-        """signedmessage_representer includes signature bytes."""
-        key = SigningKey.generate()
-        signed = key.sign(b'sig check')
-        sio = StringIO()
-        yaml.dump({'sm': signed}, sio)
-        output = sio.getvalue()
-        assert '!signedmessage' in output
-        assert 'signature' in output
-
-    def test_constructor_known_broken(self):
-        """signedmessage_constructor is broken: SignedMessage does not accept keyword args (line 229).
-
-        This test documents the pre-existing bug. The representer works but
-        the constructor raises TypeError when attempting to reconstruct from YAML.
-        """
-        key = SigningKey.generate()
-        signed = key.sign(b'broken constructor')
-        sio = StringIO()
-        yaml.dump({'sm': signed}, sio)
-        sio.seek(0)
-        with pytest.raises(TypeError):
-            yaml.load(sio)

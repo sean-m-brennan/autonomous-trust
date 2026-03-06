@@ -14,7 +14,7 @@ export MINIKUBE_CPUS=$((local_cpu_total / 2))
 #export MINIKUBE_ADDONS="registry,metrics-server,dashboard"
 export MINIKUBE_ADDONS="registry"
 
-source ./build_py.sh
+./build_py.sh --dist
 
 export NUM_PARTICIPANTS=6
 export AUTONOMOUS_TRUST_CFG_BASE=$here/examples/mission

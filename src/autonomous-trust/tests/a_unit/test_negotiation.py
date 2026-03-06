@@ -1,5 +1,5 @@
 import pytest
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from queue import Empty
 from uuid import uuid4
 from unittest.mock import patch, MagicMock
@@ -140,7 +140,7 @@ class TestTaskTracker:
 
 class TestJob:
     def _make_job(self, start_ts=1000000, duration_secs=10):
-        when = datetime.fromtimestamp(start_ts)
+        when = datetime.fromtimestamp(start_ts, tz=UTC)
         tp = TaskParameters('cap1', when=when, duration=timedelta(seconds=duration_secs))
         task = Task(tp, 'req')
         return Job(task)
@@ -169,7 +169,7 @@ class TestJob:
 
 class TestJobQueue:
     def _make_job(self, start_ts=1000000, duration_secs=10):
-        when = datetime.fromtimestamp(start_ts)
+        when = datetime.fromtimestamp(start_ts, tz=UTC)
         tp = TaskParameters('cap1', when=when, duration=timedelta(seconds=duration_secs))
         task = Task(tp, 'req')
         return Job(task)
@@ -193,7 +193,7 @@ class TestJobQueue:
         assert jq.min() is None
         j = self._make_job(1000000)
         jq.push(j)
-        assert jq.min() == datetime.fromtimestamp(1000000)
+        assert jq.min() == datetime.fromtimestamp(1000000, tz=UTC)
 
     def test_clear(self):
         jq = JobQueue()
@@ -249,10 +249,10 @@ class TestJobQueue:
 
 class TestJobNotLt:
     def test_same_start(self):
-        when1 = datetime.fromtimestamp(1000000)
+        when1 = datetime.fromtimestamp(1000000, tz=UTC)
         tp1 = TaskParameters('cap1', when=when1, duration=timedelta(seconds=10))
         j1 = Job(Task(tp1, 'req'))
-        when2 = datetime.fromtimestamp(1000000)
+        when2 = datetime.fromtimestamp(1000000, tz=UTC)
         tp2 = TaskParameters('cap1', when=when2, duration=timedelta(seconds=10))
         j2 = Job(Task(tp2, 'req'))
         assert not (j1 < j2)
@@ -260,7 +260,7 @@ class TestJobNotLt:
 
 class TestFindNearestSlot:
     def _make_job(self, start_ts=1000000, duration_secs=10):
-        when = datetime.fromtimestamp(start_ts)
+        when = datetime.fromtimestamp(start_ts, tz=UTC)
         tp = TaskParameters('cap1', when=when, duration=timedelta(seconds=duration_secs))
         task = Task(tp, 'req')
         return Job(task)
@@ -269,11 +269,11 @@ class TestFindNearestSlot:
         jq = JobQueue()
         j = self._make_job(1000000, 10)
         slot = jq.find_nearest_slot(j)
-        assert slot == datetime.fromtimestamp(1000000)
+        assert slot == datetime.fromtimestamp(1000000, tz=UTC)
 
     def test_from_task(self):
         jq = JobQueue()
-        when = datetime.fromtimestamp(1000000)
+        when = datetime.fromtimestamp(1000000, tz=UTC)
         tp = TaskParameters('cap1', when=when, duration=timedelta(seconds=10))
         task = Task(tp, 'req')
         slot = jq.find_nearest_slot(task)
@@ -359,7 +359,7 @@ class TestFindNearestSlotOccupied:
     """
 
     def _make_job(self, start_ts=1000000, duration_secs=10):
-        when = datetime.fromtimestamp(start_ts)
+        when = datetime.fromtimestamp(start_ts, tz=UTC)
         tp = TaskParameters('cap1', when=when, duration=timedelta(seconds=duration_secs))
         task = Task(tp, 'req')
         return Job(task)
@@ -369,7 +369,7 @@ class TestFindNearestSlotOccupied:
         jq = JobQueue()
         j = self._make_job(1000000, 10)
         slot = jq.find_nearest_slot(j)
-        assert slot == datetime.fromtimestamp(1000000)
+        assert slot == datetime.fromtimestamp(1000000, tz=UTC)
 
     def test_non_overlapping_jobs_return_requested_time(self):
         """A job that does not overlap any queue entry gets its own slot."""
@@ -377,7 +377,7 @@ class TestFindNearestSlotOccupied:
         jq.push(self._make_job(1000000, 10))   # occupies [1000000, 1000010)
         new_job = self._make_job(1001000, 10)  # starts well after queue ends
         slot = jq.find_nearest_slot(new_job)
-        assert slot == datetime.fromtimestamp(1001000)
+        assert slot == datetime.fromtimestamp(1001000, tz=UTC)
 
     def test_while_loop_enters_on_full_slot_known_bug(self):
         """When the slot is fully occupied the while loop enters and raises AttributeError.
@@ -402,9 +402,9 @@ class TestFindNearestSlotOccupied:
     def test_from_task_object_empty_queue(self):
         """find_nearest_slot accepts a Task (not just a Job) and converts it."""
         jq = JobQueue()
-        when = datetime.fromtimestamp(1000000)
+        when = datetime.fromtimestamp(1000000, tz=UTC)
         tp = TaskParameters('cap1', when=when, duration=timedelta(seconds=10))
         task = Task(tp, 'req')
         slot = jq.find_nearest_slot(task)
         assert isinstance(slot, datetime)
-        assert slot == datetime.fromtimestamp(1000000)
+        assert slot == datetime.fromtimestamp(1000000, tz=UTC)

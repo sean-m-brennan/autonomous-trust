@@ -21,7 +21,7 @@ import pkgutil
 import queue
 import sys
 import traceback
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Union
 
 from nacl.hash import blake2b
@@ -70,7 +70,7 @@ QueueType = Union[queue.Queue, multiprocessing.Queue]
 
 
 def now():  # FIXME NTP sourced
-    return datetime.utcnow()
+    return datetime.now(UTC)
 
 
 class PackageHash(object):

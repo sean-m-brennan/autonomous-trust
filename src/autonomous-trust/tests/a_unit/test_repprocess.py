@@ -684,7 +684,7 @@ class TestHandleRepReqStr:
     def test_rep_req_string_obj(self):
         rp = _make_rep_process()
         peer = _make_mock_peer()
-        # handle_reputation_request with str obj calls from_yaml_string
+        # handle_reputation_request with str obj calls from_json_string
         # Use a UUID (serializable) instead of MagicMock for the identity part
         data = to_yaml_string((peer.uuid, 'some_proc'))
         msg = Message(CfgIds.reputation, ReputationProtocol.rep_req,
@@ -882,7 +882,7 @@ class TestTryAgain:
         # Patch now() so start - now() >= wait from the first check, skipping loop
         frozen = datetime(2020, 1, 1, 12, 0, 0)
         with patch('autonomous_trust.core.reputation.repprocess.now', return_value=frozen):
-            rp._try_again(timedelta(0), {CfgIds.network: net_q}, score)
+            rp._try_again(0, {CfgIds.network: net_q}, score)
         assert not net_q.empty()
 
     def test_try_again_full_exception(self):
@@ -895,7 +895,7 @@ class TestTryAgain:
         frozen = datetime(2020, 1, 1, 12, 0, 0)
         with patch('autonomous_trust.core.reputation.repprocess.now', return_value=frozen):
             # Should not raise; Full is caught inside _try_again
-            rp._try_again(timedelta(0), {CfgIds.network: full_q}, score)
+            rp._try_again(0, {CfgIds.network: full_q}, score)
 
 
 class TestHandleNackDeeper2:

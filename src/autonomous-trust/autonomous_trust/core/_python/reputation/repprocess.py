@@ -161,7 +161,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def _try_again(self, wait, queues, score):
         start = now()
-        while start - now() < wait:
+        while (now() - start).total_seconds() < wait:
             time.sleep(self.cadence)
         try:
             self._start_paxos(queues, score)
@@ -333,19 +333,26 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # TODO can we use the transaction memory to do better than CTFT before reputation kicks in?
 
     def _compute_reputation(self, peer, req_proc, requestor):
-        previous = 0.0
-        if peer.uuid in self.reputations:
-            previous = self.reputations[peer.uuid]
-        if previous > 0.5:
-            self.logger.debug('Cooperation mode')
-            rep_score = self._pure_reputation(peer)
-        else:
-            self.logger.debug('Tit-for-tat mode')
-            rep_score = self._contrite_tit_for_tat(peer)
-        self.reputations.update(peer.uuid, rep_score)
-        self.reputations.to_file(os.path.join(Configuration.get_cfg_dir(),
-                                              CfgIds.reputation + Configuration.file_ext))
-        self.requested_reps.append((Reputation(peer.uuid, rep_score), req_proc, requestor))
+        try:
+            peer_uuid = peer if isinstance(peer, UUID) else peer.uuid
+            previous = 0.0
+            if peer_uuid in self.reputations:
+                previous = self.reputations[peer_uuid]
+            if previous > 0.5:
+                self.logger.debug('Cooperation mode')
+                rep_score = self._pure_reputation(peer)
+            else:
+                self.logger.debug('Tit-for-tat mode')
+                rep_score = self._contrite_tit_for_tat(peer)
+            self.reputations.update(peer_uuid, rep_score)
+            try:
+                self.reputations.to_file(os.path.join(Configuration.get_cfg_dir(),
+                                                      CfgIds.reputation + Configuration.file_ext))
+            except (OSError, IOError) as e:
+                self.logger.warning('Could not persist reputations: %s' % e)
+            self.requested_reps.append((Reputation(peer_uuid, rep_score), req_proc, requestor))
+        except Exception as e:
+            self.logger.warning('_compute_reputation failed: %s' % e)
 
     def handle_reputation_request(self, _, message):
         if message.function == ReputationProtocol.rep_req:

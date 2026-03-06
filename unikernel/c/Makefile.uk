@@ -1,3 +1,0 @@
-$(eval $(call addlib,appautonomoustrust))
-
-APPAUTONOMOUSTRUST_SRCS-y += $(APPAUTONOMOUSTRUST_BASE)/main.c

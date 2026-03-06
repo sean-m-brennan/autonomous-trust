@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 import heapq
 from enum import Enum
 from queue import Empty
@@ -186,7 +186,7 @@ class JobQueue(object):
     def min(self) -> Optional[datetime]:
         """What is the datetime of the next Job"""
         if len(self) > 0:
-            return datetime.fromtimestamp(self._heap[0][0])
+            return datetime.fromtimestamp(self._heap[0][0], tz=UTC)
         return None
 
     def clear(self) -> None:
@@ -236,4 +236,4 @@ class JobQueue(object):
                     break
             if job.start is None:
                 job.start = last
-        return datetime.fromtimestamp(job.start)
+        return datetime.fromtimestamp(job.start, tz=UTC)

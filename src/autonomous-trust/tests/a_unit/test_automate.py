@@ -16,7 +16,7 @@
 
 import os
 import queue
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import uuid4
 from unittest.mock import MagicMock, patch
 
@@ -591,8 +591,8 @@ class TestAutonomousTasking:
         queues = {CfgIds.negotiation: q_neg, CfgIds.reputation: q_rep}
         # Patch _random_task and to_yaml_string so nothing tries to serialize MagicMock identity
         with patch.object(at, '_random_task') as mock_rt:
-            with patch('autonomous_trust.core.automate.to_yaml_string', return_value='mocked'):
-                with patch('autonomous_trust.core.automate.now', return_value=datetime(2099, 1, 1)):
+            with patch('autonomous_trust.core.automate.to_json_string', return_value='mocked'):
+                with patch('autonomous_trust.core.automate.now', return_value=datetime(2099, 1, 1, tzinfo=UTC)):
                     at.autonomous_tasking(queues)
         # _random_task should have been called when tick fires
         assert mock_rt.called

@@ -1,7 +1,7 @@
 import pytest
 import queue
 from uuid import uuid4
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 from autonomous_trust.core.negotiation.negprocess import NegotiationProcess
@@ -65,7 +65,7 @@ class TestNegotiationProcessInit:
 class TestAddTask:
     def test_add_task(self):
         np = _make_neg_process()
-        tp = TaskParameters('cap1', when=datetime(2025, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2025, 1, 1, tzinfo=UTC))
         task = Task(tp, 'req')
         result = np._add_task(task)
         assert result is True
@@ -81,7 +81,7 @@ class TestGetJobs:
     def test_ready_jobs(self):
         np = _make_neg_process()
         # Add a job in the past
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, 'req')
         np._add_task(task)
         jobs = np._get_jobs()
@@ -127,7 +127,7 @@ class TestHandleAccept:
 
     def test_accept(self):
         np = _make_neg_process()
-        tp = TaskParameters('cap1', when=datetime(2025, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2025, 1, 1, tzinfo=UTC))
         task = Task(tp, 'req')
         peer = _make_mock_peer()
         msg = Message(CfgIds.negotiation, NegotiationProtocol.acceptance,
@@ -178,11 +178,11 @@ class TestForwardStatus:
 
     def test_task_status_with_status(self):
         np = _make_neg_process()
-        tp = TaskParameters('cap1', when=datetime(2025, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2025, 1, 1, tzinfo=UTC))
         mock_requestor = MagicMock(spec=Identity)
         task = Task(tp, mock_requestor)
         ts = TaskStatus(task=task, status=Status.running)
-        ts.to_yaml_string = MagicMock(return_value='mock_yaml')
+        ts.to_json_string = MagicMock(return_value='mock_yaml')
         ts.requestor = mock_requestor
         net_q = queue.Queue()
         result = np.forward_status({CfgIds.network: net_q}, ts)
@@ -190,7 +190,7 @@ class TestForwardStatus:
 
     def test_task_status_none_status(self):
         np = _make_neg_process()
-        tp = TaskParameters('cap1', when=datetime(2025, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2025, 1, 1, tzinfo=UTC))
         mock_requestor = MagicMock(spec=Identity)
         task = Task(tp, mock_requestor)
         ts = TaskStatus(task=task, status=None)
@@ -207,11 +207,11 @@ class TestForwardResult:
 
     def test_task_result(self):
         np = _make_neg_process()
-        tp = TaskParameters('cap1', when=datetime(2025, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2025, 1, 1, tzinfo=UTC))
         mock_requestor = MagicMock(spec=Identity)
         task = Task(tp, mock_requestor)
         tr = TaskResult(task=task, result=42)
-        tr.to_yaml_string = MagicMock(return_value='mock_yaml')
+        tr.to_json_string = MagicMock(return_value='mock_yaml')
         tr.requestor = mock_requestor
         net_q = queue.Queue()
         result = np.forward_result({CfgIds.network: net_q}, tr)
@@ -228,9 +228,9 @@ class TestStartTaskDeeper:
         np.protocol.peer_capabilities.items = MagicMock(return_value=[('video', [peer.uuid])])
         np.protocol.peers.find_by_uuid = MagicMock(return_value=peer)
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='mock_yaml')
+        task.to_json_string = MagicMock(return_value='mock_yaml')
         msg = Message(CfgIds.negotiation, NegotiationProtocol.start, task)
         net_q = queue.Queue()
         result = np.start_task({CfgIds.network: net_q}, msg)
@@ -244,7 +244,7 @@ class TestStartTaskDeeper:
         cap = Capability('video')
         np.protocol.peer_capabilities.items = MagicMock(return_value=[])
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
         msg = Message(CfgIds.negotiation, NegotiationProtocol.start, task)
         result = np.start_task({CfgIds.network: queue.Queue()}, msg)
@@ -258,9 +258,9 @@ class TestHandleInviteDeeper:
         cap = Capability('nonexistent')
         np.protocol.capabilities.__contains__ = MagicMock(return_value=False)
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
                       task, from_whom=peer)
         net_q = queue.Queue()
@@ -273,9 +273,9 @@ class TestHandleInviteDeeper:
         cap = Capability('video')
         np.protocol.capabilities.__contains__ = MagicMock(return_value=True)
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         task.parameters.acceptable = MagicMock(return_value=True)
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
                       task, from_whom=peer)
@@ -290,9 +290,9 @@ class TestHandleInviteDeeper:
         cap = Capability('video')
         np.protocol.capabilities.__contains__ = MagicMock(return_value=True)
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         task.parameters.acceptable = MagicMock(return_value=True)
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
                       task, from_whom=peer)
@@ -306,9 +306,9 @@ class TestHandleHaggleDeeper:
     def test_flexible_task(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         task.parameters.flexible = True
         msg = Message(CfgIds.negotiation, NegotiationProtocol.response,
                       task, from_whom=peer)
@@ -320,7 +320,7 @@ class TestHandleHaggleDeeper:
     def test_inflexible_task(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
         task.parameters.flexible = False
         # Need the task in my_tasks for _cancel_participant
@@ -337,7 +337,7 @@ class TestHandleResultsDeeper:
     def test_results_collected(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer, size=1)
         task.result = 'done'
         np.my_tasks[task.uuid] = TaskTracker(task)
@@ -351,7 +351,7 @@ class TestHandleResultsDeeper:
     def test_results_unknown_task(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
         msg = Message(CfgIds.negotiation, NegotiationProtocol.result,
                       task, from_whom=peer)
@@ -363,7 +363,7 @@ class TestHandleRefuseDeeper:
     def test_refuse_cancels_participant(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer, size=2)
         np.my_tasks[task.uuid] = TaskTracker(task)
         np.my_tasks[task.uuid].results[peer.uuid] = None
@@ -379,7 +379,7 @@ class TestHandleStatReqDeeper:
     def test_stat_req_pending_in_stack(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2025, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2025, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
         # Add task to the stack so it's found as pending
         np._add_task(task)
@@ -395,7 +395,7 @@ class TestHandleStatReqDeeper:
     def test_stat_req_not_in_stack(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
         msg = Message(CfgIds.negotiation, NegotiationProtocol.status_req,
                       task, from_whom=peer)
@@ -412,9 +412,9 @@ class TestHandleInviteNotAcceptable:
         cap = Capability('video')
         np.protocol.capabilities.__contains__ = MagicMock(return_value=True)
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         task.parameters.acceptable = MagicMock(return_value=False)
         task.adjust = MagicMock()
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
@@ -429,7 +429,7 @@ class TestHandleStatRespDeeper:
     def test_running_status_extends_timeout(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
         ts = TaskStatus(task=task, status=Status.running)
 
@@ -446,7 +446,7 @@ class TestHandleStatRespDeeper:
     def test_pending_status_clock_sync_error(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
         ts = TaskStatus(task=task, status=Status.pending)
 
@@ -461,7 +461,7 @@ class TestHandleStatRespDeeper:
     def test_dead_status_cancels(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer, size=2)
         ts = TaskStatus(task=task, status=Status.dead)
 
@@ -485,7 +485,7 @@ class TestHandleStatRespDeeper:
     def test_sleeping_status_with_duration_timeout(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1),
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC),
                           timeout=timedelta(seconds=0),
                           duration=timedelta(seconds=100))
         task = Task(tp, peer)
@@ -503,7 +503,7 @@ class TestHandleStatRespDeeper:
         """Running status but task not in confirmed - should not extend."""
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
         ts = TaskStatus(task=task, status=Status.running)
 
@@ -517,7 +517,7 @@ class TestHandleRefuseDeeper2:
     def test_refuse_with_registered_task(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer, size=1)
         np.my_tasks[task.uuid] = TaskTracker(task)
         np.my_tasks[task.uuid].results[peer.uuid] = None
@@ -542,9 +542,9 @@ class TestHandleInviteFullException:
         # 'nonexistent' capability is not registered → refusal path
         cap = Capability('nonexistent')
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
                       task, from_whom=peer)
         full_q = MagicMock()
@@ -561,9 +561,9 @@ class TestHandleInviteFullException:
         # Register so __contains__ check passes
         np.protocol.capabilities.register_ability('video', lambda: None)
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         # acceptable() returns True by default; _add_task will succeed on empty stack
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
                       task, from_whom=peer)
@@ -579,9 +579,9 @@ class TestHandleInviteFullException:
         cap = Capability('video')
         np.protocol.capabilities.register_ability('video', lambda: None)
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         # Force _add_task to return False
         np._add_task = MagicMock(return_value=False)
         np.task_stack.find_nearest_slot = MagicMock(return_value=datetime(2020, 6, 1))
@@ -599,9 +599,9 @@ class TestHandleInviteFullException:
         cap = Capability('video')
         np.protocol.capabilities.register_ability('video', lambda: None)
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         task.parameters.acceptable = MagicMock(return_value=False)
         # task.adjust() is called in negprocess but Task has no adjust; mock it
         task.adjust = MagicMock()
@@ -626,9 +626,9 @@ class TestHandleInviteAddTaskFail:
         # Register so the capability check passes
         np.protocol.capabilities.register_ability('video', lambda: None)
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         # acceptable() returns True by default; force _add_task to fail
         np._add_task = MagicMock(return_value=False)
         np.task_stack.find_nearest_slot = MagicMock(return_value=datetime(2021, 1, 1))
@@ -649,9 +649,9 @@ class TestHandleInviteAddTaskFail:
         cap = Capability('video')
         np.protocol.capabilities.register_ability('video', lambda: None)
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         task.parameters.acceptable = MagicMock(return_value=False)
         # task.adjust() is called in negprocess on the Task (which lacks adjust); mock it
         task.adjust = MagicMock()
@@ -677,9 +677,9 @@ class TestHandleInviteNewTask:
         # 'nonexistent' not registered → goes to refusal path; still creates counter
         cap = Capability('nonexistent')
 
-        tp = TaskParameters(cap, when=datetime(2020, 1, 1))
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         assert task.uuid not in np.proposed_tasks
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
                       task, from_whom=peer)
@@ -695,9 +695,9 @@ class TestHandleHaggleFullException:
         """Full exception when sending announce for flexible task."""
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.to_yaml_string = MagicMock(return_value='yaml')
+        task.to_json_string = MagicMock(return_value='yaml')
         task.parameters.flexible = True
         msg = Message(CfgIds.negotiation, NegotiationProtocol.response,
                       task, from_whom=peer)
@@ -710,7 +710,7 @@ class TestHandleHaggleFullException:
         """Full exception in _cancel_participant for non-flexible task."""
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer, size=2)
         task.parameters.flexible = False
         np.my_tasks[task.uuid] = TaskTracker(task)
@@ -730,7 +730,7 @@ class TestHandleRefuseFullException:
         """Full exception in _cancel_participant during handle_refuse."""
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer, size=2)
         np.my_tasks[task.uuid] = TaskTracker(task)
         np.my_tasks[task.uuid].results[peer.uuid] = None
@@ -749,7 +749,7 @@ class TestHandleStatReqFullException:
         """Full exception when forwarding status_req to main queue."""
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
         msg = Message(CfgIds.negotiation, NegotiationProtocol.status_req,
                       task, from_whom=peer)
@@ -765,11 +765,11 @@ class TestForwardStatusFullException:
     def test_forward_status_full_queue(self):
         """Full exception when putting status_resp onto network queue."""
         np = _make_neg_process()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         mock_requestor = MagicMock(spec=Identity)
         task = Task(tp, mock_requestor)
         ts = TaskStatus(task=task, status=Status.running)
-        ts.to_yaml_string = MagicMock(return_value='mock_yaml')
+        ts.to_json_string = MagicMock(return_value='mock_yaml')
         ts.requestor = mock_requestor
         full_q = MagicMock()
         full_q.put = MagicMock(side_effect=queue.Full)
@@ -784,7 +784,7 @@ class TestHandleStatRespFullException:
         """Full exception in _cancel_participant during handle_stat_resp with dead status."""
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer, size=2)
         ts = TaskStatus(task=task, status=Status.dead)
         np.my_tasks[task.uuid] = TaskTracker(task)
@@ -803,11 +803,11 @@ class TestForwardResultFullException:
     def test_forward_result_full_queue(self):
         """Full exception when putting result onto network queue."""
         np = _make_neg_process()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         mock_requestor = MagicMock(spec=Identity)
         task = Task(tp, mock_requestor)
         tr = TaskResult(task=task, result=42)
-        tr.to_yaml_string = MagicMock(return_value='mock_yaml')
+        tr.to_json_string = MagicMock(return_value='mock_yaml')
         tr.requestor = mock_requestor
         full_q = MagicMock()
         full_q.put = MagicMock(side_effect=queue.Full)
@@ -822,7 +822,7 @@ class TestHandleResultsFullException:
         """Full exception when forwarding completed results to main queue."""
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer, size=1)
         task.result = 'done'
         np.my_tasks[task.uuid] = TaskTracker(task)
@@ -842,7 +842,7 @@ class TestHandleResultsComplete:
         """All results collected → put task on main queue and remove from my_tasks."""
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer, size=1)
         task.result = 'finished'
         np.my_tasks[task.uuid] = TaskTracker(task)
@@ -870,7 +870,7 @@ class TestHandleResultsComplete:
         peer1 = _make_mock_peer(nickname='p1')
         peer2 = _make_mock_peer(nickname='p2', address='10.0.0.2')
         peer3 = _make_mock_peer(nickname='p3', address='10.0.0.3')
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1))
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
         # size=4 → need 4 results; only 3 participants tracked → won't forward
         task = Task(tp, peer1, size=4)
         task.result = 'partial'
