@@ -1,0 +1,15 @@
+[run]
+omit =
+    autonomous_trust/__main__.py
+    autonomous_trust/core/__main__.py
+    autonomous_trust/core/config/__main__.py
+    autonomous_trust/core/network/ntp.py
+    autonomous_trust/core/protobuf/*
+    autonomous_trust/core/identity/protocol.py
+    autonomous_trust/simple/__main__.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__
+    pass

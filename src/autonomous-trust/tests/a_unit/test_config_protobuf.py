@@ -109,9 +109,8 @@ def test_linked_step_no_proto_init():
     assert step.payload == b'test_payload'
 
 
-# ---- sync_to/from_message not yet implemented ----
+# ---- sync_to/from_message roundtrips ----
 
-@pytest.mark.skip(reason="sync_to_message not yet implemented on Signature")
 def test_signature_sync_roundtrip(sig):
     pub_sig = Signature(sig.publish(), True)
     pub_sig.sync_to_message()
@@ -126,94 +125,203 @@ def test_signature_sync_roundtrip(sig):
     assert restored.public_only is True
 
 
-@pytest.mark.skip(reason="Proto to_string not yet implemented (no !PB: prefix)")
-def test_signature_to_from_string(sig):
-    pub_sig = Signature(sig.publish(), True)
-    s = pub_sig.to_string()
-    assert s.startswith('!PB:')
-    restored = Signature.from_string(s)
-    assert restored.publish() == pub_sig.publish()
-
-
-@pytest.mark.skip(reason="sync_to_message not yet implemented on Encryptor")
 def test_encryptor_sync_roundtrip(enc):
     pub_enc = Encryptor(enc.publish(), True)
     pub_enc.sync_to_message()
+    raw = pub_enc.message.SerializeToString()
+
+    restored = object.__new__(Encryptor)
+    restored.message = identity_pb2.Encryptor()
+    restored.message.ParseFromString(raw)
+    restored.sync_from_message()
+
+    assert restored.publish() == pub_enc.publish()
+    assert restored.public_only is True
 
 
-@pytest.mark.skip(reason="Proto to_string not yet implemented")
-def test_encryptor_to_from_string(enc):
-    pass
-
-
-@pytest.mark.skip(reason="sync_to_message not yet implemented on Identity")
 def test_identity_sync_roundtrip(identity):
     identity.sync_to_message()
+    raw = identity.message.SerializeToString()
+
+    restored = object.__new__(Identity)
+    restored.message = identity_pb2.Identity()
+    restored.message.ParseFromString(raw)
+    restored.sync_from_message()
+
+    assert restored.uuid == identity.uuid
+    assert restored.fullname == identity.fullname
+    assert restored.address == identity.address
+    assert restored.signature.publish() == identity.signature.publish()
+    assert restored.encryptor.publish() == identity.encryptor.publish()
 
 
-@pytest.mark.skip(reason="Proto to_string not yet implemented")
-def test_identity_to_from_string(identity):
-    pass
-
-
-@pytest.mark.skip(reason="Proto to_wire_bytes not yet implemented")
-def test_identity_wire_bytes(identity):
-    pass
-
-
-@pytest.mark.skip(reason="sync_to_message not yet implemented on Group")
 def test_group_sync_roundtrip(enc):
-    pass
+    grp = Group(uuid_mod.uuid4(), {'peer1': '10.0.0.1'}, 'test-group',
+                Encryptor(enc.publish(), True))
+    grp.sync_to_message()
+    raw = grp.message.SerializeToString()
+
+    restored = object.__new__(Group)
+    restored.message = identity_pb2.Group()
+    restored.message.ParseFromString(raw)
+    restored.sync_from_message()
+
+    assert restored.uuid == grp.uuid
+    assert restored.encryptor.publish() == grp.encryptor.publish()
 
 
-@pytest.mark.skip(reason="Proto to_string not yet implemented")
-def test_group_to_from_string(enc):
-    pass
-
-
-@pytest.mark.skip(reason="sync_to_message not yet implemented on AgreementProof")
 def test_agreement_proof_sync_roundtrip():
-    pass
+    uid = uuid_mod.uuid4()
+    proof = AgreementProof(uid, b'digest123', True, b'nonce456')
+    proof.sync_to_message()
+    raw = proof.message.SerializeToString()
+
+    restored = object.__new__(AgreementProof)
+    restored.message = agreement_pb2.AgreementProof()
+    restored.message.ParseFromString(raw)
+    restored.sync_from_message()
+
+    assert restored.uuid == proof.uuid
+    assert restored.digest == proof.digest
+    assert restored.approval == proof.approval
+    assert restored.nonce == proof.nonce
 
 
-@pytest.mark.skip(reason="Proto to_string not yet implemented")
-def test_agreement_proof_to_from_string():
-    pass
-
-
-@pytest.mark.skip(reason="sync_to_message not yet implemented on Capability")
 def test_capability_sync_roundtrip():
-    pass
+    cap = Capability('video_stream')
+    cap.sync_to_message()
+    raw = cap.message.SerializeToString()
+
+    restored = object.__new__(Capability)
+    restored.message = capabilities_pb2.Capability()
+    restored.message.ParseFromString(raw)
+    restored.sync_from_message()
+
+    assert restored.name == cap.name
 
 
-@pytest.mark.skip(reason="Proto to_string not yet implemented")
-def test_capability_to_from_string():
-    pass
-
-
-@pytest.mark.skip(reason="sync_to_message not yet implemented on PeerCapabilities")
 def test_peer_capabilities_sync_roundtrip():
-    pass
+    pc = PeerCapabilities()
+    pc.register('peer-1', ['video', 'audio'])
+    pc.register('peer-2', ['video'])
+    pc.sync_to_message()
+    raw = pc.message.SerializeToString()
+
+    restored = object.__new__(PeerCapabilities)
+    restored.message = capabilities_pb2.PeerCapabilities()
+    restored.message.ParseFromString(raw)
+    restored.sync_from_message()
+
+    assert set(restored._listing.keys()) == set(pc._listing.keys())
+    for key in pc._listing:
+        assert sorted(restored._listing[key]) == sorted(pc._listing[key])
 
 
-@pytest.mark.skip(reason="Proto to_string not yet implemented")
-def test_peer_capabilities_to_from_string():
-    pass
-
-
-@pytest.mark.skip(reason="sync_to_message not yet implemented on LinkedStep")
 def test_linked_step_sync_roundtrip():
-    pass
+    step = LinkedStep(payload=b'test_payload')
+    step.sync_to_message()
+    raw = step.message.SerializeToString()
+
+    restored = object.__new__(LinkedStep)
+    restored.message = dag_pb2.LinkedStep()
+    restored.message.ParseFromString(raw)
+    restored.sync_from_message()
+
+    # Step.__init__ always sets uuid=None (pre-existing bug), so both sides are None
+    assert restored.uuid == step.uuid
 
 
-@pytest.mark.skip(reason="Proto to_string not yet implemented")
-def test_linked_step_to_from_string():
-    pass
-
-
-@pytest.mark.skip(reason="sync_to_message not yet implemented on IdentityObj")
 def test_identity_obj_sync_roundtrip(identity):
-    pass
+    originator = uuid_mod.uuid4()
+    idobj = IdentityObj(identity, originator)
+    idobj.sync_to_message()
+    raw = idobj.message.SerializeToString()
+
+    restored = object.__new__(IdentityObj)
+    restored.message = history_pb2.IdBlob()
+    restored.message.ParseFromString(raw)
+    restored.sync_from_message()
+
+    assert restored.originator == idobj.originator
+    assert restored.identity.uuid == idobj.identity.uuid
+    assert restored.identity.fullname == idobj.identity.fullname
+
+
+# ---- wire bytes roundtrips ----
+
+def test_signature_wire_bytes(sig):
+    pub_sig = Signature(sig.publish(), True)
+    raw = pub_sig.to_wire_bytes()
+    assert isinstance(raw, bytes)
+    restored = Signature.from_wire_bytes(raw)
+    assert restored.publish() == pub_sig.publish()
+
+
+def test_encryptor_wire_bytes(enc):
+    pub_enc = Encryptor(enc.publish(), True)
+    raw = pub_enc.to_wire_bytes()
+    assert isinstance(raw, bytes)
+    restored = Encryptor.from_wire_bytes(raw)
+    assert restored.publish() == pub_enc.publish()
+
+
+def test_identity_wire_bytes(identity):
+    raw = identity.to_wire_bytes()
+    assert isinstance(raw, bytes)
+    restored = Identity.from_wire_bytes(raw)
+    assert restored.uuid == identity.uuid
+    assert restored.fullname == identity.fullname
+    assert restored.signature.publish() == identity.signature.publish()
+    assert restored.encryptor.publish() == identity.encryptor.publish()
+
+
+def test_group_wire_bytes(enc):
+    grp = Group(uuid_mod.uuid4(), {'peer1': '10.0.0.1'}, 'test-group',
+                Encryptor(enc.publish(), True))
+    raw = grp.to_wire_bytes()
+    assert isinstance(raw, bytes)
+    restored = Group.from_wire_bytes(raw)
+    assert restored.uuid == grp.uuid
+    assert restored.encryptor.publish() == grp.encryptor.publish()
+
+
+def test_agreement_proof_wire_bytes():
+    proof = AgreementProof(uuid_mod.uuid4(), b'digest123', True, b'nonce456')
+    raw = proof.to_wire_bytes()
+    assert isinstance(raw, bytes)
+    restored = AgreementProof.from_wire_bytes(raw)
+    assert restored.uuid == proof.uuid
+    assert restored.digest == proof.digest
+    assert restored.approval == proof.approval
+
+
+def test_capability_wire_bytes():
+    cap = Capability('video_stream')
+    raw = cap.to_wire_bytes()
+    assert isinstance(raw, bytes)
+    restored = Capability.from_wire_bytes(raw)
+    assert restored.name == cap.name
+
+
+def test_peer_capabilities_wire_bytes():
+    pc = PeerCapabilities()
+    pc.register('peer-1', ['video', 'audio'])
+    pc.register('peer-2', ['video'])
+    raw = pc.to_wire_bytes()
+    assert isinstance(raw, bytes)
+    restored = PeerCapabilities.from_wire_bytes(raw)
+    assert set(restored._listing.keys()) == set(pc._listing.keys())
+    for key in pc._listing:
+        assert sorted(restored._listing[key]) == sorted(pc._listing[key])
+
+
+def test_linked_step_wire_bytes():
+    step = LinkedStep(payload=b'test_payload')
+    raw = step.to_wire_bytes()
+    assert isinstance(raw, bytes)
+    restored = LinkedStep.from_wire_bytes(raw)
+    # Step.__init__ always sets uuid=None (pre-existing bug), so both sides are None
+    assert restored.uuid == step.uuid
 
 
 # ---- YAML disk I/O unchanged ----

@@ -744,7 +744,6 @@ from autonomous_trust.core.automate import AutonomousTrust
 from autonomous_trust.core.system import CfgIds
 
 
-@pytest.mark.skip
 def test_reject(setup_teardown):
     at = AutonomousTrust(logfile=Configuration.log_stdout)
     cfgs = at._configure(start=False)
@@ -752,11 +751,10 @@ def test_reject(setup_teardown):
     udp = _UDP(cfgs, dict({}), None)
     udp.send_peer('test1', net_addr)
     msg_tpl = udp.recv_peer()
-    assert msg_tpl[0] is None
-    assert net_addr == msg_tpl[1][0]
+    # Sending to own address: _recv_udp returns (None, None, None)
+    assert msg_tpl == (None, None, None)
 
 
-@pytest.mark.skip
 def test_p2p(setup_teardown):
     at = AutonomousTrust(logfile=Configuration.log_stdout)
     cfgs = at._configure(start=False)

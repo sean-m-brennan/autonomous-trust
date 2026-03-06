@@ -20,7 +20,7 @@ from uuid import UUID
 from ..config import Configuration
 from ..structures.merkle import SimplestBlob
 from ..system import encoding
-from ..protobuf.algorithms import agreement_pb2
+from autonomous_trust.core.protobuf.algorithms import agreement_pb2
 
 
 class AgreementProof(Configuration):

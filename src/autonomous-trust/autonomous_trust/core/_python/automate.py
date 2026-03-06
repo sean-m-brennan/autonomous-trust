@@ -37,7 +37,7 @@ from decimal import Decimal, getcontext
 import psutil
 
 try:
-    from . import __version__ as version
+    from autonomous_trust.core import __version__ as version
 except ImportError:
     version = '?.?.?'
 from .config import Configuration, to_json_string, ConfigMap

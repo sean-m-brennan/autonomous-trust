@@ -24,10 +24,8 @@ operate at the queue/tracker level rather than individual task fields.
 
 from .._ffi import ffi, lib
 
-# Re-export Python classes for full API compatibility
-from ..._python.negotiation.negotiation import (  # noqa: F401
-    Task, TaskParameters, TaskStatus, Status, TaskResult,
-)
+# Re-export everything from the Python negotiation module for API compatibility
+from ..._python.negotiation.negotiation import *  # noqa: F401, F403
 from ..._python.negotiation.negprocess import NegotiationProcess  # noqa: F401
 
 

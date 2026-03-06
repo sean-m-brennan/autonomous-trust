@@ -25,8 +25,8 @@ import uuid as _uuid
 
 from .._ffi import ffi, lib
 
-# Re-export Python classes for full API compatibility
-from ..._python.reputation.reputation import TransactionScore  # noqa: F401
+# Re-export everything from the Python reputation module for API compatibility
+from ..._python.reputation.reputation import *  # noqa: F401, F403
 from ..._python.reputation.repprocess import ReputationProcess  # noqa: F401
 
 

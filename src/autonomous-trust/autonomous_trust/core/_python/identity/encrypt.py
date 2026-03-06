@@ -18,7 +18,7 @@ from nacl.public import PrivateKey, PublicKey
 from nacl.encoding import HexEncoder
 
 from ..config.configuration import Configuration
-from ..protobuf.identity import identity_pb2
+from autonomous_trust.core.protobuf.identity import identity_pb2
 
 class Encryptor(Configuration):
     _msg_class = identity_pb2.Encryptor

@@ -23,7 +23,7 @@ from ...config import Configuration, from_yaml_string
 from ...processes import ProcessLogger
 from ...system import encoding
 from ..identity import Identity
-from ...protobuf.identity import identity_pb2, history_pb2
+from autonomous_trust.core.protobuf.identity import identity_pb2, history_pb2
 
 
 # FIXME how does a DAG relate to the merkle tree?

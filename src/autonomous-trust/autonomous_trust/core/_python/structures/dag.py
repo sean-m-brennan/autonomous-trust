@@ -24,7 +24,7 @@ import string
 
 from ..config import Configuration
 from ..system import now
-from ..protobuf.structures import dag_pb2
+from autonomous_trust.core.protobuf.structures import dag_pb2
 
 class Step(ABC):
     def __init__(self, uuid):  # FIXME
