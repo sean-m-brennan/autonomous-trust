@@ -7,7 +7,12 @@ cd "$here" || exit 1
 
 # FIXME ensure conda env is active
 
-if [[ "$@" = *"--py"* ]]; then
+ARGS="$*"
+if [[ "$ARGS" = "" ]]; then
+  ARGS="--py --dist --c"
+fi
+
+if [[ "$ARGS" = *"--py"* ]]; then
   # Generate the Protobuf interfaces
   protobuf_src=src/protobuf
   protobuf_py_dir=src/autonomous-trust
@@ -20,7 +25,7 @@ if [[ "$@" = *"--py"* ]]; then
   done
   touch "$protobuf_py/__init__.py"
 
-  if [[ "$@" = *"--dist"* ]]; then
+  if [[ "$ARGS" = *"--dist"* ]]; then
     # Create and extract distros
     rm -rf dist
     mkdir -p dist
@@ -39,9 +44,14 @@ if [[ "$@" = *"--py"* ]]; then
 fi
 
 # Build the C library
-if [[ "$@" = *"--c"* ]]; then
+if [[ "$ARGS" = *"--c"* ]]; then
   cd src/c || exit 1
   rm -rf build
+  # If CC points to a missing compiler (e.g. conda cross-compiler), fall back
+  # to system defaults and skip the conda sysroot
+  if [ -n "$CC" ] && ! command -v "$CC" >/dev/null 2>&1; then
+    unset CC CXX CONDA_PREFIX
+  fi
   cmake -S . -B build
   cd build || exit 1
   make -j1
