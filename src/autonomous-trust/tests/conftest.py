@@ -18,7 +18,7 @@ import json
 import os
 import shutil
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -51,7 +51,7 @@ def setup(local_net=False):
         net_cfg_file = os.path.join(test_dir, CfgIds.network + Configuration.file_ext)
         with open(net_cfg_file, 'r') as net:
             data = json.load(net)
-        data['_ip4_address'] = '127.0.0.1'
+        data['_ip4_cidr'] = '127.0.0.1/8'
         data['_port'] = None
         with open(net_cfg_file, 'w') as net:
             json.dump(data, net, indent=2)
@@ -88,14 +88,14 @@ class QuickTrust(AutonomousTrust):
         self.debug = False
 
     def autonomous_loop(self, results, queues, signals):
-        start = datetime.utcnow()
+        start = datetime.now(UTC)
         end = start + timedelta(seconds=self.runtime)
         if self.debug:
             print()
-        while datetime.utcnow() < end:
+        while datetime.now(UTC) < end:
             time.sleep(1)
             if self.debug:
-                print('%d    ' % (end - datetime.utcnow()).seconds, end='\r')
+                print('%d    ' % (end - datetime.now(UTC)).seconds, end='\r')
         for result in results.values():
             if result.ready():
                 try:

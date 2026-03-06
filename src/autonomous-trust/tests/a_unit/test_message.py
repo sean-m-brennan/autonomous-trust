@@ -112,12 +112,9 @@ class TestMessage:
         assert msg.encrypt is False
 
 
-def test_message_yaml_string_obj():
-    from autonomous_trust.core.config import Configuration
-    # Create a yaml string that starts with --- and YAML_PREFIX
-    yaml_str = '--- %s:some.module.Class\nkey: value' % Configuration.YAML_PREFIX
-    msg = Message('proc', 'func', yaml_str)
-    # Should attempt to deserialize; may fail and leave as string
+def test_message_json_string_obj():
+    msg = Message('proc', 'func', '{"key": "value"}')
+    # Should leave as string since no __type__ tag
     assert msg.obj is not None
 
 

@@ -4,7 +4,7 @@ theme: uncover
 size: 16:9
 math: mathjax
 paginate: true
-footer: "TakFive - AutonomousTrust"
+footer: "TekFive - AutonomousTrust"
 style: |
     section {
         font-size: 30px;
@@ -63,13 +63,13 @@ style: |
         display: grid;
         grid-template-columns: 500px 500px;
         grid-template-rows: 100px auto;
-        grid-template-areas: 
+        grid-template-areas:
             "slideheading slideheading"
             "leftpanel rightpanel";
     }
-    /* debug 
-    section.split h3, 
-    section.split .ldiv, 
+    /* debug
+    section.split h3,
+    section.split .ldiv,
     section.split .rdiv { border: 1.5pt dashed dimgray; }
     section.split h3 {
         grid-area: slideheading;
@@ -84,132 +84,128 @@ style: |
 ![bg left:40% 80%](./t5logo.png)
 # **AutonomousTrust** <!--fit-->
 
-## Machine-to-Machine Security <!--fit-->
+## Machines that earn, evaluate, and enforce trust with each other <!--fit-->
 
 ---
 # Problem Statement
 
-Target domain: Industrial Internet of Things (IIoT)
+Machine-to-machine cybersecurity is brittle and non-scalable.
 
-* resource constrained
-* large scale
-* autonomous/independent
-* in-situ sensoring/controlling (edge vs cloud)
+**Target domain:** Industrial Internet of Things (IIoT)
+* resource constrained (power, bandwidth)
+* massive scale (billions of devices)
+* autonomous/independent operation
+* in-situ sensing/controlling (edge vs cloud)
+* software vulnerabilities now risk **human safety**
 
-Cybersecurity is therefore extra challenging, and imperative.
-
-However, solutions here should (ideally) apply elsewhere.
+Solutions here apply broadly — IoT represents the computational extremes.
 
 ---
-# Industry Standard
-## Machine-to-Machine Zero Trust
+# Why Zero Trust Falls Short
 
-Centered around service APIs - assumes consumerist paradigm
+The industry standard for M2M security:
 
-* **identity** - service account / workload id
-* **authentication** - mTLS, digital certificates, API keys
-* **session length** - per-request or very short-lived tokens
-* **authorization** - service health, image signature, network path
+* **identity** — service accounts, workload IDs
+* **authentication** — mTLS, certificates, API keys
+* **session length** — per-request or short-lived tokens
+* **authorization** — service health, image signature, network path
 
-Lacking dynamic response, difficult to scale, and configuration is brittle
+Assumes a consumerist paradigm. Lacks dynamic response, difficult to scale, and configuration is brittle — fundamentally non-scalable against evolving topologies and threat vectors.
 
 ---
 # Proposed Solution
 
 Dynamic machine cooperation, enabled by:
 
-* real-time distributed reputation tracking
+* real-time distributed **reputation** tracking
    * trust metric based on immutable interaction scores
-   * contract negotiation protocols govern interactions
+   * **contract** negotiation protocols govern interactions
       * work definition
-      * work confirmation / reality testing
+      * work confirmation / **reality testing**
    * bootstrapping / fallback
 * remote service discovery
 * directly affects network topology
 * adjustable max-risk evaluation
 
 ---
-# Details
-
-* identity: unique, immutable, tied to reputation
-* trust scores on a distributed ledger
-* interaction scores: $R_x = \sum\limits_{i=1}^n \frac{S_x^i R_i^\prime}{n}$ where $R_i^\prime$ is the previous $R_i$ ($S$ is individual score, $R$ is accumulated reputation)
-* bootstrap when $R_x^\prime \lt 0.5$:  $R_x = R_x^{\prime\prime}$ where $R_x^{\prime\prime}$ is the TFT sum
-* work confirmation via zk-STARKs, zk-rollups, and/or coincident multi-modal validation
-* socially-determined hierarchical networking/routing
-
----
 # The Product
 
-Tightly interdependent subsystems:
+A system-engineering framework — more like running containerized services than linking a library.
 
-Services:
+**Services:**
 * reputation distributed ledger and protocols
 * contract negotiation protocol
 * hierarchical social mechanisms
 
-Development tools:
+**Development tools:**
 * knowledge domain encoding toolset
 * reality testing framework
-* zk-stark/rollup toolset
+* zk-STARK/rollup toolset
+
+Open source framework; our commodity is expertise in building these networks.
 
 ---
 # Deployment
 
 Depending on desired level of control:
 
-* Cloud cluster: ingress/egress control plus micro-service support
-* Edge host: kernel drivers plus active services 
+* **Cloud cluster:** ingress/egress control plus micro-service support
+* **Edge host:** kernel drivers plus active services
 
-Development toolsets for both
-
----
-# Use-cases
-
-* Industrial instrumentation
-   * emphasis on flexible controls and environmental response
-   * in-situ inputs, limited outputs
-   * mostly communal action
-
-* AI safety
-   * emphasis on data correctness and context
-   * widely varying global inputs
-
-* Robotics
-   * emphasis on multi-modal sensors and situational awareness
-   * in-situ inputs, varying outputs
-   * mostly independent action
+Development toolsets for both. Deployment as relocatable containers, VMs, or monolithic embedded kernels.
 
 ---
-# Unknowns
+# Technical Details
 
-* resilience to network attacks (DoS, Sybils)
-* resilience to epistemic attacks (data poisoning, noise injection)
-* novel social attacks (isolation, turncoats)
+* identity: unique, immutable, tied to reputation
+* trust scores on a distributed ledger
+* interaction scores: $R_x = \sum\limits_{i=1}^n \frac{S_x^i R_i^\prime}{n}$ where $R_i^\prime$ is the previous $R_i$ ($S$ is individual score, $R$ is accumulated reputation)
+* bootstrap when $R_x^\prime \lt 0.5$:  $R_x = R_x^{\prime\prime}$ where $R_x^{\prime\prime}$ is the TFT sum
+* **computable** data verified via zk-STARKs and zk-rollups
+* **observable** data validated via coincident multi-modal consensus
+* socially-determined hierarchical networking/routing
+
+---
+# Use Cases
+
+* **Sensor Networks**
+   * in-situ inputs, flexible controls, environmental response
+   * collective action despite prolific failures and attacks
+   * original inspiration — ground-truth is inherently difficult
+
+* **AI Safety and Knowledge Integrity**
+   * verify data provenance, resist adversarial inputs at scale
+   * maintain knowledge-base quality amid active sabotage
+
+* **Defense**
+   * multi-modal sensors, situational awareness in contested environments
+   * vet and winnow datastreams — cut through the fog of war
+
+---
+# Open Questions
+
+* resilience to **network attacks** (DoS, partitioning, selective dropping)
+* resilience to **epistemic attacks** (data poisoning, coordinated false consensus)
+* **social/Sybil attacks** (identity fabrication, collusion, isolation, turncoats)
 * knowledge domain failures
 * contractual failures
+* **fault tolerance limits** — can a small cadre detect truth within overwhelming error?
 
 ---
 # Market Competitors
 
 <!-- _class: small -->
 
-No products approximate our solution, but some approach certain facets:
+No products approximate our full approach, but some address certain facets:
 
-* Proofpoint Dynamic Reputation
-   email connection management using ML content classification with a reputation score
+* **Proofpoint Dynamic Reputation** — ML content classification with reputation scores for email connections
+* **Microsoft Defender Threat Intelligence** — per-machine reputation scores (0-100) via ML and algorithms
+* **Bitdefender Reputation Threat Intelligence** — real-time M2M threat APIs for files/IPs, reputation-based
+* **OpenText Threat Intelligence (BrightCloud)** — ML plus reputation scoring for websites, files, IPs
+* **DeepTrust** — real-time detection of AI threats (deepfakes, voice phishing)
 
-* Microsoft Defender Threat Intelligence
-   per machine reputation scores determined by ML and other algorithms
-
-* Bitdefender Reputation Threat Intelligence
-   real-time threat APIs for files/IPs, also reputation-based
-
-* OpenText Threat Intelligence (BrightCloud)
-   ML plus reputation scoring for websites, files, IPs
-
-* DeepTrust
-   real-time detection of AI threats (deepfakes, voice phishing)
+Academic: **M2M-REP** — distributed trustworthiness for autonomous IoT without central authority
 
 ---
 # Prototype Demo
+

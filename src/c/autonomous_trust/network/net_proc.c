@@ -16,18 +16,34 @@
 
 #define _XOPEN_SOURCE 700
 #include <stdbool.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <errno.h>
 
 #include "processes/processes.h"
 #include "utilities/message.h"
+#include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
 #include "utilities/logger.h"
-#include "network.h"
+#include "network/network.h"
+#include "network/net_message.h"
+#include "identity/identity.h"
+#include "identity/identity_priv.h"
+#include "structures/data_priv.h"
+
+#define ENET_SEND 230
+DEFINE_ERROR(ENET_SEND, "Network send failed");
+#define ENET_RECV 231
+DEFINE_ERROR(ENET_RECV, "Network receive failed");
 
 const bool use_mcast = false;
+static const int UDP_PACKET_SIZE = 65507;
+static const int TCP_CHUNK_SIZE = 2048;
 
 typedef struct
 {
@@ -51,14 +67,488 @@ typedef struct
     int recv_cast;
 } recvrs_t;
 
-int _send(socket_t *cfg, char *msg, char *host, int port)
+typedef struct
 {
-    // int sock = socket(cfg->domain, cfg->type, cfg->protocol);
-    //  encode
-    //  connect
-    //  send all
+    socket_t *cfg;
+    recvrs_t *socks;
+    process_t *proc;
+    directory_t *queues;
+    logger_t *logger;
+    network_config_t *net_cfg;
+    identity_t *myself;
+    bool *stop;
+    int port;
+    bool ipv6;
+} net_thread_ctx_t;
+
+/****************************
+ * UDP send/recv
+ ****************************/
+
+static int _send_udp(const uint8_t *msg, size_t msg_len, const char *host, int port, logger_t *logger)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == -1)
+        return SYS_EXCEPTION();
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0)
+    {
+        close(sock);
+        return EXCEPTION(EINVAL);
+    }
+
+    size_t send_len = msg_len;
+    if (send_len > (size_t)UDP_PACKET_SIZE)
+    {
+        log_warn(logger, "UDP message truncated from %zu to %d bytes\n", msg_len, UDP_PACKET_SIZE);
+        send_len = UDP_PACKET_SIZE;
+    }
+
+    ssize_t sent = sendto(sock, msg, send_len, 0,
+                          (struct sockaddr *)&addr, sizeof(addr));
+    close(sock);
+    if (sent <= 0)
+        return EXCEPTION(ENET_SEND);
+
     return 0;
 }
+
+static int _recv_udp(int sock, uint8_t *buf, size_t buf_size,
+                     char *from_addr, size_t addr_len, int *from_port)
+{
+    struct sockaddr_in sender = {0};
+    socklen_t slen = sizeof(sender);
+
+    ssize_t numbytes = recvfrom(sock, buf, buf_size, 0,
+                                (struct sockaddr *)&sender, &slen);
+    if (numbytes < 0)
+    {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return ENOMSG;
+        return SYS_EXCEPTION();
+    }
+
+    if (from_addr != NULL)
+        inet_ntop(AF_INET, &sender.sin_addr, from_addr, addr_len);
+    if (from_port != NULL)
+        *from_port = ntohs(sender.sin_port);
+
+    return (int)numbytes;
+}
+
+/****************************
+ * TCP send/recv
+ ****************************/
+
+static int _send_tcp(const uint8_t *msg, size_t msg_len, const char *host, int port, logger_t *logger)
+{
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == -1)
+        return SYS_EXCEPTION();
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0)
+    {
+        close(sock);
+        return EXCEPTION(EINVAL);
+    }
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0)
+    {
+        close(sock);
+        return EXCEPTION(ENET_SEND);
+    }
+
+    /* Send frame: "size|" header */
+    char size_hdr[32];
+    int hdr_len = snprintf(size_hdr, sizeof(size_hdr), "%zu|", msg_len);
+    if (send(sock, size_hdr, hdr_len, 0) != hdr_len)
+    {
+        close(sock);
+        return EXCEPTION(ENET_SEND);
+    }
+
+    /* Send data in chunks */
+    size_t total_sent = 0;
+    while (total_sent < msg_len)
+    {
+        size_t chunk = msg_len - total_sent;
+        if (chunk > (size_t)TCP_CHUNK_SIZE)
+            chunk = TCP_CHUNK_SIZE;
+        ssize_t sent = send(sock, msg + total_sent, chunk, 0);
+        if (sent <= 0)
+        {
+            close(sock);
+            return EXCEPTION(ENET_SEND);
+        }
+        total_sent += sent;
+    }
+
+    close(sock);
+    log_debug(logger, "TCP sent %zu bytes to %s:%d\n", total_sent, host, port);
+    return 0;
+}
+
+static int _recv_tcp(int listen_sock, uint8_t **buf_out, size_t *buf_len,
+                     char *from_addr, size_t addr_len, int *from_port)
+{
+    struct sockaddr_in sender = {0};
+    socklen_t slen = sizeof(sender);
+
+    int client = accept(listen_sock, (struct sockaddr *)&sender, &slen);
+    if (client < 0)
+    {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return ENOMSG;
+        return SYS_EXCEPTION();
+    }
+
+    if (from_addr != NULL)
+        inet_ntop(AF_INET, &sender.sin_addr, from_addr, addr_len);
+    if (from_port != NULL)
+        *from_port = ntohs(sender.sin_port);
+
+    /* Read size header: bytes until '|' */
+    char size_buf[32] = {0};
+    int si = 0;
+    while (si < 31)
+    {
+        char c;
+        ssize_t n = recv(client, &c, 1, 0);
+        if (n <= 0)
+        {
+            close(client);
+            return EXCEPTION(ENET_RECV);
+        }
+        if (c == '|')
+            break;
+        size_buf[si++] = c;
+    }
+    size_t data_size = (size_t)atol(size_buf);
+    if (data_size == 0 || data_size > NET_MSG_MAX_DATA)
+    {
+        close(client);
+        return EXCEPTION(ENET_RECV);
+    }
+
+    /* Read exactly data_size bytes */
+    uint8_t *data = malloc(data_size);
+    if (data == NULL)
+    {
+        close(client);
+        return SYS_EXCEPTION();
+    }
+
+    size_t total = 0;
+    while (total < data_size)
+    {
+        size_t chunk = data_size - total;
+        if (chunk > (size_t)TCP_CHUNK_SIZE)
+            chunk = TCP_CHUNK_SIZE;
+        ssize_t n = recv(client, data + total, chunk, 0);
+        if (n <= 0)
+        {
+            free(data);
+            close(client);
+            return EXCEPTION(ENET_RECV);
+        }
+        total += n;
+    }
+
+    close(client);
+    *buf_out = data;
+    *buf_len = data_size;
+    return 0;
+}
+
+/****************************
+ * Encrypt/decrypt helpers
+ ****************************/
+
+int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *msg,
+                         const socket_t *cfg, int port, logger_t *logger)
+{
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    if (net_message_to_wire(msg, &wire, &wire_len) != 0)
+        return -1;
+
+    if (msg->to_whom.type == RECIPIENT_BROADCAST)
+    {
+        /* Broadcast: no encryption */
+        int ret;
+        if (cfg->type == SOCK_DGRAM)
+            ret = _send_udp(wire, wire_len, msg->to_whom.target.peer.address, port, logger);
+        else
+            ret = _send_tcp(wire, wire_len, msg->to_whom.target.peer.address, port, logger);
+        free(wire);
+        return ret;
+    }
+
+    if (msg->encrypt && msg->to_whom.type == RECIPIENT_PEER)
+    {
+        /* Encrypt for a specific peer */
+        unsigned char nonce[crypto_box_NONCEBYTES];
+        randombytes_buf(nonce, sizeof(nonce));
+
+        msg_str_t plain = {.msg = wire, .len = wire_len};
+        size_t cipher_len = wire_len + crypto_box_MACBYTES;
+        unsigned char *cipher = malloc(cipher_len);
+        if (cipher == NULL)
+        {
+            free(wire);
+            return SYS_EXCEPTION();
+        }
+
+        int ret = identity_encrypt(myself, &plain, &msg->to_whom.target.peer, nonce, cipher);
+        free(wire);
+        if (ret != 0)
+        {
+            free(cipher);
+            return ret;
+        }
+
+        /* Frame: nonce + ciphertext */
+        size_t frame_len = sizeof(nonce) + cipher_len;
+        uint8_t *frame = malloc(frame_len);
+        if (frame == NULL)
+        {
+            free(cipher);
+            return SYS_EXCEPTION();
+        }
+        memcpy(frame, nonce, sizeof(nonce));
+        memcpy(frame + sizeof(nonce), cipher, cipher_len);
+        free(cipher);
+
+        const char *host = msg->to_whom.target.peer.address;
+        if (cfg->type == SOCK_DGRAM)
+            ret = _send_udp(frame, frame_len, host, port, logger);
+        else
+            ret = _send_tcp(frame, frame_len, host, port, logger);
+        free(frame);
+        return ret;
+    }
+
+    /* Unencrypted peer send */
+    const char *host = msg->to_whom.target.peer.address;
+    int ret;
+    if (cfg->type == SOCK_DGRAM)
+        ret = _send_udp(wire, wire_len, host, port, logger);
+    else
+        ret = _send_tcp(wire, wire_len, host, port, logger);
+    free(wire);
+    return ret;
+}
+
+static int decrypt_message(const identity_t *myself, const public_identity_t *peer,
+                           const uint8_t *frame, size_t frame_len,
+                           uint8_t **plain_out, size_t *plain_len)
+{
+    if (frame_len <= crypto_box_NONCEBYTES + crypto_box_MACBYTES)
+        return EXCEPTION(ENET_RECV);
+
+    const unsigned char *nonce = frame;
+    const unsigned char *cipher = frame + crypto_box_NONCEBYTES;
+    size_t cipher_len = frame_len - crypto_box_NONCEBYTES;
+    size_t plen = cipher_len - crypto_box_MACBYTES;
+
+    unsigned char *plain = malloc(plen);
+    if (plain == NULL)
+        return SYS_EXCEPTION();
+
+    msg_str_t cmsg = {.msg = (unsigned char *)cipher, .len = cipher_len};
+    int ret = identity_decrypt(myself, &cmsg, peer, nonce, plain);
+    if (ret != 0)
+    {
+        free(plain);
+        return ret;
+    }
+
+    *plain_out = plain;
+    *plain_len = plen;
+    return 0;
+}
+
+/****************************
+ * Find peer by address
+ ****************************/
+
+static const public_identity_t *find_peer_by_address(const process_t *proc, const char *addr)
+{
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        if (strcmp(proc->protocol.peers[i].address, addr) == 0)
+            return &proc->protocol.peers[i];
+    }
+    return NULL;
+}
+
+/****************************
+ * Route message to process queue
+ ****************************/
+
+static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
+                            directory_t *queues, logger_t *logger)
+{
+    /* Build a generic_msg_t with NET_MESSAGE type */
+    generic_msg_t gmsg = {0};
+    gmsg.type = NET_MESSAGE;
+    strncpy(gmsg.info.net_msg.process, wmsg->process, PROC_NAME_LEN);
+    gmsg.info.net_msg.function = strdup(wmsg->function);
+    gmsg.info.net_msg.obj = wmsg->data;
+    gmsg.info.net_msg.len = wmsg->data_len;
+    memcpy(&gmsg.info.net_msg.from_whom, &wmsg->from_whom, sizeof(public_identity_t));
+    gmsg.info.net_msg.encrypt = wmsg->encrypt;
+
+    /* Send to the target process queue */
+    int ret = messaging_send(wmsg->process, NET_MESSAGE, &gmsg, false);
+    if (ret != 0)
+    {
+        log_error(logger, "Failed to route message to process '%s'\n", wmsg->process);
+        if (gmsg.info.net_msg.function != NULL)
+            free(gmsg.info.net_msg.function);
+        return ret;
+    }
+
+    log_debug(logger, "Routed %s.%s from %s\n", wmsg->process, wmsg->function,
+              wmsg->from_whom.fullname);
+    if (gmsg.info.net_msg.function != NULL)
+        free(gmsg.info.net_msg.function);
+    return 0;
+}
+
+/****************************
+ * Receiver thread functions
+ ****************************/
+
+static void *peer_receiver_thread(void *arg)
+{
+    net_thread_ctx_t *ctx = (net_thread_ctx_t *)arg;
+    uint8_t buf[UDP_PACKET_SIZE];
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000; /* 0.1 seconds */
+    setsockopt(ctx->socks->recv_ptp, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    while (!(*ctx->stop))
+    {
+        char from_addr[IPV4_ADDR_LEN] = {0};
+        int from_port = 0;
+
+        if (ctx->cfg->type == SOCK_DGRAM)
+        {
+            int nbytes = _recv_udp(ctx->socks->recv_ptp, buf, sizeof(buf),
+                                   from_addr, sizeof(from_addr), &from_port);
+            if (nbytes == ENOMSG || nbytes < 0)
+                continue;
+
+            /* Skip messages from self */
+            char my_addr[IPV4_ADDR_LEN] = {0};
+            cidr_split(ctx->net_cfg->ip4_cidr, my_addr, NULL);
+            if (strcmp(from_addr, my_addr) == 0)
+                continue;
+
+            const public_identity_t *peer = find_peer_by_address(ctx->proc, from_addr);
+            if (peer != NULL)
+            {
+                /* Decrypt */
+                uint8_t *plain = NULL;
+                size_t plain_len = 0;
+                if (decrypt_message(ctx->myself, peer, buf, nbytes, &plain, &plain_len) == 0)
+                {
+                    net_wire_msg_t wmsg;
+                    if (net_message_from_wire(plain, plain_len, peer, &wmsg) == 0)
+                        route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+                    free(plain);
+                    net_wire_msg_free(&wmsg);
+                }
+            }
+            else
+            {
+                log_debug(ctx->logger, "Encrypted message from unknown peer %s\n", from_addr);
+            }
+        }
+        else
+        {
+            /* TCP */
+            uint8_t *data = NULL;
+            size_t data_len = 0;
+            int ret = _recv_tcp(ctx->socks->recv_ptp, &data, &data_len,
+                                from_addr, sizeof(from_addr), &from_port);
+            if (ret == ENOMSG || ret < 0)
+                continue;
+
+            char my_addr[IPV4_ADDR_LEN] = {0};
+            cidr_split(ctx->net_cfg->ip4_cidr, my_addr, NULL);
+            if (strcmp(from_addr, my_addr) == 0)
+            {
+                free(data);
+                continue;
+            }
+
+            const public_identity_t *peer = find_peer_by_address(ctx->proc, from_addr);
+            if (peer != NULL)
+            {
+                uint8_t *plain = NULL;
+                size_t plain_len = 0;
+                if (decrypt_message(ctx->myself, peer, data, data_len, &plain, &plain_len) == 0)
+                {
+                    net_wire_msg_t wmsg;
+                    if (net_message_from_wire(plain, plain_len, peer, &wmsg) == 0)
+                        route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+                    free(plain);
+                    net_wire_msg_free(&wmsg);
+                }
+            }
+            free(data);
+        }
+    }
+    return NULL;
+}
+
+static void *broadcast_receiver_thread(void *arg)
+{
+    net_thread_ctx_t *ctx = (net_thread_ctx_t *)arg;
+    uint8_t buf[UDP_PACKET_SIZE];
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000;
+    setsockopt(ctx->socks->recv_cast, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    while (!(*ctx->stop))
+    {
+        char from_addr[IPV4_ADDR_LEN] = {0};
+        int from_port = 0;
+
+        int nbytes = _recv_udp(ctx->socks->recv_cast, buf, sizeof(buf),
+                               from_addr, sizeof(from_addr), &from_port);
+        if (nbytes == ENOMSG || nbytes < 0)
+            continue;
+
+        char my_addr[IPV4_ADDR_LEN] = {0};
+        cidr_split(ctx->net_cfg->ip4_cidr, my_addr, NULL);
+        if (strcmp(from_addr, my_addr) == 0)
+            continue;
+
+        /* Broadcast messages are unencrypted */
+        net_wire_msg_t wmsg;
+        if (net_message_from_wire(buf, nbytes, NULL, &wmsg) == 0)
+            route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+        net_wire_msg_free(&wmsg);
+    }
+    return NULL;
+}
+
+/****************************
+ * Network shutdown
+ ****************************/
 
 void network_shutdown(recvrs_t *socks)
 {
@@ -70,6 +560,10 @@ void network_shutdown(recvrs_t *socks)
         close(socks->recv_ptp);
 }
 
+/****************************
+ * Network process main
+ ****************************/
+
 int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger, bool ipv6)
 {
     recvrs_t socks = {0};
@@ -78,14 +572,13 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
     int one = 1;
 
     char *address = NULL;
+    char addr_buf[IPV6_ADDR_LEN];
     if (ipv6) {
-        char ipv6_addr[IPV6_ADDR_LEN];
-        cidr_split(net_cfg->ip6_cidr, ipv6_addr, NULL);
-        address = ipv6_addr;
+        cidr_split(net_cfg->ip6_cidr, addr_buf, NULL);
+        address = addr_buf;
     } else {
-        char ipv4_addr[IPV4_ADDR_LEN];
-        cidr_split(net_cfg->ip4_cidr, ipv4_addr, NULL);
-        address = ipv4_addr;
+        cidr_split(net_cfg->ip4_cidr, addr_buf, NULL);
+        address = addr_buf;
     }
 
     struct addrinfo *res;
@@ -132,7 +625,7 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
         log_exception(logger);
         return -1;
     }
-    err = bind(socks.recv_ptp, res->ai_addr, res->ai_addrlen);  // FIXME EADDRNOTAVAIL
+    err = bind(socks.recv_ptp, res->ai_addr, res->ai_addrlen);
     if (err != 0)
     {
         network_shutdown(&socks);
@@ -150,6 +643,7 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
             return -1;
         }
     }
+    log_info(logger, "Bound peer recv to %s:%d\n", address, port_num);
     freeaddrinfo(res);
 
     err = getaddrinfo(address, grp_port_str, &hints, &res);
@@ -182,7 +676,6 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
         log_exception(logger);
         return -1;
     }
-    // FIXME different port?
     err = bind(socks.recv_grp, res->ai_addr, res->ai_addrlen);
     if (err != 0)
     {
@@ -201,6 +694,7 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
             return -1;
         }
     }
+    log_info(logger, "Bound group recv to %s:%d\n", address, grp_port);
     freeaddrinfo(res);
 
     if (use_mcast)
@@ -225,9 +719,6 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
             log_exception(logger);
             return -1;
         }
-        // size_t packet_size = 65527;
-        // int mcast_ttl = 2;
-        // sock_opts_t send_opts = { .level = IPPROTO_IP, .optname = IP_MULTICAST_TTL, .optval = &mcast_ttl, .optlen = sizeof(int) };
         socks.recv_cast = socket(cfg->domain, SOCK_DGRAM, IPPROTO_UDP);
         if (socks.recv_cast == -1)
         {
@@ -252,7 +743,7 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
             log_exception(logger);
             return -1;
         }
-        // setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, req);
+        /* TODO: setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, req); */
         freeaddrinfo(res);
     }
     else
@@ -278,8 +769,6 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
             log_exception(logger);
             return -1;
         }
-        // size_t packet_size = 65507;
-        // sock_opts_t send_opts = { .level = SOL_SOCKET, .optname = SO_BROADCAST, .optval = &one, .optlen = sizeof(int) };
         socks.recv_cast = socket(cfg->domain, SOCK_DGRAM, IPPROTO_UDP);
         if (socks.recv_cast == -1)
         {
@@ -307,8 +796,42 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
         freeaddrinfo(res);
     }
 
-    // register handlers for intern msgs
-    return process_run(proc, queues, signal, logger);
+    /* Get identity from configs */
+    identity_t *myself = NULL;
+    data_t *id_dat = NULL;
+    char id_key[] = "identity";
+    if (map_get(proc->configs, id_key, &id_dat) == 0)
+        data_object_ptr(id_dat, (void **)&myself);
+
+    /* Start receiver threads */
+    bool stop = false;
+    net_thread_ctx_t thread_ctx = {
+        .cfg = cfg,
+        .socks = &socks,
+        .proc = proc,
+        .queues = queues,
+        .logger = logger,
+        .net_cfg = net_cfg,
+        .myself = myself,
+        .stop = &stop,
+        .port = port_num,
+        .ipv6 = ipv6,
+    };
+
+    pthread_t peer_thread, bcast_thread;
+    pthread_create(&peer_thread, NULL, peer_receiver_thread, &thread_ctx);
+    pthread_create(&bcast_thread, NULL, broadcast_receiver_thread, &thread_ctx);
+
+    /* Delegate to process_run for main loop with outbound message handling */
+    int ret = process_run(proc, queues, signal, logger);
+
+    /* Signal threads to stop and join */
+    stop = true;
+    pthread_join(peer_thread, NULL);
+    pthread_join(bcast_thread, NULL);
+    network_shutdown(&socks);
+
+    return ret;
 }
 
 /**********/

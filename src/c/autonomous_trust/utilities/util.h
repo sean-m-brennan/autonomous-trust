@@ -54,7 +54,7 @@ char *strremove(char *str, const char *sub);
 
 int makedirs(char *path, mode_t mode);
 
-int compare_float_precision(float f1, float f2, float, float epsilon);
+int compare_float_precision(float f1, float f2, float epsilon);
 
 #define compare_float(f1, f2) \
     compare_float_precision(f1, f2, 0.00001)

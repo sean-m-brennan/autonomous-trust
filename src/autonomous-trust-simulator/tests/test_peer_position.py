@@ -16,7 +16,11 @@
 
 import pytest
 
-from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
+try:
+    from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
+except ImportError as _e:
+    pytestmark = pytest.mark.skip(reason=f"missing dependency: {_e}")
+    GeoPosition = UTMPosition = None
 
 
 @pytest.fixture

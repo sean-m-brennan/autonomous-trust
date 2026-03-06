@@ -16,7 +16,7 @@
 
 import os
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from queue import Empty, Full
 
 from autonomous_trust.core import Process, ProcMeta, CfgIds, Configuration, InitializableConfig
@@ -46,7 +46,7 @@ class MetadataProtocol(Protocol):
 class TimeSource(object):
     def acquire(self) -> datetime:
         # TODO tap into custom NTP
-        return datetime.utcnow()
+        return datetime.now(UTC)
 
 
 class PositionSource(object):

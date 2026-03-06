@@ -1,19 +1,17 @@
 [build-system]
-requires = ["maturin>=0.14,<0.15"]
+requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "autonomous-trust"
-version = "0.1.1"
-description = "AutonomousTrust - a high-trust cooperative computing framework"
+name = "autonomous-trust-zkp"
+version = "0.1.0"
+description = "ZK-STARK proof module for AutonomousTrust task data integrity (Plonky3 + PyO3)"
 authors = [
     {name = "Sean M Brennan", email = "sean.brennan@tekfive.com"}
 ]
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.10"
 
 [tool.maturin]
-python-source = "."
-python-packages = ["autonomous_trust"]
 manifest-path = "rust/Cargo.toml"
 features = ["pyo3/extension-module"]
 compatibility = "manylinux2014"

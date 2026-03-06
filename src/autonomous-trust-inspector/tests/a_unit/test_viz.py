@@ -17,8 +17,18 @@
 import os
 from queue import Queue
 import pytest
-from autonomous_trust.inspector.viz import server
+
+try:
+    from autonomous_trust.inspector.viz import server
+    has_viz = True
+except (ImportError, ModuleNotFoundError):
+    server = None
+    has_viz = False
+
 from .. import INSIDE_DOCKER
+
+pytestmark = pytest.mark.skipif(not has_viz,
+                                reason='inspector viz dependencies not available')
 
 
 @pytest.mark.skipif(INSIDE_DOCKER, reason='Inside docker (not valid)')

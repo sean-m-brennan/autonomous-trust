@@ -56,7 +56,7 @@ def test_insertion():
         _compare_ins(m)
 
 
-@pytest.mark.skip(reason="too long")
+@pytest.mark.slow
 def test_insertion_large():
     for m in range(1000, 10001, 1000):
         _compare_ins(m)

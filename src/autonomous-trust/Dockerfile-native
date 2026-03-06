@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1.3
+
+# AutonomousTrust image with native C backend (CFFI)
+# Builds the C library inside the image and sets AUTONOMOUS_TRUST_BACKEND=native.
+# Build with:
+#   docker build --network host -t autonomous-trust -f src/autonomous-trust/Dockerfile-native .
+
+FROM continuumio/miniconda3
+
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG CERT_CONTENT
+
+WORKDIR /app
+SHELL ["/bin/bash", "-c"]
+
+# Install CA cert for proxy if provided
+RUN if [ -n "$CERT_CONTENT" ]; then \
+      echo "$CERT_CONTENT" > /usr/local/share/ca-certificates/proxy-ca.crt && \
+      cat /usr/local/share/ca-certificates/proxy-ca.crt >> /etc/ssl/certs/ca-certificates.crt; \
+    fi
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt
+
+# Network tools + C build toolchain
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+        iproute2 iputils-ping \
+        cmake clang make pkg-config \
+        uuid-dev libsodium-dev libjansson-dev \
+        protobuf-compiler protobuf-c-compiler libprotobuf-c-dev libprotobuf-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+COPY src/autonomous-trust/entrypoint.sh /bin/entrypoint.sh
+ENV ROUTER="172.17.0.1"
+ENTRYPOINT ["/bin/entrypoint.sh"]
+
+COPY src/autonomous-trust/requirements.txt /app/requirements.txt
+RUN pip install -r /app/requirements.txt && pip install protobuf cffi
+
+# Build C library (src/c/protobuf is a symlink to src/protobuf — copy real dir separately)
+ARG GIT_VERSION="unknown"
+COPY src/c /app/c-src
+COPY src/protobuf /app/c-src/protobuf
+RUN rm -rf /app/c-src/build && mkdir -p /app/c-src/build && cd /app/c-src/build && \
+    CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DREVISION="$GIT_VERSION" && \
+    make -j$(nproc) && \
+    cp libautonomous_trust.so /usr/local/lib/ && \
+    ldconfig && \
+    cd /app && rm -rf /app/c-src
+
+# Copy Python package
+COPY src/autonomous-trust/autonomous_trust autonomous_trust
+RUN rm -rf autonomous_trust/etc autonomous_trust/var
+
+COPY src/autonomous-trust/pyproject.toml pyproject.toml
+
+ENV AUTONOMOUS_TRUST_ROOT="/"
+ENV AUTONOMOUS_TRUST_ENTRY="python3"
+ENV AUTONOMOUS_TRUST_BACKEND="native"
+ENV AUTONOMOUS_TRUST_LIB="/usr/local/lib/libautonomous_trust.so"
+ENV AUTONOMOUS_TRUST_ARGS=""
+CMD []

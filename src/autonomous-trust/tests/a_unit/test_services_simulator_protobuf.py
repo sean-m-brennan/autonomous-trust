@@ -18,29 +18,45 @@ import importlib
 
 import pytest
 
-from autonomous_trust.core.protobuf.services import position_pb2, metadata_pb2
-from autonomous_trust.core.protobuf.simulator import sim_data_pb2
+try:
+    from autonomous_trust.core.protobuf.services import position_pb2, metadata_pb2
+    has_services_proto = True
+except (ImportError, ModuleNotFoundError):
+    position_pb2 = metadata_pb2 = None
+    has_services_proto = False
+
+try:
+    from autonomous_trust.core.protobuf.simulator import sim_data_pb2
+    has_simulator_proto = True
+except (ImportError, ModuleNotFoundError):
+    sim_data_pb2 = None
+    has_simulator_proto = False
 
 has_services = importlib.util.find_spec('autonomous_trust.services') is not None
 has_simulator = importlib.util.find_spec('autonomous_trust.simulator') is not None
 
-services_skip = pytest.mark.skipif(not has_services, reason='autonomous_trust.services not installed')
-simulator_skip = pytest.mark.skipif(not has_simulator, reason='autonomous_trust.simulator not installed')
+services_skip = pytest.mark.skipif(not (has_services and has_services_proto),
+                                   reason='autonomous_trust.services or protobuf not available')
+simulator_skip = pytest.mark.skipif(not (has_simulator and has_simulator_proto),
+                                    reason='autonomous_trust.simulator or protobuf not available')
 
 
 # ---- Proto message classes are generated correctly ----
 
+@pytest.mark.skipif(not has_services_proto, reason='services protobuf not available')
 def test_position_pb2_has_messages():
     assert hasattr(position_pb2, 'Position')
     assert hasattr(position_pb2, 'GeoPosition')
     assert hasattr(position_pb2, 'UTMPosition')
 
 
+@pytest.mark.skipif(not has_services_proto, reason='services protobuf not available')
 def test_metadata_pb2_has_messages():
     assert hasattr(metadata_pb2, 'PeerData')
     assert hasattr(metadata_pb2, 'NetworkStats')
 
 
+@pytest.mark.skipif(not has_simulator_proto, reason='simulator protobuf not available')
 def test_sim_data_pb2_has_messages():
     assert hasattr(sim_data_pb2, 'Ident')
     assert hasattr(sim_data_pb2, 'SimState')

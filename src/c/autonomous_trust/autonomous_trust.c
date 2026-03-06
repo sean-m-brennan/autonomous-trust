@@ -37,6 +37,8 @@
 #include "structures/map_priv.h"
 #include "utilities/protobuf_shutdown.h"
 #include "network/network.h"
+#include "negotiation/negotiation.h"
+#include "reputation/reputation.h"
 
 
 void reread_configs() { /* do nothing */ }
@@ -212,7 +214,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
     array_t unhandled_msgs;
     if (array_init(&unhandled_msgs) != 0)
         log_exception(&logger);
-    sleep(3); // FIXME
+    usleep(500000); /* 0.5s startup delay */
     while (!stop_process)
     {
         // monitor processes for early termination
@@ -256,15 +258,21 @@ int run_autonomous_trust(char *q_in, char *q_out,
             log_exception(&logger);
         else if (ret == 0)
         {
-            if (task_msg.type != TASK)
+            switch (task_msg.type)
             {
-                /*error*/
-            }
-            else
-            {
-                // FIXME handling tasking from extern
-                // parse task
-                // send task to proper process
+            case TASK:
+                /* Route tasks to negotiation process */
+                if (messaging_send("negotiation", TASK, &task_msg, false) != 0)
+                    log_exception(&logger);
+                break;
+            case TASK_STATUS:
+                /* Route task status queries to negotiation */
+                if (messaging_send("negotiation", TASK_STATUS, &task_msg, false) != 0)
+                    log_exception(&logger);
+                break;
+            default:
+                log_warn(&logger, "%s: unexpected extern message type %ld\n", name, task_msg.type);
+                break;
             }
         }
 
@@ -289,21 +297,41 @@ int run_autonomous_trust(char *q_in, char *q_out,
         data_t *msg_dat;
         array_for_each(&unhandled_msgs, index, msg_dat)
         {
-            // FIXME handle msg
+            /* Route internal messages by type */
+            generic_msg_t *inner = NULL;
+            data_object_ptr(msg_dat, (void **)&inner);
+            if (inner != NULL)
+            {
+                switch (inner->type)
+                {
+                case TASK_RESULT:
+                    /* Task results go to reputation for scoring */
+                    if (messaging_send("reputation", TASK_RESULT, inner, false) != 0)
+                        log_exception(&logger);
+                    break;
+                case TASK_STATUS:
+                    /* Task status updates go to negotiation */
+                    if (messaging_send("negotiation", TASK_STATUS, inner, false) != 0)
+                        log_exception(&logger);
+                    break;
+                case TRANSACTION_SCORE:
+                    /* Transaction scores go to extern */
+                    if (array_append(&extern_msgs, msg_dat) != 0)
+                        log_exception(&logger);
+                    do_send = true;
+                    break;
+                default:
+                    break;
+                }
+            }
             if (array_remove(&unhandled_msgs, msg_dat) != 0)
                 log_exception(&logger);
-            if (false)
-            { // FIXME
-                if (array_append(&extern_msgs, msg_dat) != 0)
-                    log_exception(&logger);
-                do_send = true;
-            }
         }
         array_end_for_each
 
             if (do_send)
         {
-            if (messaging_send("extern_out", result_msg.type, &result_msg, false) != 0)
+            if (messaging_send(q_out, result_msg.type, &result_msg, false) != 0)
                 log_exception(&logger);
         }
 
