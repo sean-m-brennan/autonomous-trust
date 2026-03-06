@@ -8,7 +8,6 @@ dependencies:
   - docker-py
   - gitpython>=3.1.35
   - types-protobuf>=6.32.1
-  #- mercurial
   - pexpect
   - rsync
   - curl
@@ -21,8 +20,6 @@ dependencies:
   - pytest-asyncio
   - pytest-cov
   - go
-  - gcc
   - napkin
   - pylint
   - nodejs
-  - cxx-compiler
