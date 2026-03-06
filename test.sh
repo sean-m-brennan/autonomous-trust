@@ -9,9 +9,9 @@ status=0
 
 echo "========== Building the C library =========="
 if [[ "$@" = *"--verbose"* ]]; then
-  ./run-build.sh --c
+  ./build.sh --c
 else
-  ./run-build.sh --c >/dev/null
+  ./build.sh --c >/dev/null
 fi
 
 for pkg in autonomous-trust autonomous-trust-services autonomous-trust-inspector autonomous-trust-simulator; do

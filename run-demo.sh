@@ -56,7 +56,7 @@ fi
 
 # --- Generate protobuf Python files if needed ---
 
-./run-build.sh --py
+./build.sh --py
 
 # --- Detect proxy settings ---
 
