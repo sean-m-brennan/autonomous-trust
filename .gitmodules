@@ -1,3 +1,0 @@
-[submodule "tools"]
-	path = tools
-	url = git@github.com:sean-m-brennan/builders-toolbox.git
