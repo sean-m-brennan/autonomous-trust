@@ -407,11 +407,17 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             self.encrypted_messages.append((raw_msg, from_addr))
                     elif from_whom is not None:
                         try:
-                            decrypt_msg = self.myself.decrypt(raw_msg, from_whom)  # FIXME
+                            decrypt_msg = self.myself.decrypt(raw_msg, from_whom)
                             self._msg_to_queue(decrypt_msg, from_whom, queues, 'point-to-point')
                         except Exception:
-                            self.logger.error('Decryption error, msg from %s: %s' % (
-                            from_whom.nickname, traceback.format_exc()))  # FIXME
+                            # Some peer messages are intentionally unencrypted
+                            # (e.g. identity accept), so try plaintext fallback
+                            try:
+                                self._msg_to_queue(raw_msg, from_whom, queues, 'point-to-point', validate=False)
+                                self.logger.debug('Unencrypted peer message from %s' % from_whom.nickname)
+                            except Exception:
+                                self.logger.error('Decryption error, msg from %s: %s' % (
+                                    from_whom.nickname, traceback.format_exc()))
                     else:
                         self.logger.error(
                             'Recvd transmission from %s - not recognized as a peer. Ignoring.' % from_addr)
@@ -428,7 +434,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                 if from_whom is not None:
                                     self._msg_to_queue(decrypt_msg, from_whom, queues, 'group')
                                 else:
-                                    self.logger.error(
+                                    self.logger.warning(
                                         'Recvd transmission from %s - not in peers. Ignoring.' % from_addr)
                                     self.logger.debug('Ignored message: %s' % str(message))
                             except nacl.exceptions.CryptoError as e:

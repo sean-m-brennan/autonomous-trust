@@ -15,6 +15,9 @@
 # ******************
 
 import os
+
+import pytest
+
 import autonomous_trust
 from autonomous_trust.core.network.ping import ping
 
@@ -23,9 +26,13 @@ if here is None:
     here = '/app/autonomous_trust/__init__.py'
 host_dir = os.path.abspath(os.path.join(os.path.dirname(here), '..'))
 
+docker_ips_path = os.path.join(host_dir, 'docker_ips')
 
+
+@pytest.mark.skipif(not os.path.exists(docker_ips_path),
+                    reason='docker_ips not found (Docker-only test)')
 def test_peer_ping():
-    with open(os.path.join(host_dir, 'docker_ips'), 'r') as ip:
+    with open(docker_ips_path, 'r') as ip:
         for line in ip:
             ip_address = line.strip()
             stats = ping(ip_address)

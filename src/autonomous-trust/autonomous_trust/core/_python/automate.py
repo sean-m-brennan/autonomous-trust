@@ -110,9 +110,15 @@ class AutonomousTrust(Protocol):
         root: logging.Logger = logging.getLogger()
         root.setLevel(logging.DEBUG)
         self._logger: logging.Logger = logging.getLogger(self.name)
-        handlers = [logging.StreamHandler(sys.stdout)]
+        # Clear any stale handlers from prior instances (loggers are singletons)
+        self._logger.handlers.clear()
+        handlers = []
+        if not silent:
+            handlers.append(logging.StreamHandler(sys.stdout))
         if logfile != Configuration.log_stdout:
             handlers.append(TimedRotatingFileHandler(logfile, when="midnight", interval=1, backupCount=5))
+        if not handlers:
+            handlers.append(logging.NullHandler())
         for handler in handlers:
             handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
                                                    '%Y-%m-%d %H:%M:%S'))

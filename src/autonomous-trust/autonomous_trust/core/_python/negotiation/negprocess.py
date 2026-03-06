@@ -94,9 +94,11 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             for cap_name, uuid_list in self.peer_capabilities.items():
                 if cap_name == task.capability.name:
                     for peer_id in uuid_list:
-                        participants.append(self.peers.find_by_uuid(peer_id))
+                        peer = self.peers.find_by_uuid(peer_id)
+                        if peer is not None:
+                            participants.append(peer)
             if len(participants) < 1:
-                self.logger.error('No capable peers')
+                self.logger.warning('No capable peers')
                 # FIXME send error to main
             try:
                 for peer in participants:

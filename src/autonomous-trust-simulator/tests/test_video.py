@@ -17,12 +17,16 @@
 import os
 import threading
 
-import cv2
-import imutils
-import numpy as np
 import pytest
 
-from autonomous_trust.simulator.video import server, client
+try:
+    import cv2
+    import imutils
+    import numpy as np
+    from autonomous_trust.simulator.video import server, client
+except ImportError as _e:
+    pytestmark = pytest.mark.skip(reason=f"missing dependency: {_e}")
+    cv2 = imutils = np = server = client = None
 
 
 video_file = 'data/220505_02_MTB_4k_015.mp4'

@@ -224,69 +224,35 @@ class SimpleTestCfg(Configuration):
         self.value = value
 
 
-def test_yaml_file_io_unchanged():
-    """to_file/from_file use YAML in YAML mode."""
-    orig = Configuration.mode
-    Configuration.mode = SerializeMode.YAML
+def test_json_file_io():
+    """to_file/from_file use JSON."""
+    cfg = SimpleTestCfg('proto_test', 99)
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cfg.json', delete=False) as f:
+        filepath = f.name
     try:
-        cfg = SimpleTestCfg('proto_test', 99)
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.cfg.yaml', delete=False) as f:
-            filepath = f.name
-        try:
-            cfg.to_file(filepath)
-            with open(filepath, 'r') as f:
-                content = f.read()
-            assert 'proto_test' in content
+        cfg.to_file(filepath)
+        with open(filepath, 'r') as f:
+            content = f.read()
+        assert 'proto_test' in content
 
-            restored = Configuration.from_file(filepath)
-            assert restored.name == 'proto_test'
-            assert restored.value == 99
-        finally:
-            os.unlink(filepath)
+        restored = Configuration.from_file(filepath)
+        assert restored.name == 'proto_test'
+        assert restored.value == 99
     finally:
-        Configuration.mode = orig
+        os.unlink(filepath)
 
 
-# ---- to_yaml_string / from_yaml_string ----
-
-def test_to_yaml_string_with_yaml_mode(identity):
-    """to_yaml_string in YAML mode produces YAML."""
-    orig = Configuration.mode
-    Configuration.mode = SerializeMode.YAML
-    try:
-        s = to_yaml_string(identity)
-        assert '!Cfg:' in s
-        restored = from_yaml_string(s)
-        assert str(restored.uuid) == str(identity.uuid)
-    finally:
-        Configuration.mode = orig
+def test_to_json_string_plain_types():
+    """Non-Configuration objects serialize as JSON."""
+    s = to_yaml_string({'key': 'value'})
+    restored = from_yaml_string(s)
+    assert restored == {'key': 'value'}
 
 
-def test_to_yaml_string_plain_types():
-    """Non-Configuration objects use YAML."""
-    orig = Configuration.mode
-    Configuration.mode = SerializeMode.YAML
-    try:
-        s = to_yaml_string({'key': 'value'})
-        assert '!PB:' not in s
-        restored = from_yaml_string(s)
-        assert restored == {'key': 'value'}
-    finally:
-        Configuration.mode = orig
-
-
-# ---- Existing YAML tests still pass ----
-
-def test_yaml_mode_to_from_string():
-    """Verify YAML mode still works for to_string/from_string."""
-    orig = Configuration.mode
-    Configuration.mode = SerializeMode.YAML
-    try:
-        cfg = SimpleTestCfg('yaml_test', 7)
-        s = cfg.to_string()
-        assert '!PB:' not in s
-        assert 'yaml_test' in s
-        restored = Configuration.from_string(s)
-        assert restored.name == 'yaml_test'
-    finally:
-        Configuration.mode = orig
+def test_json_mode_to_from_string():
+    """Verify JSON mode works for to_string/from_string."""
+    cfg = SimpleTestCfg('json_test', 7)
+    s = cfg.to_string()
+    assert 'json_test' in s
+    restored = Configuration.from_string(s)
+    assert restored.name == 'json_test'

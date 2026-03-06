@@ -304,24 +304,25 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return
         self.logger.debug('Process accepted peer: %s (%s)' % (blob.identity.nickname, amnesia))
 
-        # inform other peers;  to self.handle_confirm_peer()
+        # inform existing group members about the new peer;  to self.handle_confirm_peer()
         message = Message(self.name, IdentityProtocol.confirm, blob, to_whom=self.group)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
-
-        if not amnesia:  # otherwise, already in listings
-            # add to group and peer list
-            self._add_peer(queues, blob.identity, amnesia)
 
         # send my identity in the open to enable encryption;  to self.handle_acceptance()
         msg_str = to_json_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
         message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=blob.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
-        # now send encrypted history (peer identities);  to self.receive_history()  # FIXME this should contain all peer identities
+        # send group key + history so peer can decrypt future group messages;  to self.receive_history()
         msg_str = to_json_string((self.group, self._history.recite()))
         message = Message(self.name, IdentityProtocol.history, msg_str, to_whom=blob.identity)
         self.logger.debug('Send full history')
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
+
+        if not amnesia:  # otherwise, already in listings
+            # add to group and peer list (after history is queued, so peer
+            # receives the group key before any group-encrypted messages)
+            self._add_peer(queues, blob.identity, amnesia)
 
     def welcoming_committee(self, queues, message):
         """

@@ -14,14 +14,19 @@
 #   limitations under the License.
 # ******************
 
+from __future__ import annotations
+
 from datetime import datetime, timedelta
 
 import pytest
-import matplotlib.pyplot as plt
 
-from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
-from autonomous_trust.simulator.peer.path import PathData, Path, Variability
-from autonomous_trust.simulator.peer.path import LineData, BezierData, BeziergonData, EllipseData
+try:
+    import matplotlib.pyplot as plt
+    from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
+    from autonomous_trust.simulator.peer.path import PathData, Path, Variability
+    from autonomous_trust.simulator.peer.path import LineData, BezierData, BeziergonData, EllipseData
+except ImportError as _e:
+    pytestmark = pytest.mark.skip(reason=f"missing dependency: {_e}")
 
 loops = 2
 steps = 10 * 2

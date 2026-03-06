@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- Run everything relative to this script ---
+
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$here" || exit 1
+
 # --- Parse arguments ---
 
 BACKEND="native"
@@ -51,23 +56,7 @@ fi
 
 # --- Generate protobuf Python files if needed ---
 
-PROTO_SRC="src/protobuf"
-PROTO_PY_DIR="src/autonomous-trust"
-PROTO_PY="$PROTO_PY_DIR/autonomous_trust/core/protobuf"
-PROTO_TARGET="$PROTO_PY_DIR/autonomous_trust/core/_python/protobuf"
-if [ ! -d "$PROTO_PY" ] || [ -z "$(find "$PROTO_PY" -name '*_pb2.py' 2>/dev/null)" ]; then
-    echo "Generating protobuf Python files..."
-    protoc --python_out="$PROTO_PY_DIR" -I "$PROTO_SRC" \
-        $(find "$PROTO_SRC" -name "*.proto")
-
-    # Create __init__.py files in all generated subdirs
-    find "$PROTO_PY" -type d -exec touch {}/__init__.py \;
-    touch "$PROTO_PY/__init__.py"
-    echo "Protobuf files generated."
-    mkdir -p $PROTO_TARGET
-    cp -R $PROTO_PY/. $PROTO_TARGET/
-    rm -rf $PROTO_PY
-fi
+./build_py.sh
 
 # --- Detect proxy settings ---
 
@@ -102,12 +91,8 @@ export AUTONOMOUS_TRUST_BACKEND="$BACKEND"
 
 # --- Launch Tilt ---
 
-cleanup() {
-    echo ""
-    echo "Shutting down Tilt..."
-    tilt down
-}
-trap cleanup INT TERM EXIT
-
 echo "Starting AutonomousTrust demo with $NUM_NODES nodes..."
 tilt up -- --num-nodes="$NUM_NODES" --backend="$BACKEND"
+# Blocks until killed (Ctl-C)
+
+tilt down -- $@

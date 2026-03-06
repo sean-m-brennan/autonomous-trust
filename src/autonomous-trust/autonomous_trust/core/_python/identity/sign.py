@@ -57,10 +57,8 @@ class Signature(Configuration):
         return self.private.encode(encoder=HexEncoder)
 
     def sync_to_message(self):
-        if self.public_only:
-            self.message.hex_seed = bytes(self.publish())
-        else:
-            self.message.hex_seed = bytes(self.private.encode(encoder=HexEncoder))
+        # Always serialize public key only (private keys must never go on the wire)
+        self.message.hex_seed = bytes(self.publish())
 
     def sync_from_message(self):
         hex_seed = self.message.hex_seed
