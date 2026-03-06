@@ -29,6 +29,10 @@ for pkg in autonomous-trust autonomous-trust-services autonomous-trust-inspector
           cov_flags="$cov_flags --cov-config=$pkg_dir/.coveragerc"
         fi
         (cd "$pkg_dir" && python -m pytest tests/ $cov_flags --ignore=tests/local --continue-on-collection-errors $flags -s "$@")
+        if [[ "$pkg" = "autonomous-trust" ]]; then
+          # Change backend
+          (cd "$pkg_dir" && AUTONOMOUS_TRUST_BACKEND=python python -m pytest tests/ $cov_flags --ignore=tests/local --continue-on-collection-errors $flags -s "$@")
+        fi
         rc=$?
         if [ $rc -eq 1 ]; then
             # Exit 1 = test failures; propagate as error
