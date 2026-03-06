@@ -30,7 +30,7 @@ class AgreementProof(Configuration):
     _msg_class = agreement_pb2.AgreementProof
 
     def __init__(self, uuid: UUID, digest: bytes, approval: bool, nonce: bytes = None):
-        super().__init__(agreement_pb2.AgreementProof)
+        Configuration.__init__(self, agreement_pb2.AgreementProof)
         self.uuid = uuid  # voter
         self.digest = digest  # hash of proposal
         self.approval = approval  # yea/nay
@@ -43,7 +43,7 @@ class AgreementProof(Configuration):
         self.message.uuid = str(self.uuid).encode('utf-8')
         self.message.digest = self.digest if self.digest else b''
         self.message.approval = self.approval
-        self.message.nonce = self.nonce if self.nonce else b''
+        self.message.nonce = self.nonce if self.nonce is not None else b''
 
     def sync_from_message(self):
         self.uuid = UUID(self.message.uuid.decode('utf-8'))

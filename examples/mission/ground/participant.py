@@ -33,15 +33,15 @@ from autonomous_trust.simulator.video.server import SimVideoSrc
 class MissionParticipant(AutonomousTrust):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.add_worker(SimMetadataSource, self.system_dependencies)  # metadata-source.cfg.yaml
+        self.add_worker(SimMetadataSource, self.system_dependencies)  # metadata-source.cfg.json
         self.add_worker(NetStatsSource, self.system_dependencies)  # no config
         # FIXME
         #if os.path.exists(os.path.join(Configuration.get_cfg_dir(),
         #                               VideoSource.name + Configuration.file_ext)):
-        #    self.add_worker(VideoSource, self.system_dependencies)  # video-source.cfg.yaml
+        #    self.add_worker(VideoSource, self.system_dependencies)  # video-source.cfg.json
         if os.path.exists(os.path.join(Configuration.get_cfg_dir(),
                                        DataSimSource.name + Configuration.file_ext)):
-            self.add_worker(DataSimSource, self.system_dependencies)  # data-source.cfg.yaml
+            self.add_worker(DataSimSource, self.system_dependencies)  # data-source.cfg.json
 
 
 if __name__ == '__main__':

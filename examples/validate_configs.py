@@ -54,11 +54,11 @@ def validate(directory, expected_groups=1, debug=False):
                     missing_groups.append(os.path.dirname(root))
                     missing_peers.append(os.path.dirname(root))
             for file in files:
-                if file == 'network.cfg.yaml':
+                if file == 'network.cfg.json':
                     file = os.path.join(os.path.relpath(root, directory), file)
                     net = Network.from_file(file)
                     addresses[os.path.dirname(os.path.dirname(root))] = net.ip4
-                if file == 'identity.cfg.yaml':
+                if file == 'identity.cfg.json':
                     if debug:
                         print(root, file)
                     missing_idents.remove(os.path.dirname(os.path.dirname(root)))
@@ -81,7 +81,7 @@ def validate(directory, expected_groups=1, debug=False):
                         print('%s has signature used in %s' % (file, prev))
                     else:
                         seen_signatures[ident.signature.publish()] = file
-                if file == 'group.cfg.yaml':
+                if file == 'group.cfg.json':
                     if debug:
                         print(root, file)
                     missing_groups.remove(os.path.dirname(os.path.dirname(root)))
@@ -110,7 +110,7 @@ def validate(directory, expected_groups=1, debug=False):
                     if grp.nickname not in grp_nicknames:
                         grp_nicknames[grp.nickname] = []
                     grp_nicknames[grp.nickname] += file
-                if file == 'peers.cfg.yaml':
+                if file == 'peers.cfg.json':
                     if debug:
                         print(root, file)
                     missing_peers.remove(os.path.dirname(os.path.dirname(root)))

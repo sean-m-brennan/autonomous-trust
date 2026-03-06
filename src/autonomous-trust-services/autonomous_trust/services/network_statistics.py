@@ -19,7 +19,7 @@ from queue import Full, Empty
 
 import psutil
 
-from autonomous_trust.core import Process, ProcMeta, Configuration, CfgIds, to_yaml_string
+from autonomous_trust.core import Process, ProcMeta, Configuration, CfgIds, to_json_string
 from autonomous_trust.core.identity import Identity
 from autonomous_trust.core.network import Message, Network
 from autonomous_trust.core.protocol import Protocol
@@ -122,7 +122,7 @@ class NetStatsSource(Process, metaclass=ProcMeta,
                 pass
 
             # ship it to consumer UI
-            obj = to_yaml_string(statistics)
+            obj = to_json_string(statistics)
             for peer in self.clients:
                 msg = Message(self.name, NetStatsProtocol.stats, obj, peer)
                 try:

@@ -58,6 +58,7 @@ class LinkedStep(Step, Configuration):
 
     def __init__(self, payload=None, uuid: UUID = None, timestamp: datetime = None,
                  parent: Step = None, previous=None):
+        Configuration.__init__(self, dag_pb2.LinkedStep)
         if uuid is None:
             uuid = uuid4()
         super().__init__(uuid)
@@ -91,25 +92,24 @@ class LinkedStep(Step, Configuration):
             self.message.parent.CopyFrom(self.parent.message)
 
     def sync_from_message(self):
-        if self.message.uuid:
-            try:
-                self.uuid = UUID(self.message.uuid.decode('utf-8'))
-            except ValueError:
-                self.uuid = None
-        else:
-            self.uuid = None
-        self.timestamp = now()
+        uuid_bytes = self.message.uuid
+        self.uuid = None
+        if uuid_bytes:
+            self.uuid = uuid_bytes.decode('utf-8')
         self.payload = None
+        self.timestamp = None
         self.previous = None
         if self.message.HasField('parent'):
-            self.parent = object.__new__(LinkedStep)
+            self.parent = LinkedStep.__new__(LinkedStep)
             self.parent.message = dag_pb2.LinkedStep()
             self.parent.message.CopyFrom(self.message.parent)
             self.parent.sync_from_message()
-            self._length = len(self.parent) + 1
         else:
             self.parent = Genesis
+        if self.parent is Genesis:
             self._length = 1
+        else:
+            self._length = len(self.parent)
 
 
 class InvalidBranchError(RuntimeError):

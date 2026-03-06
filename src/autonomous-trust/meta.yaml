@@ -38,4 +38,3 @@ requirements:
     - psutil
     - pynacl
     - python-dateutil
-    - ruamel.yaml

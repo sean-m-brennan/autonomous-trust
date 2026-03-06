@@ -14,9 +14,11 @@
 #   limitations under the License.
 # ******************
 
-import base64
+import io
 import os
 import sys
+import json
+import base64
 from io import StringIO
 from datetime import datetime, timedelta
 from dateutil import parser
@@ -24,47 +26,33 @@ from uuid import UUID
 from decimal import Decimal, getcontext
 from enum import Enum
 
-import ruamel.yaml
+from google.protobuf.json_format import MessageToJson, Parse as ParseJson
 from nacl.signing import SignedMessage
 
 from ..util import ClassEnumMeta
 
-yaml = ruamel.yaml.YAML(typ='safe')
-yaml.default_flow_style = False
-
 
 class SerializeMode(Enum):
     PROTO = 1
-    YAML = 2
+    JSON = 2
     PJSON = 3
 
 
-def to_yaml_string(item):
-    if Configuration.mode == SerializeMode.PROTO and isinstance(item, Configuration) and hasattr(item, 'message') and item._msg_class is not None:
-        return item.to_string()  # uses !PB: prefix
-    sio = StringIO()
-    yaml.dump(item, sio)
-    return sio.getvalue()
-
-
-def from_yaml_string(string):
-    if isinstance(string, str) and string.startswith('!PB:'):
-        return Configuration.from_string(string)
-    sio = StringIO(string) if isinstance(string, str) else StringIO(string.decode('utf-8'))
-    return yaml.load(sio)
-
+class WireFormat(Enum):
+    BINARY = 1
+    JSON = 2
 
 
 class Configuration(object):
     ROOT_VARIABLE_NAME = 'AUTONOMOUS_TRUST_ROOT'
     CFG_PATH = os.path.join('etc', 'at')
     DATA_PATH = os.path.join('var', 'at')
-    YAML_PREFIX = u'!Cfg'
-    PROTO_PREFIX = '!PB:'
-    mode = SerializeMode.PROTO
-    file_ext = '.cfg.yaml'  # disk is always YAML regardless of mode
+    # FIXME from config
+    mode = SerializeMode.JSON
+    wire_format = WireFormat.JSON
+    file_ext = '.cfg.json'
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
-    _msg_class = None  # subclasses with protos override this
+    _msg_class = None
 
     def __init__(self, msg_class=None):
         mc = msg_class or self.__class__._msg_class
@@ -82,10 +70,6 @@ class Configuration(object):
     def get_data_dir(cls):
         return cls.get_cfg_dir().removesuffix(cls.CFG_PATH) + cls.DATA_PATH
 
-    @property
-    def yaml_tag(self):
-        return '%s:%s.%s' % (Configuration.YAML_PREFIX, self.__class__.__module__, self.__class__.__name__)
-
     def __repr__(self):
         attrs = []
         for k, v in sorted(self.to_dict().items()):
@@ -101,26 +85,33 @@ class Configuration(object):
             del d['message']
         return d
 
-    @staticmethod
-    def yaml_representer(dumper, data):
-        return dumper.represent_mapping(data.yaml_tag, data.to_dict())
-
     def sync_to_message(self):
         raise NotImplementedError
 
     def to_stream(self, stream):
-        yaml.dump(self, stream)
+        if self.mode == SerializeMode.JSON:
+            stream.write(json.dumps(self, cls=ConfigJSONEncoder))
+        else:
+            self.sync_to_message()
+            if self.wire_format == WireFormat.BINARY:
+                stream.write(self.message.SerializeToString())
+            else:
+                stream.write(MessageToJson(self.message))
 
-    def to_yaml_string(self):
-        sio = StringIO()
-        self.to_stream(sio)
-        return sio.getvalue()
+    def to_json_string(self):
+        return str(self)
+
+    # Backward-compat alias
+    to_yaml_string = to_json_string
 
     def to_string(self):
-        if self.mode == SerializeMode.PROTO and hasattr(self, 'message') and self._msg_class is not None:
-            self.sync_to_message()
-            class_tag = '%s.%s' % (self.__class__.__module__, self.__class__.__name__)
-            return self.PROTO_PREFIX + class_tag + ':' + base64.b64encode(self.message.SerializeToString()).decode('ascii')
+        if self.mode == SerializeMode.PROTO and self.wire_format == WireFormat.BINARY:
+            buf = io.BytesIO()
+            self.to_stream(buf)
+            return buf.getvalue()
+        return str(self)
+
+    def __str__(self):
         sio = StringIO()
         self.to_stream(sio)
         return sio.getvalue()
@@ -146,53 +137,55 @@ class Configuration(object):
 
     def to_file(self, filepath):
         with open(filepath, 'w') as cfg:
-            self.to_stream(cfg)
-
-    @staticmethod
-    def yaml_constructor(loader, tag_suffix, node):
-        modulename, classname = tag_suffix[1:].rsplit('.', 1)
-        cls = getattr(sys.modules[modulename], classname)
-        return cls(**loader.construct_mapping(node, deep=True))
+            json.dump(self, cfg, cls=ConfigJSONEncoder, indent=2)
 
     def sync_from_message(self):
         raise NotImplementedError
 
     @classmethod
     def from_stream(cls, stream):
-        return yaml.load(stream)
+        if cls.mode == SerializeMode.JSON:
+            data = stream.read()
+            if isinstance(data, bytes):
+                data = data.decode('utf-8')
+            return json.loads(data, object_hook=config_json_decoder)
+        else:
+            obj = cls.__new__(cls)
+            msg_class = cls._msg_class
+            if msg_class is None:
+                raise ValueError('No _msg_class defined for %s' % cls.__name__)
+            obj.message = msg_class()
+            data = stream.read()
+            if cls.wire_format == WireFormat.BINARY:
+                obj.message.ParseFromString(data)
+            else:
+                if isinstance(data, bytes):
+                    data = data.decode('utf-8')
+                ParseJson(data, obj.message)
+            obj.sync_from_message()
+            return obj
 
     @classmethod
-    def from_yaml_string(cls, string):
-        sio = StringIO(string)
-        return cls.from_stream(sio)
+    def from_json_string(cls, string):
+        return cls.from_string(string)
+
+    # Backward-compat alias
+    from_yaml_string = from_json_string
 
     @classmethod
     def from_string(cls, string):
-        if isinstance(string, str) and string.startswith(cls.PROTO_PREFIX):
-            rest = string[len(cls.PROTO_PREFIX):]
-            if ':' in rest:
-                class_tag, b64data = rest.split(':', 1)
-                data = base64.b64decode(b64data)
-                # If called on base Configuration, resolve the actual class
-                if cls is Configuration or cls._msg_class is None:
-                    modulename, classname = class_tag.rsplit('.', 1)
-                    target_cls = getattr(sys.modules[modulename], classname)
-                    return target_cls.from_wire_bytes(data)
-                return cls.from_wire_bytes(data)
-            else:
-                data = base64.b64decode(rest)
-                return cls.from_wire_bytes(data)
+        if cls.mode == SerializeMode.PROTO and cls.wire_format == WireFormat.BINARY:
+            buf = io.BytesIO(string)
+            return cls.from_stream(buf)
+        if isinstance(string, bytes):
+            string = string.decode('utf-8')
         sio = StringIO(string)
         return cls.from_stream(sio)
 
     @classmethod
     def from_file(cls, filepath):
         with open(filepath, 'r') as cfg:
-            return cls.from_stream(cfg)
-
-
-yaml.representer.add_multi_representer(Configuration, Configuration.yaml_representer),
-yaml.constructor.add_multi_constructor(Configuration.YAML_PREFIX, Configuration.yaml_constructor)
+            return json.load(cfg, object_hook=config_json_decoder)
 
 
 class InitializableConfig(Configuration):
@@ -204,66 +197,87 @@ class EmptyObject(Configuration):
     pass
 
 
-def datetime_representer(dumper, data: datetime):
-    return dumper.represent_scalar(u'!datetime', u'%s' % data.isoformat('T'))
+class ConfigJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Configuration):
+            type_name = obj.__class__.__module__ + '.' + obj.__class__.__name__
+            d = {'__type__': type_name}
+            d.update(obj.to_dict())
+            return d
+        if isinstance(obj, Enum):
+            type_name = 'Enumcfg:' + obj.__class__.__module__ + '.' + obj.__class__.__name__
+            return {'__type__': type_name, '__value__': obj.name}
+        if isinstance(obj, datetime):
+            return {'__type__': 'datetime', '__value__': obj.isoformat('T')}
+        if isinstance(obj, timedelta):
+            return {'__type__': 'timedelta', '__value__': obj.total_seconds()}
+        if isinstance(obj, UUID):
+            return {'__type__': 'UUID', '__value__': str(obj)}
+        if isinstance(obj, Decimal):
+            return {'__type__': 'Decimal', '__value__': str(obj)}
+        if isinstance(obj, bytes):
+            return {'__type__': 'bytes', '__value__': base64.b64encode(obj).decode('ascii')}
+        if isinstance(obj, SignedMessage):
+            return {'__type__': 'signedmessage', '__value__': {
+                'message': base64.b64encode(obj.message).decode('ascii'),
+                'signature': base64.b64encode(obj.signature).decode('ascii'),
+            }}
+        return super().default(obj)
 
 
-def datetime_constructor(loader, node):
-    value = loader.construct_scalar(node)
-    return parser.parse(value)
+def config_json_decoder(dct):
+    if '__type__' not in dct:
+        return dct
+    type_name = dct['__type__']
+    if type_name == 'datetime':
+        return parser.parse(dct['__value__'])
+    if type_name == 'timedelta':
+        return timedelta(seconds=float(dct['__value__']))
+    if type_name == 'UUID':
+        return UUID(dct['__value__'])
+    if type_name == 'Decimal':
+        value = dct['__value__']
+        getcontext().prec = len(value)
+        return Decimal(value)
+    if type_name == 'bytes':
+        return base64.b64decode(dct['__value__'])
+    if type_name == 'signedmessage':
+        val = dct['__value__']
+        sig = base64.b64decode(val['signature'])
+        msg = base64.b64decode(val['message'])
+        return SignedMessage._from_parts(signature=sig, message=msg, combined=sig + msg)
+    if type_name.startswith('Enumcfg:'):
+        enum_path = type_name[len('Enumcfg:'):]
+        module_name, class_name = enum_path.rsplit('.', 1)
+        try:
+            module = sys.modules[module_name]
+        except KeyError:
+            from importlib import import_module
+            module = import_module(module_name)
+        cls = getattr(module, class_name)
+        return cls[dct['__value__']]
+    if '.' in type_name:
+        module_name, class_name = type_name.rsplit('.', 1)
+        try:
+            module = sys.modules[module_name]
+        except KeyError:
+            from importlib import import_module
+            module = import_module(module_name)
+        cls = getattr(module, class_name)
+        kwargs = {k: v for k, v in dct.items() if k != '__type__'}
+        return cls(**kwargs)
+    return dct
 
 
-yaml.representer.add_representer(datetime, datetime_representer),
-yaml.constructor.add_constructor(u'!datetime', datetime_constructor)
+# Module-level serialization functions
+def to_json_string(item):
+    return json.dumps(item, cls=ConfigJSONEncoder)
 
 
-def timedelta_representer(dumper, data: timedelta):
-    return dumper.represent_scalar(u'!timedelta', u'%s' % data.total_seconds())
+def from_json_string(string):
+    return json.loads(string, object_hook=config_json_decoder)
 
 
-def timedelta_constructor(loader, node):
-    value = loader.construct_scalar(node)
-    return timedelta(seconds=float(value))
-
-
-yaml.representer.add_representer(timedelta, timedelta_representer),
-yaml.constructor.add_constructor(u'!timedelta', timedelta_constructor)
-
-
-def uuid_representer(dumper, data: UUID):
-    return dumper.represent_scalar(u'!UUID', u'%s' % str(data))
-
-
-def uuid_constructor(loader, node):
-    value = loader.construct_scalar(node)
-    return UUID(value)
-
-
-yaml.representer.add_representer(UUID, uuid_representer),
-yaml.constructor.add_constructor(u'!UUID', uuid_constructor)
-
-
-def signedmessage_representer(dumper, data: SignedMessage):
-    return dumper.represent_mapping(u'!signedmessage', dict(message=data.message, signature=data.signature))
-
-
-def signedmessage_constructor(loader, node):
-    return SignedMessage(**loader.construct_mapping(node, deep=True))
-
-
-yaml.representer.add_representer(SignedMessage, signedmessage_representer),
-yaml.constructor.add_constructor(u'!signedmessage', signedmessage_constructor)
-
-
-def decimal_representer(dumper, data: Decimal):
-    return dumper.represent_scalar(u'!Decimal', u'%s' % str(data))
-
-
-def decimal_constructor(loader, node):
-    value = loader.construct_scalar(node)
-    getcontext().prec = len(value)
-    return Decimal(value)
-
-
-yaml.representer.add_representer(Decimal, decimal_representer),
-yaml.constructor.add_constructor(u'!Decimal', decimal_constructor)
+# Backward-compat aliases
+to_yaml_string = to_json_string
+from_yaml_string = from_json_string
