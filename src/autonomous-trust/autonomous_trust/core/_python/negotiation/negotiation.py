@@ -122,13 +122,49 @@ class TaskStatus(Task):
 
 
 class TaskResult(TaskInfo):
-    def __init__(self, task=None, result=None, **kwargs):
+    def __init__(self, task=None, result=None, proof=None, **kwargs):
         if task is None:
             task_args = {}
         else:
             task_args = task.to_dict()
         super().__init__(**task_args, **kwargs)
         self.result = result
+        self.proof = proof
+
+    def generate_proof(self):
+        """Generate a ZK-STARK proof of data integrity for this result.
+
+        The proof covers the serialized task UUID + result data, allowing
+        a verifier to confirm the result hasn't been tampered with.
+        Returns True if proof was generated, False if ZKP is unavailable.
+        """
+        from autonomous_trust.core._zkp import ZKP_AVAILABLE, prove
+        if not ZKP_AVAILABLE:
+            return False
+        self.proof = prove(self._proof_data())
+        return True
+
+    def verify_proof(self) -> Optional[bool]:
+        """Verify the ZK-STARK proof attached to this result.
+
+        Returns True if valid, False if invalid, None if no proof is present
+        or ZKP is unavailable.
+        """
+        if self.proof is None:
+            return None
+        from autonomous_trust.core._zkp import ZKP_AVAILABLE, verify
+        if not ZKP_AVAILABLE:
+            return None
+        return verify(self.proof)
+
+    def _proof_data(self) -> bytes:
+        """Serialize the fields covered by the proof."""
+        import json
+        payload = json.dumps({
+            'uuid': str(self.uuid),
+            'result': self.result,
+        }, sort_keys=True, default=str)
+        return payload.encode('utf-8')
 
 
 class TaskCounter(Task):
