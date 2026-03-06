@@ -44,5 +44,5 @@ if [[ "$@" = *"--c"* ]]; then
   rm -rf build
   cmake -S . -B build
   cd build || exit 1
-  make
+  make -j1
 fi

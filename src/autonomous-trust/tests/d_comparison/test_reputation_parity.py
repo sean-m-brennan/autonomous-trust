@@ -29,7 +29,7 @@ class TestReputationParity:
     def test_transaction_history_crud(self):
         """TransactionHistory: create, update, len."""
         from autonomous_trust.core._native.reputation import (
-            TransactionHistory,
+            NativeTransactionHistory as TransactionHistory,
         )
 
         hist = TransactionHistory()
@@ -53,7 +53,9 @@ class TestReputationParity:
 
     def test_reputations_crud(self):
         """Reputations: create, update, get, contains."""
-        from autonomous_trust.core._native.reputation import Reputations
+        from autonomous_trust.core._native.reputation import (
+            NativeReputations as Reputations,
+        )
 
         reps = Reputations()
 
@@ -75,7 +77,9 @@ class TestReputationParity:
     def test_reputation_compute_default(self):
         """Default reputation for unknown peer is 0.5 (neutral)."""
         from autonomous_trust.core._native.reputation import (
-            TransactionHistory, Reputations, reputation_compute,
+            NativeTransactionHistory as TransactionHistory,
+            NativeReputations as Reputations,
+            native_reputation_compute as reputation_compute,
         )
 
         hist = TransactionHistory()
@@ -91,7 +95,9 @@ class TestReputationParity:
     def test_reputation_compute_with_history(self):
         """Reputation after recording transactions."""
         from autonomous_trust.core._native.reputation import (
-            TransactionHistory, Reputations, reputation_compute,
+            NativeTransactionHistory as TransactionHistory,
+            NativeReputations as Reputations,
+            native_reputation_compute as reputation_compute,
         )
 
         hist = TransactionHistory()
@@ -120,7 +126,9 @@ class TestNegotiationParity:
 
     def test_job_queue_lifecycle(self):
         """JobQueue: create, count, clear."""
-        from autonomous_trust.core._native.negotiation import JobQueue
+        from autonomous_trust.core._native.negotiation import (
+            NativeJobQueue as JobQueue,
+        )
 
         jq = JobQueue()
         assert len(jq) == 0
@@ -130,7 +138,9 @@ class TestNegotiationParity:
 
     def test_task_tracker_lifecycle(self):
         """TaskTracker: create, set_result, result_count."""
-        from autonomous_trust.core._native.negotiation import TaskTracker
+        from autonomous_trust.core._native.negotiation import (
+            NativeTaskTracker as TaskTracker,
+        )
 
         task_id = uuid.uuid4()
         tt = TaskTracker(task_id.bytes, expected=3)

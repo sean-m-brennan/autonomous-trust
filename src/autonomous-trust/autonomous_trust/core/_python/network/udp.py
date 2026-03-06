@@ -118,7 +118,8 @@ class UDPNetworkProcess(NetworkProcess):
     def _recv_udp(self, sock, packet_size):
         msg, (addr, port) = sock.recvfrom(packet_size)
         if addr == self.my_address:
-            return None, None, None  # my own message
+            if self.acceptance is None or not self.acceptance(addr):
+                return None, None, None  # my own message
         if self.reject_message(addr):
             return None, addr, port  # reject
         return msg, addr, port

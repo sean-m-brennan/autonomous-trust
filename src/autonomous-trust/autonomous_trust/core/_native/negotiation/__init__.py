@@ -14,13 +14,16 @@
 #   limitations under the License.
 # ******************
 
-# Native C-backed wrappers
-from .negotiation import (
-    NegotiationProtocol,
-    JobQueue,
-    TaskTracker,
+# Native C-backed wrappers (available under prefixed names)
+from ._native_wrappers import (
+    JobQueue as NativeJobQueue,
+    TaskTracker as NativeTaskTracker,
 )
 
-# Delegate to Python for classes without native C wrappers
+# API-compatible exports from Python backend
+from ..._python.negotiation.protocol import NegotiationProtocol
+from ..._python.negotiation.negotiation import (
+    Task, TaskParameters, TaskStatus, Status, TaskResult,
+    JobQueue, TaskTracker,
+)
 from ..._python.negotiation.negprocess import NegotiationProcess
-from ..._python.negotiation.negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult

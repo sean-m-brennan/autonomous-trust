@@ -52,7 +52,7 @@ class TestBackendSwitching:
 
     def test_native_reputation_types(self):
         """Native reputation types are C-backed."""
-        from autonomous_trust.core._native.reputation.reputation import (
+        from autonomous_trust.core._native.reputation._native_wrappers import (
             TransactionHistory, Reputations, reputation_compute,
         )
 

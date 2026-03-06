@@ -14,14 +14,14 @@
 #   limitations under the License.
 # ******************
 
-# Native C-backed wrappers
-from .reputation import (
-    ReputationProtocol,
-    TransactionHistory,
-    Reputations,
-    reputation_compute,
+# Native C-backed wrappers (available under prefixed names)
+from ._native_wrappers import (
+    TransactionHistory as NativeTransactionHistory,
+    Reputations as NativeReputations,
+    reputation_compute as native_reputation_compute,
 )
 
-# Delegate to Python for classes without native C wrappers
-from ..._python.reputation.reputation import TransactionScore
+# API-compatible exports from Python backend
+from ..._python.reputation.protocol import ReputationProtocol
+from ..._python.reputation.reputation import TransactionHistory, Reputations, TransactionScore
 from ..._python.reputation.repprocess import ReputationProcess
