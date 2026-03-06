@@ -40,21 +40,21 @@ def test_sim_config():
     end = datetime.now() + timedelta(minutes=30)
     shape1 = LineData(t5, uah)
     path1 = PathData(start, end, shape1, Variability.BROWNIAN, 4.4, Variability.UNIFORM)
-    peer1 = PeerInfo(str(uuid4()), 'drone', '192.168.0.1', path1.shape.start, -200.,
+    peer1 = PeerInfo(str(uuid4()), 'drone', 'peer1', '192.168.0.1', path1.shape.start, -200.,
                      Antenna.YAGI, NetInterface.MEDIUM, start, end, path1, [])
     shape2 = BezierData(t5, uah, [one, two])
     path2 = PathData(start, end, shape2, Variability.GAUSSIAN, 4.4, Variability.UNIFORM)
-    peer2 = PeerInfo(str(uuid4()), 'drone', '192.168.0.2', path2.shape.start, -200.,
+    peer2 = PeerInfo(str(uuid4()), 'drone', 'peer2', '192.168.0.2', path2.shape.start, -200.,
                      Antenna.DIPOLE, NetInterface.SMALL, start, end, path2, [])
     shape3 = BeziergonData(t5, [one, two], 2)
     path3 = PathData(start, end, shape3, Variability.GAUSSIAN, 4.4, Variability.UNIFORM)
-    peer3 = PeerInfo(str(uuid4()), 'drone', '192.168.0.3', path3.shape.start, -200.,
+    peer3 = PeerInfo(str(uuid4()), 'drone', 'peer3', '192.168.0.3', path3.shape.start, -200.,
                      Antenna.DIPOLE, NetInterface.SMALL, start, end, path3, [])
     shape4 = EllipseData(uah, 1000, 600, -45., 2)
     path4 = PathData(start, end, shape4, Variability.GAUSSIAN, 4.4, Variability.UNIFORM)
-    peer4 = PeerInfo(str(uuid4()), 'drone', '192.168.0.4', path4.shape.start, -200.,
+    peer4 = PeerInfo(str(uuid4()), 'drone', 'peer4', '192.168.0.4', path4.shape.start, -200.,
                      Antenna.DIPOLE, NetInterface.SMALL, start, end, path4, [])
-    config = SimConfig(time=start, peers=[peer1, peer2, peer3, peer4])
+    config = SimConfig(start=start, end=end, peers=[peer1, peer2, peer3, peer4])
     s = config.to_json_string()
     config2 = SimConfig.load(s)
     assert repr(config) == repr(config2)

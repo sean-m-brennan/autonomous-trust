@@ -14,15 +14,171 @@
  *   limitations under the License.
  *******************/
 
+#include <string.h>
+#include <sodium.h>
+
+#include "autonomous_trust/structures/dag.h"
+#include "autonomous_trust/utilities/protobuf_shutdown.h"
+
 #define DEBUG_TESTS 1
 #include "test_setup.h"
 
-/* DAG types not yet implemented (dag.h is empty).
-   Placeholder until dag.h/dag.c are populated. */
-
-DEFINE_TEST(test_dag_placeholder)
+DEFINE_TEST(test_dag_create_and_add)
 {
-    ck_assert(1);
-}
+    if (sodium_init() < 0 && sodium_init() != 1)
+        return;
 
-RUN_TESTS(DAG, test_dag_placeholder)
+    step_dag_t dag;
+    ck_assert_ret_ok(dag_init(&dag));
+
+    linked_step_t *s1 = NULL;
+    ck_assert_ret_ok(linked_step_create(NULL, NULL, &s1));
+    ck_assert_ptr_nonnull(s1);
+    ck_assert_int_eq(s1->length, 1);
+
+    ck_assert_ret_ok(dag_add_step(&dag, s1, NULL));
+
+    linked_step_t *s2 = NULL;
+    ck_assert_ret_ok(linked_step_create(NULL, NULL, &s2));
+    ck_assert_ret_ok(dag_add_step(&dag, s2, NULL));
+    ck_assert_int_eq(s2->length, 2);
+    ck_assert(s2->parent == s1);
+
+    linked_step_t *head = NULL;
+    ck_assert_ret_ok(dag_fork(&dag, NULL, &head));
+    ck_assert(head == s2);
+
+    dag_free(&dag);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_dag_branch_and_merge)
+{
+    step_dag_t dag;
+    ck_assert_ret_ok(dag_init(&dag));
+
+    linked_step_t *s1 = NULL;
+    ck_assert_ret_ok(linked_step_create("aaaa-1111", NULL, &s1));
+    ck_assert_ret_ok(dag_add_step(&dag, s1, NULL));
+
+    linked_step_t *s2 = NULL;
+    ck_assert_ret_ok(linked_step_create("bbbb-2222", NULL, &s2));
+    ck_assert_ret_ok(dag_add_step(&dag, s2, NULL));
+
+    /* branch from main */
+    linked_step_t *b1 = NULL;
+    ck_assert_ret_ok(linked_step_create("cccc-3333", NULL, &b1));
+    ck_assert_ret_ok(dag_branch(&dag, "feature", b1, DAG_MAIN_BRANCH));
+
+    linked_step_t *b2 = NULL;
+    ck_assert_ret_ok(linked_step_create("dddd-4444", NULL, &b2));
+    ck_assert_ret_ok(dag_add_step(&dag, b2, "feature"));
+
+    /* add to main too */
+    linked_step_t *s3 = NULL;
+    ck_assert_ret_ok(linked_step_create("eeee-5555", NULL, &s3));
+    ck_assert_ret_ok(dag_add_step(&dag, s3, NULL));
+
+    /* merge feature into main */
+    ck_assert_ret_ok(dag_merge(&dag, "feature", NULL, false));
+
+    dag_free(&dag);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_dag_diff)
+{
+    step_dag_t dag;
+    ck_assert_ret_ok(dag_init(&dag));
+
+    linked_step_t *s1 = NULL;
+    ck_assert_ret_ok(linked_step_create("1111", NULL, &s1));
+    ck_assert_ret_ok(dag_add_step(&dag, s1, NULL));
+
+    /* create branch from genesis */
+    linked_step_t *b1 = NULL;
+    ck_assert_ret_ok(linked_step_create("2222", NULL, &b1));
+    ck_assert_ret_ok(dag_branch(&dag, "other", b1, "genesis"));
+
+    int idx;
+    linked_step_t *common;
+    ck_assert_ret_ok(dag_diff(&dag, "other", DAG_MAIN_BRANCH, &idx, &common));
+    ck_assert_int_eq(idx, 0);
+
+    dag_free(&dag);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_dag_recite)
+{
+    step_dag_t dag;
+    ck_assert_ret_ok(dag_init(&dag));
+
+    linked_step_t *s1 = NULL;
+    ck_assert_ret_ok(linked_step_create("a1a1", NULL, &s1));
+    ck_assert_ret_ok(dag_add_step(&dag, s1, NULL));
+
+    linked_step_t *s2 = NULL;
+    ck_assert_ret_ok(linked_step_create("b2b2", NULL, &s2));
+    ck_assert_ret_ok(dag_add_step(&dag, s2, NULL));
+
+    linked_step_t *s3 = NULL;
+    ck_assert_ret_ok(linked_step_create("c3c3", NULL, &s3));
+    ck_assert_ret_ok(dag_add_step(&dag, s3, NULL));
+
+    array_t *steps = NULL;
+    ck_assert_ret_ok(dag_recite(&dag, NULL, NULL, &steps));
+    ck_assert_ptr_nonnull(steps);
+
+    /* recite returns head-to-root order */
+    ck_assert_int_eq(array_size(steps), 3);
+
+    array_free(steps);
+    dag_free(&dag);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_dag_ingest_branch)
+{
+    step_dag_t dag;
+    ck_assert_ret_ok(dag_init(&dag));
+
+    /* create external steps */
+    linked_step_t *ext[3];
+    ck_assert_ret_ok(linked_step_create("ext-3", NULL, &ext[0]));  /* head */
+    ck_assert_ret_ok(linked_step_create("ext-2", NULL, &ext[1]));
+    ck_assert_ret_ok(linked_step_create("ext-1", NULL, &ext[2]));  /* root */
+
+    char name[32];
+    ck_assert_ret_ok(dag_ingest_branch(&dag, ext, 3, "incoming", name, sizeof(name)));
+    ck_assert_str_eq(name, "incoming");
+
+    linked_step_t *head = NULL;
+    ck_assert_ret_ok(dag_fork(&dag, "incoming", &head));
+    ck_assert_ptr_nonnull(head);
+
+    dag_free(&dag);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_dag_branch_exists_error)
+{
+    step_dag_t dag;
+    ck_assert_ret_ok(dag_init(&dag));
+
+    linked_step_t *s1 = NULL;
+    ck_assert_ret_ok(linked_step_create(NULL, NULL, &s1));
+    ck_assert_ret_ok(dag_branch(&dag, "test_br", s1, "genesis"));
+
+    /* try creating same branch again */
+    linked_step_t *s2 = NULL;
+    ck_assert_ret_ok(linked_step_create(NULL, NULL, &s2));
+    ck_assert_ret_nonzero(dag_branch(&dag, "test_br", s2, "genesis"));
+
+    dag_free(&dag);
+}
+END_TEST_DEFINITION()
+
+RUN_TESTS(DAG, test_dag_create_and_add, test_dag_branch_and_merge,
+          test_dag_diff, test_dag_recite, test_dag_ingest_branch,
+          test_dag_branch_exists_error)

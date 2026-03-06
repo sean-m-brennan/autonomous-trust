@@ -14,15 +14,15 @@
 #   limitations under the License.
 # ******************
 
-# Native C-backed wrappers
-from .network import NetworkConfig
+# Native C-backed wrappers (renamed to avoid intercepting _python imports)
+from ._netconfig import NetworkConfig
 from .message import NetWireMessage, RecipientType
-from .ping import PingStats, ping
+from ._ping_native import PingStats as NativePingStats, ping as native_ping
 
-# Delegate to Python for classes without native C wrappers
+# Delegate to Python for API-compatible classes
 from ..._python.network.network import Network
 from ..._python.network.message import Message
 from ..._python.network.netprocess import NetworkProcess, NetworkProtocol
 from ..._python.network.tcp import TCPNetworkProcess
 from ..._python.network.udp import UDPNetworkProcess
-from ..._python.network.ping import PingServer
+from ..._python.network.ping import PingServer, PingStats, ping

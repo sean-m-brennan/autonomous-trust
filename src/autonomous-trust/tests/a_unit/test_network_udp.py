@@ -57,6 +57,7 @@ def _make_proc(my_address='192.168.1.10', port=8000, group_port=8001,
     proc.logger = MagicMock()
     proc.my_ip = my_address
     proc.reject_message.return_value = reject
+    proc.acceptance = None
     if sock_options is None:
         proc.sock_options = (socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     else:
@@ -762,8 +763,8 @@ def test_p2p(setup_teardown):
     udp = _UDP(cfgs, dict({}), None, acceptance_func=lambda x: True)
     udp.send_peer('test1', net_addr)
     msg_tpl = udp.recv_peer()
-    assert 'test1' == msg_tpl[0]
-    assert net_addr == msg_tpl[1][0]
+    assert b'test1' == msg_tpl[0]
+    assert net_addr == msg_tpl[1]
 
 
 @pytest.mark.skip(reason="blocked by firewall")

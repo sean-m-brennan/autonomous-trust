@@ -171,9 +171,12 @@ set(libsrc
     autonomous_trust/autonomous_trust.c
     autonomous_trust/algorithms/agreement.c
     autonomous_trust/config/configuration.c
+    autonomous_trust/config/discover.c
+    autonomous_trust/config/names.c
     autonomous_trust/identity/encryptor.c
     autonomous_trust/identity/group.c
     autonomous_trust/identity/hexlify.c
+    autonomous_trust/identity/history.c
     autonomous_trust/identity/identity.c
     autonomous_trust/identity/id_proc.c
     autonomous_trust/identity/peers.c
@@ -208,6 +211,7 @@ set(libsrc
     autonomous_trust/utilities/message.c
     autonomous_trust/utilities/msg_types.c
     autonomous_trust/utilities/protobuf_shutdown.cpp
+    autonomous_trust/utilities/queue_pool.c
     autonomous_trust/utilities/sighandler.c
     autonomous_trust/utilities/util.c
 )
@@ -216,7 +220,11 @@ set(libhdr
     autonomous_trust/algorithms/agreement.h
     autonomous_trust/algorithms/algorithms.h
     autonomous_trust/config/configuration.h
+    autonomous_trust/config/discover.h
+    autonomous_trust/config/names.h
+    autonomous_trust/identity/history.h
     autonomous_trust/identity/identity.h
+    autonomous_trust/identity/peers.h
     autonomous_trust/network/net_message.h
     autonomous_trust/processes/capabilities.h
     autonomous_trust/structures/array.h
@@ -229,6 +237,7 @@ set(libhdr
     autonomous_trust/utilities/logger.h
     autonomous_trust/utilities/message.h
     autonomous_trust/utilities/msg_types.h
+    autonomous_trust/utilities/queue_pool.h
     autonomous_trust/utilities/sighandler.h
     autonomous_trust/negotiation/negotiation.h
     autonomous_trust/reputation/reputation.h
@@ -435,6 +444,14 @@ add_executable(reputation_test test/reputation_test.c)
 set_source_files_properties(test/reputation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(reputation_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES} m)
 
+add_executable(history_test test/history_test.c)
+set_source_files_properties(test/history_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(history_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(queue_pool_test test/queue_pool_test.c)
+set_source_files_properties(test/queue_pool_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(queue_pool_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
 enable_testing()
 
 add_test(NAME array_test COMMAND $<TARGET_FILE:array_test>)
@@ -450,6 +467,8 @@ add_test(NAME agreement_test COMMAND $<TARGET_FILE:agreement_test>)
 add_test(NAME net_message_test COMMAND $<TARGET_FILE:net_message_test>)
 add_test(NAME negotiation_test COMMAND $<TARGET_FILE:negotiation_test>)
 add_test(NAME reputation_test COMMAND $<TARGET_FILE:reputation_test>)
+add_test(NAME history_test COMMAND $<TARGET_FILE:history_test>)
+add_test(NAME queue_pool_test COMMAND $<TARGET_FILE:queue_pool_test>)
 
 
 ####################
