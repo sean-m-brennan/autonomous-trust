@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "autonomous_trust_simulator"
-version = "0.1.1"
+version = "0.2.1"
 description = "AutonomousTrust Simulator - an AutonomousTrust simulation tool"
 authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
 readme = "README.md"
@@ -14,13 +14,13 @@ exclude = ["**/__pycache__"]
 
 [project]
 name = "autonomous_trust_simulator"
-version = "0.1.1"
+version = "0.2.1"
 
 [tool.poetry.dependencies]
 python = "^3.13"
-autonomous-trust = ">=0.1.1"
-autonomous-trust-services = ">=0.1.1"
-autonomous-trust-inspector = ">=0.1.1"
+autonomous-trust = ">=0.2.1"
+autonomous-trust-services = ">=0.2.1"
+autonomous-trust-inspector = ">=0.2.1"
 numpy = ">=1.25.2"
 opencv-python = ">=4.8.0"
 imutils = ">=0.5.4"

@@ -210,8 +210,108 @@ inline int datetime_to_isoformat(const datetime_t *dt, char *s, size_t max)
 
 int datetime_strptime(const char *s, const char *format, datetime_t *dt)
 {
-    // FIXME parse %f, %z
-    strptime(s, format, (struct tm *)dt); // FIXME error handling
+    if (s == NULL || format == NULL || dt == NULL)
+        return EINVAL;
+
+    memset(dt, 0, sizeof(datetime_t));
+    dt->tm_tz_offset = 0;
+    dt->tm_utc = false;
+
+    /* build a modified format string, replacing %f and %z with markers,
+       then parse in stages */
+    char mod_fmt[MAX_DT_STR + 1] = {0};
+    int fi = 0, mi = 0;
+    (void)0; /* %f and %z are parsed from remainder, not by position */
+    size_t fmt_len = strlen(format);
+
+    /* find where %f and %z appear in format, build strptime-compatible format */
+    for (fi = 0; fi < (int)fmt_len && mi < MAX_DT_STR - 1; fi++)
+    {
+        if (fi + 1 < (int)fmt_len && format[fi] == '%')
+        {
+            if (format[fi + 1] == 'f')
+            {
+                fi++;       /* skip 'f' */
+                continue;
+            }
+            else if (format[fi + 1] == 'z' || format[fi + 1] == 'Z')
+            {
+                fi++;
+                continue;
+            }
+        }
+        mod_fmt[mi++] = format[fi];
+    }
+    mod_fmt[mi] = '\0';
+
+    /* parse the standard part first with strptime on the original string */
+    /* strptime handles what it can and returns pointer to unparsed remainder */
+    char *remainder = strptime(s, "%FT%T", (struct tm *)dt);
+    if (remainder == NULL)
+    {
+        /* try the modified format directly */
+        remainder = strptime(s, mod_fmt, (struct tm *)dt);
+        if (remainder == NULL)
+            return EXCEPTION(EDT_FMT);
+    }
+
+    /* now parse the fractional seconds (%f) if present */
+    if (remainder != NULL && *remainder == '.')
+    {
+        remainder++; /* skip '.' */
+        char frac_buf[16] = {0};
+        int frac_idx = 0;
+        while (*remainder >= '0' && *remainder <= '9' && frac_idx < 9)
+        {
+            frac_buf[frac_idx++] = *remainder++;
+        }
+        /* pad to 9 digits (nanoseconds) */
+        while (frac_idx < 9)
+            frac_buf[frac_idx++] = '0';
+        frac_buf[9] = '\0';
+        dt->tm_nsec = strtoul(frac_buf, NULL, 10);
+    }
+
+    /* now parse timezone offset (%z) if present */
+    if (remainder != NULL && (*remainder == '+' || *remainder == '-' || *remainder == 'Z'))
+    {
+        if (*remainder == 'Z')
+        {
+            dt->tm_utc = true;
+            dt->tm_tz_offset = 0;
+        }
+        else
+        {
+            int sign = (*remainder == '-') ? -1 : 1;
+            remainder++;
+            /* parse HH:MM or HHMM */
+            long hours = 0, minutes = 0;
+            char tz_buf[8] = {0};
+            int ti = 0;
+            while ((*remainder >= '0' && *remainder <= '9') || *remainder == ':')
+            {
+                if (*remainder != ':' && ti < 7)
+                    tz_buf[ti++] = *remainder;
+                remainder++;
+            }
+            tz_buf[ti] = '\0';
+            if (ti >= 4)
+            {
+                char h[3] = {tz_buf[0], tz_buf[1], '\0'};
+                char m[3] = {tz_buf[2], tz_buf[3], '\0'};
+                hours = strtol(h, NULL, 10);
+                minutes = strtol(m, NULL, 10);
+            }
+            else if (ti >= 2)
+            {
+                char h[3] = {tz_buf[0], tz_buf[1], '\0'};
+                hours = strtol(h, NULL, 10);
+            }
+            dt->tm_tz_offset = sign * (hours + minutes / 60.0f);
+            dt->tm_utc = false;
+        }
+    }
+
     return 0;
 }
 
@@ -273,12 +373,101 @@ int timedelta_sync_in(AutonomousTrust__Core__Protobuf__Structures__TimeDelta *pr
 
 int timedelta_from_string(const char *s, timedelta_t *td)
 {
-    // FIXME
+    if (s == NULL || td == NULL)
+        return EINVAL;
+
+    memset(td, 0, sizeof(timedelta_t));
+
+    /* format: "Dd HH:MM:SS.nnnnnnnnn" or "HH:MM:SS.nnnnnnnnn" or "Dd" */
+    const char *p = s;
+    bool negative = false;
+    if (*p == '-')
+    {
+        negative = true;
+        p++;
+    }
+
+    /* check for "Xd" days prefix */
+    const char *d_pos = strchr(p, 'd');
+    if (d_pos != NULL)
+    {
+        char day_buf[16] = {0};
+        size_t dlen = d_pos - p;
+        if (dlen > 15) dlen = 15;
+        memcpy(day_buf, p, dlen);
+        td->days = strtol(day_buf, NULL, 10);
+        p = d_pos + 1;
+        while (*p == ' ') p++;
+    }
+
+    /* parse HH:MM:SS */
+    if (*p != '\0')
+    {
+        long hours = 0, minutes = 0, seconds = 0;
+        if (sscanf(p, "%ld:%ld:%ld", &hours, &minutes, &seconds) >= 2)
+        {
+            td->seconds = (unsigned int)(hours * 3600 + minutes * 60 + seconds);
+        }
+
+        /* parse fractional seconds */
+        const char *dot = strchr(p, '.');
+        if (dot != NULL)
+        {
+            dot++;
+            char frac_buf[10] = {0};
+            int fi = 0;
+            while (*dot >= '0' && *dot <= '9' && fi < 9)
+                frac_buf[fi++] = *dot++;
+            while (fi < 9)
+                frac_buf[fi++] = '0';
+            td->nsecs = (unsigned int)strtoul(frac_buf, NULL, 10);
+        }
+    }
+
+    if (negative)
+    {
+        /* normalize: timedelta(-1) means days=-1, seconds=86399, etc */
+        td->days = -td->days;
+        if (td->seconds > 0 || td->nsecs > 0)
+        {
+            td->days--;
+            td->seconds = 86400 - td->seconds;
+            if (td->nsecs > 0)
+            {
+                td->seconds--;
+                td->nsecs = 1000000000 - td->nsecs;
+            }
+        }
+    }
     return 0;
 }
 
 int timedelta_to_string(const timedelta_t *td, char *s, size_t max)
 {
-    // FIXME
+    if (td == NULL || s == NULL || max == 0)
+        return EINVAL;
+
+    long total_seconds = td->seconds;
+    long hours = total_seconds / 3600;
+    long rem = total_seconds % 3600;
+    long minutes = rem / 60;
+    long seconds = rem % 60;
+
+    int written;
+    if (td->days != 0 && td->nsecs > 0)
+        written = snprintf(s, max, "%ldd %02ld:%02ld:%02ld.%09u",
+                          td->days, hours, minutes, seconds, td->nsecs);
+    else if (td->days != 0)
+        written = snprintf(s, max, "%ldd %02ld:%02ld:%02ld",
+                          td->days, hours, minutes, seconds);
+    else if (td->nsecs > 0)
+        written = snprintf(s, max, "%ld:%02ld:%02ld.%09u",
+                          hours, minutes, seconds, td->nsecs);
+    else
+        written = snprintf(s, max, "%ld:%02ld:%02ld",
+                          hours, minutes, seconds);
+
+    if (written < 0 || (size_t)written >= max)
+        return E2BIG;
     return 0;
 }

@@ -1,144 +1,296 @@
+/********************
+ *  Copyright 2025 Sean M. Brennan and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
 #ifndef TEST_SETUP_H
 #define TEST_SETUP_H
 
-// FOR_EACH macro from stackoverflow (https://stackoverflow.com/a/11994395)
-
-#define FE_00(WHAT)
-#define FE_01(WHAT, X) WHAT(X)
-#define FE_02(WHAT, X, ...) WHAT(X) FE_01(WHAT, __VA_ARGS__)
-#define FE_03(WHAT, X, ...) WHAT(X) FE_02(WHAT, __VA_ARGS__)
-#define FE_04(WHAT, X, ...) WHAT(X) FE_03(WHAT, __VA_ARGS__)
-#define FE_05(WHAT, X, ...) WHAT(X) FE_04(WHAT, __VA_ARGS__)
-#define FE_06(WHAT, X, ...) WHAT(X) FE_05(WHAT, __VA_ARGS__)
-#define FE_07(WHAT, X, ...) WHAT(X) FE_06(WHAT, __VA_ARGS__)
-#define FE_08(WHAT, X, ...) WHAT(X) FE_07(WHAT, __VA_ARGS__)
-#define FE_09(WHAT, X, ...) WHAT(X) FE_08(WHAT, __VA_ARGS__)
-#define FE_10(WHAT, X, ...) WHAT(X) FE_09(WHAT, __VA_ARGS__)
-#define FE_11(WHAT, X, ...) WHAT(X) FE_10(WHAT, __VA_ARGS__)
-#define FE_12(WHAT, X, ...) WHAT(X) FE_11(WHAT, __VA_ARGS__)
-#define FE_13(WHAT, X, ...) WHAT(X) FE_12(WHAT, __VA_ARGS__)
-#define FE_14(WHAT, X, ...) WHAT(X) FE_13(WHAT, __VA_ARGS__)
-#define FE_15(WHAT, X, ...) WHAT(X) FE_14(WHAT, __VA_ARGS__)
-#define FE_16(WHAT, X, ...) WHAT(X) FE_15(WHAT, __VA_ARGS__)
-#define FE_17(WHAT, X, ...) WHAT(X) FE_16(WHAT, __VA_ARGS__)
-#define FE_18(WHAT, X, ...) WHAT(X) FE_17(WHAT, __VA_ARGS__)
-#define FE_19(WHAT, X, ...) WHAT(X) FE_18(WHAT, __VA_ARGS__)
-#define FE_20(WHAT, X, ...) WHAT(X) FE_19(WHAT, __VA_ARGS__)
-
-#define GET_MACRO(_00, _01, _02, _03, _04, _05, _06, _07, _08, _09, _10, _11, _12, _13, _14, _15, _16, _17, _18, _19, _20, NAME, ...) NAME
-#define FOR_EACH(action, ...)                                                                                                                                                     \
-    GET_MACRO(_0, __VA_ARGS__, FE_20, FE_19, FE_18, FE_17, FE_16, FE_15, FE_14, FE_13, FE_12, FE_11, FE_10, FE_09, FE_08, FE_07, FE_06, FE_05, FE_04, FE_03, FE_02, FE_01, FE_00) \
-    (action, __VA_ARGS__)
-
-//////////
-
 #if DEBUG_TESTS
-#define ck_assert_int_eq(x, y)                   \
-    do                                           \
-    {                                            \
-        if (x != y)                              \
-            log_error(NULL, "%d != %d\n", x, y); \
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+static int _test_failures = 0;
+static int _test_count    = 0;
+
+#define _ck_fail(fmt, ...) \
+    do { \
+        fprintf(stderr, "  FAIL [%s:%d]: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); \
+        _test_failures++; \
     } while (0)
 
-#define ck_assert_int_ne(x, y)                   \
-    do                                           \
-    {                                            \
-        if (x == y)                              \
-            log_error(NULL, "%d == %d\n", x, y); \
+#define ck_assert(expr) \
+    do { \
+        _test_count++; \
+        if (!(expr)) { _ck_fail("assertion failed: %s", #expr); } \
     } while (0)
 
-#define ck_assert_str_eq(x, y)                   \
-    do                                           \
-    {                                            \
-        if (strcmp(x, y) != 0)                   \
-            log_error(NULL, "%s != %s\n", x, y); \
+#define ck_assert_ret_ok(expr) \
+    do { \
+        _test_count++; \
+        int _ret = (expr); \
+        if (_ret != 0) { _ck_fail("%s returned %d (expected 0)", #expr, _ret); } \
     } while (0)
 
-#define ck_assert_ptr_nonnull(x)               \
-    do                                         \
-    {                                          \
-        if (x == NULL)                         \
-            log_error(NULL, "Null pointer\n"); \
+#define ck_assert_ret_nonzero(expr) \
+    do { \
+        _test_count++; \
+        int _ret = (expr); \
+        if (_ret == 0) { _ck_fail("%s returned 0 (expected non-zero)", #expr); } \
     } while (0)
 
-#define ck_assert_ret_ok(x)                                        \
-    do                                                             \
-    {                                                              \
-        int rv = x;                                                \
-        if (rv != 0)                                               \
-        {                                                          \
-            log_error(NULL, "Function returned nonzero %d\n", rv); \
-            SYS_EXCEPTION();                                       \
-            log_exception(NULL);                                   \
-        }                                                          \
+#define ck_assert_int_eq(a, b) \
+    do { \
+        _test_count++; \
+        long long _a = (long long)(a); \
+        long long _b = (long long)(b); \
+        if (_a != _b) { _ck_fail("%s == %s: %lld != %lld", #a, #b, _a, _b); } \
     } while (0)
 
-#define ck_assert_ret_nonzero(x)                         \
-    do                                                   \
-    {                                                    \
-        if (x == 0)                                      \
-            log_error(NULL, "Function returned zero\n"); \
+#define ck_assert_uint_eq(a, b) \
+    do { \
+        _test_count++; \
+        unsigned long long _a = (unsigned long long)(a); \
+        unsigned long long _b = (unsigned long long)(b); \
+        if (_a != _b) { _ck_fail("%s == %s: %llu != %llu", #a, #b, _a, _b); } \
     } while (0)
 
-#else
+#define ck_assert_ptr_nonnull(p) \
+    do { \
+        _test_count++; \
+        if ((p) == NULL) { _ck_fail("%s is NULL (expected non-NULL)", #p); } \
+    } while (0)
+
+#define ck_assert_ptr_null(p) \
+    do { \
+        _test_count++; \
+        if ((p) != NULL) { _ck_fail("%s is non-NULL (expected NULL)", #p); } \
+    } while (0)
+
+#define ck_assert_ptr_eq(a, b) \
+    do { \
+        _test_count++; \
+        const void *_a = (const void *)(a); \
+        const void *_b = (const void *)(b); \
+        if (_a != _b) { _ck_fail("%s == %s: %p != %p", #a, #b, _a, _b); } \
+    } while (0)
+
+#define ck_assert_str_eq(a, b) \
+    do { \
+        _test_count++; \
+        const char *_a = (a); \
+        const char *_b = (b); \
+        if (_a == NULL || _b == NULL || strcmp(_a, _b) != 0) { \
+            _ck_fail("%s == %s: \"%s\" != \"%s\"", #a, #b, \
+                     _a ? _a : "(null)", _b ? _b : "(null)"); \
+        } \
+    } while (0)
+
+#define ck_assert_mem_eq(a, b, n) \
+    do { \
+        _test_count++; \
+        if (memcmp((a), (b), (n)) != 0) { \
+            _ck_fail("memcmp(%s, %s, %zu) != 0", #a, #b, (size_t)(n)); \
+        } \
+    } while (0)
+
+#define ck_assert_double_eq_tol(a, b, tol) \
+    do { \
+        _test_count++; \
+        double _a = (double)(a); \
+        double _b = (double)(b); \
+        double _t = (double)(tol); \
+        if (fabs(_a - _b) > _t) { \
+            _ck_fail("%s ~= %s (tol %g): %g != %g", #a, #b, _t, _a, _b); \
+        } \
+    } while (0)
+
+#define ck_assert_double_lt(a, b) \
+    do { \
+        _test_count++; \
+        double _a = (double)(a); \
+        double _b = (double)(b); \
+        if (!(_a < _b)) { \
+            _ck_fail("%s < %s: %g not < %g", #a, #b, _a, _b); \
+        } \
+    } while (0)
+
+#define DEFINE_TEST(name) static void name(void)
+
+#define END_TEST_DEFINITION() /* nothing needed in debug mode */
+
+/* --- RUN_TESTS variadic dispatch --- */
+
+#define RUN_TESTS_1(suite, t1) \
+    int main(void) { \
+        printf("=== %s ===\n", #suite); \
+        t1(); \
+        printf("=== %d checks, %d failures ===\n", _test_count, _test_failures); \
+        return _test_failures > 0 ? 1 : 0; \
+    }
+
+#define RUN_TESTS_2(suite, t1, t2) \
+    int main(void) { \
+        printf("=== %s ===\n", #suite); \
+        t1(); t2(); \
+        printf("=== %d checks, %d failures ===\n", _test_count, _test_failures); \
+        return _test_failures > 0 ? 1 : 0; \
+    }
+
+#define RUN_TESTS_3(suite, t1, t2, t3) \
+    int main(void) { \
+        printf("=== %s ===\n", #suite); \
+        t1(); t2(); t3(); \
+        printf("=== %d checks, %d failures ===\n", _test_count, _test_failures); \
+        return _test_failures > 0 ? 1 : 0; \
+    }
+
+#define RUN_TESTS_4(suite, t1, t2, t3, t4) \
+    int main(void) { \
+        printf("=== %s ===\n", #suite); \
+        t1(); t2(); t3(); t4(); \
+        printf("=== %d checks, %d failures ===\n", _test_count, _test_failures); \
+        return _test_failures > 0 ? 1 : 0; \
+    }
+
+#define RUN_TESTS_5(suite, t1, t2, t3, t4, t5) \
+    int main(void) { \
+        printf("=== %s ===\n", #suite); \
+        t1(); t2(); t3(); t4(); t5(); \
+        printf("=== %d checks, %d failures ===\n", _test_count, _test_failures); \
+        return _test_failures > 0 ? 1 : 0; \
+    }
+
+#define RUN_TESTS_6(suite, t1, t2, t3, t4, t5, t6) \
+    int main(void) { \
+        printf("=== %s ===\n", #suite); \
+        t1(); t2(); t3(); t4(); t5(); t6(); \
+        printf("=== %d checks, %d failures ===\n", _test_count, _test_failures); \
+        return _test_failures > 0 ? 1 : 0; \
+    }
+
+#define _GET_RUN_MACRO(_1, _2, _3, _4, _5, _6, NAME, ...) NAME
+#define RUN_TESTS(suite, ...) \
+    _GET_RUN_MACRO(__VA_ARGS__, RUN_TESTS_6, RUN_TESTS_5, RUN_TESTS_4, RUN_TESTS_3, RUN_TESTS_2, RUN_TESTS_1)(suite, __VA_ARGS__)
+
+#else  /* DEBUG_TESTS == 0: use libcheck */
+
 #include <check.h>
-#define ck_assert_ret_ok(x) ck_assert_int_eq(0, x)
-#define ck_assert_ret_nonzero(x) ck_assert_int_ne(0, x)
-#endif
 
-#if DEBUG_TESTS // libcheck disabled
+#define DEFINE_TEST(name)     START_TEST(name)
+#define END_TEST_DEFINITION() END_TEST
 
-#define DEFINE_TEST(test_name) \
-    void test_name()
+#define ck_assert_ret_ok(expr)      ck_assert_int_eq((expr), 0)
+#define ck_assert_ret_nonzero(expr) ck_assert_int_ne((expr), 0)
+#define ck_assert_double_eq_tol(a, b, tol) \
+    ck_assert_double_eq_tol((a), (b), (tol))
 
-#define END_TEST_DEFINITION()
-
-#define ADD_TEST(x) x();
-
-#define RUN_TESTS(suite_name, ...)      \
-                                        \
-    int main()                          \
-    {                                   \
-        FOR_EACH(ADD_TEST, __VA_ARGS__) \
-        return 0;                       \
+/* RUN_TESTS with libcheck: build a simple non-forking suite and run it */
+#define RUN_TESTS_1(suite, t1) \
+    int main(void) { \
+        Suite *s = suite_create(#suite); \
+        TCase *tc = tcase_create("core"); \
+        tcase_add_test(tc, t1); \
+        suite_add_tcase(s, tc); \
+        SRunner *sr = srunner_create(s); \
+        srunner_set_fork_status(sr, CK_NOFORK); \
+        srunner_run_all(sr, CK_NORMAL); \
+        int nfail = srunner_ntests_failed(sr); \
+        srunner_free(sr); \
+        return nfail > 0 ? 1 : 0; \
     }
 
-#else // not DEBUG_TESTS
-
-#define DEFINE_TEST(test_name) \
-    START_TEST(test_name)
-
-#define END_TEST_DEFINITION() \
-    END_TEST
-
-#define ADD_TEST(x) tcase_add_test(tc_core, x);
-
-#define RUN_TESTS(suite_name, ...)                                 \
-    END_TEST                                                       \
-                                                                   \
-    Suite *test_suite(void)                                        \
-    {                                                              \
-        Suite *s = suite_create(#suite_name);                      \
-        TCase *tc_core = tcase_create("Core");                     \
-                                                                   \
-        FOR_EACH(ADD_TEST, __VA_ARGS__)                            \
-        suite_add_tcase(s, tc_core);                               \
-                                                                   \
-        return s;                                                  \
-    }                                                              \
-                                                                   \
-    int main(void)                                                 \
-    {                                                              \
-        int number_failed;                                         \
-        Suite *s = test_suite();                                   \
-        SRunner *sr = srunner_create(s);                           \
-                                                                   \
-        srunner_run_all(sr, CK_VERBOSE);                           \
-        number_failed = srunner_ntests_failed(sr);                 \
-        srunner_free(sr);                                          \
-        return (number_failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE; \
+#define RUN_TESTS_2(suite, t1, t2) \
+    int main(void) { \
+        Suite *s = suite_create(#suite); \
+        TCase *tc = tcase_create("core"); \
+        tcase_add_test(tc, t1); tcase_add_test(tc, t2); \
+        suite_add_tcase(s, tc); \
+        SRunner *sr = srunner_create(s); \
+        srunner_set_fork_status(sr, CK_NOFORK); \
+        srunner_run_all(sr, CK_NORMAL); \
+        int nfail = srunner_ntests_failed(sr); \
+        srunner_free(sr); \
+        return nfail > 0 ? 1 : 0; \
     }
 
-#endif // DEBUG_TESTS
+#define RUN_TESTS_3(suite, t1, t2, t3) \
+    int main(void) { \
+        Suite *s = suite_create(#suite); \
+        TCase *tc = tcase_create("core"); \
+        tcase_add_test(tc, t1); tcase_add_test(tc, t2); tcase_add_test(tc, t3); \
+        suite_add_tcase(s, tc); \
+        SRunner *sr = srunner_create(s); \
+        srunner_set_fork_status(sr, CK_NOFORK); \
+        srunner_run_all(sr, CK_NORMAL); \
+        int nfail = srunner_ntests_failed(sr); \
+        srunner_free(sr); \
+        return nfail > 0 ? 1 : 0; \
+    }
 
-#endif // TEST_SETUP_H
+#define RUN_TESTS_4(suite, t1, t2, t3, t4) \
+    int main(void) { \
+        Suite *s = suite_create(#suite); \
+        TCase *tc = tcase_create("core"); \
+        tcase_add_test(tc, t1); tcase_add_test(tc, t2); \
+        tcase_add_test(tc, t3); tcase_add_test(tc, t4); \
+        suite_add_tcase(s, tc); \
+        SRunner *sr = srunner_create(s); \
+        srunner_set_fork_status(sr, CK_NOFORK); \
+        srunner_run_all(sr, CK_NORMAL); \
+        int nfail = srunner_ntests_failed(sr); \
+        srunner_free(sr); \
+        return nfail > 0 ? 1 : 0; \
+    }
+
+#define RUN_TESTS_5(suite, t1, t2, t3, t4, t5) \
+    int main(void) { \
+        Suite *s = suite_create(#suite); \
+        TCase *tc = tcase_create("core"); \
+        tcase_add_test(tc, t1); tcase_add_test(tc, t2); tcase_add_test(tc, t3); \
+        tcase_add_test(tc, t4); tcase_add_test(tc, t5); \
+        suite_add_tcase(s, tc); \
+        SRunner *sr = srunner_create(s); \
+        srunner_set_fork_status(sr, CK_NOFORK); \
+        srunner_run_all(sr, CK_NORMAL); \
+        int nfail = srunner_ntests_failed(sr); \
+        srunner_free(sr); \
+        return nfail > 0 ? 1 : 0; \
+    }
+
+#define RUN_TESTS_6(suite, t1, t2, t3, t4, t5, t6) \
+    int main(void) { \
+        Suite *s = suite_create(#suite); \
+        TCase *tc = tcase_create("core"); \
+        tcase_add_test(tc, t1); tcase_add_test(tc, t2); tcase_add_test(tc, t3); \
+        tcase_add_test(tc, t4); tcase_add_test(tc, t5); tcase_add_test(tc, t6); \
+        suite_add_tcase(s, tc); \
+        SRunner *sr = srunner_create(s); \
+        srunner_set_fork_status(sr, CK_NOFORK); \
+        srunner_run_all(sr, CK_NORMAL); \
+        int nfail = srunner_ntests_failed(sr); \
+        srunner_free(sr); \
+        return nfail > 0 ? 1 : 0; \
+    }
+
+#define _GET_RUN_MACRO(_1, _2, _3, _4, _5, _6, NAME, ...) NAME
+#define RUN_TESTS(suite, ...) \
+    _GET_RUN_MACRO(__VA_ARGS__, RUN_TESTS_6, RUN_TESTS_5, RUN_TESTS_4, RUN_TESTS_3, RUN_TESTS_2, RUN_TESTS_1)(suite, __VA_ARGS__)
+
+#endif  /* DEBUG_TESTS */
+
+#endif  /* TEST_SETUP_H */

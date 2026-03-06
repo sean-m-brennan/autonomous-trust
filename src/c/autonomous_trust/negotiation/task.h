@@ -17,6 +17,7 @@
 #ifndef TASK_H
 #define TASK_H
 
+#include <uuid/uuid.h>
 #include "processes/capabilities.h"
 #include "structures/datetime.h"
 
@@ -26,6 +27,9 @@ typedef struct {
     timedelta_t duration;
     long timeout;
     thread_args_t;
+    uuid_t uuid;
+    uuid_t requestor_uuid;
+    bool flexible;
 } task_t;
 
 int task_run(task_t *task);

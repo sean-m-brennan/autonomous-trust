@@ -218,10 +218,26 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
 int map_remove(map_t *map, map_key_t key)
 {
     size_t index = map_key2index(map, key);
-    map->length--;
-    size_t tail_len = (map->length - index) * sizeof(map_item_t);
-    memmove(map->items + index, map->items + index + 1, tail_len);
-    return 0;
+    /* find the actual slot (handle collision chains) */
+    size_t start = index;
+    while (map->items[index].key != NULL)
+    {
+        if (strcmp(key, map->items[index].key) == 0)
+        {
+            free(map->items[index].key);
+            map->items[index].key = NULL;
+            map->items[index].value = NULL;
+            map->items[index].hash = 0;
+            map->length--;
+            return 0;
+        }
+        index++;
+        if (index >= map->capacity)
+            index = 0;
+        if (index == start)
+            break;
+    }
+    return EXCEPTION(EMAP_NOKEY);
 }
 
 void map_free(map_t *map)

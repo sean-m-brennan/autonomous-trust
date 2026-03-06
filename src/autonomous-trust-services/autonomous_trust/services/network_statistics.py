@@ -14,12 +14,12 @@
 #   limitations under the License.
 # ******************
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from queue import Full, Empty
 
 import psutil
 
-from autonomous_trust.core import Process, ProcMeta, Configuration, CfgIds, to_json_string
+from autonomous_trust.core import Process, ProcMeta, Configuration, CfgIds, to_yaml_string
 from autonomous_trust.core.identity import Identity
 from autonomous_trust.core.network import Message, Network
 from autonomous_trust.core.protocol import Protocol
@@ -80,7 +80,7 @@ class NetStatsSource(Process, metaclass=ProcMeta,
     @staticmethod
     def acquire_totals():
         net_io = psutil.net_io_counters()
-        return datetime.utcnow(), net_io.bytes_sent, net_io.bytes_recv, net_io.errout, net_io.errin
+        return datetime.now(UTC), net_io.bytes_sent, net_io.bytes_recv, net_io.errout, net_io.errin
 
     def compute_rate(self):  # for totals
         current = self.acquire_totals()
@@ -122,7 +122,7 @@ class NetStatsSource(Process, metaclass=ProcMeta,
                 pass
 
             # ship it to consumer UI
-            obj = to_json_string(statistics)
+            obj = to_yaml_string(statistics)
             for peer in self.clients:
                 msg = Message(self.name, NetStatsProtocol.stats, obj, peer)
                 try:

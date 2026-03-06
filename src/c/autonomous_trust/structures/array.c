@@ -33,7 +33,7 @@ int array_init(array_t *a)
 
 int array_create(array_t **array_ptr)
 {
-    if (*array_ptr == NULL)
+    if (array_ptr == NULL)
         return EXCEPTION(EINVAL);
     *array_ptr = smrt_create(sizeof(array_t));
     if (*array_ptr == NULL)
@@ -126,9 +126,10 @@ int array_remove(array_t *a, data_t *element)
     if (index < 0)
         return EXCEPTION(EARR_NOELT);
     size_t n = a->size - (index + 1);
-    memmove(a->array + index, a->array + index + 1, n);
-    memset(a->array + a->size, 0, sizeof(data_t));
+    if (n > 0)
+        memmove(a->array + index, a->array + index + 1, n * sizeof(data_t *));
     a->size--;
+    a->array[a->size] = NULL;
     return 0;
 }
 

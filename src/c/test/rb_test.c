@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include "autonomous_trust/structures/redblack.h"
 
-#define DEBUG_TESTS 0
+#define DEBUG_TESTS 1
 
 #include "test_setup.h"
 

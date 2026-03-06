@@ -30,7 +30,7 @@ from .viz.live_graph import LiveData
 
 class InspectorProcess(Process, metaclass=ProcMeta,
                        proc_name='monitor', description='Silent system activity monitor'):
-    command_deck = [item.value for item in CfgIds] + ['package_hash', 'log-level', 'processes']
+    command_deck = list(CfgIds) + ['package_hash', 'log-level', 'processes']
 
     def __init__(self, configurations, subsystems, log_q, dependencies):
         super().__init__(configurations, subsystems, log_q, dependencies=dependencies)

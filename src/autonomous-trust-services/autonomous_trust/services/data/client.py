@@ -17,7 +17,7 @@
 import struct
 from queue import Empty, Full
 
-from autonomous_trust.core import Process, ProcMeta, CfgIds, from_json_string
+from autonomous_trust.core import Process, ProcMeta, CfgIds, from_yaml_string
 from autonomous_trust.core.network import Message
 from .server import DataProcess, DataProtocol
 
@@ -38,7 +38,7 @@ class DataRcvr(Process, metaclass=ProcMeta,
         if message.function == DataProtocol.data:
             try:
                 uuid = message.from_whom.uuid
-                data = from_json_string(message.obj)
+                data = from_yaml_string(message.obj)
                 if uuid in self.cohort.peers:
                     self.cohort.peers[uuid].data_stream.put(data, block=True, timeout=self.q_cadence)
             except (Full, Empty):

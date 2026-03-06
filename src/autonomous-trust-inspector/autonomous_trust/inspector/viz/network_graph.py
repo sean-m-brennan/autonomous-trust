@@ -109,10 +109,12 @@ class NetworkGraph(object):
     def max_node_id(self):
         return max(self.node_ids)
 
+    _link_key = 'edges'  # networkx 3.x uses 'edges'; older used 'links'
+
     def _record_state(self):
         previous_state = self._to_dict(False)
         self.previous_nodes = previous_state['nodes']
-        self.previous_links = previous_state['links']
+        self.previous_links = previous_state[self._link_key]
 
     def change(self):
         raise NotImplementedError
@@ -336,24 +338,25 @@ class NetworkGraph(object):
     def _to_dict(self, track_change=True):
         # node-link format to serialize
         data_obj = nx.json_graph.node_link_data(self.G)
+        lk = self._link_key
         data_obj['groups'] = self.groupLabels
         if track_change and self.change_type is not None:
             data_obj['type'] = self.change_type.value.lower()
             if self.change_type == self.PhaseChange.ADD:
                 data_obj['nodes'] = self.nodeset_diff(data_obj['nodes'],
                                                       self.previous_nodes)
-                data_obj['links'] = self.edgeset_diff(data_obj['links'],
-                                                      self.previous_links)
+                data_obj[lk] = self.edgeset_diff(data_obj[lk],
+                                                 self.previous_links)
             elif self.change_type == self.PhaseChange.REMOVE:
                 data_obj['nodes'] = self.nodeset_diff(self.previous_nodes,
                                                       data_obj['nodes'])
-                data_obj['links'] = self.edgeset_diff(self.previous_links,
-                                                      data_obj['links'])
+                data_obj[lk] = self.edgeset_diff(self.previous_links,
+                                                 data_obj[lk])
             elif self.change_type == self.PhaseChange.META:
                 data_obj['nodes'] = self.nodeset_diff(self.previous_nodes,
                                                       data_obj['nodes'])
-                data_obj['links'] = self.edgeset_diff(self.previous_links,
-                                                      data_obj['links'])
+                data_obj[lk] = self.edgeset_diff(self.previous_links,
+                                                 data_obj[lk])
         return data_obj
 
     def __str__(self):

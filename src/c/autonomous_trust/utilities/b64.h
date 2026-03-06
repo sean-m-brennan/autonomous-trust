@@ -1,14 +1,34 @@
 #ifndef B64_H
 #define B64_H
 
-#include <stdint.h>
-#include <stdlib.h>
-#include <stdbool.h>
+#include <stddef.h>
+#include <sodium.h>
 
-size_t b64_encoded_len(size_t size);
-int32_t base64_encode(const uint8_t* in, size_t data_length, char* result, size_t max_result_length);
+static inline size_t b64_encoded_len(size_t input_len)
+{
+    return sodium_base64_encoded_len(input_len, sodium_base64_VARIANT_ORIGINAL);
+}
 
-size_t b64_decoded_len(size_t size, uint8_t last_byte);
-int32_t base64_decode(const char* in, size_t in_len, uint8_t* out, size_t max_out_len);
+static inline size_t b64_decoded_len(size_t enc_len, char last_char)
+{
+    size_t len = (enc_len / 4) * 3;
+    if (last_char == '=')
+        len--;
+    return len;
+}
 
-#endif  // B64_H
+static inline void base64_encode(const unsigned char *src, size_t src_len,
+                                  char *dst, size_t dst_len)
+{
+    sodium_bin2base64(dst, dst_len, src, src_len, sodium_base64_VARIANT_ORIGINAL);
+}
+
+static inline void base64_decode(const char *src, size_t src_len,
+                                  unsigned char *dst, size_t dst_len)
+{
+    size_t bin_len = 0;
+    sodium_base642bin(dst, dst_len, src, src_len, NULL, &bin_len, NULL,
+                      sodium_base64_VARIANT_ORIGINAL);
+}
+
+#endif  /* B64_H */

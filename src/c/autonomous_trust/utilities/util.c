@@ -73,7 +73,7 @@ int makedirs(char *path, mode_t mode)
         ? 0                                          \
         : ((f1 < f2) ? -1 : 1)
 
-int compare_float_precision(float f1, float f2, float, float epsilon)
+int compare_float_precision(float f1, float f2, float epsilon)
 {
     return compare_flt_pt(f1, f2, epsilon);
 }

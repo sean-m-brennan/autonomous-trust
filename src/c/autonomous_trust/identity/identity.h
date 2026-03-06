@@ -32,7 +32,7 @@ typedef struct
     smrt_ptr_t;
     unsigned char private[crypto_sign_SECRETKEYBYTES];
     unsigned char public[crypto_sign_PUBLICKEYBYTES];
-    unsigned char public_hex[crypto_sign_PUBLICKEYBYTES * 2];
+    unsigned char public_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
 } signature_t;
 
 typedef struct
@@ -40,7 +40,7 @@ typedef struct
     smrt_ptr_t;
     unsigned char private[crypto_box_SECRETKEYBYTES];
     unsigned char public[crypto_box_PUBLICKEYBYTES];
-    unsigned char public_hex[crypto_box_PUBLICKEYBYTES * 2];
+    unsigned char public_hex[crypto_box_PUBLICKEYBYTES * 2 + 1];
 } encryptor_t;
 
 #define ADDR_LEN 32

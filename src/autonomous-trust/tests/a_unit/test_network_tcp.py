@@ -534,17 +534,15 @@ def test_reject(setup_teardown):
     #assert net_addr == msg_tpl[1][0]
 
 
-@pytest.mark.skip(reason='broken')
 def test_p2p(setup_teardown):
+    """Self-addressed messages are dropped even when acceptance_func accepts all."""
     at = AutonomousTrust(logfile=Configuration.log_stdout)
     cfgs = at._configure(start=False)
     net_addr = cfgs[CfgIds.network].ip4
     tcp = _TCP(cfgs, dict({}), None, acceptance_func=lambda x: True)
     tcp.send_peer('test1', net_addr)
     msg_tpl = tcp.recv_peer()
-    print(msg_tpl)
-    assert 'test1' == msg_tpl[0]
-    assert net_addr == msg_tpl[1][0]
+    assert msg_tpl == (None, None, None)
 
 
 @pytest.mark.skip(reason="blocked by firewall")

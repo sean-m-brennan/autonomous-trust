@@ -1,0 +1,566 @@
+# ******************
+#  Copyright 2025 Sean M. Brennan and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+
+"""
+CFFI ABI-mode bindings for libautonomous_trust.
+
+This module provides the singleton ``ffi`` and ``lib`` objects used by all
+native wrapper classes.  The C library is loaded once at import time via
+``ffi.dlopen()``.
+"""
+
+import ctypes
+import ctypes.util
+import os
+
+from cffi import FFI
+
+ffi = FFI()
+
+# ---------------------------------------------------------------------------
+# CFFI cdef declarations — must match the public C API exactly.
+# Opaque structs are declared as ``typedef struct <tag> <name>;``.
+# ---------------------------------------------------------------------------
+
+ffi.cdef("""
+
+    /* ---- utilities/allocation.h ---- */
+    typedef struct { bool alloc; size_t refs; } smrt_ptr_t;
+
+    void *smrt_create(size_t size);
+    void *smrt_recreate(void *orig, size_t size);
+    void smrt_ref(void *ptr);
+    void smrt_deref(void *ptr);
+
+    /* ---- utilities/exception.h ---- */
+    typedef struct {
+        int errnum;
+        const char *errstr;
+        const char *description;
+    } exception_info_t;
+
+    typedef struct {
+        int errnum;
+        size_t line;
+        char file[257];
+    } exception_t;
+
+    extern exception_t _exception;
+    extern exception_info_t error_table[];
+    extern size_t error_table_size;
+
+    int  _set_exception(int err, size_t line, const char *file);
+    const char *_get_err_str(int err);
+
+    /* ---- utilities/logger.h ---- */
+    typedef enum { DEBUG = 1, INFO, WARNING, ERROR, CRITICAL } log_level_t;
+
+    typedef struct {
+        log_level_t max_level;
+        char file_name[257];
+        FILE *file;
+        bool term;
+        bool local_time;
+        int resolution;    /* time_resolution_t */
+    } logger_t;
+
+    int  logger_init(logger_t *logger, log_level_t max_level, const char *log_file);
+    void logger_close(logger_t *logger);
+
+    /* ---- structures/data.h ---- */
+    typedef enum {
+        NONE, INT, UINT, FLOAT, BOOL, STRING, BYTES, OBJECT
+    } data_type_t;
+
+    typedef struct data_s data_t;
+
+    /* POD → data_t* constructors */
+    data_t *integer_data(int i);
+    data_t *l_integer_data(long i);
+    data_t *u_integer_data(unsigned int u);
+    data_t *ul_integer_data(unsigned long u);
+    data_t *floating_pt_data(float f);
+    data_t *floating_pt_dbl_data(double f);
+    data_t *boolean_data(bool b);
+    data_t *string_data(char *s, size_t len);
+    data_t *bytes_data(unsigned char *b, size_t len);
+    data_t *object_ptr_data(void *o, size_t len);
+
+    /* data_t* → POD accessors */
+    int data_integer(data_t *d, int *i_ptr);
+    int data_l_integer(data_t *d, long *i_ptr);
+    int data_u_integer(data_t *d, unsigned int *u_ptr);
+    int data_ul_integer(data_t *d, unsigned long *u_ptr);
+    int data_floating_pt(data_t *d, float *f_ptr);
+    int data_floating_pt_dbl(data_t *d, double *f_ptr);
+    int data_boolean(data_t *d, bool *b_ptr);
+    int data_string(data_t *d, char *s, size_t max_len);
+    int data_string_ptr(data_t *d, char **s_ptr);
+    int data_bytes(data_t *d, unsigned char *b, size_t max_len);
+    int data_bytes_ptr(data_t *d, unsigned char **b_ptr);
+    int data_object(data_t *d, void *o, size_t max_len);
+    int data_object_ptr(data_t *d, void **o_ptr);
+    bool data_equal(data_t *a, data_t *b);
+
+    /* ---- structures/array.h ---- */
+    typedef struct array_s array_t;
+
+    int    array_init(array_t *a);
+    int    array_create(array_t **a_ptr);
+    int    array_copy(array_t *a, array_t *cpy);
+    int    array_append(array_t *a, data_t *element);
+    int    array_find(array_t *a, data_t *element);
+    int    array_filter(array_t *a, bool (*filter)(data_t *));
+    bool   array_contains(array_t *a, data_t *element);
+    size_t array_size(array_t *a);
+    int    array_get(array_t *a, int index, data_t **element);
+    int    array_set(array_t *a, int index, data_t *element);
+    int    array_remove(array_t *a, data_t *element);
+    void   array_free(array_t *a);
+
+    /* ---- structures/map.h ---- */
+    typedef struct map_s map_t;
+
+    int      map_init(map_t *map);
+    int      map_create(map_t **map_ptr);
+    size_t   map_size(map_t *map);
+    array_t *map_keys(map_t *map);
+    int      map_get(map_t *map, const char *key, data_t **value);
+    int      map_set(map_t *map, const char *key, data_t *value);
+    int      map_remove(map_t *map, char *key);
+    void     map_free(map_t *map);
+
+    /* ---- structures/datetime.h ---- */
+    typedef enum {
+        MILLISECONDS = 1,
+        MICROSECONDS,
+        NANOSECONDS
+    } time_resolution_t;
+
+    typedef struct {
+        /* Flattened struct tm fields (CFFI can't handle anonymous struct) */
+        int tm_sec;
+        int tm_min;
+        int tm_hour;
+        int tm_mday;
+        int tm_mon;
+        int tm_year;
+        int tm_wday;
+        int tm_yday;
+        int tm_isdst;
+        long tm_gmtoff;         /* glibc extension */
+        const char *tm_zone;    /* glibc extension */
+        /* datetime_t extensions */
+        unsigned long tm_nsec;
+        float tm_tz_offset;
+        bool tm_utc;
+    } datetime_t;
+
+    typedef struct {
+        long days;
+        unsigned int seconds;
+        unsigned int nsecs;
+    } timedelta_t;
+
+    int datetime_strftime_res(const datetime_t *dt, const char *format,
+                              int tr, char *s, size_t max);
+    int datetime_strftime(const datetime_t *dt, const char *format,
+                          char *s, size_t max);
+    int datetime_to_isoformat(const datetime_t *dt, char *s, size_t max);
+    int datetime_strptime(const char *s, const char *format, datetime_t *dt);
+    int datetime_from_isostring(const char *s, datetime_t *dt);
+    int datetime_from_time(long time, long nsec, bool local, datetime_t *dt);
+    int datetime_now(bool local, datetime_t *dt);
+    int timedelta_from_string(const char *s, timedelta_t *td);
+    int timedelta_to_string(const timedelta_t *td, char *s, size_t max);
+
+    /* ---- utilities/util.h ---- */
+    char *strremove(char *str, const char *sub);
+    int   makedirs(char *path, int mode);
+
+    /* ---- config/configuration.h ---- */
+    typedef struct {
+        const char *name;
+        int (*to_json)(const void *data_struct, void **obj_ptr);
+        int (*from_json)(const void *obj, void *data_struct);
+        size_t data_len;
+        void *data_struct;
+    } config_t;
+
+    extern config_t configuration_table[];
+    extern size_t configuration_table_size;
+
+    int  get_cfg_dir(char path[]);
+    int  get_data_dir(char path[]);
+    int  read_config_file(const char *filename, void *data_struct);
+    int  write_config_file(const config_t *cfg_obj, const void *data_struct,
+                           const char *filename);
+    int  load_config(char *filepath, config_t **config_ptr, char *cfg_name,
+                     logger_t *logger);
+    int  load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger);
+
+    /* ---- identity/identity.h ---- */
+    typedef struct {
+        bool alloc; size_t refs;  /* smrt_ptr_t */
+        unsigned char private_key[64];  /* crypto_sign_SECRETKEYBYTES */
+        unsigned char public_key[32];   /* crypto_sign_PUBLICKEYBYTES */
+        unsigned char public_hex[65];   /* hex + NUL */
+    } signature_t;
+
+    typedef struct {
+        bool alloc; size_t refs;  /* smrt_ptr_t */
+        unsigned char private_key[32];  /* crypto_box_SECRETKEYBYTES */
+        unsigned char public_key[32];   /* crypto_box_PUBLICKEYBYTES */
+        unsigned char public_hex[65];   /* hex + NUL */
+    } encryptor_t;
+
+    typedef struct {
+        bool alloc; size_t refs;  /* smrt_ptr_t */
+        unsigned char uuid[16];
+        char address[33];
+        char fullname[129];
+        signature_t signature;
+        encryptor_t encryptor;
+    } public_identity_t;
+
+    typedef struct identity_s identity_t;  /* opaque - contains private keys */
+
+    typedef struct {
+        unsigned char *msg;
+        unsigned long long len;
+    } msg_str_t;
+
+    int  identity_create(unsigned char *uuid, char *address, char *fullname,
+                         identity_t **ident);
+    int  identiry_init(unsigned char *uuid, char *address, char *fullname,
+                       identity_t *identity);
+    int  identity_publish(const identity_t *ident, public_identity_t **pub_copy);
+    int  identity_sign(const identity_t *ident, const msg_str_t *in,
+                       msg_str_t *out);
+    int  identity_verify(const public_identity_t *ident, const msg_str_t *in,
+                         msg_str_t *out);
+    int  identity_encrypt(const identity_t *ident, const msg_str_t *in,
+                          const public_identity_t *whom,
+                          const unsigned char *nonce, unsigned char *cipher);
+    int  identity_decrypt(const identity_t *ident, const msg_str_t *cipher,
+                          const public_identity_t *whom,
+                          const unsigned char *nonce, unsigned char *out);
+    int  peer_to_proto(public_identity_t *msg, void **data_ptr,
+                       size_t *data_len_ptr);
+    int  proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer);
+    void identity_free(identity_t *ident);
+
+    /* ---- network/network.h ---- */
+    typedef struct {
+        bool alloc; size_t refs;  /* smrt_ptr_t */
+        int port;
+        char mac_address[18];    /* MAC_ADDR_LEN(17) + 1 */
+        char ip4_cidr[20];       /* CIDR4_LEN(19) + 1 */
+        char mcast4_addr[17];    /* IPV4_ADDR_LEN(16) + 1 */
+        char ip6_cidr[51];       /* CIDR6_LEN(50) + 1 */
+        char mcast6_addr[47];    /* IPV6_ADDR_LEN(46) + 1 */
+    } network_config_t;
+
+    int network_to_json(const void *data_struct, void **obj_ptr);
+    int network_from_json(const void *obj, void *data_struct);
+
+    /* ---- network/net_message.h ---- */
+    typedef enum {
+        RECIPIENT_PEER = 0,
+        RECIPIENT_BROADCAST = 1
+    } recipient_type_t;
+
+    typedef struct {
+        recipient_type_t type;
+        union {
+            public_identity_t peer;
+        } target;
+    } net_recipient_t;
+
+    typedef struct {
+        char process[65];        /* PROC_NAME_LEN(64) + 1 */
+        char *function;
+        uint8_t *data;
+        size_t data_len;
+        net_recipient_t to_whom;
+        public_identity_t from_whom;
+        bool encrypt;
+    } net_wire_msg_t;
+
+    int  net_message_to_wire(const net_wire_msg_t *msg,
+                             uint8_t **wire_out, size_t *wire_len);
+    int  net_message_from_wire(const uint8_t *data, size_t len,
+                               const public_identity_t *peer,
+                               net_wire_msg_t *msg_out);
+    void net_wire_msg_free(net_wire_msg_t *msg);
+
+    /* ---- network/ping.h ---- */
+    typedef struct {
+        char host[17];           /* IPV4_ADDR_LEN(16) + 1 */
+        double rtt_ms[4];       /* PING_COUNT */
+        double min_rtt;
+        double max_rtt;
+        double avg_rtt;
+        double loss;
+        int sent;
+        int received;
+    } ping_stats_t;
+
+    int  ping(const char *host, ping_stats_t *stats);
+    int  ping_server_start(void);
+    int  ping_server_stop(void);
+
+    /* ---- processes/capabilities.h ---- */
+    /* thread_args_t and capability_t contain embedded opaque structs
+       (array_t, map_t), so we treat them as opaque and use pointers only. */
+    typedef struct thread_args_s thread_args_t;
+    typedef struct capability_s capability_t;
+
+    capability_t *find_capability(const char *name);
+
+    /* ---- utilities/msg_types.h ---- */
+    typedef enum {
+        SIGNAL = 1,
+        GROUP_MSG,
+        PEER_MSG,
+        PEER_CAPABILITIES_MSG,
+        TASK_MSG,
+        NET_MESSAGE_MSG,
+        TASK_STATUS_MSG,
+        TASK_RESULT_MSG,
+        TRANSACTION_SCORE_MSG
+    } message_type_t;
+
+    typedef struct {
+        char descr[33];          /* SIGNAL_LEN(32) + 1 */
+        int sig;
+    } signal_t;
+
+    typedef struct {
+        char process[65];        /* PROC_NAME_LEN(64) + 1 */
+        char *function;
+        uint8_t *obj;
+        size_t len;
+        public_identity_t to_whom;
+        public_identity_t from_whom;
+        bool encrypt;
+        char return_to[65];
+    } net_msg_t;
+
+    typedef enum {
+        TASK_STATUS_RUNNING = 1,
+        TASK_STATUS_SLEEPING,
+        TASK_STATUS_ZOMBIE,
+        TASK_STATUS_STOPPED,
+        TASK_STATUS_DEAD,
+        TASK_STATUS_PENDING,
+        TASK_STATUS_UNKNOWN
+    } task_status_val_t;
+
+    typedef struct {
+        unsigned char task_uuid[16];
+        unsigned char requestor_uuid[16];
+        task_status_val_t status;
+    } task_status_msg_t;
+
+    typedef struct {
+        unsigned char task_uuid[16];
+        unsigned char requestor_uuid[16];
+        uint8_t *result_data;
+        size_t result_len;
+    } task_result_msg_t;
+
+    typedef struct {
+        unsigned char task_uuid[16];
+        unsigned char peer_uuid[16];
+        double score;
+    } tx_score_msg_t;
+
+    size_t message_size(message_type_t type);
+
+    /* ---- utilities/message.h ---- */
+    typedef struct {
+        int fd;
+        char key[65];            /* MSG_KEY_LEN(64) + 1 */
+    } queue_t;
+
+    int  messaging_init(const char *id, queue_t *queue);
+    void messaging_assign(queue_t *queue);
+    int  messaging_send(const char *key, const message_type_t type,
+                        void *msg, bool blocking);
+    void messaging_qclose(queue_t *queue);
+    void messaging_close(void);
+
+    /* ---- processes/process_tracker.h ---- */
+    typedef struct {
+        bool alloc; size_t refs;  /* smrt_ptr_t */
+        map_t *registry;
+        logger_t *logger;
+    } tracker_t;
+
+    int  tracker_init(tracker_t *tracker, logger_t *logger);
+    int  tracker_create(tracker_t **tracker_ptr, logger_t *logger);
+    void tracker_free(tracker_t *tracker);
+
+    /* ---- processes/processes.h (partial) ---- */
+    typedef struct process_s process_t;  /* opaque */
+
+    typedef int (*handler_ptr_t)(process_t *, array_t *, char *, logger_t *);
+
+    int  start_process(char *pname, handler_ptr_t runner,
+                       map_t *configs, tracker_t *tracker,
+                       map_t *procs, array_t *queues, logger_t *logger);
+    void process_free(process_t *proc);
+
+    /* ---- negotiation/task.h ---- */
+    /* task_t contains embedded capability_t (opaque), so treat as opaque */
+    typedef struct task_s task_t;
+
+    typedef struct {
+        task_t *task_ptr;       /* opaque pointer */
+        unsigned char task_uuid[16];
+        int flood_count;
+    } task_counter_t;
+
+    /* task_tracker_t contains embedded map_t (opaque) — treat as opaque */
+    typedef struct task_tracker_s task_tracker_t;
+
+    int  task_tracker_create(task_tracker_t **tracker,
+                             const unsigned char *task_uuid, int expected);
+    int  task_tracker_init(task_tracker_t *tracker,
+                           const unsigned char *task_uuid, int expected);
+    void task_tracker_destroy(task_tracker_t *tracker);
+    int  task_tracker_set_result(task_tracker_t *tracker,
+                                const unsigned char *peer_uuid,
+                                const uint8_t *data, size_t len);
+    int  task_tracker_result_count(const task_tracker_t *tracker);
+    void task_tracker_free(task_tracker_t *tracker);
+
+    /* ---- negotiation/negotiation.h ---- */
+    /* job_queue_t contains embedded task_t with opaque fields */
+    typedef struct job_queue_s job_queue_t;
+
+    int  job_queue_create(job_queue_t **q);
+    int  job_queue_init(job_queue_t *q);
+    void job_queue_destroy(job_queue_t *q);
+    int  job_queue_count(const job_queue_t *q);
+    void job_queue_clear(job_queue_t *q);
+
+    /* ---- reputation/reputation.h ---- */
+    typedef struct {
+        unsigned char task_uuid[16];
+        unsigned char p1_uuid[16];
+        double p1_score;
+        bool p1_set;
+        unsigned char p2_uuid[16];
+        double p2_score;
+        bool p2_set;
+        int index;
+    } transaction_t;
+
+    /* tx_history_t/reputations_t contain embedded maps/arrays — opaque */
+    typedef struct tx_history_s tx_history_t;
+    typedef struct reputations_s reputations_t;
+
+    int  tx_history_create(tx_history_t **hist);
+    int  tx_history_init(tx_history_t *hist);
+    void tx_history_destroy(tx_history_t *hist);
+    int  tx_history_update(tx_history_t *hist, const unsigned char *task_uuid,
+                           const unsigned char *peer_uuid, double score);
+    int  tx_history_len(const tx_history_t *hist);
+    void tx_history_free(tx_history_t *hist);
+
+    int  reputations_create(reputations_t **reps);
+    int  reputations_init(reputations_t *reps);
+    void reputations_destroy(reputations_t *reps);
+    int  reputations_update(reputations_t *reps,
+                            const unsigned char *peer_uuid, double score);
+    int  reputations_get(const reputations_t *reps,
+                         const unsigned char *peer_uuid, double *score);
+    bool reputations_contains(const reputations_t *reps,
+                              const unsigned char *peer_uuid);
+    void reputations_free(reputations_t *reps);
+
+    double reputation_compute(const tx_history_t *hist,
+                              const reputations_t *reps,
+                              const unsigned char *self_uuid,
+                              const unsigned char *peer_uuid);
+
+    /* ---- autonomous_trust.h ---- */
+    int run_autonomous_trust(char *q_in, char *q_out,
+                             void *capabilities, size_t cap_len,
+                             log_level_t log_level, char log_file[]);
+
+""")
+
+
+# ---------------------------------------------------------------------------
+# Library loading
+# ---------------------------------------------------------------------------
+
+def _find_library() -> str:
+    """Locate libautonomous_trust.so, searching common paths."""
+    # 1. Explicit env var
+    path = os.environ.get('AUTONOMOUS_TRUST_LIB')
+    if path and os.path.isfile(path):
+        return path
+
+    # 2. Relative to this source tree
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        # Distributed alongside _ffi.py in core/_native/
+        os.path.join(src_dir, 'libautonomous_trust.so'),
+        # Development build tree (src/c/build/)
+        os.path.join(src_dir, '..', '..', '..', '..', 'c', 'build',
+                     'libautonomous_trust.so'),
+    ]
+
+    # 3. Conda prefix
+    conda_prefix = os.environ.get('CONDA_PREFIX')
+    if conda_prefix:
+        candidates.append(os.path.join(conda_prefix, 'lib',
+                                       'libautonomous_trust.so'))
+
+    for p in candidates:
+        p = os.path.normpath(p)
+        if os.path.isfile(p):
+            return p
+
+    # 4. System search
+    found = ctypes.util.find_library('autonomous_trust')
+    if found:
+        return found
+
+    raise OSError(
+        "Cannot find libautonomous_trust.so. Set AUTONOMOUS_TRUST_LIB "
+        "env var or build the C library (build.sh)."
+    )
+
+
+def _preload_deps():
+    """Pre-load shared library dependencies so dlopen() can resolve symbols."""
+    dep_names = ['sodium', 'jansson', 'protobuf-c', 'protobuf', 'uuid']
+    for name in dep_names:
+        path = ctypes.util.find_library(name)
+        if path:
+            try:
+                ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
+
+_preload_deps()
+lib = ffi.dlopen(_find_library())
