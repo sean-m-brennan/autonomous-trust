@@ -518,10 +518,13 @@ def _find_library() -> str:
     if path and os.path.isfile(path):
         return path
 
-    # 2. Relative to this source tree  (src/c/build/)
+    # 2. Relative to this source tree
     src_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        os.path.join(src_dir, '..', '..', '..', '..', '..', 'c', 'build',
+        # Distributed alongside _ffi.py in core/_native/
+        os.path.join(src_dir, 'libautonomous_trust.so'),
+        # Development build tree (src/c/build/)
+        os.path.join(src_dir, '..', '..', '..', '..', 'c', 'build',
                      'libautonomous_trust.so'),
     ]
 
@@ -543,7 +546,7 @@ def _find_library() -> str:
 
     raise OSError(
         "Cannot find libautonomous_trust.so. Set AUTONOMOUS_TRUST_LIB "
-        "env var or build the C library (build_clib.sh)."
+        "env var or build the C library (run-build.sh)."
     )
 
 

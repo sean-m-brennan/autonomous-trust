@@ -43,19 +43,12 @@
 dist
 /lib
 
-# Unikraft
-/unikernel/.unikraft*
-/unikernel/.kraftrc
-/unikernel/.update
-/unikernel/lib/*
-/unikernel/extern/*
-
 /src/autonomous-trust/.local
 /src/autonomous-trust-inspector/.local
 /*.log
 
 /src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/assets
-/src/autonomous-trust/autonomous_trust/core/_python/protobuf
+/src/autonomous-trust/autonomous_trust/core/protobuf
 
 # Custom Dash component
 /src/autonomous-trust-inspector/reactjs/src/AsyncUpdate.jl

@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "autonomous_trust_inspector"
-version = "0.1.1"
+version = "0.2.1"
 description = "AutonomousTrust Inspector - the AutonomousTrust network visualization tool"
 authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
 readme = "README.md"
@@ -18,13 +18,13 @@ exclude = ["**/__pycache__"]
 
 [project]
 name = "autonomous_trust_inspector"
-version = "0.1.1"
+version = "0.2.1"
 
 [tool.poetry.dependencies]
 python = "^3.13"
 #autonomous_trust.core = {path = "../autonomous-trust"}
-autonomous-trust = ">=0.1.1"
-autonomous-trust-services = ">=0.1.1"
+autonomous-trust = ">=0.2.1"
+autonomous-trust-services = ">=0.2.1"
 aenum = ">=3.1.11"
 libsass = ">=0.22.0"
 networkx = ">=3.0"

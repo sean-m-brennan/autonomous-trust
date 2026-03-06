@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from queue import Full, Empty
 
 import psutil
@@ -80,7 +80,7 @@ class NetStatsSource(Process, metaclass=ProcMeta,
     @staticmethod
     def acquire_totals():
         net_io = psutil.net_io_counters()
-        return datetime.utcnow(), net_io.bytes_sent, net_io.bytes_recv, net_io.errout, net_io.errin
+        return datetime.now(UTC), net_io.bytes_sent, net_io.bytes_recv, net_io.errout, net_io.errin
 
     def compute_rate(self):  # for totals
         current = self.acquire_totals()

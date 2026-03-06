@@ -3,17 +3,32 @@
 
 # Run everything relative to this script
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$here" || exit 1
 
 status=0
 
-# Build C library
-(cd src/c/build && cmake .. && make)
+echo "========== Building the C library =========="
+if [[ "$@" = *"--verbose"* ]]; then
+  ./run-build.sh --c
+else
+  ./run-build.sh --c >/dev/null
+fi
 
 for pkg in autonomous-trust autonomous-trust-services autonomous-trust-inspector autonomous-trust-simulator; do
     pkg_dir="$here/src/$pkg"
     if [ -d "$pkg_dir/tests" ]; then
         echo "========== Testing $pkg =========="
-        (cd "$pkg_dir" && python -m pytest tests/ --ignore=tests/local --continue-on-collection-errors -v -s "$@")
+        flags=
+        if [[ "$@" = *"--verbose"* ]]; then
+          flags="-v"
+        else
+          flags="-q"
+        fi
+        cov_flags="--cov=autonomous_trust --cov-report=term-missing"
+        if [ -f "$pkg_dir/.coveragerc" ]; then
+          cov_flags="$cov_flags --cov-config=$pkg_dir/.coveragerc"
+        fi
+        (cd "$pkg_dir" && python -m pytest tests/ $cov_flags --ignore=tests/local --continue-on-collection-errors $flags -s "$@")
         rc=$?
         if [ $rc -eq 1 ]; then
             # Exit 1 = test failures; propagate as error

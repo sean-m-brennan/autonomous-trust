@@ -18,7 +18,7 @@ from collections.abc import Mapping
 import multiprocessing
 
 from .config import Configuration
-from .protobuf.processes import capabilities_pb2
+from autonomous_trust.core.protobuf.processes import capabilities_pb2
 
 
 class Capability(Configuration):

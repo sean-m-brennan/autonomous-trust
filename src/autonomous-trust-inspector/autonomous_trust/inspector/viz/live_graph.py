@@ -49,12 +49,12 @@ class LiveNetwork(ng.NetworkGraph):
         self.node_data.append('persist')
         self.iteration = 0
         groups = ['a', '', ' ', 'trouble']
+        self.data_q = kwargs.pop('data_q')
         super().__init__(nx.complete_graph, 1, delay=True, groups=groups, **kwargs)
         all_nodes = list(self.G)
         self.problem = all_nodes[0]
         self._start()
         self.wise = []
-        self.data_q = kwargs['data_q']
 
     @property
     def stop(self):

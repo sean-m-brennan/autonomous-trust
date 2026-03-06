@@ -25,13 +25,11 @@ C library is built with ``-DFORK=0`` (no daemonization).
 
 from ._ffi import ffi, lib
 
-# Re-export the Python AutonomousTrust as the default — downstream
-# packages (services, inspector, simulator) subclass it and rely on
-# multiprocessing.Queue-based IPC which the C side doesn't support yet.
-from .._python.automate import AutonomousTrust  # noqa: F401
-
-# Re-export LogLevel mapping
-from .._python.processes import LogLevel
+# Re-export everything from the Python automate module — downstream
+# packages (services, inspector, simulator) subclass AutonomousTrust and
+# rely on multiprocessing.Queue-based IPC which the C side doesn't support yet.
+from .._python.automate import *  # noqa: F401, F403
+from .._python.automate import LogLevel  # noqa: explicit for _LOG_LEVEL_MAP
 
 
 # C log_level_t values (must match utilities/logger.h)

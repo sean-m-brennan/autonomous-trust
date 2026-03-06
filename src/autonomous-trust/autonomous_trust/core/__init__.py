@@ -18,13 +18,36 @@ import importlib
 import importlib.abc
 import importlib.util
 import os
+import subprocess
 import sys
+
+
+def _git_describe_version():
+    """Derive a PEP 440-ish version from ``git describe --tags``."""
+    try:
+        desc = subprocess.check_output(
+            ['git', 'describe', '--tags', '--always'],
+            stderr=subprocess.DEVNULL,
+            cwd=os.path.dirname(__file__),
+        ).decode().strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    # Strip leading 'v' (e.g. v0.2.1-191-gbe0baef -> 0.2.1-191-gbe0baef)
+    if desc.startswith('v'):
+        desc = desc[1:]
+    # Convert git describe format to PEP 440 local: 0.2.1.dev191+gbe0baef
+    parts = desc.split('-', 2)
+    if len(parts) == 3:
+        base, count, sha = parts
+        return f'{base}.dev{count}+{sha}'
+    return desc or None
+
 
 try:
     import importlib.metadata  # noqa
     __version__ = importlib.metadata.version("autonomous_trust")
-except ImportError:
-    __version__ = '?.?'
+except (ImportError, importlib.metadata.PackageNotFoundError):
+    __version__ = _git_describe_version() or '?.?.?'
 
 _BACKEND = os.environ.get('AUTONOMOUS_TRUST_BACKEND', 'auto')
 _CORE_PREFIX = 'autonomous_trust.core.'
@@ -67,6 +90,9 @@ class _BackendRedirector(importlib.abc.MetaPathFinder):
         suffix = fullname[len(_CORE_PREFIX):]
         # Don't intercept _python or _native themselves
         if suffix.startswith('_'):
+            return None
+        # Don't intercept protobuf — it's generated code shared by all backends
+        if suffix == 'protobuf' or suffix.startswith('protobuf.'):
             return None
         # Already loaded — no need to redirect
         if fullname in sys.modules:

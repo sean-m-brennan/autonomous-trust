@@ -28,6 +28,9 @@ import enum
 
 from ._ffi import ffi, lib
 
+# Re-export everything from the Python processes module for API compatibility
+from .._python.processes import *  # noqa: F401, F403
+
 
 class MessageType(enum.IntEnum):
     """Message type enumeration matching C ``message_type_t``."""
