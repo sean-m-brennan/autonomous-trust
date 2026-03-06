@@ -546,7 +546,7 @@ def _find_library() -> str:
 
     raise OSError(
         "Cannot find libautonomous_trust.so. Set AUTONOMOUS_TRUST_LIB "
-        "env var or build the C library (run-build.sh)."
+        "env var or build the C library (build.sh)."
     )
 
 

@@ -104,7 +104,7 @@ build_containers() {
         build_args+=(--registry "$REGISTRY_URL")
     fi
 
-    "$SCRIPT_DIR/build-docker.sh" "${build_args[@]}" devel test
+    "$SCRIPT_DIR/run-build-docker.sh" "${build_args[@]}" devel test
 }
 
 # ---------------------------------------------------------------------------

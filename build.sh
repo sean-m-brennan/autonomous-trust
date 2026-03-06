@@ -47,10 +47,13 @@ fi
 if [[ "$ARGS" = *"--c"* ]]; then
   cd src/c || exit 1
   rm -rf build
-  # If CC points to a missing compiler (e.g. conda cross-compiler), fall back
-  # to system defaults and skip the conda sysroot
+  # Prefer clang if available (some GCC versions produce corrupt ELF objects).
+  # Also handle conda cross-compiler that may not exist on this system.
   if [ -n "$CC" ] && ! command -v "$CC" >/dev/null 2>&1; then
     unset CC CXX CONDA_PREFIX
+  fi
+  if [ -z "$CC" ] && command -v clang >/dev/null 2>&1; then
+    export CC=clang CXX=clang++
   fi
   cmake -S . -B build
   cd build || exit 1
