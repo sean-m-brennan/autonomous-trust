@@ -71,7 +71,7 @@ int ip4_binary_to_addr(uint32_t ip, char *addr)
 {
     struct in_addr addr_struct = {0};
     addr_struct.s_addr = ip;
-    if (inet_ntop(AF_INET, &addr_struct, addr, INET_ADDRSTRLEN))
+    if (inet_ntop(AF_INET, &addr_struct, addr, INET_ADDRSTRLEN) == NULL)
         return SYS_EXCEPTION();
     return 0;
 }
@@ -79,11 +79,13 @@ int ip4_binary_to_addr(uint32_t ip, char *addr)
 int cidr4_to_broadcast(char *cidr, char *bcast_addr)
 {
     uint32_t ip;
-    uint8_t mask;
-    if (cidr4_to_ip4_binary(cidr, &ip, &mask) < 0)
+    uint8_t prefix;
+    if (cidr4_to_ip4_binary(cidr, &ip, &prefix) < 0)
         return -1;
-    uint32_t net = ip & mask;
-    uint32_t bcast = net | ~mask;
+    /* Convert CIDR prefix length to network-byte-order bitmask */
+    uint32_t host_mask = (prefix == 0) ? 0 : ~((1U << (32 - prefix)) - 1);
+    uint32_t net_mask = htonl(host_mask);
+    uint32_t bcast = (ip & net_mask) | ~net_mask;
     return ip4_binary_to_addr(bcast, bcast_addr);
 }
 
@@ -107,7 +109,7 @@ int ip6_binary_to_addr(uint128_t ip, char *addr)
 {
     struct in6_addr addr_struct;
     memcpy(&addr_struct.s6_addr, &ip, sizeof(uint128_t));
-    if (inet_ntop(AF_INET6, &addr_struct, addr, INET6_ADDRSTRLEN))
+    if (inet_ntop(AF_INET6, &addr_struct, addr, INET6_ADDRSTRLEN) == NULL)
         return SYS_EXCEPTION();
     return 0;
 }

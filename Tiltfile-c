@@ -47,6 +47,9 @@ docker_build(
 # Load the generated compose file
 docker_compose("docker-compose.tilt.yaml")
 
+# Exclude generated compose file from Tilt's file watch
+watch_settings(ignore=["docker-compose.tilt.yaml"])
+
 # Watch only C source dirs for live rebuild triggers
 watch_file("src/c")
 watch_file("src/protobuf")

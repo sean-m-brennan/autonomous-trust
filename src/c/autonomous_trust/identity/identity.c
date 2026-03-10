@@ -59,7 +59,8 @@ int identity_create(uuid_t *uuid, char *address, char *fullname, identity_t **id
 { // FIXME address + 4 names
     if (sodium_init() < 0)
     {
-        exit(-1); // FIXME logging?
+        // sodium_init() failed: libsodium could not be initialized
+        return -1;
     }
     *ident = smrt_create(sizeof(identity_t));
     identity_t *identity = *ident;
@@ -162,13 +163,18 @@ int identity_from_json(const json_t *obj, void *data_struct)
     if (uuid_parse(uuid_str, ident->uuid) < 0)
         return -1;
     ident->rank = json_integer_value(json_object_get(obj, "rank"));
+    const char *addr_str = json_string_value(json_object_get(obj, "address"));
+    if (addr_str != NULL)
+        strncpy(ident->address, addr_str, sizeof(ident->address)-1);
     strncpy(ident->fullname, (char *)json_string_value(json_object_get(obj, "fullname")), sizeof(ident->fullname)-1);
     strncpy(ident->nickname, (char *)json_string_value(json_object_get(obj, "nickname")), sizeof(ident->nickname)-1);
     strncpy(ident->petname, (char *)json_string_value(json_object_get(obj, "petname")), sizeof(ident->petname)-1);
-    uint8_t *seed = (uint8_t *)json_object_get(json_object_get(obj, "signature"), "hex_seed");
-    signature_init(&ident->signature, seed); // decoded
-    seed = (uint8_t *)json_object_get(json_object_get(obj, "encryptor"), "hex_seed");
-    encryptor_init(&ident->encryptor, seed); // decoded
+    const char *sig_hex = json_string_value(json_object_get(json_object_get(obj, "signature"), "hex_seed"));
+    if (sig_hex != NULL)
+        signature_init(&ident->signature, (const unsigned char *)sig_hex);
+    const char *enc_hex = json_string_value(json_object_get(json_object_get(obj, "encryptor"), "hex_seed"));
+    if (enc_hex != NULL)
+        encryptor_init(&ident->encryptor, (const unsigned char *)enc_hex);
     return 0;
 }
 

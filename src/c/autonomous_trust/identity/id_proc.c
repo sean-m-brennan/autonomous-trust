@@ -14,8 +14,10 @@
  *   limitations under the License.
  *******************/
 
+#define _GNU_SOURCE
 #include <stdarg.h>
 #include <string.h>
+#include <unistd.h>
 #include <pthread.h>
 
 #include "processes/processes.h"
@@ -316,18 +318,13 @@ static int _acquire_capabilities(const process_t *proc, directory_t *queues)
     return 0;
 }
 
-static int _announce_identity(const process_t *proc, directory_t *queues)
+static int _build_announcement(const process_t *proc, generic_msg_t *buf)
 {
-    data_t net = STRING_DATA("network");
-    if (!array_contains(queues, &net))
-        return EXCEPTION(EID_NOQ);
-
-    /* Build announcement: identity + package_hash + capabilities */
-    generic_msg_t buf = {0};
-    buf.type = NET_MESSAGE;
-    strncpy(buf.info.net_msg.process, "identity", PROC_NAME_LEN);
-    buf.info.net_msg.function = (char *)ID_ANNOUNCE;
-    buf.info.net_msg.encrypt = false; /* Broadcast is unencrypted */
+    memset(buf, 0, sizeof(generic_msg_t));
+    buf->type = NET_MESSAGE;
+    strncpy(buf->info.net_msg.process, "identity", PROC_NAME_LEN);
+    buf->info.net_msg.function = (char *)ID_ANNOUNCE;
+    buf->info.net_msg.encrypt = false; /* Broadcast is unencrypted */
 
     /* Get own identity from config */
     data_t *id_dat = NULL;
@@ -341,16 +338,43 @@ static int _announce_identity(const process_t *proc, directory_t *queues)
             identity_publish((const identity_t *)ident, &pub);
             if (pub != NULL)
             {
-                memcpy(&buf.info.net_msg.from_whom, pub, sizeof(public_identity_t));
+                memcpy(&buf->info.net_msg.from_whom, pub, sizeof(public_identity_t));
                 smrt_deref(pub);
             }
         }
     }
 
-    /* Set broadcast recipient */
-    strncpy(buf.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    /* Set broadcast recipient (to_whom empty = broadcast) */
+    strncpy(buf->info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    return 0;
+}
 
-    messaging_send("network", NET_MESSAGE, &buf, false);
+static int _announce_identity(const process_t *proc, directory_t *queues)
+{
+    data_t net = STRING_DATA("network");
+    if (!array_contains(queues, &net))
+        return EXCEPTION(EID_NOQ);
+
+    generic_msg_t buf = {0};
+    _build_announcement(proc, &buf);
+
+    /* Retry until network process IPC socket is ready */
+    int ret = -1;
+    for (int attempt = 0; attempt < 20; attempt++)
+    {
+        ret = messaging_send("network", NET_MESSAGE, &buf, false);
+        if (ret == 0)
+            break;
+        log_debug(proc->logger, "Identity: network not ready, retrying (%d)...\n", attempt);
+        usleep(100000); /* 100ms */
+    }
+
+    if (ret != 0)
+    {
+        log_error(proc->logger, "Identity: failed to send announcement to network\n");
+        return ret;
+    }
+
     log_info(proc->logger, "Identity: announced self to network\n");
     return 0;
 }
@@ -361,6 +385,12 @@ static int _announce_identity(const process_t *proc, directory_t *queues)
 
 int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
+    /* Daemonize first so messaging is available for pre-loop activity */
+    process_ctx_t pctx = {0};
+    int err = process_setup(proc, signal, logger, &pctx);
+    if (err != 0)
+        return err;
+
     /* Register protocol handlers */
     process_register_handler(proc, (char *)ID_ANNOUNCE, (handler_ptr_t)handle_welcoming_committee);
     process_register_handler(proc, (char *)ID_ACCEPT,   (handler_ptr_t)handle_acceptance);
@@ -383,6 +413,38 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
     /* For now, set to phase 3 after announcement */
     proc->protocol.phase = 3;
 
-    return process_run(proc, queues, signal, logger);
+    /* Identity-specific loop: re-announce periodically until peers found */
+    generic_msg_t announce_buf = {0};
+    _build_announcement(proc, &announce_buf);
+    int announce_interval = 10; /* re-announce every 10 cadence cycles (~5s) */
+    int cycle = 0;
+
+    while (keep_running(proc, &pctx.sig_q, logger))
+    {
+        sleep_until(proc, cadence);
+
+        /* Periodic re-announcement until we have peers */
+        if (proc->protocol.num_peers == 0 && ++cycle >= announce_interval)
+        {
+            cycle = 0;
+            messaging_send("network", NET_MESSAGE, &announce_buf, false);
+            log_debug(logger, "Identity: re-announcing (no peers yet)\n");
+        }
+
+        generic_msg_t buf = {0};
+        err = messaging_recv(&buf);
+        if (err == -1 || err == ENOMSG)
+            continue;
+        if (!run_message_handlers(proc, queues, buf.type, &buf))
+        {
+            log_debug(logger, "Identity: unhandled message type %ld\n", buf.type);
+        }
+    }
+
+    if (pctx.fd1 > 0)
+        close(pctx.fd1);
+    if (pctx.fd2 > 0)
+        close(pctx.fd2);
+    return 0;
 }
 DECLARE_PROCESS(identity, id_proc, identity_run);

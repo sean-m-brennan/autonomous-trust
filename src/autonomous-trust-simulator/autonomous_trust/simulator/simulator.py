@@ -26,7 +26,7 @@ from datetime import timedelta
 from autonomous_trust.core import Configuration
 from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 from .peer.peer import PeerMovement
-from .sim_data import SimConfig, SimState, Map, Matrix, Ident
+from .sim_data import SimConfig, SimState, Map, Matrix, SignalMatrix, Ident
 from .sim_client import SimClient
 from . import sim_net as net
 from . import default_port, default_steps
@@ -72,7 +72,7 @@ class Simulator(net.SelectServer):
         self.end_time = self.cfg.end
         self.cadence = (self.end_time - self.start_time).total_seconds() / self.max_time_steps
         self.state = SimState()
-        self.pre_state: dict[int, tuple[GeoPosition, float, Map, Matrix, list[str]]] = {}
+        self.pre_state: dict[int, tuple[GeoPosition, float, Map, Matrix, list[str], SignalMatrix]] = {}
         if self.precompute:
             self.precompute_network()
         else:
@@ -90,8 +90,10 @@ class Simulator(net.SelectServer):
         current_time = self.start_time + timedelta(seconds=self.cadence * tick)
         mapp: Map = {}
         matrix: Matrix = {}
+        sig_quality: SignalMatrix = {}
         max_dist = 0
         active = []
+        path_loss = self.cfg.path_loss_matrix
         for peer in self.cfg.peers:
             if peer.initial_time <= current_time <= peer.last_seen:
                 active.append(peer.uuid)
@@ -103,32 +105,47 @@ class Simulator(net.SelectServer):
                     mapp[peer.uuid].position is None:
                 continue
             matrix[peer.uuid] = {}
+            sig_quality[peer.uuid] = {}
             for other in self.cfg.peers:
                 if peer == other or current_time < other.initial_time or current_time > other.last_seen or \
                         mapp[other.uuid].position is None:
                     continue
-                matrix[peer.uuid][other.uuid] = peer.can_reach(other)  # connectivity
+                # Look up terrain path loss if available
+                terrain_loss = None
+                if path_loss is not None:
+                    peer_row = path_loss.get(peer.uuid)
+                    if peer_row is not None:
+                        terrain_loss = peer_row.get(other.uuid)
+                matrix[peer.uuid][other.uuid] = peer.can_reach(other, terrain_loss)
+                if terrain_loss is not None:
+                    sig_quality[peer.uuid][other.uuid] = terrain_loss
                 dist = mapp[peer.uuid].position.distance(mapp[other.uuid].position)
                 if max_dist < dist:
                     max_dist = dist
         mid = UTMPosition.middle(list(map(lambda x: x.position, [v for v in mapp.values() if v.position is not None])))
         center: GeoPosition = mid.convert(GeoPosition)
-        return center, max_dist, mapp, matrix, active
+        return center, max_dist, mapp, matrix, active, sig_quality
 
     def precompute_network(self):
         self.init_computation()
         for tick in range(0, self.max_time_steps):
             self.pre_state[tick] = self.compute_step(tick)
 
+    @staticmethod
+    def _make_state(cur_time, step_result):
+        center, max_dist, mapp, matrix, active, sig_quality = step_result
+        return SimState(cur_time, center, max_dist, mapp, matrix, active,
+                        signal_quality=sig_quality)
+
     def send_state(self, tick, sock: socket.socket):
         cur_time = self.start_time + timedelta(**{self.time_resolution: tick * self.cadence})
         try:
             if self.precompute:
-                state = SimState(cur_time, *self.pre_state[tick])
+                state = self._make_state(cur_time, self.pre_state[tick])
             else:
                 if tick > self.max_time_steps:
                     raise KeyError
-                state = SimState(cur_time, *self.compute_step(tick))
+                state = self._make_state(cur_time, self.compute_step(tick))
             self.active_len = len(state.active)
         except KeyError as e:
             self.send_all(sock, 'end'.encode())

@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <string.h>
 
@@ -229,6 +230,32 @@ int map_remove(map_t *map, map_key_t key)
             map->items[index].value = NULL;
             map->items[index].hash = 0;
             map->length--;
+
+            /* Backward-shift deletion: move subsequent entries in the
+               same probe chain back to fill the gap, so that linear
+               probing in map_get/map_set is not broken. */
+            size_t empty = index;
+            size_t j = (index + 1) % map->capacity;
+            while (map->items[j].key != NULL)
+            {
+                size_t natural = map_hash2index(map, map->items[j].hash);
+                /* Check if entry at j belongs at or before the empty slot
+                   in the circular probe sequence. */
+                bool should_move;
+                if (empty <= j)
+                    should_move = (natural <= empty || natural > j);
+                else
+                    should_move = (natural <= empty && natural > j);
+                if (should_move)
+                {
+                    map->items[empty] = map->items[j];
+                    map->items[j].key = NULL;
+                    map->items[j].value = NULL;
+                    map->items[j].hash = 0;
+                    empty = j;
+                }
+                j = (j + 1) % map->capacity;
+            }
             return 0;
         }
         index++;
@@ -314,7 +341,7 @@ int map_to_json(const void *data_struct, json_t **obj_ptr)
     for (int i = 0; i < map->capacity; i++)
     {
         json_t *elt;
-        if (strlen(map->items[i].key) == 0)
+        if (map->items[i].key == NULL || strlen(map->items[i].key) == 0)
             elt = json_null();
         else
         {
