@@ -61,11 +61,11 @@ class Message(object):
                     self.obj = Configuration.from_string(obj)
                 except Exception:
                     pass  # leave obj as string if deserialization fails
-        # FIXME signing
+        # FIXME: Sign message content with sender's NaCl signing key so recipients can verify authenticity
 
     def __str__(self):
         obj_str = str(self.obj)
-        # FIXME signing
+        # FIXME: Include cryptographic signature field in serialized output for wire-level verification
         if isinstance(self.obj, Configuration):
             obj_str = self.obj.to_string()
         return '|'.join([self.process, self.function, obj_str])

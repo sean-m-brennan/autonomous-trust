@@ -82,7 +82,11 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
     {
         proc = smrt_create(sizeof(process_t)); // FIXME does this get freed?
         if (process_init(proc, pname, runner, configs, tracker, logger, NULL) != 0)
-            return -1; // FIXME no such key in the map (EMAP_NOKEY)
+        {
+            // process_init may fail if pname is not found in the configs map (EMAP_NOKEY);
+            // the exception has already been set by the map_get call inside process_init
+            return -1;
+        }
     }
 
     char sig[SIG_NAME_LEN + 1] = {0};
@@ -153,7 +157,7 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
         return true;
     default:
         net_msg_t *nmsg = &msg->info.net_msg;
-        if (nmsg->process == proc->name)
+        if (strcmp(nmsg->process, proc->name) == 0)
         {
             data_t *h_dat;
             int err = map_get(proc->protocol.handlers, nmsg->function, &h_dat);
@@ -187,7 +191,7 @@ bool keep_running(const process_t *proc, queue_t *sig_q, logger_t *logger)
             log_error(logger, "Non-signal message on signal queue: %d\n", type);
         else if (err == ENOMSG)
             return true;
-        else if (msg.descr == sig_quit)
+        else if (strcmp(msg.descr, sig_quit) == 0)
             return false;
         else
             log_error(logger, "Unhandled signal: %d - '%s'\n", msg.sig, msg.descr);
@@ -218,39 +222,40 @@ void sleep_until(const process_t *proc, long how_long)
         usleep(delta);
 }
 
-int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
+int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
+                  process_ctx_t *ctx)
 {
     char data_path[MAX_FILENAME + 1];
     get_data_dir(data_path);
 
-    int fd1 = 0;
-    int fd2 = 0;
-    int err = daemonize(data_path, proc->flags, &fd1, &fd2);
+    ctx->fd1 = 0;
+    ctx->fd2 = 0;
+    int err = daemonize(data_path, proc->flags, &ctx->fd1, &ctx->fd2);
     if (err != 0)
         return err;
 
     pid_t pid = getpid();
-    log_debug(logger, "Child pid %d\n", pid); // FIXME remove
-    // FIXME message_init
-    queue_t my_q;
-    if (messaging_init(proc->name, &my_q) != 0)
+    log_debug(logger, "Child pid %d\n", pid);
+    if (messaging_init(proc->name, &ctx->my_q) != 0)
         log_exception(logger);
-    messaging_assign(&my_q);
-    queue_t sig_q;
-    if (messaging_init(signal, &sig_q) != 0)
+    messaging_assign(&ctx->my_q);
+    if (messaging_init(signal, &ctx->sig_q) != 0)
         log_exception(logger);
 
-    // FIXME pre-loop activity
+    return 0;
+}
 
-    // handle messages
+int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
+                 process_ctx_t *ctx)
+{
     array_t unprocessed;
     array_init(&unprocessed);
-    while (keep_running(proc, &sig_q, logger))
+    while (keep_running(proc, &ctx->sig_q, logger))
     {
         sleep_until(proc, cadence);
 
         generic_msg_t buf = {0};
-        err = messaging_recv(&buf);
+        int err = messaging_recv(&buf);
         if (err == -1)
             ; // FIXME repair?
         if (err == ENOMSG)
@@ -269,10 +274,19 @@ int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_
     }
     array_free(&unprocessed);
     array_free(queues);
-    if (fd1 > 0)
-        close(fd1);
-    if (fd2 > 0)
-        close(fd2);
+    if (ctx->fd1 > 0)
+        close(ctx->fd1);
+    if (ctx->fd2 > 0)
+        close(ctx->fd2);
 
     return 0;
+}
+
+int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
+{
+    process_ctx_t ctx = {0};
+    int err = process_setup(proc, signal, logger, &ctx);
+    if (err != 0)
+        return err;
+    return process_loop(proc, queues, logger, &ctx);
 }

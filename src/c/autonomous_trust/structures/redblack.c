@@ -129,6 +129,8 @@ struct rbNode *nodeMinLeaf(struct rbNode *node)
 }
 
 void nodesFree(struct rbNode *node) {
+    if (node == NULL)
+        return;
     if (node->left != NULL)
         nodesFree(node->left);
     if (node->right != NULL)
@@ -160,52 +162,60 @@ void rotateTree(tree_t *tree, enum Direction dir, struct rbNode *node)
     node->parent = pivot;
 }
 
-struct rbNode *recolorInsPartial(tree_t *tree, enum Direction dir, struct rbNode *node)
-{
-    struct rbNode *cousin;
-    struct rbNode *sibling;
-    if (dir == LEFT)
-    {
-        cousin = node->parent->parent->left;
-        sibling = node->parent->left;
-    }
-    else
-    {
-        cousin = node->parent->parent->right;
-        sibling = node->parent->right;
-    }
-    if (cousin->red)
-    {
-        cousin->red = false;
-        node->parent->red = false;
-        node->parent->parent->red = true;
-        node = node->parent->parent;
-    }
-    else
-    {
-        if (node == sibling)
-        {
-            node = node->parent;
-            rotateTree(tree, opposite_direction(dir), node);
-        }
-        node->parent->red = false;
-        node->parent->parent->red = true;
-        rotateTree(tree, dir, node->parent->parent);
-    }
-    return node;
-}
-
 void recolorInsert(tree_t *tree, struct rbNode *node)
 {
-    while (node != tree->root && node->parent->red)
+    while (node != tree->root && node->parent != NULL && node->parent->red)
     {
-        if (node->parent == node->parent->parent->right)
-            node = recolorInsPartial(tree, LEFT, node);
+        struct rbNode *grandparent = node->parent->parent;
+        if (grandparent == NULL)
+            break;
+
+        if (node->parent == grandparent->left)
+        {
+            struct rbNode *uncle = grandparent->right;
+            if (uncle != NULL && uncle->red)
+            {
+                node->parent->red = false;
+                uncle->red = false;
+                grandparent->red = true;
+                node = grandparent;
+            }
+            else
+            {
+                if (node == node->parent->right)
+                {
+                    node = node->parent;
+                    rotateTree(tree, LEFT, node);
+                }
+                node->parent->red = false;
+                node->parent->parent->red = true;
+                rotateTree(tree, RIGHT, node->parent->parent);
+            }
+        }
         else
-            node = recolorInsPartial(tree, RIGHT, node);
-        tree->root->red = false;
-        node = node->parent;
+        {
+            struct rbNode *uncle = grandparent->left;
+            if (uncle != NULL && uncle->red)
+            {
+                node->parent->red = false;
+                uncle->red = false;
+                grandparent->red = true;
+                node = grandparent;
+            }
+            else
+            {
+                if (node == node->parent->left)
+                {
+                    node = node->parent;
+                    rotateTree(tree, RIGHT, node);
+                }
+                node->parent->red = false;
+                node->parent->parent->red = true;
+                rotateTree(tree, LEFT, node->parent->parent);
+            }
+        }
     }
+    tree->root->red = false;
 }
 
 void transplant(tree_t *tree, struct rbNode *u, struct rbNode *v)
@@ -216,7 +226,8 @@ void transplant(tree_t *tree, struct rbNode *u, struct rbNode *v)
         u->parent->left = v;
     else
         u->parent->right = v;
-    v->parent = u->parent;
+    if (v != NULL)
+        v->parent = u->parent;
 }
 
 struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode *node)
@@ -327,6 +338,25 @@ int tree_copy(tree_t *orig, tree_t **copy_ptr)
     return 0;
 }
 
+int tree_size(tree_t *tree)
+{
+    return tree->size;
+}
+
+static int node_depth(struct rbNode *node)
+{
+    if (node == NULL)
+        return 0;
+    int left_depth = node_depth(node->left);
+    int right_depth = node_depth(node->right);
+    return 1 + (left_depth > right_depth ? left_depth : right_depth);
+}
+
+int tree_depth(tree_t *tree)
+{
+    return node_depth(tree->root);
+}
+
 tree_data_ptr_t tree_find(tree_t *tree, int key)
 {
     struct rbNode *node = findNode(tree, key);
@@ -379,7 +409,7 @@ int tree_delete(tree_t *tree, int key)
     if (!tree->root)
         return EXCEPTION(ERBT_EMPTY);
 
-    struct rbNode *node = tree_find(tree, key);
+    struct rbNode *node = findNode(tree, key);
     if (node == NULL)
         return EXCEPTION(ERBT_NO_KEY);
 
@@ -402,15 +432,24 @@ int tree_delete(tree_t *tree, int key)
         color = temp->red;
         fix_root = temp->right;
         if (temp->parent == node)
-            fix_root->parent = temp;
+        {
+            if (fix_root != NULL)
+                fix_root->parent = temp;
+        }
         else
         {
             transplant(tree, temp, temp->right);
             temp->right = node->right;
-            temp->right->parent = temp;
+            if (temp->right != NULL)
+                temp->right->parent = temp;
         }
+        transplant(tree, node, temp);
+        temp->left = node->left;
+        if (temp->left != NULL)
+            temp->left->parent = temp;
+        temp->red = node->red;
     }
-    if (!color)
+    if (!color && fix_root != NULL)
         recolorDelete(tree, fix_root);
     tree->size--;
     return 0;

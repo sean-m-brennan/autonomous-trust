@@ -193,8 +193,8 @@ int datetime_strftime_res(const datetime_t *dt, const char *format, const time_r
         if (stop)
             break;
     }
-    if (prev == NULL && strlen(s) == 0 && strlen(fmt) > 0)
-        strftime(s, max, fmt, tm);
+    if (!stop && prev != NULL && *prev != '\0')
+        len += strftime(s + len, remaining, prev, tm);
     return err;
 }
 

@@ -25,6 +25,7 @@ from autonomous_trust.services.peer.position import Position, GeoPosition
 from .peer.peer import PeerInfo
 
 Matrix = dict[str, dict[str, bool]]
+SignalMatrix = dict[str, dict[str, float]]  # peer_id -> {peer_id: path_loss_dB}
 
 
 class Ident(Configuration):
@@ -45,7 +46,7 @@ class SimState(Configuration):
     def __init__(self, time: Optional[datetime] = None, center: Optional[GeoPosition] = None,
                  scale: Optional[float] = None, peers: Optional[Map] = None,
                  reachable: Optional[Matrix] = None, active: Optional[list[str]] = None,
-                 blank: bool = False):
+                 blank: bool = False, signal_quality: Optional[SignalMatrix] = None):
         super().__init__(sim_data_pb2.SimState)
         self.time = time
         if time is None:
@@ -62,6 +63,9 @@ class SimState(Configuration):
         if active is None:
             self.active = []
         self.blank = blank
+        self.signal_quality = signal_quality
+        if signal_quality is None:
+            self.signal_quality: SignalMatrix = {}
 
     def convert(self) -> 'SimState':
         state = SimState(**self.to_dict())
@@ -78,6 +82,7 @@ class SimConfig(Configuration):
         self.start: datetime = kwargs['start']
         self.end: datetime = kwargs['end']
         self.peers: list[PeerInfo] = kwargs['peers']
+        self.path_loss_matrix: Optional[SignalMatrix] = kwargs.get('path_loss_matrix')
 
     @classmethod
     def load(cls, data: str) -> 'SimConfig':

@@ -1,0 +1,62 @@
+# Conda environment for SPLAT! terrain simulation.
+# Installs AT packages via pip editable without modifying the base autonomous_trust env.
+#
+# Usage:
+#   cd src/autonomous-trust-simulator/config
+#   conda env create -f simulation_environ.yaml
+#   conda activate muudd_simulation
+#   bash build_splat.sh
+#   bash download_srtm.sh
+
+name: muudd_simulation
+channels:
+  - conda-forge
+dependencies:
+  - python==3.13.*
+  - pip
+
+  # AT's C library deps (not installable via pip)
+  - libprotobuf>=6.33.5
+  - protobuf-c>=1.5.2
+  - libuuid
+  - libsodium
+  - jansson
+  - cmake
+
+  # Python deps matching AT's environment.yaml
+  - numpy
+  - py-opencv
+  - geopy
+  - utm
+  - pynacl
+  - psutil
+  - icontract
+  - python-dateutil
+  - protobuf>=6.33.5
+  - aenum
+  - pydantic
+  - dill
+  - networkx
+
+  # SPLAT! build toolchain
+  - gcc_linux-64
+  - gxx_linux-64
+  - make
+  - bzip2
+  - zlib
+  - libgdal
+
+  # SRTM processing
+  - unzip
+  - curl
+
+  # Testing
+  - pytest
+  - pytest-cov
+
+  - pip:
+      # AT packages as editable installs (paths relative to this file's directory)
+      - -e ../../autonomous-trust
+      - -e ../../autonomous-trust-services
+      - -e ../../autonomous-trust-inspector
+      - -e ../../autonomous-trust-simulator

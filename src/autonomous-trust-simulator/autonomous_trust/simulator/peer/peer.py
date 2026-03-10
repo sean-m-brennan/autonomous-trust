@@ -39,14 +39,39 @@ class PeerConnection(Configuration):
         self.iface = iface
         self.antenna = antenna
 
-    def can_reach(self, other: 'PeerConnection') -> bool:
-        min_strength = -154 * 10 * math.log10(self.iface.rate)  # dBm * 10log10(bps)
-        dist = self.position.distance(other.position)
-        if dist == 0:
-            dist = .001
-        signal_strength = (1.0 / (dist ** 2) * self.signal) + self.antenna.gain
-        # dBm is negative, more negative is stronger
-        return signal_strength < min_strength
+    # Receiver sensitivity thresholds (dBm) by NetInterface class
+    # Used only in terrain-aware mode; original model uses its own formula
+    _rx_sensitivity = {
+        'small': -120.0,   # LoRa-class: very sensitive, low data rate
+        'medium': -90.0,   # WiFi-class: typical 802.11 receiver
+        'large': -70.0,    # High-bandwidth point-to-point
+    }
+
+    def can_reach(self, other: 'PeerConnection', terrain_loss_db: Optional[float] = None) -> bool:
+        """Determine if this peer can reach another.
+
+        When terrain_loss_db is provided (from SPLAT! or similar), uses a
+        standard RF link budget: received_power = tx_power - path_loss + tx_gain + rx_gain.
+        Link is viable if received_power >= receiver_sensitivity.
+
+        When terrain_loss_db is None, falls back to the original inverse-square
+        model for backward compatibility with existing tactical scenarios.
+        """
+        if terrain_loss_db is not None:
+            # Terrain-aware: standard RF link budget in dB scale
+            # tx_power_dbm is stored directly in self.signal for terrain scenarios
+            received_power = self.signal - terrain_loss_db + self.antenna.gain + other.antenna.gain
+            sensitivity = self._rx_sensitivity.get(self.iface.value, -90.0)
+            return received_power >= sensitivity
+        else:
+            # Original inverse-square model (backward compatibility)
+            min_strength = -154 * 10 * math.log10(self.iface.rate)
+            dist = self.position.distance(other.position)
+            if dist == 0:
+                dist = .001
+            signal_strength = (1.0 / (dist ** 2) * self.signal) + self.antenna.gain
+            # dBm is negative, more negative is stronger
+            return signal_strength < min_strength
 
 
 class DataStream(Configuration):

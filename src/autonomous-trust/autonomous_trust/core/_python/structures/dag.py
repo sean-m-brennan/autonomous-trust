@@ -27,8 +27,8 @@ from ..system import now
 from autonomous_trust.core.protobuf.structures import dag_pb2
 
 class Step(ABC):
-    def __init__(self, uuid):  # FIXME
-        self.uuid = None
+    def __init__(self, uuid):  # uuid is required; subclasses provide defaults (e.g. LinkedStep generates via uuid4)
+        self.uuid = uuid
 
 
 class GenesisType(Step):

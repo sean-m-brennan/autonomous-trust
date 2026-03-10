@@ -16,6 +16,7 @@
 
 #include <string.h>
 #include <stddef.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <stdio.h>
@@ -57,13 +58,13 @@ int makedirs(char *path, mode_t mode)
         {
             *p = 0;
             int err = mkdir(tmp, mode);
-            if (err != 0)
+            if (err != 0 && errno != EEXIST)
                 return SYS_EXCEPTION();
             *p = '/';
         }
     }
     int err = mkdir(tmp, mode);
-    if (err != 0)
+    if (err != 0 && errno != EEXIST)
         return SYS_EXCEPTION();
     return 0;
 }

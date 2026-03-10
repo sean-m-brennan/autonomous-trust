@@ -91,6 +91,7 @@ int num_config_files(char path[])
             break;
         i++;
     }
+    closedir(d);
     return i;
 }
 
@@ -129,7 +130,9 @@ int all_config_files(char dir[], array_t *paths)
 int config_absolute_path(const char *path_in, char *path_out)
 {
     char cfg_dir[CFG_PATH_LEN + 1];
-    get_cfg_dir(cfg_dir); // FIXME error checking?
+    int len = get_cfg_dir(cfg_dir);
+    if (len < 0 || len > CFG_PATH_LEN)
+        return -1;
     if (strncmp(path_in, cfg_dir, strlen(cfg_dir)) != 0)
     {
         int remain = snprintf(path_out, 255, "%s/%s", cfg_dir, path_in);

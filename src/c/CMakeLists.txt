@@ -8,6 +8,9 @@ if(DEFINED ENV{CONDA_PREFIX})
     set(CMAKE_PREFIX_PATH ${CONDA_SYSROOT})
     #set(CMAKE_SYSROOT ${CONDA_SYSROOT})  # Doesn't work
     set(sysroot_flag --sysroot=${CONDA_SYSROOT})
+    # Ensure conda libs are found at runtime even without conda activated
+    set(CMAKE_INSTALL_RPATH "${CONDA_ROOT}/lib")
+    set(CMAKE_BUILD_RPATH "${CONDA_ROOT}/lib")
     message("-- Conda is active; sysroot now at ${CONDA_SYSROOT}")
 endif()
 
@@ -109,7 +112,7 @@ endif()
 
 # check (testing only)
 find_path(LIBCHECK_INCLUDE_DIR check.h PATHS ${CONDA_ROOT})
-find_library(LIBCHECK_LIBRARY libcheck.so PATHS ${CONDA_ROOT})
+find_library(LIBCHECK_LIBRARY NAMES check libcheck.so libcheck.a PATHS ${CONDA_ROOT})
 include_directories(${LIBCHECK_INCLUDE_DIRS})
 if(LIBCHECK_LIBRARY)
     message("-- Found libcheck at ${LIBCHECK_LIBRARY}")
@@ -382,7 +385,7 @@ target_sources(autonomous_trust PUBLIC ${libsrc}
 # example app
 
 add_executable(at_example example.c)
-target_link_libraries(at_example PRIVATE autonomous_trust_static ${DEPENDENCIES})
+target_link_libraries(at_example PRIVATE -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive ${DEPENDENCIES})
 #target_link_libraries(at_example PRIVATE autonomous_trust ${DEPENDENCIES})
 target_compile_options(at_example PRIVATE -Wall ${sysroot_flag})
 target_link_options(at_example PRIVATE ${sysroot_flag})
@@ -393,7 +396,7 @@ target_link_directories(at_example PRIVATE ${CMAKE_SYSROOT})
 # demo app (containerized)
 
 add_executable(at_demo at_demo.c)
-target_link_libraries(at_demo PRIVATE autonomous_trust_static ${DEPENDENCIES})
+target_link_libraries(at_demo PRIVATE -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive ${DEPENDENCIES})
 target_compile_options(at_demo PRIVATE -Wall ${sysroot_flag})
 target_link_options(at_demo PRIVATE ${sysroot_flag})
 target_link_directories(at_demo PRIVATE ${CMAKE_SYSROOT})
@@ -463,6 +466,58 @@ add_executable(queue_pool_test test/queue_pool_test.c)
 set_source_files_properties(test/queue_pool_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(queue_pool_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
+add_executable(network_test test/network_test.c)
+set_source_files_properties(test/network_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(network_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(identity_test test/identity_test.c)
+set_source_files_properties(test/identity_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(identity_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(data_test test/data_test.c)
+set_source_files_properties(test/data_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(data_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(datetime_test test/datetime_test.c)
+set_source_files_properties(test/datetime_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(datetime_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(b64_test test/b64_test.c)
+set_source_files_properties(test/b64_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(b64_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(group_test test/group_test.c)
+set_source_files_properties(test/group_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(data_json_test test/data_json_test.c)
+set_source_files_properties(test/data_json_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(data_json_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(datetime2_test test/datetime2_test.c)
+set_source_files_properties(test/datetime2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(datetime2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(config_test test/config_test.c)
+set_source_files_properties(test/config_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(config_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(reputation2_test test/reputation2_test.c)
+set_source_files_properties(test/reputation2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(reputation2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(map_json_test test/map_json_test.c)
+set_source_files_properties(test/map_json_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(map_json_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(array2_test test/array2_test.c)
+set_source_files_properties(test/array2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(array2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(negotiation2_test test/negotiation2_test.c)
+set_source_files_properties(test/negotiation2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(negotiation2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
 enable_testing()
 
 add_test(NAME array_test COMMAND $<TARGET_FILE:array_test>)
@@ -480,6 +535,93 @@ add_test(NAME negotiation_test COMMAND $<TARGET_FILE:negotiation_test>)
 add_test(NAME reputation_test COMMAND $<TARGET_FILE:reputation_test>)
 add_test(NAME history_test COMMAND $<TARGET_FILE:history_test>)
 add_test(NAME queue_pool_test COMMAND $<TARGET_FILE:queue_pool_test>)
+add_test(NAME network_test COMMAND $<TARGET_FILE:network_test>)
+add_test(NAME identity_test COMMAND $<TARGET_FILE:identity_test>)
+add_test(NAME data_test COMMAND $<TARGET_FILE:data_test>)
+add_test(NAME datetime_test COMMAND $<TARGET_FILE:datetime_test>)
+add_test(NAME b64_test COMMAND $<TARGET_FILE:b64_test>)
+add_test(NAME group_test COMMAND $<TARGET_FILE:group_test>)
+add_test(NAME data_json_test COMMAND $<TARGET_FILE:data_json_test>)
+add_test(NAME datetime2_test COMMAND $<TARGET_FILE:datetime2_test>)
+add_test(NAME config_test COMMAND $<TARGET_FILE:config_test>)
+add_test(NAME reputation2_test COMMAND $<TARGET_FILE:reputation2_test>)
+add_test(NAME map_json_test COMMAND $<TARGET_FILE:map_json_test>)
+add_test(NAME array2_test COMMAND $<TARGET_FILE:array2_test>)
+add_test(NAME negotiation2_test COMMAND $<TARGET_FILE:negotiation2_test>)
+
+add_executable(msg_types_test test/msg_types_test.c)
+set_source_files_properties(test/msg_types_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(msg_types_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(network2_test test/network2_test.c)
+set_source_files_properties(test/network2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(network2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(proc_tracker2_test test/proc_tracker2_test.c)
+set_source_files_properties(test/proc_tracker2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(proc_tracker2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(processes_test test/processes_test.c)
+set_source_files_properties(test/processes_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(processes_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(capabilities_test test/capabilities_test.c)
+set_source_files_properties(test/capabilities_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(capabilities_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_test(NAME msg_types_test COMMAND $<TARGET_FILE:msg_types_test>)
+add_test(NAME network2_test COMMAND $<TARGET_FILE:network2_test>)
+add_test(NAME proc_tracker2_test COMMAND $<TARGET_FILE:proc_tracker2_test>)
+add_test(NAME processes_test COMMAND $<TARGET_FILE:processes_test>)
+add_test(NAME capabilities_test COMMAND $<TARGET_FILE:capabilities_test>)
+
+add_executable(util_test test/util_test.c)
+set_source_files_properties(test/util_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(util_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(err_str_test test/err_str_test.c)
+set_source_files_properties(test/err_str_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(err_str_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_test(NAME util_test COMMAND $<TARGET_FILE:util_test>)
+add_test(NAME err_str_test COMMAND $<TARGET_FILE:err_str_test>)
+
+add_executable(message_test test/message_test.c)
+set_source_files_properties(test/message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(message_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(rb2_test test/rb2_test.c)
+set_source_files_properties(test/rb2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rb2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_test(NAME message_test COMMAND $<TARGET_FILE:message_test>)
+add_test(NAME rb2_test COMMAND $<TARGET_FILE:rb2_test>)
+
+add_executable(map2_test test/map2_test.c)
+set_source_files_properties(test/map2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(map2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(reputation3_test test/reputation3_test.c)
+set_source_files_properties(test/reputation3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(reputation3_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(config2_test test/config2_test.c)
+set_source_files_properties(test/config2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(config2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(util2_test test/util2_test.c)
+set_source_files_properties(test/util2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(util2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_executable(msg_types2_test test/msg_types2_test.c)
+set_source_files_properties(test/msg_types2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(msg_types2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_test(NAME map2_test COMMAND $<TARGET_FILE:map2_test>)
+add_test(NAME reputation3_test COMMAND $<TARGET_FILE:reputation3_test>)
+add_test(NAME config2_test COMMAND $<TARGET_FILE:config2_test>)
+add_test(NAME util2_test COMMAND $<TARGET_FILE:util2_test>)
+add_test(NAME msg_types2_test COMMAND $<TARGET_FILE:msg_types2_test>)
 
 
 ####################
