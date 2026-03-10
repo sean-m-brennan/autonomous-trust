@@ -88,3 +88,5 @@ dist
 /examples/mission/docker-compose.yaml
 /examples/mission/air/airsdk
 /src/autonomous-trust/autonomous_trust/core/protobuf/
+/.minikube/
+/.kube/

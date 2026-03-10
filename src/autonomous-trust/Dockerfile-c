@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1.3
+
+# AutonomousTrust pure-C image (no Python at runtime)
+# Multi-stage: build C library + at_demo, then copy to minimal runtime image.
+# Build with:
+#   docker build --network host -t autonomous-trust-c -f src/autonomous-trust/Dockerfile-c .
+
+####################
+# Stage 1: Builder
+####################
+FROM debian:bookworm AS builder
+
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG CERT_CONTENT
+ARG GIT_VERSION="unknown"
+
+# Install CA cert for proxy if provided
+RUN if [ -n "$CERT_CONTENT" ]; then \
+      echo "$CERT_CONTENT" > /usr/local/share/ca-certificates/proxy-ca.crt && \
+      update-ca-certificates; \
+    fi
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+        python3 python-is-python3 \
+        cmake clang make pkg-config libc-dev \
+        uuid-dev libsodium-dev libjansson-dev \
+        protobuf-compiler protobuf-c-compiler libprotobuf-c-dev libprotobuf-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy C source and protobuf definitions (src/c/protobuf is a symlink)
+COPY src/c /build/c-src
+COPY src/protobuf /build/c-src/protobuf
+
+RUN rm -rf /build/c-src/build && mkdir -p /build/c-src/build && cd /build/c-src/build && \
+    CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DREVISION="$GIT_VERSION" -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" -DCMAKE_CXX_FLAGS="-Wno-unknown-warning-option" && \
+    make -j$(nproc) && \
+    make install DESTDIR=/build/install
+
+####################
+# Stage 2: Runtime
+####################
+FROM debian:bookworm-slim
+
+ARG CERT_CONTENT
+
+# Install CA cert for proxy if provided
+RUN if [ -n "$CERT_CONTENT" ]; then \
+      echo "$CERT_CONTENT" > /usr/local/share/ca-certificates/proxy-ca.crt && \
+      update-ca-certificates; \
+    fi
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+        libsodium23 libjansson4 libuuid1 \
+        libprotobuf-c1 libprotobuf32 \
+        iproute2 iputils-ping && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Copy built artifacts from builder
+COPY --from=builder /build/install/usr/local/bin/at_demo /usr/local/bin/at_demo
+COPY --from=builder /build/install/usr/local/lib/libautonomous_trust.so /usr/local/lib/libautonomous_trust.so
+RUN ldconfig
+
+COPY src/autonomous-trust/entrypoint-c.sh /bin/entrypoint-c.sh
+RUN chmod +x /bin/entrypoint-c.sh
+
+ENV AUTONOMOUS_TRUST_ROOT="/"
+ENV ROUTER="172.17.0.1"
+
+ENTRYPOINT ["/bin/entrypoint-c.sh"]
+CMD []

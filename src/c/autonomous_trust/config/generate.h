@@ -52,6 +52,7 @@ DECLARE_ERROR(EGEN_NOIF, "No suitable network interface found");
 int discover_network(net_iface_t *iface);
 int generate_identity(const char *fullname, const char *cfg_dir);
 int generate_network_config(const char *cfg_dir);
+int generate_subsystems_config(const char *cfg_dir);
 int random_config(const char *cfg_dir);
 
 #endif  /* GENERATE_H */
