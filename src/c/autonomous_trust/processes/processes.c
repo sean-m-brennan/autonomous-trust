@@ -46,11 +46,12 @@ int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *confi
     // FIXME general config load/save
     config_t *cfg = NULL;
     data_t *cfg_dat = NULL;
-    if (map_get(configurations, proc->name, &cfg_dat) != 0)
-        return -1;
-    if (data_object_ptr(cfg_dat, (void **)&cfg) != 0)
-        return -1;
-    memcpy(&proc->conf, cfg, sizeof(config_t));
+    memset(&proc->conf, 0, sizeof(config_t));
+    if (map_get(configurations, proc->name, &cfg_dat) == 0)
+    {
+        if (data_object_ptr(cfg_dat, (void **)&cfg) == 0)
+            memcpy(&proc->conf, cfg, sizeof(config_t));
+    }
     proc->configs = configurations;
     proc->subsystems = subsystems;
     proc->logger = logger;

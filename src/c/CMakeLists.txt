@@ -390,6 +390,17 @@ target_link_directories(at_example PRIVATE ${CMAKE_SYSROOT})
 
 
 ####################
+# demo app (containerized)
+
+add_executable(at_demo at_demo.c)
+target_link_libraries(at_demo PRIVATE autonomous_trust_static ${DEPENDENCIES})
+target_compile_options(at_demo PRIVATE -Wall ${sysroot_flag})
+target_link_options(at_demo PRIVATE ${sysroot_flag})
+target_link_directories(at_demo PRIVATE ${CMAKE_SYSROOT})
+install(TARGETS at_demo RUNTIME DESTINATION bin)
+
+
+####################
 # tests
 
 add_executable(array_test test/array_test.c)

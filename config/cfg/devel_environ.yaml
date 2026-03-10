@@ -23,3 +23,7 @@ dependencies:
   - napkin
   - pylint
   - nodejs
+  - clang
+  - clangxx
+  - lld
+  - git

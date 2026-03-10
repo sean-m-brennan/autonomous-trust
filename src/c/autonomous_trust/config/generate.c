@@ -30,6 +30,8 @@
 
 #include "config/generate.h"
 #include "config/configuration.h"
+#include "network/network.h"
+#include "processes/process_tracker.h"
 #include "utilities/util.h"
 
 DEFINE_ERROR(EGEN_NOIF, "No suitable network interface found");
@@ -164,21 +166,16 @@ int generate_identity(const char *fullname, const char *cfg_dir)
     if (err != 0)
         return err;
 
-    /* Write identity config as JSON */
     char filepath[CFG_PATH_LEN + 1];
     snprintf(filepath, CFG_PATH_LEN, "%s/identity.cfg.json", cfg_dir);
 
-    /* In full impl: use identity_to_json + write_config_file */
-    /* For now, write a minimal JSON config */
-    json_t *obj = json_object();
-    char uuid_str[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(uuid, uuid_str);
-    json_object_set_new(obj, "uuid", json_string(uuid_str));
-    json_object_set_new(obj, "fullname", json_string(fullname));
-    json_object_set_new(obj, "address", json_string(address));
-
-    err = json_dump_file(obj, filepath, JSON_INDENT(2));
-    json_decref(obj);
+    config_t *cfg = find_configuration("identity");
+    if (cfg == NULL)
+    {
+        identity_free(ident);
+        return -1;
+    }
+    err = write_config_file(cfg, ident, filepath);
     identity_free(ident);
 
     return err;
@@ -195,20 +192,55 @@ int generate_network_config(const char *cfg_dir)
     if (err != 0)
         return err;
 
+    network_config_t net_cfg = {0};
+    net_cfg.port = COMM_PORT;
+    strncpy(net_cfg.mac_address, iface.mac_addr, MAC_ADDR_LEN);
+    strncpy(net_cfg.ip4_cidr, iface.ip4_cidr, CIDR4_LEN);
+    strncpy(net_cfg.ip6_cidr, iface.ip6_cidr, CIDR6_LEN);
+    /* mcast addresses left empty */
+
     char filepath[CFG_PATH_LEN + 1];
     snprintf(filepath, CFG_PATH_LEN, "%s/network.cfg.json", cfg_dir);
 
-    json_t *obj = json_object();
-    json_object_set_new(obj, "port", json_integer(COMM_PORT));
-    json_object_set_new(obj, "mac_address", json_string(iface.mac_addr));
-    json_object_set_new(obj, "ip4_cidr", json_string(iface.ip4_cidr));
-    json_object_set_new(obj, "mcast4_addr", json_string(""));
-    json_object_set_new(obj, "ip6_cidr", json_string(iface.ip6_cidr));
-    json_object_set_new(obj, "mcast6_addr", json_string(""));
+    config_t *cfg = find_configuration("network");
+    if (cfg == NULL)
+        return -1;
+    return write_config_file(cfg, &net_cfg, filepath);
+}
 
-    err = json_dump_file(obj, filepath, JSON_INDENT(2));
-    json_decref(obj);
-    return err;
+/****************************
+ * Subsystems config generation
+ ****************************/
+
+int generate_subsystems_config(const char *cfg_dir)
+{
+    logger_t logger;
+    int err = logger_init(&logger, WARNING, NULL);
+    if (err != 0)
+        return err;
+
+    tracker_t tracker;
+    err = tracker_init(&logger, &tracker);
+    if (err != 0)
+        return err;
+
+    err = tracker_register_subsystem(&tracker, "network", "udp_net_4");
+    if (err != 0)
+        return err;
+    err = tracker_register_subsystem(&tracker, "identity", "id_proc");
+    if (err != 0)
+        return err;
+    err = tracker_register_subsystem(&tracker, "negotiation", "neg_proc");
+    if (err != 0)
+        return err;
+    err = tracker_register_subsystem(&tracker, "reputation", "rep_proc");
+    if (err != 0)
+        return err;
+
+    char filepath[CFG_PATH_LEN + 1];
+    snprintf(filepath, CFG_PATH_LEN, "%s/%s", cfg_dir, default_tracker_filename);
+
+    return tracker_to_file(&tracker, filepath);
 }
 
 /****************************
@@ -230,5 +262,9 @@ int random_config(const char *cfg_dir)
     if (err != 0)
         return err;
 
-    return generate_network_config(cfg_dir);
+    err = generate_network_config(cfg_dir);
+    if (err != 0)
+        return err;
+
+    return generate_subsystems_config(cfg_dir);
 }
