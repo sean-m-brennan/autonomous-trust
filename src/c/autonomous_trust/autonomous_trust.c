@@ -124,7 +124,6 @@ int run_autonomous_trust(char *q_in, char *q_out,
                          log_level_t log_level, char log_file[])
 {
     // FIXME pass in/register capabilities
-    const long cadence = 500000L; // microseconds
     int error = 0;
     char cfg_dir[CFG_PATH_LEN + 1] = {0};
     get_cfg_dir(cfg_dir);

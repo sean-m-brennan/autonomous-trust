@@ -91,6 +91,10 @@ static int _send_udp(const uint8_t *msg, size_t msg_len, const char *host, int p
     if (sock == -1)
         return SYS_EXCEPTION();
 
+    /* Required for sending to broadcast addresses */
+    int one = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -537,10 +541,22 @@ static void *broadcast_receiver_thread(void *arg)
         if (strcmp(from_addr, my_addr) == 0)
             continue;
 
+        log_info(ctx->logger, "Network: broadcast received %d bytes from %s\n", nbytes, from_addr);
+
         /* Broadcast messages are unencrypted */
         net_wire_msg_t wmsg;
         if (net_message_from_wire(buf, nbytes, NULL, &wmsg) == 0)
+        {
+            log_debug(ctx->logger, "Network: broadcast msg %s.%s from %s\n",
+                      wmsg.process, wmsg.function, wmsg.from_whom.fullname);
+            /* Populate sender address from UDP source so recipient can respond */
+            strncpy(wmsg.from_whom.address, from_addr, ADDR_LEN);
             route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+        }
+        else
+        {
+            log_error(ctx->logger, "Network: failed to deserialize broadcast from %s\n", from_addr);
+        }
         net_wire_msg_free(&wmsg);
     }
     return NULL;
@@ -803,7 +819,19 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
     if (map_get(proc->configs, id_key, &id_dat) == 0)
         data_object_ptr(id_dat, (void **)&myself);
 
-    /* Start receiver threads */
+    /* Preserve network sockets across daemonize (which closes all FDs) */
+    proc->flags |= NO_CLOSE_FILES;
+
+    /* Daemonize first, then start receiver threads in the child */
+    process_ctx_t pctx = {0};
+    int ret = process_setup(proc, signal, logger, &pctx);
+    if (ret != 0)
+    {
+        network_shutdown(&socks);
+        return ret;
+    }
+
+    /* Start receiver threads (now in the daemonized child) */
     bool stop = false;
     net_thread_ctx_t thread_ctx = {
         .cfg = cfg,
@@ -822,8 +850,73 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
     pthread_create(&peer_thread, NULL, peer_receiver_thread, &thread_ctx);
     pthread_create(&bcast_thread, NULL, broadcast_receiver_thread, &thread_ctx);
 
-    /* Delegate to process_run for main loop with outbound message handling */
-    int ret = process_run(proc, queues, signal, logger);
+    /* Network-specific message loop: handle outbound sends */
+    char bcast_addr[IPV4_ADDR_LEN] = {0};
+    cidr4_to_broadcast(net_cfg->ip4_cidr, bcast_addr);
+    log_info(logger, "Network: ready, broadcast=%s port=%d recv_ptp=%d recv_cast=%d\n",
+             bcast_addr, port_num, socks.recv_ptp, socks.recv_cast);
+
+    while (keep_running(proc, &pctx.sig_q, logger))
+    {
+        sleep_until(proc, cadence);
+
+        generic_msg_t buf = {0};
+        err = messaging_recv(&buf);
+        if (err == -1 || err == ENOMSG)
+            continue;
+
+        if (buf.type == NET_MESSAGE)
+        {
+            net_msg_t *nmsg = &buf.info.net_msg;
+
+            /* Convert IPC net_msg_t to wire format */
+            net_wire_msg_t wmsg = {0};
+            strncpy(wmsg.process, nmsg->process, PROC_NAME_LEN);
+            wmsg.function = nmsg->function;
+            wmsg.data = nmsg->obj;
+            wmsg.data_len = nmsg->len;
+            wmsg.encrypt = nmsg->encrypt;
+            memcpy(&wmsg.from_whom, &nmsg->from_whom, sizeof(public_identity_t));
+
+            /* Determine broadcast vs peer from to_whom address */
+            bool is_broadcast = (nmsg->to_whom.address[0] == '\0');
+            if (is_broadcast)
+            {
+                wmsg.to_whom.type = RECIPIENT_BROADCAST;
+                strncpy(wmsg.to_whom.target.peer.address, bcast_addr, ADDR_LEN);
+                log_debug(logger, "Network: broadcasting %s.%s to %s\n",
+                          nmsg->process, nmsg->function, bcast_addr);
+            }
+            else
+            {
+                wmsg.to_whom.type = RECIPIENT_PEER;
+                memcpy(&wmsg.to_whom.target.peer, &nmsg->to_whom, sizeof(public_identity_t));
+            }
+
+            ret = net_encrypt_and_send(myself, &wmsg, cfg, port_num, logger);
+            if (ret != 0)
+            {
+                log_error(logger, "Network: send failed for %s.%s\n", nmsg->process, nmsg->function);
+                log_exception(logger);
+            }
+            else
+            {
+                log_info(logger, "Network: sent %s.%s to %s\n", nmsg->process, nmsg->function,
+                         is_broadcast ? bcast_addr : nmsg->to_whom.address);
+            }
+        }
+        else
+        {
+            /* Non-network messages: use generic handler */
+            run_message_handlers(proc, queues, buf.type, &buf);
+        }
+    }
+
+    /* Cleanup */
+    if (pctx.fd1 > 0)
+        close(pctx.fd1);
+    if (pctx.fd2 > 0)
+        close(pctx.fd2);
 
     /* Signal threads to stop and join */
     stop = true;

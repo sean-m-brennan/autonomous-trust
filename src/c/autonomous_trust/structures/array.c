@@ -51,6 +51,7 @@ int array_copy(array_t *a, array_t *cpy)
     if (cpy->array == NULL)
         return EXCEPTION(ENOMEM);
     memcpy(cpy->array, a->array, sizeof(data_t) * a->size);
+    cpy->size = a->size;
     return 0;
 }
 

@@ -104,6 +104,9 @@ if ! command -v docker &>/dev/null; then
     exit 1
 fi
 
+# Source local registry helpers (push after build)
+source "$SCRIPT_DIR/local-registry.sh" 2>/dev/null || true
+
 # ---------------------------------------------------------------------------
 # Common build args
 # ---------------------------------------------------------------------------
@@ -132,6 +135,7 @@ build_devel() {
         -t "${IMAGE_NAME}-devel" \
         -f "$AT_DIR/Dockerfile-devel" \
         "$SCRIPT_DIR"
+    push_to_registry "${IMAGE_NAME}-devel" 2>/dev/null || true
 }
 
 build_test() {
@@ -142,6 +146,7 @@ build_test() {
         -t "${IMAGE_NAME}-test" \
         -f "$AT_DIR/Dockerfile-test" \
         "$AT_DIR"
+    push_to_registry "${IMAGE_NAME}-test" 2>/dev/null || true
 }
 
 build_full_devel() {
@@ -152,6 +157,7 @@ build_full_devel() {
         -t "${IMAGE_NAME}-full-devel" \
         -f "$SRC_DIR/Dockerfile-devel" \
         "$SCRIPT_DIR"
+    push_to_registry "${IMAGE_NAME}-full-devel" 2>/dev/null || true
 }
 
 build_builder() {
@@ -162,6 +168,7 @@ build_builder() {
         -t "package-builder" \
         -f "$SRC_DIR/Dockerfile-build" \
         "$SRC_DIR"
+    push_to_registry "package-builder" 2>/dev/null || true
 }
 
 build_release() {
@@ -172,6 +179,7 @@ build_release() {
         -t "${IMAGE_NAME}" \
         -f "$AT_DIR/Dockerfile" \
         "$SRC_DIR"
+    push_to_registry "${IMAGE_NAME}" 2>/dev/null || true
 }
 
 build_full() {
@@ -182,6 +190,7 @@ build_full() {
         -t "${IMAGE_NAME}-full" \
         -f "$SRC_DIR/Dockerfile" \
         "$SRC_DIR"
+    push_to_registry "${IMAGE_NAME}-full" 2>/dev/null || true
 }
 
 build_lite() {
@@ -192,6 +201,7 @@ build_lite() {
         -t "${IMAGE_NAME}-lite" \
         -f "$AT_DIR/Dockerfile-lite" \
         "$SCRIPT_DIR"
+    push_to_registry "${IMAGE_NAME}-lite" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------

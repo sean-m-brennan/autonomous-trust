@@ -15,6 +15,7 @@
 # ******************
 
 import argparse
+import math
 import os
 import subprocess
 import shlex
@@ -32,12 +33,20 @@ class Router(net.Client):
     header_fmt = '!Q'
     max_rate = max_bw = '100Gbit'
 
+    # Signal quality thresholds for bandwidth degradation (dB path loss)
+    # Below min_loss: full rate. Above max_loss: minimum rate.
+    # Between: linear interpolation.
+    _min_loss_db = 80.0    # path loss below which full bandwidth is available
+    _max_loss_db = 160.0   # path loss above which minimum bandwidth applies
+    _min_rate_fraction = 0.01  # minimum rate as fraction of interface rate
+
     def __init__(self, containerized: bool = False, rate_limit: bool = False):
         super().__init__()
         self.all_peers: list[PeerConnection] = []
         self.containerized = containerized
         self.rate_limit = rate_limit
         self.orig_tc_qdisc = None
+        self._mark_to_classid: dict[int, int] = {}
 
         if os.geteuid() != 0:
             raise RuntimeError('This user cannot modify iptables')
@@ -70,15 +79,20 @@ class Router(net.Client):
                          'parent 1:1 classid 1:100 cbq bandwidth %s rate %s ' % (self.max_bw, self.max_rate) +
                          'allot 1514 weight 1Mbit prio 5 maxburst 1000 avpkt 1000')
         self.traffic_ctl('qdisc', 'add dev', self.iface, 'parent 1:100 sfq quantum 1514b perturb 15')
-        # throttled classes:
-        for net_class in [n.value for n in NetInterface]:
+        # throttled classes: one per NetInterface type, keyed by iptables mark
+        self._mark_to_classid = {}
+        for idx, net_iface in enumerate(NetInterface):
+            classid = 200 + idx
+            self._mark_to_classid[net_iface.mark] = classid
+            rate_str = '%dbit' % net_iface.rate
             self.traffic_ctl('class', 'add dev', self.iface,
-                             'parent 1:1 classid 1:200 cbq bandwidth %s rate %s ' % (self.max_bw, net_class.rate) +
-                             'allot 1514 weight %s prio 3 maxburst 50 avpkt 1000 bounded' % net_class.rate)
+                             'parent 1:1 classid 1:%d cbq bandwidth %s rate %s ' % (classid, self.max_bw, rate_str) +
+                             'allot 1514 weight %s prio 3 maxburst 50 avpkt 1000 bounded' % rate_str)
             self.traffic_ctl('qdisc', 'add dev', self.iface,
-                             'parent 1:200 tbf rate %s latency 100ms burst 1540' % net_class.rate)
-            self.traffic_ctl('qdisc', 'add dev', self.iface,
-                             'protocol ip parent 1:0 prio 8 handle %d fw flowid 1:200' % net_class.mark)
+                             'parent 1:%d tbf rate %s latency 100ms burst 1540' % (classid, rate_str))
+            self.traffic_ctl('filter', 'add dev', self.iface,
+                             'protocol ip parent 1:0 prio 8 handle %d fw flowid 1:%d'
+                             % (net_iface.mark, classid))
 
     def unlimiting(self):
         if self.rate_limit:
@@ -117,6 +131,32 @@ class Router(net.Client):
                 return True
         return False
 
+    @classmethod
+    def degraded_rate(cls, base_rate_bps: int, path_loss_db: float) -> str:
+        """Compute a degraded bandwidth rate string based on signal quality.
+
+        Linearly interpolates between full rate (at min_loss) and minimum rate
+        (at max_loss). Returns a tc-compatible rate string (e.g., '5Mbit').
+        """
+        if path_loss_db <= cls._min_loss_db:
+            fraction = 1.0
+        elif path_loss_db >= cls._max_loss_db:
+            fraction = cls._min_rate_fraction
+        else:
+            # Linear interpolation in dB domain
+            t = (path_loss_db - cls._min_loss_db) / (cls._max_loss_db - cls._min_loss_db)
+            fraction = 1.0 - t * (1.0 - cls._min_rate_fraction)
+
+        rate_bps = max(1000, int(base_rate_bps * fraction))  # floor at 1 Kbps
+
+        if rate_bps >= 1_000_000_000:
+            return '%dGbit' % (rate_bps // 1_000_000_000)
+        elif rate_bps >= 1_000_000:
+            return '%dMbit' % (rate_bps // 1_000_000)
+        elif rate_bps >= 1_000:
+            return '%dKbit' % (rate_bps // 1_000)
+        return '%dbit' % rate_bps
+
     def recv_data(self, **kwargs):
         state = super().recv_data(**kwargs)
 
@@ -154,6 +194,27 @@ class Router(net.Client):
                     if not self.parse_chain(chain, None, peer.ip4_addr):
                         self.iptables('-A %s -t mangle -j MARK --set-mark %d -d %s' %
                                       (chain, peer.iface.mark, peer.ip4_addr))
+
+        # Apply signal-quality-based bandwidth degradation
+        if self.rate_limit and hasattr(state, 'signal_quality') and state.signal_quality:
+            for p_id in state.signal_quality:
+                if p_id not in state.peers:
+                    continue
+                peer = state.peers[p_id]
+                classid = self._mark_to_classid.get(peer.iface.mark)
+                if classid is None:
+                    continue
+                # Find worst-case link quality for this peer to set its tc class rate
+                worst_loss = max(state.signal_quality[p_id].values(), default=0.0)
+                rate_str = self.degraded_rate(peer.iface.rate, worst_loss)
+                try:
+                    self.traffic_ctl('class', 'change dev', self.iface,
+                                     'parent 1:1 classid 1:%d cbq bandwidth %s rate %s '
+                                     % (classid, self.max_bw, rate_str) +
+                                     'allot 1514 weight %s prio 3 maxburst 50 avpkt 1000 bounded'
+                                     % rate_str)
+                except subprocess.CalledProcessError:
+                    pass  # tc class may not exist yet; limiting() must run first
 
     def finish(self):  # clear any rules created
         self.unlimiting()

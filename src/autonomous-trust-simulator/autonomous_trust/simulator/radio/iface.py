@@ -24,7 +24,7 @@ class Antenna(SerializableEnum):
 
     @property
     def gain(self):
-        """Antenna gain in dBm"""
+        """Antenna gain in dBi (decibels relative to isotropic)"""
         if self.value == 'dipole':
             return 3.0
         if self.value == 'yagi':

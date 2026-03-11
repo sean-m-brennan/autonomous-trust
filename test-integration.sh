@@ -89,22 +89,28 @@ if ! command -v docker &>/dev/null; then
     exit 1
 fi
 
+# Source local registry helpers (pull-or-build fallback)
+source "$SCRIPT_DIR/local-registry.sh" 2>/dev/null || true
+
 # ---------------------------------------------------------------------------
-# Build containers (delegates to build-docker.sh)
+# Build containers (pull from registry or build as fallback)
 # ---------------------------------------------------------------------------
 build_containers() {
-    local build_args=()
     if $FORCE; then
-        build_args+=(--force)
+        # Force rebuild via build-docker.sh (which also pushes to registry)
+        local build_args=(--force)
+        if $DEBUG; then
+            build_args+=(--debug)
+        fi
+        if [[ -n "$REGISTRY_URL" ]]; then
+            build_args+=(--registry "$REGISTRY_URL")
+        fi
+        "$SCRIPT_DIR/build-docker.sh" "${build_args[@]}" devel test
+    else
+        # Pull from local registry, build as fallback
+        require_image "${IMAGE_NAME}-devel" devel
+        require_image "${IMAGE_NAME}-test" devel test
     fi
-    if $DEBUG; then
-        build_args+=(--debug)
-    fi
-    if [[ -n "$REGISTRY_URL" ]]; then
-        build_args+=(--registry "$REGISTRY_URL")
-    fi
-
-    "$SCRIPT_DIR/build-docker.sh" "${build_args[@]}" devel test
 }
 
 # ---------------------------------------------------------------------------
