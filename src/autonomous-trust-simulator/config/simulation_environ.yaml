@@ -37,6 +37,7 @@ dependencies:
   - pydantic
   - dill
   - networkx
+  - pyyaml
 
   # SPLAT! build toolchain
   - gcc_linux-64

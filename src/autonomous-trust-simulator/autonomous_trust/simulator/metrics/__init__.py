@@ -14,4 +14,4 @@
 #   limitations under the License.
 # ******************
 
-__all__ = ['appalachian']
+__all__ = ['MetricsCollector']

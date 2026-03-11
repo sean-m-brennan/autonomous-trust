@@ -46,6 +46,7 @@ class Router(net.Client):
         self.containerized = containerized
         self.rate_limit = rate_limit
         self.orig_tc_qdisc = None
+        self._mark_to_classid: dict[int, int] = {}
 
         if os.geteuid() != 0:
             raise RuntimeError('This user cannot modify iptables')
@@ -78,15 +79,20 @@ class Router(net.Client):
                          'parent 1:1 classid 1:100 cbq bandwidth %s rate %s ' % (self.max_bw, self.max_rate) +
                          'allot 1514 weight 1Mbit prio 5 maxburst 1000 avpkt 1000')
         self.traffic_ctl('qdisc', 'add dev', self.iface, 'parent 1:100 sfq quantum 1514b perturb 15')
-        # throttled classes:
-        for net_class in [n.value for n in NetInterface]:
+        # throttled classes: one per NetInterface type, keyed by iptables mark
+        self._mark_to_classid = {}
+        for idx, net_iface in enumerate(NetInterface):
+            classid = 200 + idx
+            self._mark_to_classid[net_iface.mark] = classid
+            rate_str = '%dbit' % net_iface.rate
             self.traffic_ctl('class', 'add dev', self.iface,
-                             'parent 1:1 classid 1:200 cbq bandwidth %s rate %s ' % (self.max_bw, net_class.rate) +
-                             'allot 1514 weight %s prio 3 maxburst 50 avpkt 1000 bounded' % net_class.rate)
+                             'parent 1:1 classid 1:%d cbq bandwidth %s rate %s ' % (classid, self.max_bw, rate_str) +
+                             'allot 1514 weight %s prio 3 maxburst 50 avpkt 1000 bounded' % rate_str)
             self.traffic_ctl('qdisc', 'add dev', self.iface,
-                             'parent 1:200 tbf rate %s latency 100ms burst 1540' % net_class.rate)
-            self.traffic_ctl('qdisc', 'add dev', self.iface,
-                             'protocol ip parent 1:0 prio 8 handle %d fw flowid 1:200' % net_class.mark)
+                             'parent 1:%d tbf rate %s latency 100ms burst 1540' % (classid, rate_str))
+            self.traffic_ctl('filter', 'add dev', self.iface,
+                             'protocol ip parent 1:0 prio 8 handle %d fw flowid 1:%d'
+                             % (net_iface.mark, classid))
 
     def unlimiting(self):
         if self.rate_limit:
@@ -195,21 +201,20 @@ class Router(net.Client):
                 if p_id not in state.peers:
                     continue
                 peer = state.peers[p_id]
-                for o_id, loss_db in state.signal_quality[p_id].items():
-                    if o_id not in state.peers:
-                        continue
-                    # Compute degraded rate based on path loss
-                    rate_str = self.degraded_rate(peer.iface.rate, loss_db)
-                    # Apply per-destination tc rate via class change
-                    # This updates the CBQ class rate for traffic to this destination
-                    try:
-                        self.traffic_ctl('class', 'change dev', self.iface,
-                                         'parent 1:1 classid 1:200 cbq bandwidth %s rate %s '
-                                         % (self.max_bw, rate_str) +
-                                         'allot 1514 weight %s prio 3 maxburst 50 avpkt 1000 bounded'
-                                         % rate_str)
-                    except subprocess.CalledProcessError:
-                        pass  # tc class may not exist yet; limiting() must run first
+                classid = self._mark_to_classid.get(peer.iface.mark)
+                if classid is None:
+                    continue
+                # Find worst-case link quality for this peer to set its tc class rate
+                worst_loss = max(state.signal_quality[p_id].values(), default=0.0)
+                rate_str = self.degraded_rate(peer.iface.rate, worst_loss)
+                try:
+                    self.traffic_ctl('class', 'change dev', self.iface,
+                                     'parent 1:1 classid 1:%d cbq bandwidth %s rate %s '
+                                     % (classid, self.max_bw, rate_str) +
+                                     'allot 1514 weight %s prio 3 maxburst 50 avpkt 1000 bounded'
+                                     % rate_str)
+                except subprocess.CalledProcessError:
+                    pass  # tc class may not exist yet; limiting() must run first
 
     def finish(self):  # clear any rules created
         self.unlimiting()
