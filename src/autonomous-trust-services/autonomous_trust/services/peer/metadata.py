@@ -54,6 +54,15 @@ class PositionSource(object):
         raise NotImplementedError
 
 
+_ALLOWED_METADATA_CLASSES = {
+    'autonomous_trust.services.peer.metadata.TimeSource',
+    'autonomous_trust.services.peer.metadata.PositionSource',
+    'autonomous_trust.services.peer.position.Position',
+    'autonomous_trust.services.peer.position.GeoPosition',
+    'autonomous_trust.services.peer.position.UTMPosition',
+}
+
+
 class Metadata(InitializableConfig):
     def __init__(self, uuid: str, peer_kind: str, data_meta: dict[str, int],
                  position_src_class: type, time_src_class: type = None):
@@ -75,7 +84,13 @@ class Metadata(InitializableConfig):
         return self.name_to_class(self.time_src_class)()
 
     @classmethod
+    def register_metadata_class(cls, klass):
+        _ALLOWED_METADATA_CLASSES.add(klass.__module__ + '.' + klass.__qualname__)
+
+    @classmethod
     def name_to_class(cls, qual_name):
+        if qual_name not in _ALLOWED_METADATA_CLASSES:
+            raise ValueError(f"Class '{qual_name}' not in allowed metadata classes")
         mod, klass = qual_name.rsplit('.', 1)
         return getattr(sys.modules[mod], klass)
 

@@ -32,6 +32,14 @@ from nacl.signing import SignedMessage
 from ..util import ClassEnumMeta
 
 
+_ALLOWED_CONFIG_TYPES: set = set()
+
+
+def register_config_type(cls):
+    type_name = cls.__module__ + '.' + cls.__qualname__
+    _ALLOWED_CONFIG_TYPES.add(type_name)
+
+
 class SerializeMode(Enum):
     PROTO = 1
     JSON = 2
@@ -44,6 +52,10 @@ class WireFormat(Enum):
 
 
 class Configuration(object):
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        register_config_type(cls)
+
     ROOT_VARIABLE_NAME = 'AUTONOMOUS_TRUST_ROOT'
     CFG_PATH = os.path.join('etc', 'at')
     DATA_PATH = os.path.join('var', 'at')
@@ -186,6 +198,9 @@ class Configuration(object):
             return json.load(cfg, object_hook=config_json_decoder)
 
 
+register_config_type(Configuration)
+
+
 class InitializableConfig(Configuration):
     def initialize(self, *args, **kwargs):
         raise NotImplementedError
@@ -255,6 +270,8 @@ def config_json_decoder(dct):
         cls = getattr(module, class_name)
         return cls[dct['__value__']]
     if '.' in type_name:
+        if type_name not in _ALLOWED_CONFIG_TYPES:
+            raise ValueError(f"Type '{type_name}' not in allowed configuration types")
         module_name, class_name = type_name.rsplit('.', 1)
         try:
             module = sys.modules[module_name]

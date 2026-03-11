@@ -61,8 +61,14 @@ class TestSerializeFast:
 
 
 class TestSerializeCrossModes:
-    def test_fast_and_safe_produce_different_bytes(self):
+    def test_fast_and_safe_produce_identical_bytes(self):
         arr = np.array([1.0, 2.0, 3.0])
         fast_data = serialize(arr, fast=True)
         safe_data = serialize(arr, fast=False)
-        assert fast_data != safe_data
+        assert fast_data == safe_data
+
+    def test_cross_mode_roundtrip(self):
+        arr = np.array([1.0, 2.0, 3.0])
+        data = serialize(arr, fast=True)
+        result = deserialize(data, fast=False)
+        np.testing.assert_array_equal(arr, result)

@@ -36,7 +36,7 @@ class VizServer(object):
         #appname = __package__.split('.')[0]  # FIXME wrong for Quart, wrong also for SassASGI?
         appname = __name__
         self.app = quart.Quart(appname, static_url_path='', static_folder=directory, template_folder=directory)
-        self.app.debug = True
+        self.app.debug = debug
 
         os.environ['PATH_INFO'] = '/scss/tekfive.scss'
         self.app.asgi_app = SassASGIMiddleware(self.app, {appname: (os.path.join(directory, 'scss'),

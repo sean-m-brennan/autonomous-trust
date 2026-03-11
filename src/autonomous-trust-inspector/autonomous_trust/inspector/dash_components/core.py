@@ -130,6 +130,11 @@ class DashControl(object):
         self.websocket_handlers: dict[str, list[Callable]] = {}
         self.clients: list[WSClient] = []
         self._client_dir: dict[WebSocketServerProtocol, WSClient] = {}
+        self.allowed_origins: set[str] = {
+            "http://localhost", "http://127.0.0.1",
+            "http://localhost:5005", "http://127.0.0.1:5005",
+            "http://localhost:8050", "http://127.0.0.1:8050",
+        }
 
         self.server = flask.Flask(name)
         dash_class = dash.Dash
@@ -175,12 +180,16 @@ class DashControl(object):
         #if self.inherited_logger is not None:
         #    for handler in self.inherited_logger.handlers:
         #      logger.addHandler(handler)
-        async with websocket_serve(self._websocket_handler, self.server_address[0], self.ws_port,
+        async with websocket_serve(self._websocket_handler, '127.0.0.1', self.ws_port,
                                    loop=self.ws_loop, logger=logger, compression=None):
             print(' * Serving websockets at ws://%s:%d' % (self.server_address[0], self.ws_port))
             await self.ws_stop
 
     async def _websocket_handler(self, websocket: WebSocketServerProtocol, path: str):
+        origin = websocket.origin
+        if self.allowed_origins and origin and origin not in self.allowed_origins:
+            await websocket.close(4003, "Origin not allowed")
+            return
         async for message in websocket:
             if message == 'connect':
                 client = WSClient(websocket)

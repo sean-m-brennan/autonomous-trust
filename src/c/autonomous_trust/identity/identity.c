@@ -166,9 +166,15 @@ int identity_from_json(const json_t *obj, void *data_struct)
     const char *addr_str = json_string_value(json_object_get(obj, "address"));
     if (addr_str != NULL)
         strncpy(ident->address, addr_str, sizeof(ident->address)-1);
-    strncpy(ident->fullname, (char *)json_string_value(json_object_get(obj, "fullname")), sizeof(ident->fullname)-1);
-    strncpy(ident->nickname, (char *)json_string_value(json_object_get(obj, "nickname")), sizeof(ident->nickname)-1);
-    strncpy(ident->petname, (char *)json_string_value(json_object_get(obj, "petname")), sizeof(ident->petname)-1);
+    const char *fullname_str = json_string_value(json_object_get(obj, "fullname"));
+    if (fullname_str != NULL)
+        strncpy(ident->fullname, fullname_str, sizeof(ident->fullname)-1);
+    const char *nickname_str = json_string_value(json_object_get(obj, "nickname"));
+    if (nickname_str != NULL)
+        strncpy(ident->nickname, nickname_str, sizeof(ident->nickname)-1);
+    const char *petname_str = json_string_value(json_object_get(obj, "petname"));
+    if (petname_str != NULL)
+        strncpy(ident->petname, petname_str, sizeof(ident->petname)-1);
     const char *sig_hex = json_string_value(json_object_get(json_object_get(obj, "signature"), "hex_seed"));
     if (sig_hex != NULL)
         signature_init(&ident->signature, (const unsigned char *)sig_hex);
@@ -236,8 +242,10 @@ int proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer)
 {
     AutonomousTrust__Core__Protobuf__Identity__Identity *msg =
         autonomous_trust__core__protobuf__identity__identity__unpack(NULL, len, data);
+    if (msg == NULL)
+        return -1;
     public_identity_sync_in(msg, peer);
-    free(msg);
+    autonomous_trust__core__protobuf__identity__identity__free_unpacked(msg, NULL);
     return 0;
 }
 
