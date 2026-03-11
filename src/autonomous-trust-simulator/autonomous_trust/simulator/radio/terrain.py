@@ -94,7 +94,7 @@ class TerrainPathLoss:
                     self._matrices[freq][src] = {}
                 self._matrices[freq][src][dst] = loss
 
-    def save_csv(self, filepath: str, freq_mhz: float = None) -> None:
+    def save_csv(self, filepath: str, freq_mhz: Optional[float] = None) -> None:
         """Save path-loss data to a CSV file.
 
         If freq_mhz is specified, only that frequency is saved.
