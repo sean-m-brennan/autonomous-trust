@@ -29,6 +29,7 @@ class Message(object):
     ====================================
     """
     def __init__(self, process, function, obj, to_whom=None, from_whom=None, encrypt=True, return_to=None):
+        self.verified = False
         try:
             self.process = process.value
         except AttributeError:

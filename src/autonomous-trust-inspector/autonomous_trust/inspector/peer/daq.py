@@ -161,9 +161,9 @@ class Cohort(CohortInterface):
                 self.peers[uuid] = PeerDataAcq(uuid, idx, group_ids[uuid], NullPeerData(), self,
                                                self.queue_pool.next(), self.queue_pool.next())
                 # FIXME dynamically creating queues is a problem: "Pickling an AuthenticationString object is disallowed for security reasons"
-        for uuid in self.peers:
-            if uuid not in group_ids:
-                del self.peers[uuid]
+        to_remove = [uuid for uuid in self.peers if uuid not in group_ids]
+        for uuid in to_remove:
+            del self.peers[uuid]
 
     @property
     def center(self) -> Position:

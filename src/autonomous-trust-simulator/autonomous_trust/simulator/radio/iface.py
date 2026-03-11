@@ -31,6 +31,7 @@ class Antenna(SerializableEnum):
             return 12.0
         if self.value == 'parabolic':
             return 25.0
+        raise ValueError(f"Unknown antenna type: {self.value}")
 
 
 class NetInterface(SerializableEnum):
@@ -49,6 +50,7 @@ class NetInterface(SerializableEnum):
             return 10 * 1000 * 1000 # 10Mbps
         if self.value == 'large':
             return 10 * 1000 * 1000 * 1000 # 10Gbps
+        raise ValueError(f"Unknown interface type: {self.value}")
 
     @property
     def mark(self):
@@ -59,3 +61,4 @@ class NetInterface(SerializableEnum):
             return 22
         if self.value == 'large':
             return 33
+        raise ValueError(f"Unknown interface type: {self.value}")

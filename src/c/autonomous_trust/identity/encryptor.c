@@ -37,6 +37,7 @@ void encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
     unsigned char seed[crypto_box_SEEDBYTES];
     unhexlify(hex_seed, crypto_box_SEEDBYTES * 2, seed);
     crypto_box_seed_keypair((unsigned char *)encr->public, (unsigned char *)encr->private, seed);
+    sodium_memzero(seed, sizeof(seed));
     hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char *)encr->public_hex);
 }
 
@@ -63,6 +64,7 @@ unsigned char *encryptor_generate()
         return NULL;
     }
     hexlify(key, crypto_box_SEEDBYTES, hex);
+    sodium_memzero(key, sizeof(key));
     return hex;
 }
 

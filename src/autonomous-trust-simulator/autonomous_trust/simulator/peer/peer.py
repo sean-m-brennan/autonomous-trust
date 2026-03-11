@@ -70,8 +70,8 @@ class PeerConnection(Configuration):
             if dist == 0:
                 dist = .001
             signal_strength = (1.0 / (dist ** 2) * self.signal) + self.antenna.gain
-            # dBm is negative, more negative is stronger
-            return signal_strength < min_strength
+            # Signal must exceed minimum threshold to reach peer
+            return signal_strength > min_strength
 
 
 class DataStream(Configuration):

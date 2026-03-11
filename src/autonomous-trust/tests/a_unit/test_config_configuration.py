@@ -105,3 +105,11 @@ def test_nesting_cfg_file(setup_teardown, nested_cfg, nested_repr):
     t7.to_file(file)
     t8 = Configuration.from_file(file)
     assert repr(t8) == nested_repr
+
+
+def test_config_json_decoder_rejects_unknown_type():
+    """P1: config_json_decoder must reject types not in the allowlist."""
+    from autonomous_trust.core.config.configuration import config_json_decoder
+    malicious = {"__type__": "os.system", "command": "echo pwned"}
+    with pytest.raises(ValueError, match="not in allowed"):
+        config_json_decoder(malicious)
