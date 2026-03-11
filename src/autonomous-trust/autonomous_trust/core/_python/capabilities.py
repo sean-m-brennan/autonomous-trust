@@ -34,8 +34,10 @@ class Capability(Configuration):
 
     def execute(self, task, pid_q):
         pid_q.put_nowait(multiprocessing.current_process().pid)
-        # FIXME handle errors
-        return self.function(*task.parameters.args, **task.parameters.kwargs)
+        try:
+            return self.function(*task.parameters.args, **task.parameters.kwargs)
+        except Exception as e:
+            raise RuntimeError('Capability %r execution failed for task %s: %s' % (self.name, task.uuid, e)) from e
 
     def __eq__(self, other):
         return self.name == other.name

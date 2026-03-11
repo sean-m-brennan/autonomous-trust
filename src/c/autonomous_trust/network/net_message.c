@@ -63,6 +63,7 @@ int net_message_to_wire(const net_wire_msg_t *msg, uint8_t **wire_out, size_t *w
     uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
     json_object_set_new(root, "from_uuid", json_string(uuid_str));
     json_object_set_new(root, "from_name", json_string(msg->from_whom.fullname));
+    json_object_set_new(root, "from_address", json_string(msg->from_whom.address));
 
     char *json_str = json_dumps(root, JSON_COMPACT);
     json_decref(root);
@@ -138,10 +139,13 @@ int net_message_from_wire(const uint8_t *data, size_t len,
     {
         const char *from_uuid = json_string_value(json_object_get(root, "from_uuid"));
         const char *from_name = json_string_value(json_object_get(root, "from_name"));
+        const char *from_addr = json_string_value(json_object_get(root, "from_address"));
         if (from_uuid != NULL)
             uuid_parse(from_uuid, msg_out->from_whom.uuid);
         if (from_name != NULL)
             strncpy(msg_out->from_whom.fullname, from_name, NAME_LEN);
+        if (from_addr != NULL)
+            strncpy(msg_out->from_whom.address, from_addr, ADDR_LEN);
     }
 
     json_decref(root);

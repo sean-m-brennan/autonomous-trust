@@ -104,11 +104,11 @@ class DataClient:
         """Assumes a categorical distribution is received"""
         result = self.summary(report)
         n = len(result)
-        for r in result:
-            if r < n:
-                result[r] = round(result[r], r)
+        for i, r in enumerate(result):
+            if i < n:
+                result[r] = round(result[r], i)
             else:
-                result[r] = round(result[r], r - 1)
+                result[r] = round(result[r], i - 1)
         self.memory.append((result, whom, time, len(report)))
         return result, whom, time
 

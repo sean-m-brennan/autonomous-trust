@@ -116,7 +116,10 @@ async def async_ping(host: str, seq_num: int = None, count: int = 1, timeout: fl
             continue
         data = packet[0]
         protocol.raise_error()
-        times[seq_num] = (end-init).total_seconds()
-        await asyncio.sleep(1)  # FIXME remainder instead
+        elapsed = (end-init).total_seconds()
+        times[seq_num] = elapsed
+        remainder = 1.0 - elapsed
+        if remainder > 0:
+            await asyncio.sleep(remainder)
     transport.close()
     return PingStats(host, times, (end-start))

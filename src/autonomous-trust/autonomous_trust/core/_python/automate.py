@@ -442,7 +442,10 @@ class AutonomousTrust(Protocol):
                             pid = pq.get(block=True, timeout=1)
                             self.active_pids[str(task.uuid)] = pid
                         except queue.Empty:
-                            self.logger.error(self.name + ': Process failed')  # FIXME more info
+                            self.logger.error(
+                                '%s: Process failed to start for task %s (capability=%s, task_uuid=%s). '
+                                'No PID received within timeout.' %
+                                (self.name, task.capability.name, capability.name, task.uuid))
                 elif isinstance(message, Message) and message.function == ReputationProtocol.rep_resp:
                     rep = message.obj
                     if rep.peer_id == self.identity.uuid:

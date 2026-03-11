@@ -131,7 +131,8 @@ void group_proto_free(AutonomousTrust__Core__Protobuf__Identity__Group *proto)
 
 int group_to_proto(group_t *msg, void **data_ptr, size_t *data_len_ptr)
 {
-    AutonomousTrust__Core__Protobuf__Identity__Group proto;
+    AutonomousTrust__Core__Protobuf__Identity__Group proto =
+        AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__GROUP__INIT;
     group_sync_out(msg, &proto);
     *data_len_ptr = autonomous_trust__core__protobuf__identity__group__get_packed_size(&proto);
     *data_ptr = smrt_create(*data_len_ptr);

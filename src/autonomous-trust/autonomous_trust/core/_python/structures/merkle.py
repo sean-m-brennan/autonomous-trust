@@ -144,7 +144,7 @@ class MerkleTree(Tree, Configuration):
 
     def _rehash(self):
         while len(self.leaves) > len(self.blobs):
-            super().delete(self.last)
+            super().delete(self.last.key)  # Tree.delete expects a key, not a Node
         while len(self.leaves) < len(self.blobs):
             super().insert(None)
         for idx, blob in enumerate(self.blobs):
@@ -154,6 +154,8 @@ class MerkleTree(Tree, Configuration):
             self.unique[leaf.uuid].append(leaf)
             if len(self.unique[leaf.uuid]) > 1:
                 self.non_unique += [node.key for node in self.unique[leaf.uuid]]
+        # FIXME: level_nodes is never populated - inner node rehashing is incomplete.
+        # Need to collect nodes at each level from the tree to rehash them bottom-up.
         for level in range(len(self), -1, -1):
             level_nodes = []  # get nodes at level
             for node in level_nodes:

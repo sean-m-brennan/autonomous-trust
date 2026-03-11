@@ -114,7 +114,7 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
             return -1;
         if (!(flags & NO_STDOUT_REDIRECT))
         {
-            if (*fd1 = dup2(f_d, STDOUT_FILENO) == -1)
+            if ((*fd1 = dup2(f_d, STDOUT_FILENO)) == -1)
                 return -1;
             //*fd1 = f_d;
         }
@@ -123,7 +123,7 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
             return -1;
          if (!(flags & NO_STDERR_REDIRECT))
         {
-            if (*fd2 = dup2(f_d, STDERR_FILENO) == -1)  // FIXME fd leaks?
+            if ((*fd2 = dup2(f_d, STDERR_FILENO)) == -1)  // FIXME fd leaks?
                 return -1;
             //*fd2 = f_d;
         }

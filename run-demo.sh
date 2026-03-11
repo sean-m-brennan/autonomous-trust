@@ -9,21 +9,35 @@ cd "$here" || exit 1
 # --- Parse arguments ---
 
 BACKEND="native"
+LOG_LEVEL="warning"
 NUM_NODES=""
 POSITIONAL_ARGS=()
 
 usage() {
-    echo "Usage: $0 [--python] [NUM_NODES]"
+    echo "Usage: $0 [--python] [--log-level LEVEL] [NUM_NODES]"
     echo ""
-    echo "  --python    Use pure-Python backend (default: native C backend)"
-    echo "  NUM_NODES   Number of peer nodes to start (default: 2)"
+    echo "  --python          Use pure-Python backend (default: native C backend)"
+    echo "  -v[v[v]]          Increase logging verbosity: to info, debug, then verbose"
+    echo "  NUM_NODES         Number of peer nodes to start (default: 2)"
     exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --python)
+        --py|--python)
             BACKEND="python"
+            shift
+            ;;
+        -v)
+            LOG_LEVEL="info"
+            shift
+            ;;
+        -vv)
+            LOG_LEVEL="debug"
+            shift
+            ;;
+        -vvv)
+            LOG_LEVEL="verbose"
             shift
             ;;
         -h|--help)
@@ -91,8 +105,8 @@ export AUTONOMOUS_TRUST_BACKEND="$BACKEND"
 
 # --- Launch Tilt ---
 
-echo "Starting AutonomousTrust demo with $NUM_NODES nodes..."
-tilt up -- --num-nodes="$NUM_NODES" --backend="$BACKEND"
+echo "Starting AutonomousTrust demo with $NUM_NODES nodes (log level: $LOG_LEVEL)..."
+tilt up -- --num-nodes="$NUM_NODES" --backend="$BACKEND" --log-level="$LOG_LEVEL" $@
 # Blocks until killed (Ctl-C)
 
 tilt down -- $@

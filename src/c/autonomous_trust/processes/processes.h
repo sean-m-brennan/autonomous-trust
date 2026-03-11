@@ -108,13 +108,39 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2);
  */
 int process_register_handler(const process_t *proc, char *func_name, handler_ptr_t handler);
 
+#ifndef PROCESSES_IMPL
+extern const long cadence;
+#endif
+
+bool keep_running(const process_t *proc, queue_t *sig_q, logger_t *logger);
+void sleep_until(const process_t *proc, long how_long);
+bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, generic_msg_t *msg);
+
 /**
- * @brief See handler_ptr_t
- *
- * @param proc
- * @param queues
- * @param signal
- * @return int
+ * @brief Context for split process setup/loop lifecycle
+ */
+typedef struct
+{
+    queue_t my_q;
+    queue_t sig_q;
+    int fd1;
+    int fd2;
+} process_ctx_t;
+
+/**
+ * @brief Daemonize and initialize messaging. Call before process_loop().
+ */
+int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
+                  process_ctx_t *ctx);
+
+/**
+ * @brief Run the message-handling loop. Call after process_setup().
+ */
+int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
+                 process_ctx_t *ctx);
+
+/**
+ * @brief Combined setup + loop (convenience for simple processes).
  */
 int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 

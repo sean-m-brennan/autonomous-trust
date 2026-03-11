@@ -81,28 +81,25 @@ char *message_type_to_string(message_type_t type)
 
 message_type_t string_to_message_type(const char *str)
 {
-    if (strncmp(str, "SIGNAL", strlen("SIGNAL")) == 0)
+    if (strcmp(str, "SIGNAL") == 0)
         return SIGNAL;
-    if (strncmp(str, autonomous_trust__core__protobuf__identity__group__descriptor.c_name,
-                strlen(autonomous_trust__core__protobuf__identity__group__descriptor.c_name)) == 0)
+    if (strcmp(str, autonomous_trust__core__protobuf__identity__group__descriptor.c_name) == 0)
         return GROUP;
-    if (strncmp(str, autonomous_trust__core__protobuf__identity__identity__descriptor.c_name,
-                strlen(autonomous_trust__core__protobuf__identity__identity__descriptor.c_name)) == 0)
+    if (strcmp(str, autonomous_trust__core__protobuf__identity__identity__descriptor.c_name) == 0)
         return PEER;
-    if (strncmp(str, autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name,
-                strlen(autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name)) == 0)
+    if (strcmp(str, autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name) == 0)
         return PEER_CAPABILITIES;
-    if (strncmp(str, "TASK", strlen("TASK")) == 0)
+    if (strcmp(str, "TASK") == 0)
         return TASK;
-    if (strncmp(str, "NET_MSG", strlen("NET_MSG")) == 0)
+    if (strcmp(str, "NET_MSG") == 0)
         return NET_MESSAGE;
-    if (strncmp(str, "TASK_STATUS", strlen("TASK_STATUS")) == 0)
+    if (strcmp(str, "TASK_STATUS") == 0)
         return TASK_STATUS;
-    if (strncmp(str, "TASK_RESULT", strlen("TASK_RESULT")) == 0)
+    if (strcmp(str, "TASK_RESULT") == 0)
         return TASK_RESULT;
-    if (strncmp(str, "TRANSACTION_SCORE", strlen("TRANSACTION_SCORE")) == 0)
+    if (strcmp(str, "TRANSACTION_SCORE") == 0)
         return TRANSACTION_SCORE;
-    return 0;
+    return -1;  // No matching message type found (all valid types are > 0)
 }
 
 int signal_to_proto(const signal_t *msg, void **data_ptr, size_t *data_len_ptr)
@@ -134,7 +131,12 @@ int wrap_in_any(message_type_t type, void *data_in, size_t data_in_len, void **d
         smrt_deref(data_in);
         return EXCEPTION(ENOMEM);
     }
-    google__protobuf__any__pack(&pb_msg, *data_ptr); // FIXME error check
+    size_t packed = google__protobuf__any__pack(&pb_msg, *data_ptr);
+    if (packed == 0)
+    {
+        smrt_deref(*data_ptr);
+        return EXCEPTION(EINVAL);
+    }
     smrt_deref(data_in);
     return 0;
 }
