@@ -272,17 +272,18 @@ int data_sync_out(data_t *data, AutonomousTrust__Core__Protobuf__Structures__Dat
     case STRING:
         pdata->type = AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA_TYPE__STRING;
         pdata->dat_case = AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA__DAT_STR;
-        pdata->str = malloc(data->size);
+        pdata->str = malloc(data->size + 1);
         if (pdata->str == NULL)
             return EXCEPTION(ENOMEM);
-        strncpy(pdata->str, data->str, min(strlen(data->str), data->size));
+        strncpy(pdata->str, data->str, data->size);
+        pdata->str[data->size] = '\0';
         break;
     case BYTES:
         pdata->type = AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA_TYPE__BYTES;
         pdata->dat_case = AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA__DAT_BYT;
         pdata->byt.len = data->size;
         pdata->byt.data = malloc(data->size);
-        if (pdata->str == NULL)
+        if (pdata->byt.data == NULL)
             return EXCEPTION(ENOMEM);
         memcpy(pdata->byt.data, data->byt, data->size);
         break;
@@ -305,6 +306,7 @@ void data_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data *pdata)
         break;
     case AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA_TYPE__BYTES:
         free(pdata->byt.data);
+        break;
     case AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA_TYPE__NONE:
     case AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA_TYPE__INT:
     case AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA_TYPE__UINT:
@@ -362,8 +364,8 @@ int data_to_json(const void *data_struct, json_t **obj_ptr)
     if (obj == NULL)
         return EXCEPTION(ENOMEM);
 
-    json_object_set(obj, "type", json_integer(data->type));
-    json_object_set(obj, "size", json_integer(data->size));
+    json_object_set_new(obj, "type", json_integer(data->type));
+    json_object_set_new(obj, "size", json_integer(data->size));
     switch (data->type)
     {
     case INT:
@@ -389,6 +391,7 @@ int data_to_json(const void *data_struct, json_t **obj_ptr)
             return EXCEPTION(ENOMEM);
         base64_encode(data->byt, data->size, enc_str, enc_size);
         json_object_set_new(obj, "dat", json_stringn_nocheck(enc_str, enc_size));
+        free(enc_str);
         break;
     }
     case NONE:
@@ -426,7 +429,7 @@ int data_from_json(const json_t *obj, void *data_struct)
     {
         size_t enc_size = json_string_length(dat);
         const char *enc_str = json_string_value(dat);
-        data->size = b64_decoded_len(enc_size, enc_str[enc_size-1]);
+        data->size = b64_decoded_len_s(enc_size, enc_str);
         data->byt = malloc(data->size);
         base64_decode(enc_str, enc_size, data->byt, data->size);
         break;

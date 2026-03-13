@@ -100,6 +100,7 @@ class UDPNetworkProcess(NetworkProcess):
 
     def send_peer(self, msg, host):
         if len(msg) > self.packet_size:
+            self.logger.warning(f"UDP message truncated from {len(msg)} to {self.packet_size - 1} bytes")
             msg = msg[:self.packet_size-1]
         self._send_udp(msg, host, self.port)
 

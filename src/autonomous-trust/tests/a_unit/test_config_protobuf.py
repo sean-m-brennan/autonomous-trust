@@ -227,7 +227,6 @@ def test_linked_step_sync_roundtrip():
     restored.message.ParseFromString(raw)
     restored.sync_from_message()
 
-    # Step.__init__ always sets uuid=None (pre-existing bug), so both sides are None
     assert restored.uuid == step.uuid
 
 
@@ -320,7 +319,6 @@ def test_linked_step_wire_bytes():
     raw = step.to_wire_bytes()
     assert isinstance(raw, bytes)
     restored = LinkedStep.from_wire_bytes(raw)
-    # Step.__init__ always sets uuid=None (pre-existing bug), so both sides are None
     assert restored.uuid == step.uuid
 
 

@@ -14,9 +14,6 @@
  *   limitations under the License.
  *******************/
 
-#ifndef ENCRYPTOR_I
-#define ENCRYPTOR_I
-
 #include <stdbool.h>
 #include <string.h>
 
@@ -67,5 +64,3 @@ unsigned char *encryptor_generate()
     sodium_memzero(key, sizeof(key));
     return hex;
 }
-
-#endif // ENCRYPTOR_I

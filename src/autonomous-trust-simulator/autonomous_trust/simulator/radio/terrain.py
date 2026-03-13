@@ -38,8 +38,8 @@ class SplatSite:
         with open(filepath, 'w') as f:
             f.write('%s\n' % self.name)
             f.write('%.6f\n' % self.lat)
-            # SPLAT! expects west longitude as positive
-            f.write('%.6f\n' % (-self.lon if self.lon < 0 else self.lon))
+            # SPLAT! expects west longitude as positive (negate since input uses east-positive convention)
+            f.write('%.6f\n' % (-self.lon))
             f.write('%.1f\n' % self.height_m)
         return filepath
 

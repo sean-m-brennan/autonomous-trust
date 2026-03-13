@@ -20,6 +20,23 @@ import importlib.util
 import os
 import subprocess
 import sys
+from typing import TYPE_CHECKING
+
+# Static analysis (IDEs, mypy) cannot follow the runtime MetaPathFinder
+# that redirects autonomous_trust.core.X → autonomous_trust.core._python.X.
+# These explicit imports let type checkers resolve submodules.
+if TYPE_CHECKING:
+    from ._python import config  # noqa: F401
+    from ._python import identity  # noqa: F401
+    from ._python import negotiation  # noqa: F401
+    from ._python import network  # noqa: F401
+    from ._python import reputation  # noqa: F401
+    from ._python import structures  # noqa: F401
+    from ._python import algorithms  # noqa: F401
+    from ._python import protocol  # noqa: F401
+    from ._python import processes  # noqa: F401
+    from ._python import system  # noqa: F401
+    from ._python import automate  # noqa: F401
 
 
 def _git_describe_version():

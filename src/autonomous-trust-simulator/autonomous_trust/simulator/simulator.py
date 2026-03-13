@@ -99,7 +99,9 @@ class Simulator(net.SelectServer):
                 active.append(peer.uuid)
             position, speed = self.peers[peer.uuid].move(tick)
             mapp[peer.uuid] = Ident(position, speed, peer.kind, peer.nickname)
-        # all must move first before looping for connectivity
+        # All must move first before looping for connectivity.
+        # Note: The nested loop below is O(n^2) by necessity -- it computes
+        # pairwise reachability and signal quality between every pair of peers.
         for peer in self.cfg.peers:
             if current_time < peer.initial_time or current_time > peer.last_seen or \
                     mapp[peer.uuid].position is None:
@@ -182,10 +184,14 @@ class Simulator(net.SelectServer):
         self.halt = True
 
     def run(self, port: int, **kwargs):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        self.logger.info('Simulation at %s:%d for %s' % (s.getsockname()[0], port, self.cfg_file))
-        s.close()
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except OSError:
+            local_ip = '127.0.0.1'
+        self.logger.info('Simulation at %s:%d for %s' % (local_ip, port, self.cfg_file))
         super().run(port, **kwargs)
 
 

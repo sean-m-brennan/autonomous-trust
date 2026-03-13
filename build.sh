@@ -9,7 +9,7 @@ cd "$here" || exit 1
 
 ARGS="$*"
 if [[ "$ARGS" = "" ]]; then
-  ARGS="--py --dist --c"
+  ARGS="--py --dist --c --zkp"
 fi
 
 if [[ "$ARGS" = *"--py"* ]]; then
@@ -40,6 +40,19 @@ if [[ "$ARGS" = *"--py"* ]]; then
     rm -f "$dist_dir"/*.toml "$dist_dir"/PKG-INFO
 
     export AUTONOMOUS_TRUST_SRC=$here/dist/autonomous_trust
+  fi
+fi
+
+# Build the ZKP Rust extension (requires rustc + maturin)
+if [[ "$ARGS" = *"--zkp"* ]]; then
+  zkp_dir="$here/src/autonomous-trust"
+  if command -v cargo >/dev/null 2>&1 && command -v maturin >/dev/null 2>&1; then
+    echo "========== Building ZKP module =========="
+    (cd "$zkp_dir" && maturin develop --release --manifest-path rust/Cargo.toml)
+  elif command -v cargo >/dev/null 2>&1; then
+    echo "WARNING: maturin not found, skipping ZKP build (pip install maturin)" >&2
+  else
+    echo "WARNING: Rust toolchain not found, skipping ZKP build (install rustup)" >&2
   fi
 fi
 

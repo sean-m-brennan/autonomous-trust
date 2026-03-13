@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # >>> conda initialize >>>
 __conda_setup="$('/opt/conda/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
@@ -30,17 +30,20 @@ fi
 export PYTHONPATH="/app:$PYTHONPATH"
 #conda run -n autonomous_trust pip3 install --upgrade pip wheel setuptools requests protobuf
 
-export AUTONOMOUS_TRUST_ENTRY="${AUTONOMOUS_TRUST_ENTRY:-"conda run --live-stream -n autonomous_trust python3"}"
+# Activate conda environment directly so that exec replaces this shell
+# with python (PID 1), allowing proper SIGTERM delivery.
+conda activate autonomous_trust
+
 export AUTONOMOUS_TRUST_EXE="${AUTONOMOUS_TRUST_EXE:-"-m autonomous_trust"}"
 # Use CMD args ($@) if provided, otherwise fall back to AUTONOMOUS_TRUST_ARGS env var
 if [ $# -eq 0 ] && [ -n "${AUTONOMOUS_TRUST_ARGS:-}" ]; then
     set -- $AUTONOMOUS_TRUST_ARGS
 fi
-export POSTMORTEM="${PORTMORTEM:-"false"}"
+export POSTMORTEM="${POSTMORTEM:-"false"}"
 if [ "$POSTMORTEM" = "true" ]; then
     # waits for manual shutdown (will not fail); cannot exec
     # FIXME does not work as intended on error
-    /bin/bash -c -- "$AUTONOMOUS_TRUST_ENTRY $AUTONOMOUS_TRUST_EXE $@" || "trap : TERM INT; sleep infinity & wait"
+    python3 $AUTONOMOUS_TRUST_EXE "$@" || (trap : TERM INT; sleep infinity & wait)
 else
-    exec $AUTONOMOUS_TRUST_ENTRY $AUTONOMOUS_TRUST_EXE $@
+    exec python3 $AUTONOMOUS_TRUST_EXE "$@"
 fi

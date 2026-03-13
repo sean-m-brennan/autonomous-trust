@@ -51,7 +51,8 @@ int unix_addr(const char *key, struct sockaddr_un *addr)
     strncat(path, key, SOCK_PATH_LEN - strlen(path) - 1);
 
     addr->sun_family = AF_UNIX;
-    strcpy(addr->sun_path, path);
+    strncpy(addr->sun_path, path, sizeof(addr->sun_path) - 1);
+    addr->sun_path[sizeof(addr->sun_path) - 1] = '\0';
     return 0;
 }
 

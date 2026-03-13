@@ -43,11 +43,10 @@ RUN mkdir /build
 RUN chown -R user:user /build
 USER user
 
-COPY --chown=user:user tools /build/build_tools
-COPY --chown=user:user config /build/config
-# FIXME replace with proper conda
-RUN --mount=type=cache,target=/opt/conda/pkgs /build/build_tools/toolbox devel install --environ
-RUN --mount=type=cache,target=/opt/conda/pkgs /build/build_tools/toolbox devel install --basic
+COPY --chown=user:user config/cfg/environment.yaml /build/config/cfg/environment.yaml
+COPY --chown=user:user config/cfg/devel_environ.yaml /build/config/cfg/devel_environ.yaml
+RUN --mount=type=cache,target=/opt/conda/pkgs conda env create -n autonomous_trust --file /build/config/cfg/environment.yaml
+RUN --mount=type=cache,target=/opt/conda/pkgs conda env update -n autonomous_trust --file /build/config/cfg/devel_environ.yaml
 
 
 SHELL ["conda", "run", "--live-stream", "-n", "autonomous_trust", "/bin/bash", "-c"]
@@ -62,7 +61,7 @@ RUN rm -rf autonomous_trust/etc autonomous_trust/var
 #COPY --chown=user:user src/autonomous-trust/rust-project.toml pyproject.toml
 #RUN maturin develop
 
-COPY --chown=user:user src/autonomous-trust/py-project.toml pyproject.toml
+COPY --chown=user:user src/autonomous-trust/pyproject.toml pyproject.toml
 RUN poetry install
 
 ENV POSTMORTEM=true

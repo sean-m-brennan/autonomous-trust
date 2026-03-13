@@ -62,6 +62,7 @@ class NetworkSource(object):
         if (now - self.last_acq).total_seconds() > self.query_cadence:
             msg = Message(self.name, Network.stats_req, None)
             self.net_queue.put(msg, block=True, timeout=self.q_cadence)
+            self.last_acq = now
         if uuid is None:
             uuid = '0'
         return self.latest.get(uuid, (0., 0., 0, 0, 0, 0))
@@ -73,7 +74,7 @@ class NetStatsSource(Process, metaclass=ProcMeta,
         super().__init__(configurations, subsystems, log_queue, dependencies=dependencies)
         self.protocol = NetStatsProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(NetStatsProtocol.request, self.handle_requests)
-        self.clients: dict[str, tuple[bool, str, Identity]] = {}
+        self.clients: dict[str, Identity] = {}
         self.network_source = NetworkSource(self.name, self.q_cadence)
         self.latest = self.acquire_totals()
 
@@ -85,6 +86,8 @@ class NetStatsSource(Process, metaclass=ProcMeta,
     def compute_rate(self):  # for totals
         current = self.acquire_totals()
         elapsed = (current[0] - self.latest[0]).total_seconds()
+        if elapsed == 0:
+            return 0.0, 0.0
         up, down = (current[1] - self.latest[1]) / elapsed, (current[2] - self.latest[2]) / elapsed
         self.latest = current
         return up, down
@@ -128,6 +131,6 @@ class NetStatsSource(Process, metaclass=ProcMeta,
                 try:
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                 except Full:
-                    pass
+                    self.logger.warning("Queue full, dropping network stats message for %s", peer)
 
             self.sleep_until(self.cadence)

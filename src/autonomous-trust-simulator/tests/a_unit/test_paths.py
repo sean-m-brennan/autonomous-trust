@@ -31,7 +31,7 @@ except ImportError as _e:
 loops = 2
 steps = 10 * 2
 cadence = 1
-display_plot = True
+display_plot = False
 
 
 def plot_shape(points: list[UTMPosition], start: UTMPosition, end: UTMPosition = None,

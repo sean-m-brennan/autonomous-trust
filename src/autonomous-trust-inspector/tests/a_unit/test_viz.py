@@ -37,6 +37,8 @@ async def test_presentation():
     pages_list = ['/']  # FIXME
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
     pres_dir = os.path.join(base_dir, 'doc', 'presentation')
+    if not os.path.isdir(pres_dir):
+        pytest.skip('doc/presentation directory not found')
     app = server.VizServer(pres_dir, 8998, False, 12).app
     for page in pages_list:
         response = await app.test_client().get(page)

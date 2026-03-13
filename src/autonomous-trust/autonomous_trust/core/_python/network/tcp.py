@@ -30,7 +30,7 @@ class TCPNetworkProcess(UDPNetworkProcess):
     net_proto = NetworkProtocol.IPV4
 
     def __init__(self, configurations, subsystems, log_q, acceptance_func=None, use_mcast=False, **kwargs):
-        super().__init__(configurations, subsystems, log_q, acceptance_func, **kwargs)
+        super().__init__(configurations, subsystems, log_q, acceptance_func, udp=False, **kwargs)
         bind_address = self.net_cfg.ip4
         self.recv_ptp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.recv_ptp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -98,6 +98,9 @@ class TCPNetworkProcess(UDPNetworkProcess):
             size_bytes += byte
             byte = sock.recv(1)
         msg_len = int(size_bytes.decode(self.enc))
+        max_msg_size = 64 * 1024 * 1024  # 64 MB
+        if msg_len > max_msg_size:
+            raise TransmissionError("Message size %d exceeds maximum allowed size %d" % (msg_len, max_msg_size))
         chunks = []
         bytes_recvd = 0
         while bytes_recvd < msg_len:

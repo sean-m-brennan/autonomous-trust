@@ -2,8 +2,14 @@ import queue
 
 import pytest
 
-from autonomous_trust.inspector.viz.live_graph import LiveData, LiveNetwork
-from autonomous_trust.inspector.viz.network_graph import Graphs
+try:
+    from autonomous_trust.inspector.viz.live_graph import LiveData, LiveNetwork
+    from autonomous_trust.inspector.viz.network_graph import Graphs
+    _has_deps = True
+except (ImportError, ModuleNotFoundError):
+    _has_deps = False
+
+pytestmark = pytest.mark.skipif(not _has_deps, reason="networkx/aenum not installed")
 
 
 class TestLiveData:

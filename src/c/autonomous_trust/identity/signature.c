@@ -14,9 +14,6 @@
  *   limitations under the License.
  *******************/
 
-#ifndef SIGNATURE_I
-#define SIGNATURE_I
-
 #include <stdbool.h>
 #include <string.h>
 
@@ -67,6 +64,3 @@ unsigned char *signature_generate()
     sodium_memzero(key, sizeof(key));
     return hex;
 }
-
-
-#endif // SIGNATURE_I

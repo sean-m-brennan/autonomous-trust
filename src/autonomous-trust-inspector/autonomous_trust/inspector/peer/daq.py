@@ -17,7 +17,7 @@
 import logging
 import sys
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from queue import Empty, Queue
 from typing import Callable, Union
 
@@ -32,7 +32,7 @@ from autonomous_trust.services.peer.metadata import MetadataProtocol, MetadataSo
 from autonomous_trust.services.peer.position import Position, GeoPosition
 
 
-NullPeerData = lambda: PeerData(datetime.utcfromtimestamp(0), Position(0, 0), 0., '', '', 0)  # noqa
+NullPeerData = lambda: PeerData(datetime.fromtimestamp(0, timezone.utc), Position(0, 0), 0., '', '', 0)  # noqa
 
 StreamType = Union[QueueType, deque]
 

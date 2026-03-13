@@ -89,23 +89,115 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Reputation: permission request from %s\n", nmsg->from_whom.fullname);
 
+    /* Unpack (id1, id2, peer_uuid) from JSON payload */
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_error(proc->logger, "Reputation: handle_request: failed to unpack JSON\n");
+        return false;
+    }
+
+    json_t *j_id1     = json_object_get(payload, "id1");
+    json_t *j_id2     = json_object_get(payload, "id2");
+    json_t *j_peer_uuid = json_object_get(payload, "peer_uuid");
+
+    if (!j_id1 || !j_id2 || !j_peer_uuid)
+    {
+        json_decref(payload);
+        log_error(proc->logger, "Reputation: handle_request: missing JSON fields\n");
+        return false;
+    }
+
+    double id1 = json_real_value(j_id1);
+    double id2 = json_real_value(j_id2);
+    const char *peer_uuid_str = json_string_value(j_peer_uuid);
+
     pthread_mutex_lock(&rep_state.lock);
 
-    /* In full impl: extract paxos_id from message data, compare with last_id
-     * For now, always grant to progress the protocol */
+    int chain_len = tx_history_len(&rep_state.history);
 
-    /* Send grant */
-    generic_msg_t grant = {0};
-    grant.type = NET_MESSAGE;
-    strncpy(grant.info.net_msg.process, "reputation", PROC_NAME_LEN);
-    grant.info.net_msg.function = (char *)REP_PROTO_GRANT;
-    grant.info.net_msg.encrypt = true;
-    memcpy(&grant.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-    strncpy(grant.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    if (id1 > rep_state.last_id)
+    {
+        if ((int)id2 == chain_len + 1)
+        {
+            /* GRANT: store this request index so we can verify transactions later */
+            char paxos_key[64];
+            snprintf(paxos_key, sizeof(paxos_key), "%.0f:%.0f", id1, id2);
+            data_t *key_dat = integer_data((int)id2);
+            array_append(&rep_state.requests, key_dat);
 
-    pthread_mutex_unlock(&rep_state.lock);
+            /* Build grant payload: (id1, id2, peer_uuid, last_id, chain_len) */
+            json_t *grant_json = json_object();
+            json_object_set_new(grant_json, "id1", json_real(id1));
+            json_object_set_new(grant_json, "id2", json_real(id2));
+            json_object_set_new(grant_json, "peer_uuid", json_string(peer_uuid_str));
+            json_object_set_new(grant_json, "last_id", json_real(rep_state.last_id));
+            json_object_set_new(grant_json, "chain_len", json_integer(chain_len));
 
-    messaging_send("network", NET_MESSAGE, &grant, false);
+            pthread_mutex_unlock(&rep_state.lock);
+            json_decref(payload);
+
+            generic_msg_t grant = {0};
+            grant.type = NET_MESSAGE;
+            strncpy(grant.info.net_msg.process, "reputation", PROC_NAME_LEN);
+            grant.info.net_msg.function = (char *)REP_PROTO_GRANT;
+            grant.info.net_msg.encrypt = true;
+            memcpy(&grant.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
+            strncpy(grant.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+            net_msg_pack_json(&grant.info.net_msg, grant_json);
+            json_decref(grant_json);
+
+            log_debug(proc->logger, "Reputation: Request granted\n");
+            messaging_send("network", NET_MESSAGE, &grant, false);
+        }
+        else
+        {
+            /* BACKDATE: chain index mismatch */
+            json_t *bd_json = json_object();
+            json_object_set_new(bd_json, "id1", json_real(id1));
+            json_object_set_new(bd_json, "id2", json_real(id2));
+
+            pthread_mutex_unlock(&rep_state.lock);
+            json_decref(payload);
+
+            generic_msg_t backdate = {0};
+            backdate.type = NET_MESSAGE;
+            strncpy(backdate.info.net_msg.process, "reputation", PROC_NAME_LEN);
+            backdate.info.net_msg.function = (char *)REP_PROTO_BACKDATE;
+            backdate.info.net_msg.encrypt = true;
+            memcpy(&backdate.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
+            strncpy(backdate.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+            net_msg_pack_json(&backdate.info.net_msg, bd_json);
+            json_decref(bd_json);
+
+            log_debug(proc->logger, "Reputation: Request backdated\n");
+            messaging_send("network", NET_MESSAGE, &backdate, false);
+        }
+    }
+    else
+    {
+        /* NACK: id1 <= last_id */
+        json_t *nack_json = json_object();
+        json_object_set_new(nack_json, "id1", json_real(id1));
+        json_object_set_new(nack_json, "id2", json_real(id2));
+
+        pthread_mutex_unlock(&rep_state.lock);
+        json_decref(payload);
+
+        generic_msg_t nack = {0};
+        nack.type = NET_MESSAGE;
+        strncpy(nack.info.net_msg.process, "reputation", PROC_NAME_LEN);
+        nack.info.net_msg.function = (char *)REP_PROTO_NACK;
+        nack.info.net_msg.encrypt = true;
+        memcpy(&nack.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
+        strncpy(nack.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+        net_msg_pack_json(&nack.info.net_msg, nack_json);
+        json_decref(nack_json);
+
+        log_debug(proc->logger, "Reputation: Request refused\n");
+        messaging_send("network", NET_MESSAGE, &nack, false);
+    }
+
     return true;
 }
 
@@ -119,15 +211,118 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Reputation: grant from %s\n", nmsg->from_whom.fullname);
 
+    /* Unpack (id1, id2, peer_uuid, last_id, chain_len) */
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_error(proc->logger, "Reputation: handle_grant: failed to unpack JSON\n");
+        return false;
+    }
+
+    json_t *j_id1      = json_object_get(payload, "id1");
+    json_t *j_id2      = json_object_get(payload, "id2");
+    json_t *j_peer_uuid = json_object_get(payload, "peer_uuid");
+
+    if (!j_id1 || !j_id2 || !j_peer_uuid)
+    {
+        json_decref(payload);
+        log_error(proc->logger, "Reputation: handle_grant: missing JSON fields\n");
+        return false;
+    }
+
+    double id1 = json_real_value(j_id1);
+    double id2 = json_real_value(j_id2);
+    const char *peer_uuid_str = json_string_value(j_peer_uuid);
+
+    /* Composite key for proposals map */
+    char paxos_key[64];
+    snprintf(paxos_key, sizeof(paxos_key), "%.0f:%.0f", id1, id2);
+
     pthread_mutex_lock(&rep_state.lock);
 
-    /* In full impl: extract task_uuid, increment grant count in proposals map
-     * When grants >= majority, broadcast the transaction */
+    /* Look up this request in my_requests (keyed by peer_uuid) */
+    char peer_uuid_key[UUID_STRING_LEN + 2];
+    strncpy(peer_uuid_key, peer_uuid_str, sizeof(peer_uuid_key) - 1);
+    peer_uuid_key[sizeof(peer_uuid_key) - 1] = '\0';
+    data_t *tx_dat = NULL;
+    if (map_get(&rep_state.my_requests, peer_uuid_key, &tx_dat) != 0)
+    {
+        /* Grant not for one of our requests */
+        pthread_mutex_unlock(&rep_state.lock);
+        json_decref(payload);
+        log_debug(proc->logger, "Reputation: Grant for already-completed or unknown request\n");
+        return true;
+    }
 
-    /* For now, simulate majority reached and broadcast TX */
-    /* This would iterate my_requests to find matching proposal */
+    tx_score_t *tx = NULL;
+    data_object_ptr(tx_dat, (void **)&tx);
+
+    /* Find or create paxos_tx_count_t in proposals */
+    data_t *prop_dat = NULL;
+    paxos_tx_count_t *ptc = NULL;
+    if (map_get(&rep_state.proposals, paxos_key, &prop_dat) == 0)
+    {
+        data_object_ptr(prop_dat, (void **)&ptc);
+        ptc->grant_count += 1;
+    }
+    else
+    {
+        ptc = smrt_create(sizeof(paxos_tx_count_t));
+        if (ptc != NULL)
+        {
+            ptc->score = (tx != NULL) ? tx->score : 0.0;
+            ptc->grant_count = 1;
+            data_t *new_prop_dat = object_ptr_data(ptc, sizeof(paxos_tx_count_t));
+            map_set(&rep_state.proposals, paxos_key, new_prop_dat);
+        }
+    }
+
+    int majority = MAJORITY(rep_state.num_peers);
+    bool send_tx = (ptc != NULL && ptc->grant_count >= majority);
+    double tx_score = (ptc != NULL) ? ptc->score : 0.0;
+
+    /* Capture task_uuid before potential removal */
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    if (send_tx && tx != NULL)
+        uuid_unparse_lower(tx->task_uuid, task_uuid_str);
+
+    if (send_tx)
+    {
+        /* Remove from my_requests */
+        map_remove(&rep_state.my_requests, peer_uuid_key);
+    }
 
     pthread_mutex_unlock(&rep_state.lock);
+
+    if (send_tx)
+    {
+        /* Broadcast REP_PROTO_TX to all peers */
+        json_t *tx_json = json_object();
+        json_object_set_new(tx_json, "id1", json_real(id1));
+        json_object_set_new(tx_json, "id2", json_real(id2));
+        json_object_set_new(tx_json, "peer_uuid", json_string(peer_uuid_str));
+        json_object_set_new(tx_json, "score", json_real(tx_score));
+        if (task_uuid_str[0] != '\0')
+            json_object_set_new(tx_json, "task_uuid", json_string(task_uuid_str));
+
+        log_debug(proc->logger, "Reputation: Submit transaction score\n");
+
+        for (size_t i = 0; i < proc->protocol.num_peers; i++)
+        {
+            generic_msg_t tx_msg = {0};
+            tx_msg.type = NET_MESSAGE;
+            strncpy(tx_msg.info.net_msg.process, "reputation", PROC_NAME_LEN);
+            tx_msg.info.net_msg.function = (char *)REP_PROTO_TX;
+            tx_msg.info.net_msg.encrypt = true;
+            memcpy(&tx_msg.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
+            strncpy(tx_msg.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+            net_msg_pack_json(&tx_msg.info.net_msg, tx_json);
+            messaging_send("network", NET_MESSAGE, &tx_msg, false);
+        }
+        json_decref(tx_json);
+    }
+
+    json_decref(payload);
     return true;
 }
 
@@ -140,17 +335,31 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Reputation: nack from %s\n", nmsg->from_whom.fullname);
 
+    /* Unpack (id1, id2) from payload for retry capability */
+    json_t *payload = NULL;
+    double id1 = 0.0, id2 = 0.0;
+    if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL)
+    {
+        json_t *j_id1 = json_object_get(payload, "id1");
+        json_t *j_id2 = json_object_get(payload, "id2");
+        if (j_id1) id1 = json_real_value(j_id1);
+        if (j_id2) id2 = json_real_value(j_id2);
+        json_decref(payload);
+    }
+
     pthread_mutex_lock(&rep_state.lock);
 
-    /* In full impl: extract task_uuid, compute backoff time, schedule retry
-     * backoff = min(BACKOFF_MULT * current_backoff, BACKOFF_MAX_SEC) */
     char from_uuid[UUID_STRING_LEN + 1];
     uuid_unparse_lower(nmsg->from_whom.uuid, from_uuid);
+
+    /* Store task info as composite key alongside backoff */
+    char paxos_key[64];
+    snprintf(paxos_key, sizeof(paxos_key), "%.0f:%.0f", id1, id2);
 
     data_t *backoff_dat = NULL;
     time_t next_retry = time(NULL) + 2;  /* Default 2 second initial backoff */
 
-    if (map_get(&rep_state.backoff, from_uuid, &backoff_dat) == 0)
+    if (map_get(&rep_state.backoff, paxos_key, &backoff_dat) == 0)
     {
         int prev = 0;
         data_integer(backoff_dat, &prev);
@@ -161,7 +370,7 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
     }
 
     data_t *retry_dat = integer_data((int)next_retry);
-    map_set(&rep_state.backoff, from_uuid, retry_dat);
+    map_set(&rep_state.backoff, paxos_key, retry_dat);
 
     pthread_mutex_unlock(&rep_state.lock);
     return true;
@@ -200,9 +409,94 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Reputation: transaction from %s\n", nmsg->from_whom.fullname);
 
-    /* In full impl: verify we granted this, validate transaction data */
+    /* Unpack (id1, id2, peer_uuid, score) */
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_error(proc->logger, "Reputation: handle_transaction: failed to unpack JSON\n");
+        return false;
+    }
 
-    /* Send accepted */
+    json_t *j_id1      = json_object_get(payload, "id1");
+    json_t *j_id2      = json_object_get(payload, "id2");
+    json_t *j_peer_uuid = json_object_get(payload, "peer_uuid");
+    json_t *j_score    = json_object_get(payload, "score");
+
+    if (!j_id1 || !j_id2 || !j_peer_uuid || !j_score)
+    {
+        json_decref(payload);
+        log_error(proc->logger, "Reputation: handle_transaction: missing JSON fields\n");
+        return false;
+    }
+
+    double id2 = json_real_value(j_id2);
+    double id1 = json_real_value(j_id1);
+    double score = json_real_value(j_score);
+    const char *peer_uuid_str = json_string_value(j_peer_uuid);
+    const char *task_uuid_str = json_string_value(json_object_get(payload, "task_uuid"));
+
+    pthread_mutex_lock(&rep_state.lock);
+
+    /* Check if we granted this: look in requests array by matching id2 */
+    bool granted = false;
+    int req_idx = -1;
+    for (size_t i = 0; i < array_size(&rep_state.requests); i++)
+    {
+        data_t *elem = NULL;
+        if (array_get(&rep_state.requests, (int)i, &elem) == 0 && elem != NULL)
+        {
+            int stored_id2 = 0;
+            data_integer(elem, &stored_id2);
+            if (stored_id2 == (int)id2)
+            {
+                granted = true;
+                req_idx = (int)i;
+                break;
+            }
+        }
+    }
+
+    if (!granted)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        json_decref(payload);
+        log_debug(proc->logger, "Reputation: Transaction not granted by us, dropping\n");
+        return true;
+    }
+
+    /* Remove from requests array */
+    data_t *elem_to_remove = NULL;
+    if (array_get(&rep_state.requests, req_idx, &elem_to_remove) == 0 && elem_to_remove != NULL)
+        array_remove(&rep_state.requests, elem_to_remove);
+
+    /* Store score in proposals */
+    char paxos_key[64];
+    snprintf(paxos_key, sizeof(paxos_key), "%.0f:%.0f", id1, id2);
+
+    data_t *prop_dat = NULL;
+    if (map_get(&rep_state.proposals, paxos_key, &prop_dat) != 0)
+    {
+        paxos_tx_count_t *ptc = smrt_create(sizeof(paxos_tx_count_t));
+        if (ptc != NULL)
+        {
+            ptc->score = score;
+            ptc->grant_count = 0;
+            data_t *new_prop = object_ptr_data(ptc, sizeof(paxos_tx_count_t));
+            map_set(&rep_state.proposals, paxos_key, new_prop);
+        }
+    }
+
+    pthread_mutex_unlock(&rep_state.lock);
+    json_decref(payload);
+
+    /* Send ACCEPTED back */
+    json_t *acc_json = json_object();
+    json_object_set_new(acc_json, "id1", json_real(id1));
+    json_object_set_new(acc_json, "id2", json_real(id2));
+    json_object_set_new(acc_json, "peer_uuid", json_string(peer_uuid_str));
+    if (task_uuid_str)
+        json_object_set_new(acc_json, "task_uuid", json_string(task_uuid_str));
+
     generic_msg_t accepted = {0};
     accepted.type = NET_MESSAGE;
     strncpy(accepted.info.net_msg.process, "reputation", PROC_NAME_LEN);
@@ -210,6 +504,8 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     accepted.info.net_msg.encrypt = true;
     memcpy(&accepted.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
     strncpy(accepted.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    net_msg_pack_json(&accepted.info.net_msg, acc_json);
+    json_decref(acc_json);
 
     messaging_send("network", NET_MESSAGE, &accepted, false);
     return true;
@@ -225,12 +521,87 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Reputation: tx accepted by %s\n", nmsg->from_whom.fullname);
 
+    /* Unpack (id1, id2, peer_uuid) */
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_error(proc->logger, "Reputation: handle_accepted: failed to unpack JSON\n");
+        return false;
+    }
+
+    json_t *j_id1      = json_object_get(payload, "id1");
+    json_t *j_id2      = json_object_get(payload, "id2");
+    json_t *j_peer_uuid = json_object_get(payload, "peer_uuid");
+
+    if (!j_id1 || !j_id2 || !j_peer_uuid)
+    {
+        json_decref(payload);
+        log_error(proc->logger, "Reputation: handle_accepted: missing JSON fields\n");
+        return false;
+    }
+
+    double id1 = json_real_value(j_id1);
+    double id2 = json_real_value(j_id2);
+    const char *peer_uuid_str = json_string_value(j_peer_uuid);
+
+    char paxos_key[64];
+    snprintf(paxos_key, sizeof(paxos_key), "%.0f:%.0f", id1, id2);
+
     pthread_mutex_lock(&rep_state.lock);
 
-    /* In full impl: increment acceptance count for this task_uuid
-     * When acceptances >= majority, commit transaction to history */
+    /* Look up score from proposals */
+    data_t *prop_dat = NULL;
+    if (map_get(&rep_state.proposals, paxos_key, &prop_dat) != 0)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        json_decref(payload);
+        log_debug(proc->logger, "Reputation: handle_accepted: no proposal found for key\n");
+        return true;
+    }
+
+    paxos_tx_count_t *ptc = NULL;
+    data_object_ptr(prop_dat, (void **)&ptc);
+    double score = (ptc != NULL) ? ptc->score : 0.0;
+
+    /* Track acceptance count per composite key */
+    data_t *acc_dat = NULL;
+    int acc_count = 0;
+    if (map_get(&rep_state.acceptances, paxos_key, &acc_dat) == 0)
+    {
+        data_integer(acc_dat, &acc_count);
+    }
+    acc_count += 1;
+    data_t *new_acc_dat = integer_data(acc_count);
+    map_set(&rep_state.acceptances, paxos_key, new_acc_dat);
+
+    bool commit = (acc_count >= MAJORITY(rep_state.num_peers));
 
     pthread_mutex_unlock(&rep_state.lock);
+
+    if (commit)
+    {
+        /* Parse UUIDs and commit to history */
+        uuid_t peer_uuid;
+        uuid_t task_uuid;
+        uuid_parse(peer_uuid_str, peer_uuid);
+
+        const char *task_uuid_str = json_string_value(json_object_get(payload, "task_uuid"));
+        if (task_uuid_str && uuid_parse(task_uuid_str, task_uuid) == 0)
+        {
+            tx_history_update(&rep_state.history, task_uuid, peer_uuid, score);
+        }
+        else
+        {
+            tx_history_update(&rep_state.history, peer_uuid, peer_uuid, score);
+        }
+        log_info(proc->logger, "Reputation: Transaction committed\n");
+    }
+    else
+    {
+        log_debug(proc->logger, "Reputation: Tx accepted (%d so far)\n", acc_count);
+    }
+
+    json_decref(payload);
     return true;
 }
 
@@ -246,13 +617,13 @@ static bool handle_outdated(const process_t *proc, directory_t *queues, generic_
 
     pthread_mutex_lock(&rep_state.lock);
 
-    /* In full impl: extract requested range from message,
-     * serialize chain slice via tx_history_era_to_json, send via REP_PROTO_UPDATE */
     json_t *era_json = NULL;
     int chain_len = tx_history_len(&rep_state.history);
     tx_history_era_to_json(&rep_state.history, 0, chain_len, &era_json);
 
-    /* Send update (in full impl, the JSON would be serialized into net_msg obj/len) */
+    pthread_mutex_unlock(&rep_state.lock);
+
+    /* Send update with the era JSON packed into the message */
     generic_msg_t update = {0};
     update.type = NET_MESSAGE;
     strncpy(update.info.net_msg.process, "reputation", PROC_NAME_LEN);
@@ -262,10 +633,12 @@ static bool handle_outdated(const process_t *proc, directory_t *queues, generic_
     strncpy(update.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
 
     if (era_json != NULL)
+    {
+        net_msg_pack_json(&update.info.net_msg, era_json);
         json_decref(era_json);
+    }
 
-    pthread_mutex_unlock(&rep_state.lock);
-
+    log_debug(proc->logger, "Reputation: Sent update\n");
     messaging_send("network", NET_MESSAGE, &update, false);
     return true;
 }
@@ -280,10 +653,98 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Reputation: chain update from %s\n", nmsg->from_whom.fullname);
 
+    /* Unpack chain JSON from payload */
+    json_t *chain_json = NULL;
+    if (net_msg_unpack_json(nmsg, &chain_json) != 0 || chain_json == NULL)
+    {
+        log_error(proc->logger, "Reputation: handle_update: failed to unpack JSON\n");
+        return false;
+    }
+
+    /* Key by sender UUID */
+    char sender_uuid[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender_uuid);
+
     pthread_mutex_lock(&rep_state.lock);
 
-    /* In full impl: deserialize JSON chain from message,
-     * compare with local chain, merge if consistent */
+    /* Store in rep_state.updates keyed by sender UUID */
+    data_t *chain_dat = object_ptr_data(chain_json, sizeof(json_t));
+    map_set(&rep_state.updates, sender_uuid, chain_dat);
+
+    size_t up_count = map_size(&rep_state.updates);
+
+    if (up_count >= 3)
+    {
+        /* Group identical updates: find majority by comparing JSON dumps */
+        /* Build parallel arrays of keys and serialized strings */
+        array_t *keys = map_keys(&rep_state.updates);
+        size_t nkeys = array_size(keys);
+
+        /* Allocate string representations */
+        char **strs = calloc(nkeys, sizeof(char *));
+        json_t **jsons = calloc(nkeys, sizeof(json_t *));
+        if (strs != NULL && jsons != NULL)
+        {
+            for (size_t ki = 0; ki < nkeys; ki++)
+            {
+                data_t *kdat = NULL;
+                if (array_get(keys, (int)ki, &kdat) != 0) continue;
+                char *kstr = NULL;
+                if (data_string_ptr(kdat, &kstr) != 0 || kstr == NULL) continue;
+                data_t *vdat = NULL;
+                if (map_get(&rep_state.updates, kstr, &vdat) != 0) continue;
+                void *jptr = NULL;
+                if (data_object_ptr(vdat, &jptr) != 0 || jptr == NULL) continue;
+                jsons[ki] = (json_t *)jptr;
+                strs[ki] = json_dumps(jsons[ki], JSON_COMPACT);
+            }
+
+            /* Find best candidate */
+            char *best_str = NULL;
+            json_t *best_json = NULL;
+            int best_count = 0;
+
+            for (size_t oi = 0; oi < nkeys; oi++)
+            {
+                if (strs[oi] == NULL) continue;
+                int count = 0;
+                for (size_t ci = 0; ci < nkeys; ci++)
+                {
+                    if (strs[ci] != NULL && strcmp(strs[oi], strs[ci]) == 0)
+                        count++;
+                }
+                if (count > best_count)
+                {
+                    best_count = count;
+                    best_str = strs[oi];
+                    best_json = jsons[oi];
+                }
+            }
+
+            if (best_json != NULL && best_count > (int)(up_count / 2))
+            {
+                tx_history_era_from_json(&rep_state.history, best_json);
+                log_debug(proc->logger, "Reputation: Updated\n");
+            }
+            else
+            {
+                log_error(proc->logger,
+                          "Reputation: Closest %zu peers unable to agree on history\n",
+                          up_count);
+            }
+
+            /* Free all string dumps */
+            for (size_t fi = 0; fi < nkeys; fi++)
+            {
+                if (strs[fi] != NULL && strs[fi] != best_str)
+                    free(strs[fi]);
+            }
+            if (best_str != NULL)
+                free(best_str);
+        }
+        if (strs != NULL) free(strs);
+        if (jsons != NULL) free(jsons);
+    }
 
     pthread_mutex_unlock(&rep_state.lock);
     return true;
@@ -299,8 +760,49 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Reputation: rep request from %s\n", nmsg->from_whom.fullname);
 
-    /* In full impl: extract target peer UUID from message,
-     * compute reputation, send response via REP_PROTO_REP_RESP */
+    /* Unpack (peer_uuid, requesting_process) */
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_error(proc->logger, "Reputation: handle_rep_request: failed to unpack JSON\n");
+        return false;
+    }
+
+    json_t *j_peer_uuid  = json_object_get(payload, "peer_uuid");
+    json_t *j_req_proc   = json_object_get(payload, "requesting_process");
+
+    if (!j_peer_uuid || !j_req_proc)
+    {
+        json_decref(payload);
+        log_error(proc->logger, "Reputation: handle_rep_request: missing JSON fields\n");
+        return false;
+    }
+
+    const char *peer_uuid_str = json_string_value(j_peer_uuid);
+    const char *req_proc_str  = json_string_value(j_req_proc);
+
+    /* Parse UUID and compute reputation */
+    uuid_t peer_uuid;
+    double score = 0.0;
+    if (uuid_parse(peer_uuid_str, peer_uuid) == 0)
+    {
+        pthread_mutex_lock(&rep_state.lock);
+        /* Use a dummy self uuid (zero) for now — process doesn't carry self identity */
+        uuid_t self_uuid;
+        uuid_clear(self_uuid);
+        score = reputation_compute(&rep_state.history, &rep_state.reputations,
+                                   self_uuid, peer_uuid);
+        reputations_update(&rep_state.reputations, peer_uuid, score);
+        pthread_mutex_unlock(&rep_state.lock);
+    }
+
+    /* Pack response (peer_uuid, score, requesting_process) */
+    json_t *resp_json = json_object();
+    json_object_set_new(resp_json, "peer_uuid", json_string(peer_uuid_str));
+    json_object_set_new(resp_json, "score", json_real(score));
+    json_object_set_new(resp_json, "requesting_process", json_string(req_proc_str));
+
+    json_decref(payload);
 
     generic_msg_t resp = {0};
     resp.type = NET_MESSAGE;
@@ -309,6 +811,8 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
     resp.info.net_msg.encrypt = true;
     memcpy(&resp.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
     strncpy(resp.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    net_msg_pack_json(&resp.info.net_msg, resp_json);
+    json_decref(resp_json);
 
     messaging_send("network", NET_MESSAGE, &resp, false);
     return true;
@@ -323,7 +827,19 @@ static bool handle_rep_response(const process_t *proc, directory_t *queues, gene
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Reputation: rep response from %s\n", nmsg->from_whom.fullname);
 
-    /* In full impl: extract score from response, store in requested_reps */
+    /* Unpack and store in requested_reps array */
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_error(proc->logger, "Reputation: handle_rep_response: failed to unpack JSON\n");
+        return false;
+    }
+
+    /* Store the JSON payload in requested_reps for later processing */
+    data_t *resp_dat = object_ptr_data(payload, sizeof(json_t));
+    pthread_mutex_lock(&rep_state.lock);
+    array_append(&rep_state.requested_reps, resp_dat);
+    pthread_mutex_unlock(&rep_state.lock);
 
     return true;
 }
@@ -333,8 +849,8 @@ static bool handle_rep_response(const process_t *proc, directory_t *queues, gene
  * Called when TRANSACTION_SCORE message arrives from negotiation.
  ****************************/
 
-static void __attribute__((unused)) _forward_transaction(const process_t *proc, const uuid_t task_uuid,
-                                 const uuid_t peer_uuid, double score)
+void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
+                          const uuid_t peer_uuid, double score)
 {
     char task_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(task_uuid, task_str);
@@ -353,9 +869,15 @@ static void __attribute__((unused)) _forward_transaction(const process_t *proc, 
         map_set(&rep_state.my_requests, task_str, tx_dat);
     }
 
-    /* Compute Paxos ID */
+    /* Compute Paxos ID — advance last_id and derive id1 from the paxos index */
     rep_state.last_id += 1.0;
-    double paxos_id = paxos_id_index(rep_state.last_id, (double)rep_state.num_peers);
+    double id1 = paxos_id_index(rep_state.last_id, (double)rep_state.num_peers);
+    int chain_len = tx_history_len(&rep_state.history);
+    double id2 = (double)(chain_len + 1);
+
+    /* Get identity UUID for the request */
+    char identity_uuid[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, identity_uuid);
 
     pthread_mutex_unlock(&rep_state.lock);
 
@@ -369,10 +891,18 @@ static void __attribute__((unused)) _forward_transaction(const process_t *proc, 
         req.info.net_msg.encrypt = true;
         memcpy(&req.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
         strncpy(req.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
-        /* In full impl: pack paxos_id + task_uuid + chain_index into obj */
-        (void)paxos_id;  /* Used in full impl */
+
+        /* Pack (id1, id2, identity_uuid) as JSON into the request */
+        json_t *req_json = json_object();
+        json_object_set_new(req_json, "id1", json_real(id1));
+        json_object_set_new(req_json, "id2", json_real(id2));
+        json_object_set_new(req_json, "peer_uuid", json_string(identity_uuid));
+        net_msg_pack_json(&req.info.net_msg, req_json);
+        json_decref(req_json);
+
         messaging_send("network", NET_MESSAGE, &req, false);
     }
+
 }
 
 /****************************

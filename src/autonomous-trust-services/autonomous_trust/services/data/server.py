@@ -93,6 +93,6 @@ class DataProcess(Process, metaclass=ProcMeta,
                         try:
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                         except Full:
-                            pass
+                            self.logger.warning("Queue full, dropping data message for %s", client_id)
 
             self.sleep_until(self.cadence)

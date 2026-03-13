@@ -41,7 +41,7 @@ void smrt_ref(void *ptr)
     sptr->refs++;
 }
 
-void smrt_deref(void *ptr)
+void _smrt_deref_impl(void *ptr)
 {
     if (ptr == NULL)
         return;

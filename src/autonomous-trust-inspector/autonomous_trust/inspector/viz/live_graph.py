@@ -46,7 +46,7 @@ class LiveNetwork(ng.NetworkGraph):
     cadence_ms = 1000
 
     def __init__(self, _, **kwargs):
-        self.node_data.append('persist')
+        self.node_data = list(self.node_data) + ['persist']
         self.iteration = 0
         groups = ['a', '', ' ', 'trouble']
         self.data_q = kwargs.pop('data_q')
@@ -70,8 +70,8 @@ class LiveNetwork(ng.NetworkGraph):
 
     def _node_init(self, n):
         super()._node_init(n)
-        for n in list(self.G):
-            self.G.nodes[n]["group"] = self.groupLabels[0]
+        for node in list(self.G):
+            self.G.nodes[node]["group"] = self.groupLabels[0]
 
     def _post_init(self):
         super()._post_init()

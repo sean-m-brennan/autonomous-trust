@@ -75,6 +75,8 @@ size_t djb_hash(map_key_t key)
 
 size_t map_hash2index(map_t *map, hash_t hash)
 {
+    if (map->capacity <= 1)
+        return 0;
 #ifdef __SIZEOF_INT128__
     return (uint64_t)(((__uint128_t)hash * (__uint128_t)(map->capacity - 1)) >> 64);
 #else
@@ -101,6 +103,12 @@ int reindex(map_t *map)
         if (entry.key != NULL && entry.key[0] != 0)
         {
             size_t idx = map_hash2index(map, entry.hash);
+            while (items[idx].key != NULL)
+            {
+                idx++;
+                if (idx >= map->capacity)
+                    idx = 0;
+            }
             items[idx] = entry;
         }
     }
@@ -155,8 +163,10 @@ int map_get(map_t *map, const map_key_t key, data_t **value)
 {
     size_t index = map_key2index(map, key);
 
-    while (map->items[index].key != NULL)
+    for (size_t i = 0; i < map->capacity; i++)
     {
+        if (map->items[index].key == NULL)
+            break;
         if (strcmp(key, map->items[index].key) == 0)
         {
             *value = map->items[index].value;
@@ -184,8 +194,10 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
     size_t index = map_hash2index(map, hash);
 
     // if the entry is already here, change it; otherwise find an empty slot nearby (hopefully)
-    while (map->items[index].key != NULL)
+    for (size_t i = 0; i < map->capacity; i++)
     {
+        if (map->items[index].key == NULL)
+            break;
         if (strcmp(key, map->items[index].key) == 0)
         {
             smrt_ref(value);
@@ -269,6 +281,11 @@ int map_remove(map_t *map, map_key_t key)
 
 void map_free(map_t *map)
 {
+    for (size_t i = 0; i < map->capacity; i++)
+    {
+        if (map->items[i].key != NULL)
+            free(map->items[i].key);
+    }
     smrt_deref(map->items);
     smrt_deref(map);
 }
@@ -304,7 +321,7 @@ int map_sync_in(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap, map_
         data_t *elt = smrt_create(sizeof(data_t));
         if (elt == NULL)
             return EXCEPTION(ENOMEM);
-        char *key = smrt_create(strlen(dmap->map[i]->key));
+        char *key = smrt_create(strlen(dmap->map[i]->key) + 1);
         if (key == NULL)
             return EXCEPTION(ENOMEM);
         strcpy(key, dmap->map[i]->key);
@@ -328,7 +345,7 @@ int map_to_json(const void *data_struct, json_t **obj_ptr)
     json_t *hash_arr = json_array();
     for (int i = 0; i < crypto_shorthash_KEYBYTES; i++)
     {
-        json_array_append(hash_arr, json_integer(map->hashkey[i]));
+        json_array_append_new(hash_arr, json_integer(map->hashkey[i]));
     }
     json_object_set_new(obj, "hashkey", hash_arr);
 
@@ -352,7 +369,7 @@ int map_to_json(const void *data_struct, json_t **obj_ptr)
             json_object_set_new(elt, "value", val);
             json_object_set_new(elt, "hash", json_integer(map->items[i].hash));
         }
-        json_array_append(j_arr, elt);
+        json_array_append_new(j_arr, elt);
     }
     json_object_set_new(obj, "items", j_arr);
     return 0;
@@ -385,6 +402,7 @@ int map_from_json(const json_t *obj, void *data_struct)
             const char *key = json_string_value(json_object_get(elt, "key"));
             map->items[i].key = malloc(strlen(key) + 1);
             strcpy(map->items[i].key, key);
+            map->items[i].value = calloc(1, sizeof(data_t));
             data_from_json(json_object_get(elt, "value"), map->items[i].value);
         }
     }

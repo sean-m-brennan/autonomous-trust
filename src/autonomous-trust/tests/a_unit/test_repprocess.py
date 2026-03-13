@@ -74,11 +74,11 @@ class TestReputationProcessInit:
 class TestPaxosIdIndex:
     def test_basic(self):
         idx = ReputationProcess._paxos_id_index(100, 5)
-        assert idx == 100.5
+        assert idx == (100, 5)
 
     def test_larger(self):
         idx = ReputationProcess._paxos_id_index(1000, 99)
-        assert idx == 1000.99
+        assert idx == (1000, 99)
 
 
 class TestHandleRequest:
