@@ -8,11 +8,13 @@ config.define_string("num-nodes")
 config.define_string("exclude-logs")
 config.define_string("log-level")
 config.define_string("backend")
+config.define_string("metrics-dir")
 cfg = config.parse()
 num_nodes = cfg.get("num-nodes", "2")
 exclude_logs = cfg.get("exclude-logs", "network")
 log_level = cfg.get("log-level", "info")
 backend = cfg.get("backend", "native")
+metrics_dir = cfg.get("metrics-dir", "")
 
 # Generate docker-compose.tilt.yaml for the requested number of nodes
 local("python3 gen_compose.py " + num_nodes + " " + exclude_logs + " " + log_level + " " + backend, quiet=True, echo_off=True)
@@ -45,7 +47,7 @@ if backend == "native":
 else:
     dockerfile = "src/autonomous-trust/Dockerfile-lite"
 
-# Build the image
+# Build the base image
 docker_build(
     "autonomous-trust",
     ".",
@@ -53,6 +55,24 @@ docker_build(
     network="host",
     build_args=build_args,
 )
+
+# Build the full-devel image chain when metrics collection is enabled.
+# autonomous-trust-full-devel depends on autonomous-trust-devel.
+if metrics_dir:
+    docker_build(
+        "autonomous-trust-devel",
+        ".",
+        dockerfile="src/autonomous-trust/Dockerfile-devel",
+        network="host",
+        build_args=build_args,
+    )
+    docker_build(
+        "autonomous-trust-full-devel",
+        ".",
+        dockerfile="src/Dockerfile-devel",
+        network="host",
+        build_args=build_args,
+    )
 
 # Load the generated compose file
 docker_compose("docker-compose.tilt.yaml")
@@ -63,3 +83,7 @@ watch_file("src/autonomous-trust/entrypoint.sh")
 watch_file("src/protobuf")
 if backend == "native":
     watch_file("src/c")
+if metrics_dir:
+    watch_file("src/autonomous-trust-inspector/autonomous_trust")
+    watch_file("src/autonomous-trust-services/autonomous_trust")
+    watch_file("src/autonomous-trust-simulator/autonomous_trust")

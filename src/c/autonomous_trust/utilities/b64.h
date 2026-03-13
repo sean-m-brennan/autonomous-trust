@@ -17,6 +17,17 @@ static inline size_t b64_decoded_len(size_t enc_len, char last_char)
     return len;
 }
 
+static inline size_t b64_decoded_len_s(size_t enc_len, const char *enc_str)
+{
+    size_t len = (enc_len / 4) * 3;
+    if (enc_len >= 1 && enc_str[enc_len - 1] == '=') {
+        len--;
+        if (enc_len >= 2 && enc_str[enc_len - 2] == '=')
+            len--;
+    }
+    return len;
+}
+
 static inline void base64_encode(const unsigned char *src, size_t src_len,
                                   char *dst, size_t dst_len)
 {

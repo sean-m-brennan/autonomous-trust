@@ -92,7 +92,8 @@ class VideoSource(object):
         return more, self.frame_position, frame
 
     def disconnect(self):
-        self.vid_cap.release()
+        if self.vid_cap is not None:
+            self.vid_cap.release()
         self.vid_cap = None
         self.frame_position = 0
 
@@ -145,6 +146,6 @@ class VideoProcess(DataProcess, metaclass=ProcMeta,
                         try:
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                         except Full:
-                            pass  # skip this frame
+                            self.logger.debug("Queue full, dropping video frame for %s", client_id)
 
             self.sleep_until(self.cadence)

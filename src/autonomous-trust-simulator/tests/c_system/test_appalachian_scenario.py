@@ -45,9 +45,9 @@ def docker_available():
 
 
 @pytest.fixture
-def compose_dir(tmp_path):
+def compose_dir(tmp_path, backend):
     """Generate Appalachian docker-compose in a temp directory."""
-    content = generate_appalachian_compose(hilltop_only=True)
+    content = generate_appalachian_compose(hilltop_only=True, backend=backend)
     compose_file = tmp_path / 'docker-compose.yaml'
     compose_file.write_text(content)
     return tmp_path

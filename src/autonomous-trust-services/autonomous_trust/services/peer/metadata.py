@@ -148,10 +148,10 @@ class MetadataSource(Process, metaclass=ProcMeta,
             obj = PeerData(time, position, speed, self.cfg.peer_kind,
                            self.cfg.data_type, self.cfg.data_channels).to_string()
             for peer in self.clients:
-                msg = Message('daq', MetadataProtocol.metadata, obj, peer)
+                msg = Message(self.name, MetadataProtocol.metadata, obj, peer)
                 try:
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                 except Full:
-                    pass
+                    self.logger.warning("Queue full, dropping metadata message for %s", peer)
 
             self.sleep_until(self.cadence)

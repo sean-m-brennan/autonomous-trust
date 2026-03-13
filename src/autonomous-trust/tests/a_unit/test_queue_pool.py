@@ -11,8 +11,9 @@ class TestPooledQueue:
 
     def test_close(self):
         pq = PooledQueue(queue.Queue)
+        pq.in_use = True
         pq.close()
-        assert pq.in_use is True
+        assert pq.in_use is False
 
 
 class TestQueuePool:
@@ -48,8 +49,8 @@ class TestQueuePool:
         pool = QueuePool(queue.Queue)
         q = pool.next()
         pool.recycle(q)
-        # recycle calls close() which sets in_use=True
+        # recycle calls close() which sets in_use=False, making queue available for reuse
         for pq in pool._pool:
             if pq.queue is q:
-                assert pq.in_use is True
+                assert pq.in_use is False
                 break

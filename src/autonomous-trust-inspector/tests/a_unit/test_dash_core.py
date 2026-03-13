@@ -12,8 +12,10 @@ try:
 except (ImportError, ModuleNotFoundError) as _e:
     has_dash = False
 
-pytestmark = pytest.mark.skipif(not has_dash,
-                                reason='dash_components dependencies not available')
+pytestmark = [
+    pytest.mark.skipif(not has_dash, reason='dash_components dependencies not available'),
+    pytest.mark.filterwarnings('ignore::RuntimeWarning'),
+]
 
 
 class TestIconSize:

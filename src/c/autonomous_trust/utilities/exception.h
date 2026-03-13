@@ -43,7 +43,7 @@ extern "C"
     } exception_t;
 
 #ifndef EXCEPTION_IMPL
-    extern exception_t _exception;
+    extern _Thread_local exception_t _exception;
     const char *_get_err_str(int err);
 
     extern exception_info_t error_table[];

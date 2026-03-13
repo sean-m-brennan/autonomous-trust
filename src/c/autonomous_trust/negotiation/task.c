@@ -21,6 +21,7 @@
 #include <errno.h>
 
 #include "task_priv.h"
+#include "negotiation/task.pb-c.h"
 
 typedef void * (*pthread_function_t)(void *);
 
@@ -41,23 +42,60 @@ int task_run(task_t *task)
     if (err != 0)
         return EXCEPTION(err);
 
-    // FIXME track thread for results
-    // place result on queue for routing
-    // FIXME args must be freed somewhere
+    pthread_detach(thread);
     return 0;
 }
 
-/* FIXME task.proto is empty — no protobuf types generated.
-   Stub out proto functions until task.proto is populated. */
-
 int task_to_proto(task_t *msg, size_t size, void **data_ptr, size_t *data_len_ptr)
 {
-    (void)msg; (void)size; (void)data_ptr; (void)data_len_ptr;
-    return -1;  /* no proto support */
+    (void)size;
+    AutonomousTrust__Core__Protobuf__Negotiation__Task proto =
+        AUTONOMOUS_TRUST__CORE__PROTOBUF__NEGOTIATION__TASK__INIT;
+
+    proto.uuid.data = msg->uuid;
+    proto.uuid.len = sizeof(uuid_t);
+    proto.requestor_uuid.data = msg->requestor_uuid;
+    proto.requestor_uuid.len = sizeof(uuid_t);
+    proto.capability_name = msg->capability.name;
+    proto.when_seconds = (int64_t)msg->when.tm_sec;
+    proto.when_nanos = (int32_t)msg->when.tm_nsec;
+    proto.duration_days = msg->duration.days;
+    proto.duration_seconds = msg->duration.seconds;
+    proto.duration_nsecs = msg->duration.nsecs;
+    proto.timeout = msg->timeout;
+    proto.flexible = msg->flexible;
+    proto.argc = (int32_t)msg->argc;
+
+    *data_len_ptr = autonomous_trust__core__protobuf__negotiation__task__get_packed_size(&proto);
+    *data_ptr = smrt_create(*data_len_ptr);
+    if (*data_ptr == NULL)
+        return EXCEPTION(ENOMEM);
+    autonomous_trust__core__protobuf__negotiation__task__pack(&proto, *data_ptr);
+    return 0;
 }
 
 int proto_to_task(uint8_t *data, size_t len, task_t *task)
 {
-    (void)data; (void)len; (void)task;
-    return -1;  /* no proto support */
+    AutonomousTrust__Core__Protobuf__Negotiation__Task *proto =
+        autonomous_trust__core__protobuf__negotiation__task__unpack(NULL, len, data);
+    if (proto == NULL)
+        return -1;
+
+    if (proto->uuid.len == sizeof(uuid_t))
+        uuid_copy(task->uuid, proto->uuid.data);
+    if (proto->requestor_uuid.len == sizeof(uuid_t))
+        uuid_copy(task->requestor_uuid, proto->requestor_uuid.data);
+    if (proto->capability_name)
+        strncpy(task->capability.name, proto->capability_name, CAP_NAMELEN);
+    task->when.tm_sec = (int)proto->when_seconds;
+    task->when.tm_nsec = (unsigned long)proto->when_nanos;
+    task->duration.days = proto->duration_days;
+    task->duration.seconds = proto->duration_seconds;
+    task->duration.nsecs = proto->duration_nsecs;
+    task->timeout = proto->timeout;
+    task->flexible = proto->flexible;
+    task->argc = (size_t)proto->argc;
+
+    autonomous_trust__core__protobuf__negotiation__task__free_unpacked(proto, NULL);
+    return 0;
 }

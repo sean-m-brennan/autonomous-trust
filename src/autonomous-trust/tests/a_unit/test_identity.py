@@ -55,8 +55,6 @@ def test_peers(setup_teardown):
     file = os.path.join(TEST_DIR, 'test_peers')
     t3.to_file(file)
     t4 = Configuration.from_file(file)
-    print(t3.listing)
-    print(t4.listing)
     assert repr(t3) == repr(t4)
 
 

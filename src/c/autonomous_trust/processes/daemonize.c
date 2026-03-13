@@ -47,7 +47,7 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
         close(io[1]);
 #if FORK > 1
         pid_t gchild = -1;
-        read(io[0], &gchild, sizeof(int));
+        (void)!read(io[0], &gchild, sizeof(int));
         close(io[0]);
         if (gchild < 0)
             return EXCEPTION(abs(gchild));
@@ -61,21 +61,21 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
 
     if (setsid() == -1) { // lead new session
         err = -errno;
-        write(io[1], &err, sizeof(int));
+        (void)!write(io[1], &err, sizeof(int));
         close(io[1]);
         return SYS_EXCEPTION();
     }
 
-#if FORK > 1        
+#if FORK > 1
     pid = fork();
     if (pid < 0) {
         err = -errno;
-        write(io[1], &err, sizeof(int));
+        (void)!write(io[1], &err, sizeof(int));
         close(io[1]);
         return SYS_EXCEPTION();
     }
     if (pid != 0) {  // parent
-        write(io[1], &pid, sizeof(int));
+        (void)!write(io[1], &pid, sizeof(int));
         close(io[1]);
         _exit(0);
     }
@@ -87,7 +87,7 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
 
     if (!(flags & NO_CHDIR))
     {
-        chdir(data_dir);
+        (void)!chdir(data_dir);
     }
 
     if (!(flags & NO_CLOSE_FILES)) // close all open files

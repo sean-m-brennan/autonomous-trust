@@ -365,3 +365,40 @@ def test_degraded_rate_floor():
     """Rate never drops below 1 Kbps."""
     rate = Router.degraded_rate(100, 200.0)  # 100 bps * 0.01 = 1 bps, but floor is 1000
     assert rate == '1Kbit'
+
+
+# --- Router parse_chain Tests (R11) ---
+
+def test_parse_chain_finds_matching_rule():
+    """parse_chain correctly identifies matching src/dst in iptables output."""
+    from unittest.mock import patch
+    router = Router.__new__(Router)
+    # Simulate iptables -L output (first 2 lines are header, then rules)
+    mock_output = [
+        'Chain FORWARD (policy ACCEPT)',
+        'target     prot opt source               destination',
+        'DROP       all  --  10.38.80.1           10.38.80.2',
+        'DROP       all  --  10.38.80.3           anywhere',
+    ]
+    with patch.object(Router, 'iptables', return_value=mock_output):
+        assert router.parse_chain('FORWARD', '10.38.80.1', '10.38.80.2') is True
+        assert router.parse_chain('FORWARD', '10.38.80.3', None) is True
+        assert router.parse_chain('FORWARD', '10.38.80.1', '10.38.80.3') is False
+
+
+def test_parse_chain_no_src_no_dst_returns_false():
+    """parse_chain returns False when both src and dst are None."""
+    router = Router.__new__(Router)
+    assert router.parse_chain('FORWARD', None, None) is False
+
+
+def test_parse_chain_empty_chain():
+    """parse_chain returns False for empty iptables chain."""
+    from unittest.mock import patch
+    router = Router.__new__(Router)
+    mock_output = [
+        'Chain FORWARD (policy ACCEPT)',
+        'target     prot opt source               destination',
+    ]
+    with patch.object(Router, 'iptables', return_value=mock_output):
+        assert router.parse_chain('FORWARD', '10.0.0.1', '10.0.0.2') is False

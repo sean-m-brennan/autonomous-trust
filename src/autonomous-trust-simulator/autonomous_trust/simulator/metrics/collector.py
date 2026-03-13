@@ -33,6 +33,8 @@ from typing import Any, Optional
 from autonomous_trust.core import ProcMeta
 from autonomous_trust.core._python.processes import Process, ProcessTracker
 from autonomous_trust.core._python.network.message import Message
+from autonomous_trust.core._python.negotiation.negotiation import TaskInfo
+from autonomous_trust.core._python.reputation.reputation import Reputation
 from autonomous_trust.core.system import QueueType
 
 
@@ -94,15 +96,27 @@ class MetricsCollector(Process, metaclass=ProcMeta,
         """Accumulate protocol traffic byte count."""
         self._protocol_bytes += nbytes
 
+    # Default assumed link capacity in bits per second for bandwidth fraction
+    # calculation.  Containers use tc-based shaping; this is a conservative
+    # estimate for a simulated radio mesh link (1 Mbps).
+    _assumed_link_bps: float = 1_000_000.0
+
     def _compute_bandwidth_report(self, end_time: datetime) -> dict:
-        """Compute bandwidth overhead fraction."""
+        """Compute bandwidth overhead fraction.
+
+        Uses externally-reported bandwidth samples when available, falling
+        back to a fixed assumed link capacity so the metric is never null
+        when protocol bytes have been observed.
+        """
         result: dict[str, Any] = {}
-        if (self._start_time and self._bandwidth_samples > 0
-                and self._total_bandwidth_bps > 0):
+        if self._start_time and self._protocol_bytes > 0:
             duration_s = (end_time - self._start_time).total_seconds()
             if duration_s > 0:
-                mean_bw_bps = self._total_bandwidth_bps / self._bandwidth_samples
-                capacity_bytes = (mean_bw_bps / 8.0) * duration_s
+                if self._bandwidth_samples > 0 and self._total_bandwidth_bps > 0:
+                    link_bps = self._total_bandwidth_bps / self._bandwidth_samples
+                else:
+                    link_bps = self._assumed_link_bps
+                capacity_bytes = (link_bps / 8.0) * duration_s
                 result['bandwidth_overhead_fraction'] = (
                     self._protocol_bytes / capacity_bytes
                     if capacity_bytes > 0 else None)
@@ -159,13 +173,22 @@ class MetricsCollector(Process, metaclass=ProcMeta,
                 json.dump(report, f, indent=2, default=str)
         return report
 
+    # Write metrics snapshot every 30 seconds so that results survive
+    # ungraceful termination (e.g. SIGKILL from ``docker stop``).
+    _SNAPSHOT_INTERVAL_S = 30.0
+
     def process(self, queues: dict[str, QueueType], signal: QueueType):
-        """Main loop: receive messages, track metrics, write report on shutdown."""
+        """Main loop: receive messages, track metrics, write report periodically."""
         self._start_time = datetime.now()
+        last_snapshot = self._start_time
         while self.keep_running(signal):
             try:
                 msg = queues[self.name].get(block=True, timeout=self.q_cadence)
             except queue.Empty:
+                # Periodically flush metrics even when idle
+                if (datetime.now() - last_snapshot).total_seconds() >= self._SNAPSHOT_INTERVAL_S:
+                    self._write_report()
+                    last_snapshot = datetime.now()
                 continue
 
             if isinstance(msg, Message):
@@ -179,18 +202,39 @@ class MetricsCollector(Process, metaclass=ProcMeta,
                 # Identity events
                 if msg.function in ('access_granted', 'request_access',
                                     'peer_accepted'):
-                    peer_id = str(msg.from_whom) if msg.from_whom else 'unknown'
-                    self._handle_identity_event(msg.function, peer_id, now)
+                    # Outgoing messages (from this node) have from_whom=None;
+                    # the admitted peer is in to_whom.  Incoming messages
+                    # (from the network) have from_whom set by Message.parse.
+                    peer_id = None
+                    if msg.from_whom:
+                        peer_id = str(msg.from_whom)
+                    elif msg.to_whom and isinstance(msg.to_whom, list) and len(msg.to_whom) > 0:
+                        peer_id = str(msg.to_whom[0])
+                    if peer_id:
+                        self._handle_identity_event(msg.function, peer_id, now)
 
                 # Reputation events
                 elif msg.function == 'reputation response':
-                    if isinstance(msg.obj, (tuple, list)) and len(msg.obj) >= 2:
+                    if isinstance(msg.obj, Reputation):
+                        self._handle_reputation_event(
+                            str(msg.obj.peer_id), float(msg.obj.score))
+                    elif isinstance(msg.obj, (tuple, list)) and len(msg.obj) >= 2:
                         self._handle_reputation_event(
                             str(msg.obj[0]), float(msg.obj[1]))
 
                 # Negotiation events
                 elif msg.function in ('invitation', 'haggle', 'ack', 'nack'):
-                    task_id = str(msg.obj) if msg.obj else 'unknown'
+                    # Extract stable task UUID rather than full object string,
+                    # so invitation/haggle for the same task match up.
+                    if isinstance(msg.obj, TaskInfo):
+                        task_id = str(msg.obj.uuid)
+                    else:
+                        task_id = str(msg.obj) if msg.obj else 'unknown'
                     self._handle_negotiation_event(msg.function, task_id, now)
+
+                # Periodic snapshot after processing messages
+                if (now - last_snapshot).total_seconds() >= self._SNAPSHOT_INTERVAL_S:
+                    self._write_report()
+                    last_snapshot = now
 
         self._write_report()

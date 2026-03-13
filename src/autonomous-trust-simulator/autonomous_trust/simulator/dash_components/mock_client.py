@@ -17,6 +17,8 @@
 import atexit
 import logging
 import os
+
+_logger = logging.getLogger(__name__)
 import random
 import threading
 import time
@@ -149,7 +151,7 @@ class SimCohort(CohortInterface):
                         thread = threading.Thread(target=video.run)  # FIXME extra processing
                         thread.start()
                         vid_q = video.buffer
-                        print('serve video %s' % vid)
+                        _logger.debug('serve video %s', vid)
                         self.threads.append(thread)
                 data = SimDataSource()
                 if 'data' not in self.disables:

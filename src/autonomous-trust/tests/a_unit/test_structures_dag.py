@@ -46,8 +46,7 @@ class TestLinkedStep:
         step = LinkedStep(payload='data', uuid=uid, timestamp=ts)
         d = step.to_dict()
         assert d['payload'] == 'data'
-        # Note: Step.__init__ always sets self.uuid = None (known bug)
-        assert d['uuid'] is None
+        assert d['uuid'] == uid
         assert d['timestamp'] == ts
 
     def test_custom_uuid(self):

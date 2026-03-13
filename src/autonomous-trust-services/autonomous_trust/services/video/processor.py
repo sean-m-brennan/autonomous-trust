@@ -14,7 +14,9 @@
 #   limitations under the License.
 # ******************
 
+import logging
 import os.path
+import socket
 import urllib.request
 
 import numpy as np
@@ -36,9 +38,17 @@ class VideoProcessor(VideoProcess):
         self.count = 0
         model_path = os.path.join(os.path.dirname(__file__), self.model_filename)
         if not os.path.exists(model_path):
-            urllib.request.urlretrieve(self.model_url, model_path)
+            try:
+                old_timeout = socket.getdefaulttimeout()
+                socket.setdefaulttimeout(30)
+                try:
+                    urllib.request.urlretrieve(self.model_url, model_path)  # noqa: S310
+                finally:
+                    socket.setdefaulttimeout(old_timeout)
+            except Exception as e:
+                logging.getLogger(__name__).warning('Failed to download model %s: %s', self.model_url, e)
         options = vision.ObjectDetectorOptions(base_options=python.BaseOptions(model_asset_path=model_path),
-                                               score_threshold=0)
+                                               score_threshold=0.5)
         self.detector = vision.ObjectDetector.create_from_options(options)
 
     def visualize(self, image, detection_result) -> np.ndarray:
@@ -52,7 +62,7 @@ class VideoProcessor(VideoProcess):
 
     def process_frame(self, frame):
         self.count += 1
-        if self.count % self.cadence:
+        if self.count % self.cadence == 0:
             # FIXME takes about .5 sec so only do this for some
             detection_result = self.detector.detect(frame)
             frame = self.visualize(frame, detection_result)

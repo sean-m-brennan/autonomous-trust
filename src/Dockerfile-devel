@@ -24,5 +24,6 @@ COPY --chown=user:user src/autonomous-trust-simulator/autonomous_trust/simulator
 
 # update and install any new dependencies from environment.yaml
 COPY --chown=user:user config/cfg/environment.yaml /build/config/cfg/environment.yaml
+COPY --chown=user:user config/cfg/environment.yaml ./environment.yaml
 COPY --chown=user:user ./*.sh .
 RUN ./setup-dev.sh --update

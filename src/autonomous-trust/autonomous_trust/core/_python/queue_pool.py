@@ -25,7 +25,7 @@ class PooledQueue(object):
         self.queue = queue_type()
 
     def close(self):
-        self.in_use = True
+        self.in_use = False
 
 
 class QueuePool(object):

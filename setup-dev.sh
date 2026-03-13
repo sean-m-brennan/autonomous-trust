@@ -132,6 +132,7 @@ create_conda_env() {
 }
 
 update_conda_env() {
+    conda update -n base -c conda-forge conda
     activate_conda
     info "Updating conda environment '$ENV_NAME' ..."
     conda env update -n "$ENV_NAME" --file "$SCRIPT_DIR/environment.yaml" --prune

@@ -20,8 +20,8 @@ from datetime import datetime
 import pytest
 
 try:
-    from autonomous_trust.core._python.network.message import Message
-    from autonomous_trust.core._python.processes import ProcessTracker
+    from autonomous_trust.core.network.message import Message
+    from autonomous_trust.core.processes import ProcessTracker
 except ImportError:
     pytest.skip("AT core not installed", allow_module_level=True)
 

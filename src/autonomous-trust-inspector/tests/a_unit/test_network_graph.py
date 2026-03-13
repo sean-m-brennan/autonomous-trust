@@ -2,11 +2,17 @@ import json
 import random
 
 import pytest
-import networkx as nx
 
-from autonomous_trust.inspector.viz.network_graph import (
-    Graphs, NetworkGraph, RandomNetwork,
-)
+try:
+    import networkx as nx
+    from autonomous_trust.inspector.viz.network_graph import (
+        Graphs, NetworkGraph, RandomNetwork,
+    )
+    _has_deps = True
+except (ImportError, ModuleNotFoundError):
+    _has_deps = False
+
+pytestmark = pytest.mark.skipif(not _has_deps, reason="networkx/aenum not installed")
 
 
 class TestGraphsRegistry:

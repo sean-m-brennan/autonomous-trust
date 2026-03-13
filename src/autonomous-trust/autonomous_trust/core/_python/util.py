@@ -19,6 +19,7 @@ class ClassEnumMeta(type):
     Allows using class variables as enums with membership checks
     """
     def __contains__(cls, item):
+        # Check by attribute name; callers use name-based lookup (e.g. 'network' in CfgIds)
         return item in [attr for attr in dir(cls)
                         if not attr.startswith('_') and not callable(getattr(cls, attr))]
 

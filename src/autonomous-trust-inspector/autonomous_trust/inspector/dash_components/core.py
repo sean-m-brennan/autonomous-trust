@@ -32,8 +32,11 @@ from dash.development.base_component import Component
 from dash_extensions.enrich import DashProxy, html
 from dash_iconify import DashIconify
 from plotly.basedatatypes import BaseFigure, BasePlotlyType
-from websockets.legacy.server import serve as websocket_serve
-from websockets.legacy.server import WebSocketServerProtocol
+try:
+    from websockets.asyncio.server import serve as websocket_serve, ServerConnection as WebSocketConnection
+except ImportError:
+    from websockets.legacy.server import serve as websocket_serve  # noqa
+    from websockets.legacy.server import WebSocketConnection as WebSocketConnection  # noqa
 
 from .async_update import bin_data_pb2 as BinaryData
 
@@ -84,16 +87,19 @@ class DashComponent(object):
 
 
 def get_ip_addr():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect(("8.8.8.8", 80))
-    ip = s.getsockname()[0]
-    s.close()
-    return ip
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return '127.0.0.1'
 
 
 class WSClient(object):
     def __init__(self, sock):  # FIXME get other client info
-        self.socket: WebSocketServerProtocol = sock
+        self.socket: WebSocketConnection = sock
         self.address = sock.remote_address[0]
 
 
@@ -129,7 +135,7 @@ class DashControl(object):
         self.ws_send_queue = Queue()
         self.websocket_handlers: dict[str, list[Callable]] = {}
         self.clients: list[WSClient] = []
-        self._client_dir: dict[WebSocketServerProtocol, WSClient] = {}
+        self._client_dir: dict[WebSocketConnection, WSClient] = {}
         self.allowed_origins: set[str] = {
             "http://localhost", "http://127.0.0.1",
             "http://localhost:5005", "http://127.0.0.1:5005",
@@ -181,11 +187,11 @@ class DashControl(object):
         #    for handler in self.inherited_logger.handlers:
         #      logger.addHandler(handler)
         async with websocket_serve(self._websocket_handler, '127.0.0.1', self.ws_port,
-                                   loop=self.ws_loop, logger=logger, compression=None):
-            print(' * Serving websockets at ws://%s:%d' % (self.server_address[0], self.ws_port))
+                                   logger=logger, compression=None):
+            logger.info('Serving websockets at ws://%s:%d', self.server_address[0], self.ws_port)
             await self.ws_stop
 
-    async def _websocket_handler(self, websocket: WebSocketServerProtocol, path: str):
+    async def _websocket_handler(self, websocket: WebSocketConnection):
         origin = websocket.origin
         if self.allowed_origins and origin and origin not in self.allowed_origins:
             await websocket.close(4003, "Origin not allowed")
@@ -203,8 +209,8 @@ class DashControl(object):
             data = None
             try:
                 json_obj = json.loads(message)
-                event = json_obj.message
-                data = json_obj.data
+                event = json_obj['message']
+                data = json_obj['data']
             except json.decoder.JSONDecodeError:
                 pass
             if event in self.websocket_handlers:
@@ -257,14 +263,20 @@ class DashControl(object):
                     add_mod(args[0], ret_val, mods)
                 elif isinstance(args[0], (list, tuple)):
                     if not isinstance(ret_val, (list, tuple)) or len(ret_val) != len(args[0]):
-                        raise RuntimeError('Non-matching ')  # FIXME err msg
+                        raise RuntimeError(
+                            'Non-matching callback output: expected %d outputs but got %r'
+                            % (len(args[0]), ret_val))
                     for idx, output in enumerate(args[0]):
                         if isinstance(output, Output):
                             add_mod(output, ret_val[idx], mods)
                         else:
-                            raise RuntimeError('Invalid ')  # FIXME err msg
+                            raise RuntimeError(
+                                'Invalid output element at index %d: expected Output, got %s'
+                                % (idx, type(output).__name__))
                 else:
-                    raise RuntimeError('Invalid ')  # FIXME err msg
+                    raise RuntimeError(
+                        'Invalid first callback argument: expected Output or list of Outputs, got %s'
+                        % type(args[0]).__name__)
                 for mod in mods:
                     self.push_mods(mod)
                 return ret_val

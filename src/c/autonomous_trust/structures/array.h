@@ -99,8 +99,8 @@ size_t array_size();
  * @details requires array_t *array, int index, and data_t value to be defined.
  *
  */
-#define array_for_each(array, index, value)             \
-    for (index = 0; index < array_size(array); index++) \
+#define array_for_each(array, index, value)                      \
+    for (index = 0; (size_t)index < array_size(array); index++) \
     {                                                   \
         int __attribute__((unused)) a_errors[1] = {0};  \
         int _a_err = array_get(array, index, &value);   \

@@ -78,8 +78,8 @@ int ip4_binary_to_addr(uint32_t ip, char *addr)
 
 int cidr4_to_broadcast(char *cidr, char *bcast_addr)
 {
-    uint32_t ip;
-    uint8_t prefix;
+    uint32_t ip = 0;
+    uint8_t prefix = 0;
     if (cidr4_to_ip4_binary(cidr, &ip, &prefix) < 0)
         return -1;
     /* Convert CIDR prefix length to network-byte-order bitmask */
@@ -126,12 +126,12 @@ int network_to_json(const void *data_struct, json_t **obj_ptr)
     if (err != 0)
         return EXCEPTION(EJSN_OBJ_SET);
         
-    json_object_set(obj, "port", json_integer(net->port));
-    json_object_set(obj, "ip4_cidr", json_string((char *)net->ip4_cidr));
-    json_object_set(obj, "ip6_cidr", json_string((char *)net->ip6_cidr));
-    json_object_set(obj, "mcast4_addr", json_string((char *)net->mcast4_addr));
-    json_object_set(obj, "mcast6_addr", json_string((char *)net->mcast6_addr));
-    json_object_set(obj, "mac_addr", json_string((char *)net->mac_address));
+    json_object_set_new(obj, "port", json_integer(net->port));
+    json_object_set_new(obj, "ip4_cidr", json_string((char *)net->ip4_cidr));
+    json_object_set_new(obj, "ip6_cidr", json_string((char *)net->ip6_cidr));
+    json_object_set_new(obj, "mcast4_addr", json_string((char *)net->mcast4_addr));
+    json_object_set_new(obj, "mcast6_addr", json_string((char *)net->mcast6_addr));
+    json_object_set_new(obj, "mac_addr", json_string((char *)net->mac_address));
     return 0;
 }
 

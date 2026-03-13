@@ -2,11 +2,17 @@ import json
 
 import pytest
 
-from autonomous_trust.inspector.viz.network_graph import Graphs, NetworkGraph
-from autonomous_trust.inspector.viz.social_graphs import (
-    DeceitNetwork, BetrayalNetwork, ReputationManipulationNetwork,
-    SybilNetwork, CorruptAuthorityNetwork,
-)
+try:
+    from autonomous_trust.inspector.viz.network_graph import Graphs, NetworkGraph
+    from autonomous_trust.inspector.viz.social_graphs import (
+        DeceitNetwork, BetrayalNetwork, ReputationManipulationNetwork,
+        SybilNetwork, CorruptAuthorityNetwork,
+    )
+    _has_deps = True
+except (ImportError, ModuleNotFoundError):
+    _has_deps = False
+
+pytestmark = pytest.mark.skipif(not _has_deps, reason="networkx/aenum not installed")
 
 
 class TestDeceitNetwork:

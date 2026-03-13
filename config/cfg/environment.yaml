@@ -13,6 +13,7 @@ dependencies:
   - protobuf-c>=1.5.2
   - aenum
   - libsass
+  - setuptools
   - networkx
   - quart>=0.19.5
   - numpy
@@ -43,6 +44,7 @@ dependencies:
   - check
   - websockets
   - pydantic
+  - pyyaml
   - pip:
       #- mediapipe
       #- parrot-olympe # uses an old version of protobuf

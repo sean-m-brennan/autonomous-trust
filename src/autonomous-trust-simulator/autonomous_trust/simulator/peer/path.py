@@ -31,13 +31,14 @@ class Variability(SerializableEnum):
     GAUSSIAN = 'gaussian'
     UNIFORM = 'uniform'
 
-    def __call__(self, *args) -> float:
+    def __call__(self, scale: float = 1.0) -> float:
         if self.value == 'brownian':
-            return random.normalvariate(mu=0.0, sigma=2.0)
+            return random.normalvariate(mu=0.0, sigma=2.0) * scale
         if self.value == 'gaussian':
-            return random.gauss(0., 1.)
+            return random.gauss(0., 1.) * scale
         if self.value == 'uniform':
-            return random.uniform(-1.0, 1.0)
+            return random.uniform(-1.0, 1.0) * scale
+        return 0.0
 
 
 # ######### Data objects
@@ -122,12 +123,6 @@ class PathShape(object):
 
     def move_along(self, var: Variability, step: int, cadence: float) -> tuple[UTMPosition, float]:
         pos = self.closest_point(step)
-
-        # add speed in proportion in each dimension
-        #pos.easting += self.bearing[0] * self.speed(cadence) * cadence #* step  # FIXME wrong, was * speed * cadence
-        #pos.northing += self.bearing[1] * self.speed(cadence) * cadence
-        #if pos.alt is not None:
-        #    pos.alt += self.bearing[2] * self.speed(cadence) * cadence
 
         # add in variability
         pos.easting += var()
@@ -262,7 +257,7 @@ class BezierPath(PathShape):
     def bearing(self) -> tuple[float, float, float]:
         return self.get_generic_bearing(self.ctl_pts[0])
 
-    def move_along(self, var: Variability, step: int, cadence: float) -> UTMPosition:
+    def move_along(self, var: Variability, step: int, cadence: float) -> tuple[UTMPosition, float]:
         self.prev_prev = self.prev
         return super().move_along(var, step, cadence)
 
@@ -290,7 +285,7 @@ class BeziergonPath(PathShape):
     def bearing(self) -> tuple[float, float, float]:
         return self.get_generic_bearing(self.ctl_pts[0])
 
-    def move_along(self, var: Variability, step: int, cadence: float) -> UTMPosition:
+    def move_along(self, var: Variability, step: int, cadence: float) -> tuple[UTMPosition, float]:
         self.prev_prev = self.prev
         return super().move_along(var, step, cadence)
 

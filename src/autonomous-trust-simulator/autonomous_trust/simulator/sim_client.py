@@ -94,14 +94,16 @@ class SimClient(net.Client):
                     self._tick += self._cadence  # successful, so can progress
                 now = datetime.now()
                 if self.last is not None:
-                    interval: timedelta = self.last - now
+                    interval: timedelta = now - self.last
                     if interval > timedelta(seconds=1):
-                        self.logger.debug('Data retrieval too slow: %f', interval.total_seconds())
+                        if self.logger is not None:
+                            self.logger.debug('Data retrieval too slow: %f', interval.total_seconds())
                 self.last = now
             except net.ReceiveError as err:
                 if self.logger is not None:
                     self.logger.warning('ReceiveError: server disconnect (%s)' % err)
                 self.halt = True  # assume server halted
         else:
-            self.logger.debug('Not connected')
+            if self.logger is not None:
+                self.logger.debug('Not connected')
         return

@@ -129,6 +129,7 @@ int identity_history_create(agreement_voter_t *myself,
                             int timeout,
                             identity_history_t **history)
 {
+    (void)myself; // TODO: use for voter registration
     if (history == NULL)
         return EINVAL;
 

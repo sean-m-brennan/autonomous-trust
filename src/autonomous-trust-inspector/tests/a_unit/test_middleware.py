@@ -3,7 +3,10 @@ from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 
-from autonomous_trust.inspector.viz.middleware import SassASGIMiddleware
+from autonomous_trust.inspector.viz.middleware import SassASGIMiddleware, _sass_available
+
+pytestmark = pytest.mark.skipif(not _sass_available,
+                                reason="libsass not available (pip install libsass)")
 
 
 class TestSassASGIMiddleware:

@@ -93,7 +93,7 @@ class TransactionHistory(Mapping):
         return len(self._chain)
 
     def __iter__(self):
-        self._chain.__iter__()
+        return self._chain.__iter__()
 
     def by_peer(self, peer_id: UUID):
         return self._peer_mapping[peer_id]

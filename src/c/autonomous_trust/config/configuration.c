@@ -69,7 +69,7 @@ int get_data_dir(char path[])
 
 config_t *find_configuration(const char *name)
 {
-    for (int i = 0; i < configuration_table_size; i++)
+    for (size_t i = 0; i < configuration_table_size; i++)
     {
         config_t *entry = &configuration_table[i];
         if (strncmp(entry->name, name, strlen(name)) == 0)
@@ -156,7 +156,6 @@ int read_config_file(const char *filename, void *data_struct)
         return EXCEPTION(ECFG_BADFMT);
     }
     strncpy(typename, json_string_value(name_obj), CFG_NAME_SIZE - 1);
-    json_decref(name_obj);
 
     config_t *cfg = find_configuration(typename);
     if (cfg == NULL)

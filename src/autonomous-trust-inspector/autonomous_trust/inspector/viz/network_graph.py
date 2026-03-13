@@ -15,11 +15,14 @@
 # ******************
 
 import json
+import logging
 import random
 import enum
 
 import networkx as nx
 import aenum
+
+_logger = logging.getLogger(__name__)
 
 
 class Graphs(object):
@@ -48,8 +51,8 @@ class NetworkGraph(object):
     Abstract base class for dynamic network graphs
     """
     initial_delay = 2000  # milliseconds
-    node_data = ['id', 'group']
-    link_data = ['source', 'target', 'group', 'weight']
+    node_data = ('id', 'group')
+    link_data = ('source', 'target', 'group', 'weight')
     default_groups = 'a b c d e f g h i j'.split(' ')
     maximum_weight = 10
 
@@ -188,12 +191,9 @@ class NetworkGraph(object):
             if self.initialized:
                 self.change()
                 if self.debug:
-                    print("Serve graph data: %d nodes, %d links" %
-                          (len(self._to_dict()["nodes"]),
-                           len(self._to_dict()["links"])))
-                elif self.debug:
-                    print("Serve full graph data: %d nodes, %d links" %
-                          (len(self.node_ids), len(self.G.edges)))
+                    _logger.debug("Serve graph data: %d nodes, %d links",
+                                  len(self._to_dict()["nodes"]),
+                                  len(self._to_dict()["links"]))
             self.grouping()
             self.prune_edges()
         data = None
@@ -245,7 +245,7 @@ class NetworkGraph(object):
             if "weight" in a and a["weight"] <= 0:
                 edge_list.append((u, v))
         if self.debug and len(edge_list) > 0:
-            print("Prune %d edges" % len(edge_list))
+            _logger.debug("Prune %d edges", len(edge_list))
         for edge in edge_list:
             self.remove_edge(*edge)
 
@@ -291,7 +291,7 @@ class NetworkGraph(object):
             if len(self.G) > 1:
                 # FIXME prefer nodes from the same group
                 edge = self._random_pair(limit_to=self.link_addition_limit())
-                while self.G.has_edge(*edge) and self.link_addition_rejected(*edge):
+                while self.G.has_edge(*edge) or self.link_addition_rejected(*edge):
                     edge = self._random_pair(limit_to=self.link_addition_limit())
                 self.add_edge(*edge)
                 self.propagate_node_grouping()
@@ -299,7 +299,7 @@ class NetworkGraph(object):
         elif add_edges < r <= remove_edges:
             if len(self.G.edges) > 2:
                 edge = self._random_pair()
-                while not self.G.has_edge(*edge) and self.link_removal_rejected(*edge):
+                while not self.G.has_edge(*edge) or self.link_removal_rejected(*edge):
                     edge = self._random_pair()
                 self.remove_edge(*edge)
         elif r > remove_edges:
@@ -363,7 +363,8 @@ class NetworkGraph(object):
         return json.dumps(self._to_dict())
 
     def to_file(self, filename):
-        json.dump(self._to_dict(False), open(filename, "w"))
+        with open(filename, "w") as f:
+            json.dump(self._to_dict(False), f)
 
 
 ####################
@@ -372,7 +373,7 @@ class NetworkGraph(object):
 class RandomNetwork(NetworkGraph):
     # randomized behavior
     def __init__(self, size, persist=False, speed=50, **kwargs):
-        self.node_data.append('persist')
+        self.node_data = list(self.node_data) + ['persist']
         m1 = size // 2
         super().__init__(nx.barbell_graph, m1, 0, **kwargs)
         self.persist = persist

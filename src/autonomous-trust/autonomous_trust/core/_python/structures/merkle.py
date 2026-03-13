@@ -144,7 +144,9 @@ class MerkleTree(Tree, Configuration):
 
     def _rehash(self):
         while len(self.leaves) > len(self.blobs):
-            super().delete(self.last.key)  # Tree.delete expects a key, not a Node
+            if self.last is None:
+                break
+            super().delete(self.last.key)
         while len(self.leaves) < len(self.blobs):
             super().insert(None)
         for idx, blob in enumerate(self.blobs):
