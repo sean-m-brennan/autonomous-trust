@@ -104,3 +104,25 @@ class TestHarnessReportGeneration:
         harness = RedTeamHarness(baseline_path=str(baseline_file), scenarios=[FakeAttack()])
         report = harness.build_report(attack_metrics={'error': 'timeout'})
         assert report['attacks'][0]['result'] == 'ERROR'
+
+
+from autonomous_trust.simulator.redteam.sybil_attack import SybilAttack
+
+
+class TestSybilAttackSetup:
+    def test_adds_sybil_containers(self):
+        attack = SybilAttack(num_sybil_nodes=3, base_ip_offset=30)
+        sim_config = {}
+        compose_config = {'services': {}, 'networks': {'at-net': {}}}
+        attack.setup(sim_config, compose_config)
+        sybil_services = [k for k in compose_config['services'] if k.startswith('sybil-')]
+        assert len(sybil_services) == 3
+
+    def test_sybil_containers_on_same_network(self):
+        attack = SybilAttack(num_sybil_nodes=2, base_ip_offset=30)
+        sim_config = {}
+        compose_config = {'services': {}, 'networks': {'at-net': {'ipam': {'config': [{'subnet': '10.27.3.0/24'}]}}}}
+        attack.setup(sim_config, compose_config)
+        for name, svc in compose_config['services'].items():
+            if name.startswith('sybil-'):
+                assert 'at-net' in svc.get('networks', {})
