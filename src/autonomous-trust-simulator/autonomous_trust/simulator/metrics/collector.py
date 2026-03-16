@@ -35,7 +35,7 @@ from autonomous_trust.core._python.processes import Process, ProcessTracker
 from autonomous_trust.core._python.network.message import Message
 from autonomous_trust.core._python.negotiation.negotiation import TaskInfo
 from autonomous_trust.core._python.reputation.reputation import Reputation
-from autonomous_trust.core.system import QueueType
+from autonomous_trust.core.system import CfgIds, QueueType
 
 
 class MetricsCollector(Process, metaclass=ProcMeta,
@@ -86,7 +86,9 @@ class MetricsCollector(Process, metaclass=ProcMeta,
         if function == 'invitation':
             if task_id not in self._negotiation_starts:
                 self._negotiation_starts[task_id] = timestamp
-        elif function == 'haggle':
+        elif function in ('haggle', 'ack'):
+            # Complete RTT on first response: either a counter-offer
+            # (haggle) or a direct acceptance (ack).
             if task_id in self._negotiation_starts:
                 start = self._negotiation_starts.pop(task_id)
                 rtt = (timestamp - start).total_seconds()
@@ -194,10 +196,19 @@ class MetricsCollector(Process, metaclass=ProcMeta,
             if isinstance(msg, Message):
                 now = datetime.now()
 
-                # Estimate message size for bandwidth tracking
-                msg_size = (len(str(msg.process)) + len(str(msg.function))
-                            + len(str(msg.obj)))
-                self._record_message_bytes(msg_size)
+                # Only count messages that actually traverse the wire:
+                # outbound (destined for network process) or inbound
+                # (from_whom set by Message.parse on network receipt).
+                is_network_msg = (msg.process == CfgIds.network
+                                  or msg.from_whom is not None)
+                if is_network_msg:
+                    try:
+                        msg_size = len(bytes(msg))
+                    except Exception:
+                        msg_size = (len(str(msg.process))
+                                    + len(str(msg.function))
+                                    + len(str(msg.obj)))
+                    self._record_message_bytes(msg_size)
 
                 # Identity events
                 if msg.function in ('access_granted', 'request_access',

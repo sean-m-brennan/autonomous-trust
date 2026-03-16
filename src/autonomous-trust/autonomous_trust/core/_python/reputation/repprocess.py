@@ -320,7 +320,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     peer_scores.append(tx.p1_score)
                     my_scores.append(tx.p2_score)
         except KeyError:
-            pass
+            self.logger.debug('No transaction history for peer %s' % peer.uuid)
         if len(peer_scores) < 1 or len(my_scores) < 1:  # not enough info
             return 0.49
         peer_standing = sum(peer_scores) / len(peer_scores)

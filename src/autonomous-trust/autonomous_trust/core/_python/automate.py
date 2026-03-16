@@ -213,12 +213,18 @@ class AutonomousTrust(Protocol):
                 if len(self.peers.all) > self.peer_count:
                     self.peer_count = len(self.peers.all)  # noqa
                     self._random_task(queues)
+                    # check reputation for all known peers on first sighting
+                    for peer in list(self.peers.all) + [self.identity]:
+                        query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
+                                        to_json_string((peer, self.proc_name)), self.identity)
+                        queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
                 elif self.tasking_tick(0):
                     self._random_task(queues)
-                    # check my own reputation
-                    query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
-                                    to_json_string((self.identity, self.proc_name)), self.identity)
-                    queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
+                    # check reputation for all known peers (including self)
+                    for peer in list(self.peers.all) + [self.identity]:
+                        query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
+                                        to_json_string((peer, self.proc_name)), self.identity)
+                        queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
         self._report_unhandled()
 
     def cleanup(self):

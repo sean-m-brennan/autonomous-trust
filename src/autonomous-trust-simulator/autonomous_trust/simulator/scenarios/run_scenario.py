@@ -18,7 +18,7 @@
 """Run Appalachian mesh scenario in-process (no Docker required).
 
 Launches the Simulator via multiprocessing.  For full AT protocol
-testing with metrics collection, use ``test-simulation.sh`` which runs
+testing with metrics collection, use ``test-simulation-scenarios.sh`` which runs
 Docker containers with the instrumented AT entry point.
 
 This script is useful for testing the Simulator and terrain-aware RF
@@ -138,7 +138,7 @@ def main():
         logger.info('Running simulator for %ds ...' % args.duration)
         logger.info('  (Press Ctrl+C to stop early)')
         logger.info('')
-        logger.info('NOTE: For full AT protocol metrics, use test-simulation.sh')
+        logger.info('NOTE: For full AT protocol metrics, use test-simulation-scenarios.sh')
         logger.info('      which runs Docker containers with instrumented AT nodes.')
 
         def handle_sigint(signum, frame):
