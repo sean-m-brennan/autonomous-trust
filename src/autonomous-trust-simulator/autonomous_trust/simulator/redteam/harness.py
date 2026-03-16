@@ -68,6 +68,13 @@ class RedTeamHarness:
         with open(output_path, 'w') as f:
             json.dump(report, f, indent=2)
 
+        # Also write markdown report
+        from .report import generate_markdown_report
+        md_path = output_path.rsplit('.', 1)[0] + '.md'
+        md_content = generate_markdown_report(report)
+        with open(md_path, 'w') as f:
+            f.write(md_content)
+
         return report
 
     def _run_simulation(self, quick: bool, timeout_s: int,

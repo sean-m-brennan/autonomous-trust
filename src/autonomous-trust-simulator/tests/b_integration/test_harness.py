@@ -153,3 +153,29 @@ class TestMitmAttackSetup:
         result = attack.collect({})
         assert result['attack_specific']['plaintext_extracted'] is True
         assert 'ask permission' in result['attack_specific']['signatures_found']
+
+
+from autonomous_trust.simulator.redteam.report import generate_markdown_report
+
+
+class TestMarkdownReport:
+    def test_generates_markdown_from_json_report(self):
+        report = {
+            'timestamp': '2026-03-16T12:00:00',
+            'baseline': {'identity_convergence_s': 74.1},
+            'attacks': [
+                {
+                    'name': 'network_partition',
+                    'description': 'iptables split',
+                    'metrics_during_attack': {'identity_convergence_s': 120.0},
+                    'attack_specific': {'partitions_scheduled': 1},
+                    'result': 'PASS',
+                },
+            ],
+            'summary': {'total': 1, 'passed': 1, 'failed': 0, 'errors': 0},
+        }
+        md = generate_markdown_report(report)
+        assert '# Red Team Report' in md
+        assert 'network_partition' in md
+        assert 'PASS' in md
+        assert '74.1' in md
