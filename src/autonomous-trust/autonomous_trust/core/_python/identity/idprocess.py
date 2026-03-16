@@ -56,8 +56,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     Handle Identity and Peer tracking
     Zero trust in this stage
     """
-    init_timeout = 10
+    init_timeout = 5
     init_extra = 2
+    vote_timeout = 0.5  # seconds to wait for additional votes after own vote cast
     enc = encoding
 
     def __init__(self, configurations, subsystems, log_q, **kwargs):
@@ -73,9 +74,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if impl == AgreementImpl.POW.value:
             self._history = IdentityByWork(self.identity, self.peers, log_q, 0)
         elif impl == AgreementImpl.POS.value:
-            self._history = IdentityByStake(self.identity, self.peers, log_q, 5)
+            self._history = IdentityByStake(self.identity, self.peers, log_q, 2)
         elif impl == AgreementImpl.POA.value:
-            self._history = IdentityByAuthority(self.identity, self.peers, log_q, 5)
+            self._history = IdentityByAuthority(self.identity, self.peers, log_q, 2)
         else:
             raise RuntimeError('Invalid identity history implementation: %s' % impl)
         self.messages: list[Message] = []
@@ -183,7 +184,18 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             start = now()
             with self.lock:
                 self.choosing = True
+            # Wait adaptively: exit early once histories arrive, with a short
+            # grace period for additional histories; fall back to init_timeout.
+            grace = 1  # seconds to wait after first history arrives
+            history_seen_at = None
             while (now() - start).seconds <= self.init_timeout:
+                with self.lock:
+                    has_histories = len(self.histories) > 0
+                if has_histories:
+                    if history_seen_at is None:
+                        history_seen_at = now()
+                    elif (now() - history_seen_at).total_seconds() >= grace:
+                        break
                 time.sleep(self.cadence)
             accepted: tuple[Optional[Group], Optional[list[LinkedStep]]] = None, None
 
@@ -283,22 +295,19 @@ class IdentityProcess(Process, metaclass=ProcMeta,
 
     def _vote_collection(self, queues, blob: IdentityObj):
         try:
+            vote = self._process_id(blob)
+            if vote is not None:
+                self._history.verify(*vote)
+                with self.lock:
+                    if vote in self.confirmed_block:
+                        self.confirmed_block.remove(vote)
+                self.logger.debug('I voted for %s' % blob.identity.nickname)
+            else:
+                self.logger.debug('I did not vote for %s' % blob.identity.nickname)
+            # Short wait for other votes to arrive before finalizing
             start = now()
-            voted = False
-            while (now() - start).seconds <= self._history.timeout:
-                if not voted:
-                    vote = self._process_id(blob)
-                    if vote is not None:
-                        self._history.verify(*vote)
-                        with self.lock:
-                            if vote in self.confirmed_block:
-                                self.confirmed_block.remove(vote)
-                        self.logger.debug('I voted for %s' % blob.identity.nickname)
-                    voted = True
-                else:
-                    time.sleep(self.cadence)
-            if not voted:
-                self.logger.debug('I did not vote')
+            while (now() - start).total_seconds() <= self.vote_timeout:
+                time.sleep(self.cadence)
             if self._history.finalize(blob):
                 self._peer_accepted(queues, blob)
         except Full:

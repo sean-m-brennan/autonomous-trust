@@ -9,7 +9,7 @@ def generate_compose(num_nodes: int, exclude_logs: str = "network",
                      metrics_dir: str = "") -> str:
     lines = ["services:"]
     for i in range(1, num_nodes + 1):
-        delay = (i - 1) * 10
+        delay = (i - 1) * 5
         ip = f"10.27.3.{10 + i}"
         exclude_arg = f"--exclude-logs {exclude_logs}" if exclude_logs else ""
         log_arg = f"--log-level {log_level}" if log_level else ""
