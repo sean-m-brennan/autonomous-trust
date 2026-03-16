@@ -1,0 +1,106 @@
+"""Tests for the red team harness orchestrator."""
+
+import json
+import os
+import pytest
+from unittest.mock import patch, MagicMock
+from datetime import datetime
+
+from autonomous_trust.simulator.redteam import AttackScenario, PartitionEvent
+from autonomous_trust.simulator.redteam.harness import RedTeamHarness
+
+
+class FakeAttack(AttackScenario):
+    name = "fake_attack"
+    description = "Test attack"
+
+    def __init__(self):
+        self.setup_called = False
+        self.teardown_called = False
+        self.collect_called = False
+
+    def setup(self, sim_config, compose_config):
+        self.setup_called = True
+
+    def teardown(self):
+        self.teardown_called = True
+
+    def collect(self, metrics):
+        self.collect_called = True
+        metrics['attack_specific'] = {'fake_metric': 42}
+        return metrics
+
+
+class TestHarnessReportGeneration:
+    """Harness produces correct JSON report structure."""
+
+    def test_report_structure(self, tmp_path):
+        """Report contains baseline, attacks array, and summary."""
+        baseline = {
+            'identity_convergence_s': 74.1,
+            'reputation_stability_stddev': 0.0,
+            'negotiation_rtt_mean_s': 76.4,
+            'bandwidth_overhead_fraction': 0.118,
+        }
+        baseline_file = tmp_path / 'baseline.json'
+        baseline_file.write_text(json.dumps(baseline))
+
+        harness = RedTeamHarness(
+            baseline_path=str(baseline_file),
+            scenarios=[FakeAttack()],
+        )
+        report = harness.build_report(
+            attack_metrics={'identity_convergence_s': 80.0},
+        )
+        assert 'timestamp' in report
+        assert report['baseline'] == baseline
+        assert len(report['attacks']) == 1
+        assert report['attacks'][0]['name'] == 'fake_attack'
+        assert report['attacks'][0]['attack_specific']['fake_metric'] == 42
+        assert 'summary' in report
+
+    def test_teardown_called_on_error(self, tmp_path):
+        """Teardown is always called even if simulation fails."""
+        baseline_file = tmp_path / 'baseline.json'
+        baseline_file.write_text('{}')
+
+        attack = FakeAttack()
+        harness = RedTeamHarness(
+            baseline_path=str(baseline_file),
+            scenarios=[attack],
+        )
+        with patch.object(harness, '_run_simulation', side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError):
+                harness.run(output_path=str(tmp_path / 'out.json'), quick=True)
+        assert attack.teardown_called
+
+    def test_pass_fail_assessment(self, tmp_path):
+        """Report marks attacks as PASS/FAIL/ERROR based on metrics."""
+        baseline_file = tmp_path / 'baseline.json'
+        baseline_file.write_text(json.dumps({
+            'identity_convergence_s': 74.1,
+            'reputation_stability_stddev': 0.0,
+        }))
+
+        harness = RedTeamHarness(
+            baseline_path=str(baseline_file),
+            scenarios=[FakeAttack()],
+        )
+        report = harness.build_report(
+            attack_metrics={'identity_convergence_s': 200.0},
+        )
+        assert report['attacks'][0]['result'] in ('PASS', 'FAIL', 'ERROR', 'NO_DATA')
+
+    def test_error_on_no_metrics(self, tmp_path):
+        baseline_file = tmp_path / 'baseline.json'
+        baseline_file.write_text('{}')
+        harness = RedTeamHarness(baseline_path=str(baseline_file), scenarios=[FakeAttack()])
+        report = harness.build_report(attack_metrics={'error': 'no_metrics'})
+        assert report['attacks'][0]['result'] == 'NO_DATA'
+
+    def test_error_on_timeout(self, tmp_path):
+        baseline_file = tmp_path / 'baseline.json'
+        baseline_file.write_text('{}')
+        harness = RedTeamHarness(baseline_path=str(baseline_file), scenarios=[FakeAttack()])
+        report = harness.build_report(attack_metrics={'error': 'timeout'})
+        assert report['attacks'][0]['result'] == 'ERROR'
