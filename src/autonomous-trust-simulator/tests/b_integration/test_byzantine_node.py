@@ -32,3 +32,25 @@ class TestByzantineNodeAttack:
         assert result['attack_specific']['byzantine_peer_ids'] == ["peer_1", "peer_2"]
         assert 'byzantine_detected' in result['attack_specific']
         assert 'consensus_integrity' in result['attack_specific']
+
+
+from autonomous_trust.simulator.redteam.reputation_gaming import ReputationGamingAttack
+
+
+class TestReputationGamingAttack:
+    def test_is_attack_scenario(self):
+        attack = ReputationGamingAttack(
+            gaming_peer_ids=["peer_1"],
+            defection_time_s=60.0,
+        )
+        assert attack.name == "reputation_gaming"
+
+    def test_setup_sets_defection_time(self):
+        attack = ReputationGamingAttack(
+            gaming_peer_ids=["peer_1"],
+            defection_time_s=60.0,
+        )
+        sim_config = {}
+        attack.setup(sim_config, {})
+        assert sim_config['gaming_peers'] == ["peer_1"]
+        assert sim_config['defection_time_s'] == 60.0
