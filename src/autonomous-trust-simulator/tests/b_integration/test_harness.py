@@ -126,3 +126,30 @@ class TestSybilAttackSetup:
         for name, svc in compose_config['services'].items():
             if name.startswith('sybil-'):
                 assert 'at-net' in svc.get('networks', {})
+
+
+from autonomous_trust.simulator.redteam.mitm_attack import MitmAttack
+
+
+class TestMitmAttackSetup:
+    def test_adds_tcpdump_sidecar(self):
+        attack = MitmAttack(target_peer_a="peer_a", target_peer_b="peer_b")
+        sim_config = {}
+        compose_config = {'services': {}}
+        attack.setup(sim_config, compose_config)
+        assert 'tcpdump-mitm' in compose_config['services']
+
+    def test_collect_reports_encryption_status(self):
+        attack = MitmAttack(target_peer_a="peer_a", target_peer_b="peer_b")
+        result = attack.collect({})
+        assert 'plaintext_extracted' in result['attack_specific']
+        assert 'replay_accepted' in result['attack_specific']
+
+    def test_collect_detects_plaintext_in_pcap(self, tmp_path):
+        pcap_file = tmp_path / 'test.pcap'
+        pcap_file.write_bytes(b'header\x00ask permission\x00more data')
+        attack = MitmAttack(target_peer_a="a", target_peer_b="b",
+                          pcap_path=str(pcap_file))
+        result = attack.collect({})
+        assert result['attack_specific']['plaintext_extracted'] is True
+        assert 'ask permission' in result['attack_specific']['signatures_found']
