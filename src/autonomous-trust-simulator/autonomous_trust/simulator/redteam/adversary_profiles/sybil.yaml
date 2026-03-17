@@ -1,0 +1,5 @@
+id: at-adversary-sybil-001
+name: AT Sybil Attack
+description: Inject fabricated identities and collect admission metrics
+atomic_ordering:
+  - at-sybil-collect-001

@@ -35,6 +35,9 @@ TIMEOUT=""
 DURATION=""
 BACKEND="native"
 OUTPUT=""
+CALDERA=""
+CALDERA_ATTACKS=""
+CALDERA_IMAGE="mitre/caldera:5.0.0"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -61,6 +64,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --output)
             OUTPUT="$2"
+            shift 2
+            ;;
+        --caldera)
+            CALDERA="true"
+            shift
+            ;;
+        --caldera-attacks)
+            CALDERA_ATTACKS="$2"
             shift 2
             ;;
         *)
@@ -91,6 +102,8 @@ echo "Backend:      $BACKEND"
 echo "Output:       ${OUTPUT:-stdout only}"
 echo "Duration:     ${DURATION}s"
 echo "Timeout:      ${TIMEOUT}s"
+echo "CALDERA:      ${CALDERA:-disabled}"
+echo "Attacks:      ${CALDERA_ATTACKS:-none}"
 echo ""
 
 # Step 1: Generate docker-compose
@@ -115,6 +128,24 @@ with open('$WORK_DIR/docker-compose.yaml', 'w') as f:
 print('  Generated: $WORK_DIR/docker-compose.yaml')
 "
 
+# Step 1b: Patch compose with CALDERA server + sandcat (if --caldera)
+if [[ -n "$CALDERA" ]]; then
+    echo "Patching compose with CALDERA server + sandcat ..."
+    python -c "
+import sys, json, os
+sys.path.insert(0, '$SIM_DIR')
+from autonomous_trust.simulator.redteam.caldera_compose import patch_caldera
+with open('$WORK_DIR/docker-compose.yaml') as f:
+    base = f.read()
+attacks = '$CALDERA_ATTACKS'.split(',') if '$CALDERA_ATTACKS' else []
+config = json.loads(os.environ.get('REDTEAM_ATTACK_CONFIG', '{}'))
+patched = patch_caldera(base, attacks, config, work_dir='$WORK_DIR')
+with open('$WORK_DIR/docker-compose.yaml', 'w') as f:
+    f.write(patched)
+print('  Patched with CALDERA server + sandcat')
+"
+fi
+
 # Step 2: Create Appalachian sim config
 echo "Creating simulation config ..."
 python -c "
@@ -135,6 +166,12 @@ echo ""
 echo "Ensuring Docker images are available ..."
 require_image "autonomous-trust-devel" devel
 require_image "autonomous-trust-full-devel" full-devel
+
+# Step 3b: Pull CALDERA image if needed
+if [[ -n "$CALDERA" ]]; then
+    echo "Pulling CALDERA image ..."
+    docker pull "$CALDERA_IMAGE" 2>/dev/null || echo "  (using cached image)"
+fi
 
 # Step 4: Launch containers
 echo ""
