@@ -1,0 +1,5 @@
+id: at-adversary-gaming-001
+name: AT Reputation Gaming
+description: Cooperate-then-defect strategy and collect penalty metrics
+atomic_ordering:
+  - at-gaming-collect-001
