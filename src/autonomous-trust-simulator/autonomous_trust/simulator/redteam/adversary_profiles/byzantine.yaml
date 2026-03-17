@@ -1,0 +1,5 @@
+id: at-adversary-byzantine-001
+name: AT Byzantine Node
+description: Deploy inconsistent reputation scoring and collect detection metrics
+atomic_ordering:
+  - at-byzantine-collect-001
