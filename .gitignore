@@ -93,3 +93,5 @@ dist
 
 # Data
 /src/autonomous-trust-simulator/data/
+
+/.tmp-sim*/

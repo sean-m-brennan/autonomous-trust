@@ -567,10 +567,12 @@ class TestAutonomousTasking:
         at.peer_count = 0
         at.peers.all = [MagicMock()]  # 1 peer > 0 (peer_count)
         q_neg = queue.Queue()
-        queues = {CfgIds.negotiation: q_neg}
-        # Patch _random_task to avoid YAML serialization of MagicMock identity
+        q_rep = queue.Queue()
+        queues = {CfgIds.negotiation: q_neg, CfgIds.reputation: q_rep}
+        # Patch _random_task and to_json_string to avoid serialization of MagicMock identity
         with patch.object(at, '_random_task') as mock_rt:
-            at.autonomous_tasking(queues)
+            with patch('autonomous_trust.core.automate.to_json_string', return_value='mocked'):
+                at.autonomous_tasking(queues)
         assert mock_rt.called
         # peer_count should be updated to match current peer count
         assert at.peer_count == 1

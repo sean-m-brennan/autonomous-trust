@@ -187,8 +187,9 @@ class TestBandwidthOverhead:
         collector._init_metrics()
         collector._start_time = datetime(2026, 1, 1, 12, 0, 0)
 
-        # 1000 bytes of protocol traffic
-        collector._record_message_bytes(1000)
+        # 1000 bytes of protocol traffic (timestamp sets first_message_time)
+        msg_time = datetime(2026, 1, 1, 12, 0, 0)
+        collector._record_message_bytes(1000, timestamp=msg_time)
         # Available bandwidth: 10 Kbps = 1250 bytes/sec
         collector._total_bandwidth_bps = 10_000.0
         collector._bandwidth_samples = 1
