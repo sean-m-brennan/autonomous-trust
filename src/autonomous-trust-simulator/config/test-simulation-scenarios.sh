@@ -16,6 +16,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SIM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 AT_ROOT="$(cd "$SIM_DIR/../.." && pwd)"
+AT_SRC="$AT_ROOT/src"
+
+# All four AT namespace packages must be importable
+POLITE_SRC="$(cd "$AT_ROOT/../polite/src/python" 2>/dev/null && pwd || echo "")"
+export PYTHONPATH="${AT_SRC}/autonomous-trust:${AT_SRC}/autonomous-trust-services:${AT_SRC}/autonomous-trust-inspector:${AT_SRC}/autonomous-trust-simulator${POLITE_SRC:+:$POLITE_SRC}${PYTHONPATH:+:$PYTHONPATH}"
 WORK_DIR=$(mktemp -d "${AT_ROOT}/.tmp-sim.XXXXXX")
 
 cleanup() {
@@ -37,7 +42,9 @@ BACKEND="native"
 OUTPUT=""
 CALDERA=""
 CALDERA_ATTACKS=""
-CALDERA_IMAGE="mitre/caldera:5.0.0"
+CALDERA_IMAGE="ghcr.io/mitre/caldera:5.2.0"
+POLITE_POLICY=""
+POLITE_OUTPUT=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -74,6 +81,14 @@ while [[ $# -gt 0 ]]; do
             CALDERA_ATTACKS="$2"
             shift 2
             ;;
+        --polite-policy)
+            POLITE_POLICY="$2"
+            shift 2
+            ;;
+        --polite-output)
+            POLITE_OUTPUT="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1" >&2
             exit 1
@@ -104,6 +119,7 @@ echo "Duration:     ${DURATION}s"
 echo "Timeout:      ${TIMEOUT}s"
 echo "CALDERA:      ${CALDERA:-disabled}"
 echo "Attacks:      ${CALDERA_ATTACKS:-none}"
+echo "Polite:       ${POLITE_POLICY:-disabled}"
 echo ""
 
 # Step 1: Generate docker-compose
@@ -144,6 +160,29 @@ with open('$WORK_DIR/docker-compose.yaml', 'w') as f:
     f.write(patched)
 print('  Patched with CALDERA server + sandcat')
 "
+fi
+
+# Step 1c: Configure Polite policy (if --polite-policy)
+if [[ -n "$POLITE_POLICY" ]]; then
+    echo "Configuring Polite policy ..."
+    # Resolve policy name to JSON file: try config/policy/<name>.json first,
+    # then treat as a literal file path.
+    POLICY_DIR="$SCRIPT_DIR/policy"
+    if [[ -f "$POLICY_DIR/${POLITE_POLICY}.json" ]]; then
+        POLITE_POLICY_FILE="$POLICY_DIR/${POLITE_POLICY}.json"
+    elif [[ -f "$POLITE_POLICY" ]]; then
+        POLITE_POLICY_FILE="$POLITE_POLICY"
+    else
+        echo "ERROR: Policy '$POLITE_POLICY' not found." >&2
+        echo "  Looked for: $POLICY_DIR/${POLITE_POLICY}.json" >&2
+        echo "  Also tried as file path: $POLITE_POLICY" >&2
+        echo "  Available policies: $(ls "$POLICY_DIR"/*.json 2>/dev/null | xargs -I{} basename {} .json | tr '\n' ' ')" >&2
+        exit 1
+    fi
+    cp "$POLITE_POLICY_FILE" "$WORK_DIR/polite-policy.json"
+    POLITE_OUTPUT="${POLITE_OUTPUT:-$METRICS_DIR/polite.json}"
+    echo "  Policy: $POLITE_POLICY (from $POLITE_POLICY_FILE)"
+    echo "  Observer output: $POLITE_OUTPUT"
 fi
 
 # Step 2: Create Appalachian sim config
