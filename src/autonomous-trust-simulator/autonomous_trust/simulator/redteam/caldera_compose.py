@@ -10,7 +10,7 @@ import os
 import stat
 import yaml
 
-CALDERA_IMAGE = 'mitre/caldera:5.0.0'
+CALDERA_IMAGE = 'ghcr.io/mitre/caldera:5.2.0'
 CALDERA_IP = '10.27.3.2'
 CALDERA_PORT = 8888
 CALDERA_URL = f'http://{CALDERA_IP}:{CALDERA_PORT}'
@@ -56,8 +56,13 @@ def _add_caldera_server(services: dict, work_dir: str) -> None:
         yaml.dump({
             'api_key_red': api_key,
             'api_key_blue': api_key,
-            'host': '0.0.0.0',
+            'host': CALDERA_IP,
             'port': CALDERA_PORT,
+            'plugins': ['sandcat', 'stockpile'],
+            'app.contact.http': CALDERA_URL,
+            'app.contact.websocket': f'{CALDERA_IP}:7012',
+            'crypt_salt': 'autonomous_trust_redteam',
+            'encryption_key': api_key,
         }, f)
 
     profiles_dir = os.path.join(_REDTEAM_DIR, 'adversary_profiles')
@@ -103,31 +108,43 @@ def _add_sandcat_to_services(services: dict, work_dir: str) -> None:
 def _write_wrapper_script(work_dir: str) -> str:
     script_path = os.path.join(work_dir, 'caldera_sandcat_wrapper.sh')
     content = f"""#!/bin/bash
-# Sandcat wrapper: download and start sandcat, then exec AT entrypoint.
+# Sandcat wrapper: download and start sandcat, then delegate to AT entrypoint.
+# The sandcat download runs in the background so it never delays AT startup.
 CALDERA_URL="{CALDERA_URL}"
 SERVICE_NAME="${{HOSTNAME}}"
 SANDCAT_PATH="/tmp/sandcat"
 
-# Download sandcat binary (retry for 60s, try curl then wget then python)
-for i in $(seq 1 12); do
-    if command -v curl >/dev/null 2>&1; then
-        curl -sf -o "$SANDCAT_PATH" "$CALDERA_URL/file/download" \\
-            -d "platform=linux&file=sandcat" && break
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$SANDCAT_PATH" \\
-            "$CALDERA_URL/file/download?platform=linux&file=sandcat" && break
+echo "[$SERVICE_NAME] Sandcat wrapper starting ..."
+
+# Background: download sandcat and start agent once ready.
+_download_sandcat() {{
+    for i in $(seq 1 6); do
+        if command -v curl >/dev/null 2>&1; then
+            curl -sf --connect-timeout 5 --max-time 10 \\
+                -o "$SANDCAT_PATH" \\
+                "$CALDERA_URL/file/download" \\
+                -d "platform=linux&file=sandcat" && break
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q --timeout=10 -O "$SANDCAT_PATH" \\
+                "$CALDERA_URL/file/download?platform=linux&file=sandcat" && break
+        else
+            timeout 10 python -c "import urllib.request; urllib.request.urlretrieve('$CALDERA_URL/file/download?platform=linux&file=sandcat', '$SANDCAT_PATH')" && break
+        fi
+        sleep 5
+    done
+    if [ -f "$SANDCAT_PATH" ]; then
+        chmod +x "$SANDCAT_PATH"
+        echo "[$SERVICE_NAME] Starting sandcat agent ..."
+        "$SANDCAT_PATH" -server "$CALDERA_URL" -group "$SERVICE_NAME"
     else
-        python -c "import urllib.request; urllib.request.urlretrieve('$CALDERA_URL/file/download?platform=linux&file=sandcat', '$SANDCAT_PATH')" && break
+        echo "[$SERVICE_NAME] WARNING: Sandcat download failed — no agent."
     fi
-    sleep 5
-done
+}}
+_download_sandcat &
 
-if [ -f "$SANDCAT_PATH" ]; then
-    chmod +x "$SANDCAT_PATH"
-    "$SANDCAT_PATH" -server "$CALDERA_URL" -group "$SERVICE_NAME" &
-fi
-
-exec python -m autonomous_trust "$@"
+# Delegate to original entrypoint immediately (handles conda, PYTHONPATH, etc.)
+echo "[$SERVICE_NAME] Handing off to AT entrypoint ..."
+exec /bin/entrypoint.sh "$@"
 """
     with open(script_path, 'w') as f:
         f.write(content)

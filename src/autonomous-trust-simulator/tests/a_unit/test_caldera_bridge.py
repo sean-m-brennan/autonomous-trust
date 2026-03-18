@@ -69,3 +69,24 @@ class TestMain:
             with pytest.raises(SystemExit) as exc_info:
                 main()
             assert exc_info.value.code == 1
+
+    def test_main_exits_1_on_missing_config(self, tmp_path):
+        with patch('sys.argv', ['caldera_bridge',
+                                '--attack', 'sybil',
+                                '--action', 'collect',
+                                '--config', str(tmp_path / 'nonexistent.json')]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1
+
+    def test_main_exits_1_on_malformed_json(self, tmp_path):
+        config_file = tmp_path / 'bad.json'
+        config_file.write_text('not valid json{{{')
+
+        with patch('sys.argv', ['caldera_bridge',
+                                '--attack', 'sybil',
+                                '--action', 'collect',
+                                '--config', str(config_file)]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 1

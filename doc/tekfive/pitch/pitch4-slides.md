@@ -77,6 +77,7 @@ style: |
     }
     section.split .ldiv { grid-area: leftpanel; }
     section.split .rdiv { grid-area: rightpanel; }*/
+
 ---
 <!-- _class: title -->
 <!-- _footer: "" -->
@@ -209,3 +210,7 @@ Academic: **M2M-REP** — distributed trustworthiness for autonomous IoT without
 ---
 # Prototype Demo
 
+<style scoped>
+p { text-align: center; }
+</style>
+![width:800px](tilt.png)

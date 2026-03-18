@@ -42,32 +42,37 @@ from .metrics.collector import MetricsCollector
 
 
 class _TeeQueue:
-    """Queue wrapper that copies put() calls to an observer queue."""
+    """Queue wrapper that copies put() calls to one or more observer queues."""
 
-    def __init__(self, real_queue, observer_queue):
+    def __init__(self, real_queue, observer_queues):
         self._real = real_queue
-        self._observer = observer_queue
+        if isinstance(observer_queues, list):
+            self._observers = observer_queues
+        else:
+            self._observers = [observer_queues]
 
     def __getstate__(self):
-        return {'_real': self._real, '_observer': self._observer}
+        return {'_real': self._real, '_observers': self._observers}
 
     def __setstate__(self, state):
         self._real = state['_real']
-        self._observer = state['_observer']
+        self._observers = state['_observers']
 
     def put(self, obj, block=True, timeout=None):
         self._real.put(obj, block=block, timeout=timeout)
-        try:
-            self._observer.put_nowait(obj)
-        except Exception:
-            pass
+        for obs in self._observers:
+            try:
+                obs.put_nowait(obj)
+            except Exception:
+                pass
 
     def put_nowait(self, obj):
         self._real.put_nowait(obj)
-        try:
-            self._observer.put_nowait(obj)
-        except Exception:
-            pass
+        for obs in self._observers:
+            try:
+                obs.put_nowait(obj)
+            except Exception:
+                pass
 
     def get(self, block=True, timeout=None):
         return self._real.get(block=block, timeout=timeout)
@@ -110,13 +115,16 @@ class InstrumentedAT(AutonomousTrust):
         ))
         queues[self.proc_name] = self._my_queue
 
-        # Wrap all queues (except collector's) with TeeQueue
-        collector_name = 'metrics-collector'
-        if collector_name in queues:
-            observer_q = queues[collector_name]
+        # Wrap all queues (except observers') with TeeQueue
+        observer_names = [
+            p.name for p in procs
+            if getattr(p, 'is_tee_observer', False)
+        ]
+        if observer_names:
+            observer_qs = [queues[n] for n in observer_names]
             for name in list(queues):
-                if name != collector_name:
-                    queues[name] = _TeeQueue(queues[name], observer_q)
+                if name not in observer_names:
+                    queues[name] = _TeeQueue(queues[name], observer_qs)
 
         signals = {}
         results = {}

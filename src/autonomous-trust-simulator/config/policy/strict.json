@@ -1,0 +1,6 @@
+{
+  "min_reputation_to_negotiate": 0.5,
+  "defection_cooldown_s": 120.0,
+  "max_group_size": 10,
+  "bandwidth_priority_by_rank": true
+}

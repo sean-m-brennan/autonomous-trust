@@ -290,18 +290,25 @@ class NetworkGraph(object):
         elif add_nodes < r <= add_edges:
             if len(self.G) > 1:
                 # FIXME prefer nodes from the same group
-                edge = self._random_pair(limit_to=self.link_addition_limit())
-                while self.G.has_edge(*edge) or self.link_addition_rejected(*edge):
-                    edge = self._random_pair(limit_to=self.link_addition_limit())
-                self.add_edge(*edge)
-                self.propagate_node_grouping()
-                self.G[edge[0]][edge[1]]["weight"] = random.randint(1, self.maximum_weight)
+                limit = self.link_addition_limit()
+                n = len(self.G) if limit is None else len(limit)
+                max_edges = n * (n - 1) // 2
+                if len(self.G.edges) < max_edges:
+                    edge = self._random_pair(limit_to=limit)
+                    while self.G.has_edge(*edge) or self.link_addition_rejected(*edge):
+                        edge = self._random_pair(limit_to=limit)
+                    self.add_edge(*edge)
+                    self.propagate_node_grouping()
+                    if self.G.has_edge(*edge):
+                        self.G[edge[0]][edge[1]]["weight"] = random.randint(1, self.maximum_weight)
         elif add_edges < r <= remove_edges:
             if len(self.G.edges) > 2:
-                edge = self._random_pair()
-                while not self.G.has_edge(*edge) or self.link_removal_rejected(*edge):
-                    edge = self._random_pair()
-                self.remove_edge(*edge)
+                edges = list(self.G.edges)
+                random.shuffle(edges)
+                for edge in edges:
+                    if not self.link_removal_rejected(*edge):
+                        self.remove_edge(*edge)
+                        break
         elif r > remove_edges:
             if len(self.G) > 1:
                 node_num = self._random_node()

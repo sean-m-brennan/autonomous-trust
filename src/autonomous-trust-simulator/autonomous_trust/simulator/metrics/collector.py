@@ -42,6 +42,8 @@ class MetricsCollector(Process, metaclass=ProcMeta,
                        proc_name='metrics-collector',
                        description='Protocol metrics collection'):
 
+    is_tee_observer = True
+
     def __init__(self, configurations: dict[str, Any], subsystems: ProcessTracker,
                  log_queue: QueueType, dependencies: list[str] = None,
                  output_path: Optional[str] = None):
@@ -67,6 +69,7 @@ class MetricsCollector(Process, metaclass=ProcMeta,
         self._total_bandwidth_bps: float = 0.0
         self._bandwidth_samples: int = 0
         self._start_time: Optional[datetime] = None
+        self._first_message_time: Optional[datetime] = None
 
     def _handle_identity_event(self, function: str, peer_id: str,
                                timestamp: datetime):
@@ -94,8 +97,10 @@ class MetricsCollector(Process, metaclass=ProcMeta,
                 rtt = (timestamp - start).total_seconds()
                 self._negotiation_rtts.append(rtt)
 
-    def _record_message_bytes(self, nbytes: int):
+    def _record_message_bytes(self, nbytes: int, timestamp: Optional[datetime] = None):
         """Accumulate protocol traffic byte count."""
+        if self._first_message_time is None:
+            self._first_message_time = timestamp or datetime.now()
         self._protocol_bytes += nbytes
 
     # Default assumed link capacity in bits per second for bandwidth fraction
@@ -109,10 +114,14 @@ class MetricsCollector(Process, metaclass=ProcMeta,
         Uses externally-reported bandwidth samples when available, falling
         back to a fixed assumed link capacity so the metric is never null
         when protocol bytes have been observed.
+
+        Duration is measured from the first observed network message to
+        avoid inflating the denominator with idle startup time.
         """
         result: dict[str, Any] = {}
-        if self._start_time and self._protocol_bytes > 0:
-            duration_s = (end_time - self._start_time).total_seconds()
+        bw_start = self._first_message_time or self._start_time
+        if bw_start and self._protocol_bytes > 0:
+            duration_s = (end_time - bw_start).total_seconds()
             if duration_s > 0:
                 if self._bandwidth_samples > 0 and self._total_bandwidth_bps > 0:
                     link_bps = self._total_bandwidth_bps / self._bandwidth_samples
@@ -208,7 +217,7 @@ class MetricsCollector(Process, metaclass=ProcMeta,
                         msg_size = (len(str(msg.process))
                                     + len(str(msg.function))
                                     + len(str(msg.obj)))
-                    self._record_message_bytes(msg_size)
+                    self._record_message_bytes(msg_size, timestamp=now)
 
                 # Identity events
                 if msg.function in ('access_granted', 'request_access',

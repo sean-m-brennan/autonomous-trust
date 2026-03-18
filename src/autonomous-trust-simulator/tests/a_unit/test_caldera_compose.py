@@ -62,6 +62,16 @@ class TestPatchCalderaServer:
         assert result['services']['caldera-server']['image'] == CALDERA_IMAGE
 
 
+    def test_local_yml_includes_plugins(self, tmp_path):
+        patch_caldera(SAMPLE_COMPOSE, [], {}, str(tmp_path))
+        local_yml = tmp_path / 'caldera-conf' / 'local.yml'
+        assert local_yml.exists()
+        config = yaml.safe_load(local_yml.read_text())
+        assert 'plugins' in config, 'local.yml must include plugins list'
+        assert 'sandcat' in config['plugins']
+        assert 'stockpile' in config['plugins']
+
+
 class TestPatchSandcat:
 
     def test_at_services_get_entrypoint_override(self, tmp_path):
@@ -83,6 +93,22 @@ class TestPatchSandcat:
     def test_wrapper_script_written_to_work_dir(self, tmp_path):
         patch_caldera(SAMPLE_COMPOSE, [], {}, str(tmp_path))
         assert (tmp_path / 'caldera_sandcat_wrapper.sh').exists()
+
+    def test_wrapper_delegates_to_entrypoint(self, tmp_path):
+        patch_caldera(SAMPLE_COMPOSE, [], {}, str(tmp_path))
+        content = (tmp_path / 'caldera_sandcat_wrapper.sh').read_text()
+        assert 'exec /bin/entrypoint.sh' in content
+
+    def test_wrapper_has_download_timeouts(self, tmp_path):
+        patch_caldera(SAMPLE_COMPOSE, [], {}, str(tmp_path))
+        content = (tmp_path / 'caldera_sandcat_wrapper.sh').read_text()
+        assert '--connect-timeout' in content
+        assert '--max-time' in content
+
+    def test_wrapper_downloads_sandcat_in_background(self, tmp_path):
+        patch_caldera(SAMPLE_COMPOSE, [], {}, str(tmp_path))
+        content = (tmp_path / 'caldera_sandcat_wrapper.sh').read_text()
+        assert '_download_sandcat &' in content
 
 
 class TestPatchAttackConfig:
