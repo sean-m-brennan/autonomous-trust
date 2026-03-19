@@ -26,6 +26,7 @@ from .peer.peer import PeerInfo
 
 Matrix = dict[str, dict[str, bool]]
 SignalMatrix = dict[str, dict[str, float]]  # peer_id -> {peer_id: path_loss_dB}
+DelayMatrix = dict[str, dict[str, float]]  # peer_id -> {peer_id: delay_seconds}
 
 
 class Ident(Configuration):
@@ -46,7 +47,8 @@ class SimState(Configuration):
     def __init__(self, time: Optional[datetime] = None, center: Optional[GeoPosition] = None,
                  scale: Optional[float] = None, peers: Optional[Map] = None,
                  reachable: Optional[Matrix] = None, active: Optional[list[str]] = None,
-                 blank: bool = False, signal_quality: Optional[SignalMatrix] = None):
+                 blank: bool = False, signal_quality: Optional[SignalMatrix] = None,
+                 delay: Optional[DelayMatrix] = None):
         super().__init__(sim_data_pb2.SimState)
         self.time = time
         if time is None:
@@ -66,6 +68,9 @@ class SimState(Configuration):
         self.signal_quality = signal_quality
         if signal_quality is None:
             self.signal_quality: SignalMatrix = {}
+        self.delay = delay
+        if delay is None:
+            self.delay: DelayMatrix = {}
 
     def convert(self) -> 'SimState':
         state = SimState(**self.to_dict())
@@ -83,6 +88,9 @@ class SimConfig(Configuration):
         self.end: datetime = kwargs['end']
         self.peers: list[PeerInfo] = kwargs['peers']
         self.path_loss_matrix: Optional[SignalMatrix] = kwargs.get('path_loss_matrix')
+        self.space_mode: bool = kwargs.get('space_mode', False)
+        self.comm_freq_hz: Optional[float] = kwargs.get('comm_freq_hz')
+        self.sun_position: Optional[Position] = kwargs.get('sun_position')
 
     @classmethod
     def load(cls, data: str) -> 'SimConfig':

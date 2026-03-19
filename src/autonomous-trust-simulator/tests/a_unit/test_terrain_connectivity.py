@@ -46,7 +46,7 @@ except ImportError as _e:
 
 @pytest.fixture
 def hilltop_pair():
-    """Two hilltop peers ~22 km apart (Sutton-Burnsville from network.md).
+    """Two hilltop peers ~22 km apart (Sutton-Burnsville from rural-network.md).
 
     For terrain-aware mode, signal is TX power in dBm.
     30 dBm = 1 W, typical for outdoor WiFi/mesh radios.

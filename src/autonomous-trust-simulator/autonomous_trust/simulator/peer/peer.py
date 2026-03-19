@@ -42,9 +42,11 @@ class PeerConnection(Configuration):
     # Receiver sensitivity thresholds (dBm) by NetInterface class
     # Used only in terrain-aware mode; original model uses its own formula
     _rx_sensitivity = {
-        'small': -120.0,   # LoRa-class: very sensitive, low data rate
-        'medium': -90.0,   # WiFi-class: typical 802.11 receiver
-        'large': -70.0,    # High-bandwidth point-to-point
+        'small': -120.0,        # LoRa-class: very sensitive, low data rate
+        'medium': -90.0,        # WiFi-class: typical 802.11 receiver
+        'large': -70.0,         # High-bandwidth point-to-point
+        'laser_comms': -140.0,  # Optical photon-counting detector (deep-space grade)
+        'deep_space': -150.0,   # DSN-class cryogenic receiver
     }
 
     def can_reach(self, other: 'PeerConnection', terrain_loss_db: Optional[float] = None) -> bool:

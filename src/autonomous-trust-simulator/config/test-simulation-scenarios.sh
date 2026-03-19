@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Orchestrated launch for Appalachian scenario simulation.
+# Orchestrated launch for scenario simulations (Appalachian or Asteroid Belt).
 #
 # Launches AT nodes in Docker containers with the first node running an
 # instrumented entry point that collects protocol metrics via tee-queues.
 #
 # Usage:
 #   bash test-simulation-scenarios.sh [--hilltop-only] [--quick] [--terrain-csv PATH] [--python] [--output PATH]
+#   bash test-simulation-scenarios.sh --space [--python] [--output PATH] [--timeout SEC]
 #
 # Prerequisites:
 #   - conda activate muudd_simulation
@@ -45,6 +46,7 @@ CALDERA_ATTACKS=""
 CALDERA_IMAGE="ghcr.io/mitre/caldera:5.2.0"
 POLITE_POLICY=""
 POLITE_OUTPUT=""
+SPACE_MODE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -89,6 +91,10 @@ while [[ $# -gt 0 ]]; do
             POLITE_OUTPUT="$2"
             shift 2
             ;;
+        --space)
+            SPACE_MODE="true"
+            shift
+            ;;
         *)
             echo "Unknown option: $1" >&2
             exit 1
@@ -96,40 +102,75 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Default duration is 60 minutes (matches create_appalachian_config default).
-# --quick sets it to 180s. Timeout defaults to duration + 30s grace period.
+# Default duration: 60 min for Appalachian, 12 hours for space
+# (AT operations take ~2-3 hours per round trip at 30-min RTT).
+# Timeout defaults to duration + 30s grace (Appalachian) or + 10min (space).
 if [[ -z "$DURATION" ]]; then
-    DURATION="3600"
+    if [[ -n "$SPACE_MODE" ]]; then
+        DURATION="43200"  # 12 hours
+    else
+        DURATION="3600"
+    fi
 fi
 if [[ -z "$TIMEOUT" ]]; then
-    TIMEOUT=$((DURATION + 30))
+    if [[ -n "$SPACE_MODE" ]]; then
+        TIMEOUT=$((DURATION + 600))
+    else
+        TIMEOUT=$((DURATION + 30))
+    fi
 fi
 
 METRICS_DIR="$WORK_DIR/metrics"
 mkdir -p "$METRICS_DIR"
 METRICS_FILE="$METRICS_DIR/metrics.json"
 
-echo "=== Appalachian Scenario Simulation ==="
+if [[ -n "$SPACE_MODE" ]]; then
+    SCENARIO_NAME="Asteroid Belt"
+else
+    SCENARIO_NAME="Appalachian"
+fi
+
+echo "=== ${SCENARIO_NAME} Scenario Simulation ==="
 echo "Work dir:     $WORK_DIR"
-echo "Hilltop only: $HILLTOP_ONLY"
-echo "Terrain CSV:  ${TERRAIN_CSV:-none}"
+if [[ -z "$SPACE_MODE" ]]; then
+    echo "Hilltop only: $HILLTOP_ONLY"
+    echo "Terrain CSV:  ${TERRAIN_CSV:-none}"
+fi
 echo "Backend:      $BACKEND"
 echo "Output:       ${OUTPUT:-stdout only}"
 echo "Duration:     ${DURATION}s"
 echo "Timeout:      ${TIMEOUT}s"
-echo "CALDERA:      ${CALDERA:-disabled}"
-echo "Attacks:      ${CALDERA_ATTACKS:-none}"
-echo "Polite:       ${POLITE_POLICY:-disabled}"
+if [[ -z "$SPACE_MODE" ]]; then
+    echo "CALDERA:      ${CALDERA:-disabled}"
+    echo "Attacks:      ${CALDERA_ATTACKS:-none}"
+    echo "Polite:       ${POLITE_POLICY:-disabled}"
+else
+    echo "Space mode:   enabled (light-delay injection, FSPL link budget)"
+fi
 echo ""
 
 # Step 1: Generate docker-compose
 echo "Generating docker-compose configuration ..."
-TERRAIN_ARG="None"
-if [[ -n "$TERRAIN_CSV" ]]; then
-    TERRAIN_ARG="'$TERRAIN_CSV'"
-fi
+if [[ -n "$SPACE_MODE" ]]; then
+    python -c "
+import sys
+sys.path.insert(0, '$SIM_DIR')
+from autonomous_trust.simulator.scenarios.asteroid_belt_compose import generate_asteroid_belt_compose
+content = generate_asteroid_belt_compose(
+    backend='$BACKEND',
+    metrics_dir='$METRICS_DIR',
+)
+with open('$WORK_DIR/docker-compose.yaml', 'w') as f:
+    f.write(content)
+print('  Generated: $WORK_DIR/docker-compose.yaml')
+"
+else
+    TERRAIN_ARG="None"
+    if [[ -n "$TERRAIN_CSV" ]]; then
+        TERRAIN_ARG="'$TERRAIN_CSV'"
+    fi
 
-python -c "
+    python -c "
 import sys
 sys.path.insert(0, '$SIM_DIR')
 from autonomous_trust.simulator.scenarios.appalachian_compose import generate_appalachian_compose
@@ -143,6 +184,7 @@ with open('$WORK_DIR/docker-compose.yaml', 'w') as f:
     f.write(content)
 print('  Generated: $WORK_DIR/docker-compose.yaml')
 "
+fi
 
 # Step 1b: Patch compose with CALDERA server + sandcat (if --caldera)
 if [[ -n "$CALDERA" ]]; then
@@ -185,9 +227,22 @@ if [[ -n "$POLITE_POLICY" ]]; then
     echo "  Observer output: $POLITE_OUTPUT"
 fi
 
-# Step 2: Create Appalachian sim config
+# Step 2: Create sim config
 echo "Creating simulation config ..."
-python -c "
+if [[ -n "$SPACE_MODE" ]]; then
+    python -c "
+import sys
+from datetime import timedelta
+sys.path.insert(0, '$SIM_DIR')
+from autonomous_trust.simulator.scenarios.asteroid_belt import create_asteroid_belt_config
+cfg = create_asteroid_belt_config(
+    output_file='$WORK_DIR/asteroid_belt.cfg',
+    duration=timedelta(seconds=$DURATION),
+)
+print('  Config: ' + cfg)
+"
+else
+    python -c "
 import sys
 from datetime import timedelta
 sys.path.insert(0, '$SIM_DIR')
@@ -199,6 +254,7 @@ cfg = create_appalachian_config(
 )
 print('  Config: ' + cfg)
 "
+fi
 
 # Step 3: Ensure AT Docker images are available (pull or build)
 echo ""
@@ -253,36 +309,69 @@ if [[ -f "$METRICS_FILE" ]]; then
     echo "Metrics:"
     python -m json.tool "$METRICS_FILE"
 
-    # Check against Phase 2 targets
+    # Check against targets (Phase 2 for Appalachian, Phase 5 for space)
     python -c "
 import json, sys
+space_mode = '$SPACE_MODE'
 with open('$METRICS_FILE') as f:
     r = json.load(f)
 print()
-print('--- Target Assessment ---')
-conv = r.get('identity_convergence_s')
-if conv is not None:
-    s = 'PASS' if conv < 90 else 'FAIL'
-    print('Identity convergence: %.1fs (target <90s) [%s]' % (conv, s))
+if space_mode:
+    print('--- Phase 5 Space Target Assessment ---')
+    print('(Targets account for multi-minute RTT)')
+    conv = r.get('identity_convergence_s')
+    if conv is not None:
+        # Identity admission: 4 round trips at ~30 min RTT = ~2.6 hrs
+        # Allow up to 4 hours for convergence
+        s = 'PASS' if conv < 14400 else 'FAIL'
+        print('Identity convergence: %.0fs / %.1fh (target <4h) [%s]' % (conv, conv/3600, s))
+    else:
+        print('Identity convergence: no data')
+    rep = r.get('reputation_stability_stddev')
+    if rep is not None:
+        # Reputation may be less stable under intermittent connectivity
+        s = 'PASS' if rep < 0.15 else 'FAIL'
+        print('Reputation stability: sigma=%.4f (target <0.15) [%s]' % (rep, s))
+    else:
+        print('Reputation stability: no data')
+    rtt = r.get('negotiation_rtt_mean_s')
+    if rtt is not None:
+        # Negotiation: 3 round trips at ~30 min = ~1.9 hrs
+        print('Negotiation RTT: %.0fs / %.1fh (N=%d)' % (rtt, rtt/3600, r.get('negotiation_rtt_count', 0)))
+    else:
+        print('Negotiation RTT: no data')
+    bw = r.get('bandwidth_overhead_fraction')
+    if bw is not None:
+        # Bandwidth is very constrained in space (100 Kbps - 10 Mbps)
+        s = 'PASS' if bw < 0.25 else 'FAIL'
+        print('Bandwidth overhead: %.1f%% (target <25%%) [%s]' % (bw * 100, s))
+    else:
+        print('Bandwidth overhead: no data')
 else:
-    print('Identity convergence: no data')
-rep = r.get('reputation_stability_stddev')
-if rep is not None:
-    s = 'PASS' if rep < 0.05 else 'FAIL'
-    print('Reputation stability: sigma=%.4f (target <0.05) [%s]' % (rep, s))
-else:
-    print('Reputation stability: no data')
-rtt = r.get('negotiation_rtt_mean_s')
-if rtt is not None:
-    print('Negotiation RTT: %.2fs (N=%d)' % (rtt, r.get('negotiation_rtt_count', 0)))
-else:
-    print('Negotiation RTT: no data')
-bw = r.get('bandwidth_overhead_fraction')
-if bw is not None:
-    s = 'PASS' if bw < 0.15 else 'FAIL'
-    print('Bandwidth overhead: %.1f%% (target <15%%) [%s]' % (bw * 100, s))
-else:
-    print('Bandwidth overhead: no data')
+    print('--- Phase 2 Target Assessment ---')
+    conv = r.get('identity_convergence_s')
+    if conv is not None:
+        s = 'PASS' if conv < 90 else 'FAIL'
+        print('Identity convergence: %.1fs (target <90s) [%s]' % (conv, s))
+    else:
+        print('Identity convergence: no data')
+    rep = r.get('reputation_stability_stddev')
+    if rep is not None:
+        s = 'PASS' if rep < 0.05 else 'FAIL'
+        print('Reputation stability: sigma=%.4f (target <0.05) [%s]' % (rep, s))
+    else:
+        print('Reputation stability: no data')
+    rtt = r.get('negotiation_rtt_mean_s')
+    if rtt is not None:
+        print('Negotiation RTT: %.2fs (N=%d)' % (rtt, r.get('negotiation_rtt_count', 0)))
+    else:
+        print('Negotiation RTT: no data')
+    bw = r.get('bandwidth_overhead_fraction')
+    if bw is not None:
+        s = 'PASS' if bw < 0.15 else 'FAIL'
+        print('Bandwidth overhead: %.1f%% (target <15%%) [%s]' % (bw * 100, s))
+    else:
+        print('Bandwidth overhead: no data')
 "
 
     if [[ -n "$OUTPUT" ]]; then
