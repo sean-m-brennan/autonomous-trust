@@ -16,15 +16,15 @@
 
 """Braxton County, WV Appalachian mesh network scenario.
 
-Defines the Sutton-Burnsville-Flatwoods triangle from network.md:
+Defines the Sutton-Burnsville-Flatwoods triangle from rural-network.md:
   - 8 hilltop relay nodes on ridgetops (Tier 1)
   - 12 valley relay nodes in hollows/valley floors (Tier 2)
   - Stationary positions (PointData paths)
   - Appropriate antenna and interface assignments per node tier
 
 Coordinates are based on real Braxton County geography:
-  - Sutton hilltop: 38.66N, 80.71W, ~670m (2200 ft) — from network.md
-  - Burnsville hilltop: 38.85N, 80.66W, ~730m (2400 ft) — from network.md
+  - Sutton hilltop: 38.66N, 80.71W, ~670m (2200 ft) — from rural-network.md
+  - Burnsville hilltop: 38.85N, 80.66W, ~730m (2400 ft) — from rural-network.md
   - Flatwoods gateway: 38.73N, 80.65W, ~580m (1900 ft) — I-79 corridor
   - Ridgeline elevations: 550-850m; valley floors: 240-370m
 """
@@ -45,12 +45,12 @@ from ..sim_data import SimConfig, SignalMatrix
 
 # Braxton County node definitions
 # Hilltop relays (Tier 1): ridgetop positions with YAGI antennas, MEDIUM interfaces
-# Coordinates derived from network.md worked examples and Braxton County geography
+# Coordinates derived from rural-network.md worked examples and Braxton County geography
 
 HILLTOP_NODES = [
     # (name, lat, lon, elevation_m)
-    ('sutton_hilltop',     38.660, -80.710, 670),   # Ridgetop above Sutton (network.md)
-    ('burnsville_hilltop', 38.850, -80.660, 730),   # Ridgetop above Burnsville (network.md)
+    ('sutton_hilltop',     38.660, -80.710, 670),   # Ridgetop above Sutton (rural-network.md)
+    ('burnsville_hilltop', 38.850, -80.660, 730),   # Ridgetop above Burnsville (rural-network.md)
     ('powell_mtn',         38.720, -80.750, 790),   # Powell Mountain — backbone node
     ('otter_creek_ridge',  38.790, -80.620, 710),   # Otter Creek Ridge — backbone node
     ('flatwoods_hilltop',  38.740, -80.640, 610),   # Ridge above Flatwoods — gateway site
