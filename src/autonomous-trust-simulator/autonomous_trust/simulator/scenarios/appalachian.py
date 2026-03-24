@@ -37,7 +37,7 @@ from typing import Optional
 from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 
 from ..peer.path import PointData, PathData, Variability
-from ..peer.peer import PeerInfo, DataStream
+from ..peer.peer import PeerInfo, DataStream, GatewayUplink
 from ..radio.iface import Antenna, NetInterface
 from ..radio.terrain import TerrainPathLoss, SplatSite
 from ..sim_data import SimConfig, SignalMatrix
@@ -135,6 +135,16 @@ def create_appalachian_config(
     hilltop_signal = 30.0   # dBm
     valley_signal = 20.0    # dBm
 
+    # Gateway uplink definitions based on FCC BDC data (June 2025)
+    # Fiber: Frontier FTTH in Sutton, Burnsville, Gassaway
+    # Cable: Shentel in Flatwoods (I-79 corridor)
+    GATEWAY_UPLINKS = {
+        'sutton_valley_1':     GatewayUplink('fiber', 1000.0, 1000.0, 0.99),
+        'burnsville_valley_1': GatewayUplink('fiber', 1000.0, 1000.0, 0.99),
+        'gassaway_valley':     GatewayUplink('fiber', 1000.0, 1000.0, 0.99),
+        'flatwoods_valley':    GatewayUplink('cable', 1000.0, 35.0, 0.97),
+    }
+
     peers = []
     node_index = 0
 
@@ -169,6 +179,7 @@ def create_appalachian_config(
             position = GeoPosition(lat, lon, elev).convert(UTMPosition)
             shape = PointData(position)
             path_data = PathData(start, end, shape, Variability.UNIFORM, 0, Variability.UNIFORM)
+            uplink = GATEWAY_UPLINKS.get(name)
             peers.append(PeerInfo(
                 uuid=node_uuid,
                 kind='valley_relay',
@@ -182,6 +193,7 @@ def create_appalachian_config(
                 last_seen=end,
                 path_list=[path_data],
                 data_streams=[],
+                uplink=uplink,
             ))
             node_index += 1
 

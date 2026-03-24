@@ -61,12 +61,12 @@ class TestAsteroidBeltSimulation:
     def test_all_habitats_active(self, sim):
         """All 7 habitats are active at every timestep."""
         for tick in range(1, 200, 40):
-            _, _, _, _, active, _, _ = sim.compute_step(tick)
+            _, _, _, _, active, _, _, _ = sim.compute_step(tick)
             assert len(active) == 7
 
     def test_delays_are_positive(self, sim):
         """All light delays are positive (habitats are separated)."""
-        _, _, _, _, _, _, delay = sim.compute_step(1)
+        _, _, _, _, _, _, delay, _ = sim.compute_step(1)
         for src, dests in delay.items():
             for dst, d in dests.items():
                 assert d > 0, f"Zero/negative delay between {src} and {dst}"
@@ -77,7 +77,7 @@ class TestAsteroidBeltSimulation:
         Minimum ~0.1 AU apart (nearby habitats) = ~0.8 min.
         Maximum ~6 AU apart (opposition) = ~50 min.
         """
-        _, _, _, _, _, _, delay = sim.compute_step(1)
+        _, _, _, _, _, _, delay, _ = sim.compute_step(1)
         for src, dests in delay.items():
             for dst, d in dests.items():
                 delay_minutes = d / 60.0
@@ -92,8 +92,8 @@ class TestAsteroidBeltSimulation:
         differential orbital motion changes inter-habitat distances enough
         to push links across the viability threshold.
         """
-        _, _, _, matrix_1, _, _, _ = sim.compute_step(1)
-        _, _, _, matrix_100, _, _, _ = sim.compute_step(100)
+        _, _, _, matrix_1, _, _, _, _ = sim.compute_step(1)
+        _, _, _, matrix_100, _, _, _, _ = sim.compute_step(100)
         diffs = 0
         for src in matrix_1:
             for dst in matrix_1.get(src, {}):
@@ -108,8 +108,8 @@ class TestAsteroidBeltSimulation:
 
     def test_habitats_move(self, sim):
         """Habitat positions change between timesteps (orbital motion)."""
-        _, _, mapp_1, _, _, _, _ = sim.compute_step(1)
-        _, _, mapp_100, _, _, _, _ = sim.compute_step(100)
+        _, _, mapp_1, _, _, _, _, _ = sim.compute_step(1)
+        _, _, mapp_100, _, _, _, _, _ = sim.compute_step(100)
         moved = 0
         for peer_id in mapp_1:
             pos_1 = mapp_1[peer_id].position
