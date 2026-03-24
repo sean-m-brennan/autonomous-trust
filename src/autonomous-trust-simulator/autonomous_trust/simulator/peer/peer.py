@@ -18,6 +18,8 @@ import math
 from datetime import datetime, timedelta
 from typing import Optional
 
+import icontract
+
 from autonomous_trust.core.config import Configuration
 from autonomous_trust.services.peer.position import Position
 
@@ -76,6 +78,21 @@ class PeerConnection(Configuration):
             return signal_strength > min_strength
 
 
+class GatewayUplink(Configuration):
+    """Internet egress capability for a gateway node."""
+
+    @icontract.require(lambda bandwidth_down_mbps: bandwidth_down_mbps > 0)
+    @icontract.require(lambda bandwidth_up_mbps: bandwidth_up_mbps > 0)
+    @icontract.require(lambda reliability: 0.0 <= reliability <= 1.0)
+    def __init__(self, technology: str, bandwidth_down_mbps: float,
+                 bandwidth_up_mbps: float, reliability: float = 0.99):
+        super().__init__()
+        self.technology = technology
+        self.bandwidth_down_mbps = bandwidth_down_mbps
+        self.bandwidth_up_mbps = bandwidth_up_mbps
+        self.reliability = reliability
+
+
 class DataStream(Configuration):
     def __init__(self, filename: str, start: datetime, bps: float):
         super().__init__()
@@ -89,13 +106,14 @@ class PeerInfo(PeerConnection):
     def __init__(self, uuid: str, kind: str, nickname: str, ip4_addr: str, initial_position: Position,
                  signal: float, antenna: Antenna, iface: NetInterface,
                  initial_time: datetime, last_seen: datetime, path_list: list[PathData],
-                 data_streams: list[DataStream]):
+                 data_streams: list[DataStream], uplink: Optional[GatewayUplink] = None):
         super().__init__(uuid, kind, nickname, ip4_addr, initial_position, signal, antenna, iface)
         self.initial_time = initial_time
         self.last_seen = last_seen
         self.initial_position = initial_position
         self.path_list = path_list
         self.data_streams = data_streams
+        self.uplink = uplink
 
     @property
     def connection(self) -> PeerConnection:

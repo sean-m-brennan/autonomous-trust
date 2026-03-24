@@ -22,11 +22,12 @@ from typing import Optional
 from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.protobuf.simulator import sim_data_pb2
 from autonomous_trust.services.peer.position import Position, GeoPosition
-from .peer.peer import PeerInfo
+from .peer.peer import PeerInfo, GatewayUplink
 
 Matrix = dict[str, dict[str, bool]]
 SignalMatrix = dict[str, dict[str, float]]  # peer_id -> {peer_id: path_loss_dB}
 DelayMatrix = dict[str, dict[str, float]]  # peer_id -> {peer_id: delay_seconds}
+GatewayMap = dict[str, GatewayUplink]
 
 
 class Ident(Configuration):
@@ -48,7 +49,12 @@ class SimState(Configuration):
                  scale: Optional[float] = None, peers: Optional[Map] = None,
                  reachable: Optional[Matrix] = None, active: Optional[list[str]] = None,
                  blank: bool = False, signal_quality: Optional[SignalMatrix] = None,
-                 delay: Optional[DelayMatrix] = None):
+                 delay: Optional[DelayMatrix] = None,
+                 gateways: Optional[GatewayMap] = None,
+                 gateway_count: int = 0,
+                 aggregate_uplink_down_mbps: float = 0.0,
+                 aggregate_uplink_up_mbps: float = 0.0,
+                 per_node_down_mbps: float = 0.0):
         super().__init__(sim_data_pb2.SimState)
         self.time = time
         if time is None:
@@ -71,6 +77,13 @@ class SimState(Configuration):
         self.delay = delay
         if delay is None:
             self.delay: DelayMatrix = {}
+        self.gateways = gateways
+        if gateways is None:
+            self.gateways: GatewayMap = {}
+        self.gateway_count = gateway_count
+        self.aggregate_uplink_down_mbps = aggregate_uplink_down_mbps
+        self.aggregate_uplink_up_mbps = aggregate_uplink_up_mbps
+        self.per_node_down_mbps = per_node_down_mbps
 
     def convert(self) -> 'SimState':
         state = SimState(**self.to_dict())
