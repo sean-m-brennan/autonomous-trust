@@ -16,6 +16,7 @@
 
 import logging
 import os.path
+import random
 import socket
 import struct
 import sys
@@ -27,7 +28,7 @@ from autonomous_trust.core import Configuration
 from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 from .peer.peer import PeerMovement
 from .radio.space_link import free_space_path_loss_db, sun_occluded, light_delay_s
-from .sim_data import SimConfig, SimState, Map, Matrix, SignalMatrix, DelayMatrix, Ident
+from .sim_data import SimConfig, SimState, Map, Matrix, SignalMatrix, DelayMatrix, GatewayMap, Ident
 from .sim_client import SimClient
 from . import sim_net as net
 from . import default_port, default_steps
@@ -73,7 +74,7 @@ class Simulator(net.SelectServer):
         self.end_time = self.cfg.end
         self.cadence = (self.end_time - self.start_time).total_seconds() / self.max_time_steps
         self.state = SimState()
-        self.pre_state: dict[int, tuple[GeoPosition, float, Map, Matrix, list[str], SignalMatrix, DelayMatrix]] = {}
+        self.pre_state: dict[int, tuple[GeoPosition, float, Map, Matrix, list[str], SignalMatrix, DelayMatrix, GatewayMap]] = {}
         if self.precompute:
             self.precompute_network()
         else:
@@ -155,7 +156,13 @@ class Simulator(net.SelectServer):
             center = GeoPosition(0.0, 0.0, 0.0)
         else:
             center = mid.convert(GeoPosition)
-        return center, max_dist, mapp, matrix, active, sig_quality, delay_matrix
+        # Build gateway map: which nodes have active internet uplinks this tick
+        gateways: GatewayMap = {}
+        for peer in self.cfg.peers:
+            if peer.uplink is not None and random.random() < peer.uplink.reliability:
+                gateways[peer.uuid] = peer.uplink
+
+        return center, max_dist, mapp, matrix, active, sig_quality, delay_matrix, gateways
 
     def precompute_network(self):
         self.init_computation()
@@ -164,9 +171,18 @@ class Simulator(net.SelectServer):
 
     @staticmethod
     def _make_state(cur_time, step_result):
-        center, max_dist, mapp, matrix, active, sig_quality, delay = step_result
+        center, max_dist, mapp, matrix, active, sig_quality, delay, gateways = step_result
+        gateway_count = len(gateways)
+        agg_down = sum(gw.bandwidth_down_mbps for gw in gateways.values())
+        agg_up = sum(gw.bandwidth_up_mbps for gw in gateways.values())
+        active_count = len(active) if active else 1
+        per_node = agg_down / active_count if active_count > 0 else 0.0
         return SimState(cur_time, center, max_dist, mapp, matrix, active,
-                        signal_quality=sig_quality, delay=delay)
+                        signal_quality=sig_quality, delay=delay,
+                        gateways=gateways, gateway_count=gateway_count,
+                        aggregate_uplink_down_mbps=agg_down,
+                        aggregate_uplink_up_mbps=agg_up,
+                        per_node_down_mbps=per_node)
 
     def send_state(self, tick, sock: socket.socket):
         cur_time = self.start_time + timedelta(**{self.time_resolution: tick * self.cadence})

@@ -129,7 +129,7 @@ class TestSpaceModeComputeStep:
         # tick 0 returns None positions (PeerMovement offset=1); use tick 1
         result = sim.compute_step(1)
         # Result tuple: (center, max_dist, mapp, matrix, active, sig_quality, delay)
-        assert len(result) == 7
+        assert len(result) == 8
         delay = result[6]
         assert 'habitat-a' in delay
         assert 'habitat-b' in delay['habitat-a']
@@ -140,7 +140,7 @@ class TestSpaceModeComputeStep:
         """Delay = distance / c for each pair."""
         sim = Simulator(space_config_file, max_time_steps=10, precompute=False)
         # tick 0 returns None positions (PeerMovement offset=1); use tick 1
-        center, max_dist, mapp, matrix, active, sig_quality, delay = sim.compute_step(1)
+        center, max_dist, mapp, matrix, active, sig_quality, delay, _ = sim.compute_step(1)
         # Compute expected delay from positions
         pos_a = mapp['habitat-a'].position
         pos_b = mapp['habitat-b'].position
@@ -153,7 +153,7 @@ class TestSpaceModeComputeStep:
         """In space mode, sig_quality contains FSPL values (not terrain loss)."""
         sim = Simulator(space_config_file, max_time_steps=10, precompute=False)
         # tick 0 returns None positions (PeerMovement offset=1); use tick 1
-        center, max_dist, mapp, matrix, active, sig_quality, delay = sim.compute_step(1)
+        center, max_dist, mapp, matrix, active, sig_quality, delay, _ = sim.compute_step(1)
         # FSPL should be present and very large for AU-scale distances
         assert 'habitat-a' in sig_quality
         loss = sig_quality['habitat-a']['habitat-b']
