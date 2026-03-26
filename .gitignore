@@ -95,3 +95,4 @@ dist
 /src/autonomous-trust-simulator/data/
 
 /.tmp-sim*/
+/doc/AutonomousTrust.pdf

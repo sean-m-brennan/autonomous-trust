@@ -11,3 +11,7 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Task Negotiation](negotiation.md) -- Distributed task lifecycle
 - [Reputation Consensus](reputation.md) -- Paxos-based reputation scoring
 - [Node Lifecycle](node-lifecycle.md) -- Startup phases and state transitions
+- [Integration Testing](integration-testing.md) -- Metrics collection and scenario verification
+- [Adversarial Testing](adversarial-testing.md) -- Security validation via attack scenarios and CALDERA orchestration
+- [Space Communications](space-communications.md) -- Interplanetary link physics, delay routing, and orbital scenarios
+- [Security Hardening](security-hardening.md) -- Memory safety, RCE prevention, and input validation

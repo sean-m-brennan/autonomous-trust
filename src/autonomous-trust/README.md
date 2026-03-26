@@ -10,6 +10,12 @@ In more concrete terms, *AutonomousTrust* is an operations framework for a vast 
 We follow the Unix philosophy: do one thing well, work together, use a universal (text) interface; yet implemented such that each microservice can choose its level of participation.
 
 
+Architecture
+------------
+
+For technical architecture documentation, see [doc/architecture/](doc/architecture/README.md).
+
+
 QuickStart
 ----------
 
