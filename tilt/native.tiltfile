@@ -1,5 +1,5 @@
 # Tiltfile for AutonomousTrust pure-C multi-node demo
-# Usage: tilt up -f Tiltfile-c -- --num-nodes=4 [--log-level=debug]
+# Usage: tilt up -- --num-nodes=4 [--log-level=debug]
 
 # We only use docker_compose, not k8s -- allow whatever context is active
 allow_k8s_contexts(k8s_context())

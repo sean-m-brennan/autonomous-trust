@@ -26,7 +26,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="$SCRIPT_DIR/config"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_DIR="$REPO_DIR/config"
 CFG_DIR="$CONFIG_DIR/cfg"
 
 ENV_NAME="autonomous_trust"
@@ -107,7 +108,7 @@ create_conda_env() {
     fi
 
     info "Creating conda environment '$ENV_NAME' ..."
-    conda env create -n "$ENV_NAME" --file "$SCRIPT_DIR/environment.yaml"
+    conda env create -n "$ENV_NAME" --file "$REPO_DIR/environment.yaml"
 
     # Overlay development dependencies
     if [ -f "$CFG_DIR/devel_environ.yaml" ]; then
@@ -135,7 +136,7 @@ update_conda_env() {
     conda update -n base -c conda-forge conda
     activate_conda
     info "Updating conda environment '$ENV_NAME' ..."
-    conda env update -n "$ENV_NAME" --file "$SCRIPT_DIR/environment.yaml" --prune
+    conda env update -n "$ENV_NAME" --file "$REPO_DIR/environment.yaml" --prune
     if [ -f "$CFG_DIR/devel_environ.yaml" ]; then
         conda env update -n "$ENV_NAME" --file "$CFG_DIR/devel_environ.yaml"
     fi
