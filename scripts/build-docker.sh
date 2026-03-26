@@ -34,7 +34,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC_DIR="$SCRIPT_DIR/src"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SRC_DIR="$REPO_DIR/src"
 AT_DIR="$SRC_DIR/autonomous-trust"
 
 # Defaults (from config/config.py)
@@ -134,7 +135,7 @@ build_devel() {
     docker build "${args[@]}" \
         -t "${IMAGE_NAME}-devel" \
         -f "$AT_DIR/Dockerfile-devel" \
-        "$SCRIPT_DIR"
+        "$REPO_DIR"
     push_to_registry "${IMAGE_NAME}-devel" 2>/dev/null || true
 }
 
@@ -156,7 +157,7 @@ build_full_devel() {
     docker build "${args[@]}" \
         -t "${IMAGE_NAME}-full-devel" \
         -f "$SRC_DIR/Dockerfile-devel" \
-        "$SCRIPT_DIR"
+        "$REPO_DIR"
     push_to_registry "${IMAGE_NAME}-full-devel" 2>/dev/null || true
 }
 
@@ -200,7 +201,7 @@ build_lite() {
     docker build "${args[@]}" \
         -t "${IMAGE_NAME}-lite" \
         -f "$AT_DIR/Dockerfile-lite" \
-        "$SCRIPT_DIR"
+        "$REPO_DIR"
     push_to_registry "${IMAGE_NAME}-lite" 2>/dev/null || true
 }
 

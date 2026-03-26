@@ -32,7 +32,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC_DIR="$SCRIPT_DIR/src"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SRC_DIR="$REPO_DIR/src"
 AT_DIR="$SRC_DIR/autonomous-trust"
 
 # Defaults (from config/config.py)
