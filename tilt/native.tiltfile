@@ -4,14 +4,11 @@
 # We only use docker_compose, not k8s -- allow whatever context is active
 allow_k8s_contexts(k8s_context())
 
-config.define_string("num-nodes")
-config.define_string("log-level")
-cfg = config.parse()
-num_nodes = cfg.get("num-nodes", "2")
-log_level = cfg.get("log-level", "info")
+num_nodes = os.getenv("_TILT_NUM_NODES", "2")
+log_level = os.getenv("_TILT_LOG_LEVEL", "info")
 
 # Generate docker-compose.tilt.yaml (reuse gen_compose.py with backend=c)
-local("python3 gen_compose.py " + num_nodes + " network " + log_level + " c", quiet=True, echo_off=True)
+local("cd .. && python3 gen_compose.py " + num_nodes + " network " + log_level + " c", quiet=True, echo_off=True)
 
 # Build args: pass through proxy env vars if set
 build_args = {}

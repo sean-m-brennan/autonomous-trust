@@ -4,20 +4,14 @@
 # We only use docker_compose, not k8s -- allow whatever context is active
 allow_k8s_contexts(k8s_context())
 
-config.define_string("num-nodes")
-config.define_string("exclude-logs")
-config.define_string("log-level")
-config.define_string("backend")
-config.define_string("metrics-dir")
-cfg = config.parse()
-num_nodes = cfg.get("num-nodes", "2")
-exclude_logs = cfg.get("exclude-logs", "network")
-log_level = cfg.get("log-level", "info")
-backend = cfg.get("backend", "native")
-metrics_dir = cfg.get("metrics-dir", "")
+num_nodes = os.getenv("_TILT_NUM_NODES", "2")
+exclude_logs = os.getenv("_TILT_EXCLUDE_LOGS", "network")
+log_level = os.getenv("_TILT_LOG_LEVEL", "info")
+backend = os.getenv("_TILT_BACKEND", "native")
+metrics_dir = os.getenv("_TILT_METRICS_DIR", "")
 
 # Generate docker-compose.tilt.yaml for the requested number of nodes
-local("python3 gen_compose.py " + num_nodes + " " + exclude_logs + " " + log_level + " " + backend, quiet=True, echo_off=True)
+local("cd .. && python3 gen_compose.py " + num_nodes + " " + exclude_logs + " " + log_level + " " + backend, quiet=True, echo_off=True)
 
 # Build args: pass through proxy env vars if set
 build_args = {}

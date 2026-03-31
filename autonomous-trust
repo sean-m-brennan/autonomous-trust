@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# ******************
+#  Copyright 2025 Sean M. Brennan and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+#
+# Unified entry point for autonomous-trust project scripts.
+#
+# Usage:
+#   ./at <command> [args...]
+#   ./at help
+#
+# Commands are derived from scripts/<command>.sh, with the .sh suffix
+# stripped and leading "test-" or "run-" prefixes kept as-is.
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPTS_DIR="$REPO_DIR/scripts"
+
+usage() {
+    cat <<'USAGE'
+Usage: ./at <command> [args...]
+
+Commands:
+  build-py               Build Python distribution
+  build-native           Build C library
+  build-zkp              Build ZKP extension
+  build-docker           Build Docker container images
+  build                  Build any or all of the above
+  local-registry         Manage local Docker image registry
+  run-c-demo             Run AutonomousTrust demo with C backend via Tilt
+  run-demo               Run AutonomousTrust demo via Tilt
+  run-mission            Run multi-node mission via Tilt + Minikube
+  run                    Run one of the above
+  setup-dev              Set up development environment (conda, Rust, Docker)
+  test-c-exe             Run C library test suites
+  test-integration       Multi-node Docker integration tests
+  test-packages          Run all Python test suites
+  test-python            Run pure-Python test suites (no C backend)
+  test-sim-pkg           Run simulator package tests
+  test                   Run any or all of the above tests
+
+Run './at <command> --help' for command-specific help.
+USAGE
+}
+
+if [[ $# -eq 0 ]] || [[ "$1" == "help" ]] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    usage
+    exit 0
+fi
+
+cmd="$1"
+shift
+
+script="$SCRIPTS_DIR/${cmd}.sh"
+if [[ ! -f "$script" ]]; then
+    echo "Error: unknown command '$cmd'" >&2
+    echo "Run '$0 help' for available commands." >&2
+    exit 1
+fi
+
+exec "$script" "$@"
