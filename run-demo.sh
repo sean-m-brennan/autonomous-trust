@@ -60,4 +60,6 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Starting AutonomousTrust demo with $NUM_NODES nodes..."
-exec tilt up -- --num-nodes="$NUM_NODES"
+tilt up -- --num-nodes="$NUM_NODES"
+
+tilt down -- --num-nodes="$NUM_NODES"

@@ -22,7 +22,7 @@ import icontract
 from .system import CfgIds, QueueType
 from .util import ClassEnumMeta
 from .identity import Group, Peers
-from .network import Message
+from .network.message import Message
 from .capabilities import Capabilities, PeerCapabilities
 
 

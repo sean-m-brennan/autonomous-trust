@@ -15,8 +15,19 @@
 # ******************
 
 from ..config import Configuration
-from ..identity import Identity, Group
-from .network import Network
+from ..system import encoding as _encoding
+
+# These constants mirror Network.broadcast and Network.encoding but are
+# imported directly to avoid a circular import through network.py.
+_broadcast = 'anyone'
+
+
+def _is_identity(obj):
+    return type(obj).__name__ == 'Identity'
+
+
+def _is_group(obj):
+    return type(obj).__name__ == 'Group'
 
 
 class Message(object):
@@ -37,15 +48,15 @@ class Message(object):
         self.function = function
         self.obj = obj
         self.to_whom = to_whom
-        if to_whom != Network.broadcast:
+        if to_whom != _broadcast:
             if to_whom is None:
                 self.to_whom = []
-            elif isinstance(to_whom, Identity):
+            elif _is_identity(to_whom):
                 self.to_whom = [to_whom]
-            elif isinstance(to_whom, Group):
+            elif _is_group(to_whom):
                 pass
             elif hasattr(to_whom, '__iter__'):
-                if len(to_whom) > 0 and not isinstance(to_whom[0], Identity):
+                if len(to_whom) > 0 and not _is_identity(to_whom[0]):
                     raise RuntimeError('Invalid to_whom arg. Must be a list of Identity, but got %s' % type(to_whom[0]))
             else:
                 raise RuntimeError('Invalid to_whom arg. Must be an Identity, but got %s' % type(to_whom))
@@ -70,12 +81,12 @@ class Message(object):
         return '|'.join([self.process, self.function, obj_str])
 
     def __bytes__(self):
-        return str(self).encode(Network.encoding)
+        return str(self).encode(_encoding)
 
     @staticmethod
     def parse(raw_msg, sender, validate=True):
-        if validate and sender is not None and not isinstance(sender, Identity):
+        if validate and sender is not None and not _is_identity(sender):
             raise RuntimeError('Sender must be an Identity')
         if isinstance(raw_msg, bytes):
-            raw_msg = raw_msg.decode(Network.encoding)
+            raw_msg = raw_msg.decode(_encoding)
         return Message(*raw_msg.split('|', 2), from_whom=sender)

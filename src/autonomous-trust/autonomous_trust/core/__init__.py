@@ -20,8 +20,14 @@ try:
 except ImportError:
     __version__ = 0
 
-from .automate import AutonomousTrust  # noqa
-
 from .processes import yaml, ProcessTracker, Process, ProcMeta, LogLevel
 from .config import Configuration, InitializableConfig, EmptyObject, to_yaml_string, from_yaml_string
 from .system import CfgIds, QueueType
+
+
+def __getattr__(name):
+    """Lazy import for AutonomousTrust to avoid circular imports in subprocess unpickling."""
+    if name == 'AutonomousTrust':
+        from .automate import AutonomousTrust
+        return AutonomousTrust
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

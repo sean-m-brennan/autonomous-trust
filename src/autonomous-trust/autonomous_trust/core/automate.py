@@ -32,7 +32,6 @@ from multiprocessing import Pool as ProcessPool
 from multiprocessing.dummy import Pool as ThreadPool
 from multiprocessing.pool import AsyncResult  # noqa
 from operator import mul, pow
-from decimal import Decimal, getcontext
 
 import psutil
 
@@ -44,7 +43,7 @@ from .config import Configuration, to_yaml_string, ConfigMap
 from .config.discover import get_cfg_type, load_configs
 from .processes import Process, LogLevel, ProcessTracker
 from .identity import Peers
-from .capabilities import Capabilities, Capability, PeerCapabilities
+from .capabilities import Capabilities, Capability, PeerCapabilities, pi
 from .system import CfgIds, PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
 from .protocol import Protocol
 from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, NegotiationProtocol
@@ -55,13 +54,6 @@ from .queue_pool import QueuePool
 PoolType = Union[ProcessPool, ThreadPool]
 
 
-def pi(precision):  # intentionally non-trivial, arbitrary precision
-    getcontext().prec = precision
-    return sum(1 / Decimal(16) ** k *
-               (Decimal(4) / (8 * k + 1) -
-                Decimal(2) / (8 * k + 4) -
-                Decimal(1) / (8 * k + 5) -
-                Decimal(1) / (8 * k + 6)) for k in range(precision))
 
 
 class Ctx(str, Enum):
@@ -459,7 +451,13 @@ class AutonomousTrust(Protocol):
         for key in list(results.keys()):
             if results[key].ready():
                 if key in list(self.process_names):
-                    self.logger.error('unexpected termination of process %s' % key)
+                    try:
+                        results[key].get()
+                    except Exception:
+                        self.logger.error('unexpected termination of process %s:\n%s' %
+                                          (key, traceback.format_exc()))
+                    else:
+                        self.logger.error('unexpected termination of process %s (no error)' % key)
                     continue
                 try:
                     self.logger.debug(self.name + ': %s Task' % key)
