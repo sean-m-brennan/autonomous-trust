@@ -18,8 +18,21 @@
 #        tilt up -- --variant=native [--num-nodes=4 ...]
 
 config.define_string("variant")
+config.define_string("num-nodes")
+config.define_string("exclude-logs")
+config.define_string("log-level")
+config.define_string("backend")
+config.define_string("metrics-dir")
 cfg = config.parse()
 variant = cfg.get("variant", "python")
+
+# Pass parsed config to sub-Tiltfiles via environment variables,
+# since include() does not share local variables.
+os.putenv("_TILT_NUM_NODES", cfg.get("num-nodes", "2"))
+os.putenv("_TILT_EXCLUDE_LOGS", cfg.get("exclude-logs", "network"))
+os.putenv("_TILT_LOG_LEVEL", cfg.get("log-level", "info"))
+os.putenv("_TILT_BACKEND", cfg.get("backend", "native"))
+os.putenv("_TILT_METRICS_DIR", cfg.get("metrics-dir", ""))
 
 if variant == "native":
     include("tilt/native.tiltfile")
