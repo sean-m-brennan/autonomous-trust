@@ -51,7 +51,7 @@ def main():
     to_log = None
     if args.exclude_logs is not None:
         to_log = [cls for cls in list(CfgIds) if cls not in args.exclude_logs]
-    AutonomousTrust(multiproc=True, log_level=LogLevel.DEBUG, logfile=Configuration.log_stdout,
+    AutonomousTrust(multiproc=True, log_level=LogLevel.INFO, logfile=Configuration.log_stdout,
                     log_classes=to_log, testing=args.test).run_forever()
 
 

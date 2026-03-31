@@ -81,7 +81,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     @staticmethod
     def _paxos_id_index(id1, id2):
         x = 10 ** len(str(id2))
-        return id1 + (id2 / x)  # convert to int for accurate expiration
+        return id1 + (id2 // x)  # convert to int for accurate expiration
 
     def handle_request(self, queues, message):
         if message.function == ReputationProtocol.request:
