@@ -37,7 +37,8 @@ COPY src/autonomous-trust/requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt && pip install protobuf
 
 COPY src/autonomous-trust/autonomous_trust autonomous_trust
-RUN rm -rf autonomous_trust/etc autonomous_trust/var
+RUN rm -rf autonomous_trust/etc autonomous_trust/var && \
+    find autonomous_trust -name __pycache__ -exec rm -rf {} + 2>/dev/null; true
 
 COPY src/autonomous-trust/pyproject.toml pyproject.toml
 

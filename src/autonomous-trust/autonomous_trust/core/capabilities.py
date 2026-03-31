@@ -15,10 +15,20 @@
 # ******************
 
 from collections.abc import Mapping
+from decimal import Decimal, getcontext
 import multiprocessing
 
 from .config import Configuration
 from .protobuf.processes import capabilities_pb2
+
+
+def pi(precision):  # intentionally non-trivial, arbitrary precision
+    getcontext().prec = precision
+    return sum(1 / Decimal(16) ** k *
+               (Decimal(4) / (8 * k + 1) -
+                Decimal(2) / (8 * k + 4) -
+                Decimal(1) / (8 * k + 5) -
+                Decimal(1) / (8 * k + 6)) for k in range(precision))
 
 
 class Capability(Configuration):

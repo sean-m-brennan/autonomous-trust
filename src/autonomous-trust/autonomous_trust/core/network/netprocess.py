@@ -25,7 +25,6 @@ from enum import Enum
 
 import nacl
 
-from ..protocol import Protocol
 from ..identity import Identity
 from ..processes import Process, ProcMeta
 from ..identity import Group
@@ -107,6 +106,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.unknown_messages = []
         self.acceptance = acceptance_func
         self.pests = {}
+        from ..protocol import Protocol  # lazy import to avoid circular dependency
         self.protocol = Protocol(self.name, self.logger, configurations)
         self.stop = False
         self.statistics = {}

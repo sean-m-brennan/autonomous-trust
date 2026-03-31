@@ -116,15 +116,21 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         idx = self._paxos_id_index(pax_id[0], pax_id[1])
         start = now()
         while (now() - start).total_seconds() < self.protocol_timeout:
-            if self.my_requests[idx].count >= len(self.peers.all) // 2:
+            req = self.my_requests.get(idx)
+            if req is None:
+                retry = False  # request was already resolved
+                break
+            if req.count >= len(self.peers.all) // 2:
                 retry = False
                 break
             time.sleep(self.cadence)
         if retry:
-            try:
-                self._start_paxos(queues, self.my_requests[idx].score)
-            except Full:
-                self.logger.error('paxos_timeout: Network queue full')
+            req = self.my_requests.get(idx)
+            if req is not None:
+                try:
+                    self._start_paxos(queues, req.score)
+                except Full:
+                    self.logger.error('paxos_timeout: Network queue full')
 
     def handle_grant(self, queues, message):
         if message.function == ReputationProtocol.grant:
