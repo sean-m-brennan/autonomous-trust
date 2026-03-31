@@ -15,33 +15,28 @@
 #   limitations under the License.
 # ******************
 #
-# Build a python distribution for live use
+# Build the C library
 
 # Run everything relative to the repo root
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
 
-set -e
-WHAT="$1"
-if [ -n "$WHAT" ]; then
-  shift
-fi
-if [[ "$WHAT" = "" ]]; then
-  WHAT="py c zkp docker"
+if [[ "${CONDA_DEFAULT_ENV:-}" != "autonomous_trust" ]]; then
+  echo "ERROR: conda environment 'autonomous_trust' is not active." >&2
+  echo "  Run: conda activate autonomous_trust" >&2
+  exit 1
 fi
 
-if [[ "$WHAT" = *"py"* ]]; then
-  scripts/build-py.sh $@
+cd src/c || exit 1
+rm -rf build
+# Prefer clang if available (some GCC versions produce corrupt ELF objects).
+# Also handle conda cross-compiler that may not exist on this system.
+if [ -n "$CC" ] && ! command -v "$CC" >/dev/null 2>&1; then
+  unset CC CXX CONDA_PREFIX
 fi
-
-if [[ "$WHAT" = *"zkp"* ]] || [[ "$WHAT" = *"zero"* ]]; then
-  scripts/build-zkp.sh $@
+if [ -z "$CC" ] && command -v clang >/dev/null 2>&1; then
+  export CC=clang CXX=clang++
 fi
-
-if [[ "$WHAT" = *"c"* ]] || [[ "$WHAT" = *"native"* ]]; then
-  scripts/build-native.sh $@
-fi
-
-if [[ "$WHAT" = *"docker"* ]]; then
-  scripts/build-docker.sh all $@
-fi
+cmake -S . -B build
+cd build || exit 1
+make -j1

@@ -21,27 +21,13 @@
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
 
-set -e
-WHAT="$1"
-if [ -n "$WHAT" ]; then
-  shift
-fi
-if [[ "$WHAT" = "" ]]; then
-  WHAT="py c zkp docker"
-fi
+WHAT=$1  # required
+shift
 
-if [[ "$WHAT" = *"py"* ]]; then
-  scripts/build-py.sh $@
-fi
-
-if [[ "$WHAT" = *"zkp"* ]] || [[ "$WHAT" = *"zero"* ]]; then
-  scripts/build-zkp.sh $@
-fi
-
-if [[ "$WHAT" = *"c"* ]] || [[ "$WHAT" = *"native"* ]]; then
-  scripts/build-native.sh $@
-fi
-
-if [[ "$WHAT" = *"docker"* ]]; then
-  scripts/build-docker.sh all $@
+if [ "$WHAT" = "c-demo" ]; then
+  scripts/run-c-demo.sh $@
+elif [ "$WHAT" = "demo" ]; then
+  scripts/run-demo.sh $@
+elif [ "$WHAT" = "mission" ]; then
+  scripts/run-mission.sh $@
 fi

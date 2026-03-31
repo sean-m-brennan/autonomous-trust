@@ -15,33 +15,14 @@
 #   limitations under the License.
 # ******************
 #
-# Build a python distribution for live use
+# Test the code base
+set -e
 
 # Run everything relative to the repo root
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
 
-set -e
-WHAT="$1"
-if [ -n "$WHAT" ]; then
-  shift
-fi
-if [[ "$WHAT" = "" ]]; then
-  WHAT="py c zkp docker"
-fi
-
-if [[ "$WHAT" = *"py"* ]]; then
-  scripts/build-py.sh $@
-fi
-
-if [[ "$WHAT" = *"zkp"* ]] || [[ "$WHAT" = *"zero"* ]]; then
-  scripts/build-zkp.sh $@
-fi
-
-if [[ "$WHAT" = *"c"* ]] || [[ "$WHAT" = *"native"* ]]; then
-  scripts/build-native.sh $@
-fi
-
-if [[ "$WHAT" = *"docker"* ]]; then
-  scripts/build-docker.sh all $@
-fi
+scripts/test-packages.sh $@
+scripts/test-c-exe.sh $@
+scripts/test-integration.sh $@
+scripts/test-sim-pkg.sh $@

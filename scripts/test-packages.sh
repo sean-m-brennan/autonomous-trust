@@ -23,12 +23,16 @@ cd "$here" || exit 1
 
 status=0
 quick=false
-if [[ "$@" = *"--quick"* ]] || [[ "$@" = *"-q"* ]]; then
-  quick=true
-fi
+verbose=false
+for arg in "$@"; do
+    case "$arg" in
+        --quick|-q) quick=true ;;
+        --verbose|-v) verbose=true ;;
+    esac
+done
 
 echo "========== Building the C library =========="
-if [[ "$@" = *"--verbose"* ]] || [[ "$@" = *"-v"* ]]; then
+if $verbose; then
   scripts/build.sh --c || exit 1
 else
   scripts/build.sh --c >/dev/null || exit 1
@@ -39,7 +43,7 @@ for pkg in autonomous-trust autonomous-trust-services autonomous-trust-inspector
     if [ -d "$pkg_dir/tests" ]; then
         echo "========== Testing $pkg =========="
         flags=
-        if [[ "$@" = *"--verbose"* ]] || [[ "$@" = *"-v"* ]]; then
+        if $verbose; then
           flags="-v"
         else
           flags="-q"
@@ -55,7 +59,7 @@ for pkg in autonomous-trust autonomous-trust-services autonomous-trust-inspector
         # Strip -q/--quick from passthrough args
         pass_args=()
         for arg in "$@"; do
-          if [[ "$arg" != "-q" ]] && [[ "$arg" != "--quick" ]]; then
+          if $quick; then
             pass_args+=("$arg")
           fi
         done

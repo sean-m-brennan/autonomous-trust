@@ -14,3 +14,19 @@
  *   limitations under the License.
  ********************/
 syntax = "proto3";
+
+package autonomous_trust.core.protobuf.negotiation;
+
+message Task {
+  bytes uuid = 1;
+  bytes requestor_uuid = 2;
+  string capability_name = 3;
+  int64 when_seconds = 4;
+  int32 when_nanos = 5;
+  sint64 duration_days = 6;
+  uint32 duration_seconds = 7;
+  uint32 duration_nsecs = 8;
+  int64 timeout = 9;
+  bool flexible = 10;
+  int32 argc = 11;
+}

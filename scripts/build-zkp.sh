@@ -15,33 +15,24 @@
 #   limitations under the License.
 # ******************
 #
-# Build a python distribution for live use
+# Build the ZKP Rust extension (requires rustc + maturin)
 
 # Run everything relative to the repo root
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
 
-set -e
-WHAT="$1"
-if [ -n "$WHAT" ]; then
-  shift
-fi
-if [[ "$WHAT" = "" ]]; then
-  WHAT="py c zkp docker"
+if [[ "${CONDA_DEFAULT_ENV:-}" != "autonomous_trust" ]]; then
+  echo "ERROR: conda environment 'autonomous_trust' is not active." >&2
+  echo "  Run: conda activate autonomous_trust" >&2
+  exit 1
 fi
 
-if [[ "$WHAT" = *"py"* ]]; then
-  scripts/build-py.sh $@
-fi
-
-if [[ "$WHAT" = *"zkp"* ]] || [[ "$WHAT" = *"zero"* ]]; then
-  scripts/build-zkp.sh $@
-fi
-
-if [[ "$WHAT" = *"c"* ]] || [[ "$WHAT" = *"native"* ]]; then
-  scripts/build-native.sh $@
-fi
-
-if [[ "$WHAT" = *"docker"* ]]; then
-  scripts/build-docker.sh all $@
+zkp_dir="$here/src/autonomous-trust"
+if command -v cargo >/dev/null 2>&1 && command -v maturin >/dev/null 2>&1; then
+  echo "========== Building ZKP module =========="
+  (cd "$zkp_dir" && maturin develop --release --manifest-path rust/Cargo.toml)
+elif command -v cargo >/dev/null 2>&1; then
+  echo "WARNING: maturin not found, skipping ZKP build (pip install maturin)" >&2
+else
+  echo "WARNING: Rust toolchain not found, skipping ZKP build (install rustup)" >&2
 fi

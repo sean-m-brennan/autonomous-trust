@@ -64,9 +64,9 @@ error() { echo -e "${RED}[test]${RESET} $*" >&2; }
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -n|--nodes)   NUM_NODES="$2"; shift 2 ;;
-        --debug)      DEBUG=true; shift ;;
-        --quick)      QUICK=true; shift ;;
-        --force)      FORCE=true; shift ;;
+        --debug|-d)      DEBUG=true; shift ;;
+        --quick|-q)      QUICK=true; shift ;;
+        --force|-f)      FORCE=true; shift ;;
         --shell)      SHELL_MODE=true; shift ;;
         --registry)   REGISTRY_URL="$2"; shift 2 ;;
         -h|--help)
