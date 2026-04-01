@@ -161,8 +161,11 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
         {
             data_t *h_dat;
             int err = map_get(proc->protocol.handlers, nmsg->function, &h_dat);
-            if (err != 0) // FIXME logging?
+            if (err != 0)
+            {
+                log_warn(proc->logger, "%s: message handler returned error\n", proc->name);
                 return false;
+            }
             msg_handler_t handler;
             err = data_object_ptr(h_dat, (void *)&handler);
             if (err != 0)
@@ -265,7 +268,10 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
             size_t size = message_size(buf.type);
             void *msg = smrt_create(size);
             if (msg == NULL)
-                continue; // FIXME logging
+            {
+                log_debug(proc->logger, "%s: skipping unhandled message type %ld\n", proc->name, buf.type);
+                continue;
+            }
             memcpy(msg, &buf.info, size);
             data_t *m_dat = object_ptr_data(msg, size);
             array_append(&unprocessed, m_dat);

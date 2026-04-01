@@ -35,7 +35,10 @@ typedef enum {
     NET_MESSAGE,  // generic
     TASK_STATUS,
     TASK_RESULT,
-    TRANSACTION_SCORE
+    TRANSACTION_SCORE,
+    UPDATE_PROPOSAL,
+    UPDATE_VOTE,
+    UPDATE_ACCEPTED
 } message_type_t;
 
 /**
@@ -85,6 +88,18 @@ typedef struct {
     double score;
 } tx_score_msg_t;
 
+typedef struct {
+    uuid_t proposal_uuid;
+    uuid_t voter_uuid;
+    bool accept;
+} update_vote_msg_t;
+
+typedef struct {
+    uuid_t proposal_uuid;
+    int accept_count;
+    int reject_count;
+} update_accepted_msg_t;
+
 #define SIGNAL_LEN 32
 
 typedef struct
@@ -107,6 +122,8 @@ typedef struct
         task_status_msg_t task_status;
         task_result_msg_t task_result;
         tx_score_msg_t tx_score;
+        update_vote_msg_t update_vote;
+        update_accepted_msg_t update_accepted;
     } info;
 } generic_msg_t;
 
