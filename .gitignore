@@ -98,3 +98,12 @@ dist
 /doc/AutonomousTrust.pdf
 /doc/whitepaper/HighTrust.pdf
 /embedded/.test-qemu/
+/embedded/.buildroot-build/
+/embedded/dist/
+/embedded/fleet-configs/
+/embedded/buildroot/rootfs-overlay/usr/local/bin/at_demo
+/embedded/buildroot/rootfs-overlay/usr/local/bin/at_demo.sig
+/src/c/build-static/
+
+# Binary signing keys (private)
+embedded/signing.key
