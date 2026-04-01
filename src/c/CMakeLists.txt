@@ -72,13 +72,21 @@ string(REPLACE ";" " " lib_compile_flags
 add_compile_options(-Wall -fms-extensions ${useful_warnings} ${warning_as_error} ${useful_flags})
 add_link_options(-pthread ${sysroot_flag})
 
+# Static linking option for embedded/IoT builds
+option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)" OFF)
+
+if(AT_STATIC)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+endif()
+
 
 ####################
 # library/program dependencies
 
 # UUID
 find_path(LIBUUID_INCLUDE_DIR uuid.h PATH_SUFFIXES uuid PATHS ${CONDA_ROOT})
-find_library(LIBUUID_LIBRARY libuuid.so PATHS ${CONDA_ROOT})
+find_library(LIBUUID_LIBRARY NAMES uuid PATHS ${CONDA_ROOT})
 include_directories(${LIBUUID_INCLUDE_DIR})
 if(LIBUUID_LIBRARY)
     message("-- Found libuuid at ${LIBUUID_LIBRARY}")
@@ -88,7 +96,7 @@ endif()
 
 # libsodium
 find_path(LIBSODIUM_INCLUDE_DIR sodium.h PATHS ${CONDA_ROOT})
-find_library(LIBSODIUM_LIBRARY libsodium.so PATHS ${CONDA_ROOT})
+find_library(LIBSODIUM_LIBRARY NAMES sodium PATHS ${CONDA_ROOT})
 include_directories(${LIBSODIUM_INCLUDE_DIR})
 if(LIBSODIUM_LIBRARY)
     message("-- Found libsodium at ${LIBSODIUM_LIBRARY}")
@@ -98,7 +106,7 @@ endif()
 
 # jansson
 find_path(LIBJANSSON_INCLUDE_DIR jansson.h PATHS ${CONDA_ROOT})
-find_library(LIBJANSSON_LIBRARY libjansson.so PATHS ${CONDA_ROOT})
+find_library(LIBJANSSON_LIBRARY NAMES jansson PATHS ${CONDA_ROOT})
 include_directories(${LIBJANSSON_INCLUDE_DIR})
 if(LIBJANSSON_LIBRARY)
     message("-- Found libjansson at ${LIBJANSSON_LIBRARY}")
@@ -122,7 +130,7 @@ endif()
 
 # protobuf-c
 find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c PATHS ${CONDA_ROOT})
-find_library(LIBPROTOBUF_C_LIBRARY libprotobuf-c.so PATHS ${CONDA_ROOT})
+find_library(LIBPROTOBUF_C_LIBRARY NAMES protobuf-c PATHS ${CONDA_ROOT})
 include_directories(${LIBPROTOBUF_C_INCLUDE_DIR})
 #find_program(PROTOC_C_EXE protoc-c PATHS ${CONDA_ROOT})
 if(LIBPROTOBUF_C_LIBRARY)
@@ -417,7 +425,19 @@ target_link_directories(at_example PRIVATE ${CMAKE_SYSROOT})
 # demo app (containerized)
 
 add_executable(at_demo at_demo.c)
-target_link_libraries(at_demo PRIVATE -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive ${DEPENDENCIES})
+if(AT_STATIC)
+    target_link_libraries(at_demo PRIVATE
+        -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive
+        ${DEPENDENCIES}
+        -static
+    )
+    target_link_libraries(at_demo PRIVATE stdc++ m)
+else()
+    target_link_libraries(at_demo PRIVATE
+        -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive
+        ${DEPENDENCIES}
+    )
+endif()
 target_compile_options(at_demo PRIVATE -Wall ${sysroot_flag})
 target_link_options(at_demo PRIVATE ${sysroot_flag})
 target_link_directories(at_demo PRIVATE ${CMAKE_SYSROOT})
