@@ -21,6 +21,7 @@
 
 #include "msg_types_priv.h"
 
+#include "fleet/update_proposal.h"
 #include "identity/identity_priv.h"
 #include "processes/capabilities_priv.h"
 #include "negotiation/task_priv.h"
@@ -49,6 +50,12 @@ size_t message_size(message_type_t type)
         return sizeof(task_result_msg_t);
     case TRANSACTION_SCORE:
         return sizeof(tx_score_msg_t);
+    case UPDATE_PROPOSAL:
+        return sizeof(update_proposal_t);
+    case UPDATE_VOTE:
+        return sizeof(update_vote_msg_t);
+    case UPDATE_ACCEPTED:
+        return sizeof(update_accepted_msg_t);
     default:
         return 0;
     }
@@ -76,6 +83,12 @@ char *message_type_to_string(message_type_t type)
         return (char*)"TASK_RESULT";
     case TRANSACTION_SCORE:
         return (char*)"TRANSACTION_SCORE";
+    case UPDATE_PROPOSAL:
+        return (char*)"UPDATE_PROPOSAL";
+    case UPDATE_VOTE:
+        return (char*)"UPDATE_VOTE";
+    case UPDATE_ACCEPTED:
+        return (char*)"UPDATE_ACCEPTED";
     default:
         return (char*)"";
     }
@@ -101,6 +114,12 @@ message_type_t string_to_message_type(const char *str)
         return TASK_RESULT;
     if (strcmp(str, "TRANSACTION_SCORE") == 0)
         return TRANSACTION_SCORE;
+    if (strcmp(str, "UPDATE_PROPOSAL") == 0)
+        return UPDATE_PROPOSAL;
+    if (strcmp(str, "UPDATE_VOTE") == 0)
+        return UPDATE_VOTE;
+    if (strcmp(str, "UPDATE_ACCEPTED") == 0)
+        return UPDATE_ACCEPTED;
     return -1;  // No matching message type found (all valid types are > 0)
 }
 
@@ -277,6 +296,25 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.tx_score, subdata_len);
         break;
     }
+    case UPDATE_VOTE:
+    {
+        subdata_len = sizeof(update_vote_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.update_vote, subdata_len);
+        break;
+    }
+    case UPDATE_ACCEPTED:
+    {
+        subdata_len = sizeof(update_accepted_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.update_accepted, subdata_len);
+        break;
+    }
+    case UPDATE_PROPOSAL:
+        /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
+        return -1;
     default:
         return -1;
     }
@@ -379,6 +417,15 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
     case TRANSACTION_SCORE:
         memcpy(&msg->info.tx_score, pb_msg->value.data, sizeof(tx_score_msg_t));
         return 0;
+    case UPDATE_VOTE:
+        memcpy(&msg->info.update_vote, pb_msg->value.data, sizeof(update_vote_msg_t));
+        return 0;
+    case UPDATE_ACCEPTED:
+        memcpy(&msg->info.update_accepted, pb_msg->value.data, sizeof(update_accepted_msg_t));
+        return 0;
+    case UPDATE_PROPOSAL:
+        /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
+        return -1;
     default:
         return -1;
     }

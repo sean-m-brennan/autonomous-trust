@@ -186,6 +186,7 @@ set(protos
     autonomous_trust/core/protobuf/structures/datetime.proto
     autonomous_trust/core/protobuf/structures/map.proto
     autonomous_trust/core/protobuf/structures/merkle.proto
+    autonomous_trust/core/protobuf/fleet/update_proposal.proto
 )
 
 set(google_protos
@@ -202,6 +203,7 @@ set(table_headers_in
 set(libsrc
     autonomous_trust/autonomous_trust.c
     autonomous_trust/algorithms/agreement.c
+    autonomous_trust/algorithms/paxos.c
     autonomous_trust/config/configuration.c
     autonomous_trust/config/discover.c
     autonomous_trust/config/names.c
@@ -246,11 +248,15 @@ set(libsrc
     autonomous_trust/utilities/queue_pool.c
     autonomous_trust/utilities/sighandler.c
     autonomous_trust/utilities/util.c
+    autonomous_trust/fleet/update_proposal.c
+    autonomous_trust/fleet/fleet_helpers.c
+    autonomous_trust/fleet/fleet_proc.c
 )
 set(libhdr
     autonomous_trust.h
     autonomous_trust/algorithms/agreement.h
     autonomous_trust/algorithms/algorithms.h
+    autonomous_trust/algorithms/paxos.h
     autonomous_trust/config/configuration.h
     autonomous_trust/config/discover.h
     autonomous_trust/config/names.h
@@ -276,6 +282,8 @@ set(libhdr
     autonomous_trust/config/generate.h
     autonomous_trust/network/ping.h
     autonomous_trust/network/ntp.h
+    autonomous_trust/fleet/update_proposal.h
+    autonomous_trust/fleet/fleet_proc.h
 )
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust)
 
@@ -677,6 +685,27 @@ set_source_files_properties(test/task_proto_test.c PROPERTIES COMPILE_FLAGS "-Wa
 target_link_libraries(task_proto_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
 
 add_test(NAME task_proto_test COMMAND $<TARGET_FILE:task_proto_test>)
+
+add_executable(paxos_test test/paxos_test.c)
+set_source_files_properties(test/paxos_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(paxos_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_test(NAME paxos_test COMMAND $<TARGET_FILE:paxos_test>)
+
+add_executable(update_proposal_test test/update_proposal_test.c)
+set_source_files_properties(test/update_proposal_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(update_proposal_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_test(NAME update_proposal_test COMMAND $<TARGET_FILE:update_proposal_test>)
+
+add_executable(fleet_proc_test
+    test/fleet_proc_test.c
+    autonomous_trust/fleet/fleet_helpers.c
+    autonomous_trust/fleet/update_proposal.c)
+set_source_files_properties(test/fleet_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(fleet_proc_test PRIVATE ${TEST_DEPENDENCIES})
+
+add_test(NAME fleet_proc_test COMMAND $<TARGET_FILE:fleet_proc_test>)
 
 endif() # LIBCHECK_LIBRARY
 

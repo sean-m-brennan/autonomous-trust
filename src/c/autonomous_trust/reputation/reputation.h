@@ -26,6 +26,7 @@
 #include "structures/array_priv.h"
 #include "identity/identity.h"
 #include "utilities/exception.h"
+#include "autonomous_trust/algorithms/paxos.h"
 
 /****************************
  * Protocol constants (must match Python ReputationProtocol)
@@ -131,7 +132,7 @@ double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *re
 double reputation_compute(const tx_history_t *hist, const reputations_t *reps,
                           const uuid_t self_uuid, const uuid_t peer_uuid);
 
-double paxos_id_index(double id1, double id2);
+/* paxos_id_index is provided by algorithms/paxos.h */
 
 /****************************
  * Error codes
