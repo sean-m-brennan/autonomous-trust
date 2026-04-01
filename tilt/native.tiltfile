@@ -32,22 +32,26 @@ git_version = str(local("git describe HEAD 2>/dev/null || echo unknown", quiet=T
 git_version = git_version.removeprefix("v")
 build_args["GIT_VERSION"] = git_version
 
+# All paths are relative to this tiltfile's directory (tilt/),
+# so use ".." to reference the repo root.
+repo_root = ".."
+
 # Build the pure-C image
 docker_build(
     "autonomous-trust",
-    ".",
-    dockerfile="src/autonomous-trust/Dockerfile-c",
+    repo_root,
+    dockerfile=repo_root + "/src/autonomous-trust/Dockerfile-c",
     network="host",
     build_args=build_args,
 )
 
 # Load the generated compose file
-docker_compose("docker-compose.tilt.yaml")
+docker_compose(repo_root + "/docker-compose.tilt.yaml")
 
 # Exclude generated compose file from Tilt's file watch
 watch_settings(ignore=["docker-compose.tilt.yaml"])
 
 # Watch only C source dirs for live rebuild triggers
-watch_file("src/c")
-watch_file("src/protobuf")
-watch_file("src/autonomous-trust/entrypoint-c.sh")
+watch_file(repo_root + "/src/c")
+watch_file(repo_root + "/src/protobuf")
+watch_file(repo_root + "/src/autonomous-trust/entrypoint-c.sh")

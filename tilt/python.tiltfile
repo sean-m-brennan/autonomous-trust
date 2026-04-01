@@ -35,16 +35,20 @@ git_version = str(local("git describe HEAD 2>/dev/null || echo unknown", quiet=T
 git_version = git_version.removeprefix("v")
 build_args["GIT_VERSION"] = git_version
 
+# All paths are relative to this tiltfile's directory (tilt/),
+# so use ".." to reference the repo root.
+repo_root = ".."
+
 # Select Dockerfile based on backend
 if backend == "native":
-    dockerfile = "src/autonomous-trust/Dockerfile-native"
+    dockerfile = repo_root + "/src/autonomous-trust/Dockerfile-native"
 else:
-    dockerfile = "src/autonomous-trust/Dockerfile-lite"
+    dockerfile = repo_root + "/src/autonomous-trust/Dockerfile-lite"
 
 # Build the base image
 docker_build(
     "autonomous-trust",
-    ".",
+    repo_root,
     dockerfile=dockerfile,
     network="host",
     build_args=build_args,
@@ -55,29 +59,29 @@ docker_build(
 if metrics_dir:
     docker_build(
         "autonomous-trust-devel",
-        ".",
-        dockerfile="src/autonomous-trust/Dockerfile-devel",
+        repo_root,
+        dockerfile=repo_root + "/src/autonomous-trust/Dockerfile-devel",
         network="host",
         build_args=build_args,
     )
     docker_build(
         "autonomous-trust-full-devel",
-        ".",
-        dockerfile="src/Dockerfile-devel",
+        repo_root,
+        dockerfile=repo_root + "/src/Dockerfile-devel",
         network="host",
         build_args=build_args,
     )
 
 # Load the generated compose file
-docker_compose("docker-compose.tilt.yaml")
+docker_compose(repo_root + "/docker-compose.tilt.yaml")
 
 # Watch key source dirs for live rebuild triggers
-watch_file("src/autonomous-trust/autonomous_trust")
-watch_file("src/autonomous-trust/entrypoint.sh")
-watch_file("src/protobuf")
+watch_file(repo_root + "/src/autonomous-trust/autonomous_trust")
+watch_file(repo_root + "/src/autonomous-trust/entrypoint.sh")
+watch_file(repo_root + "/src/protobuf")
 if backend == "native":
-    watch_file("src/c")
+    watch_file(repo_root + "/src/c")
 if metrics_dir:
-    watch_file("src/autonomous-trust-inspector/autonomous_trust")
-    watch_file("src/autonomous-trust-services/autonomous_trust")
-    watch_file("src/autonomous-trust-simulator/autonomous_trust")
+    watch_file(repo_root + "/src/autonomous-trust-inspector/autonomous_trust")
+    watch_file(repo_root + "/src/autonomous-trust-services/autonomous_trust")
+    watch_file(repo_root + "/src/autonomous-trust-simulator/autonomous_trust")
