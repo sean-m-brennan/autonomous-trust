@@ -33,6 +33,8 @@ IMAGE_BASE="autonomous-trust-c"
 
 FORCE=false
 ALL_ARCH=false
+STATIC=false
+DOCKERFILE_STATIC="$REPO_DIR/src/autonomous-trust/Dockerfile-c-static"
 PLATFORMS=(linux/arm64)
 
 # Colors
@@ -49,11 +51,13 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --force)     FORCE=true; shift ;;
         --all-arch)  ALL_ARCH=true; shift ;;
+        --static)    STATIC=true; shift ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo
             echo "Options:"
             echo "  --all-arch   Build for both arm64 and amd64"
+            echo "  --static     Build fully static binary (no shared lib deps)"
             echo "  --force      Rebuild from scratch (--no-cache)"
             echo "  -h, --help   Show this help"
             exit 0 ;;
@@ -88,6 +92,11 @@ extract_artifacts() {
     local arch="${platform#linux/}"  # arm64 or amd64
     local container_name="at-extract-${arch}-$$"
     local tarball="$DIST_DIR/autonomous-trust-${arch}.tar.gz"
+    local dockerfile="$DOCKERFILE"
+    if $STATIC; then
+        dockerfile="$DOCKERFILE_STATIC"
+        tarball="$DIST_DIR/autonomous-trust-${arch}-static.tar.gz"
+    fi
 
     info "Building for $platform ..."
 
@@ -96,7 +105,7 @@ extract_artifacts() {
         --build-arg "GIT_VERSION=$GIT_VERSION"
         --load
         -t "${IMAGE_BASE}:${arch}"
-        -f "$DOCKERFILE"
+        -f "$dockerfile"
     )
     if $FORCE; then
         build_args+=(--no-cache)
@@ -114,7 +123,9 @@ extract_artifacts() {
     mkdir -p "$staging/usr/local/bin" "$staging/usr/local/lib"
 
     docker cp "$container_name:/usr/local/bin/at_demo" "$staging/usr/local/bin/"
-    docker cp "$container_name:/usr/local/lib/libautonomous_trust.so" "$staging/usr/local/lib/"
+    if ! $STATIC; then
+        docker cp "$container_name:/usr/local/lib/libautonomous_trust.so" "$staging/usr/local/lib/"
+    fi
     docker rm -f "$container_name"
     trap - EXIT
 
