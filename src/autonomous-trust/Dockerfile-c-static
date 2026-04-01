@@ -1,0 +1,81 @@
+# ******************
+#  Copyright 2025 Sean M. Brennan and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+
+# Fully static at_demo build — no shared library dependencies at runtime.
+# Produces a single static ELF binary suitable for minimal/embedded images.
+#
+# Build with:
+#   docker build --network host -t autonomous-trust-c-static \
+#     -f src/autonomous-trust/Dockerfile-c-static .
+
+####################
+# Stage 1: Builder (static libs + static link)
+####################
+FROM debian:bookworm AS builder
+
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG CERT_CONTENT
+ARG GIT_VERSION="unknown"
+
+RUN if [ -n "$CERT_CONTENT" ]; then \
+      echo "$CERT_CONTENT" > /usr/local/share/ca-certificates/proxy-ca.crt && \
+      update-ca-certificates; \
+    fi
+
+# Install build tools + static library variants
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+        python3 python-is-python3 \
+        cmake clang make pkg-config libc-dev \
+        uuid-dev libsodium-dev libjansson-dev \
+        protobuf-compiler protobuf-c-compiler \
+        libprotobuf-c-dev libprotobuf-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy C source and protobuf definitions
+# CMake expects protobuf as a sibling: ${CMAKE_CURRENT_SOURCE_DIR}/../protobuf
+COPY src/c /build/c-src
+COPY src/protobuf /build/protobuf
+
+RUN rm -rf /build/c-src/build && mkdir -p /build/c-src/build && cd /build/c-src/build && \
+    CC=clang CXX=clang++ cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DREVISION="$GIT_VERSION" \
+        -DAT_STATIC=ON \
+        -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" \
+        -DCMAKE_CXX_FLAGS="-Wno-unknown-warning-option" && \
+    make -j$(nproc) && \
+    make install DESTDIR=/build/install
+
+####################
+# Stage 2: Verification (minimal image, just the binary)
+####################
+FROM debian:bookworm-slim
+
+# Copy only the static binary — no shared libraries needed
+COPY --from=builder /build/install/usr/local/bin/at_demo /usr/local/bin/at_demo
+
+# Verify it's truly static
+RUN ldd /usr/local/bin/at_demo 2>&1 | grep -q "not a dynamic executable" || \
+    (echo "ERROR: at_demo is not statically linked" && ldd /usr/local/bin/at_demo && exit 1)
+
+ENV AUTONOMOUS_TRUST_ROOT="/"
+
+ENTRYPOINT ["/usr/local/bin/at_demo"]
+CMD ["--generate-config", "--log-level", "info"]
