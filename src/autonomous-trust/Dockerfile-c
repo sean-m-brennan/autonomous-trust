@@ -46,9 +46,10 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Copy C source and protobuf definitions (src/c/protobuf is a symlink)
+# Copy C source and protobuf definitions
+# CMake expects protobuf as a sibling: ${CMAKE_CURRENT_SOURCE_DIR}/../protobuf
 COPY src/c /build/c-src
-COPY src/protobuf /build/c-src/protobuf
+COPY src/protobuf /build/protobuf
 
 RUN rm -rf /build/c-src/build && mkdir -p /build/c-src/build && cd /build/c-src/build && \
     CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DREVISION="$GIT_VERSION" -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" -DCMAKE_CXX_FLAGS="-Wno-unknown-warning-option" && \

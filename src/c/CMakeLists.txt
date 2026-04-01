@@ -62,9 +62,11 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang")
 endif()
 set(useful_flags
     #-fanalyzer
-    -fstack-clash-protection
     -fstack-protector
 )
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    list(APPEND useful_flags -fstack-clash-protection)
+endif()
 string(REPLACE ";" " " lib_compile_flags
         "-Wall ${warning_as_error} ${useful_warnings} -fms-extensions ${useful_flags} ${sysroot_flag}")
 add_compile_options(-Wall -fms-extensions ${useful_warnings} ${warning_as_error} ${useful_flags})
@@ -129,14 +131,14 @@ else()
     message(FATAL_ERROR "Required dependency libprotobuf-c not found.")
 endif()
 
-# check (testing only)
+# check (testing only — optional for non-test builds)
 find_path(LIBCHECK_INCLUDE_DIR check.h PATHS ${CONDA_ROOT})
 find_library(LIBCHECK_LIBRARY NAMES check libcheck.so libcheck.a PATHS ${CONDA_ROOT})
-include_directories(${LIBCHECK_INCLUDE_DIR})
 if(LIBCHECK_LIBRARY)
+    include_directories(${LIBCHECK_INCLUDE_DIR})
     message("-- Found libcheck at ${LIBCHECK_LIBRARY}")
 else()
-    message(ERROR "Testing dependency libcheck not found.")
+    message(WARNING "Testing dependency libcheck not found. Tests will not be built.")
 endif()
 
 set(DEPENDENCIES
@@ -423,7 +425,9 @@ install(TARGETS at_demo RUNTIME DESTINATION bin)
 
 
 ####################
-# tests
+# tests (only built when libcheck is available)
+
+if(LIBCHECK_LIBRARY)
 
 add_executable(array_test test/array_test.c)
 set_source_files_properties(test/array_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -654,6 +658,7 @@ target_link_libraries(task_proto_test PRIVATE autonomous_trust_static ${TEST_DEP
 
 add_test(NAME task_proto_test COMMAND $<TARGET_FILE:task_proto_test>)
 
+endif() # LIBCHECK_LIBRARY
 
 ####################
 # Packaging
