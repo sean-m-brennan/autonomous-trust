@@ -518,28 +518,4 @@ double reputation_compute(const tx_history_t *hist, const reputations_t *reps,
         return reputation_contrite_tft(hist, reps, self_uuid, peer_uuid);
 }
 
-/****************************
- * Paxos ID helpers
- ****************************/
-
-double paxos_id_index(double id1, double id2)
-{
-    if (fabs(id2) < 1e-15)
-        return id1;
-
-    /* Count digits in id2 */
-    int digits = 0;
-    double tmp = fabs(id2);
-    if (tmp < 1.0)
-        digits = 1;
-    else
-    {
-        while (tmp >= 1.0)
-        {
-            tmp /= 10.0;
-            digits++;
-        }
-    }
-
-    return id1 + id2 / pow(10.0, (double)digits);
-}
+/* paxos_id_index is now provided by algorithms/paxos.c */

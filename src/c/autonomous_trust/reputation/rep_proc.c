@@ -22,6 +22,7 @@
 
 #include "processes/processes.h"
 #include "reputation/reputation.h"
+#include "algorithms/paxos.h"
 #include "structures/map.h"
 #include "structures/map_priv.h"
 #include "structures/array_priv.h"
@@ -38,22 +39,15 @@ DEFINE_ERROR(EREP_PAXOS, "Paxos consensus error");
  * Process state (file-scope static, thread-safe via mutex)
  ****************************/
 
-#define BACKOFF_MULT     1.5
-#define BACKOFF_MAX_SEC  90
 #define STALE_TIMEOUT    300  /* seconds */
-#define MAJORITY(n)      (((n) / 2) + 1)
 
 static struct {
     tx_history_t history;
     reputations_t reputations;
     map_t my_requests;     /* uuid_str -> tx_score_t* (pending Paxos requests) */
-    map_t proposals;       /* uuid_str -> paxos_tx_count_t* */
-    map_t acceptances;     /* uuid_str -> int (acceptance count) */
-    map_t backoff;         /* uuid_str -> time_t (next retry time) */
     map_t updates;         /* uuid_str -> json_t* (pending chain updates) */
-    array_t requests;      /* array of incoming reputation request UUIDs */
     array_t requested_reps; /* array of pending reputation responses */
-    double last_id;
+    paxos_instance_t paxos;
     int num_peers;
     pthread_mutex_t lock;
     bool initialized;
@@ -66,13 +60,9 @@ static void _ensure_init(void)
         tx_history_init(&rep_state.history);
         reputations_init(&rep_state.reputations);
         map_init(&rep_state.my_requests);
-        map_init(&rep_state.proposals);
-        map_init(&rep_state.acceptances);
-        map_init(&rep_state.backoff);
         map_init(&rep_state.updates);
-        array_init(&rep_state.requests);
         array_init(&rep_state.requested_reps);
-        rep_state.last_id = 0.0;
+        /* paxos_init is called in reputation_run after num_peers is known */
         rep_state.num_peers = 0;
         pthread_mutex_init(&rep_state.lock, NULL);
         rep_state.initialized = true;
@@ -112,67 +102,55 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     double id2 = json_real_value(j_id2);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
 
-    pthread_mutex_lock(&rep_state.lock);
+    double out_last_id = 0.0;
+    int out_chain_len = 0;
+    paxos_response_t result = paxos_handle_request(&rep_state.paxos, id1, id2,
+                                                   &out_last_id, &out_chain_len);
 
-    int chain_len = tx_history_len(&rep_state.history);
+    json_decref(payload);
 
-    if (id1 > rep_state.last_id)
+    if (result == PAXOS_GRANT)
     {
-        if ((int)id2 == chain_len + 1)
-        {
-            /* GRANT: store this request index so we can verify transactions later */
-            char paxos_key[64];
-            snprintf(paxos_key, sizeof(paxos_key), "%.0f:%.0f", id1, id2);
-            data_t *key_dat = integer_data((int)id2);
-            array_append(&rep_state.requests, key_dat);
+        /* Build grant payload: (id1, id2, peer_uuid, last_id, chain_len) */
+        json_t *grant_json = json_object();
+        json_object_set_new(grant_json, "id1", json_real(id1));
+        json_object_set_new(grant_json, "id2", json_real(id2));
+        json_object_set_new(grant_json, "peer_uuid", json_string(peer_uuid_str));
+        json_object_set_new(grant_json, "last_id", json_real(out_last_id));
+        json_object_set_new(grant_json, "chain_len", json_integer(out_chain_len));
 
-            /* Build grant payload: (id1, id2, peer_uuid, last_id, chain_len) */
-            json_t *grant_json = json_object();
-            json_object_set_new(grant_json, "id1", json_real(id1));
-            json_object_set_new(grant_json, "id2", json_real(id2));
-            json_object_set_new(grant_json, "peer_uuid", json_string(peer_uuid_str));
-            json_object_set_new(grant_json, "last_id", json_real(rep_state.last_id));
-            json_object_set_new(grant_json, "chain_len", json_integer(chain_len));
+        generic_msg_t grant = {0};
+        grant.type = NET_MESSAGE;
+        strncpy(grant.info.net_msg.process, "reputation", PROC_NAME_LEN);
+        grant.info.net_msg.function = (char *)REP_PROTO_GRANT;
+        grant.info.net_msg.encrypt = true;
+        memcpy(&grant.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
+        strncpy(grant.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+        net_msg_pack_json(&grant.info.net_msg, grant_json);
+        json_decref(grant_json);
 
-            pthread_mutex_unlock(&rep_state.lock);
-            json_decref(payload);
+        log_debug(proc->logger, "Reputation: Request granted\n");
+        messaging_send("network", NET_MESSAGE, &grant, false);
+    }
+    else if (result == PAXOS_BACKDATE)
+    {
+        /* BACKDATE: chain index mismatch */
+        json_t *bd_json = json_object();
+        json_object_set_new(bd_json, "id1", json_real(id1));
+        json_object_set_new(bd_json, "id2", json_real(id2));
 
-            generic_msg_t grant = {0};
-            grant.type = NET_MESSAGE;
-            strncpy(grant.info.net_msg.process, "reputation", PROC_NAME_LEN);
-            grant.info.net_msg.function = (char *)REP_PROTO_GRANT;
-            grant.info.net_msg.encrypt = true;
-            memcpy(&grant.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-            strncpy(grant.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
-            net_msg_pack_json(&grant.info.net_msg, grant_json);
-            json_decref(grant_json);
+        generic_msg_t backdate = {0};
+        backdate.type = NET_MESSAGE;
+        strncpy(backdate.info.net_msg.process, "reputation", PROC_NAME_LEN);
+        backdate.info.net_msg.function = (char *)REP_PROTO_BACKDATE;
+        backdate.info.net_msg.encrypt = true;
+        memcpy(&backdate.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
+        strncpy(backdate.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+        net_msg_pack_json(&backdate.info.net_msg, bd_json);
+        json_decref(bd_json);
 
-            log_debug(proc->logger, "Reputation: Request granted\n");
-            messaging_send("network", NET_MESSAGE, &grant, false);
-        }
-        else
-        {
-            /* BACKDATE: chain index mismatch */
-            json_t *bd_json = json_object();
-            json_object_set_new(bd_json, "id1", json_real(id1));
-            json_object_set_new(bd_json, "id2", json_real(id2));
-
-            pthread_mutex_unlock(&rep_state.lock);
-            json_decref(payload);
-
-            generic_msg_t backdate = {0};
-            backdate.type = NET_MESSAGE;
-            strncpy(backdate.info.net_msg.process, "reputation", PROC_NAME_LEN);
-            backdate.info.net_msg.function = (char *)REP_PROTO_BACKDATE;
-            backdate.info.net_msg.encrypt = true;
-            memcpy(&backdate.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-            strncpy(backdate.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
-            net_msg_pack_json(&backdate.info.net_msg, bd_json);
-            json_decref(bd_json);
-
-            log_debug(proc->logger, "Reputation: Request backdated\n");
-            messaging_send("network", NET_MESSAGE, &backdate, false);
-        }
+        log_debug(proc->logger, "Reputation: Request backdated\n");
+        messaging_send("network", NET_MESSAGE, &backdate, false);
     }
     else
     {
@@ -180,9 +158,6 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
         json_t *nack_json = json_object();
         json_object_set_new(nack_json, "id1", json_real(id1));
         json_object_set_new(nack_json, "id2", json_real(id2));
-
-        pthread_mutex_unlock(&rep_state.lock);
-        json_decref(payload);
 
         generic_msg_t nack = {0};
         nack.type = NET_MESSAGE;
@@ -234,10 +209,6 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
     double id2 = json_real_value(j_id2);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
 
-    /* Composite key for proposals map */
-    char paxos_key[64];
-    snprintf(paxos_key, sizeof(paxos_key), "%.0f:%.0f", id1, id2);
-
     pthread_mutex_lock(&rep_state.lock);
 
     /* Look up this request in my_requests (keyed by peer_uuid) */
@@ -256,30 +227,10 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
 
     tx_score_t *tx = NULL;
     data_object_ptr(tx_dat, (void **)&tx);
+    double tx_score = (tx != NULL) ? tx->score : 0.0;
 
-    /* Find or create paxos_tx_count_t in proposals */
-    data_t *prop_dat = NULL;
-    paxos_tx_count_t *ptc = NULL;
-    if (map_get(&rep_state.proposals, paxos_key, &prop_dat) == 0)
-    {
-        data_object_ptr(prop_dat, (void **)&ptc);
-        ptc->grant_count += 1;
-    }
-    else
-    {
-        ptc = smrt_create(sizeof(paxos_tx_count_t));
-        if (ptc != NULL)
-        {
-            ptc->score = (tx != NULL) ? tx->score : 0.0;
-            ptc->grant_count = 1;
-            data_t *new_prop_dat = object_ptr_data(ptc, sizeof(paxos_tx_count_t));
-            map_set(&rep_state.proposals, paxos_key, new_prop_dat);
-        }
-    }
-
-    int majority = MAJORITY(rep_state.num_peers);
-    bool send_tx = (ptc != NULL && ptc->grant_count >= majority);
-    double tx_score = (ptc != NULL) ? ptc->score : 0.0;
+    int count = paxos_record_grant(&rep_state.paxos, id1, id2, tx_score);
+    bool send_tx = (count >= PAXOS_MAJORITY(rep_state.num_peers));
 
     /* Capture task_uuid before potential removal */
     char task_uuid_str[UUID_STRING_LEN + 1] = {0};
@@ -347,32 +298,11 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
         json_decref(payload);
     }
 
-    pthread_mutex_lock(&rep_state.lock);
+    int wait_sec = paxos_record_nack(&rep_state.paxos, id1, id2);
 
-    char from_uuid[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(nmsg->from_whom.uuid, from_uuid);
+    log_debug(proc->logger, "Reputation: nack backoff %d seconds\n", wait_sec);
+    (void)wait_sec;
 
-    /* Store task info as composite key alongside backoff */
-    char paxos_key[64];
-    snprintf(paxos_key, sizeof(paxos_key), "%.0f:%.0f", id1, id2);
-
-    data_t *backoff_dat = NULL;
-    time_t next_retry = time(NULL) + 2;  /* Default 2 second initial backoff */
-
-    if (map_get(&rep_state.backoff, paxos_key, &backoff_dat) == 0)
-    {
-        int prev = 0;
-        data_integer(backoff_dat, &prev);
-        time_t wait = (time_t)((double)((long)prev - time(NULL)) * BACKOFF_MULT);
-        if (wait > BACKOFF_MAX_SEC) wait = BACKOFF_MAX_SEC;
-        if (wait < 1) wait = 2;
-        next_retry = time(NULL) + wait;
-    }
-
-    data_t *retry_dat = integer_data((int)next_retry);
-    map_set(&rep_state.backoff, paxos_key, retry_dat);
-
-    pthread_mutex_unlock(&rep_state.lock);
     return true;
 }
 
@@ -435,58 +365,15 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
     const char *task_uuid_str = json_string_value(json_object_get(payload, "task_uuid"));
 
-    pthread_mutex_lock(&rep_state.lock);
-
-    /* Check if we granted this: look in requests array by matching id2 */
-    bool granted = false;
-    int req_idx = -1;
-    for (size_t i = 0; i < array_size(&rep_state.requests); i++)
+    if (!paxos_has_granted_id(&rep_state.paxos, (int)id2))
     {
-        data_t *elem = NULL;
-        if (array_get(&rep_state.requests, (int)i, &elem) == 0 && elem != NULL)
-        {
-            int stored_id2 = 0;
-            data_integer(elem, &stored_id2);
-            if (stored_id2 == (int)id2)
-            {
-                granted = true;
-                req_idx = (int)i;
-                break;
-            }
-        }
-    }
-
-    if (!granted)
-    {
-        pthread_mutex_unlock(&rep_state.lock);
         json_decref(payload);
         log_debug(proc->logger, "Reputation: Transaction not granted by us, dropping\n");
         return true;
     }
 
-    /* Remove from requests array */
-    data_t *elem_to_remove = NULL;
-    if (array_get(&rep_state.requests, req_idx, &elem_to_remove) == 0 && elem_to_remove != NULL)
-        array_remove(&rep_state.requests, elem_to_remove);
-
-    /* Store score in proposals */
-    char paxos_key[64];
-    snprintf(paxos_key, sizeof(paxos_key), "%.0f:%.0f", id1, id2);
-
-    data_t *prop_dat = NULL;
-    if (map_get(&rep_state.proposals, paxos_key, &prop_dat) != 0)
-    {
-        paxos_tx_count_t *ptc = smrt_create(sizeof(paxos_tx_count_t));
-        if (ptc != NULL)
-        {
-            ptc->score = score;
-            ptc->grant_count = 0;
-            data_t *new_prop = object_ptr_data(ptc, sizeof(paxos_tx_count_t));
-            map_set(&rep_state.proposals, paxos_key, new_prop);
-        }
-    }
-
-    pthread_mutex_unlock(&rep_state.lock);
+    /* Record the grant (score) in the paxos proposals for later acceptance tracking */
+    paxos_record_grant(&rep_state.paxos, id1, id2, score);
     json_decref(payload);
 
     /* Send ACCEPTED back */
@@ -544,39 +431,23 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
     double id2 = json_real_value(j_id2);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
 
-    char paxos_key[64];
+    /* Look up score from paxos proposals */
+    char paxos_key[PAXOS_KEY_LEN];
     snprintf(paxos_key, sizeof(paxos_key), "%.0f:%.0f", id1, id2);
 
-    pthread_mutex_lock(&rep_state.lock);
-
-    /* Look up score from proposals */
+    pthread_mutex_lock(&rep_state.paxos.lock);
     data_t *prop_dat = NULL;
-    if (map_get(&rep_state.proposals, paxos_key, &prop_dat) != 0)
+    double score = 0.0;
+    if (map_get(&rep_state.paxos.proposals, paxos_key, &prop_dat) == 0)
     {
-        pthread_mutex_unlock(&rep_state.lock);
-        json_decref(payload);
-        log_debug(proc->logger, "Reputation: handle_accepted: no proposal found for key\n");
-        return true;
+        paxos_proposal_t *ptc = NULL;
+        data_object_ptr(prop_dat, (void **)&ptc);
+        if (ptc != NULL) score = ptc->score;
     }
+    pthread_mutex_unlock(&rep_state.paxos.lock);
 
-    paxos_tx_count_t *ptc = NULL;
-    data_object_ptr(prop_dat, (void **)&ptc);
-    double score = (ptc != NULL) ? ptc->score : 0.0;
-
-    /* Track acceptance count per composite key */
-    data_t *acc_dat = NULL;
-    int acc_count = 0;
-    if (map_get(&rep_state.acceptances, paxos_key, &acc_dat) == 0)
-    {
-        data_integer(acc_dat, &acc_count);
-    }
-    acc_count += 1;
-    data_t *new_acc_dat = integer_data(acc_count);
-    map_set(&rep_state.acceptances, paxos_key, new_acc_dat);
-
-    bool commit = (acc_count >= MAJORITY(rep_state.num_peers));
-
-    pthread_mutex_unlock(&rep_state.lock);
+    int acc_count = paxos_record_acceptance(&rep_state.paxos, id1, id2);
+    bool commit = (acc_count >= PAXOS_MAJORITY(rep_state.num_peers));
 
     if (commit)
     {
@@ -594,6 +465,7 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
         {
             tx_history_update(&rep_state.history, peer_uuid, peer_uuid, score);
         }
+        paxos_advance_chain(&rep_state.paxos);
         log_info(proc->logger, "Reputation: Transaction committed\n");
     }
     else
@@ -869,17 +741,15 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
         map_set(&rep_state.my_requests, task_str, tx_dat);
     }
 
-    /* Compute Paxos ID — advance last_id and derive id1 from the paxos index */
-    rep_state.last_id += 1.0;
-    double id1 = paxos_id_index(rep_state.last_id, (double)rep_state.num_peers);
-    int chain_len = tx_history_len(&rep_state.history);
-    double id2 = (double)(chain_len + 1);
+    pthread_mutex_unlock(&rep_state.lock);
+
+    /* Compute Paxos IDs via shared engine */
+    double id1, id2;
+    paxos_next_ids(&rep_state.paxos, &id1, &id2);
 
     /* Get identity UUID for the request */
     char identity_uuid[UUID_STRING_LEN + 1];
     uuid_unparse_lower(peer_uuid, identity_uuid);
-
-    pthread_mutex_unlock(&rep_state.lock);
 
     /* Broadcast Paxos Phase 1a: request permission from all peers */
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
@@ -914,6 +784,7 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
     _ensure_init();
 
     rep_state.num_peers = (int)proc->protocol.num_peers;
+    paxos_init(&rep_state.paxos, rep_state.num_peers, logger);
 
     /* Register protocol handlers */
     process_register_handler(proc, (char *)REP_PROTO_REQUEST,   (handler_ptr_t)handle_request);

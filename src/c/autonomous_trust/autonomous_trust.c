@@ -267,6 +267,11 @@ int run_autonomous_trust(char *q_in, char *q_out,
                 if (messaging_send("negotiation", TASK_STATUS, &task_msg, false) != 0)
                     log_exception(&logger);
                 break;
+            case UPDATE_PROPOSAL:
+                /* Route update proposals to fleet process */
+                if (messaging_send("fleet", UPDATE_PROPOSAL, &task_msg, false) != 0)
+                    log_exception(&logger);
+                break;
             default:
                 log_warn(&logger, "%s: unexpected extern message type %ld\n", name, task_msg.type);
                 break;
@@ -313,6 +318,12 @@ int run_autonomous_trust(char *q_in, char *q_out,
                     break;
                 case TRANSACTION_SCORE:
                     /* Transaction scores go to extern */
+                    if (array_append(&extern_msgs, msg_dat) != 0)
+                        log_exception(&logger);
+                    do_send = true;
+                    break;
+                case UPDATE_ACCEPTED:
+                    /* Update accepted notifications go to extern */
                     if (array_append(&extern_msgs, msg_dat) != 0)
                         log_exception(&logger);
                     do_send = true;

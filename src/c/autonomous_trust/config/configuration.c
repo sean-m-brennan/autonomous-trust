@@ -277,11 +277,13 @@ int load_config(char *filepath, config_t **config_ptr, char *cfg_name, logger_t 
         log_error(logger, "No config for %s\n", cfg_name);
         return -1;
     }
-    config->data_struct = smrt_create(config->data_len); // FIXME needs freed
+    config->data_struct = smrt_create(config->data_len);
     if (config->data_struct == NULL)
         return EXCEPTION(ENOMEM);
     if (read_config_file(abspath, config->data_struct) != 0)
     {
+        smrt_deref(config->data_struct);
+        config->data_struct = NULL;
         log_exception_extra(logger, " for config named '%s'\n", cfg_name);
         return -1;
     }
