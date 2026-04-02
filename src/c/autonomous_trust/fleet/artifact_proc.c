@@ -439,7 +439,7 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
 
         if (net_msg_pack_json(rnmsg, ready) == 0)
         {
-            messaging_send("fleet", NET_MESSAGE, &ready_msg, false);
+            messaging_send("update", NET_MESSAGE, &ready_msg, false);
         }
         json_decref(ready);
 

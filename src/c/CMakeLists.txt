@@ -254,6 +254,9 @@ set(libsrc
     autonomous_trust/fleet/artifact_store.c
     autonomous_trust/fleet/artifact_proc_helpers.c
     autonomous_trust/fleet/artifact_proc.c
+    autonomous_trust/fleet/update_proc_helpers.c
+    autonomous_trust/fleet/update_selftest.c
+    autonomous_trust/fleet/update_proc.c
 )
 set(libhdr
     autonomous_trust.h
@@ -289,6 +292,7 @@ set(libhdr
     autonomous_trust/fleet/fleet_proc.h
     autonomous_trust/fleet/artifact_store.h
     autonomous_trust/fleet/artifact_proc.h
+    autonomous_trust/fleet/update_proc.h
 )
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust)
 
@@ -727,6 +731,15 @@ set_source_files_properties(test/artifact_proc_test.c PROPERTIES COMPILE_FLAGS "
 target_link_libraries(artifact_proc_test PRIVATE ${TEST_DEPENDENCIES})
 
 add_test(NAME artifact_proc_test COMMAND $<TARGET_FILE:artifact_proc_test>)
+
+add_executable(update_proc_test
+    test/update_proc_test.c
+    autonomous_trust/fleet/update_proc_helpers.c
+    autonomous_trust/fleet/update_selftest.c)
+set_source_files_properties(test/update_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(update_proc_test PRIVATE ${TEST_DEPENDENCIES})
+
+add_test(NAME update_proc_test COMMAND $<TARGET_FILE:update_proc_test>)
 
 endif() # LIBCHECK_LIBRARY
 
