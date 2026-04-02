@@ -47,6 +47,7 @@ typedef struct {
     char binary_path[256];
     long timestamp;
     int attempt;
+    char type[16];                              /* "binary" or "config" */
 } update_state_t;
 
 /* --- State file helpers (pure, no process deps) --- */

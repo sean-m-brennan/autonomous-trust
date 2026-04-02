@@ -28,6 +28,7 @@
 #include "fleet/update_proc.h"
 #include "fleet/artifact_proc.h"
 #include "fleet/artifact_store.h"
+#include "fleet/config_proc.h"
 #include "config/configuration.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
@@ -197,6 +198,7 @@ static int stage_and_apply(const process_t *proc,
     strncpy(state.hash_hex, hash_hex, sizeof(state.hash_hex) - 1);
     strncpy(state.backup_path, backup_path, sizeof(state.backup_path) - 1);
     strncpy(state.binary_path, binary_path, sizeof(state.binary_path) - 1);
+    strncpy(state.type, "binary", sizeof(state.type) - 1);
     state.timestamp = (long)time(NULL);
     state.attempt = 1;
 
@@ -219,7 +221,30 @@ static int stage_and_apply(const process_t *proc,
  */
 static void rollback(const process_t *proc, update_state_t *state)
 {
-    copy_file(state->backup_path, state->binary_path);
+    if (strcmp(state->type, "config") == 0)
+    {
+        /* Config rollback: restore all backed-up configs */
+        char cfg_dir[CFG_PATH_LEN];
+        if (get_cfg_dir(cfg_dir) == 0)
+        {
+            if (config_restore_all(cfg_dir, update_data_dir) != 0)
+            {
+                log_error(proc->logger, "Update: config rollback failed — could not restore configs\n");
+                update_state_delete(update_data_dir);
+                return;
+            }
+        }
+    }
+    else
+    {
+        /* Binary rollback: restore backup binary */
+        if (copy_file(state->backup_path, state->binary_path) != 0)
+        {
+            log_error(proc->logger, "Update: rollback failed — could not restore backup\n");
+            update_state_delete(update_data_dir);
+            return;
+        }
+    }
 
     strncpy(state->state, "ROLLBACK", sizeof(state->state) - 1);
     state->state[sizeof(state->state) - 1] = '\0';
@@ -306,7 +331,16 @@ static void run_health_check(const process_t *proc, update_state_t *state)
 
     /* All checks passed */
     update_state_delete(update_data_dir);
-    unlink(state->backup_path);
+
+    /* Clean up based on type */
+    if (strcmp(state->type, "config") == 0)
+        config_backup_delete(update_data_dir);
+    else
+    {
+        char backup_buf[512];
+        if (update_backup_path(update_data_dir, backup_buf, sizeof(backup_buf)) == 0)
+            unlink(backup_buf);
+    }
 
     broadcast_status(proc, state->hash_hex, state->version, "success",
                      "update applied and verified");
@@ -316,6 +350,60 @@ static void run_health_check(const process_t *proc, update_state_t *state)
 /* ------------------------------------------------------------------ */
 /* Protocol handlers                                                   */
 /* ------------------------------------------------------------------ */
+
+/**
+ * handle_config_ready - a new config has been written to disk, trigger restart.
+ */
+static bool handle_config_ready(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    net_msg_t *nmsg = &msg->info.net_msg;
+    log_info(proc->logger, "Update: config ready notification received\n");
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return false;
+
+    const char *config_name = json_string_value(json_object_get(payload, "config_name"));
+    const char *hash_hex = json_string_value(json_object_get(payload, "hash"));
+    const char *version = json_string_value(json_object_get(payload, "version"));
+
+    if (!config_name || !hash_hex || !version)
+    {
+        json_decref(payload);
+        return false;
+    }
+
+    log_info(proc->logger, "Update: config '%s' v%s ready, triggering restart\n",
+             config_name, version);
+
+    if (ensure_staging_dir() != 0)
+    {
+        json_decref(payload);
+        return false;
+    }
+
+    update_state_t state;
+    memset(&state, 0, sizeof(state));
+    strncpy(state.state, "APPLYING", sizeof(state.state) - 1);
+    strncpy(state.version, version, sizeof(state.version) - 1);
+    strncpy(state.hash_hex, hash_hex, sizeof(state.hash_hex) - 1);
+    strncpy(state.type, "config", sizeof(state.type) - 1);
+    state.timestamp = (long)time(NULL);
+    state.attempt = 1;
+
+    if (update_state_write(update_data_dir, &state) != 0)
+    {
+        json_decref(payload);
+        return false;
+    }
+
+    json_decref(payload);
+
+    log_info(proc->logger, "Update: triggering restart for config update\n");
+    execl("/usr/bin/sudo", "sudo", "systemctl", "restart", "autonomous-trust", NULL);
+    log_error(proc->logger, "Update: execl failed: %s\n", strerror(errno));
+    return false;
+}
 
 /**
  * handle_artifact_ready - an artifact download completed and is ready for install.
@@ -442,6 +530,8 @@ int update_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
                              (handler_ptr_t)handle_artifact_ready);
     process_register_handler(proc, (char *)UPDATE_PROTO_STATUS,
                              (handler_ptr_t)handle_update_status);
+    process_register_handler(proc, (char *)CONFIG_PROTO_READY,
+                             (handler_ptr_t)handle_config_ready);
 
     proc->protocol.phase = 1;
     return process_run(proc, queues, signal, logger);
