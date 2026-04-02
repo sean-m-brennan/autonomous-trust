@@ -45,6 +45,7 @@ typedef struct {
     int received_chunks;
     uint8_t expected_hash[UPDATE_HASH_LEN];
     char version[UPDATE_VERSION_LEN + 1];
+    char notify_process[65];   /* process to receive ARTIFACT_READY (default: "update") */
 } download_state_t;
 
 /* --- Testable helper functions (no process/messaging deps) --- */
