@@ -59,6 +59,7 @@ int update_state_write(const char *data_dir, const update_state_t *state)
     json_object_set_new(root, "binary_path", json_string(state->binary_path));
     json_object_set_new(root, "timestamp",   json_integer(state->timestamp));
     json_object_set_new(root, "attempt",     json_integer(state->attempt));
+    json_object_set_new(root, "type",        json_string(state->type));
 
     char file_path[512];
     snprintf(file_path, sizeof(file_path), "%s/update/state.json", data_dir);
@@ -102,6 +103,10 @@ int update_state_read(const char *data_dir, update_state_t *state)
 
     state->timestamp = (long)json_integer_value(json_object_get(root, "timestamp"));
     state->attempt   = (int)json_integer_value(json_object_get(root, "attempt"));
+
+    s = json_string_value(json_object_get(root, "type"));
+    if (s) strncpy(state->type, s, sizeof(state->type) - 1);
+    state->type[sizeof(state->type) - 1] = '\0';
 
     json_decref(root);
     return 0;
