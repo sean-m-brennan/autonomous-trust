@@ -10,9 +10,11 @@ The system provides two deployment tiers:
 
 - **Phase 1 (Bare-metal systemd service):** SSH to a device, run one script, node is live. Uses the `at_demo` C binary with shared library dependencies on a standard Debian-based OS. Suitable for development and non-security-critical deployments.
 
-- **Phase 4 (Hardened minimal OS image):** Flash an SD card, insert, power on. True zero-touch deployment. The image contains a fully static `at_demo` binary on a dm-verity-protected, minimal Buildroot Linux. No runtime shared libraries, no shell post-provisioning, no SSH. Every byte in the image is accounted for.
+- **Phase 2 (Hardened minimal OS image):** Flash an SD card, insert, power on. True zero-touch deployment. The image contains a fully static `at_demo` binary on a dm-verity-protected, minimal Buildroot Linux. No runtime shared libraries, no shell post-provisioning, no SSH. Every byte in the image is accounted for.
 
-The motivation for Phase 4 is that for a trust framework, supply chain compromise is existential -- it undermines the product's core value proposition. The hardened image captures approximately 80% of a unikernel's supply chain benefit at approximately 10% of the implementation cost, and works on target hardware today.
+- **Phase 3 (Decentralized fleet management):** The mesh manages itself. Software updates and configuration changes are proposed, voted on via Paxos consensus, distributed peer-to-peer, and automatically rolled back if health checks fail. No central server, no SSH, no single point of compromise.
+
+The motivation for Phase 2 is that for a trust framework, supply chain compromise is existential -- it undermines the product's core value proposition. The hardened image captures approximately 80% of a unikernel's supply chain benefit at approximately 10% of the implementation cost, and works on target hardware today.
 
 ## 2. Architecture Diagram
 
@@ -76,6 +78,40 @@ The motivation for Phase 4 is that for a trust framework, supply chain compromis
 +------------------------------------------------------------------+
 ```
 
+### Phase 3: Fleet Management Process Architecture
+
+```
++------------------+     +-------------------+     +--------------------+
+| fleet_proc       |     | artifact_proc     |     | update_proc        |
+| Paxos consensus  | --> | Chunked P2P       | --> | Binary swap        |
+| for binary       |     | transfer (960B    |     | systemd restart    |
+| update proposals |     | chunks, blake2b)  |     | Health check       |
++------------------+     +-------------------+     | Rollback           |
+                                |                   +--------------------+
++------------------+            |                          ^
+| config_proc      |            |                          |
+| Paxos consensus  | ---------->+ (reuses artifact_proc    |
+| for config       |              via notify_process)      |
+| proposals        | ---------------------------------------->
+| Identity guard   |   (sends CONFIG_READY to update_proc)
++------------------+
+
+Update lifecycle:
+  IDLE -> STAGING -> APPLYING -> [restart] -> HEALTH_CHECK -> COMPLETE
+                                                           -> ROLLBACK -> [restart] -> IDLE
+
+Config update:
+  Propose -> Paxos vote -> Accept -> Artifact fetch -> Backup all configs -> Write -> Restart
+```
+
+### Deployment Requirements for Phase 3
+
+Phase 3 fleet management requires the following on each node:
+
+- **Sudoers entry:** `at_user ALL=(root) NOPASSWD: /usr/bin/systemctl restart autonomous-trust`
+- **Systemd unit:** `ExecStartPre=-/bin/mkdir -p /opt/autonomous-trust/var/at/update`
+- **Writable paths:** `/opt/autonomous-trust/var/at/` for artifacts, update staging, config backups, and state files
+
 ## 3. Security Model
 
 ### Supply Chain Threat Model
@@ -116,7 +152,7 @@ at_demo starts (signature verified)
 | Excluded Component | Rationale |
 |--------------------|-----------|
 | Package manager (apt, opkg) | Eliminates runtime package supply chain; prevents unauthorized software installation |
-| SSH daemon | Replaced by AT fleet management (Phase 5); removes remote access attack surface |
+| SSH daemon | Replaced by AT's decentralized fleet management (Phase 3); removes remote access attack surface |
 | Shell (post-provisioning) | Busybox is present for first boot only; prevents lateral movement via shell |
 | Compiler, interpreter, debug tools | No on-device code execution capability for attackers |
 | Man pages, docs, locales | Reduces image size and eliminates unnecessary files |
@@ -131,7 +167,7 @@ Full Debian  <--  Docker  <--  Static binary  <--  Minimal Linux (Buildroot)  <-
      ~150+ packages                    ~15 packages                    ~5 packages     formally verified
 ```
 
-Phase 1 sits at the "Static binary on Full Debian" point. Phase 4 sits at the "Minimal Linux (Buildroot)" point.
+Phase 1 sits at the "Static binary on Full Debian" point. Phase 2 sits at the "Minimal Linux (Buildroot)" point.
 
 ### dm-verity Details
 
@@ -154,7 +190,7 @@ Binary signing uses Ed25519 via OpenSSL (available in OpenSSL 1.1.1+):
 - **Key generation:** `openssl genpkey -algorithm Ed25519` produces a PEM private key. The public key is extracted with `openssl pkey -pubout`.
 - **Signing:** `openssl pkeyutl -sign -inkey signing.key -rawin -in at_demo -out at_demo.sig` produces a detached signature.
 - **Verification:** `openssl pkeyutl -verify -pubin -inkey signing.pub -rawin -in at_demo -sigfile at_demo.sig` returns exit code 0 on success.
-- The signing key is the initial trust root; Phase 5's consensus mechanism can rotate it.
+- The signing key is the initial trust root; Phase 3's consensus mechanism can rotate it.
 
 Ed25519 was chosen over NaCl's `crypto_sign` directly because `openssl` is a portable CLI tool available in build environments without requiring a custom C program for signing. The underlying algorithm is identical (Ed25519/RFC 8032).
 
@@ -166,30 +202,32 @@ SSH to an ARM device, run one script, node is live. Uses the `at_demo` C binary 
 
 **Implemented files:** `embedded/build-arm.sh`, `embedded/install.sh`, `embedded/provision.sh`, `embedded/test-qemu.sh`, `embedded/autonomous-trust.service`.
 
-### Phase 2: Docker Compose -- Planned
-
-For devices that already run Docker. A single-node `docker-compose.yml` with `network_mode: host`, the `autonomous-trust-c` multi-arch image, and a volume mount for persistent config. Not yet implemented.
-
-### Phase 3: Unikraft Unikernel -- Future R&D
-
-Minimal-footprint deployment on KVM-capable edge hardware. Prior work exists in `embedded-trust/` (Python 3.7.4 unikernel with PyNaCl/libsodium). Current assessment: best suited for KVM/Xen environments, not bare-metal Pi. No major unikernel framework has production-ready bare-metal ARM support. Requires a Linux KVM host, which reintroduces supply chain surface.
-
-### Phase 4: Hardened Minimal OS Image -- Implemented
+### Phase 2: Hardened Minimal OS Image -- Implemented
 
 Flash SD card, insert, power on. Zero-touch deployment. Fully static binary on a dm-verity-protected Buildroot Linux. Approximately 15 packages total (versus 150+ for Debian minimal). Zero runtime shared libraries.
 
 **Implemented files:** `src/autonomous-trust/Dockerfile-c-static`, `embedded/build-image.sh`, `embedded/sign-binary.sh`, `embedded/verify-binary.sh`, `embedded/verify-image.sh`, `embedded/flash.sh`, `embedded/buildroot/Dockerfile`, `embedded/buildroot/at_defconfig`, `embedded/buildroot/kernel.defconfig`, `embedded/buildroot/post-build.sh`, `embedded/buildroot/post-image.sh`, `embedded/buildroot/rootfs-overlay/`.
 
-### Phase 5: Decentralized Fleet Management -- Planned
+### Phase 3: Decentralized Fleet Management -- Implemented
 
-The mesh manages itself using AT's existing trust, negotiation, and reputation machinery. Software updates are proposed, verified, voted on via Paxos consensus, distributed peer-to-peer, and rolled back automatically if health checks fail. No central server. Estimated effort: 3-4 weeks building on existing AT infrastructure.
+The mesh manages itself using AT's existing trust, negotiation, and reputation machinery. No central server, no single point of compromise. Decomposed into four sub-projects:
+
+**3A: Update Proposal + Consensus.** A shared Paxos engine (extracted from the reputation process) enables trust-gated voting on update proposals. Proposals carry Ed25519 signatures and require a minimum proposer reputation threshold. Only peers above the threshold can propose; acceptance requires majority quorum.
+
+**3B: Artifact Distribution.** Content-addressed, chunked peer-to-peer binary transfer over AT's existing encrypted UDP channels. Files are hashed with blake2b-256, chunked to 960 bytes (MAX_MSG_SIZE=1024 minus 64 bytes JSON overhead), and reassembled with full-artifact hash verification. Pull-based protocol: REQUEST → MANIFEST → CHUNK_REQ → CHUNK → COMPLETE → READY. File-based artifact store persists chunks to disk for serving to other peers.
+
+**3C: Self-Update + Health Check.** Binary staging within the writable data partition, backup of the current binary, atomic `rename()` swap, and restart via `sudo systemctl restart` (narrowest privilege escalation -- only the restart needs root, via a sudoers entry). After restart, a self-test suite runs: identity load, crypto sign/verify round-trip, config parse, and peer handshake (tries multiple peers to avoid false negatives). Automatic rollback with loop prevention (attempt counter in state file). Update status broadcast to all peers.
+
+**3D: Configuration Distribution.** Per-file config updates via the same consensus + transfer pipeline. Paxos vote on config proposals, transfer via artifact_proc, full backup of all existing configs before writing the new one, restart + health check + rollback. Identity config is immutable -- attempts to modify it are rejected and penalized via the reputation system. Rollback restores the complete config snapshot.
+
+**Implemented files:** `src/c/autonomous_trust/fleet/fleet_proc.{h,c}`, `fleet_helpers.c`, `update_proposal.{h,c}`, `artifact_store.{h,c}`, `artifact_proc.{h,c}`, `artifact_proc_helpers.c`, `update_proc.{h,c}`, `update_proc_helpers.c`, `update_selftest.c`, `config_proc.{h,c}`, `config_proc_helpers.c`; `src/c/autonomous_trust/algorithms/paxos.{h,c}`. Tests: `test/fleet_proc_test.c`, `test/artifact_store_test.c`, `test/artifact_proc_test.c`, `test/update_proc_test.c`, `test/config_proc_test.c` (4 test suites, 146 total checks).
 
 ## 5. Component Reference
 
 | File | Purpose | Inputs | Outputs |
 |------|---------|--------|---------|
 | `embedded/build-arm.sh` | Cross-compile `at_demo` for ARM64 (and optionally AMD64) via `docker buildx`. Supports `--static` for fully static builds. | Source code in `src/c/`, `src/protobuf/`; `Dockerfile-c` or `Dockerfile-c-static` | `embedded/dist/autonomous-trust-{arch}.tar.gz` or `autonomous-trust-{arch}-static.tar.gz` |
-| `embedded/build-image.sh` | Orchestrate the full Phase 4 build: static binary, optional signing, Buildroot in Docker, dm-verity, SD card image assembly. | Static binary from `build-arm.sh --static`; Buildroot configs in `embedded/buildroot/` | `embedded/dist/autonomous-trust.img`, `embedded/dist/root-hash.txt` |
+| `embedded/build-image.sh` | Orchestrate the full Phase 2 build: static binary, optional signing, Buildroot in Docker, dm-verity, SD card image assembly. | Static binary from `build-arm.sh --static`; Buildroot configs in `embedded/buildroot/` | `embedded/dist/autonomous-trust.img`, `embedded/dist/root-hash.txt` |
 | `embedded/install.sh` | Install AT on a bare-metal Linux device. Detects architecture, installs runtime deps via apt, deploys binary, enables systemd service. | Architecture-specific tarball from `build-arm.sh` | Binary at `/usr/local/bin/at_demo`, library at `/usr/local/lib/`, systemd service enabled |
 | `embedded/provision.sh` | Generate provisioning configs for a fleet of N nodes. Produces per-node bootstrap configs with peer addresses and optional full identity pre-generation. | `--nodes N`, `--subnet CIDR`; optionally `at_demo` in PATH for `--full-identity` | Per-node tarballs in `embedded/fleet-configs/` containing bootstrap configs and environment files |
 | `embedded/sign-binary.sh` | Sign `at_demo` with an Ed25519 key. Can generate a new keypair on first use. | Binary file, Ed25519 private key (PEM) | Detached signature file (`at_demo.sig`) |
@@ -205,10 +243,17 @@ The mesh manages itself using AT's existing trust, negotiation, and reputation m
 | `embedded/buildroot/post-image.sh` | Buildroot post-image hook. Generates dm-verity hash tree via `veritysetup format`, assembles FAT32 boot partition (Pi firmware, U-Boot, kernel, DTBs, config.txt), creates data partition, assembles final 3-partition SD card image via `sfdisk` + `dd`. | Buildroot images directory (rootfs.ext4, Image, DTBs, u-boot.bin, rpi-firmware) | `autonomous-trust.img`, `root-hash.txt`, `verity.table`, `boot.vfat`, `data.ext4` |
 | `embedded/buildroot/rootfs-overlay/etc/systemd/system/autonomous-trust.service` | Copy of the systemd service file placed into the Buildroot rootfs overlay. Identical to `embedded/autonomous-trust.service`. | N/A | N/A (baked into rootfs) |
 | `src/autonomous-trust/Dockerfile-c-static` | Multi-stage Docker build producing a fully static `at_demo`. Stage 1 builds with `clang`, `-DAT_STATIC=ON`, linking libsodium, libjansson, libuuid, protobuf-c statically. Stage 2 verifies `ldd` reports "not a dynamic executable". | `src/c/`, `src/protobuf/`, `GIT_VERSION` build arg | Docker image with static `at_demo` at `/usr/local/bin/at_demo` |
+| `src/c/autonomous_trust/fleet/fleet_proc.{h,c}` | Fleet process: Paxos consensus for binary update proposals. Validates Ed25519 signatures, checks reputation thresholds, manages vote protocol, triggers artifact fetch on acceptance. | Update proposals from peers, reputation scores | UPDATE_ACCEPTED messages, ARTIFACT_REQUEST to artifact_proc |
+| `src/c/autonomous_trust/fleet/update_proposal.{h,c}` | Update proposal struct and operations: JSON serialization, Ed25519 signing/verification. Defines UPDATE_HASH_LEN (32), UPDATE_VERSION_LEN (64), UPDATE_SIG_LEN (64). | Proposal data, Ed25519 keys | Serialized/signed proposals |
+| `src/c/autonomous_trust/fleet/artifact_store.{h,c}` | File-based artifact storage. Chunks stored as individual files under `var/at/artifacts/<hash_hex>/`. Manifest JSON tracks chunk count and sizes. blake2b-256 streaming verification of reassembled artifacts. | Chunk data, expected hashes | Verified artifacts on disk |
+| `src/c/autonomous_trust/fleet/artifact_proc.{h,c}` | P2P artifact transfer process. Pull-based protocol: REQUEST → MANIFEST → CHUNK_REQ → CHUNK → COMPLETE → READY. Configurable ARTIFACT_READY routing via `notify_process` field (defaults to "update", config_proc sets "config"). | Artifact requests from fleet/config_proc | ARTIFACT_READY to update_proc or config_proc |
+| `src/c/autonomous_trust/fleet/update_proc.{h,c}` | Self-update process. Handles ARTIFACT_READY (binary) and CONFIG_READY (config). Stages binary swap, triggers systemd restart, runs post-restart health check (identity, crypto, config, peer handshake), automatic rollback on failure. State file persists across restart with type field for binary vs config rollback. | ARTIFACT_READY, CONFIG_READY | systemd restart, UPDATE_STATUS broadcast |
+| `src/c/autonomous_trust/fleet/config_proc.{h,c}` | Config distribution process. Paxos consensus for per-file config proposals. Identity guard rejects and penalizes attempts to modify identity config. Backs up all configs before writing new one. Signals update_proc for restart. | Config proposals from peers | CONFIG_READY to update_proc, TRANSACTION_SCORE for identity violations |
+| `src/c/autonomous_trust/algorithms/paxos.{h,c}` | Shared Paxos consensus engine. Used by both fleet_proc (binary updates) and config_proc (config updates). Manages proposal IDs, Phase 1a/1b grant/nack protocol, quorum detection, chain advancement. | Vote requests/grants/nacks | Quorum decisions |
 
 ## 6. Boot Flow
 
-Step-by-step from power-on to `at_demo` running on a Pi4 with the Phase 4 image:
+Step-by-step from power-on to `at_demo` running on a Pi4 with the Phase 2 image:
 
 1. **Pi4 EEPROM loads boot partition.** The EEPROM reads the FAT32 partition (partition 1) from the SD card at `/dev/mmcblk0p1`.
 
@@ -333,7 +378,7 @@ No major unikernel framework (MirageOS, OSv, IncludeOS, Rumprun) has production-
 
 Prior work exists in `embedded-trust/` (Python 3.7.4 unikernel with PyNaCl/libsodium), but Python 3.7.4 is EOL, the current codebase requires 3.13, and the C-only unikernel path is only at hello-world proof-of-concept stage.
 
-What would change that: (1) Unikraft or another framework shipping a bare-metal ARM platform driver; (2) the C unikernel path being built out with full `at_demo` support; (3) edge gateways with KVM capability becoming the primary deployment target (Phase 3 path).
+What would change that: (1) Unikraft or another framework shipping a bare-metal ARM platform driver; (2) the C unikernel path being built out with full `at_demo` support; (3) edge gateways with KVM capability becoming the primary deployment target.
 
 ### Why dm-verity over other integrity mechanisms
 
@@ -349,6 +394,6 @@ dm-verity provides the strongest whole-filesystem integrity guarantee with minim
 
 SSH is a remote access mechanism -- and a high-value attack surface. For a trust framework device, remote management should use the trust framework itself, not an independent channel that bypasses it.
 
-Phase 4 removes SSH after first boot. Phase 5 (planned) replaces traditional remote management with AT's peer-to-peer, trust-gated, consensus-based fleet management. Software updates are proposed, voted on, and distributed through AT's own encrypted channels. No central server, no SSH keys to manage, no single point of compromise.
+Phase 2 removes SSH after first boot. Phase 3 replaces traditional remote management with AT's peer-to-peer, trust-gated, consensus-based fleet management. Software updates and configuration changes are proposed, voted on via Paxos consensus, distributed peer-to-peer, and automatically rolled back if health checks fail -- all through AT's own encrypted channels. No central server, no SSH keys to manage, no single point of compromise.
 
 During initial provisioning (first boot), busybox provides a minimal shell if physical access is needed. After first boot, the shell is removed from the rootfs overlay.
