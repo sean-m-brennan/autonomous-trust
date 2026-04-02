@@ -239,6 +239,9 @@ int generate_subsystems_config(const char *cfg_dir)
     err = tracker_register_subsystem(&tracker, "fleet", "fleet_proc");
     if (err != 0)
         return err;
+    err = tracker_register_subsystem(&tracker, "artifact", "artifact_proc");
+    if (err != 0)
+        return err;
 
     char filepath[CFG_PATH_LEN + 1];
     snprintf(filepath, CFG_PATH_LEN, "%s/%s", cfg_dir, default_tracker_filename);

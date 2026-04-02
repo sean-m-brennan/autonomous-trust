@@ -17,10 +17,12 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sodium.h>
 
 #include "processes/processes.h"
 #include "fleet/fleet_proc.h"
 #include "fleet/update_proposal.h"
+#include "fleet/artifact_proc.h"
 #include "algorithms/paxos.h"
 #include "structures/map.h"
 #include "structures/map_priv.h"
@@ -380,6 +382,41 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
     notify.type = UPDATE_ACCEPTED;
     uuid_parse(prop_uuid_str, notify.info.update_accepted.proposal_uuid);
     messaging_send("AutonomousTrust", UPDATE_ACCEPTED, &notify, false);
+
+    /* Trigger artifact download for the accepted proposal */
+    pthread_mutex_lock(&fleet_state.lock);
+    data_t *accepted_dat = NULL;
+    if (map_get(&fleet_state.accepted_updates, prop_uuid_str, &accepted_dat) == 0 && accepted_dat != NULL)
+    {
+        update_proposal_t *accepted_prop = NULL;
+        data_object_ptr(accepted_dat, (ptr_t *)&accepted_prop);
+        if (accepted_prop != NULL)
+        {
+            char artifact_hash_hex[UPDATE_HASH_LEN * 2 + 1];
+            sodium_bin2hex(artifact_hash_hex, sizeof(artifact_hash_hex),
+                           accepted_prop->artifact_hash, UPDATE_HASH_LEN);
+
+            /* Send artifact request to the peer who sent us the acceptance */
+            json_t *fetch_req = json_object();
+            json_object_set_new(fetch_req, "hash", json_string(artifact_hash_hex));
+
+            generic_msg_t artifact_msg = {0};
+            artifact_msg.type = NET_MESSAGE;
+            net_msg_t *anmsg = &artifact_msg.info.net_msg;
+            strncpy(anmsg->process, "artifact", PROC_NAME_LEN);
+            anmsg->function = (char *)ARTIFACT_PROTO_REQUEST;
+            memcpy(&anmsg->to_whom, &nmsg->from_whom, sizeof(public_identity_t));
+            anmsg->encrypt = true;
+            strncpy(anmsg->return_to, "artifact", PROC_NAME_LEN);
+
+            net_msg_pack_json(anmsg, fetch_req);
+            json_decref(fetch_req);
+            messaging_send("network", NET_MESSAGE, &artifact_msg, false);
+
+            log_info(proc->logger, "Fleet: triggered artifact fetch for %s\n", artifact_hash_hex);
+        }
+    }
+    pthread_mutex_unlock(&fleet_state.lock);
 
     return true;
 }
