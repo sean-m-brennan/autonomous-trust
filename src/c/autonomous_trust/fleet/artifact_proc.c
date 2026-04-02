@@ -219,6 +219,14 @@ static bool handle_artifact_manifest(const process_t *proc, directory_t *queues,
 
     artifact_download_state_init(state, hash_hex, total_chunks, expected_hash, version);
 
+    /* Read notify_process from request payload, default to "update" */
+    const char *notify = json_string_value(json_object_get(payload, "notify_process"));
+    if (notify && strlen(notify) > 0)
+        strncpy(state->notify_process, notify, sizeof(state->notify_process) - 1);
+    else
+        strncpy(state->notify_process, "update", sizeof(state->notify_process) - 1);
+    state->notify_process[sizeof(state->notify_process) - 1] = '\0';
+
     /* Store in active_downloads map */
     pthread_mutex_lock(&artifact_state.lock);
     data_t *dat = object_ptr_data(state, sizeof(download_state_t));
@@ -408,6 +416,10 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         strncpy(version, state->version, sizeof(version) - 1);
         version[sizeof(version) - 1] = '\0';
 
+        char notify_target[65];
+        strncpy(notify_target, state->notify_process, sizeof(notify_target) - 1);
+        notify_target[sizeof(notify_target) - 1] = '\0';
+
         /* Remove from active downloads and free state */
         map_remove(&artifact_state.active_downloads, (char *)hash_hex);
         free(state);
@@ -439,7 +451,7 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
 
         if (net_msg_pack_json(rnmsg, ready) == 0)
         {
-            messaging_send("update", NET_MESSAGE, &ready_msg, false);
+            messaging_send(notify_target, NET_MESSAGE, &ready_msg, false);
         }
         json_decref(ready);
 
