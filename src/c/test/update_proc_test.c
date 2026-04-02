@@ -223,6 +223,35 @@ DEFINE_TEST(test_selftest_crypto_tampered)
 }
 END_TEST_DEFINITION()
 
+/* ---------------------------------------------------------------
+ * test_update_state_type_field
+ * --------------------------------------------------------------- */
+DEFINE_TEST(test_update_state_type_field)
+{
+    setup_test_dir();
+
+    update_state_t orig;
+    memset(&orig, 0, sizeof(orig));
+    strncpy(orig.state, "APPLYING", sizeof(orig.state) - 1);
+    strncpy(orig.type, "config", sizeof(orig.type) - 1);
+    orig.attempt = 1;
+
+    ck_assert_ret_ok(update_state_write(test_dir, &orig));
+
+    update_state_t loaded;
+    memset(&loaded, 0, sizeof(loaded));
+    ck_assert_ret_ok(update_state_read(test_dir, &loaded));
+    ck_assert_str_eq(loaded.type, "config");
+
+    strncpy(orig.type, "binary", sizeof(orig.type) - 1);
+    ck_assert_ret_ok(update_state_write(test_dir, &orig));
+    ck_assert_ret_ok(update_state_read(test_dir, &loaded));
+    ck_assert_str_eq(loaded.type, "binary");
+
+    teardown_test_dir();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(UpdateProc,
     test_state_file_roundtrip,
     test_state_file_rollback_guard,
@@ -231,5 +260,6 @@ RUN_TESTS(UpdateProc,
     test_state_delete,
     test_current_binary_path,
     test_selftest_crypto,
-    test_selftest_crypto_tampered
+    test_selftest_crypto_tampered,
+    test_update_state_type_field
 )
