@@ -251,6 +251,9 @@ set(libsrc
     autonomous_trust/fleet/update_proposal.c
     autonomous_trust/fleet/fleet_helpers.c
     autonomous_trust/fleet/fleet_proc.c
+    autonomous_trust/fleet/artifact_store.c
+    autonomous_trust/fleet/artifact_proc_helpers.c
+    autonomous_trust/fleet/artifact_proc.c
 )
 set(libhdr
     autonomous_trust.h
@@ -284,6 +287,8 @@ set(libhdr
     autonomous_trust/network/ntp.h
     autonomous_trust/fleet/update_proposal.h
     autonomous_trust/fleet/fleet_proc.h
+    autonomous_trust/fleet/artifact_store.h
+    autonomous_trust/fleet/artifact_proc.h
 )
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust)
 
@@ -706,6 +711,22 @@ set_source_files_properties(test/fleet_proc_test.c PROPERTIES COMPILE_FLAGS "-Wa
 target_link_libraries(fleet_proc_test PRIVATE ${TEST_DEPENDENCIES})
 
 add_test(NAME fleet_proc_test COMMAND $<TARGET_FILE:fleet_proc_test>)
+
+add_executable(artifact_store_test
+    test/artifact_store_test.c
+    autonomous_trust/fleet/artifact_store.c)
+set_source_files_properties(test/artifact_store_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(artifact_store_test PRIVATE ${TEST_DEPENDENCIES})
+
+add_test(NAME artifact_store_test COMMAND $<TARGET_FILE:artifact_store_test>)
+
+add_executable(artifact_proc_test
+    test/artifact_proc_test.c
+    autonomous_trust/fleet/artifact_proc_helpers.c)
+set_source_files_properties(test/artifact_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(artifact_proc_test PRIVATE ${TEST_DEPENDENCIES})
+
+add_test(NAME artifact_proc_test COMMAND $<TARGET_FILE:artifact_proc_test>)
 
 endif() # LIBCHECK_LIBRARY
 
