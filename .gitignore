@@ -98,6 +98,8 @@ dist
 /doc/AutonomousTrust.pdf
 /doc/whitepaper/HighTrust.pdf
 /embedded/.test-qemu/
+/embedded/.test-docker-fleet*/
+/embedded/.fleet-test*/
 /embedded/.buildroot-build/
 /embedded/dist/
 /embedded/fleet-configs/

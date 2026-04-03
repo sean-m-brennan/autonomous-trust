@@ -177,10 +177,20 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
     uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
     json_object_set_new(root, "from_uuid", json_string(uuid_str));
     json_object_set_new(root, "from_name", json_string(msg->from_whom.fullname));
+    json_object_set_new(root, "from_address", json_string(msg->from_whom.address));
+    json_object_set_new(root, "from_sig_hex",
+                        json_string((const char *)msg->from_whom.signature.public_hex));
+    json_object_set_new(root, "from_enc_hex",
+                        json_string((const char *)msg->from_whom.encryptor.public_hex));
 
     uuid_unparse_lower(msg->to_whom.uuid, uuid_str);
     json_object_set_new(root, "to_uuid", json_string(uuid_str));
     json_object_set_new(root, "to_name", json_string(msg->to_whom.fullname));
+    json_object_set_new(root, "to_address", json_string(msg->to_whom.address));
+    json_object_set_new(root, "to_sig_hex",
+                        json_string((const char *)msg->to_whom.signature.public_hex));
+    json_object_set_new(root, "to_enc_hex",
+                        json_string((const char *)msg->to_whom.encryptor.public_hex));
 
     if (msg->obj != NULL && msg->len > 0)
     {
@@ -358,6 +368,15 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     const char *from_name = json_string_value(json_object_get(root, "from_name"));
     if (from_name)
         strncpy(net_msg->from_whom.fullname, from_name, NAME_LEN);
+    const char *from_addr = json_string_value(json_object_get(root, "from_address"));
+    if (from_addr)
+        strncpy(net_msg->from_whom.address, from_addr, ADDR_LEN);
+    const char *from_sig = json_string_value(json_object_get(root, "from_sig_hex"));
+    if (from_sig && from_sig[0] != '\0')
+        public_signature_init(&net_msg->from_whom.signature, (const unsigned char *)from_sig);
+    const char *from_enc = json_string_value(json_object_get(root, "from_enc_hex"));
+    if (from_enc && from_enc[0] != '\0')
+        public_encryptor_init(&net_msg->from_whom.encryptor, (const unsigned char *)from_enc);
 
     const char *to_uuid = json_string_value(json_object_get(root, "to_uuid"));
     if (to_uuid)
@@ -365,6 +384,15 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     const char *to_name = json_string_value(json_object_get(root, "to_name"));
     if (to_name)
         strncpy(net_msg->to_whom.fullname, to_name, NAME_LEN);
+    const char *to_addr = json_string_value(json_object_get(root, "to_address"));
+    if (to_addr)
+        strncpy(net_msg->to_whom.address, to_addr, ADDR_LEN);
+    const char *to_sig = json_string_value(json_object_get(root, "to_sig_hex"));
+    if (to_sig && to_sig[0] != '\0')
+        public_signature_init(&net_msg->to_whom.signature, (const unsigned char *)to_sig);
+    const char *to_enc = json_string_value(json_object_get(root, "to_enc_hex"));
+    if (to_enc && to_enc[0] != '\0')
+        public_encryptor_init(&net_msg->to_whom.encryptor, (const unsigned char *)to_enc);
 
     const char *obj_str = json_string_value(json_object_get(root, "obj"));
     json_int_t obj_len = json_integer_value(json_object_get(root, "obj_len"));

@@ -23,6 +23,7 @@
 #include "fleet/fleet_proc.h"
 #include "fleet/update_proposal.h"
 #include "fleet/artifact_proc.h"
+#include "fleet/artifact_store.h"
 #include "algorithms/paxos.h"
 #include "structures/map.h"
 #include "structures/map_priv.h"
@@ -62,6 +63,9 @@ static void _ensure_init(void)
         fleet_state.initialized = true;
     }
 }
+
+/* Forward declarations */
+static bool handle_update_accepted(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 
 /****************************
  * Handler: handle_update_proposal
@@ -103,7 +107,15 @@ static bool handle_update_proposal(const process_t *proc, directory_t *queues, g
     uuid_unparse_lower(proposal.proposal_uuid, prop_uuid_str);
 
     pthread_mutex_lock(&fleet_state.lock);
-    data_t *prop_dat = object_ptr_data(&proposal, sizeof(update_proposal_t));
+    update_proposal_t *heap_prop = smrt_create(sizeof(update_proposal_t));
+    if (heap_prop == NULL)
+    {
+        pthread_mutex_unlock(&fleet_state.lock);
+        json_decref(payload);
+        return false;
+    }
+    memcpy(heap_prop, &proposal, sizeof(update_proposal_t));
+    data_t *prop_dat = object_ptr_data(heap_prop, sizeof(update_proposal_t));
     map_set(&fleet_state.pending_proposals, prop_uuid_str, prop_dat);
     pthread_mutex_unlock(&fleet_state.lock);
 
@@ -166,14 +178,16 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
 
     double id1 = json_real_value(j_id1);
     double id2 = json_real_value(j_id2);
-    const char *prop_uuid_str = json_string_value(j_prop_uuid);
+    const char *prop_uuid_raw = json_string_value(j_prop_uuid);
+    char prop_uuid_str[UUID_STRING_LEN + 1];
+    strncpy(prop_uuid_str, prop_uuid_raw ? prop_uuid_raw : "", UUID_STRING_LEN);
+    prop_uuid_str[UUID_STRING_LEN] = '\0';
+    json_decref(payload);
 
     double out_last_id = 0.0;
     int out_chain_len = 0;
     paxos_response_t result = paxos_handle_request(&fleet_state.vote_paxos, id1, id2,
                                                    &out_last_id, &out_chain_len);
-
-    json_decref(payload);
 
     if (result == PAXOS_GRANT)
     {
@@ -253,21 +267,38 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
 
     double id1 = json_real_value(j_id1);
     double id2 = json_real_value(j_id2);
-    const char *prop_uuid_str = json_string_value(j_prop_uuid);
+    const char *prop_uuid_raw = json_string_value(j_prop_uuid);
+    char prop_uuid_str[UUID_STRING_LEN + 1];
+    strncpy(prop_uuid_str, prop_uuid_raw ? prop_uuid_raw : "", UUID_STRING_LEN);
+    prop_uuid_str[UUID_STRING_LEN] = '\0';
+    json_decref(payload);
 
     /* Record grant with score=1.0 (vote weight) */
     int count = paxos_record_grant(&fleet_state.vote_paxos, id1, id2, 1.0);
     bool quorum = (count >= PAXOS_MAJORITY(fleet_state.num_peers));
 
-    json_decref(payload);
-
     if (quorum)
     {
-        /* Broadcast FLEET_PROTO_ACCEPTED to all peers */
+        /* Look up proposal to get artifact hash */
+        char artifact_hash_hex[UPDATE_HASH_LEN * 2 + 1] = {0};
+        pthread_mutex_lock(&fleet_state.lock);
+        data_t *p_dat = NULL;
+        if (map_get(&fleet_state.pending_proposals, prop_uuid_str, &p_dat) == 0 && p_dat != NULL)
+        {
+            update_proposal_t *p = NULL;
+            data_object_ptr(p_dat, (ptr_t *)&p);
+            if (p != NULL)
+                sodium_bin2hex(artifact_hash_hex, sizeof(artifact_hash_hex),
+                               p->artifact_hash, UPDATE_HASH_LEN);
+        }
+        pthread_mutex_unlock(&fleet_state.lock);
+
+        /* Broadcast FLEET_PROTO_ACCEPTED to all peers (include artifact hash) */
         json_t *acc_json = json_object();
         json_object_set_new(acc_json, "id1", json_real(id1));
         json_object_set_new(acc_json, "id2", json_real(id2));
         json_object_set_new(acc_json, "proposal_uuid", json_string(prop_uuid_str));
+        json_object_set_new(acc_json, "artifact_hash", json_string(artifact_hash_hex));
 
         log_info(proc->logger, "Fleet: Quorum reached for proposal %s, broadcasting accepted\n",
                  prop_uuid_str);
@@ -287,6 +318,18 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
         json_decref(acc_json);
 
         paxos_advance_chain(&fleet_state.vote_paxos);
+
+        /* Also process acceptance locally (proposer has the proposal in pending) */
+        generic_msg_t self_acc = {0};
+        self_acc.type = NET_MESSAGE;
+        strncpy(self_acc.info.net_msg.process, "fleet", PROC_NAME_LEN);
+        self_acc.info.net_msg.function = (char *)FLEET_PROTO_ACCEPTED;
+        json_t *self_json = json_object();
+        json_object_set_new(self_json, "proposal_uuid", json_string(prop_uuid_str));
+        json_object_set_new(self_json, "artifact_hash", json_string(artifact_hash_hex));
+        net_msg_pack_json(&self_acc.info.net_msg, self_json);
+        json_decref(self_json);
+        handle_update_accepted(proc, queues, &self_acc);
     }
     else
     {
@@ -352,30 +395,35 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
 
     const char *prop_uuid_raw = json_string_value(j_prop_uuid);
     char prop_uuid_str[UUID_STRING_LEN + 2];
-    strncpy(prop_uuid_str, prop_uuid_raw, sizeof(prop_uuid_str) - 1);
+    strncpy(prop_uuid_str, prop_uuid_raw ? prop_uuid_raw : "", sizeof(prop_uuid_str) - 1);
     prop_uuid_str[sizeof(prop_uuid_str) - 1] = '\0';
+
+    /* Get artifact hash from accepted message (always present) */
+    json_t *j_artifact_hash = json_object_get(payload, "artifact_hash");
+    char artifact_hash_hex[UPDATE_HASH_LEN * 2 + 1] = {0};
+    if (j_artifact_hash)
+    {
+        const char *h = json_string_value(j_artifact_hash);
+        if (h) strncpy(artifact_hash_hex, h, sizeof(artifact_hash_hex) - 1);
+    }
+    json_decref(payload);
 
     pthread_mutex_lock(&fleet_state.lock);
 
-    /* Look up proposal in pending */
+    /* Look up proposal in pending (only the proposer has it) */
     data_t *prop_dat = NULL;
+    bool is_proposer = false;
     if (map_get(&fleet_state.pending_proposals, prop_uuid_str, &prop_dat) == 0 && prop_dat != NULL)
     {
         /* Move to accepted */
         map_set(&fleet_state.accepted_updates, prop_uuid_str, prop_dat);
         map_remove(&fleet_state.pending_proposals, prop_uuid_str);
+        is_proposer = true;
         log_info(proc->logger, "Fleet: Proposal %s accepted and moved to accepted_updates\n",
                  prop_uuid_str);
     }
-    else
-    {
-        log_debug(proc->logger, "Fleet: Accepted proposal %s not found in pending\n",
-                  prop_uuid_str);
-    }
 
     pthread_mutex_unlock(&fleet_state.lock);
-
-    json_decref(payload);
 
     /* Also notify the main process about the acceptance via UPDATE_ACCEPTED */
     generic_msg_t notify = {0};
@@ -383,20 +431,17 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
     uuid_parse(prop_uuid_str, notify.info.update_accepted.proposal_uuid);
     messaging_send("AutonomousTrust", UPDATE_ACCEPTED, &notify, false);
 
-    /* Trigger artifact download for the accepted proposal */
-    pthread_mutex_lock(&fleet_state.lock);
-    data_t *accepted_dat = NULL;
-    if (map_get(&fleet_state.accepted_updates, prop_uuid_str, &accepted_dat) == 0 && accepted_dat != NULL)
+    /* If we already have the artifact (proposer), mark complete.
+     * Otherwise, request the artifact from the sender (proposer). */
+    if (artifact_hash_hex[0] != '\0')
     {
-        update_proposal_t *accepted_prop = NULL;
-        data_object_ptr(accepted_dat, (ptr_t *)&accepted_prop);
-        if (accepted_prop != NULL)
+        if (is_proposer && artifact_store_has(artifact_hash_hex))
         {
-            char artifact_hash_hex[UPDATE_HASH_LEN * 2 + 1];
-            sodium_bin2hex(artifact_hash_hex, sizeof(artifact_hash_hex),
-                           accepted_prop->artifact_hash, UPDATE_HASH_LEN);
-
-            /* Send artifact request to the peer who sent us the acceptance */
+            log_info(proc->logger, "Fleet: proposer already has artifact %s\n", artifact_hash_hex);
+        }
+        else if (nmsg->from_whom.address[0] != '\0')
+        {
+            /* Request artifact from the proposer who sent us the acceptance */
             json_t *fetch_req = json_object();
             json_object_set_new(fetch_req, "hash", json_string(artifact_hash_hex));
 
@@ -413,10 +458,10 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
             json_decref(fetch_req);
             messaging_send("network", NET_MESSAGE, &artifact_msg, false);
 
-            log_info(proc->logger, "Fleet: triggered artifact fetch for %s\n", artifact_hash_hex);
+            log_info(proc->logger, "Fleet: triggered artifact fetch for %s from %s\n",
+                     artifact_hash_hex, nmsg->from_whom.address);
         }
     }
-    pthread_mutex_unlock(&fleet_state.lock);
 
     return true;
 }
