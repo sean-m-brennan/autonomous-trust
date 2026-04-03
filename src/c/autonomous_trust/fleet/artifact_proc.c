@@ -175,11 +175,48 @@ static bool handle_artifact_manifest(const process_t *proc, directory_t *queues,
         return false;
     }
 
-    const char *hash_hex = json_string_value(j_hash);
+    const char *hash_raw = json_string_value(j_hash);
     int total_chunks = (int)json_integer_value(j_total_chunks);
     size_t total_size = (size_t)json_integer_value(j_total_size);
     size_t chunk_size = (size_t)json_integer_value(j_chunk_size);
-    const char *version = json_string_value(j_version);
+    const char *version_raw = json_string_value(j_version);
+
+    char hash_hex[UPDATE_HASH_LEN * 2 + 1];
+    strncpy(hash_hex, hash_raw ? hash_raw : "", sizeof(hash_hex) - 1);
+    hash_hex[sizeof(hash_hex) - 1] = '\0';
+    char version[UPDATE_VERSION_LEN + 1];
+    strncpy(version, version_raw ? version_raw : "", UPDATE_VERSION_LEN);
+    version[UPDATE_VERSION_LEN] = '\0';
+
+    /* Read notify_process from request payload, default to "update" */
+    char notify_process[PROC_NAME_LEN + 1];
+    const char *notify = json_string_value(json_object_get(payload, "notify_process"));
+    if (notify && strlen(notify) > 0)
+        strncpy(notify_process, notify, sizeof(notify_process) - 1);
+    else
+        strncpy(notify_process, "update", sizeof(notify_process) - 1);
+    notify_process[sizeof(notify_process) - 1] = '\0';
+
+    json_decref(payload);
+
+    /* Skip if we already have this artifact or are already downloading it */
+    if (artifact_store_has(hash_hex))
+    {
+        log_debug(proc->logger, "Artifact: already have %s, ignoring manifest\n", hash_hex);
+        return true;
+    }
+
+    pthread_mutex_lock(&artifact_state.lock);
+    data_t *existing = NULL;
+    if (map_get(&artifact_state.active_downloads, (char *)hash_hex, &existing) == 0
+        && existing != NULL)
+    {
+        pthread_mutex_unlock(&artifact_state.lock);
+        log_debug(proc->logger, "Artifact: already downloading %s, ignoring duplicate manifest\n",
+                  hash_hex);
+        return true;
+    }
+    pthread_mutex_unlock(&artifact_state.lock);
 
     /* Save manifest to disk */
     artifact_manifest_t manifest;
@@ -192,7 +229,6 @@ static bool handle_artifact_manifest(const process_t *proc, directory_t *queues,
 
     if (artifact_store_save_manifest(&manifest) != 0)
     {
-        json_decref(payload);
         log_error(proc->logger, "Artifact: failed to save manifest for %s\n", hash_hex);
         return false;
     }
@@ -204,7 +240,6 @@ static bool handle_artifact_manifest(const process_t *proc, directory_t *queues,
                        hash_hex, strlen(hash_hex),
                        NULL, &bin_len, NULL) != 0)
     {
-        json_decref(payload);
         log_error(proc->logger, "Artifact: failed to decode hash hex\n");
         return false;
     }
@@ -212,19 +247,10 @@ static bool handle_artifact_manifest(const process_t *proc, directory_t *queues,
     /* Create download state */
     download_state_t *state = calloc(1, sizeof(download_state_t));
     if (!state)
-    {
-        json_decref(payload);
         return false;
-    }
 
     artifact_download_state_init(state, hash_hex, total_chunks, expected_hash, version);
-
-    /* Read notify_process from request payload, default to "update" */
-    const char *notify = json_string_value(json_object_get(payload, "notify_process"));
-    if (notify && strlen(notify) > 0)
-        strncpy(state->notify_process, notify, sizeof(state->notify_process) - 1);
-    else
-        strncpy(state->notify_process, "update", sizeof(state->notify_process) - 1);
+    strncpy(state->notify_process, notify_process, sizeof(state->notify_process) - 1);
     state->notify_process[sizeof(state->notify_process) - 1] = '\0';
 
     /* Store in active_downloads map */
@@ -232,8 +258,6 @@ static bool handle_artifact_manifest(const process_t *proc, directory_t *queues,
     data_t *dat = object_ptr_data(state, sizeof(download_state_t));
     map_set(&artifact_state.active_downloads, (char *)hash_hex, dat);
     pthread_mutex_unlock(&artifact_state.lock);
-
-    json_decref(payload);
 
     /* Request first chunk */
     json_t *req = json_object();
@@ -271,15 +295,18 @@ static bool handle_chunk_request(const process_t *proc, directory_t *queues, gen
         return false;
     }
 
-    const char *hash_hex = json_string_value(j_hash);
+    const char *hash_raw = json_string_value(j_hash);
     int chunk_index = (int)json_integer_value(j_chunk_index);
+    char hash_hex[UPDATE_HASH_LEN * 2 + 1];
+    strncpy(hash_hex, hash_raw ? hash_raw : "", sizeof(hash_hex) - 1);
+    hash_hex[sizeof(hash_hex) - 1] = '\0';
+    json_decref(payload);
 
     /* Read chunk from store */
     uint8_t chunk_buf[ARTIFACT_CHUNK_SIZE];
     size_t chunk_len = 0;
     if (artifact_store_read_chunk(hash_hex, chunk_index, chunk_buf, sizeof(chunk_buf), &chunk_len) != 0)
     {
-        json_decref(payload);
         log_error(proc->logger, "Artifact: failed to read chunk %d for %s\n", chunk_index, hash_hex);
         return false;
     }
@@ -303,7 +330,6 @@ static bool handle_chunk_request(const process_t *proc, directory_t *queues, gen
     json_object_set_new(resp, "chunk_hash", json_string(chunk_hash_hex));
     json_object_set_new(resp, "data_len", json_integer((json_int_t)chunk_len));
 
-    json_decref(payload);
     send_to_peer(proc, ARTIFACT_PROTO_CHUNK, resp, &nmsg->from_whom);
 
     return true;
@@ -339,16 +365,21 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         return false;
     }
 
-    const char *hash_hex = json_string_value(j_hash);
+    const char *hash_raw = json_string_value(j_hash);
     int chunk_index = (int)json_integer_value(j_chunk_index);
     const char *data_hex = json_string_value(j_data);
-    const char *chunk_hash_hex = json_string_value(j_chunk_hash);
+    const char *chunk_hash_hex_raw = json_string_value(j_chunk_hash);
     size_t data_len = (size_t)json_integer_value(j_data_len);
 
-    /* Decode hex data */
+    /* Copy hash before freeing payload */
+    char hash_hex[UPDATE_HASH_LEN * 2 + 1];
+    strncpy(hash_hex, hash_raw ? hash_raw : "", sizeof(hash_hex) - 1);
+    hash_hex[sizeof(hash_hex) - 1] = '\0';
+
+    /* Decode hex data (before freeing payload since data_hex points into it) */
     uint8_t data_buf[ARTIFACT_CHUNK_SIZE];
     size_t bin_len = 0;
-    if (sodium_hex2bin(data_buf, sizeof(data_buf),
+    if (!data_hex || sodium_hex2bin(data_buf, sizeof(data_buf),
                        data_hex, strlen(data_hex),
                        NULL, &bin_len, NULL) != 0)
     {
@@ -357,11 +388,11 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         return false;
     }
 
-    /* Decode chunk hash */
+    /* Decode chunk hash (before freeing payload) */
     uint8_t chunk_hash[UPDATE_HASH_LEN];
     size_t hash_bin_len = 0;
-    if (sodium_hex2bin(chunk_hash, UPDATE_HASH_LEN,
-                       chunk_hash_hex, strlen(chunk_hash_hex),
+    if (!chunk_hash_hex_raw || sodium_hex2bin(chunk_hash, UPDATE_HASH_LEN,
+                       chunk_hash_hex_raw, strlen(chunk_hash_hex_raw),
                        NULL, &hash_bin_len, NULL) != 0)
     {
         json_decref(payload);
@@ -369,10 +400,11 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         return false;
     }
 
+    json_decref(payload);
+
     /* Verify per-chunk hash */
     if (artifact_verify_chunk_hash(data_buf, data_len, chunk_hash) != 0)
     {
-        json_decref(payload);
         log_error(proc->logger, "Artifact: chunk %d hash mismatch for %s\n", chunk_index, hash_hex);
         return false;
     }
@@ -380,7 +412,6 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
     /* Save chunk to store */
     if (artifact_store_save_chunk(hash_hex, chunk_index, data_buf, data_len) != 0)
     {
-        json_decref(payload);
         log_error(proc->logger, "Artifact: failed to save chunk %d for %s\n", chunk_index, hash_hex);
         return false;
     }
@@ -400,7 +431,6 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
     if (!state)
     {
         pthread_mutex_unlock(&artifact_state.lock);
-        json_decref(payload);
         log_error(proc->logger, "Artifact: no active download for %s\n", hash_hex);
         return false;
     }
@@ -425,7 +455,6 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         free(state);
 
         pthread_mutex_unlock(&artifact_state.lock);
-        json_decref(payload);
 
         /* Send ARTIFACT_PROTO_COMPLETE to source peer */
         json_t *comp = json_object();
@@ -464,7 +493,6 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         int next_chunk = chunk_index + 1;
         int total = state->total_chunks;
         pthread_mutex_unlock(&artifact_state.lock);
-        json_decref(payload);
 
         while (next_chunk < total && artifact_store_has_chunk(hash_hex, next_chunk))
         {

@@ -114,6 +114,11 @@ cp "$SCRIPT_DIR/autonomous-trust.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 
+# Allow at_demo to restart its own service (Phase 3 fleet management)
+info "Configuring sudoers for autonomous-trust restart ..."
+echo "ALL ALL=(root) NOPASSWD: /usr/bin/systemctl restart $SERVICE_NAME" > /etc/sudoers.d/$SERVICE_NAME
+chmod 440 /etc/sudoers.d/$SERVICE_NAME
+
 info "Installation complete."
 info ""
 info "To start now:   systemctl start $SERVICE_NAME"

@@ -452,6 +452,9 @@ static void *peer_receiver_thread(void *arg)
             if (nbytes == ENOMSG || nbytes < 0)
                 continue;
 
+            log_debug(ctx->logger, "Network: peer_recv got %d bytes from %s\n",
+                      nbytes, from_addr);
+
             /* Skip messages from self */
             char my_addr[IPV4_ADDR_LEN] = {0};
             cidr_split(ctx->net_cfg->ip4_cidr, my_addr, NULL);
@@ -464,7 +467,8 @@ static void *peer_receiver_thread(void *arg)
                 /* Decrypt */
                 uint8_t *plain = NULL;
                 size_t plain_len = 0;
-                if (decrypt_message(ctx->myself, peer, buf, nbytes, &plain, &plain_len) == 0)
+                int dec_ret = decrypt_message(ctx->myself, peer, buf, nbytes, &plain, &plain_len);
+                if (dec_ret == 0)
                 {
                     net_wire_msg_t wmsg;
                     if (net_message_from_wire(plain, plain_len, peer, &wmsg) == 0)
@@ -472,10 +476,28 @@ static void *peer_receiver_thread(void *arg)
                     free(plain);
                     net_wire_msg_free(&wmsg);
                 }
+                else
+                {
+                    log_error(ctx->logger, "Network: decrypt failed (%d) from peer %s\n",
+                              dec_ret, from_addr);
+                }
             }
             else
             {
-                log_debug(ctx->logger, "Encrypted message from unknown peer %s\n", from_addr);
+                /* Try as unencrypted message (e.g. access_granted to unknown peer) */
+                net_wire_msg_t wmsg;
+                if (net_message_from_wire(buf, nbytes, NULL, &wmsg) == 0)
+                {
+                    strncpy(wmsg.from_whom.address, from_addr, ADDR_LEN);
+                    log_debug(ctx->logger, "Network: unencrypted msg %s.%s from unknown %s\n",
+                              wmsg.process, wmsg.function, from_addr);
+                    route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+                    net_wire_msg_free(&wmsg);
+                }
+                else
+                {
+                    log_debug(ctx->logger, "Encrypted message from unknown peer %s\n", from_addr);
+                }
             }
         }
         else
@@ -814,10 +836,18 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
 
     /* Get identity from configs */
     identity_t *myself = NULL;
+    public_identity_t *my_public = NULL;
     data_t *id_dat = NULL;
     char id_key[] = "identity";
     if (map_get(proc->configs, id_key, &id_dat) == 0)
-        data_object_ptr(id_dat, (void **)&myself);
+    {
+        config_t *id_cfg = NULL;
+        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 && id_cfg->data_struct != NULL)
+        {
+            myself = (identity_t *)id_cfg->data_struct;
+            identity_publish(myself, &my_public);
+        }
+    }
 
     /* Preserve network sockets across daemonize (which closes all FDs) */
     proc->flags |= NO_CLOSE_FILES;
@@ -828,6 +858,8 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
     if (ret != 0)
     {
         network_shutdown(&socks);
+        if (my_public != NULL)
+            smrt_deref(my_public);
         return ret;
     }
 
@@ -876,7 +908,16 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
             wmsg.data = nmsg->obj;
             wmsg.data_len = nmsg->len;
             wmsg.encrypt = nmsg->encrypt;
-            memcpy(&wmsg.from_whom, &nmsg->from_whom, sizeof(public_identity_t));
+
+            /* Always stamp from_whom with our own identity.
+             * Callers (id_proc, fleet_proc, etc.) may not populate from_whom,
+             * and for unencrypted messages (e.g. access_granted) the receiver
+             * needs the sender's full identity (UUID, name, keys) to register
+             * it as a peer. */
+            if (my_public != NULL)
+                memcpy(&wmsg.from_whom, my_public, sizeof(public_identity_t));
+            else
+                memcpy(&wmsg.from_whom, &nmsg->from_whom, sizeof(public_identity_t));
 
             /* Determine broadcast vs peer from to_whom address */
             bool is_broadcast = (nmsg->to_whom.address[0] == '\0');
@@ -905,6 +946,32 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
                          is_broadcast ? bcast_addr : nmsg->to_whom.address);
             }
         }
+        else if (buf.type == PEER)
+        {
+            /* A new peer was accepted — add to our peer list for encrypted messaging */
+            public_identity_t *new_peer = &buf.info.peer;
+            if (new_peer->fullname[0] != '\0' && proc->protocol.num_peers < MAX_PEERS)
+            {
+                /* Check for duplicate */
+                bool found = false;
+                for (size_t i = 0; i < proc->protocol.num_peers; i++)
+                {
+                    if (uuid_compare(proc->protocol.peers[i].uuid, new_peer->uuid) == 0)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    memcpy(&proc->protocol.peers[proc->protocol.num_peers],
+                           new_peer, sizeof(public_identity_t));
+                    proc->protocol.num_peers++;
+                    log_info(logger, "Network: added peer %s (%s) for encrypted messaging\n",
+                             new_peer->fullname, new_peer->address);
+                }
+            }
+        }
         else
         {
             /* Non-network messages: use generic handler */
@@ -923,6 +990,8 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
     pthread_join(peer_thread, NULL);
     pthread_join(bcast_thread, NULL);
     network_shutdown(&socks);
+    if (my_public != NULL)
+        smrt_deref(my_public);
 
     return ret;
 }

@@ -104,31 +104,47 @@ int messaging_recv_on(queue_t *q, generic_msg_t *msg, struct sockaddr_storage *t
     int flags = 0;
     if (!blocking)
         flags = MSG_DONTWAIT;
-    socklen_t addr_len = sizeof(struct sockaddr_storage);
-    socklen_t *len_ptr = &addr_len;
-    if (their_addr == NULL)
-        len_ptr = NULL;
 
-    size_t net_size = 0;
-    ssize_t numbytes = recvfrom(q->fd, &net_size, sizeof(size_t),
-                                flags, (struct sockaddr *)their_addr, len_ptr);
-    if (numbytes < 0)
+    /* Peek to learn the total datagram size (size_t header + payload).
+     * MSG_PEEK | MSG_TRUNC returns the real datagram length even if our
+     * buffer is too small, without consuming the datagram. */
+    ssize_t dgram_len = recvfrom(q->fd, NULL, 0,
+                                 flags | MSG_PEEK | MSG_TRUNC, NULL, NULL);
+    if (dgram_len < 0)
     {
         if (errno == EAGAIN)
             return ENOMSG;
         return SYS_EXCEPTION();
     }
-    size_t data_size = ntohll(net_size);
-    uint8_t *data = malloc(data_size);
-    numbytes = recvfrom(q->fd, data, data_size,
-                        flags, (struct sockaddr *)their_addr, len_ptr);
-    if (numbytes < 0)
-        return SYS_EXCEPTION();
+    if ((size_t)dgram_len < sizeof(size_t))
+        return -1;  /* runt datagram */
 
-    if (proto_to_generic_msg(data, numbytes, msg) != 0)
-        return -1;
-    free(data);
-    return 0;
+    uint8_t *frame = malloc(dgram_len);
+    if (frame == NULL)
+        return EXCEPTION(ENOMEM);
+
+    socklen_t addr_len = sizeof(struct sockaddr_storage);
+    socklen_t *len_ptr = their_addr ? &addr_len : NULL;
+    ssize_t numbytes = recvfrom(q->fd, frame, dgram_len,
+                                flags, (struct sockaddr *)their_addr, len_ptr);
+    if (numbytes < 0)
+    {
+        free(frame);
+        if (errno == EAGAIN)
+            return ENOMSG;
+        return SYS_EXCEPTION();
+    }
+
+    size_t net_size;
+    memcpy(&net_size, frame, sizeof(size_t));
+    size_t data_size = ntohll(net_size);
+    size_t payload_len = (size_t)numbytes - sizeof(size_t);
+    if (payload_len < data_size)
+        data_size = payload_len;  /* clamp to actual received bytes */
+
+    int ret = proto_to_generic_msg(frame + sizeof(size_t), data_size, msg);
+    free(frame);
+    return (ret != 0) ? -1 : 0;
 }
 
 int signal_recv(queue_t *q, long *msg_type, signal_t *sig)
@@ -158,19 +174,25 @@ int messaging_send(const char *key, const message_type_t type, generic_msg_t *ms
 
     struct sockaddr_un target;
     if (unix_addr(key, &target) != 0)
-        return SYS_EXCEPTION();
-
-    size_t net_size = htonll(data_len);
-    ssize_t numbytes = sendto(my_q->fd, &net_size, sizeof(size_t),
-                              flags, (const struct sockaddr *)&target, sizeof(struct sockaddr_un));
-    if (numbytes < 0)
     {
-        if (errno == EAGAIN)
-            return EAGAIN;
+        smrt_deref(data);
         return SYS_EXCEPTION();
     }
-    numbytes = sendto(my_q->fd, data, data_len,
-                      flags, (const struct sockaddr *)&target, sizeof(struct sockaddr_un));
+
+    /* Send size header + payload as a single atomic datagram so that
+     * concurrent senders to the same target cannot interleave. */
+    size_t net_size = htonll(data_len);
+    struct iovec iov[2] = {
+        { .iov_base = &net_size, .iov_len = sizeof(size_t) },
+        { .iov_base = data,      .iov_len = data_len },
+    };
+    struct msghdr mh = {
+        .msg_name    = &target,
+        .msg_namelen = sizeof(struct sockaddr_un),
+        .msg_iov     = iov,
+        .msg_iovlen  = 2,
+    };
+    ssize_t numbytes = sendmsg(my_q->fd, &mh, flags);
     smrt_deref(data);
     if (numbytes < 0)
     {

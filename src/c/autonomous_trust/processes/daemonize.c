@@ -16,6 +16,7 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <sys/wait.h>
@@ -100,9 +101,22 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
                 continue;
             close(f_d);
         }
-    }
 
-    close(STDIN_FILENO);
+        /* Redirect stdin to /dev/null instead of closing it.
+         * Closing fd 0 leaves it available for reuse by socket() or open(),
+         * which causes silent corruption when daemonize is called again with
+         * NO_CLOSE_FILES — the unconditional close(STDIN_FILENO) would destroy
+         * a socket that happened to get fd 0. */
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0)
+        {
+            if (devnull != STDIN_FILENO)
+            {
+                dup2(devnull, STDIN_FILENO);
+                close(devnull);
+            }
+        }
+    }
 
 #if 0 // FIXME
     if (!(flags & NO_STDOUT_REDIRECT & NO_STDERR_REDIRECT))

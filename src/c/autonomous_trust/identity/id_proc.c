@@ -159,7 +159,6 @@ static int _peer_accepted(process_t *proc, directory_t *queues, const public_ide
 
 static bool handle_welcoming_committee(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
-    (void)queues;
     if (proc->protocol.phase != 3)
         return false;
 
@@ -185,22 +184,53 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         }
     }
 
-    /* Propose this peer to existing group members for voting */
-    generic_msg_t propose_msg = {0};
-    propose_msg.type = NET_MESSAGE;
-    strncpy(propose_msg.info.net_msg.process, "identity", PROC_NAME_LEN);
-    propose_msg.info.net_msg.function = (char *)ID_PROPOSE;
-    /* Attach the new peer's identity as data */
-    memcpy(&propose_msg.info.net_msg.from_whom, &nmsg->from_whom, sizeof(public_identity_t));
-    propose_msg.info.net_msg.encrypt = true;
+    /* Bootstrap: auto-accept when no existing peers (no one to vote) */
+    if (proc->protocol.num_peers == 0)
+    {
+        log_info(proc->logger, "Identity: bootstrap — auto-accepting first peer %s\n",
+                 nmsg->from_whom.fullname);
+        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom);
+        return true;
+    }
 
-    /* Send proposal to each existing peer via network */
+    /* Store proposed peer in potentials and self-vote before sending proposals */
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, uuid_str);
+
+    pthread_mutex_lock(&id_state.lock);
+    public_identity_t *potential = smrt_create(sizeof(public_identity_t));
+    if (potential != NULL)
+    {
+        memcpy(potential, &nmsg->from_whom, sizeof(public_identity_t));
+        data_t *pot_dat = object_ptr_data(potential, sizeof(public_identity_t));
+        map_set(&id_state.peer_potentials, uuid_str, pot_dat);
+    }
+    /* Proposer self-vote: count as 1 */
+    data_t *self_vote = integer_data(1);
+    map_set(&id_state.vote_collection, uuid_str, self_vote);
+    pthread_mutex_unlock(&id_state.lock);
+
+    /* Propose this peer to existing group members for voting.
+     * Carry proposed peer identity in JSON payload (not from_whom)
+     * because encrypted messages overwrite from_whom with the sender. */
+    json_t *proposal_json = json_object();
+    json_object_set_new(proposal_json, "uuid", json_string(uuid_str));
+    json_object_set_new(proposal_json, "fullname", json_string(nmsg->from_whom.fullname));
+    json_object_set_new(proposal_json, "address", json_string(nmsg->from_whom.address));
+
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
+        generic_msg_t propose_msg = {0};
+        propose_msg.type = NET_MESSAGE;
+        strncpy(propose_msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+        propose_msg.info.net_msg.function = (char *)ID_PROPOSE;
+        propose_msg.info.net_msg.encrypt = true;
         memcpy(&propose_msg.info.net_msg.to_whom, &proc->protocol.peers[i],
                sizeof(public_identity_t));
+        net_msg_pack_json(&propose_msg.info.net_msg, proposal_json);
         messaging_send("network", NET_MESSAGE, &propose_msg, false);
     }
+    json_decref(proposal_json);
 
     log_info(proc->logger, "Identity: proposed peer %s for voting\n",
              nmsg->from_whom.fullname);
@@ -220,6 +250,16 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Identity: access granted by %s\n",
              nmsg->from_whom.fullname);
+
+    /* Check if already a peer (bootstrap auto-accept may have already added them) */
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        if (uuid_compare(proc->protocol.peers[i].uuid, nmsg->from_whom.uuid) == 0)
+        {
+            log_debug(proc->logger, "Identity: peer already known, skipping duplicate add\n");
+            return true;
+        }
+    }
 
     /* Add the accepting peer to our peer list */
     if (proc->protocol.num_peers < MAX_PEERS)
@@ -280,28 +320,37 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
         return false;
 
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Identity: received peer proposal from %s\n",
-             nmsg->from_whom.fullname);
 
-    /* Extract proposed peer identity from the from_whom field */
-    const public_identity_t *proposed = &nmsg->from_whom;
-
-    /* Validate the proposed peer */
-    if (proposed->fullname[0] == '\0')
+    /* Extract proposed peer identity from JSON payload (not from_whom,
+     * which gets overwritten by decryption with the sender's identity) */
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
     {
-        log_warn(proc->logger, "Identity: rejecting vote request for empty identity\n");
+        log_warn(proc->logger, "Identity: handle_vote_on_peer: no JSON payload\n");
         return true;
     }
 
-    /* Pack approval JSON: proposed peer's UUID and approval flag */
-    char uuid_str[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(proposed->uuid, uuid_str);
+    const char *proposed_uuid_raw = json_string_value(json_object_get(payload, "uuid"));
+    if (proposed_uuid_raw == NULL)
+    {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: handle_vote_on_peer: missing uuid\n");
+        return true;
+    }
 
+    char proposed_uuid[UUID_STRING_LEN + 1];
+    strncpy(proposed_uuid, proposed_uuid_raw, UUID_STRING_LEN);
+    proposed_uuid[UUID_STRING_LEN] = '\0';
+    json_decref(payload);
+
+    log_info(proc->logger, "Identity: received peer proposal for %s\n", proposed_uuid);
+
+    /* Pack approval vote */
     json_t *vote_json = json_object();
-    json_object_set_new(vote_json, "uuid", json_string(uuid_str));
+    json_object_set_new(vote_json, "uuid", json_string(proposed_uuid));
     json_object_set_new(vote_json, "approved", json_true());
 
-    /* Send vote back to the proposer */
+    /* Send vote back to the proposer (from_whom = sender after decryption) */
     generic_msg_t vote_msg = {0};
     vote_msg.type = NET_MESSAGE;
     strncpy(vote_msg.info.net_msg.process, "identity", PROC_NAME_LEN);
@@ -313,7 +362,7 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
 
     messaging_send("network", NET_MESSAGE, &vote_msg, false);
 
-    log_debug(proc->logger, "Identity: sent approval vote for %s\n", uuid_str);
+    log_debug(proc->logger, "Identity: sent approval vote for %s\n", proposed_uuid);
     return true;
 }
 
@@ -349,22 +398,21 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
         return true;
     }
 
-    const char *peer_uuid_str = json_string_value(j_uuid);
+    const char *peer_uuid_raw = json_string_value(j_uuid);
     bool approved = json_is_true(j_approved);
-    json_decref(payload);
 
-    if (!approved || peer_uuid_str == NULL)
+    if (!approved || peer_uuid_raw == NULL)
     {
+        json_decref(payload);
         log_debug(proc->logger, "Identity: vote not approved, skipping\n");
         return true;
     }
 
-    pthread_mutex_lock(&id_state.lock);
-
-    /* Increment vote count for this proposed peer UUID */
+    /* Copy UUID before freeing JSON payload */
     char uuid_key[UUID_STRING_LEN + 2];
-    strncpy(uuid_key, peer_uuid_str, sizeof(uuid_key) - 1);
+    strncpy(uuid_key, peer_uuid_raw, sizeof(uuid_key) - 1);
     uuid_key[sizeof(uuid_key) - 1] = '\0';
+    json_decref(payload);
 
     data_t *count_dat = NULL;
     int count = 0;
@@ -581,11 +629,11 @@ static int _build_announcement(const process_t *proc, generic_msg_t *buf)
     char id_key[] = "identity";
     if (map_get(proc->configs, id_key, &id_dat) == 0)
     {
-        void *ident = NULL;
-        if (data_object_ptr(id_dat, &ident) == 0)
+        config_t *id_cfg = NULL;
+        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 && id_cfg->data_struct != NULL)
         {
             public_identity_t *pub = NULL;
-            identity_publish((const identity_t *)ident, &pub);
+            identity_publish((const identity_t *)id_cfg->data_struct, &pub);
             if (pub != NULL)
             {
                 memcpy(&buf->info.net_msg.from_whom, pub, sizeof(public_identity_t));
