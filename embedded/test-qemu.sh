@@ -29,6 +29,7 @@
 #   ./test-qemu.sh --nodes 3      # 3 nodes
 #   ./test-qemu.sh --keep         # don't tear down VMs on exit
 #   ./test-qemu.sh --skip-build   # reuse existing dist/autonomous-trust-amd64.tar.gz
+#   ./test-qemu.sh --fleet-test  # also test fleet update protocol after deployment
 
 set -euo pipefail
 
@@ -38,6 +39,7 @@ WORK_DIR="$SCRIPT_DIR/.test-qemu"
 NODE_COUNT=2
 KEEP=false
 SKIP_BUILD=false
+FLEET_TEST=false
 SUBNET="10.0.2.0/24"  # QEMU user-mode default; VMs use socket mcast for inter-VM
 VM_NET_SUBNET="192.168.100"
 SSH_BASE_PORT=10022
@@ -104,6 +106,7 @@ while [[ $# -gt 0 ]]; do
         --nodes)      NODE_COUNT="$2"; shift 2 ;;
         --keep)       KEEP=true; shift ;;
         --skip-build) SKIP_BUILD=true; shift ;;
+        --fleet-test) FLEET_TEST=true; shift ;;
         --ram)        VM_RAM="$2"; shift 2 ;;
         -h|--help)    usage ;;
         *)            error "Unknown option: $1"; exit 1 ;;
@@ -197,6 +200,12 @@ for i in $(seq 1 "$NODE_COUNT"); do
     fi
 
     # Create cloud-init user-data
+    #
+    # The LAN NIC (second virtio-net, MAC 52:54:00:00:02:XX) is configured
+    # via a persistent systemd-networkd .network file rather than a transient
+    # "ip addr add" in runcmd.  This survives networkd restarts and avoids
+    # the race where networkd reconfigures the interface after runcmd.
+    LAN_MAC_FULL="52:54:00:00:02:$(printf '%02x' "$i")"
     cat > "$vm_dir/user-data" <<USERDATA
 #cloud-config
 hostname: $node_name
@@ -207,24 +216,18 @@ users:
     shell: /bin/bash
     ssh_authorized_keys:
       - $SSH_KEY
-# Configure the second NIC (AT LAN) with a static IP.
-# Interface name varies by image (eth1, ens4, enp0s4, etc.),
-# so we find it dynamically: the NIC whose MAC starts with 52:54:00:00:02.
+write_files:
+  - path: /etc/systemd/network/10-at-lan.network
+    content: |
+      [Match]
+      MACAddress=$LAN_MAC_FULL
+
+      [Network]
+      Address=$node_ip/24
 runcmd:
   - ssh-keygen -A
   - systemctl restart ssh
-  - |
-    LAN_MAC="52:54:00:00:02"
-    for dev in /sys/class/net/*; do
-      iface=\$(basename "\$dev")
-      mac=\$(cat "\$dev/address" 2>/dev/null)
-      case "\$mac" in \${LAN_MAC}*)
-        ip addr add $node_ip/24 dev "\$iface"
-        ip link set "\$iface" up
-        break
-        ;;
-      esac
-    done
+  - networkctl reload
 USERDATA
 
     # Create seed ISO for cloud-init
@@ -401,6 +404,74 @@ for i in $(seq 1 "$NODE_COUNT"); do
         check "at-node-$i -> at-node-$j ($peer_ip) ping" $rc
     done
 done
+
+# -----------------------------------------------------------------------
+# Fleet management integration test (optional)
+# -----------------------------------------------------------------------
+if [ "$FLEET_TEST" = true ]; then
+    info "=== Fleet management integration test ==="
+
+    node1_port=$((SSH_BASE_PORT + 0))
+    node2_port=$((SSH_BASE_PORT + 1))
+    ssh_node1="ssh $SSH_OPTS -i $WORK_DIR/test_key -p $node1_port test@localhost"
+    ssh_node2="ssh $SSH_OPTS -i $WORK_DIR/test_key -p $node2_port test@localhost"
+
+    # Reconfigure node-1 with --inject-update
+    info "Reconfiguring node-1 with --inject-update ..."
+    $ssh_node1 "sudo systemctl stop autonomous-trust"
+    $ssh_node1 "sudo sed -i 's|AUTONOMOUS_TRUST_ARGS=.*|AUTONOMOUS_TRUST_ARGS=\"--inject-update --log-level debug\"|' /opt/autonomous-trust/etc/at/environment"
+    $ssh_node1 "sudo systemctl start autonomous-trust"
+
+    # Wait for node-2 artifact download (poll logs)
+    info "Waiting for node-2 artifact download (up to 120s) ..."
+    FLEET_ELAPSED=0
+    FLEET_TIMEOUT=120
+    while [ $FLEET_ELAPSED -lt $FLEET_TIMEOUT ]; do
+        if $ssh_node2 "journalctl -u autonomous-trust --no-pager" 2>/dev/null | grep -q "download complete"; then
+            info "Node-2: artifact download complete after ${FLEET_ELAPSED}s"
+            break
+        fi
+        sleep 5
+        FLEET_ELAPSED=$((FLEET_ELAPSED + 5))
+    done
+
+    if [ $FLEET_ELAPSED -ge $FLEET_TIMEOUT ]; then
+        error "  FAIL: Node-2: artifact download did not complete within ${FLEET_TIMEOUT}s"
+        FAIL=$((FAIL + 1))
+    else
+        $ssh_node2 "test -n ok" 2>/dev/null && rc=0 || rc=$?
+        check "Node-2: artifact download" 0
+
+        # Wait for node-2 restart
+        info "Waiting for node-2 restart (up to 30s) ..."
+        sleep 10
+        RECONNECT_ELAPSED=0
+        RECONNECT_TIMEOUT=30
+        while [ $RECONNECT_ELAPSED -lt $RECONNECT_TIMEOUT ]; do
+            if $ssh_node2 "echo ok" >/dev/null 2>&1; then
+                info "Node-2: SSH reconnected after restart"
+                break
+            fi
+            sleep 3
+            RECONNECT_ELAPSED=$((RECONNECT_ELAPSED + 3))
+        done
+
+        # Verify post-restart state
+        $ssh_node2 "systemctl is-active autonomous-trust" &>/dev/null && rc=0 || rc=$?
+        check "Node-2: service active after restart" $rc
+
+        $ssh_node2 "! test -f /opt/autonomous-trust/var/at/update/state.json" 2>/dev/null && rc=0 || rc=$?
+        check "Node-2: state file cleaned up" $rc
+
+        $ssh_node2 "journalctl -u autonomous-trust --no-pager" 2>/dev/null | grep -q "health check PASSED" && rc=0 || rc=$?
+        check "Node-2: health check passed in logs" $rc
+
+        $ssh_node2 "ls /opt/autonomous-trust/var/at/artifacts/*/complete >/dev/null 2>&1" && rc=0 || rc=$?
+        check "Node-2: artifact store has complete marker" $rc
+    fi
+
+    info "=== Fleet test complete ==="
+fi
 
 # -----------------------------------------------------------------------
 # Summary
