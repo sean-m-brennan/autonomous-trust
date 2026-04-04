@@ -57,7 +57,7 @@ DEFINE_TEST(test_state_file_roundtrip)
     strncpy(ws.state, "APPLYING", sizeof(ws.state) - 1);
     strncpy(ws.version, "2.1.0", sizeof(ws.version) - 1);
     strncpy(ws.hash_hex, "abcdef0123456789", sizeof(ws.hash_hex) - 1);
-    strncpy(ws.backup_path, "/opt/at/var/at/update/at_demo.backup", sizeof(ws.backup_path) - 1);
+    strncpy(ws.backup_path, "/opt/at/var/at/fleet_update/at_demo.backup", sizeof(ws.backup_path) - 1);
     strncpy(ws.binary_path, "/opt/at/bin/at_demo", sizeof(ws.binary_path) - 1);
     ws.timestamp = 1743600000;
     ws.attempt = 1;
@@ -71,7 +71,7 @@ DEFINE_TEST(test_state_file_roundtrip)
     ck_assert_str_eq(rs.state, "APPLYING");
     ck_assert_str_eq(rs.version, "2.1.0");
     ck_assert_str_eq(rs.hash_hex, "abcdef0123456789");
-    ck_assert_str_eq(rs.backup_path, "/opt/at/var/at/update/at_demo.backup");
+    ck_assert_str_eq(rs.backup_path, "/opt/at/var/at/fleet_update/at_demo.backup");
     ck_assert_str_eq(rs.binary_path, "/opt/at/bin/at_demo");
     ck_assert_int_eq((int)rs.timestamp, 1743600000);
     ck_assert_int_eq(rs.attempt, 1);
@@ -107,13 +107,13 @@ DEFINE_TEST(test_staging_paths)
     char buf[256];
 
     ck_assert_ret_ok(update_staging_dir("/opt/at/var/at", buf, sizeof(buf)));
-    ck_assert_str_eq(buf, "/opt/at/var/at/update");
+    ck_assert_str_eq(buf, "/opt/at/var/at/fleet_update");
 
     ck_assert_ret_ok(update_staging_path("/opt/at/var/at", buf, sizeof(buf)));
-    ck_assert_str_eq(buf, "/opt/at/var/at/update/at_demo.new");
+    ck_assert_str_eq(buf, "/opt/at/var/at/fleet_update/at_demo.new");
 
     ck_assert_ret_ok(update_backup_path("/opt/at/var/at", buf, sizeof(buf)));
-    ck_assert_str_eq(buf, "/opt/at/var/at/update/at_demo.backup");
+    ck_assert_str_eq(buf, "/opt/at/var/at/fleet_update/at_demo.backup");
 }
 END_TEST_DEFINITION()
 
@@ -132,9 +132,9 @@ DEFINE_TEST(test_state_write_creates_dir)
 
     ck_assert_ret_ok(update_state_write(test_dir, &ws));
 
-    /* Verify <test_dir>/update/ exists */
+    /* Verify <test_dir>/fleet_update/ exists */
     char update_dir[512];
-    snprintf(update_dir, sizeof(update_dir), "%s/update", test_dir);
+    snprintf(update_dir, sizeof(update_dir), "%s/fleet_update", test_dir);
     struct stat st;
     ck_assert_int_eq(stat(update_dir, &st), 0);
     ck_assert(S_ISDIR(st.st_mode));

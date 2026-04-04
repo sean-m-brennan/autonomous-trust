@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <ifaddrs.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -37,10 +38,78 @@
 DEFINE_ERROR(EGEN_NOIF, "No suitable network interface found");
 
 /****************************
+ * Bootstrap config reader
+ * Reads node_address and subnet from bootstrap/bootstrap.cfg.json if present.
+ ****************************/
+
+static int read_bootstrap(const char *cfg_dir, char *addr_out, size_t addr_len,
+                          char *subnet_out, size_t subnet_len)
+{
+    char path[CFG_PATH_LEN + 1];
+    snprintf(path, sizeof(path), "%s/bootstrap/bootstrap.cfg.json", cfg_dir);
+
+    json_error_t err;
+    json_t *root = json_load_file(path, 0, &err);
+    if (root == NULL)
+        return -1;
+
+    const char *addr = json_string_value(json_object_get(root, "node_address"));
+    const char *sub  = json_string_value(json_object_get(root, "subnet"));
+
+    if (addr == NULL || addr[0] == '\0')
+    {
+        json_decref(root);
+        return -1;
+    }
+
+    strncpy(addr_out, addr, addr_len - 1);
+    addr_out[addr_len - 1] = '\0';
+
+    if (sub != NULL && subnet_out != NULL)
+    {
+        strncpy(subnet_out, sub, subnet_len - 1);
+        subnet_out[subnet_len - 1] = '\0';
+    }
+
+    json_decref(root);
+    return 0;
+}
+
+/****************************
  * Network interface discovery
  ****************************/
 
-int discover_network(net_iface_t *iface)
+static void fill_ipv4(net_iface_t *iface, struct ifaddrs *ifa,
+                      const char *override_ip)
+{
+    struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+
+    /* Use the bootstrap-provided IP if given, otherwise the interface's own */
+    if (override_ip != NULL && override_ip[0] != '\0')
+        strncpy(iface->ip4_addr, override_ip, IPV4_ADDR_LEN);
+    else
+        inet_ntop(AF_INET, &sa->sin_addr, iface->ip4_addr, IPV4_ADDR_LEN);
+
+    if (ifa->ifa_netmask != NULL)
+    {
+        struct sockaddr_in *nm = (struct sockaddr_in *)ifa->ifa_netmask;
+        uint32_t mask = ntohl(nm->sin_addr.s_addr);
+        int bits = 0;
+        while (mask & 0x80000000) { bits++; mask <<= 1; }
+        char cidr_buf[64];
+        snprintf(cidr_buf, sizeof(cidr_buf), "%s/%d", iface->ip4_addr, bits);
+        strncpy(iface->ip4_cidr, cidr_buf, CIDR4_LEN);
+    }
+
+    strncpy(iface->if_name, ifa->ifa_name, sizeof(iface->if_name) - 1);
+}
+
+/**
+ * Discover network interface.  When preferred_ip is non-NULL, select the
+ * interface whose subnet contains that address (and use it as our IP).
+ * Falls back to the first non-loopback IPv4 interface.
+ */
+static int discover_network_for(net_iface_t *iface, const char *preferred_ip)
 {
     memset(iface, 0, sizeof(net_iface_t));
 
@@ -48,45 +117,46 @@ int discover_network(net_iface_t *iface)
     if (getifaddrs(&ifaddr) == -1)
         return SYS_EXCEPTION();
 
-    bool found_ip4 = false;
-    struct ifaddrs *ifa;
+    /* Parse preferred IP for subnet matching */
+    uint32_t pref_addr = 0;
+    if (preferred_ip != NULL && preferred_ip[0] != '\0')
+    {
+        struct in_addr pa;
+        if (inet_pton(AF_INET, preferred_ip, &pa) == 1)
+            pref_addr = ntohl(pa.s_addr);
+    }
 
-    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
+    bool found_ip4 = false;
+    struct ifaddrs *fallback_ifa = NULL;  /* first non-loopback IPv4 */
+
+    for (struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
     {
         if (ifa->ifa_addr == NULL)
             continue;
-
-        /* Skip loopback */
         if (ifa->ifa_flags & IFF_LOOPBACK)
             continue;
 
         int family = ifa->ifa_addr->sa_family;
 
-        if (family == AF_INET && !found_ip4)
+        if (family == AF_INET)
         {
-            struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
-            inet_ntop(AF_INET, &sa->sin_addr, iface->ip4_addr, IPV4_ADDR_LEN);
+            if (fallback_ifa == NULL)
+                fallback_ifa = ifa;
 
-            /* Get netmask for CIDR */
-            if (ifa->ifa_netmask != NULL)
+            /* If we have a preferred IP, check if this interface's subnet matches */
+            if (pref_addr != 0 && ifa->ifa_netmask != NULL)
             {
+                struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
                 struct sockaddr_in *nm = (struct sockaddr_in *)ifa->ifa_netmask;
-                uint32_t mask = ntohl(nm->sin_addr.s_addr);
-                int bits = 0;
-                while (mask & 0x80000000)
+                uint32_t if_net  = ntohl(sa->sin_addr.s_addr) & ntohl(nm->sin_addr.s_addr);
+                uint32_t pref_net = pref_addr & ntohl(nm->sin_addr.s_addr);
+                if (if_net == pref_net)
                 {
-                    bits++;
-                    mask <<= 1;
-                }
-                {
-                    char cidr_buf[64];
-                    snprintf(cidr_buf, sizeof(cidr_buf), "%s/%d", iface->ip4_addr, bits);
-                    strncpy(iface->ip4_cidr, cidr_buf, CIDR4_LEN);
+                    fill_ipv4(iface, ifa, preferred_ip);
+                    found_ip4 = true;
+                    break;  /* preferred match — stop looking */
                 }
             }
-
-            strncpy(iface->if_name, ifa->ifa_name, sizeof(iface->if_name) - 1);
-            found_ip4 = true;
         }
         else if (family == AF_INET6)
         {
@@ -114,6 +184,13 @@ int discover_network(net_iface_t *iface)
                 }
             }
         }
+    }
+
+    /* Fall back to first non-loopback IPv4 if preferred match wasn't found */
+    if (!found_ip4 && fallback_ifa != NULL)
+    {
+        fill_ipv4(iface, fallback_ifa, NULL);
+        found_ip4 = true;
     }
 
     /* Get MAC address via ioctl */
@@ -144,6 +221,11 @@ int discover_network(net_iface_t *iface)
     return 0;
 }
 
+int discover_network(net_iface_t *iface)
+{
+    return discover_network_for(iface, NULL);
+}
+
 /****************************
  * Identity generation
  ****************************/
@@ -153,10 +235,14 @@ int generate_identity(const char *fullname, const char *cfg_dir)
     uuid_t uuid;
     uuid_generate(uuid);
 
-    /* Use first IP as address placeholder */
+    /* Check bootstrap for a provisioned address */
+    char bootstrap_addr[IPV4_ADDR_LEN + 1] = {0};
+    read_bootstrap(cfg_dir, bootstrap_addr, sizeof(bootstrap_addr), NULL, 0);
+
+    /* Discover the right interface (preferring bootstrap subnet) */
     net_iface_t iface;
     char address[ADDR_LEN + 1] = {0};
-    if (discover_network(&iface) == 0)
+    if (discover_network_for(&iface, bootstrap_addr[0] ? bootstrap_addr : NULL) == 0)
         strncpy(address, iface.ip4_addr, ADDR_LEN);
     else
         strncpy(address, "127.0.0.1", ADDR_LEN);
@@ -187,8 +273,12 @@ int generate_identity(const char *fullname, const char *cfg_dir)
 
 int generate_network_config(const char *cfg_dir)
 {
+    /* Check bootstrap for a provisioned address */
+    char bootstrap_addr[IPV4_ADDR_LEN + 1] = {0};
+    read_bootstrap(cfg_dir, bootstrap_addr, sizeof(bootstrap_addr), NULL, 0);
+
     net_iface_t iface;
-    int err = discover_network(&iface);
+    int err = discover_network_for(&iface, bootstrap_addr[0] ? bootstrap_addr : NULL);
     if (err != 0)
         return err;
 
@@ -261,20 +351,28 @@ int generate_subsystems_config(const char *cfg_dir)
 
 int random_config(const char *cfg_dir)
 {
-    /* Generate a random name */
-    uuid_t name_uuid;
-    uuid_generate(name_uuid);
-    char name_str[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(name_uuid, name_str);
+    /* Only generate identity if it doesn't already exist.
+     * Regenerating would create new keys, breaking existing peer
+     * relationships (peers still hold the old public key). */
+    char id_path[CFG_PATH_LEN + 1];
+    snprintf(id_path, sizeof(id_path), "%s/identity.cfg.json", cfg_dir);
+    struct stat st;
+    if (stat(id_path, &st) != 0)
+    {
+        uuid_t name_uuid;
+        uuid_generate(name_uuid);
+        char name_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(name_uuid, name_str);
 
-    char fullname[NAME_LEN + 1];
-    snprintf(fullname, NAME_LEN, "agent-%.*s", 8, name_str);
+        char fullname[NAME_LEN + 1];
+        snprintf(fullname, NAME_LEN, "agent-%.*s", 8, name_str);
 
-    int err = generate_identity(fullname, cfg_dir);
-    if (err != 0)
-        return err;
+        int err = generate_identity(fullname, cfg_dir);
+        if (err != 0)
+            return err;
+    }
 
-    err = generate_network_config(cfg_dir);
+    int err = generate_network_config(cfg_dir);
     if (err != 0)
         return err;
 

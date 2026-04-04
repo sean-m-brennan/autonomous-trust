@@ -269,6 +269,47 @@ int artifact_store_get_path(const char *hash_hex, char *path_buf, size_t buflen)
     return build_artifact_dir(hash_hex, path_buf, buflen);
 }
 
+int artifact_store_reassemble(const char *hash_hex, char *out_path, size_t out_path_len)
+{
+    artifact_manifest_t manifest;
+    if (artifact_store_load_manifest(hash_hex, &manifest) != 0)
+        return -1;
+
+    char art_dir[512];
+    if (build_artifact_dir(hash_hex, art_dir, sizeof(art_dir)) != 0)
+        return -1;
+
+    int n = snprintf(out_path, out_path_len, "%s/assembled", art_dir);
+    if (n < 0 || (size_t)n >= out_path_len)
+        return -1;
+
+    FILE *out = fopen(out_path, "wb");
+    if (!out)
+        return -1;
+
+    uint8_t chunk_buf[65536];
+    for (int i = 0; i < manifest.total_chunks; i++)
+    {
+        size_t chunk_len = 0;
+        if (artifact_store_read_chunk(hash_hex, i, chunk_buf, sizeof(chunk_buf),
+                                      &chunk_len) != 0)
+        {
+            fclose(out);
+            unlink(out_path);
+            return -1;
+        }
+        if (fwrite(chunk_buf, 1, chunk_len, out) != chunk_len)
+        {
+            fclose(out);
+            unlink(out_path);
+            return -1;
+        }
+    }
+
+    fclose(out);
+    return 0;
+}
+
 int artifact_store_delete(const char *hash_hex)
 {
     char art_dir[512];

@@ -202,6 +202,7 @@ set(table_headers_in
 
 set(libsrc
     autonomous_trust/autonomous_trust.c
+    autonomous_trust/node.c
     autonomous_trust/algorithms/agreement.c
     autonomous_trust/algorithms/paxos.c
     autonomous_trust/config/configuration.c
@@ -250,6 +251,7 @@ set(libsrc
     autonomous_trust/utilities/util.c
     autonomous_trust/fleet/update_proposal.c
     autonomous_trust/fleet/fleet_helpers.c
+    autonomous_trust/fleet/fleet_ops.c
     autonomous_trust/fleet/fleet_proc.c
     autonomous_trust/fleet/artifact_store.c
     autonomous_trust/fleet/artifact_proc_helpers.c
