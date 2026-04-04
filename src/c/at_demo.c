@@ -16,24 +16,27 @@
 
 #include <stdio.h>
 #include <stdbool.h>
-#include <signal.h>
 #include <string.h>
-#include <errno.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <unistd.h>
-#include <sys/wait.h>
 #include <getopt.h>
 
+#include <sodium.h>
+
 #include "autonomous_trust.h"
-#include "autonomous_trust/config/generate.h"
+#include "autonomous_trust/fleet/update_proposal.h"
+#include "autonomous_trust/fleet/fleet_proc.h"
+
+/* ------------------------------------------------------------------ */
+/* CLI helpers                                                         */
+/* ------------------------------------------------------------------ */
 
 static void print_usage(const char *prog)
 {
-    fprintf(stderr, "Usage: %s [--generate-config] [--log-level LEVEL] [--test]\n", prog);
+    fprintf(stderr, "Usage: %s [--generate-config] [--log-level LEVEL] [--test] [--inject-update]\n", prog);
     fprintf(stderr, "  --generate-config   Generate identity, network, and subsystems configs\n");
     fprintf(stderr, "  --log-level LEVEL   Set log level: debug, info, warning, error, critical\n");
     fprintf(stderr, "  --test              Run in test mode (limited iterations)\n");
+    fprintf(stderr, "  --inject-update     Inject a self-referencing update proposal after peer discovery\n");
 }
 
 static log_level_t parse_log_level(const char *str)
@@ -47,44 +50,91 @@ static log_level_t parse_log_level(const char *str)
     return INFO;
 }
 
-static int mkdirs(const char *path)
+/* ------------------------------------------------------------------ */
+/* Inject-update (test-only)                                           */
+/* ------------------------------------------------------------------ */
+
+#define TEST_ITERATIONS 1600      /* ~800s at 500ms cadence */
+#define INJECT_ITERATIONS 1600    /* same; inject starts after INJECT_DELAY */
+#define INJECT_DELAY_ITERATIONS 60 /* ~30s delay for peer discovery */
+
+typedef struct {
+    bool inject_update;
+} demo_ctx_t;
+
+/**
+ * Inject a self-referencing update proposal: store our own binary as an
+ * artifact and submit a signed proposal to the fleet process.
+ * Exercises the full fleet-update pipeline end-to-end.
+ */
+static void inject_self_update(at_node_t *node)
 {
-    char tmp[CFG_PATH_LEN + 1];
-    strncpy(tmp, path, CFG_PATH_LEN);
-    for (char *p = tmp + 1; *p; p++)
+    logger_t *log = at_node_logger(node);
+    log_info(log, "Inject-update: starting self-referencing update proposal\n");
+
+    if (sodium_init() < 0)
     {
-        if (*p == '/')
-        {
-            *p = '\0';
-            if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
-                return -1;
-            *p = '/';
-        }
+        log_error(log, "Inject-update: sodium_init failed\n");
+        return;
     }
-    if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
-        return -1;
+
+    /* Resolve our own binary path */
+    char self_path[256];
+    ssize_t len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+    if (len <= 0)
+    {
+        log_error(log, "Inject-update: could not read /proc/self/exe\n");
+        return;
+    }
+    self_path[len] = '\0';
+
+    /* Store binary as artifact */
+    uint8_t hash[UPDATE_HASH_LEN];
+    char hash_hex[UPDATE_HASH_LEN * 2 + 1];
+    if (fleet_store_artifact(self_path, "test-1.0.0", log, hash, hash_hex) != 0)
+        return;
+
+    /* Propose update with throwaway keypair (test only) */
+    uint8_t pk[crypto_sign_PUBLICKEYBYTES];
+    uint8_t sk[crypto_sign_SECRETKEYBYTES];
+    crypto_sign_keypair(pk, sk);
+
+    fleet_propose_update(hash, "test-1.0.0", "test", pk, sk, log);
+}
+
+/* ------------------------------------------------------------------ */
+/* Tick callback                                                       */
+/* ------------------------------------------------------------------ */
+
+static int demo_tick(at_node_t *node, void *user_data)
+{
+    demo_ctx_t *ctx = (demo_ctx_t *)user_data;
+    if (ctx->inject_update && at_node_iteration(node) == INJECT_DELAY_ITERATIONS)
+        inject_self_update(node);
     return 0;
 }
 
-#define TEST_ITERATIONS 200
+/* ------------------------------------------------------------------ */
+/* Main                                                                */
+/* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[])
 {
-    const long cadence = 500000L; /* microseconds */
-
     log_level_t log_level = INFO;
     bool gen_config = false;
     bool test_mode = false;
+    bool inject_update = false;
 
     static struct option long_options[] = {
         {"generate-config", no_argument, NULL, 'g'},
         {"log-level", required_argument, NULL, 'l'},
         {"test", no_argument, NULL, 't'},
+        {"inject-update", no_argument, NULL, 'i'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "gl:th", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "gl:tih", long_options, NULL)) != -1)
     {
         switch (opt)
         {
@@ -97,6 +147,10 @@ int main(int argc, char *argv[])
         case 't':
             test_mode = true;
             break;
+        case 'i':
+            inject_update = true;
+            test_mode = true;
+            break;
         case 'h':
             print_usage(argv[0]);
             return 0;
@@ -106,87 +160,28 @@ int main(int argc, char *argv[])
         }
     }
 
-    logger_t log = {0};
-    logger_init(&log, log_level, NULL);
+    /* Configure and run the AT node */
+    size_t max_iters = 0;
+    if (test_mode)
+        max_iters = inject_update ? INJECT_ITERATIONS : TEST_ITERATIONS;
 
-    /* Create required directories */
-    char cfg_dir[CFG_PATH_LEN + 1];
-    char data_dir[CFG_PATH_LEN + 1];
-    get_cfg_dir(cfg_dir);
-    get_data_dir(data_dir);
+    at_node_config_t cfg = {
+        .log_level = log_level,
+        .generate_config = gen_config,
+        .app_name = "at_demo",
+        .q_out = "demo_to_at",
+        .q_in = "at_to_demo",
+        .max_iterations = max_iters,
+    };
 
-    if (mkdirs(cfg_dir) != 0)
-    {
-        log_error(&log, "Failed to create config dir %s: %s\n", cfg_dir, strerror(errno));
+    at_node_t node = {0};
+    if (at_node_init(&node, &cfg) != 0)
         return 1;
-    }
-    if (mkdirs(data_dir) != 0)
-    {
-        log_error(&log, "Failed to create data dir %s: %s\n", data_dir, strerror(errno));
+    if (at_node_start(&node) != 0)
         return 1;
-    }
 
-    /* Generate configs if requested */
-    if (gen_config)
-    {
-        log_info(&log, "Generating configs in %s\n", cfg_dir);
-        int err = random_config(cfg_dir);
-        if (err != 0)
-        {
-            log_error(&log, "Config generation failed: %s\n", strerror(errno));
-            log_exception(&log);
-            return 1;
-        }
-        log_info(&log, "Configs generated successfully\n");
-    }
-
-    /* Launch autonomous trust daemon */
-    char *q_out = (char *)"demo_to_at";
-    char *q_in = (char *)"at_to_demo";
-
-    int at_pid = run_autonomous_trust(q_out, q_in, NULL, 0, log_level, NULL);
-    if (at_pid <= 0)
-    {
-        log_error(&log, "Autonomous Trust (%d) failed to start: %s\n", at_pid, strerror(errno));
-        return at_pid;
-    }
-
-    init_sig_handling(NULL);
-
-    log_info(&log, "AT demo running (AT daemon at PID %d)\n", at_pid);
-
-    /* Monitor loop */
-    bool at_alive = true;
-    size_t loop = 0;
-    while (!stop_process && (!test_mode || loop < TEST_ITERATIONS))
-    {
-        loop++;
-        int err = kill(at_pid, 0);
-        if (err == -1)
-        {
-            if (errno == ESRCH)
-            {
-                log_info(&log, "AT daemon exited\n");
-                stop_process = true;
-                at_alive = false;
-            }
-            else
-            {
-                SYS_EXCEPTION();
-                log_exception(&log);
-            }
-        }
-        usleep(cadence);
-    }
-
-    if (at_alive)
-    {
-        log_info(&log, "Sending SIGINT to AT daemon (PID %d)\n", at_pid);
-        kill(at_pid, SIGINT);
-        int status;
-        waitpid(at_pid, &status, 0);
-    }
-
-    log_info(&log, "AT demo exiting\n");
-    return 0;
+    demo_ctx_t ctx = { .inject_update = inject_update };
+    int ret = at_node_run(&node, demo_tick, &ctx);
+    at_node_shutdown(&node);
+    return ret;
 }

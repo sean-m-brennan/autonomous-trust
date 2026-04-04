@@ -20,6 +20,7 @@
 #include <sodium.h>
 
 #include "network/net_message.h"
+#include "identity/identity_priv.h"
 #include "utilities/exception.h"
 
 #define ENET_WIRE 232
@@ -64,6 +65,10 @@ int net_message_to_wire(const net_wire_msg_t *msg, uint8_t **wire_out, size_t *w
     json_object_set_new(root, "from_uuid", json_string(uuid_str));
     json_object_set_new(root, "from_name", json_string(msg->from_whom.fullname));
     json_object_set_new(root, "from_address", json_string(msg->from_whom.address));
+    json_object_set_new(root, "from_sig_hex",
+                        json_string((const char *)msg->from_whom.signature.public_hex));
+    json_object_set_new(root, "from_enc_hex",
+                        json_string((const char *)msg->from_whom.encryptor.public_hex));
 
     char *json_str = json_dumps(root, JSON_COMPACT);
     json_decref(root);
@@ -146,6 +151,12 @@ int net_message_from_wire(const uint8_t *data, size_t len,
             strncpy(msg_out->from_whom.fullname, from_name, NAME_LEN);
         if (from_addr != NULL)
             strncpy(msg_out->from_whom.address, from_addr, ADDR_LEN);
+        const char *from_sig = json_string_value(json_object_get(root, "from_sig_hex"));
+        if (from_sig != NULL && from_sig[0] != '\0')
+            public_signature_init(&msg_out->from_whom.signature, (const unsigned char *)from_sig);
+        const char *from_enc = json_string_value(json_object_get(root, "from_enc_hex"));
+        if (from_enc != NULL && from_enc[0] != '\0')
+            public_encryptor_init(&msg_out->from_whom.encryptor, (const unsigned char *)from_enc);
     }
 
     json_decref(root);

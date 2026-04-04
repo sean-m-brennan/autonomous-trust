@@ -214,8 +214,8 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
     memcpy(&identity->uuid, proto->uuid.data, sizeof(uuid_t));
     strncpy(identity->address, proto->address, ADDR_LEN);
     strncpy(identity->fullname, proto->fullname, NAME_LEN);
-    memcpy(identity->signature.public_hex, proto->signature->hex_seed.data, crypto_sign_PUBLICKEYBYTES * 2);
-    memcpy(identity->encryptor.public_hex, proto->encryptor->hex_seed.data, crypto_box_PUBLICKEYBYTES * 2);
+    public_signature_init(&identity->signature, proto->signature->hex_seed.data);
+    public_encryptor_init(&identity->encryptor, proto->encryptor->hex_seed.data);
     return 0;
 }
 

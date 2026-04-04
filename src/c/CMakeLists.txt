@@ -62,13 +62,23 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang")
 endif()
 set(useful_flags
     #-fanalyzer
-    -fstack-clash-protection
     -fstack-protector
 )
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    list(APPEND useful_flags -fstack-clash-protection)
+endif()
 string(REPLACE ";" " " lib_compile_flags
         "-Wall ${warning_as_error} ${useful_warnings} -fms-extensions ${useful_flags} ${sysroot_flag}")
 add_compile_options(-Wall -fms-extensions ${useful_warnings} ${warning_as_error} ${useful_flags})
 add_link_options(-pthread ${sysroot_flag})
+
+# Static linking option for embedded/IoT builds
+option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)" OFF)
+
+if(AT_STATIC)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+endif()
 
 
 ####################
@@ -76,7 +86,7 @@ add_link_options(-pthread ${sysroot_flag})
 
 # UUID
 find_path(LIBUUID_INCLUDE_DIR uuid.h PATH_SUFFIXES uuid PATHS ${CONDA_ROOT})
-find_library(LIBUUID_LIBRARY libuuid.so PATHS ${CONDA_ROOT})
+find_library(LIBUUID_LIBRARY NAMES uuid PATHS ${CONDA_ROOT})
 include_directories(${LIBUUID_INCLUDE_DIR})
 if(LIBUUID_LIBRARY)
     message("-- Found libuuid at ${LIBUUID_LIBRARY}")
@@ -86,7 +96,7 @@ endif()
 
 # libsodium
 find_path(LIBSODIUM_INCLUDE_DIR sodium.h PATHS ${CONDA_ROOT})
-find_library(LIBSODIUM_LIBRARY libsodium.so PATHS ${CONDA_ROOT})
+find_library(LIBSODIUM_LIBRARY NAMES sodium PATHS ${CONDA_ROOT})
 include_directories(${LIBSODIUM_INCLUDE_DIR})
 if(LIBSODIUM_LIBRARY)
     message("-- Found libsodium at ${LIBSODIUM_LIBRARY}")
@@ -96,7 +106,7 @@ endif()
 
 # jansson
 find_path(LIBJANSSON_INCLUDE_DIR jansson.h PATHS ${CONDA_ROOT})
-find_library(LIBJANSSON_LIBRARY libjansson.so PATHS ${CONDA_ROOT})
+find_library(LIBJANSSON_LIBRARY NAMES jansson PATHS ${CONDA_ROOT})
 include_directories(${LIBJANSSON_INCLUDE_DIR})
 if(LIBJANSSON_LIBRARY)
     message("-- Found libjansson at ${LIBJANSSON_LIBRARY}")
@@ -120,7 +130,7 @@ endif()
 
 # protobuf-c
 find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c PATHS ${CONDA_ROOT})
-find_library(LIBPROTOBUF_C_LIBRARY libprotobuf-c.so PATHS ${CONDA_ROOT})
+find_library(LIBPROTOBUF_C_LIBRARY NAMES protobuf-c PATHS ${CONDA_ROOT})
 include_directories(${LIBPROTOBUF_C_INCLUDE_DIR})
 #find_program(PROTOC_C_EXE protoc-c PATHS ${CONDA_ROOT})
 if(LIBPROTOBUF_C_LIBRARY)
@@ -129,14 +139,14 @@ else()
     message(FATAL_ERROR "Required dependency libprotobuf-c not found.")
 endif()
 
-# check (testing only)
+# check (testing only — optional for non-test builds)
 find_path(LIBCHECK_INCLUDE_DIR check.h PATHS ${CONDA_ROOT})
 find_library(LIBCHECK_LIBRARY NAMES check libcheck.so libcheck.a PATHS ${CONDA_ROOT})
-include_directories(${LIBCHECK_INCLUDE_DIR})
 if(LIBCHECK_LIBRARY)
+    include_directories(${LIBCHECK_INCLUDE_DIR})
     message("-- Found libcheck at ${LIBCHECK_LIBRARY}")
 else()
-    message(ERROR "Testing dependency libcheck not found.")
+    message(WARNING "Testing dependency libcheck not found. Tests will not be built.")
 endif()
 
 set(DEPENDENCIES
@@ -176,6 +186,7 @@ set(protos
     autonomous_trust/core/protobuf/structures/datetime.proto
     autonomous_trust/core/protobuf/structures/map.proto
     autonomous_trust/core/protobuf/structures/merkle.proto
+    autonomous_trust/core/protobuf/fleet/update_proposal.proto
 )
 
 set(google_protos
@@ -191,7 +202,9 @@ set(table_headers_in
 
 set(libsrc
     autonomous_trust/autonomous_trust.c
+    autonomous_trust/node.c
     autonomous_trust/algorithms/agreement.c
+    autonomous_trust/algorithms/paxos.c
     autonomous_trust/config/configuration.c
     autonomous_trust/config/discover.c
     autonomous_trust/config/names.c
@@ -236,11 +249,24 @@ set(libsrc
     autonomous_trust/utilities/queue_pool.c
     autonomous_trust/utilities/sighandler.c
     autonomous_trust/utilities/util.c
+    autonomous_trust/fleet/update_proposal.c
+    autonomous_trust/fleet/fleet_helpers.c
+    autonomous_trust/fleet/fleet_ops.c
+    autonomous_trust/fleet/fleet_proc.c
+    autonomous_trust/fleet/artifact_store.c
+    autonomous_trust/fleet/artifact_proc_helpers.c
+    autonomous_trust/fleet/artifact_proc.c
+    autonomous_trust/fleet/update_proc_helpers.c
+    autonomous_trust/fleet/update_selftest.c
+    autonomous_trust/fleet/update_proc.c
+    autonomous_trust/fleet/config_proc_helpers.c
+    autonomous_trust/fleet/config_proc.c
 )
 set(libhdr
     autonomous_trust.h
     autonomous_trust/algorithms/agreement.h
     autonomous_trust/algorithms/algorithms.h
+    autonomous_trust/algorithms/paxos.h
     autonomous_trust/config/configuration.h
     autonomous_trust/config/discover.h
     autonomous_trust/config/names.h
@@ -266,6 +292,12 @@ set(libhdr
     autonomous_trust/config/generate.h
     autonomous_trust/network/ping.h
     autonomous_trust/network/ntp.h
+    autonomous_trust/fleet/update_proposal.h
+    autonomous_trust/fleet/fleet_proc.h
+    autonomous_trust/fleet/artifact_store.h
+    autonomous_trust/fleet/artifact_proc.h
+    autonomous_trust/fleet/update_proc.h
+    autonomous_trust/fleet/config_proc.h
 )
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust)
 
@@ -415,7 +447,19 @@ target_link_directories(at_example PRIVATE ${CMAKE_SYSROOT})
 # demo app (containerized)
 
 add_executable(at_demo at_demo.c)
-target_link_libraries(at_demo PRIVATE -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive ${DEPENDENCIES})
+if(AT_STATIC)
+    target_link_libraries(at_demo PRIVATE
+        -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive
+        ${DEPENDENCIES}
+        -static
+    )
+    target_link_libraries(at_demo PRIVATE stdc++ m)
+else()
+    target_link_libraries(at_demo PRIVATE
+        -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive
+        ${DEPENDENCIES}
+    )
+endif()
 target_compile_options(at_demo PRIVATE -Wall ${sysroot_flag})
 target_link_options(at_demo PRIVATE ${sysroot_flag})
 target_link_directories(at_demo PRIVATE ${CMAKE_SYSROOT})
@@ -423,7 +467,9 @@ install(TARGETS at_demo RUNTIME DESTINATION bin)
 
 
 ####################
-# tests
+# tests (only built when libcheck is available)
+
+if(LIBCHECK_LIBRARY)
 
 add_executable(array_test test/array_test.c)
 set_source_files_properties(test/array_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -654,6 +700,62 @@ target_link_libraries(task_proto_test PRIVATE autonomous_trust_static ${TEST_DEP
 
 add_test(NAME task_proto_test COMMAND $<TARGET_FILE:task_proto_test>)
 
+add_executable(paxos_test test/paxos_test.c)
+set_source_files_properties(test/paxos_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(paxos_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_test(NAME paxos_test COMMAND $<TARGET_FILE:paxos_test>)
+
+add_executable(update_proposal_test test/update_proposal_test.c)
+set_source_files_properties(test/update_proposal_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(update_proposal_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_test(NAME update_proposal_test COMMAND $<TARGET_FILE:update_proposal_test>)
+
+add_executable(fleet_proc_test
+    test/fleet_proc_test.c
+    autonomous_trust/fleet/fleet_helpers.c
+    autonomous_trust/fleet/update_proposal.c)
+set_source_files_properties(test/fleet_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(fleet_proc_test PRIVATE ${TEST_DEPENDENCIES})
+
+add_test(NAME fleet_proc_test COMMAND $<TARGET_FILE:fleet_proc_test>)
+
+add_executable(artifact_store_test
+    test/artifact_store_test.c
+    autonomous_trust/fleet/artifact_store.c)
+set_source_files_properties(test/artifact_store_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(artifact_store_test PRIVATE ${TEST_DEPENDENCIES})
+
+add_test(NAME artifact_store_test COMMAND $<TARGET_FILE:artifact_store_test>)
+
+add_executable(artifact_proc_test
+    test/artifact_proc_test.c
+    autonomous_trust/fleet/artifact_proc_helpers.c)
+set_source_files_properties(test/artifact_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(artifact_proc_test PRIVATE ${TEST_DEPENDENCIES})
+
+add_test(NAME artifact_proc_test COMMAND $<TARGET_FILE:artifact_proc_test>)
+
+add_executable(update_proc_test
+    test/update_proc_test.c
+    autonomous_trust/fleet/update_proc_helpers.c
+    autonomous_trust/fleet/update_selftest.c)
+set_source_files_properties(test/update_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(update_proc_test PRIVATE ${TEST_DEPENDENCIES})
+
+add_test(NAME update_proc_test COMMAND $<TARGET_FILE:update_proc_test>)
+
+add_executable(config_proc_test
+    test/config_proc_test.c
+    autonomous_trust/fleet/config_proc_helpers.c
+    autonomous_trust/fleet/update_proc_helpers.c)
+set_source_files_properties(test/config_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(config_proc_test PRIVATE ${TEST_DEPENDENCIES})
+
+add_test(NAME config_proc_test COMMAND $<TARGET_FILE:config_proc_test>)
+
+endif() # LIBCHECK_LIBRARY
 
 ####################
 # Packaging

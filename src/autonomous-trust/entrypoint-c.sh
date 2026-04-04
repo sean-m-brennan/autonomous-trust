@@ -30,7 +30,11 @@ if [ -n "$STARTUP_DELAY" ] && [ "$STARTUP_DELAY" -gt 0 ] 2>/dev/null; then
 fi
 
 debug "Creating directories..."
-mkdir -p "${AUTONOMOUS_TRUST_ROOT}/etc/at" "${AUTONOMOUS_TRUST_ROOT}/var/at"
+mkdir -p "${AUTONOMOUS_TRUST_ROOT}/etc/at" "${AUTONOMOUS_TRUST_ROOT}/var/at" 2>/dev/null || true
 
-debug "Launching: at_demo --generate-config --log-level ${LOG_LEVEL:-info} $*"
-exec at_demo --generate-config --log-level "${LOG_LEVEL:-info}" "$@"
+AT_DEMO="${AUTONOMOUS_TRUST_ROOT:-}/opt/autonomous-trust/bin/at_demo"
+if [ ! -x "$AT_DEMO" ]; then
+    AT_DEMO="$(command -v at_demo 2>/dev/null || echo at_demo)"
+fi
+debug "Launching: $AT_DEMO --generate-config --log-level ${LOG_LEVEL:-info} $*"
+exec "$AT_DEMO" --generate-config --log-level "${LOG_LEVEL:-info}" "$@"
