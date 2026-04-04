@@ -41,10 +41,15 @@ void smrt_ref(void *ptr)
     sptr->refs++;
 }
 
-void smrt_deref(void *ptr)
+void _smrt_deref_impl(void *ptr)
 {
+    if (ptr == NULL)
+        return;
     smrt_ptr_t *sptr = ptr;
     sptr->refs--;
-    if (sptr->alloc && sptr->refs <= 0)
+    if (sptr->alloc && sptr->refs <= 0) {
+        sptr->alloc = false;
+        sptr->refs = 0;
         free(ptr);
+    }
 }

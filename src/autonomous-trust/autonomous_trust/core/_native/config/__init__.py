@@ -30,6 +30,7 @@ from ..._python.config import (
     from_json_string,
     to_yaml_string,
     from_yaml_string,
+    register_config_type,
     ConfigMap,
 )
 

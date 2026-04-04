@@ -31,6 +31,9 @@ void *smrt_recreate(void *orig, size_t size);
 
 void smrt_ref(void *ptr);
 
-void smrt_deref(void *ptr);
+void _smrt_deref_impl(void *ptr);
+
+/* Macro NULLs the caller's pointer after free to prevent use-after-free */
+#define smrt_deref(ptr) do { _smrt_deref_impl(ptr); (ptr) = NULL; } while(0)
 
 #endif  // ALLOCATION_H

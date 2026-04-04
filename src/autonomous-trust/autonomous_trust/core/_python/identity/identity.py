@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-import random
+import secrets
 import time
 import uuid as uuid_mod
 
@@ -50,6 +50,7 @@ class Identity(InitializableConfig, AgreementVoter):
 
     def __eq__(self, other):
         return self.__class__.__name__ == other.__class__.__name__ and self.uuid == other.uuid and \
+            self.address == other.address and \
             self.fullname == other.fullname and self.nickname == other.nickname and \
             self.signature == other.signature and self.encryptor == other.encryptor
 
@@ -166,6 +167,6 @@ class Identity(InitializableConfig, AgreementVoter):
     def initialize(my_name, my_nickname, my_address):
         if '/' in my_address:
             my_address = my_address.split('/')[0]
-        time.sleep(random.random())  # reduce chance of collision
+        time.sleep(secrets.randbelow(1000) / 1000.0)  # reduce chance of collision
         return Identity(uuid_mod.uuid4(), my_address, my_name, my_nickname,
                         Signature.generate(), Encryptor.generate(), 'me', False)

@@ -1,9 +1,30 @@
+# ******************
+#  Copyright 2025 Sean M. Brennan and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
 import queue
 
 import pytest
 
-from autonomous_trust.inspector.viz.live_graph import LiveData, LiveNetwork
-from autonomous_trust.inspector.viz.network_graph import Graphs
+try:
+    from autonomous_trust.inspector.viz.live_graph import LiveData, LiveNetwork
+    from autonomous_trust.inspector.viz.network_graph import Graphs
+    _has_deps = True
+except (ImportError, ModuleNotFoundError):
+    _has_deps = False
+
+pytestmark = pytest.mark.skipif(not _has_deps, reason="networkx/aenum not installed")
 
 
 class TestLiveData:

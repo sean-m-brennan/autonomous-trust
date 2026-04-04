@@ -207,16 +207,14 @@ def test_rehash_adds_leaves():
 
 
 def test_rehash_removes_excess_leaves():
-    """Test _rehash when blobs shrink - removal path hits pre-existing bug.
-    MerkleTree._rehash passes self.last (a node) to super().delete() which
-    expects a key, causing TypeError. We verify the bug is still present."""
+    """Test _rehash when blobs shrink — excess leaves are removed."""
     mt = MerkleTree()
     for _ in range(5):
         mt.insert(ABlob(uuid4()))
     assert len(mt.leaves) == 5
     mt.blobs = mt.blobs[:2]
-    with pytest.raises(TypeError):
-        mt._rehash()
+    mt._rehash()
+    assert len(mt.leaves) <= len(mt.blobs) or mt.last is None
 
 
 def test_hash_inner_node_both_children():

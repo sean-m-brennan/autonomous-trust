@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import hmac
 import os
 import sys
 import time
@@ -55,8 +56,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     Handle Identity and Peer tracking
     Zero trust in this stage
     """
-    init_timeout = 10
+    init_timeout = 5
     init_extra = 2
+    vote_timeout = 0.5  # seconds to wait for additional votes after own vote cast
     enc = encoding
 
     def __init__(self, configurations, subsystems, log_q, **kwargs):
@@ -72,9 +74,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if impl == AgreementImpl.POW.value:
             self._history = IdentityByWork(self.identity, self.peers, log_q, 0)
         elif impl == AgreementImpl.POS.value:
-            self._history = IdentityByStake(self.identity, self.peers, log_q, 5)
+            self._history = IdentityByStake(self.identity, self.peers, log_q, 2)
         elif impl == AgreementImpl.POA.value:
-            self._history = IdentityByAuthority(self.identity, self.peers, log_q, 5)
+            self._history = IdentityByAuthority(self.identity, self.peers, log_q, 2)
         else:
             raise RuntimeError('Invalid identity history implementation: %s' % impl)
         self.messages: list[Message] = []
@@ -146,7 +148,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if self.capabilities is not None:
                 break
             time.sleep(self.cadence)
-        self.phase = 1
+        with self.lock:
+            self.phase = 1
 
     def announce_identity(self, queues):
         """
@@ -168,7 +171,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
         except Full:
             self.logger.error('announce_identity: Network queue full')
-        self.phase = 2
+        with self.lock:
+            self.phase = 2
 
     def choose_group(self, queues):
         """
@@ -178,8 +182,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         """
         try:
             start = now()
-            self.choosing = True
+            with self.lock:
+                self.choosing = True
+            # Wait adaptively: exit early once histories arrive, with a short
+            # grace period for additional histories; fall back to init_timeout.
+            grace = 1  # seconds to wait after first history arrives
+            history_seen_at = None
             while (now() - start).seconds <= self.init_timeout:
+                with self.lock:
+                    has_histories = len(self.histories) > 0
+                if has_histories:
+                    if history_seen_at is None:
+                        history_seen_at = now()
+                    elif (now() - history_seen_at).total_seconds() >= grace:
+                        break
                 time.sleep(self.cadence)
             accepted: tuple[Optional[Group], Optional[list[LinkedStep]]] = None, None
 
@@ -230,8 +246,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self._record_group(queues)
             except Full:
                 self.logger.error('choose_group: Network queue full')
-            self.choosing = False
-            self.phase = 3
+            with self.lock:
+                self.choosing = False
+                self.phase = 3
         except Exception as err:
             self.report_exception(err, 'choose_group')
 
@@ -246,7 +263,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if message.function == IdentityProtocol.history:
             self.logger.debug('Received existing history')
             hist_tpl = from_json_string(message.obj)  # from self._peer_accepted()
-            self.histories.append(hist_tpl)  # see choose_group
+            with self.lock:
+                self.histories.append(hist_tpl)  # see choose_group
             if not self.choosing:
                 threading.Thread(target=self.choose_group, args=(queues,), daemon=True).start()
             return True
@@ -277,21 +295,19 @@ class IdentityProcess(Process, metaclass=ProcMeta,
 
     def _vote_collection(self, queues, blob: IdentityObj):
         try:
+            vote = self._process_id(blob)
+            if vote is not None:
+                self._history.verify(*vote)
+                with self.lock:
+                    if vote in self.confirmed_block:
+                        self.confirmed_block.remove(vote)
+                self.logger.debug('I voted for %s' % blob.identity.nickname)
+            else:
+                self.logger.debug('I did not vote for %s' % blob.identity.nickname)
+            # Short wait for other votes to arrive before finalizing
             start = now()
-            voted = False
-            while (now() - start).seconds <= self._history.timeout:
-                if not voted:
-                    vote = self._process_id(blob)
-                    if vote is not None:
-                        self._history.verify(*vote)
-                        if vote in self.confirmed_block:
-                            self.confirmed_block.remove(vote)
-                        self.logger.debug('I voted for %s' % blob.identity.nickname)
-                    voted = True
-                else:
-                    time.sleep(self.cadence)
-            if not voted:
-                self.logger.debug('I did not vote')
+            while (now() - start).total_seconds() <= self.vote_timeout:
+                time.sleep(self.cadence)
             if self._history.finalize(blob):
                 self._peer_accepted(queues, blob)
         except Full:
@@ -339,7 +355,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 if new_id == self.identity:
                     self.logger.debug('Should not have received my own announcement')
                     return
-                if ph != self.package_hash:
+                if not hmac.compare_digest(str(ph), str(self.package_hash)):
                     self.logger.error("Newbie is running a counterfeit; Ignore")
                     return True
                 id_obj = IdentityObj(new_id, new_id.uuid)
@@ -350,7 +366,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     return True
 
                 self.logger.debug('Received new identity: %s - %s - %s' % (new_id.nickname, new_id.address, new_id.uuid))
-                self.peer_potentials[new_id.uuid] = caps
+                with self.lock:
+                    self.peer_potentials[new_id.uuid] = caps
 
                 # threading.Thread(target=self._process_id, args=(id_obj,), daemon=True).start()
                 # time.sleep(self.cadence) # FIXME invalid
@@ -379,14 +396,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self._record_group(queues)
             self._update_group(queues, self.group, level)  # FIXME use group from new peer instead?
         self._history.insert_peer(identity, level)
-        if identity.uuid in self.peer_potentials:
-            capabilities = self.peer_potentials[identity.uuid]
+        with self.lock:
+            has_potential = identity.uuid in self.peer_potentials
+            capabilities = self.peer_potentials.get(identity.uuid) if has_potential else None
+        if has_potential:
             self.peer_capabilities.register(identity.uuid, capabilities)
             self._record_peers(queues)
-            try:
-                del self.peer_potentials[identity.uuid]
-            except KeyError:
-                pass  # FIXME but, why? This should have thrown above instead
+            with self.lock:
+                try:
+                    del self.peer_potentials[identity.uuid]
+                except KeyError:
+                    pass  # FIXME but, why? This should have thrown above instead
         # FIXME these may not be necessary: (see self.update())
         queues[CfgIds.main].put(self.peer_capabilities, block=True, timeout=self.q_cadence)
         queues[CfgIds.negotiation].put(self.peer_capabilities, block=True, timeout=self.q_cadence)
@@ -403,7 +423,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             sigmsg = self.identity.sign(proof)
             vote = blob, proof, (sigmsg.message, sigmsg.signature)
             # FIXME any failures should *not* load confirmed_block
-            self.confirmed_block.append(vote)
+            with self.lock:
+                self.confirmed_block.append(vote)
             return vote
         except Exception as err:
             self.report_exception(err, 'process_id')
@@ -438,10 +459,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         """
         if self.phase != 3:
             return
-        if len(self.confirmed_block) < 1:
-            return
-        try:
+        with self.lock:
+            if len(self.confirmed_block) < 1:
+                return
             vote: VoteData = self.confirmed_block.pop(0)
+        try:
             if vote[0].uuid == vote[1].uuid:
                 return  # no voting for yourself
             # FIXME handle if I proposed the vote
@@ -458,10 +480,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if message.function == IdentityProtocol.accept:
             self.logger.debug('Received peer acceptance')
             ident, pkh, caps = from_json_string(message.obj)  # from self._peer_accepted()
-            if pkh != self.package_hash:
+            if not hmac.compare_digest(str(pkh), str(self.package_hash)):
                 self.logger.error("Counterfeit 'peer'")
                 return True
-            self.peer_potentials[ident.uuid] = caps
+            with self.lock:
+                self.peer_potentials[ident.uuid] = caps
             self._add_peer(queues, ident)
             return True
         return False

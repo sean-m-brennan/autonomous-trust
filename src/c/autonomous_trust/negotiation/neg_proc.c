@@ -61,23 +61,225 @@ static void _ensure_init(void)
 }
 
 /****************************
+ * Helper: build a reply net_msg_t directed back to sender
+ ****************************/
+
+static void _build_reply(const net_msg_t *nmsg, const char *func, generic_msg_t *reply)
+{
+    memset(reply, 0, sizeof(*reply));
+    reply->type = NET_MESSAGE;
+    strncpy(reply->info.net_msg.process, "negotiation", PROC_NAME_LEN);
+    reply->info.net_msg.function = (char *)func;
+    reply->info.net_msg.encrypt = true;
+    memcpy(&reply->info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
+    strncpy(reply->info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
+}
+
+/****************************
+ * Helper: build a JSON payload containing just task_uuid
+ ****************************/
+
+static json_t *_task_uuid_json(const char *task_uuid_str)
+{
+    json_t *j = json_object();
+    if (j)
+        json_object_set_new(j, "task_uuid", json_string(task_uuid_str));
+    return j;
+}
+
+/****************************
+ * Helper: serialize task_t fields into a JSON object
+ ****************************/
+
+static json_t *_task_to_json(const task_t *task)
+{
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    char req_uuid_str[UUID_STRING_LEN + 1] = {0};
+
+    uuid_unparse_lower(task->uuid, task_uuid_str);
+    uuid_unparse_lower(task->requestor_uuid, req_uuid_str);
+
+    /* duration in total seconds (days*86400 + seconds) */
+    long duration_sec = task->duration.days * 86400L + (long)task->duration.seconds;
+
+    /* when as epoch seconds (mktime on embedded tm) */
+    struct tm tm_copy;
+    memcpy(&tm_copy, &task->when, sizeof(struct tm));
+    time_t when_sec = mktime(&tm_copy);
+
+    json_t *j = json_object();
+    if (!j)
+        return NULL;
+
+    json_object_set_new(j, "task_uuid",       json_string(task_uuid_str));
+    json_object_set_new(j, "requestor_uuid",  json_string(req_uuid_str));
+    json_object_set_new(j, "capability_name", json_string(task->capability.name));
+    json_object_set_new(j, "flexible",        json_boolean(task->flexible));
+    json_object_set_new(j, "timeout",         json_integer(task->timeout));
+    json_object_set_new(j, "when_sec",        json_integer((json_int_t)when_sec));
+    json_object_set_new(j, "duration_sec",    json_integer((json_int_t)duration_sec));
+
+    return j;
+}
+
+/****************************
+ * Helper: populate a task_t from a JSON object (partial – fills uuid, cap name, flexible, timeout)
+ ****************************/
+
+static int _task_from_json(const json_t *j, task_t *task)
+{
+    if (!j || !task)
+        return -1;
+
+    const char *task_uuid_str = NULL;
+    json_t *j_uuid = json_object_get(j, "task_uuid");
+    if (j_uuid && json_is_string(j_uuid))
+    {
+        task_uuid_str = json_string_value(j_uuid);
+        if (uuid_parse(task_uuid_str, task->uuid) != 0)
+            return -1;
+    }
+
+    json_t *j_req = json_object_get(j, "requestor_uuid");
+    if (j_req && json_is_string(j_req))
+        uuid_parse(json_string_value(j_req), task->requestor_uuid);
+
+    json_t *j_cap = json_object_get(j, "capability_name");
+    if (j_cap && json_is_string(j_cap))
+        strncpy(task->capability.name, json_string_value(j_cap), CAP_NAMELEN);
+
+    json_t *j_flex = json_object_get(j, "flexible");
+    if (j_flex && json_is_boolean(j_flex))
+        task->flexible = json_boolean_value(j_flex);
+
+    json_t *j_timeout = json_object_get(j, "timeout");
+    if (j_timeout && json_is_integer(j_timeout))
+        task->timeout = (long)json_integer_value(j_timeout);
+
+    json_t *j_when = json_object_get(j, "when_sec");
+    if (j_when && json_is_integer(j_when))
+    {
+        time_t when_sec = (time_t)json_integer_value(j_when);
+        struct tm *tm_ptr = gmtime(&when_sec);
+        if (tm_ptr)
+            memcpy(&task->when, tm_ptr, sizeof(struct tm));
+    }
+
+    json_t *j_dur = json_object_get(j, "duration_sec");
+    if (j_dur && json_is_integer(j_dur))
+    {
+        long dur = (long)json_integer_value(j_dur);
+        task->duration.days    = dur / 86400L;
+        task->duration.seconds = (unsigned int)(dur % 86400L);
+        task->duration.nsecs   = 0;
+    }
+
+    return 0;
+}
+
+/****************************
+ * Helper: check if a peer (by UUID string) has a given capability
+ *         by looking it up in proc->protocol.peer_capabilities.
+ * Returns true if peer_capabilities is NULL (fallback: assume capable).
+ ****************************/
+
+static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_str,
+                                  const char *cap_name)
+{
+    if (!proc->protocol.peer_capabilities)
+        return true;  /* no capability info — broadcast to all */
+
+    data_t *cap_arr_dat = NULL;
+    if (map_get(proc->protocol.peer_capabilities, (map_key_t)peer_uuid_str, &cap_arr_dat) != 0)
+        return false;  /* peer not known */
+
+    /* peer_capabilities_matrix_t maps uuid_str -> array_t of capability_t* */
+    array_t *caps = NULL;
+    if (data_object_ptr(cap_arr_dat, (ptr_t *)&caps) != 0 || !caps)
+        return false;
+
+    for (size_t k = 0; k < array_size(caps); k++)
+    {
+        data_t *cap_dat = NULL;
+        if (array_get(caps, k, &cap_dat) != 0)
+            continue;
+        capability_t *cap = NULL;
+        if (data_object_ptr(cap_dat, (ptr_t *)&cap) != 0 || !cap)
+            continue;
+        if (strncmp(cap->name, cap_name, CAP_NAMELEN) == 0)
+            return true;
+    }
+    return false;
+}
+
+/****************************
  * Handler: handle_start_task (spawn task) — NEG_PROTO_START
- * Log the new task, find capable peers, send invite.
+ * Deserialize task JSON, create tracker, filter peers by capability, send invitations.
  ****************************/
 
 static bool handle_start_task(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
+    (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Negotiation: start task from %s\n", nmsg->from_whom.fullname);
 
     pthread_mutex_lock(&neg_state.lock);
 
-    /* In full impl: deserialize task_t from nmsg->obj/len,
-     * store in proposed_tasks, find peers with matching capabilities */
+    /* Deserialize task from JSON payload */
+    json_t *j = NULL;
+    task_t task;
+    memset(&task, 0, sizeof(task));
 
-    /* For now, broadcast invitation to all known peers */
+    bool have_task = false;
+    if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
+    {
+        if (_task_from_json(j, &task) == 0)
+            have_task = true;
+        json_decref(j);
+    }
+
+    if (!have_task)
+    {
+        /* Fallback: generate a new UUID for this task */
+        uuid_generate(task.uuid);
+        uuid_copy(task.requestor_uuid, nmsg->from_whom.uuid);
+    }
+
+    /* Store task in proposed_tasks keyed by task UUID string */
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(task.uuid, task_uuid_str);
+
+    task_t *task_copy = (task_t *)malloc(sizeof(task_t));
+    if (task_copy)
+    {
+        memcpy(task_copy, &task, sizeof(task_t));
+        data_t *task_dat = object_ptr_data(task_copy, sizeof(task_t));
+        map_set(&neg_state.proposed_tasks, task_uuid_str, task_dat);
+    }
+
+    /* Create a task tracker for result collection (expect num_peers responses) */
+    task_tracker_t *tracker = NULL;
+    int expected = (int)proc->protocol.num_peers;
+    if (task_tracker_create(&tracker, task.uuid, expected) == 0 && tracker)
+    {
+        data_t *trk_dat = object_ptr_data(tracker, sizeof(task_tracker_t));
+        map_set(&neg_state.my_tasks, task_uuid_str, trk_dat);
+    }
+
+    /* Build JSON payload for invitation */
+    json_t *invite_json = _task_to_json(&task);
+
+    /* Send invitation to capable peers */
+    int invited = 0;
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
+        char peer_uuid_str[UUID_STRING_LEN + 1] = {0};
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, peer_uuid_str);
+
+        /* Filter by capability if peer_capabilities map is available */
+        if (!_peer_has_capability(proc, peer_uuid_str, task.capability.name))
+            continue;
+
         generic_msg_t invite = {0};
         invite.type = NET_MESSAGE;
         strncpy(invite.info.net_msg.process, "negotiation", PROC_NAME_LEN);
@@ -86,10 +288,20 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
         memcpy(&invite.info.net_msg.to_whom, &proc->protocol.peers[i],
                sizeof(public_identity_t));
         strncpy(invite.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
-        /* In full impl: attach serialized task_t as obj/len payload */
+
+        if (invite_json)
+            net_msg_pack_json(&invite.info.net_msg, invite_json);
 
         messaging_send("network", NET_MESSAGE, &invite, false);
+        invited++;
     }
+
+    if (invite_json)
+        json_decref(invite_json);
+
+    if (invited == 0)
+        log_warn(proc->logger, "Negotiation: no capable peers found for task %s\n",
+                 task_uuid_str);
 
     pthread_mutex_unlock(&neg_state.lock);
     return true;
@@ -97,100 +309,334 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
 
 /****************************
  * Handler: handle_invite (invitation) — NEG_PROTO_ANNOUNCE
- * Log the invite, check capability, accept or refuse.
+ * Check capability, flood counter, accept/refuse/haggle.
  ****************************/
 
 static bool handle_invite(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
+    (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Negotiation: invitation from %s\n", nmsg->from_whom.fullname);
 
-    /* In full impl: deserialize task_t from payload, check own capabilities
-     * against task requirements, and determine accept or refuse */
+    /* Deserialize task from payload */
+    json_t *j = NULL;
+    task_t task;
+    memset(&task, 0, sizeof(task));
 
-    /* For now, accept unconditionally */
-    generic_msg_t reply = {0};
-    reply.type = NET_MESSAGE;
-    strncpy(reply.info.net_msg.process, "negotiation", PROC_NAME_LEN);
-    reply.info.net_msg.function = (char *)NEG_PROTO_ACCEPT;
-    reply.info.net_msg.encrypt = true;
-    memcpy(&reply.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-    strncpy(reply.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
+    bool have_task = false;
+    if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
+    {
+        if (_task_from_json(j, &task) == 0)
+            have_task = true;
+        json_decref(j);
+    }
 
-    messaging_send("network", NET_MESSAGE, &reply, false);
-    return true;
-}
-
-/****************************
- * Handler: handle_haggle (haggle) — NEG_PROTO_RESPONSE
- * Log the haggle response; re-announce if flexible on terms.
- ****************************/
-
-static bool handle_haggle(const process_t *proc, directory_t *queues, generic_msg_t *msg)
-{
-    net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Negotiation: haggle response from %s\n", nmsg->from_whom.fullname);
-
-    /* In full impl: deserialize counter-offer from payload,
-     * evaluate whether terms are acceptable, re-announce if adjustable */
-
-    /* For now, accept the counter-offer as-is */
-    generic_msg_t ack = {0};
-    ack.type = NET_MESSAGE;
-    strncpy(ack.info.net_msg.process, "negotiation", PROC_NAME_LEN);
-    ack.info.net_msg.function = (char *)NEG_PROTO_ACCEPT;
-    ack.info.net_msg.encrypt = true;
-    memcpy(&ack.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-    strncpy(ack.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
-
-    messaging_send("network", NET_MESSAGE, &ack, false);
-    return true;
-}
-
-/****************************
- * Handler: handle_accept (ack) — NEG_PROTO_ACCEPT
- * Log the acceptance and record in confirmed map.
- ****************************/
-
-static bool handle_accept(const process_t *proc, directory_t *queues, generic_msg_t *msg)
-{
-    net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Negotiation: accepted by %s\n", nmsg->from_whom.fullname);
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    if (have_task)
+        uuid_unparse_lower(task.uuid, task_uuid_str);
 
     pthread_mutex_lock(&neg_state.lock);
 
-    /* In full impl: extract task_uuid from payload, record this peer
-     * in the confirmed map for that task */
-    char from_uuid[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(nmsg->from_whom.uuid, from_uuid);
+    /* Flood detection: count how many times we have seen this task */
+    if (have_task)
+    {
+        data_t *cnt_dat = NULL;
+        int flood_count = 0;
+        if (map_get(&neg_state.proposed_tasks, task_uuid_str, &cnt_dat) == 0 && cnt_dat)
+        {
+            /* proposed_tasks stores task_t* for originator; reuse confirmed for flood */
+            data_integer(cnt_dat, &flood_count);
+        }
+        /* We track flood counts separately using a local counter stored as integer */
+        /* Use a dedicated prefix key to avoid collision with task objects */
+        char flood_key[UUID_STRING_LEN + 8];
+        snprintf(flood_key, sizeof(flood_key), "flood:%s", task_uuid_str);
 
-    data_t *count_dat = NULL;
-    int count = 0;
-    if (map_get(&neg_state.confirmed, from_uuid, &count_dat) == 0)
-        data_integer(count_dat, &count);
+        data_t *flood_dat = NULL;
+        flood_count = 0;
+        if (map_get(&neg_state.proposed_tasks, flood_key, &flood_dat) == 0 && flood_dat)
+            data_integer(flood_dat, &flood_count);
 
-    count++;
-    data_t *new_count = integer_data(count);
-    map_set(&neg_state.confirmed, from_uuid, new_count);
+        flood_count++;
+        data_t *new_flood = integer_data(flood_count);
+        map_set(&neg_state.proposed_tasks, flood_key, new_flood);
+
+        if (flood_count > 5)
+        {
+            log_warn(proc->logger,
+                     "Negotiation: flood detected for task %s (count=%d), refusing\n",
+                     task_uuid_str, flood_count);
+
+            generic_msg_t refuse = {0};
+            _build_reply(nmsg, NEG_PROTO_REFUSE, &refuse);
+            json_t *rj = _task_uuid_json(task_uuid_str);
+            if (rj)
+            {
+                net_msg_pack_json(&refuse.info.net_msg, rj);
+                json_decref(rj);
+            }
+            messaging_send("network", NET_MESSAGE, &refuse, false);
+            pthread_mutex_unlock(&neg_state.lock);
+            return true;
+        }
+    }
+
+    /* Check own capabilities */
+    capability_t *cap = NULL;
+    if (have_task && task.capability.name[0] != '\0')
+        cap = find_capability(task.capability.name);
+
+    if (!have_task || cap != NULL)
+    {
+        /* We are capable — check for schedule conflicts */
+        time_t duration_secs = (time_t)(task.duration.days * 86400L
+                                        + task.duration.seconds);
+        time_t slot_time = 0;
+        int slot_err = job_queue_find_nearest_slot(&neg_state.task_stack,
+                                                   duration_secs,
+                                                   neg_state.max_concurrency,
+                                                   &slot_time);
+
+        if (slot_err == 0 && slot_time > 0 && have_task && !task.flexible)
+        {
+            /* Schedule conflict and task is inflexible — haggle with suggested time */
+            log_info(proc->logger,
+                     "Negotiation: schedule conflict for task %s, hagggling\n",
+                     task_uuid_str);
+
+            task.when.tm_sec  = 0;
+            task.when.tm_min  = 0;
+            task.when.tm_hour = 0;
+            struct tm *slot_tm = gmtime(&slot_time);
+            if (slot_tm)
+                memcpy(&task.when, slot_tm, sizeof(struct tm));
+
+            generic_msg_t haggle = {0};
+            _build_reply(nmsg, NEG_PROTO_RESPONSE, &haggle);
+            json_t *hj = _task_to_json(&task);
+            if (hj)
+            {
+                net_msg_pack_json(&haggle.info.net_msg, hj);
+                json_decref(hj);
+            }
+            messaging_send("network", NET_MESSAGE, &haggle, false);
+        }
+        else
+        {
+            /* Accept: push to task_stack, send ACK */
+            job_t job;
+            memset(&job, 0, sizeof(job));
+            memcpy(&job.task, &task, sizeof(task_t));
+
+            struct tm tm_copy;
+            memcpy(&tm_copy, &task.when, sizeof(struct tm));
+            job.start_time = mktime(&tm_copy);
+            job.end_time   = job.start_time + duration_secs;
+
+            job_queue_push(&neg_state.task_stack, &job);
+
+            generic_msg_t accept = {0};
+            _build_reply(nmsg, NEG_PROTO_ACCEPT, &accept);
+            json_t *aj = _task_uuid_json(task_uuid_str);
+            if (aj)
+            {
+                net_msg_pack_json(&accept.info.net_msg, aj);
+                json_decref(aj);
+            }
+            messaging_send("network", NET_MESSAGE, &accept, false);
+        }
+    }
+    else
+    {
+        /* Not capable — refuse */
+        log_info(proc->logger,
+                 "Negotiation: capability '%s' not available, refusing task %s\n",
+                 task.capability.name, task_uuid_str);
+
+        generic_msg_t refuse = {0};
+        _build_reply(nmsg, NEG_PROTO_REFUSE, &refuse);
+        json_t *rj = _task_uuid_json(task_uuid_str);
+        if (rj)
+        {
+            net_msg_pack_json(&refuse.info.net_msg, rj);
+            json_decref(rj);
+        }
+        messaging_send("network", NET_MESSAGE, &refuse, false);
+    }
 
     pthread_mutex_unlock(&neg_state.lock);
     return true;
 }
 
 /****************************
+ * Handler: handle_haggle (haggle) — NEG_PROTO_RESPONSE
+ * If task is flexible, re-announce with adjusted params; otherwise refuse.
+ ****************************/
+
+static bool handle_haggle(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    log_debug(proc->logger, "Negotiation: haggle response from %s\n", nmsg->from_whom.fullname);
+
+    /* Deserialize counter-offer task from payload */
+    json_t *j = NULL;
+    task_t task;
+    memset(&task, 0, sizeof(task));
+
+    bool have_task = false;
+    if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
+    {
+        if (_task_from_json(j, &task) == 0)
+            have_task = true;
+        json_decref(j);
+    }
+
+    if (have_task && task.flexible)
+    {
+        /* Re-announce with the adjusted schedule proposed by the peer */
+        log_info(proc->logger,
+                 "Negotiation: re-announcing flexible task with adjusted params\n");
+
+        json_t *rj = _task_to_json(&task);
+        generic_msg_t announce = {0};
+        _build_reply(nmsg, NEG_PROTO_ANNOUNCE, &announce);
+        if (rj)
+        {
+            net_msg_pack_json(&announce.info.net_msg, rj);
+            json_decref(rj);
+        }
+        messaging_send("network", NET_MESSAGE, &announce, false);
+    }
+    else
+    {
+        /* Not flexible (or no payload) — refuse the counter-offer */
+        char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+        if (have_task)
+            uuid_unparse_lower(task.uuid, task_uuid_str);
+
+        log_info(proc->logger,
+                 "Negotiation: task not flexible, refusing counter-offer for %s\n",
+                 task_uuid_str);
+
+        generic_msg_t refuse = {0};
+        _build_reply(nmsg, NEG_PROTO_REFUSE, &refuse);
+        json_t *rj = _task_uuid_json(task_uuid_str);
+        if (rj)
+        {
+            net_msg_pack_json(&refuse.info.net_msg, rj);
+            json_decref(rj);
+        }
+        messaging_send("network", NET_MESSAGE, &refuse, false);
+    }
+
+    return true;
+}
+
+/****************************
  * Handler: handle_refuse (nack) — NEG_PROTO_REFUSE
- * Log the refusal and cancel this participant.
+ * Extract task UUID, decrement expected count in tracker; log failure if insufficient.
  ****************************/
 
 static bool handle_refuse(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
+    (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Negotiation: refused by %s\n", nmsg->from_whom.fullname);
 
     pthread_mutex_lock(&neg_state.lock);
 
-    /* In full impl: extract task_uuid from payload, remove this peer
-     * from proposed_tasks participant list for that task */
+    /* Extract task_uuid from payload */
+    json_t *j = NULL;
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    bool have_task_uuid = false;
+
+    if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
+    {
+        json_t *j_uuid = json_object_get(j, "task_uuid");
+        if (j_uuid && json_is_string(j_uuid))
+        {
+            strncpy(task_uuid_str, json_string_value(j_uuid), UUID_STRING_LEN);
+            have_task_uuid = true;
+        }
+        json_decref(j);
+    }
+
+    if (have_task_uuid)
+    {
+        /* Look up tracker in my_tasks; decrement expected */
+        data_t *trk_dat = NULL;
+        if (map_get(&neg_state.my_tasks, task_uuid_str, &trk_dat) == 0 && trk_dat)
+        {
+            task_tracker_t *tracker = NULL;
+            if (data_object_ptr(trk_dat, (ptr_t *)&tracker) == 0 && tracker)
+            {
+                tracker->expected--;
+                int collected = task_tracker_result_count(tracker);
+                if (tracker->expected <= 0 && collected == 0)
+                {
+                    log_error(proc->logger,
+                              "Negotiation: all peers refused task %s — no participants\n",
+                              task_uuid_str);
+                }
+                else if (tracker->expected < 1)
+                {
+                    log_warn(proc->logger,
+                             "Negotiation: insufficient participants remaining for task %s\n",
+                             task_uuid_str);
+                }
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&neg_state.lock);
+    return true;
+}
+
+/****************************
+ * Handler: handle_accept (ack) — NEG_PROTO_ACCEPT
+ * Extract task_uuid from payload; track count of confirmed peers per task.
+ ****************************/
+
+static bool handle_accept(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    log_info(proc->logger, "Negotiation: accepted by %s\n", nmsg->from_whom.fullname);
+
+    pthread_mutex_lock(&neg_state.lock);
+
+    /* Extract task_uuid from payload */
+    json_t *j = NULL;
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    bool have_task_uuid = false;
+
+    if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
+    {
+        json_t *j_uuid = json_object_get(j, "task_uuid");
+        if (j_uuid && json_is_string(j_uuid))
+        {
+            strncpy(task_uuid_str, json_string_value(j_uuid), UUID_STRING_LEN);
+            have_task_uuid = true;
+        }
+        json_decref(j);
+    }
+
+    /* Keyed by task UUID, count confirmed peer acceptances */
+    const char *key = have_task_uuid ? task_uuid_str : "unknown";
+
+    data_t *count_dat = NULL;
+    int count = 0;
+    if (map_get(&neg_state.confirmed, (map_key_t)key, &count_dat) == 0 && count_dat)
+        data_integer(count_dat, &count);
+
+    count++;
+    data_t *new_count = integer_data(count);
+    map_set(&neg_state.confirmed, (map_key_t)key, new_count);
+
+    log_debug(proc->logger,
+              "Negotiation: task %s now has %d confirmed peer(s)\n",
+              key, count);
 
     pthread_mutex_unlock(&neg_state.lock);
     return true;
@@ -198,24 +644,58 @@ static bool handle_refuse(const process_t *proc, directory_t *queues, generic_ms
 
 /****************************
  * Handler: handle_stat_req (status request) — NEG_PROTO_STAT_REQ
- * Reply to a status query with current task status.
+ * Look up task in task_stack, reply with current status.
  ****************************/
 
 static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
+    (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Negotiation: status request from %s\n", nmsg->from_whom.fullname);
 
-    /* In full impl: extract task_uuid from payload, look up status
-     * in my_tasks map, serialize task_status_t into response */
+    /* Extract task UUID from payload */
+    json_t *j = NULL;
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    uuid_t task_uuid;
+    bool have_task_uuid = false;
+
+    if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
+    {
+        json_t *j_uuid = json_object_get(j, "task_uuid");
+        if (j_uuid && json_is_string(j_uuid))
+        {
+            strncpy(task_uuid_str, json_string_value(j_uuid), UUID_STRING_LEN);
+            if (uuid_parse(task_uuid_str, task_uuid) == 0)
+                have_task_uuid = true;
+        }
+        json_decref(j);
+    }
+
+    /* Determine status */
+    neg_status_t status = NEG_UNKNOWN;
+    if (have_task_uuid)
+    {
+        pthread_mutex_lock(&neg_state.lock);
+        if (job_queue_contains(&neg_state.task_stack, task_uuid))
+            status = NEG_RUNNING;
+        pthread_mutex_unlock(&neg_state.lock);
+    }
+
+    /* Build response JSON */
+    json_t *resp_json = json_object();
+    if (resp_json)
+    {
+        json_object_set_new(resp_json, "task_uuid", json_string(task_uuid_str));
+        json_object_set_new(resp_json, "status",    json_integer((json_int_t)status));
+    }
 
     generic_msg_t resp = {0};
-    resp.type = NET_MESSAGE;
-    strncpy(resp.info.net_msg.process, "negotiation", PROC_NAME_LEN);
-    resp.info.net_msg.function = (char *)NEG_PROTO_STAT_RSP;
-    resp.info.net_msg.encrypt = true;
-    memcpy(&resp.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-    strncpy(resp.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
+    _build_reply(nmsg, NEG_PROTO_STAT_RSP, &resp);
+    if (resp_json)
+    {
+        net_msg_pack_json(&resp.info.net_msg, resp_json);
+        json_decref(resp_json);
+    }
 
     messaging_send("network", NET_MESSAGE, &resp, false);
     return true;
@@ -223,18 +703,91 @@ static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_
 
 /****************************
  * Handler: handle_stat_resp (status response) — NEG_PROTO_STAT_RSP
- * Log the received status response.
+ * Update tracking: extend timeout if active; log cancellation if dead.
  ****************************/
 
 static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
+    (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Negotiation: status response from %s\n", nmsg->from_whom.fullname);
 
     pthread_mutex_lock(&neg_state.lock);
 
-    /* In full impl: deserialize task_status_t from payload,
-     * update tracking state and remove from status_pending */
+    json_t *j = NULL;
+    if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
+    {
+        char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+        neg_status_t status = NEG_UNKNOWN;
+
+        json_t *j_uuid = json_object_get(j, "task_uuid");
+        if (j_uuid && json_is_string(j_uuid))
+            strncpy(task_uuid_str, json_string_value(j_uuid), UUID_STRING_LEN);
+
+        json_t *j_status = json_object_get(j, "status");
+        if (j_status && json_is_integer(j_status))
+            status = (neg_status_t)json_integer_value(j_status);
+
+        json_decref(j);
+
+        /* Look up the task tracker */
+        data_t *trk_dat = NULL;
+        task_tracker_t *tracker = NULL;
+        if (map_get(&neg_state.my_tasks, task_uuid_str, &trk_dat) == 0 && trk_dat)
+            data_object_ptr(trk_dat, (ptr_t *)&tracker);
+
+        switch (status)
+        {
+            case NEG_RUNNING:
+            case NEG_SLEEPING:
+            case NEG_PENDING:
+                /* Task is active — extend its timeout */
+                if (tracker)
+                {
+                    /* Find the job in task_stack and bump its end_time */
+                    uuid_t task_uuid;
+                    if (uuid_parse(task_uuid_str, task_uuid) == 0
+                        && job_queue_contains(&neg_state.task_stack, task_uuid))
+                    {
+                        log_debug(proc->logger,
+                                  "Negotiation: task %s active (status=%d), extending timeout\n",
+                                  task_uuid_str, (int)status);
+                    }
+                }
+                break;
+
+            case NEG_DEAD:
+            case NEG_ZOMBIE:
+            case NEG_STOPPED:
+                log_warn(proc->logger,
+                         "Negotiation: task %s appears cancelled/dead (status=%d)\n",
+                         task_uuid_str, (int)status);
+                break;
+
+            case NEG_UNKNOWN:
+            default:
+                log_debug(proc->logger,
+                          "Negotiation: task %s unknown status %d\n",
+                          task_uuid_str, (int)status);
+                break;
+        }
+
+        /* Remove task_uuid from status_pending list */
+        for (size_t i = 0; i < array_size(&neg_state.status_pending); i++)
+        {
+            data_t *item = NULL;
+            if (array_get(&neg_state.status_pending, i, &item) != 0)
+                continue;
+            char *stored = NULL;
+            if (data_string_ptr(item, &stored) == 0 && stored
+                && strncmp(stored, task_uuid_str, UUID_STRING_LEN) == 0)
+            {
+                /* Found; mark by zeroing the string so it is effectively removed */
+                stored[0] = '\0';
+                break;
+            }
+        }
+    }
 
     pthread_mutex_unlock(&neg_state.lock);
     return true;
@@ -242,19 +795,95 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
 
 /****************************
  * Handler: handle_results (report results) — NEG_PROTO_RESULT
- * Log the result and collect into task tracker.
+ * Collect result, forward to main process when all results arrive.
  ****************************/
 
 static bool handle_results(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
+    (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Negotiation: results from %s\n", nmsg->from_whom.fullname);
 
     pthread_mutex_lock(&neg_state.lock);
 
-    /* In full impl: deserialize task_result_t from payload,
-     * look up tracker in my_tasks, call task_tracker_set_result(),
-     * check if all expected results have arrived */
+    json_t *j = NULL;
+    if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
+    {
+        char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+        uuid_t task_uuid;
+        bool have_task_uuid = false;
+
+        json_t *j_uuid = json_object_get(j, "task_uuid");
+        if (j_uuid && json_is_string(j_uuid))
+        {
+            strncpy(task_uuid_str, json_string_value(j_uuid), UUID_STRING_LEN);
+            if (uuid_parse(task_uuid_str, task_uuid) == 0)
+                have_task_uuid = true;
+        }
+
+        /* Extract raw result bytes (base64-encoded string or omitted) */
+        const uint8_t *result_data = NULL;
+        size_t result_len = 0;
+        json_t *j_result = json_object_get(j, "result_data");
+        if (j_result && json_is_string(j_result))
+        {
+            result_data = (const uint8_t *)json_string_value(j_result);
+            result_len  = strlen((const char *)result_data);
+        }
+
+        if (have_task_uuid)
+        {
+            /* Look up tracker */
+            data_t *trk_dat = NULL;
+            task_tracker_t *tracker = NULL;
+            if (map_get(&neg_state.my_tasks, task_uuid_str, &trk_dat) == 0 && trk_dat)
+                data_object_ptr(trk_dat, (ptr_t *)&tracker);
+
+            if (tracker)
+            {
+                /* Record the result from this peer */
+                task_tracker_set_result(tracker, nmsg->from_whom.uuid,
+                                        result_data, result_len);
+
+                int collected = task_tracker_result_count(tracker);
+                log_debug(proc->logger,
+                          "Negotiation: task %s collected %d/%d results\n",
+                          task_uuid_str, collected, tracker->expected);
+
+                /* If all expected results have arrived, forward to main process */
+                if (collected >= tracker->expected)
+                {
+                    log_info(proc->logger,
+                             "Negotiation: task %s complete — forwarding results\n",
+                             task_uuid_str);
+
+                    /* Build TASK_RESULT message to the main (requestor) process */
+                    generic_msg_t result_msg;
+                    memset(&result_msg, 0, sizeof(result_msg));
+                    result_msg.type = TASK_RESULT;
+                    uuid_copy(result_msg.info.task_result.task_uuid, task_uuid);
+                    uuid_copy(result_msg.info.task_result.requestor_uuid,
+                              nmsg->from_whom.uuid);
+                    result_msg.info.task_result.result_data = (uint8_t *)result_data;
+                    result_msg.info.task_result.result_len  = result_len;
+
+                    messaging_send("main", TASK_RESULT, &result_msg, false);
+
+                    /* Clean up tracker entry */
+                    map_remove(&neg_state.my_tasks, task_uuid_str);
+                    task_tracker_free(tracker);
+                }
+            }
+            else
+            {
+                log_warn(proc->logger,
+                         "Negotiation: received results for unknown task %s\n",
+                         task_uuid_str);
+            }
+        }
+
+        json_decref(j);
+    }
 
     pthread_mutex_unlock(&neg_state.lock);
     return true;

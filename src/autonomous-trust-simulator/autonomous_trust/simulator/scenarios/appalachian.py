@@ -16,15 +16,15 @@
 
 """Braxton County, WV Appalachian mesh network scenario.
 
-Defines the Sutton-Burnsville-Flatwoods triangle from network.md:
+Defines the Sutton-Burnsville-Flatwoods triangle from rural-network.md:
   - 8 hilltop relay nodes on ridgetops (Tier 1)
   - 12 valley relay nodes in hollows/valley floors (Tier 2)
   - Stationary positions (PointData paths)
   - Appropriate antenna and interface assignments per node tier
 
 Coordinates are based on real Braxton County geography:
-  - Sutton hilltop: 38.66N, 80.71W, ~670m (2200 ft) — from network.md
-  - Burnsville hilltop: 38.85N, 80.66W, ~730m (2400 ft) — from network.md
+  - Sutton hilltop: 38.66N, 80.71W, ~670m (2200 ft) — from rural-network.md
+  - Burnsville hilltop: 38.85N, 80.66W, ~730m (2400 ft) — from rural-network.md
   - Flatwoods gateway: 38.73N, 80.65W, ~580m (1900 ft) — I-79 corridor
   - Ridgeline elevations: 550-850m; valley floors: 240-370m
 """
@@ -37,7 +37,7 @@ from typing import Optional
 from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 
 from ..peer.path import PointData, PathData, Variability
-from ..peer.peer import PeerInfo, DataStream
+from ..peer.peer import PeerInfo, DataStream, GatewayUplink
 from ..radio.iface import Antenna, NetInterface
 from ..radio.terrain import TerrainPathLoss, SplatSite
 from ..sim_data import SimConfig, SignalMatrix
@@ -45,12 +45,12 @@ from ..sim_data import SimConfig, SignalMatrix
 
 # Braxton County node definitions
 # Hilltop relays (Tier 1): ridgetop positions with YAGI antennas, MEDIUM interfaces
-# Coordinates derived from network.md worked examples and Braxton County geography
+# Coordinates derived from rural-network.md worked examples and Braxton County geography
 
 HILLTOP_NODES = [
     # (name, lat, lon, elevation_m)
-    ('sutton_hilltop',     38.660, -80.710, 670),   # Ridgetop above Sutton (network.md)
-    ('burnsville_hilltop', 38.850, -80.660, 730),   # Ridgetop above Burnsville (network.md)
+    ('sutton_hilltop',     38.660, -80.710, 670),   # Ridgetop above Sutton (rural-network.md)
+    ('burnsville_hilltop', 38.850, -80.660, 730),   # Ridgetop above Burnsville (rural-network.md)
     ('powell_mtn',         38.720, -80.750, 790),   # Powell Mountain — backbone node
     ('otter_creek_ridge',  38.790, -80.620, 710),   # Otter Creek Ridge — backbone node
     ('flatwoods_hilltop',  38.740, -80.640, 610),   # Ridge above Flatwoods — gateway site
@@ -135,6 +135,16 @@ def create_appalachian_config(
     hilltop_signal = 30.0   # dBm
     valley_signal = 20.0    # dBm
 
+    # Gateway uplink definitions based on FCC BDC data (June 2025)
+    # Fiber: Frontier FTTH in Sutton, Burnsville, Gassaway
+    # Cable: Shentel in Flatwoods (I-79 corridor)
+    GATEWAY_UPLINKS = {
+        'sutton_valley_1':     GatewayUplink('fiber', 1000.0, 1000.0, 0.99),
+        'burnsville_valley_1': GatewayUplink('fiber', 1000.0, 1000.0, 0.99),
+        'gassaway_valley':     GatewayUplink('fiber', 1000.0, 1000.0, 0.99),
+        'flatwoods_valley':    GatewayUplink('cable', 1000.0, 35.0, 0.97),
+    }
+
     peers = []
     node_index = 0
 
@@ -169,6 +179,7 @@ def create_appalachian_config(
             position = GeoPosition(lat, lon, elev).convert(UTMPosition)
             shape = PointData(position)
             path_data = PathData(start, end, shape, Variability.UNIFORM, 0, Variability.UNIFORM)
+            uplink = GATEWAY_UPLINKS.get(name)
             peers.append(PeerInfo(
                 uuid=node_uuid,
                 kind='valley_relay',
@@ -182,6 +193,7 @@ def create_appalachian_config(
                 last_seen=end,
                 path_list=[path_data],
                 data_streams=[],
+                uplink=uplink,
             ))
             node_index += 1
 

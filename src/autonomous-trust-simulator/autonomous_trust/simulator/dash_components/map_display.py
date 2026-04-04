@@ -18,6 +18,8 @@ import logging
 import os
 from collections import OrderedDict
 
+_logger = logging.getLogger(__name__)
+
 import dash_bootstrap_components as dbc
 from dash import Patch, page_container
 
@@ -218,7 +220,7 @@ class MapDisplay(object):
                            Input('overview_trigger', 'triggers'),
                            prevent_initial_call=True)
         def update_overview_divs(_):
-            print('Overview')
+            _logger.debug('Overview')
             patched = Patch()
             current = OrderedDict(self.status)  # freeze content
             add = [current[uuid].glance_div()
@@ -229,7 +231,7 @@ class MapDisplay(object):
                 patched.append(div)
             for div in sub:
                 patched.remove(div)
-            print('Update overview +%d -%d' % (len(add), len(sub)))
+            _logger.debug('Update overview +%d -%d', len(add), len(sub))
             self.prev_overview_status = OrderedDict(current)
             return patched
 
@@ -237,7 +239,7 @@ class MapDisplay(object):
                            Input('full_status_trigger', 'triggers'),
                            prevent_initial_call=True)
         def update_full_divs(_):
-            print('Full')
+            _logger.debug('Full')
             patched = Patch()
             current = OrderedDict(self.status)  # freeze content
             add = [current[uuid].peer_details()
@@ -248,7 +250,7 @@ class MapDisplay(object):
                 patched.append(div)
             for div in sub:
                 patched.remove(div)
-            print('Update full +%d -%d' % (len(add), len(sub)))
+            _logger.debug('Update full +%d -%d', len(add), len(sub))
             self.prev_full_status = OrderedDict(current)
             return patched
 

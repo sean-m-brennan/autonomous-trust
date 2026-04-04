@@ -21,6 +21,8 @@ class Antenna(SerializableEnum):
     DIPOLE = 'dipole'
     YAGI = 'yagi'
     PARABOLIC = 'parabolic'
+    LASER = 'laser'                          # Optical telescope, very high gain
+    HIGH_GAIN_PARABOLIC = 'high_gain_parabolic'  # DSN-class 3-5m dish
 
     @property
     def gain(self):
@@ -31,6 +33,11 @@ class Antenna(SerializableEnum):
             return 12.0
         if self.value == 'parabolic':
             return 25.0
+        if self.value == 'laser':
+            return 50.0
+        if self.value == 'high_gain_parabolic':
+            return 45.0
+        raise ValueError(f"Unknown antenna type: {self.value}")
 
 
 class NetInterface(SerializableEnum):
@@ -39,6 +46,8 @@ class NetInterface(SerializableEnum):
     MEDIUM = 'medium'
     LARGE = 'large'
     POINT_TO_POINT = LARGE  # eg. laser
+    LASER_COMMS = 'laser_comms'      # Optical, requires line-of-sight
+    DEEP_SPACE = 'deep_space'        # Low-bandwidth RF, high-gain parabolic
 
     @property
     def rate(self):
@@ -49,6 +58,11 @@ class NetInterface(SerializableEnum):
             return 10 * 1000 * 1000 # 10Mbps
         if self.value == 'large':
             return 10 * 1000 * 1000 * 1000 # 10Gbps
+        if self.value == 'laser_comms':
+            return 10 * 1000 * 1000  # 10 Mbps
+        if self.value == 'deep_space':
+            return 100 * 1000  # 100 Kbps
+        raise ValueError(f"Unknown interface type: {self.value}")
 
     @property
     def mark(self):
@@ -59,3 +73,8 @@ class NetInterface(SerializableEnum):
             return 22
         if self.value == 'large':
             return 33
+        if self.value == 'laser_comms':
+            return 44
+        if self.value == 'deep_space':
+            return 55
+        raise ValueError(f"Unknown interface type: {self.value}")

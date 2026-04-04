@@ -142,7 +142,7 @@ class Peers(Configuration):
         index = self._index_by(who)
         idx = self._find_v(index)
         if idx is not None:
-            if idx < len(self.hierarchy):
+            if idx < len(self.valuation) - 1:
                 self.valuation[idx + 1][index] = who
             else:
                 del self.listing[who.address]

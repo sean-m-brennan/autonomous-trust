@@ -17,7 +17,7 @@
 import logging
 import sys
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from queue import Empty, Queue
 from typing import Callable, Union
 
@@ -32,7 +32,7 @@ from autonomous_trust.services.peer.metadata import MetadataProtocol, MetadataSo
 from autonomous_trust.services.peer.position import Position, GeoPosition
 
 
-NullPeerData = lambda: PeerData(datetime.utcfromtimestamp(0), Position(0, 0), 0., '', '', 0)  # noqa
+NullPeerData = lambda: PeerData(datetime.fromtimestamp(0, timezone.utc), Position(0, 0), 0., '', '', 0)  # noqa
 
 StreamType = Union[QueueType, deque]
 
@@ -161,9 +161,9 @@ class Cohort(CohortInterface):
                 self.peers[uuid] = PeerDataAcq(uuid, idx, group_ids[uuid], NullPeerData(), self,
                                                self.queue_pool.next(), self.queue_pool.next())
                 # FIXME dynamically creating queues is a problem: "Pickling an AuthenticationString object is disallowed for security reasons"
-        for uuid in self.peers:
-            if uuid not in group_ids:
-                del self.peers[uuid]
+        to_remove = [uuid for uuid in self.peers if uuid not in group_ids]
+        for uuid in to_remove:
+            del self.peers[uuid]
 
     @property
     def center(self) -> Position:

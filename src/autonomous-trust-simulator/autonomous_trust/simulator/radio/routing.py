@@ -99,7 +99,7 @@ class Router(net.Client):
             self.rate_limit = False
             if self.orig_tc_qdisc is not None:
                 self.traffic_ctl('qdisc', 'del dev', self.iface, 'root')
-                self.traffic_ctl('qdisc', 'add dev', self.iface, self.orig_tc_qdisc)
+                self.traffic_ctl('qdisc', 'add dev', self.iface, self.orig_tc_qdisc.decode().strip())
 
     @staticmethod
     def iptables(args, output: bool = False):
@@ -127,7 +127,8 @@ class Router(net.Client):
             dst = 'anywhere'
         result = self.iptables('-L %s' % chain, output=True)[2:]
         for line in result:
-            if line[3] == src and line[4] == dst:
+            fields = line.split()
+            if len(fields) > 4 and fields[3] == src and fields[4] == dst:
                 return True
         return False
 
@@ -173,10 +174,10 @@ class Router(net.Client):
                 rule_present = self.parse_chain(chain, peer.ip4_addr, other.ip4_addr)
                 if state.reachable[p_id][o_id]:  # unblock
                     if rule_present:
-                        self.iptables('-D %s -s %s -d %s DROP' % (chain, peer.ip4_addr, other.ip4_addr))
+                        self.iptables('-D %s -s %s -d %s -j DROP' % (chain, peer.ip4_addr, other.ip4_addr))
                 else:
                     if not rule_present:  # cannot reach, block
-                        self.iptables('-A %s -s %s -d %s DROP' % (chain, peer.ip4_addr, other.ip4_addr))
+                        self.iptables('-A %s -s %s -d %s -j DROP' % (chain, peer.ip4_addr, other.ip4_addr))
 
         if self.rate_limit:
             for peer in state.peers.values():
@@ -189,10 +190,10 @@ class Router(net.Client):
                         if chain.startswith('PRE'):
                             self.iptables('-A %s -j INPUT' % chain)
                         else:
-                            self.iptables('A OUTPUT -j %s' % chain)
+                            self.iptables('-A OUTPUT -j %s' % chain)
 
                     if not self.parse_chain(chain, None, peer.ip4_addr):
-                        self.iptables('-A %s -t mangle -j MARK --set-mark %d -d %s' %
+                        self.iptables('-t mangle -A %s -j MARK --set-mark %d -d %s' %
                                       (chain, peer.iface.mark, peer.ip4_addr))
 
         # Apply signal-quality-based bandwidth degradation

@@ -31,7 +31,7 @@ from .data_feed import DataFeed
 
 
 class PeerStatus(DashComponent):
-    count = 0
+    _count = 0
     icon_height = 40
 
     def __init__(self, ctl: DashControl, peer: PeerDataAcq, cohort: CohortInterface, mapp: DynamicMap,
@@ -43,8 +43,8 @@ class PeerStatus(DashComponent):
         self.icon_map = icons
         self.parent = parent
 
-        self.idx = int(PeerStatus.count)
-        PeerStatus.count += 1
+        self.idx = int(PeerStatus._count)
+        PeerStatus._count += 1
         self.peer_detail_id = 'peer_status_%d' % self.idx
 
         # FIXME dependent on 'video' in peer.metadata

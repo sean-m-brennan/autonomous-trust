@@ -33,7 +33,7 @@ extern int all_config_files(char dir[], array_t *paths);
 extern int read_config_file(const char *filename, void *data_struct);
 extern int config_absolute_path(const char *path_in, char *path_out);
 
-static char test_root[256];
+static char test_root[512];
 
 static void make_test_dirs(void)
 {
@@ -42,13 +42,13 @@ static void make_test_dirs(void)
     ck_assert_ptr_nonnull(dir);
     strncpy(test_root, dir, sizeof(test_root) - 1);
 
-    char cfg_dir[256];
+    char cfg_dir[1024];
     snprintf(cfg_dir, sizeof(cfg_dir), "%s/etc", test_root);
     mkdir(cfg_dir, 0755);
     snprintf(cfg_dir, sizeof(cfg_dir), "%s/etc/at", test_root);
     mkdir(cfg_dir, 0755);
 
-    char data_dir[256];
+    char data_dir[1024];
     snprintf(data_dir, sizeof(data_dir), "%s/var", test_root);
     mkdir(data_dir, 0755);
     snprintf(data_dir, sizeof(data_dir), "%s/var/at", test_root);
@@ -71,7 +71,7 @@ DEFINE_TEST(test_num_config_files)
 {
     make_test_dirs();
 
-    char cfg_dir[256];
+    char cfg_dir[1024];
     snprintf(cfg_dir, sizeof(cfg_dir), "%s/etc/at", test_root);
 
     /* Empty dir has . and .. = 2 entries */
@@ -94,7 +94,7 @@ DEFINE_TEST(test_all_config_files)
 {
     make_test_dirs();
 
-    char cfg_dir[256];
+    char cfg_dir[1024];
     snprintf(cfg_dir, sizeof(cfg_dir), "%s/etc/at", test_root);
 
     write_test_file("alpha.cfg.json", "{}");

@@ -15,41 +15,62 @@
 # ******************
 
 import os
-from sassutils.wsgi import SassMiddleware
-from sass import CompileError
+
+try:
+    import sass
+    _sass_available = True
+except ImportError:
+    _sass_available = False
 
 
-class SassASGIMiddleware(SassMiddleware):
+class SassASGIMiddleware:
+    """ASGI middleware that compiles SCSS to CSS on the fly using libsass.
+
+    Args:
+        app: The Quart/ASGI application.
+        manifests: Dict mapping name to (scss_dir, css_dir, url_prefix, strip_ext).
+    """
+
     def __init__(self, app, manifests, package_dir=None, error_status='200 OK'):
-        if package_dir is None:
-            package_dir = {}
-        self.logger = app.logger  # noqa
-        super().__init__(app.asgi_app, manifests, package_dir, error_status)  # noqa
+        if not _sass_available:
+            raise ImportError("sass module is required for SassASGIMiddleware (pip install libsass)")
+        self.app = app.asgi_app
+        self.logger = app.logger
+        self.paths = []
+        for name, manifest in manifests.items():
+            scss_dir, css_dir, url_prefix, strip_ext = manifest
+            self.paths.append((url_prefix, scss_dir, css_dir, strip_ext))
 
-    async def __call__(self, scope, recv, send):  # noqa
+    async def __call__(self, scope, recv, send):
         path = scope.get('path', '/')
         if path.endswith('.css'):
-            for prefix, package_dir, manifest in self.paths:
-                if not path.startswith(prefix):
+            for url_prefix, scss_dir, css_dir, strip_ext in self.paths:
+                if not path.startswith(url_prefix):
                     continue
-                css_filename = path[len(prefix):]
-                sass_filename = manifest.unresolve_filename(package_dir, css_filename)
-                src_dir = manifest.sass_path
-                if not os.path.isabs(manifest.sass_path):
-                    src_dir = os.path.join(package_dir, manifest.sass_path)
-                if not os.path.exists(os.path.join(src_dir, sass_filename)):
+                css_filename = path[len(url_prefix):]
+                if css_filename.startswith('/'):
+                    css_filename = css_filename[1:]
+                # Derive the .scss source filename from the .css request
+                sass_filename = css_filename[:-4] + '.scss'
+                sass_path = os.path.join(scss_dir, sass_filename)
+                if not os.path.exists(sass_path):
                     continue
-                tgt_dir = manifest.css_path
-                if not os.path.isabs(manifest.css_path):
-                    tgt_dir = os.path.join(package_dir, manifest.css_path)
-                css_path = os.path.join(tgt_dir, css_filename)
+                css_path = os.path.join(css_dir, css_filename)
                 try:
-                    self.logger.info('Compile %s' % os.path.join(src_dir, sass_filename))
-                    manifest.build_one(os.path.dirname(src_dir), sass_filename, source_map=True)
+                    self.logger.info('Compile %s' % sass_path)
+                    result = sass.compile(
+                        filename=sass_path,
+                        output_style='nested',
+                        source_map_filename=css_path + '.map',
+                    )
+                    os.makedirs(os.path.dirname(css_path), exist_ok=True)
+                    with open(css_path, 'w') as f:
+                        f.write(result)
                 except (IOError, OSError) as err:
                     self.logger.error(str(err))
                     break
-                except CompileError as err:
+                except sass.CompileError as err:
                     self.logger.error(str(err))
-                    os.remove(css_path)
+                    if os.path.exists(css_path):
+                        os.remove(css_path)
         return await self.app(scope, recv, send)

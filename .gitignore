@@ -93,3 +93,7 @@ dist
 
 # Data
 /src/autonomous-trust-simulator/data/
+
+/.tmp-sim*/
+/doc/AutonomousTrust.pdf
+/doc/whitepaper/HighTrust.pdf

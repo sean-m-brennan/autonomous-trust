@@ -43,6 +43,7 @@ def generate_appalachian_compose(
     backend: str = "native",
     log_level: str = "info",
     exclude_logs: str = "network",
+    metrics_dir: str = "",
 ) -> str:
     """Generate docker-compose YAML for Appalachian scenario.
 
@@ -55,6 +56,7 @@ def generate_appalachian_compose(
         backend: AT backend selection (native/python).
         log_level: Logging verbosity.
         exclude_logs: Log categories to exclude.
+        metrics_dir: Host directory to mount for metrics output.
 
     Returns:
         YAML string for docker-compose.
@@ -64,7 +66,8 @@ def generate_appalachian_compose(
         nodes.extend(VALLEY_NODES)
 
     num_nodes = len(nodes)
-    base_yaml = generate_compose(num_nodes, exclude_logs, log_level, backend)
+    base_yaml = generate_compose(num_nodes, exclude_logs, log_level, backend,
+                                 metrics_dir)
     data = yaml.safe_load(base_yaml)
 
     # Rebuild services with Appalachian node names and metadata

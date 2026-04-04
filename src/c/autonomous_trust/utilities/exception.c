@@ -19,7 +19,7 @@
 
 #define EXCEPTION_IMPL
 
-exception_t _exception = {0};
+_Thread_local exception_t _exception = {0};
 
 int _set_exception(int err, size_t line, const char *file)
 {

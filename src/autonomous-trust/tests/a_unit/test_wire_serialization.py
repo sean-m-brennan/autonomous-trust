@@ -148,11 +148,9 @@ class TestLinkedStepWire:
         child = LinkedStep(payload='child_data', uuid=uuid4(), parent=parent)
         data = child.to_string()
         restored = LinkedStep.from_string(data)
-        # Note: Step.__init__ always sets self.uuid = None (pre-existing bug)
-        # so child.uuid is None and sync_to_message writes nothing for uuid
-        assert restored.uuid is None
+        assert restored.uuid == child.uuid
         assert restored.parent is not None
-        assert restored.parent.uuid is None
+        assert restored.parent.uuid == parent.uuid
         # Lossy fields
         assert restored.payload is None
         assert restored.timestamp is None

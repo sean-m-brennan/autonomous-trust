@@ -14,4 +14,6 @@
 #   limitations under the License.
 # ******************
 
+from . import appalachian  # noqa: F401
+
 __all__ = ['appalachian']

@@ -14,9 +14,12 @@
 #   limitations under the License.
 # ******************
 
+import logging
 import random
 import time
 from collections import deque
+
+_logger = logging.getLogger(__name__)
 from datetime import timedelta, datetime
 from typing import Optional
 
@@ -55,7 +58,7 @@ class SimVideoSource(VideoSource):
             if self.peer is not None:
                 elapsed = int((self.peer.time - self.start).total_seconds())
                 if self.peer.active and not self.peer.cohort.paused and prev < elapsed:
-                    print('Elapsed ', elapsed)  # FIXME all are active
+                    _logger.debug('Elapsed %d', elapsed)
                     more, frame_num, frame = self.next(at_position=elapsed, post_proc=extra_process)
                     prev = elapsed
                     if frame is not None:

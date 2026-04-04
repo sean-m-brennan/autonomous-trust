@@ -22,7 +22,7 @@ import numpy as np
 
 
 class Ident:
-    idx = 1
+    idx = 1  # Class-level counter: intentionally shared across instances to generate unique sequential IDs
 
     def __init__(self, name):
         self.name = '%s#%s' % (name, str(Ident.idx).zfill(3))

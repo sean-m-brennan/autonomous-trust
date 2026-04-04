@@ -73,7 +73,7 @@ class Position(Configuration):
         mid_x = (max(x) + min(x)) / 2.
         y = [pos._y for pos in others]
         mid_y = (max(y) + min(y)) / 2.
-        z = [pos._z for pos in others if pos is not None]
+        z = [pos._z for pos in others if pos._z is not None]
         mid_z = None
         if len(z) > 0:
             mid_z = (max(z) + min(z)) / 2.
@@ -171,7 +171,7 @@ class UTMPosition(Position):
         super().__init__(easting, northing, alt, msg_class=position_pb2.UTMPosition)
         self.easting = float(easting)
         self.northing = float(northing)
-        self.alt = float(alt)
+        self.alt = float(alt) if alt is not None else None
         self.zone = zone
         self.north = zone.lower().endswith('n')
         self.zone_num = int(zone[:-1])

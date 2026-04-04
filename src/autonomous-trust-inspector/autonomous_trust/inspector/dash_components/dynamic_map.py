@@ -43,11 +43,10 @@ class DynamicMap(DashComponent):
         self.logger = logger
         self.height = size
         self.width = size * 1.3
-        self.mapbox_style = style
+        self.map_style = style
 
         self.queue = Queue(maxsize=1)
-        self.mapbox_token = os.environ.get('MAPBOX', None)
-        self.use_mapbox = False if self.mapbox_token is None else True
+        self.use_map = os.environ.get('MAPBOX', None) is not None
         self.fig = go.Figure()
         self.color_map = {}
         self.coords: dict[str, Coord] = {}
@@ -77,9 +76,9 @@ class DynamicMap(DashComponent):
                       [Input('map-graph', 'relayoutData')])
         def get_map_scale(relay_out):
             if relay_out is not None:
-                if self.use_mapbox:
-                    if 'mapbox.zoom' in relay_out:
-                        self.z_scale = relay_out['mapbox.zoom']
+                if self.use_map:
+                    if 'map.zoom' in relay_out:
+                        self.z_scale = relay_out['map.zoom']
                 else:
                     if 'geo.projection.scale' in relay_out:
                         self.z_scale = relay_out['geo.projection.scale']
@@ -133,15 +132,14 @@ class DynamicMap(DashComponent):
                                            lat=[self.coords[uuid].lat[-1]], lon=[self.coords[uuid].lon[-1]])
         if self.z_scale != self.default_scale:  # FIXME or pitch/bearing/follow changes
             margin = dict(l=self.fig_margin, r=self.fig_margin, t=self.fig_margin, b=self.fig_margin)
-            if self.use_mapbox:
+            if self.use_map:
                 self.fig.update_layout(dict(**self.basic_layout,
-                                            mapbox=dict(accesstoken=self.mapbox_token,
-                                                        style=self.mapbox_style,
-                                                        center=dict(lat=self.center.lat, lon=self.center.lon),
-                                                        zoom=self.z_scale,
-                                                        pitch=self.pitch,
-                                                        bearing=self.bearing,
-                                                        ), ),
+                                            map=dict(style=self.map_style,
+                                                     center=dict(lat=self.center.lat, lon=self.center.lon),
+                                                     zoom=self.z_scale,
+                                                     pitch=self.pitch,
+                                                     bearing=self.bearing,
+                                                     ), ),
                                        True)
             else:
                 self.fig.update_layout(dict(**self.basic_layout,
@@ -193,8 +191,8 @@ class DynamicMap(DashComponent):
     def add_traces(self, idx, uuid):
         position = self.cohort.peers[uuid].position.convert(GeoPosition)
         scatter = go.Scattergeo
-        if self.use_mapbox:
-            scatter = go.Scattermapbox
+        if self.use_map:
+            scatter = go.Scattermap
         self.color_map[uuid] = colors.qualitative.Light24[idx]
         self.fig.add_trace(scatter(lat=[position.lat], lon=[position.lon],
                                    mode='markers', marker=dict(color=self.color_map[uuid], opacity=.7),
@@ -215,7 +213,7 @@ class DynamicMap(DashComponent):
         self.cohort.update(initial=True)  # FIXME initial - must not run components
         self.logger.debug('Initialize map: %d peers' % len(self.cohort.peers))
         center = self.cohort.center.convert(GeoPosition)
-        if self.use_mapbox:
+        if self.use_map:
             self.z_scale = 14  # TODO: compute, this is tuned for the example config
         for idx, uuid in enumerate(self.cohort.peers):
             if self.cohort.peers[uuid].active:
@@ -224,15 +222,14 @@ class DynamicMap(DashComponent):
             else:  # FIXME insert at update instead
                 self.peer_tracker[uuid] = False
                 #position = GeoPosition(0., 0., 0.)  # hide it
-        if self.use_mapbox:
+        if self.use_map:
             self.fig.update_layout(**self.basic_layout,
-                                   mapbox=dict(accesstoken=self.mapbox_token,
-                                               style=self.mapbox_style,
-                                               center=dict(lat=center.lat, lon=center.lon),
-                                               zoom=self.z_scale,
-                                               pitch=self.pitch,
-                                               bearing=self.bearing,
-                                               ),
+                                   map=dict(style=self.map_style,
+                                            center=dict(lat=center.lat, lon=center.lon),
+                                            zoom=self.z_scale,
+                                            pitch=self.pitch,
+                                            bearing=self.bearing,
+                                            ),
                                    )
         else:
             self.fig.update_layout(**self.basic_layout,
@@ -245,8 +242,6 @@ class DynamicMap(DashComponent):
         if self.initialized:  # i.e. a reset
             if self.ctl.legacy:
                 config = dict(displayModeBar=False)
-                if self.use_mapbox:
-                    config['mapboxtoken'] = self.mapbox_token
                 self.ctl.emit('update_figure', ['map-graph', self.fig.to_dict(), config])
             else:
                 self.ctl.push_mods({'map-graph': {'figure': self.fig.to_dict()}})

@@ -93,7 +93,7 @@ int array_append(array_t *a, data_t *element)
 int array_get(array_t *a, int index, data_t **element)
 {
     if (index < 0)
-        index = a->size + 1 + index;
+        index = a->size + index;
     if (index > a->size)
         return EXCEPTION(EARR_OOB);
     *element = a->array[index];
@@ -103,7 +103,7 @@ int array_get(array_t *a, int index, data_t **element)
 int array_set(array_t *a, int index, data_t *element)
 {
     if (index < 0)
-        index = a->size + 1 + index;
+        index = a->size + index;
     if (index > a->size)
         return EXCEPTION(EARR_OOB);
 
@@ -183,7 +183,7 @@ int array_to_json(const void *data_struct, json_t **obj_ptr)
     if (obj == NULL)
         return EXCEPTION(ENOMEM);
 
-    json_object_set(obj, "size", json_integer(array->size));
+    json_object_set_new(obj, "size", json_integer(array->size));
     json_t *j_arr = json_array();
     for (int i=0; i<array->size; i++) {
         json_t *dat;
@@ -199,13 +199,12 @@ int array_from_json(const json_t *obj, void *data_struct)
 {
     array_t *array = data_struct;
     array->size = json_integer_value(json_object_get(obj, "size"));
-    array->array = smrt_create(array->size * sizeof(data_t));
+    array->array = smrt_create(array->size * sizeof(data_t *));
     json_t *j_arr = json_object_get(obj, "array");
     for (int i=0; i<array->size; i++) {
         json_t *elt = json_array_get(j_arr, i);
+        array->array[i] = smrt_create(sizeof(data_t));
         data_from_json(elt, array->array[i]);
-        array->array[i]->alloc = true;
-        array->array[i]->refs = 1;
     }
     return 0;
 }

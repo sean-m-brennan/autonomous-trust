@@ -72,7 +72,7 @@ typedef struct
 
 
 /** */
-int identiry_init(uuid_t *uuid, char *address, char *fullname, identity_t *identity);
+int identity_init(uuid_t *uuid, char *address, char *fullname, identity_t *identity);
 
 /***/
 int identity_create(uuid_t *uuid, char *address, char *fullname, identity_t **ident);

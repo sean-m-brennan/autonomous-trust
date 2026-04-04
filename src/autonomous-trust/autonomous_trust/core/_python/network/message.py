@@ -15,7 +15,6 @@
 # ******************
 
 from ..config import Configuration
-from ..identity import Identity, Group
 from .network import Network
 
 
@@ -29,6 +28,11 @@ class Message(object):
     ====================================
     """
     def __init__(self, process, function, obj, to_whom=None, from_whom=None, encrypt=True, return_to=None):
+        # Deferred import to break circular dependency:
+        # network.__init__ -> message -> identity -> idprocess -> network
+        from ..identity import Identity, Group
+
+        self.verified = False
         try:
             self.process = process.value
         except AttributeError:
@@ -75,6 +79,7 @@ class Message(object):
 
     @staticmethod
     def parse(raw_msg, sender, validate=True):
+        from ..identity import Identity
         if validate and sender is not None and not isinstance(sender, Identity):
             raise RuntimeError('Sender must be an Identity')
         if isinstance(raw_msg, bytes):

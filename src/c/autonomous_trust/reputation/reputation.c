@@ -337,7 +337,7 @@ int reputations_update(reputations_t *reps, const uuid_t peer_uuid, double score
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(peer_uuid, uuid_str);
 
-    data_t *score_dat = floating_pt_data((float)score);
+    data_t *score_dat = floating_pt_data((float)score);  /* floating_pt_data accepts float; truncation from double is acceptable */
     return map_set(&reps->scores, uuid_str, score_dat);
 }
 
@@ -438,6 +438,7 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
 double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *reps,
                                const uuid_t self_uuid, const uuid_t peer_uuid)
 {
+    (void)reps;
     transaction_t txns[MAX_CHAIN_LEN];
     int count = 0;
     tx_history_by_peer(hist, peer_uuid, txns, &count, MAX_CHAIN_LEN);

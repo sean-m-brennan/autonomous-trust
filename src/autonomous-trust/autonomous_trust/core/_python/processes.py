@@ -216,7 +216,10 @@ class ProcessLogger(object):
         if self.suppress:
             return
         if self.log_queue is not None:
-            self.log_queue.put((level, self.name, msg), block=True, timeout=0.001)
+            try:
+                self.log_queue.put((level, self.name, msg), block=True, timeout=0.001)
+            except queue.Full:
+                pass  # drop log message rather than crash
         else:
             self.logger.log(level, msg)
 
