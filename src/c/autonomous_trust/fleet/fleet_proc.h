@@ -61,6 +61,41 @@ bool fleet_should_accept_proposal(const update_proposal_t *prop,
                                   const uint8_t *signer_pk,
                                   double proposer_reputation);
 
+/**
+ * fleet_store_artifact - read a file, hash it, and store it in the
+ * artifact store as chunks.
+ *
+ * @file_path:  path to the file to store
+ * @version:    version string to attach to the manifest
+ * @logger:     logger for diagnostics (may be NULL)
+ * @hash_out:   receives the raw blake2b-256 hash (UPDATE_HASH_LEN bytes)
+ * @hash_hex_out: receives the hex-encoded hash string (must be at least
+ *                UPDATE_HASH_LEN*2+1 bytes)
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int fleet_store_artifact(const char *file_path, const char *version,
+                         logger_t *logger,
+                         uint8_t *hash_out, char *hash_hex_out);
+
+/**
+ * fleet_propose_update - build, sign, and submit an update proposal to
+ * the local fleet process via IPC.
+ *
+ * @artifact_hash:  raw blake2b-256 hash of the artifact (UPDATE_HASH_LEN)
+ * @version:        version string
+ * @target_arch:    target architecture (e.g. "amd64", "arm64")
+ * @signing_pk:     proposer's public key (crypto_sign_PUBLICKEYBYTES)
+ * @signing_sk:     proposer's secret key (crypto_sign_SECRETKEYBYTES)
+ * @logger:         logger for diagnostics (may be NULL)
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int fleet_propose_update(const uint8_t *artifact_hash, const char *version,
+                         const char *target_arch,
+                         const uint8_t *signing_pk, const uint8_t *signing_sk,
+                         logger_t *logger);
+
 int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
 #endif /* FLEET_PROC_H */

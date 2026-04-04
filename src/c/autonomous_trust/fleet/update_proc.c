@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -109,6 +110,37 @@ static int ensure_staging_dir(void)
 }
 
 /**
+ * trigger_service_restart - signal the AT daemon to shut down so systemd
+ * restarts the service with the new binary/config.
+ *
+ * Reads the daemon PID from <data_dir>/at_daemon.pid and sends SIGTERM.
+ * The daemon exits, at_demo detects this and exits, and systemd's
+ * Restart=on-failure brings the service back up.
+ *
+ * This avoids the need for sudo (which fails under NoNewPrivileges=true).
+ */
+static void trigger_service_restart(void)
+{
+    char pid_path[512];
+    snprintf(pid_path, sizeof(pid_path), "%s/at_daemon.pid", update_data_dir);
+
+    FILE *f = fopen(pid_path, "r");
+    if (!f)
+        _exit(1);  /* PID file missing — exit so systemd restarts us */
+
+    int daemon_pid = 0;
+    if (fscanf(f, "%d", &daemon_pid) != 1 || daemon_pid <= 0)
+    {
+        fclose(f);
+        _exit(1);
+    }
+    fclose(f);
+
+    kill(daemon_pid, SIGTERM);
+    _exit(0);
+}
+
+/**
  * broadcast_status - send update status to all known peers.
  */
 static void broadcast_status(const process_t *proc,
@@ -150,7 +182,8 @@ static void broadcast_status(const process_t *proc,
 /**
  * stage_and_apply - stage artifact, back up current binary, swap, restart.
  *
- * On success this function does not return (execl replaces the process).
+ * On success this function does not return (_exit terminates the process
+ * after signalling the AT daemon for a service restart).
  * Returns -1 on error.
  */
 static int stage_and_apply(const process_t *proc,
@@ -209,10 +242,10 @@ static int stage_and_apply(const process_t *proc,
         return -1;
     }
 
-    /* Restart the service — replaces this process image */
-    execl("/usr/bin/sudo", "sudo", "systemctl", "restart", "autonomous-trust", NULL);
+    /* Signal the AT daemon to shut down; systemd will restart the service */
+    trigger_service_restart();
 
-    /* If execl returns, something went wrong */
+    /* trigger_service_restart calls _exit; this is only reached on failure */
     return -1;
 }
 
@@ -255,7 +288,8 @@ static void rollback(const process_t *proc, update_state_t *state)
     broadcast_status(proc, state->hash_hex, state->version, "failed",
                      "health check failed, rolling back");
 
-    execl("/usr/bin/sudo", "sudo", "systemctl", "restart", "autonomous-trust", NULL);
+    /* Signal the AT daemon to shut down; systemd will restart the service */
+    trigger_service_restart();
 }
 
 /**
@@ -281,7 +315,7 @@ static void run_health_check(const process_t *proc, update_state_t *state)
         !selftest_config(cfg_dir))
     {
         rollback(proc, state);
-        return;  /* only reached if execl fails */
+        return;  /* only reached if trigger_service_restart fails */
     }
 
     /* Peer handshake test: try to reach at least one peer */
@@ -326,10 +360,12 @@ static void run_health_check(const process_t *proc, update_state_t *state)
     if (!handshake_ok)
     {
         rollback(proc, state);
-        return;  /* only reached if execl fails */
+        return;  /* only reached if trigger_service_restart fails */
     }
 
     /* All checks passed */
+    log_info(proc->logger, "Update: health check PASSED for %s v%s\n",
+             state->hash_hex, state->version);
     update_state_delete(update_data_dir);
 
     /* Clean up based on type */
@@ -400,8 +436,10 @@ static bool handle_config_ready(const process_t *proc, directory_t *queues, gene
     json_decref(payload);
 
     log_info(proc->logger, "Update: triggering restart for config update\n");
-    execl("/usr/bin/sudo", "sudo", "systemctl", "restart", "autonomous-trust", NULL);
-    log_error(proc->logger, "Update: execl failed: %s\n", strerror(errno));
+    trigger_service_restart();
+
+    /* trigger_service_restart calls _exit; this is only reached on failure */
+    log_error(proc->logger, "Update: trigger_service_restart failed\n");
     return false;
 }
 
@@ -437,7 +475,16 @@ static bool handle_artifact_ready(const process_t *proc, directory_t *queues, ge
     log_info(proc->logger, "Update: artifact ready hash=%s version=%s path=%s\n",
              hash_hex, version, artifact_path);
 
-    int rc = stage_and_apply(proc, artifact_path, hash_hex, version);
+    /* Reassemble chunks into a single file for stage_and_apply */
+    char assembled_path[512];
+    if (artifact_store_reassemble(hash_hex, assembled_path, sizeof(assembled_path)) != 0)
+    {
+        log_error(proc->logger, "Update: artifact reassembly failed for %s\n", hash_hex);
+        json_decref(payload);
+        return false;
+    }
+
+    int rc = stage_and_apply(proc, assembled_path, hash_hex, version);
 
     /* If we get here, stage_and_apply failed (execl didn't happen) */
     if (rc != 0)

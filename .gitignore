@@ -97,6 +97,10 @@ dist
 /.tmp-sim*/
 /doc/AutonomousTrust.pdf
 /doc/whitepaper/HighTrust.pdf
+/doc/tekfive/pitch/*.pdf
+/doc/tekfive/whitepaper/bibtex2bibjson/
+/docs/
+/run_data/
 /embedded/.test-qemu/
 /embedded/.test-docker-fleet*/
 /embedded/.fleet-test*/
