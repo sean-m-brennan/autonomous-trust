@@ -29,9 +29,10 @@ EnvironmentFile=-/opt/autonomous-trust/etc/at/environment
 
 ExecStartPre=/bin/mkdir -p /opt/autonomous-trust/etc/at /opt/autonomous-trust/var/at
 ExecStartPre=/bin/sh -c '[ "${STARTUP_DELAY:-0}" -le 0 ] 2>/dev/null || sleep "$STARTUP_DELAY"'
-ExecStart=/usr/local/bin/at_demo --generate-config --log-level ${LOG_LEVEL}
+ExecStart=/bin/sh -c 'exec /opt/autonomous-trust/bin/at_demo --generate-config --log-level ${LOG_LEVEL} ${AUTONOMOUS_TRUST_ARGS}'
+Environment=LD_LIBRARY_PATH=/opt/autonomous-trust/lib
 
-Restart=on-failure
+Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal

@@ -193,6 +193,23 @@ for i in $(seq 1 "$NODE_COUNT"); do
     vm_dir="$WORK_DIR/$node_name"
     mkdir -p "$vm_dir"
 
+    # Kill leftover QEMU from a previous --keep run (PID file or port probe)
+    if [ -f "$vm_dir/qemu.pid" ]; then
+        old_pid="$(cat "$vm_dir/qemu.pid" 2>/dev/null)"
+    else
+        # No PID file — check if something is holding our SSH port
+        old_pid="$(ss -tlnp 2>/dev/null | grep ":${ssh_port} " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1 || true)"
+    fi
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+        info "  Stopping leftover $node_name (PID $old_pid) ..."
+        kill "$old_pid" 2>/dev/null
+        for _w in $(seq 1 20); do
+            kill -0 "$old_pid" 2>/dev/null || break
+            sleep 0.5
+        done
+    fi
+    rm -f "$vm_dir/qemu.pid"
+
     # Create per-VM disk (COW overlay on base image)
     disk="$vm_dir/disk.qcow2"
     if [ ! -f "$disk" ]; then
@@ -250,6 +267,13 @@ USERDATA
         -pidfile "$vm_dir/qemu.pid" \
         -daemonize
 
+    # Verify QEMU started (daemonize masks failures)
+    sleep 1
+    if [ ! -f "$vm_dir/qemu.pid" ]; then
+        error "$node_name: QEMU failed to start. Check: $vm_dir/console.log"
+        error "Hint: try removing stale disk: rm $vm_dir/disk.qcow2"
+        exit 1
+    fi
     pid="$(cat "$vm_dir/qemu.pid")"
     VM_PIDS+=("$pid")
     info "  $node_name PID=$pid"
@@ -362,11 +386,11 @@ for i in $(seq 1 "$NODE_COUNT"); do
     ssh_cmd="ssh $SSH_OPTS -i $WORK_DIR/test_key -p $ssh_port test@localhost"
 
     # Check 1: at_demo binary is installed
-    $ssh_cmd "test -x /usr/local/bin/at_demo" 2>/dev/null && rc=0 || rc=$?
+    $ssh_cmd "test -x /opt/autonomous-trust/bin/at_demo" 2>/dev/null && rc=0 || rc=$?
     check "$node_name: at_demo binary installed" $rc
 
     # Check 2: shared library is present
-    $ssh_cmd "test -f /usr/local/lib/libautonomous_trust.so" 2>/dev/null && rc=0 || rc=$?
+    $ssh_cmd "test -f /opt/autonomous-trust/lib/libautonomous_trust.so" 2>/dev/null && rc=0 || rc=$?
     check "$node_name: libautonomous_trust.so present" $rc
 
     # Check 3: systemd service is active
@@ -423,11 +447,13 @@ if [ "$FLEET_TEST" = true ]; then
     $ssh_node1 "sudo systemctl start autonomous-trust"
 
     # Wait for node-2 artifact download (poll logs)
-    info "Waiting for node-2 artifact download (up to 120s) ..."
+    # Artifact transfer is sequential (one chunk per round-trip) and QEMU TCG
+    # emulation adds latency, so allow enough time for ~350 chunks + bootstrap.
+    FLEET_TIMEOUT=600
+    info "Waiting for node-2 artifact download (up to ${FLEET_TIMEOUT}s) ..."
     FLEET_ELAPSED=0
-    FLEET_TIMEOUT=120
     while [ $FLEET_ELAPSED -lt $FLEET_TIMEOUT ]; do
-        if $ssh_node2 "journalctl -u autonomous-trust --no-pager" 2>/dev/null | grep -q "download complete"; then
+        if $ssh_node2 "sudo journalctl -u autonomous-trust --no-pager 2>/dev/null | grep -q 'download complete'" 2>/dev/null; then
             info "Node-2: artifact download complete after ${FLEET_ELAPSED}s"
             break
         fi
@@ -456,14 +482,20 @@ if [ "$FLEET_TEST" = true ]; then
             RECONNECT_ELAPSED=$((RECONNECT_ELAPSED + 3))
         done
 
-        # Verify post-restart state
-        $ssh_node2 "systemctl is-active autonomous-trust" &>/dev/null && rc=0 || rc=$?
+        # Verify post-restart state (service may be in RestartSec delay)
+        rc=1
+        for _attempt in $(seq 1 6); do
+            if $ssh_node2 "systemctl is-active autonomous-trust" &>/dev/null; then
+                rc=0; break
+            fi
+            sleep 3
+        done
         check "Node-2: service active after restart" $rc
 
-        $ssh_node2 "! test -f /opt/autonomous-trust/var/at/update/state.json" 2>/dev/null && rc=0 || rc=$?
+        $ssh_node2 "! test -f /opt/autonomous-trust/var/at/fleet_update/state.json" 2>/dev/null && rc=0 || rc=$?
         check "Node-2: state file cleaned up" $rc
 
-        $ssh_node2 "journalctl -u autonomous-trust --no-pager" 2>/dev/null | grep -q "health check PASSED" && rc=0 || rc=$?
+        $ssh_node2 "sudo journalctl -u autonomous-trust --no-pager 2>/dev/null | grep -q 'health check PASSED'" 2>/dev/null && rc=0 || rc=$?
         check "Node-2: health check passed in logs" $rc
 
         $ssh_node2 "ls /opt/autonomous-trust/var/at/artifacts/*/complete >/dev/null 2>&1" && rc=0 || rc=$?

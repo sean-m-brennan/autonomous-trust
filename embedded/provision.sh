@@ -151,6 +151,7 @@ BOOTSTRAP
     cat > "$config_dir/environment" <<ENV
 LOG_LEVEL=info
 STARTUP_DELAY=$((i * STAGGER_DELAY))
+AUTONOMOUS_TRUST_ARGS=
 ENV
 
     if $FULL_IDENTITY; then

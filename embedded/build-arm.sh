@@ -120,11 +120,11 @@ extract_artifacts() {
 
     local staging="$DIST_DIR/staging-${arch}"
     rm -rf "$staging"
-    mkdir -p "$staging/usr/local/bin" "$staging/usr/local/lib"
+    mkdir -p "$staging/opt/autonomous-trust/bin" "$staging/opt/autonomous-trust/lib"
 
-    docker cp "$container_name:/usr/local/bin/at_demo" "$staging/usr/local/bin/"
+    docker cp "$container_name:/opt/autonomous-trust/bin/at_demo" "$staging/opt/autonomous-trust/bin/"
     if ! $STATIC; then
-        docker cp "$container_name:/usr/local/lib/libautonomous_trust.so" "$staging/usr/local/lib/"
+        docker cp "$container_name:/opt/autonomous-trust/lib/libautonomous_trust.so" "$staging/opt/autonomous-trust/lib/"
     fi
     docker rm -f "$container_name"
     trap - EXIT
