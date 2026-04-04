@@ -1,0 +1,101 @@
+/********************
+ *  Copyright 2025 Sean M. Brennan and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
+#ifndef FLEET_PROC_H
+#define FLEET_PROC_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "autonomous_trust/processes/processes.h"
+#include "autonomous_trust/fleet/update_proposal.h"
+
+#define FLEET_PROTO_PROPOSE      "update proposal"
+#define FLEET_PROTO_VOTE_REQ     "update vote request"
+#define FLEET_PROTO_VOTE_GRANT   "update vote grant"
+#define FLEET_PROTO_VOTE_NACK    "update vote nack"
+#define FLEET_PROTO_ACCEPTED     "update accepted"
+#define FLEET_PROTO_REJECTED     "update rejected"
+
+#define FLEET_DEFAULT_MIN_REPUTATION 0.7
+
+/**
+ * fleet_validate_proposal - verify the proposal signature.
+ * @prop:      the proposal to verify
+ * @signer_pk: public key of the expected signer (crypto_sign_PUBLICKEYBYTES)
+ * Returns true if the signature is valid, false otherwise.
+ */
+bool fleet_validate_proposal(const update_proposal_t *prop, const uint8_t *signer_pk);
+
+/**
+ * fleet_check_reputation_threshold - test whether a peer meets the minimum
+ * reputation requirement.
+ * @peer_reputation: the peer's current reputation score
+ * @min_threshold:   the minimum required reputation
+ * Returns true if peer_reputation >= min_threshold.
+ */
+bool fleet_check_reputation_threshold(double peer_reputation, double min_threshold);
+
+/**
+ * fleet_should_accept_proposal - combined validation + reputation gate.
+ * @prop:               the proposal to validate
+ * @signer_pk:          public key of the proposer
+ * @proposer_reputation: the proposer's current reputation score
+ * Returns true only if the signature is valid AND reputation meets the
+ * threshold embedded in the proposal (prop->min_proposer_reputation).
+ */
+bool fleet_should_accept_proposal(const update_proposal_t *prop,
+                                  const uint8_t *signer_pk,
+                                  double proposer_reputation);
+
+/**
+ * fleet_store_artifact - read a file, hash it, and store it in the
+ * artifact store as chunks.
+ *
+ * @file_path:  path to the file to store
+ * @version:    version string to attach to the manifest
+ * @logger:     logger for diagnostics (may be NULL)
+ * @hash_out:   receives the raw blake2b-256 hash (UPDATE_HASH_LEN bytes)
+ * @hash_hex_out: receives the hex-encoded hash string (must be at least
+ *                UPDATE_HASH_LEN*2+1 bytes)
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int fleet_store_artifact(const char *file_path, const char *version,
+                         logger_t *logger,
+                         uint8_t *hash_out, char *hash_hex_out);
+
+/**
+ * fleet_propose_update - build, sign, and submit an update proposal to
+ * the local fleet process via IPC.
+ *
+ * @artifact_hash:  raw blake2b-256 hash of the artifact (UPDATE_HASH_LEN)
+ * @version:        version string
+ * @target_arch:    target architecture (e.g. "amd64", "arm64")
+ * @signing_pk:     proposer's public key (crypto_sign_PUBLICKEYBYTES)
+ * @signing_sk:     proposer's secret key (crypto_sign_SECRETKEYBYTES)
+ * @logger:         logger for diagnostics (may be NULL)
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int fleet_propose_update(const uint8_t *artifact_hash, const char *version,
+                         const char *target_arch,
+                         const uint8_t *signing_pk, const uint8_t *signing_sk,
+                         logger_t *logger);
+
+int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
+
+#endif /* FLEET_PROC_H */

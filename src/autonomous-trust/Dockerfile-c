@@ -46,9 +46,10 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Copy C source and protobuf definitions (src/c/protobuf is a symlink)
+# Copy C source and protobuf definitions
+# CMake expects protobuf as a sibling: ${CMAKE_CURRENT_SOURCE_DIR}/../protobuf
 COPY src/c /build/c-src
-COPY src/protobuf /build/c-src/protobuf
+COPY src/protobuf /build/protobuf
 
 RUN rm -rf /build/c-src/build && mkdir -p /build/c-src/build && cd /build/c-src/build && \
     CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DREVISION="$GIT_VERSION" -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" -DCMAKE_CXX_FLAGS="-Wno-unknown-warning-option" && \
@@ -75,12 +76,16 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy built artifacts from builder
-COPY --from=builder /build/install/usr/local/bin/at_demo /usr/local/bin/at_demo
-COPY --from=builder /build/install/usr/local/lib/libautonomous_trust.so /usr/local/lib/libautonomous_trust.so
-RUN ldconfig
+COPY --from=builder /build/install/usr/local/bin/at_demo /opt/autonomous-trust/bin/at_demo
+COPY --from=builder /build/install/usr/local/lib/libautonomous_trust.so /opt/autonomous-trust/lib/libautonomous_trust.so
+RUN echo "/opt/autonomous-trust/lib" > /etc/ld.so.conf.d/autonomous-trust.conf && ldconfig
+ENV PATH="/opt/autonomous-trust/bin:$PATH"
 
 COPY src/autonomous-trust/entrypoint-c.sh /bin/entrypoint-c.sh
 RUN chmod +x /bin/entrypoint-c.sh
+
+# Pre-create data dirs writable by any UID (supports user: in compose)
+RUN mkdir -p /etc/at /var/at && chmod 777 /etc/at /var/at
 
 ENV AUTONOMOUS_TRUST_ROOT="/"
 ENV ROUTER="172.17.0.1"

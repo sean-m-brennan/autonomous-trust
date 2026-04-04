@@ -14,101 +14,57 @@
  *   limitations under the License.
  *******************/
 
+/**
+ * Minimal example of an application hosting an Autonomous Trust node.
+ *
+ * The tick callback receives messages from the AT daemon and can react
+ * to them — replace the body with your application logic.
+ */
+
 #include <stdio.h>
-#include <stdbool.h>
-#include <signal.h>
-#include <string.h>
-#include <errno.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <string.h>
-#include <sys/wait.h>
 
 #include "autonomous_trust.h"
 
-#define LIMITED_RUN
+#define EXAMPLE_ITERATIONS 200
 
-#ifdef LIMITED_RUN
-#define CONTINUE_RUN (loop < 200)
-#else
-#define CONTINUE_RUN true
-#endif
+static int example_tick(at_node_t *node, void *user_data)
+{
+    (void)user_data;
+
+    /* Check for messages from AT sub-processes */
+    generic_msg_t buf = {0};
+    int err = messaging_recv(&buf);
+    if (err == -1)
+        log_exception(at_node_logger(node));
+    if (err != 0)
+        return 0;  /* no message this tick */
+
+    /* React to messages here — e.g. transaction scores, task results */
+    (void)buf;
+
+    return 0;
+}
 
 int main(int argc, char *argv[])
 {
-    const long cadence = 500000L; // microseconds
+    (void)argc;
+    (void)argv;
 
-    logger_t log = {0};
-    logger_init(&log, DEBUG, NULL);
+    at_node_config_t cfg = {
+        .log_level = DEBUG,
+        .app_name = "at_example",
+        .q_out = "extern_to_at",
+        .q_in = "at_to_extern",
+        .max_iterations = EXAMPLE_ITERATIONS,
+    };
 
-    char *q_out = (char *)"extern_to_at";
-    char *q_in = (char *)"at_to_extern";
-    queue_t from_at;
-    if (messaging_init(q_in, &from_at) != 0)
-        log_exception(&log);
-    // queue_t to_at;
-    // if (messaging_init(q_out, &to_at) != 0)
-    //     log_exception(&log);
+    at_node_t node = {0};
+    if (at_node_init(&node, &cfg) != 0)
+        return 1;
+    if (at_node_start(&node) != 0)
+        return 1;
 
-    // queue names are in reverse order (out here is in there)
-    int at_pid = run_autonomous_trust(q_out, q_in, NULL, 0, DEBUG, NULL);
-    if (at_pid <= 0)
-    {
-        log_error(&log, "Autonomous Trust (%d) failed to start: %s\n", at_pid, strerror(errno));
-        return at_pid;
-    }
-
-    init_sig_handling(NULL);
-    messaging_assign(&from_at);
-
-    log_debug(&log, "AT example main (AT at %d)\n", at_pid);
-    bool at_alive = true;
-    size_t loop = 0;
-    while (!stop_process && CONTINUE_RUN)
-    {
-        loop++;
-        int err = kill(at_pid, 0);
-        if (err == -1)
-        {
-            if (errno == ESRCH)
-            {
-                log_debug(&log, "AT exited\n");
-                stop_process = true;
-                at_alive = false;
-            }
-            else
-            {
-                SYS_EXCEPTION();
-                log_exception(&log);
-                // FIXME ??
-            }
-        }
-
-        generic_msg_t buf;
-        err = messaging_recv(&buf);
-        if (err == -1)
-            log_exception(&log);
-        if (err == ENOMSG)
-            goto snooze;
-
-        bool do_send = false;
-        // react to info
-        if (do_send)
-        {
-            if (messaging_send(q_out, buf.type, &buf, true) != 0)
-                log_exception(&log);
-        }
-        // do other things
-
-    snooze:
-        usleep(cadence);
-    }
-    if (at_alive)
-    {
-        log_debug(&log, "SIGINT to %d\n", at_pid);
-        kill(at_pid, SIGINT);
-    }
-    log_debug(&log, "Example exit\n");
-    return 0;
+    int ret = at_node_run(&node, example_tick, NULL);
+    at_node_shutdown(&node);
+    return ret;
 }

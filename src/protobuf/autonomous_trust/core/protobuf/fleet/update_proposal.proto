@@ -1,0 +1,12 @@
+syntax = "proto3";
+package autonomous_trust.core.protobuf.fleet;
+
+message UpdateProposal {
+    string version = 1;
+    bytes artifact_hash = 2;
+    bytes signer_uuid = 3;
+    string target_arch = 4;
+    double min_proposer_reputation = 5;
+    bytes proposal_uuid = 6;
+    bytes signature = 7;
+}

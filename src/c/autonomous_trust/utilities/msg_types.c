@@ -21,6 +21,7 @@
 
 #include "msg_types_priv.h"
 
+#include "fleet/update_proposal.h"
 #include "identity/identity_priv.h"
 #include "processes/capabilities_priv.h"
 #include "negotiation/task_priv.h"
@@ -49,6 +50,12 @@ size_t message_size(message_type_t type)
         return sizeof(task_result_msg_t);
     case TRANSACTION_SCORE:
         return sizeof(tx_score_msg_t);
+    case UPDATE_PROPOSAL:
+        return sizeof(update_proposal_t);
+    case UPDATE_VOTE:
+        return sizeof(update_vote_msg_t);
+    case UPDATE_ACCEPTED:
+        return sizeof(update_accepted_msg_t);
     default:
         return 0;
     }
@@ -76,6 +83,12 @@ char *message_type_to_string(message_type_t type)
         return (char*)"TASK_RESULT";
     case TRANSACTION_SCORE:
         return (char*)"TRANSACTION_SCORE";
+    case UPDATE_PROPOSAL:
+        return (char*)"UPDATE_PROPOSAL";
+    case UPDATE_VOTE:
+        return (char*)"UPDATE_VOTE";
+    case UPDATE_ACCEPTED:
+        return (char*)"UPDATE_ACCEPTED";
     default:
         return (char*)"";
     }
@@ -101,6 +114,12 @@ message_type_t string_to_message_type(const char *str)
         return TASK_RESULT;
     if (strcmp(str, "TRANSACTION_SCORE") == 0)
         return TRANSACTION_SCORE;
+    if (strcmp(str, "UPDATE_PROPOSAL") == 0)
+        return UPDATE_PROPOSAL;
+    if (strcmp(str, "UPDATE_VOTE") == 0)
+        return UPDATE_VOTE;
+    if (strcmp(str, "UPDATE_ACCEPTED") == 0)
+        return UPDATE_ACCEPTED;
     return -1;  // No matching message type found (all valid types are > 0)
 }
 
@@ -158,10 +177,20 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
     uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
     json_object_set_new(root, "from_uuid", json_string(uuid_str));
     json_object_set_new(root, "from_name", json_string(msg->from_whom.fullname));
+    json_object_set_new(root, "from_address", json_string(msg->from_whom.address));
+    json_object_set_new(root, "from_sig_hex",
+                        json_string((const char *)msg->from_whom.signature.public_hex));
+    json_object_set_new(root, "from_enc_hex",
+                        json_string((const char *)msg->from_whom.encryptor.public_hex));
 
     uuid_unparse_lower(msg->to_whom.uuid, uuid_str);
     json_object_set_new(root, "to_uuid", json_string(uuid_str));
     json_object_set_new(root, "to_name", json_string(msg->to_whom.fullname));
+    json_object_set_new(root, "to_address", json_string(msg->to_whom.address));
+    json_object_set_new(root, "to_sig_hex",
+                        json_string((const char *)msg->to_whom.signature.public_hex));
+    json_object_set_new(root, "to_enc_hex",
+                        json_string((const char *)msg->to_whom.encryptor.public_hex));
 
     if (msg->obj != NULL && msg->len > 0)
     {
@@ -277,6 +306,25 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.tx_score, subdata_len);
         break;
     }
+    case UPDATE_VOTE:
+    {
+        subdata_len = sizeof(update_vote_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.update_vote, subdata_len);
+        break;
+    }
+    case UPDATE_ACCEPTED:
+    {
+        subdata_len = sizeof(update_accepted_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.update_accepted, subdata_len);
+        break;
+    }
+    case UPDATE_PROPOSAL:
+        /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
+        return -1;
     default:
         return -1;
     }
@@ -320,6 +368,15 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     const char *from_name = json_string_value(json_object_get(root, "from_name"));
     if (from_name)
         strncpy(net_msg->from_whom.fullname, from_name, NAME_LEN);
+    const char *from_addr = json_string_value(json_object_get(root, "from_address"));
+    if (from_addr)
+        strncpy(net_msg->from_whom.address, from_addr, ADDR_LEN);
+    const char *from_sig = json_string_value(json_object_get(root, "from_sig_hex"));
+    if (from_sig && from_sig[0] != '\0')
+        public_signature_init(&net_msg->from_whom.signature, (const unsigned char *)from_sig);
+    const char *from_enc = json_string_value(json_object_get(root, "from_enc_hex"));
+    if (from_enc && from_enc[0] != '\0')
+        public_encryptor_init(&net_msg->from_whom.encryptor, (const unsigned char *)from_enc);
 
     const char *to_uuid = json_string_value(json_object_get(root, "to_uuid"));
     if (to_uuid)
@@ -327,6 +384,15 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     const char *to_name = json_string_value(json_object_get(root, "to_name"));
     if (to_name)
         strncpy(net_msg->to_whom.fullname, to_name, NAME_LEN);
+    const char *to_addr = json_string_value(json_object_get(root, "to_address"));
+    if (to_addr)
+        strncpy(net_msg->to_whom.address, to_addr, ADDR_LEN);
+    const char *to_sig = json_string_value(json_object_get(root, "to_sig_hex"));
+    if (to_sig && to_sig[0] != '\0')
+        public_signature_init(&net_msg->to_whom.signature, (const unsigned char *)to_sig);
+    const char *to_enc = json_string_value(json_object_get(root, "to_enc_hex"));
+    if (to_enc && to_enc[0] != '\0')
+        public_encryptor_init(&net_msg->to_whom.encryptor, (const unsigned char *)to_enc);
 
     const char *obj_str = json_string_value(json_object_get(root, "obj"));
     json_int_t obj_len = json_integer_value(json_object_get(root, "obj_len"));
@@ -379,6 +445,15 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
     case TRANSACTION_SCORE:
         memcpy(&msg->info.tx_score, pb_msg->value.data, sizeof(tx_score_msg_t));
         return 0;
+    case UPDATE_VOTE:
+        memcpy(&msg->info.update_vote, pb_msg->value.data, sizeof(update_vote_msg_t));
+        return 0;
+    case UPDATE_ACCEPTED:
+        memcpy(&msg->info.update_accepted, pb_msg->value.data, sizeof(update_accepted_msg_t));
+        return 0;
+    case UPDATE_PROPOSAL:
+        /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
+        return -1;
     default:
         return -1;
     }
