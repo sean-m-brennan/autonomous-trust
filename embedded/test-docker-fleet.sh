@@ -35,7 +35,7 @@ IMAGE_NAME="autonomous-trust-c"
 NETWORK_NAME="at-fleet-test"
 SUBNET="172.28.0.0/24"
 NODE_COUNT=3
-TIMEOUT=480
+TIMEOUT=900
 SKIP_BUILD=false
 KEEP=false
 
@@ -68,7 +68,7 @@ while [[ $# -gt 0 ]]; do
         --keep)       KEEP=true; shift ;;
         --nodes|-n)   NODE_COUNT=$2; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--skip-build] [--keep]"
+            echo "Usage: $0 [--skip-build] [--keep] [--nodes N]"
             exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -83,7 +83,7 @@ cleanup() {
     info "Cleaning up ..."
     docker compose -f "$WORK_DIR/docker-compose.yml" down -v 2>/dev/null || true
     docker network rm "$NETWORK_NAME" 2>/dev/null || true
-    rm -rf "$WORK_DIR"
+    rm -rf "$WORK_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -102,12 +102,19 @@ fi
 # Step 2: Generate work directory and compose file
 # ---------------------------------------------------------------
 info "Setting up $NODE_COUNT-node test environment ..."
-rm -rf "$WORK_DIR"
+# Clean previous run's work dir.  Container-created files may be root-owned
+# (Docker UID remapping), so fall back to a privileged container for cleanup.
+if [ -d "$WORK_DIR" ]; then
+    docker compose -f "$WORK_DIR/docker-compose.yml" down -v 2>/dev/null || true
+    rm -rf "$WORK_DIR" 2>/dev/null || \
+        docker run --rm --privileged -v "$(dirname "$WORK_DIR"):/host" alpine \
+            rm -rf "/host/$(basename "$WORK_DIR")" 2>/dev/null || true
+fi
 mkdir -p "$WORK_DIR"
 
 # Generate per-node data directories
 for i in $(seq 1 $NODE_COUNT); do
-    mkdir -p "$WORK_DIR/node-$i/var/at" "$WORK_DIR/node-$i/etc/at"
+    mkdir -p "$WORK_DIR/node-$i/var/at"
 done
 
 # Generate docker-compose.yml
@@ -139,7 +146,6 @@ for i in $(seq 1 $NODE_COUNT); do
     command: ["$EXTRA_ARGS"]
     volumes:
       - $WORK_DIR/node-$i/var/at:/var/at
-      - $WORK_DIR/node-$i/etc/at:/etc/at
     networks:
       $NETWORK_NAME:
         ipv4_address: $IP

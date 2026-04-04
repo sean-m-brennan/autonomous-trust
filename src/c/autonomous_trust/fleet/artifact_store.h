@@ -72,6 +72,11 @@ int artifact_store_verify(const char *hash_hex, const uint8_t *expected_hash);
    Returns 0 on success, -1 if artifact is not complete. */
 int artifact_store_get_path(const char *hash_hex, char *path_buf, size_t buflen);
 
+/* Reassemble all chunks into a single file: <artifact_dir>/assembled.
+   Writes the assembled file path to out_path.
+   Returns 0 on success, -1 on error. */
+int artifact_store_reassemble(const char *hash_hex, char *out_path, size_t out_path_len);
+
 /* Delete an artifact: all chunk files, manifest, and complete marker. */
 int artifact_store_delete(const char *hash_hex);
 

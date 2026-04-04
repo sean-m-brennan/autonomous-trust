@@ -38,6 +38,7 @@ void handle_signal(int signum)
     switch (signum)
     {
     case SIGINT:
+    case SIGTERM:
     case SIGQUIT:
     case SIGABRT:
         stop_process = true;
@@ -78,5 +79,8 @@ int init_sig_handling(logger_t *logger)
     _logger = logger;
     struct sigaction sa = {0};
     sa.sa_handler = handle_signal;
-    return sigaction(SIGINT, &sa, NULL);
+    int err = sigaction(SIGINT, &sa, NULL);
+    if (err == 0)
+        err = sigaction(SIGTERM, &sa, NULL);
+    return err;
 }

@@ -146,7 +146,20 @@ int run_autonomous_trust(char *q_in, char *q_out,
     if (set_process_name(name) < 0)
         log_exception(&logger);
     init_sig_handling(&logger);
-    log_debug(&logger, "AT pid %d\n", getpid());
+    pid_t my_pid = getpid();
+    log_debug(&logger, "AT pid %d\n", my_pid);
+
+    /* Write PID file so update process can signal us for restart */
+    char pid_path[CFG_PATH_LEN + 32];
+    snprintf(pid_path, sizeof(pid_path), "%s/at_daemon.pid", data_dir);
+    FILE *pid_fp = fopen(pid_path, "w");
+    if (pid_fp != NULL)
+    {
+        fprintf(pid_fp, "%d\n", my_pid);
+        fclose(pid_fp);
+    }
+    else
+        log_warn(&logger, "Could not write PID file %s: %s\n", pid_path, strerror(errno));
 
     map_t configs = {0};
     int ret = load_all_configs(cfg_dir, &configs, &logger);
@@ -381,6 +394,9 @@ int run_autonomous_trust(char *q_in, char *q_out,
     if (fd2 > 0)
         close(fd2);
     shutdown_protobuf_library();
+
+    /* Clean up PID file */
+    unlink(pid_path);
 
     return error;
 }

@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-INSTALL_PREFIX="/usr/local"
+INSTALL_PREFIX="/opt/autonomous-trust"
 AT_ROOT="/opt/autonomous-trust"
 SERVICE_NAME="autonomous-trust"
 
@@ -98,6 +98,7 @@ info "Installing from $TARBALL ..."
 tar -xzf "$TARBALL" -C /
 
 # Update shared library cache
+echo "$INSTALL_PREFIX/lib" > /etc/ld.so.conf.d/autonomous-trust.conf
 ldconfig
 
 # Verify binary
@@ -113,11 +114,6 @@ info "Installing systemd service ..."
 cp "$SCRIPT_DIR/autonomous-trust.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
-
-# Allow at_demo to restart its own service (Phase 3 fleet management)
-info "Configuring sudoers for autonomous-trust restart ..."
-echo "ALL ALL=(root) NOPASSWD: /usr/bin/systemctl restart $SERVICE_NAME" > /etc/sudoers.d/$SERVICE_NAME
-chmod 440 /etc/sudoers.d/$SERVICE_NAME
 
 info "Installation complete."
 info ""

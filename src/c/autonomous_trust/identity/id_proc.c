@@ -173,13 +173,22 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         return true;
     }
 
-    /* Check if already a peer */
+    /* Check if already a peer.  If so, re-send access_granted in case the
+     * peer restarted and lost its in-memory peer list (it still holds the
+     * same identity/keys, but needs us to re-acknowledge it). */
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         if (uuid_compare(proc->protocol.peers[i].uuid, nmsg->from_whom.uuid) == 0)
         {
-            log_debug(proc->logger, "Identity: peer %s already known\n",
-                      nmsg->from_whom.fullname);
+            log_info(proc->logger, "Identity: peer %s already known, re-sending access_granted\n",
+                     nmsg->from_whom.fullname);
+            generic_msg_t accept = {0};
+            accept.type = NET_MESSAGE;
+            strncpy(accept.info.net_msg.process, "identity", PROC_NAME_LEN);
+            accept.info.net_msg.function = (char *)ID_ACCEPT;
+            accept.info.net_msg.encrypt = false;
+            memcpy(&accept.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
+            messaging_send("network", NET_MESSAGE, &accept, false);
             return true;
         }
     }
