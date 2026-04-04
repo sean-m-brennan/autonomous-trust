@@ -1,0 +1,129 @@
+/********************
+ *  Copyright 2025 Sean M. Brennan and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
+/**
+ * node.h — AT node lifecycle API.
+ *
+ * Provides a reusable lifecycle for any application that hosts an
+ * Autonomous Trust daemon: directory setup, optional config generation,
+ * daemon launch, IPC init, monitor loop with per-iteration callback,
+ * and graceful shutdown.
+ *
+ * Usage:
+ *   at_node_config_t cfg = { .app_name = "my_app", .log_level = INFO };
+ *   at_node_t node = {0};
+ *   at_node_init(&node, &cfg);
+ *   at_node_start(&node);
+ *   at_node_run(&node, my_tick, my_ctx);
+ *   at_node_shutdown(&node);
+ */
+
+#ifndef AT_NODE_H
+#define AT_NODE_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#include "utilities/logger.h"
+#include "utilities/message.h"
+#include "config/configuration.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Configuration                                                       */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    log_level_t   log_level;
+    const char   *log_file;        /* NULL = stderr */
+    bool          generate_config; /* run random_config() before launch */
+    const char   *app_name;        /* IPC queue name, e.g. "at_demo"   */
+    const char   *q_out;           /* queue: app -> AT daemon           */
+    const char   *q_in;            /* queue: AT daemon -> app           */
+    void         *capabilities;    /* passed to run_autonomous_trust    */
+    size_t        cap_len;
+    size_t        max_iterations;  /* 0 = unlimited (run until signal)  */
+} at_node_config_t;
+
+/* ------------------------------------------------------------------ */
+/* Node handle                                                         */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    at_node_config_t config;
+    logger_t         log;
+    queue_t          app_queue;
+    int              daemon_pid;
+    bool             daemon_alive;
+    size_t           iteration;
+} at_node_t;
+
+/* ------------------------------------------------------------------ */
+/* Per-iteration callback                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Called once per monitor-loop iteration.
+ * Return 0 to continue, non-zero to request shutdown.
+ */
+typedef int (*at_node_tick_fn)(at_node_t *node, void *user_data);
+
+/* ------------------------------------------------------------------ */
+/* Lifecycle                                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Initialise the node: create logger, ensure cfg/data directories exist,
+ * optionally run config generation.
+ * Returns 0 on success.
+ */
+int at_node_init(at_node_t *node, const at_node_config_t *cfg);
+
+/**
+ * Launch the AT daemon, install signal handlers, set up IPC.
+ * Returns 0 on success (daemon PID stored internally).
+ */
+int at_node_start(at_node_t *node);
+
+/**
+ * Monitor loop: check daemon liveness, invoke tick callback, sleep.
+ * Returns 0 on clean exit.
+ * @param tick  per-iteration callback (may be NULL)
+ * @param user_data  opaque pointer forwarded to tick
+ */
+int at_node_run(at_node_t *node, at_node_tick_fn tick, void *user_data);
+
+/**
+ * Graceful shutdown: SIGINT the daemon, wait for it, log exit.
+ */
+void at_node_shutdown(at_node_t *node);
+
+/* ------------------------------------------------------------------ */
+/* Accessors (for use inside tick callbacks)                           */
+/* ------------------------------------------------------------------ */
+
+int         at_node_daemon_pid(const at_node_t *node);
+logger_t   *at_node_logger(at_node_t *node);
+size_t      at_node_iteration(const at_node_t *node);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* AT_NODE_H */

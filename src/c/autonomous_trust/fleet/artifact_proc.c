@@ -474,7 +474,7 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         generic_msg_t ready_msg = {0};
         ready_msg.type = NET_MESSAGE;
         net_msg_t *rnmsg = &ready_msg.info.net_msg;
-        strncpy(rnmsg->process, "artifact", PROC_NAME_LEN);
+        strncpy(rnmsg->process, notify_target, PROC_NAME_LEN);
         rnmsg->function = (char *)ARTIFACT_PROTO_READY;
         strncpy(rnmsg->return_to, "artifact", PROC_NAME_LEN);
 
