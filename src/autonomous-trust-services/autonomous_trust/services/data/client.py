@@ -42,7 +42,7 @@ class DataRcvr(Process, metaclass=ProcMeta,
                 if uuid in self.cohort.peers:
                     self.cohort.peers[uuid].data_stream.put(data, block=True, timeout=self.q_cadence)
             except (Full, Empty):
-                pass
+                self.logger.warning("Queue full/empty, dropping data message from %s", uuid)
 
     def process(self, queues, signal):
         while self.keep_running(signal):

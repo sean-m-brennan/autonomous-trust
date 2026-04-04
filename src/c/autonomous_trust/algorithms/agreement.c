@@ -352,7 +352,7 @@ int agreement_prove(agreement_protocol_t *proto, merkle_blob_t *blob,
 
             /* check if first difficulty bytes are zero */
             bool valid = true;
-            for (int i = 0; i < difficulty && i < MERKLE_DIGEST_LEN; i++)
+            for (unsigned int i = 0; i < (unsigned int)difficulty && i < MERKLE_DIGEST_LEN; i++)
             {
                 if (hash[i] != 0)
                 {
@@ -397,7 +397,7 @@ bool agreement_verify(agreement_protocol_t *proto, merkle_blob_t *blob,
             return false;
 
         bool prefix_ok = true;
-        for (int i = 0; i < proto->state.work.difficulty && i < MERKLE_DIGEST_LEN; i++)
+        for (unsigned int i = 0; i < (unsigned int)proto->state.work.difficulty && i < MERKLE_DIGEST_LEN; i++)
         {
             if (proof->digest[i] != 0)
             {

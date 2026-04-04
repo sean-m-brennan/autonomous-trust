@@ -66,7 +66,7 @@ class VideoRcvr(Process, metaclass=ProcMeta,
                 if uuid in self.cohort.peers:
                     self.cohort.peers[uuid].video_stream.put((idx, frame, 1), block=True, timeout=self.q_cadence)
             except (Full, Empty):
-                pass
+                self.logger.debug("Queue full/empty, dropping video frame from %s", uuid)
 
     def process(self, queues, signal):
         while self.keep_running(signal):

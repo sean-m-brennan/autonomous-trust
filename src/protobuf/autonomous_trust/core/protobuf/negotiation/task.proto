@@ -1,1 +1,32 @@
+/********************
+ *  Copyright 2025 Sean M. Brennan and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ ********************/
 syntax = "proto3";
+
+package autonomous_trust.core.protobuf.negotiation;
+
+message Task {
+  bytes uuid = 1;
+  bytes requestor_uuid = 2;
+  string capability_name = 3;
+  int64 when_seconds = 4;
+  int32 when_nanos = 5;
+  sint64 duration_days = 6;
+  uint32 duration_seconds = 7;
+  uint32 duration_nsecs = 8;
+  int64 timeout = 9;
+  bool flexible = 10;
+  int32 argc = 11;
+}

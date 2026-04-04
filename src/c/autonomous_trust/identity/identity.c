@@ -133,24 +133,24 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr)
 
     char uuid_str[UUID_STRING_LEN+1] = {0};
     uuid_unparse(ident->uuid, uuid_str);
-    json_object_set(obj, "uuid", json_string(uuid_str));
-    json_object_set(obj, "rank", json_integer(ident->rank));
-    json_object_set(obj, "address", json_string((char *)ident->address));
-    json_object_set(obj, "fullname", json_string(ident->fullname));
-    json_object_set(obj, "nickname", json_string(ident->nickname));
-    json_object_set(obj, "petname", json_string(ident->petname));
+    json_object_set_new(obj, "uuid", json_string(uuid_str));
+    json_object_set_new(obj, "rank", json_integer(ident->rank));
+    json_object_set_new(obj, "address", json_string((char *)ident->address));
+    json_object_set_new(obj, "fullname", json_string(ident->fullname));
+    json_object_set_new(obj, "nickname", json_string(ident->nickname));
+    json_object_set_new(obj, "petname", json_string(ident->petname));
 
     json_t *sig = json_object();
     unsigned char *hex = signature_publish(&ident->signature); // encoded
-    json_object_set(sig, "hex_seed", json_string((char *)hex));
+    json_object_set_new(sig, "hex_seed", json_string((char *)hex));
     free(hex);
-    json_object_set(obj, "signature", sig);
+    json_object_set_new(obj, "signature", sig);
 
     json_t *encr = json_object();
     hex = encryptor_publish(&ident->encryptor); // encoded
-    json_object_set(encr, "hex_seed", json_string((char *)hex));
+    json_object_set_new(encr, "hex_seed", json_string((char *)hex));
     free(hex);
-    json_object_set(obj, "encryptor", encr);
+    json_object_set_new(obj, "encryptor", encr);
 
     return 0;
 }
@@ -160,15 +160,21 @@ int identity_from_json(const json_t *obj, void *data_struct)
     identity_t *ident = data_struct;
     json_t *uuid_obj = json_object_get(obj, "uuid");
     const char *uuid_str = json_string_value(uuid_obj);
-    if (uuid_parse(uuid_str, ident->uuid) < 0)
+    if (uuid_str == NULL || uuid_parse(uuid_str, ident->uuid) < 0)
         return -1;
     ident->rank = json_integer_value(json_object_get(obj, "rank"));
     const char *addr_str = json_string_value(json_object_get(obj, "address"));
     if (addr_str != NULL)
         strncpy(ident->address, addr_str, sizeof(ident->address)-1);
-    strncpy(ident->fullname, (char *)json_string_value(json_object_get(obj, "fullname")), sizeof(ident->fullname)-1);
-    strncpy(ident->nickname, (char *)json_string_value(json_object_get(obj, "nickname")), sizeof(ident->nickname)-1);
-    strncpy(ident->petname, (char *)json_string_value(json_object_get(obj, "petname")), sizeof(ident->petname)-1);
+    const char *fullname_str = json_string_value(json_object_get(obj, "fullname"));
+    if (fullname_str != NULL)
+        strncpy(ident->fullname, fullname_str, sizeof(ident->fullname)-1);
+    const char *nickname_str = json_string_value(json_object_get(obj, "nickname"));
+    if (nickname_str != NULL)
+        strncpy(ident->nickname, nickname_str, sizeof(ident->nickname)-1);
+    const char *petname_str = json_string_value(json_object_get(obj, "petname"));
+    if (petname_str != NULL)
+        strncpy(ident->petname, petname_str, sizeof(ident->petname)-1);
     const char *sig_hex = json_string_value(json_object_get(json_object_get(obj, "signature"), "hex_seed"));
     if (sig_hex != NULL)
         signature_init(&ident->signature, (const unsigned char *)sig_hex);
@@ -236,13 +242,21 @@ int proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer)
 {
     AutonomousTrust__Core__Protobuf__Identity__Identity *msg =
         autonomous_trust__core__protobuf__identity__identity__unpack(NULL, len, data);
+    if (msg == NULL)
+        return -1;
     public_identity_sync_in(msg, peer);
-    free(msg);
+    autonomous_trust__core__protobuf__identity__identity__free_unpacked(msg, NULL);
     return 0;
 }
 
 void identity_free(identity_t *ident)
 {
-    // FIXME sig, encr
+    if (ident == NULL)
+        return;
+    /* Zero sensitive key material before releasing memory */
+    sodium_memzero(ident->signature.private, sizeof(ident->signature.private));
+    sodium_memzero(ident->signature.public, sizeof(ident->signature.public));
+    sodium_memzero(ident->encryptor.private, sizeof(ident->encryptor.private));
+    sodium_memzero(ident->encryptor.public, sizeof(ident->encryptor.public));
     smrt_deref(ident);
 }

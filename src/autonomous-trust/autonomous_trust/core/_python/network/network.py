@@ -104,6 +104,8 @@ class Network(InitializableConfig):
 
     @property
     def ip4(self):
+        if self._ip4_cidr is None:
+            return None
         return self._ip4_cidr.split('/')[0]
 
     @property

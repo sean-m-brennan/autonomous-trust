@@ -20,6 +20,23 @@ import importlib.util
 import os
 import subprocess
 import sys
+from typing import TYPE_CHECKING
+
+# Static analysis (IDEs, mypy) cannot follow the runtime MetaPathFinder
+# that redirects autonomous_trust.core.X → autonomous_trust.core._python.X.
+# These explicit imports let type checkers resolve submodules.
+if TYPE_CHECKING:
+    from ._python import config  # noqa: F401
+    from ._python import identity  # noqa: F401
+    from ._python import negotiation  # noqa: F401
+    from ._python import network  # noqa: F401
+    from ._python import reputation  # noqa: F401
+    from ._python import structures  # noqa: F401
+    from ._python import algorithms  # noqa: F401
+    from ._python import protocol  # noqa: F401
+    from ._python import processes  # noqa: F401
+    from ._python import system  # noqa: F401
+    from ._python import automate  # noqa: F401
 
 
 def _git_describe_version():
@@ -61,11 +78,26 @@ class _AliasLoader(importlib.abc.Loader):
 
     def create_module(self, spec):
         real_mod = importlib.import_module(self._real)
+        # Save original metadata before the import system overwrites it
+        # with alias values (_load_unlocked calls _init_module_attrs with
+        # override=True), which can cause __package__ != __spec__.parent
+        # mismatches that trigger DeprecationWarning on relative imports
+        # in Python 3.12+.
+        self._orig_spec = real_mod.__spec__
+        self._orig_package = getattr(real_mod, '__package__', None)
+        self._orig_name = real_mod.__name__
         sys.modules[spec.name] = real_mod
         return real_mod
 
     def exec_module(self, module):
-        pass
+        # Restore original metadata so relative imports within the real
+        # module continue to resolve correctly.
+        if self._orig_spec is not None:
+            module.__spec__ = self._orig_spec
+        if self._orig_package is not None:
+            module.__package__ = self._orig_package
+        if self._orig_name is not None:
+            module.__name__ = self._orig_name
 
 
 class _BackendRedirector(importlib.abc.MetaPathFinder):

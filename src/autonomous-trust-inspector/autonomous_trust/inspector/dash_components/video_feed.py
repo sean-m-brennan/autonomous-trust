@@ -15,6 +15,7 @@
 # ******************
 
 import base64
+import logging
 import threading
 import time
 from queue import Empty
@@ -22,6 +23,8 @@ from queue import Empty
 from flask import Flask, Response
 
 from .core import DashComponent, DashControl, html
+
+_logger = logging.getLogger(__name__)
 from ..peer.daq import PeerDataAcq
 
 
@@ -47,28 +50,28 @@ class VideoFeed(DashComponent):
     def xmit(self):
         while not self.halt:
             if self.peer.cohort.paused or not self.peer.active:
-                time.sleep(0.02)
+                time.sleep(0.1)  # polling interval; no event-based alternative available
                 continue
             try:
                 while not self.halt and len(self.peer.video_stream) < 1:
-                    time.sleep(0.02)  # max 50 fps
+                    time.sleep(0.1)  # polling interval; no event-based alternative available  # max 50 fps
                 idx, frame, cadence = self.peer.video_stream.pop()
                 frame = frame.tobytes()
             except (Empty, IndexError):
                 continue
             if frame:
-                print('xmit frame')
+                _logger.debug('xmit frame')
                 frame = b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n'
                 self.ctl.emit('video', dict(id=self.img_id, data=frame), binary=True)
 
     def rcv(self):
         while not self.halt:
             if self.peer.cohort.paused or not self.peer.active:
-                time.sleep(0.02)  # max 50 fps
+                time.sleep(0.1)  # polling interval; no event-based alternative available  # max 50 fps
                 continue
             try:
                 while not self.halt and len(self.peer.video_stream) < 1:
-                    time.sleep(0.02)  # max 50 fps
+                    time.sleep(0.1)  # polling interval; no event-based alternative available  # max 50 fps
                 idx, frame, cadence = self.peer.video_stream.pop()  # speed is determined by source speed
                 frame = frame.tobytes()
             except Empty:

@@ -123,7 +123,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
                          capability_t *capabilities, size_t cap_len, // FIXME from config file?
                          log_level_t log_level, char log_file[])
 {
-    // FIXME pass in/register capabilities
+    (void)capabilities; (void)cap_len; // FIXME pass in/register capabilities
     int error = 0;
     char cfg_dir[CFG_PATH_LEN + 1] = {0};
     get_cfg_dir(cfg_dir);
@@ -152,8 +152,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
     int ret = load_all_configs(cfg_dir, &configs, &logger);
     if (ret < 0)
         return ret;
-    if (ret > 0)
-        ; // FIXME handle partial errors ('required' list?)
+    if (ret > 0) { /* FIXME handle partial errors ('required' list?) */ }
 
     tracker_t tracker = {0};
     directory_t queues = {0};
@@ -161,8 +160,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
     ret = register_queues(&tracker, name, &queues, &signals, &logger);
     if (ret < 0)
         return ret;
-    if (ret > 0)
-        ; // FIXME handle partial errors
+    if (ret > 0) { /* FIXME handle partial errors */ }
 
     // spawn processes per tracker config
     map_key_t key = NULL;

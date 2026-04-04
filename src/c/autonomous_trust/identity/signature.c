@@ -14,9 +14,6 @@
  *   limitations under the License.
  *******************/
 
-#ifndef SIGNATURE_I
-#define SIGNATURE_I
-
 #include <stdbool.h>
 #include <string.h>
 
@@ -37,6 +34,7 @@ void signature_init(signature_t *sig, const unsigned char *hex_seed)
     unsigned char seed[crypto_sign_SEEDBYTES];
     unhexlify(hex_seed, crypto_sign_SEEDBYTES * 2, seed);
     crypto_sign_seed_keypair((unsigned char *)sig->public, (unsigned char *)sig->private, seed);
+    sodium_memzero(seed, sizeof(seed));
     hexlify(sig->public, crypto_sign_PUBLICKEYBYTES, (unsigned char *)sig->public_hex);
 }
 
@@ -63,8 +61,6 @@ unsigned char *signature_generate()
         return NULL;
     }
     hexlify(key, crypto_sign_SEEDBYTES, hex);
+    sodium_memzero(key, sizeof(key));
     return hex;
 }
-
-
-#endif // SIGNATURE_I

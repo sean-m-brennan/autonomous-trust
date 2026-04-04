@@ -101,10 +101,10 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.diplomat = True
         self.ping = None
         self.myself = configurations[CfgIds.identity]
-        self.peer_messages = []
-        self.encrypted_messages = []
-        self.group_messages = []
-        self.unknown_messages = []
+        self.peer_messages = deque()
+        self.encrypted_messages = deque()
+        self.group_messages = deque()
+        self.unknown_messages = deque()
         self.acceptance = acceptance_func
         self.pests = {}
         self.protocol = Protocol(self.name, self.logger, configurations)
@@ -156,7 +156,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             elapsed = self.statistics[uuid].times[-1] - self.statistics[uuid].times[0]
             up, down = sum(self.statistics[uuid].send) / elapsed, sum(self.statistics[uuid].recv) / elapsed
             cumulative[uuid] = (up, down, self.statistics[uuid].send_total, self.statistics[uuid].recv_total,
-                                self.statistics[uuid][2], self.statistics[uuid][3])
+                                self.statistics[uuid].err_out, self.statistics[uuid].err_in)
         return cumulative
 
     def send_peer(self, msg, whom):
@@ -268,20 +268,26 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         """
         try_count = {}
         while not self.stop:
-            for raw_msg, from_addr in self.encrypted_messages:
+            remaining = deque()
+            while True:
+                try:
+                    raw_msg, from_addr = self.encrypted_messages.popleft()
+                except IndexError:
+                    break
                 peer = self.peers.find_by_address(from_addr)
                 if peer is not None:
                     decrypt_msg = self.myself.decrypt(raw_msg, peer)
                     self._msg_to_queue(decrypt_msg, peer, queues, 'point-to-point')
                     self.logger.debug('Out-of-order message from %s handled' % peer.nickname)
-                    self.encrypted_messages.remove((raw_msg, from_addr))
                 else:
                     if from_addr not in try_count:
                         try_count[from_addr] = 0
                     try_count[from_addr] += 1
                     if try_count[from_addr] > self.mystery_max_retries:
-                        self.encrypted_messages.remove((raw_msg, from_addr))
                         self.logger.debug('Spurious encrypted message from %s dropped' % from_addr)
+                    else:
+                        remaining.append((raw_msg, from_addr))
+            self.encrypted_messages.extend(remaining)
             time.sleep(self.cadence + self.q_cadence)  # curiously, does not sleep if exactly cadence
 
     def _msg_to_queue(self, msg, from_whom, queues, rcvd_by, validate=True):
@@ -394,8 +400,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         self.logger.debug('Ignored message: %s' % str(message))
 
                 # async recv point-to-point messages
-                if len(self.peer_messages) > 0:
-                    raw_msg, from_addr = self.peer_messages.pop(0)
+                try:
+                    raw_msg, from_addr = self.peer_messages.popleft()
                     peers = self.configs[CfgIds.peers]
                     from_whom = peers.find_by_address(from_addr)
                     if len(peers.all) < 1:
@@ -412,6 +418,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         except Exception:
                             # Some peer messages are intentionally unencrypted
                             # (e.g. identity accept), so try plaintext fallback
+                            self.logger.warning(f"Decryption failed for peer {from_whom}, falling back to plaintext")
                             try:
                                 self._msg_to_queue(raw_msg, from_whom, queues, 'point-to-point', validate=False)
                                 self.logger.debug('Unencrypted peer message from %s' % from_whom.nickname)
@@ -422,11 +429,13 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         self.logger.error(
                             'Recvd transmission from %s - not recognized as a peer. Ignoring.' % from_addr)
                         self.logger.debug('Ignored message: %s' % str(message))
+                except IndexError:
+                    pass
 
                 # async recv group messages
-                if len(self.group_messages) > 0:
+                try:
                     if self.group is not None:  # otherwise, skip for now
-                        raw_msg, from_addr = self.group_messages.pop(0)
+                        raw_msg, from_addr = self.group_messages.popleft()
                         if from_addr in self.group.addresses:
                             from_whom = self.peers.find_by_address(from_addr)
                             try:
@@ -446,11 +455,15 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
                             self.logger.debug('Ignored message: %s' % str(message))
                             # FIXME ask others in group
+                except IndexError:
+                    pass
 
                 # async recv stranger messages (separate channel)
-                if len(self.unknown_messages) > 0:
-                    raw_msg, from_addr = self.unknown_messages.pop(0)
+                try:
+                    raw_msg, from_addr = self.unknown_messages.popleft()
                     self._msg_to_queue(raw_msg, from_addr, queues, 'multicast', validate=False)
+                except IndexError:
+                    pass
             except Exception as err:
                 self.logger.error(err)
                 self.logger.error(traceback.format_exc())

@@ -58,9 +58,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(ReputationProtocol.update, self.handle_update)
         self.protocol.register_handler(ReputationProtocol.rep_req, self.handle_reputation_request)
         self.history = TransactionHistory()
-        self.my_requests: dict[int, TxCount] = {}
-        self.requests: list[int] = []
-        self.proposals: dict[int, TransactionScore] = {}
+        self.my_requests: dict[tuple[int, int], TxCount] = {}
+        self.requests: list[tuple[int, int]] = []
+        self.proposals: dict[tuple[int, int], TransactionScore] = {}
         self.acceptances: dict[UUID, list[TransactionScore]] = {}
         self.last_id = None
         self.last_value = None
@@ -80,8 +80,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     @staticmethod
     def _paxos_id_index(id1, id2):
-        x = 10 ** len(str(id2))
-        return id1 + (id2 / x)  # convert to int for accurate expiration
+        return (id1, id2)  # use tuple key to avoid float equality issues
 
     def handle_request(self, queues, message):
         if message.function == ReputationProtocol.request:
@@ -215,6 +214,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 return True  # not granted, drop
             self.requests.remove(idx)
             # FIXME: Verify the sender's NaCl signature on the transaction score to prevent spoofed Paxos proposals
+            if not message.verified:
+                self.logger.warning(f"Unverified Paxos proposal from {message.from_whom}")
             if idx not in self.proposals:
                 self.proposals[idx] = score
                 self.logger.debug("Tx to proposals ")
@@ -244,6 +245,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self.acceptances[score.task_id] = []
             if message.from_whom not in self.acceptances[score.task_id]:
                 # FIXME: Validate the sender's NaCl signature on the acceptance message to ensure it came from an authorized peer
+                if not message.verified:
+                    self.logger.warning(f"Unverified Paxos acceptance from {message.from_whom}")
                 self.acceptances[score.task_id].append(message.from_whom)
             if len(self.acceptances[score.task_id]) > len(self.peers.all) // 2:
                 self.history.update(score.task_id, peer_id, score.score)
@@ -303,7 +306,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             elif tx.p2_id == peer.uuid and tx.p1_id in self.reputations:
                 total += tx.p1_score * self.reputations[tx.p1_id]
                 count += 1
-        return total / count
+        return total / count if count > 0 else 0.0
 
     def _contrite_tit_for_tat(self, peer):
         peer_scores = []
@@ -317,7 +320,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     peer_scores.append(tx.p1_score)
                     my_scores.append(tx.p2_score)
         except KeyError:
-            pass
+            self.logger.debug('No transaction history for peer %s' % peer.uuid)
         if len(peer_scores) < 1 or len(my_scores) < 1:  # not enough info
             return 0.49
         peer_standing = sum(peer_scores) / len(peer_scores)
@@ -393,10 +396,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
                 present = now().timestamp()
                 for req in list(self.requests):
-                    if present - int(req) > self.expiration:
+                    if present - req[0] > self.expiration:
                         self.requests.remove(req)
                 for prop in dict(self.proposals):
-                    if present - int(prop) > self.expiration:
+                    if present - prop[0] > self.expiration:
                         del self.proposals[prop]
 
                 self.sleep_until(self.cadence)

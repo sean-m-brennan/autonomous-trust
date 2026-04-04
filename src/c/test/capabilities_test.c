@@ -76,7 +76,7 @@ DEFINE_TEST(test_capability_table_exists)
     ck_assert(sodium_init() >= 0);
 
     /* capability_table_size should be defined (possibly 0) */
-    ck_assert(capability_table_size >= 0);
+    ck_assert(capability_table_size < (size_t)-1);
 }
 END_TEST_DEFINITION()
 

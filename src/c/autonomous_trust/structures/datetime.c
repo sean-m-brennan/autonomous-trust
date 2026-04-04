@@ -175,14 +175,14 @@ int datetime_strftime_res(const datetime_t *dt, const char *format, const time_r
                     len += sprintf(s + len, res_cfg.time_fmt, ns);
                 else if (j == 1 || j == 2) // %z, %Z - timezone offset
                     len += sprintf(s + len, "%s", tz);
-                remaining = max - len;
-                if (len < 0)
+                if (len > max)
                 {
-                    err = len;
+                    err = E2BIG;
                     stop = true;
                     break;
                 }
-                if (remaining <= 0)
+                remaining = max - len;
+                if (remaining == 0)
                 {
                     err = E2BIG;
                     stop = true;

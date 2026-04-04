@@ -1,3 +1,18 @@
+# ******************
+#  Copyright 2025 Sean M. Brennan and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
 cmake_minimum_required(VERSION 3.23)
 
 if(DEFINED ENV{CONDA_PREFIX})
@@ -20,8 +35,9 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_BUILD_TYPE Debug)
-#set(CMAKE_BUILD_TYPE Release)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
 set(CMAKE_C_FLAGS_DEBUG "-g -O0")
 
 set(warning_as_error -Werror)
@@ -30,16 +46,19 @@ set(useful_warnings
     -Wpointer-arith 
     -Wcast-align 
     -Wfloat-equal 
-    #-Wextra
+    -Wextra
+    -Wno-unused-parameter
+    -Wno-sign-compare
+    -Wno-missing-field-initializers
     -Wwrite-strings
     -Wswitch-enum
     -Winit-self
 )
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
-    list(APPEND useful_warnings -Wuse-after-free -Wfree-nonheap-object)
+    list(APPEND useful_warnings -Wuse-after-free -Wfree-nonheap-object -Wno-cast-function-type -Wno-stringop-truncation -Wno-format-truncation)
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
-    list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align)
+    list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align -Wno-cast-function-type-mismatch)
 endif()
 set(useful_flags
     #-fanalyzer
@@ -113,7 +132,7 @@ endif()
 # check (testing only)
 find_path(LIBCHECK_INCLUDE_DIR check.h PATHS ${CONDA_ROOT})
 find_library(LIBCHECK_LIBRARY NAMES check libcheck.so libcheck.a PATHS ${CONDA_ROOT})
-include_directories(${LIBCHECK_INCLUDE_DIRS})
+include_directories(${LIBCHECK_INCLUDE_DIR})
 if(LIBCHECK_LIBRARY)
     message("-- Found libcheck at ${LIBCHECK_LIBRARY}")
 else()
@@ -142,7 +161,7 @@ endif()
 
 set(top_src_dir ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 
-set(PROTO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/protobuf")
+set(PROTO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../protobuf")
 set(PROTO_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/protobuf")
 
 set(protos
@@ -622,6 +641,18 @@ add_test(NAME reputation3_test COMMAND $<TARGET_FILE:reputation3_test>)
 add_test(NAME config2_test COMMAND $<TARGET_FILE:config2_test>)
 add_test(NAME util2_test COMMAND $<TARGET_FILE:util2_test>)
 add_test(NAME msg_types2_test COMMAND $<TARGET_FILE:msg_types2_test>)
+
+add_executable(msg_types3_test test/msg_types3_test.c)
+set_source_files_properties(test/msg_types3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(msg_types3_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_test(NAME msg_types3_test COMMAND $<TARGET_FILE:msg_types3_test>)
+
+add_executable(task_proto_test test/task_proto_test.c)
+set_source_files_properties(test/task_proto_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(task_proto_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+
+add_test(NAME task_proto_test COMMAND $<TARGET_FILE:task_proto_test>)
 
 
 ####################

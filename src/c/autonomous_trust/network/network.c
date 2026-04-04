@@ -78,8 +78,8 @@ int ip4_binary_to_addr(uint32_t ip, char *addr)
 
 int cidr4_to_broadcast(char *cidr, char *bcast_addr)
 {
-    uint32_t ip;
-    uint8_t prefix;
+    uint32_t ip = 0;
+    uint8_t prefix = 0;
     if (cidr4_to_ip4_binary(cidr, &ip, &prefix) < 0)
         return -1;
     /* Convert CIDR prefix length to network-byte-order bitmask */
@@ -126,12 +126,12 @@ int network_to_json(const void *data_struct, json_t **obj_ptr)
     if (err != 0)
         return EXCEPTION(EJSN_OBJ_SET);
         
-    json_object_set(obj, "port", json_integer(net->port));
-    json_object_set(obj, "ip4_cidr", json_string((char *)net->ip4_cidr));
-    json_object_set(obj, "ip6_cidr", json_string((char *)net->ip6_cidr));
-    json_object_set(obj, "mcast4_addr", json_string((char *)net->mcast4_addr));
-    json_object_set(obj, "mcast6_addr", json_string((char *)net->mcast6_addr));
-    json_object_set(obj, "mac_addr", json_string((char *)net->mac_address));
+    json_object_set_new(obj, "port", json_integer(net->port));
+    json_object_set_new(obj, "ip4_cidr", json_string((char *)net->ip4_cidr));
+    json_object_set_new(obj, "ip6_cidr", json_string((char *)net->ip6_cidr));
+    json_object_set_new(obj, "mcast4_addr", json_string((char *)net->mcast4_addr));
+    json_object_set_new(obj, "mcast6_addr", json_string((char *)net->mcast6_addr));
+    json_object_set_new(obj, "mac_addr", json_string((char *)net->mac_address));
     return 0;
 }
 
@@ -139,11 +139,17 @@ int network_from_json(const json_t *obj, void *data_struct)
 {
     network_config_t *net = data_struct;
     net->port = json_integer_value(json_object_get(obj, "port"));
-    strncpy(net->ip4_cidr, (char *)json_string_value(json_object_get(obj, "ip4_cidr")), CIDR4_LEN);
-    strncpy(net->ip6_cidr, (char *)json_string_value(json_object_get(obj, "ip6_cidr")), CIDR6_LEN);
-    strncpy(net->mcast4_addr, (char *)json_string_value(json_object_get(obj, "mcast4_addr")), IPV4_ADDR_LEN);
-    strncpy(net->mcast6_addr, (char *)json_string_value(json_object_get(obj, "mcast6_addr")), IPV6_ADDR_LEN);
-    strncpy(net->mac_address, (char *)json_string_value(json_object_get(obj, "mac_addr")), MAC_ADDR_LEN);
+    const char *val;
+    val = json_string_value(json_object_get(obj, "ip4_cidr"));
+    if (val != NULL) strncpy(net->ip4_cidr, val, CIDR4_LEN);
+    val = json_string_value(json_object_get(obj, "ip6_cidr"));
+    if (val != NULL) strncpy(net->ip6_cidr, val, CIDR6_LEN);
+    val = json_string_value(json_object_get(obj, "mcast4_addr"));
+    if (val != NULL) strncpy(net->mcast4_addr, val, IPV4_ADDR_LEN);
+    val = json_string_value(json_object_get(obj, "mcast6_addr"));
+    if (val != NULL) strncpy(net->mcast6_addr, val, IPV6_ADDR_LEN);
+    val = json_string_value(json_object_get(obj, "mac_addr"));
+    if (val != NULL) strncpy(net->mac_address, val, MAC_ADDR_LEN);
     return 0;
 }
 

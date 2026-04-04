@@ -78,7 +78,8 @@ def test_generate_randomize_with_string_seed(setup_teardown):
     assert ident is not None
 
 
-def test_generate_randomize_verbose(setup_teardown, capsys):
+def test_generate_randomize_verbose(setup_teardown, caplog):
+    import logging
     cfg_dir = os.path.join(TEST_DIR, 'gen_verbose')
     os.makedirs(cfg_dir, exist_ok=True)
     mock_addrs = {
@@ -89,10 +90,10 @@ def test_generate_randomize_verbose(setup_teardown, capsys):
         'ip6_subnet': 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
         'mac_bcast': 'ff:ff:ff:ff:ff:ff',
     }
-    with patch('autonomous_trust.core.config.generate.Network.get_addresses', return_value=mock_addrs):
-        generate_identity(cfg_dir, randomize=True, seed=1, silent=False)
-    captured = capsys.readouterr()
-    assert 'Wrote configs' in captured.out
+    with caplog.at_level(logging.DEBUG, logger='autonomous_trust.core._python.config.generate'):
+        with patch('autonomous_trust.core.config.generate.Network.get_addresses', return_value=mock_addrs):
+            generate_identity(cfg_dir, randomize=True, seed=1, silent=False)
+    assert 'Wrote configs' in caplog.text
 
 
 def test_random_config(setup_teardown):

@@ -257,7 +257,7 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
         generic_msg_t buf = {0};
         int err = messaging_recv(&buf);
         if (err == -1)
-            ; // FIXME repair?
+            continue; /* FIXME repair? */
         if (err == ENOMSG)
             continue;
         if (!run_message_handlers(proc, queues, buf.type, &buf))

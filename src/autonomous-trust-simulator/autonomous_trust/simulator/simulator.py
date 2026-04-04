@@ -16,6 +16,7 @@
 
 import logging
 import os.path
+import random
 import socket
 import struct
 import sys
@@ -26,7 +27,8 @@ from datetime import timedelta
 from autonomous_trust.core import Configuration
 from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 from .peer.peer import PeerMovement
-from .sim_data import SimConfig, SimState, Map, Matrix, SignalMatrix, Ident
+from .radio.space_link import free_space_path_loss_db, sun_occluded, light_delay_s
+from .sim_data import SimConfig, SimState, Map, Matrix, SignalMatrix, DelayMatrix, GatewayMap, Ident
 from .sim_client import SimClient
 from . import sim_net as net
 from . import default_port, default_steps
@@ -72,7 +74,7 @@ class Simulator(net.SelectServer):
         self.end_time = self.cfg.end
         self.cadence = (self.end_time - self.start_time).total_seconds() / self.max_time_steps
         self.state = SimState()
-        self.pre_state: dict[int, tuple[GeoPosition, float, Map, Matrix, list[str], SignalMatrix]] = {}
+        self.pre_state: dict[int, tuple[GeoPosition, float, Map, Matrix, list[str], SignalMatrix, DelayMatrix, GatewayMap]] = {}
         if self.precompute:
             self.precompute_network()
         else:
@@ -91,6 +93,7 @@ class Simulator(net.SelectServer):
         mapp: Map = {}
         matrix: Matrix = {}
         sig_quality: SignalMatrix = {}
+        delay_matrix: DelayMatrix = {}
         max_dist = 0
         active = []
         path_loss = self.cfg.path_loss_matrix
@@ -99,32 +102,67 @@ class Simulator(net.SelectServer):
                 active.append(peer.uuid)
             position, speed = self.peers[peer.uuid].move(tick)
             mapp[peer.uuid] = Ident(position, speed, peer.kind, peer.nickname)
-        # all must move first before looping for connectivity
+        # All must move first before looping for connectivity.
+        # Note: The nested loop below is O(n^2) by necessity -- it computes
+        # pairwise reachability and signal quality between every pair of peers.
         for peer in self.cfg.peers:
             if current_time < peer.initial_time or current_time > peer.last_seen or \
                     mapp[peer.uuid].position is None:
                 continue
             matrix[peer.uuid] = {}
             sig_quality[peer.uuid] = {}
+            if self.cfg.space_mode:
+                delay_matrix[peer.uuid] = {}
             for other in self.cfg.peers:
                 if peer == other or current_time < other.initial_time or current_time > other.last_seen or \
                         mapp[other.uuid].position is None:
                     continue
-                # Look up terrain path loss if available
-                terrain_loss = None
-                if path_loss is not None:
-                    peer_row = path_loss.get(peer.uuid)
-                    if peer_row is not None:
-                        terrain_loss = peer_row.get(other.uuid)
-                matrix[peer.uuid][other.uuid] = peer.can_reach(other, terrain_loss)
-                if terrain_loss is not None:
-                    sig_quality[peer.uuid][other.uuid] = terrain_loss
+
                 dist = mapp[peer.uuid].position.distance(mapp[other.uuid].position)
                 if max_dist < dist:
                     max_dist = dist
-        mid = UTMPosition.middle(list(map(lambda x: x.position, [v for v in mapp.values() if v.position is not None])))
-        center: GeoPosition = mid.convert(GeoPosition)
-        return center, max_dist, mapp, matrix, active, sig_quality
+
+                if self.cfg.space_mode:
+                    # Space mode: compute dynamic FSPL and LOS per pair
+                    delay_matrix[peer.uuid][other.uuid] = light_delay_s(dist)
+                    if self.cfg.sun_position and sun_occluded(
+                            mapp[peer.uuid].position, mapp[other.uuid].position,
+                            self.cfg.sun_position):
+                        # Sun occultation: link blocked
+                        fspl = 999.0
+                    else:
+                        fspl = free_space_path_loss_db(
+                            dist, self.cfg.comm_freq_hz or 8.4e9)
+                    sig_quality[peer.uuid][other.uuid] = fspl
+                    matrix[peer.uuid][other.uuid] = peer.can_reach(other, fspl)
+                else:
+                    # Terrestrial mode: use static terrain path loss if available
+                    terrain_loss = None
+                    if path_loss is not None:
+                        peer_row = path_loss.get(peer.uuid)
+                        if peer_row is not None:
+                            terrain_loss = peer_row.get(other.uuid)
+                    matrix[peer.uuid][other.uuid] = peer.can_reach(other, terrain_loss)
+                    if terrain_loss is not None:
+                        sig_quality[peer.uuid][other.uuid] = terrain_loss
+
+        positions = [v.position for v in mapp.values() if v.position is not None]
+        mid = UTMPosition.middle(positions)
+        if self.cfg.space_mode:
+            # Space mode uses dummy UTM zone with AU-scale coordinates;
+            # utm.to_latlon would crash on these values.  Return a sentinel
+            # GeoPosition so downstream serialization (which expects GeoPosition)
+            # still works without hitting the utm library.
+            center = GeoPosition(0.0, 0.0, 0.0)
+        else:
+            center = mid.convert(GeoPosition)
+        # Build gateway map: which nodes have active internet uplinks this tick
+        gateways: GatewayMap = {}
+        for peer in self.cfg.peers:
+            if peer.uplink is not None and random.random() < peer.uplink.reliability:
+                gateways[peer.uuid] = peer.uplink
+
+        return center, max_dist, mapp, matrix, active, sig_quality, delay_matrix, gateways
 
     def precompute_network(self):
         self.init_computation()
@@ -133,9 +171,18 @@ class Simulator(net.SelectServer):
 
     @staticmethod
     def _make_state(cur_time, step_result):
-        center, max_dist, mapp, matrix, active, sig_quality = step_result
+        center, max_dist, mapp, matrix, active, sig_quality, delay, gateways = step_result
+        gateway_count = len(gateways)
+        agg_down = sum(gw.bandwidth_down_mbps for gw in gateways.values())
+        agg_up = sum(gw.bandwidth_up_mbps for gw in gateways.values())
+        active_count = len(active) if active else 1
+        per_node = agg_down / active_count if active_count > 0 else 0.0
         return SimState(cur_time, center, max_dist, mapp, matrix, active,
-                        signal_quality=sig_quality)
+                        signal_quality=sig_quality, delay=delay,
+                        gateways=gateways, gateway_count=gateway_count,
+                        aggregate_uplink_down_mbps=agg_down,
+                        aggregate_uplink_up_mbps=agg_up,
+                        per_node_down_mbps=per_node)
 
     def send_state(self, tick, sock: socket.socket):
         cur_time = self.start_time + timedelta(**{self.time_resolution: tick * self.cadence})
@@ -182,10 +229,14 @@ class Simulator(net.SelectServer):
         self.halt = True
 
     def run(self, port: int, **kwargs):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        self.logger.info('Simulation at %s:%d for %s' % (s.getsockname()[0], port, self.cfg_file))
-        s.close()
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except OSError:
+            local_ip = '127.0.0.1'
+        self.logger.info('Simulation at %s:%d for %s' % (local_ip, port, self.cfg_file))
         super().run(port, **kwargs)
 
 

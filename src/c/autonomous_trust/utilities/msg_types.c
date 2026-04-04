@@ -17,12 +17,14 @@
 #include <string.h>
 #include <errno.h>
 #include <stdint.h>
+#include <jansson.h>
 
 #include "msg_types_priv.h"
 
 #include "identity/identity_priv.h"
 #include "processes/capabilities_priv.h"
 #include "negotiation/task_priv.h"
+#include "negotiation/task.pb-c.h"
 #include "google/protobuf/any.pb-c.h"
 
 size_t message_size(message_type_t type)
@@ -65,7 +67,7 @@ char *message_type_to_string(message_type_t type)
     case PEER_CAPABILITIES:
         return (char*)autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name;
     case TASK:
-        return (char*)"TASK";  /* task.proto is empty; no descriptor */
+        return (char*)autonomous_trust__core__protobuf__negotiation__task__descriptor.c_name;
     case NET_MESSAGE:
         return (char*)"NET_MSG";
     case TASK_STATUS:
@@ -89,7 +91,7 @@ message_type_t string_to_message_type(const char *str)
         return PEER;
     if (strcmp(str, autonomous_trust__core__protobuf__processes__peer_capabilities__descriptor.c_name) == 0)
         return PEER_CAPABILITIES;
-    if (strcmp(str, "TASK") == 0)
+    if (strcmp(str, autonomous_trust__core__protobuf__negotiation__task__descriptor.c_name) == 0)
         return TASK;
     if (strcmp(str, "NET_MSG") == 0)
         return NET_MESSAGE;
@@ -112,9 +114,77 @@ int signal_to_proto(const signal_t *msg, void **data_ptr, size_t *data_len_ptr)
     return 0;
 }
 
+int net_msg_pack_json(net_msg_t *msg, json_t *json)
+{
+    char *str = json_dumps(json, JSON_COMPACT);
+    if (str == NULL)
+        return -1;
+    size_t slen = strlen(str);
+    msg->obj = smrt_create(slen + 1);
+    if (msg->obj == NULL)
+    {
+        free(str);
+        return EXCEPTION(ENOMEM);
+    }
+    memcpy(msg->obj, str, slen + 1);
+    msg->len = slen;
+    free(str);
+    return 0;
+}
+
+int net_msg_unpack_json(const net_msg_t *msg, json_t **json)
+{
+    if (msg->obj == NULL || msg->len == 0)
+        return -1;
+    json_error_t error;
+    *json = json_loads((const char *)msg->obj, 0, &error);
+    if (*json == NULL)
+        return -1;
+    return 0;
+}
+
 int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr)
 {
-    return 0;  // FIXME
+    json_t *root = json_object();
+    if (root == NULL)
+        return -1;
+
+    json_object_set_new(root, "process", json_string(msg->process));
+    json_object_set_new(root, "function", json_string(msg->function ? msg->function : ""));
+    json_object_set_new(root, "encrypt", json_boolean(msg->encrypt));
+    json_object_set_new(root, "return_to", json_string(msg->return_to));
+
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
+    json_object_set_new(root, "from_uuid", json_string(uuid_str));
+    json_object_set_new(root, "from_name", json_string(msg->from_whom.fullname));
+
+    uuid_unparse_lower(msg->to_whom.uuid, uuid_str);
+    json_object_set_new(root, "to_uuid", json_string(uuid_str));
+    json_object_set_new(root, "to_name", json_string(msg->to_whom.fullname));
+
+    if (msg->obj != NULL && msg->len > 0)
+    {
+        json_object_set_new(root, "obj", json_stringn((const char *)msg->obj, msg->len));
+        json_object_set_new(root, "obj_len", json_integer((json_int_t)msg->len));
+    }
+
+    char *str = json_dumps(root, JSON_COMPACT);
+    json_decref(root);
+    if (str == NULL)
+        return -1;
+
+    size_t slen = strlen(str);
+    *data_ptr = smrt_create(slen + 1);
+    if (*data_ptr == NULL)
+    {
+        free(str);
+        return EXCEPTION(ENOMEM);
+    }
+    memcpy(*data_ptr, str, slen + 1);
+    *data_len_ptr = slen;
+    free(str);
+    return 0;
 }
 
 int wrap_in_any(message_type_t type, void *data_in, size_t data_in_len, void **data_ptr, size_t *data_len_ptr)
@@ -143,8 +213,8 @@ int wrap_in_any(message_type_t type, void *data_in, size_t data_in_len, void **d
 
 int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
 {
-    void *subdata;
-    size_t subdata_len;
+    void *subdata = NULL;
+    size_t subdata_len = 0;
     switch (msg->type)
     {
     case SIGNAL:
@@ -221,7 +291,57 @@ int proto_to_signal(uint8_t *data, size_t len, signal_t *sig)
 
 int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
 {
-    // FIXME
+    json_error_t error;
+    json_t *root = json_loadb((const char *)data, len, 0, &error);
+    if (root == NULL)
+        return -1;
+
+    const char *proc = json_string_value(json_object_get(root, "process"));
+    if (proc)
+        strncpy(net_msg->process, proc, PROC_NAME_LEN);
+
+    const char *func = json_string_value(json_object_get(root, "function"));
+    if (func && func[0] != '\0')
+    {
+        net_msg->function = smrt_create(strlen(func) + 1);
+        if (net_msg->function != NULL)
+            strcpy(net_msg->function, func);
+    }
+
+    net_msg->encrypt = json_boolean_value(json_object_get(root, "encrypt"));
+
+    const char *ret = json_string_value(json_object_get(root, "return_to"));
+    if (ret)
+        strncpy(net_msg->return_to, ret, PROC_NAME_LEN);
+
+    const char *from_uuid = json_string_value(json_object_get(root, "from_uuid"));
+    if (from_uuid)
+        uuid_parse(from_uuid, net_msg->from_whom.uuid);
+    const char *from_name = json_string_value(json_object_get(root, "from_name"));
+    if (from_name)
+        strncpy(net_msg->from_whom.fullname, from_name, NAME_LEN);
+
+    const char *to_uuid = json_string_value(json_object_get(root, "to_uuid"));
+    if (to_uuid)
+        uuid_parse(to_uuid, net_msg->to_whom.uuid);
+    const char *to_name = json_string_value(json_object_get(root, "to_name"));
+    if (to_name)
+        strncpy(net_msg->to_whom.fullname, to_name, NAME_LEN);
+
+    const char *obj_str = json_string_value(json_object_get(root, "obj"));
+    json_int_t obj_len = json_integer_value(json_object_get(root, "obj_len"));
+    if (obj_str && obj_len > 0)
+    {
+        net_msg->obj = smrt_create((size_t)obj_len + 1);
+        if (net_msg->obj != NULL)
+        {
+            memcpy(net_msg->obj, obj_str, (size_t)obj_len);
+            net_msg->obj[obj_len] = '\0';
+            net_msg->len = (size_t)obj_len;
+        }
+    }
+
+    json_decref(root);
     return 0;
 }
 
@@ -231,7 +351,7 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
 
     pb_msg = google__protobuf__any__unpack(NULL, data_len, data);
     if (pb_msg == NULL)
-        ; // FIXME
+        return -1; /* FIXME proper error code */
 
     message_type_t type = string_to_message_type(pb_msg->type_url);
     msg->type = type;

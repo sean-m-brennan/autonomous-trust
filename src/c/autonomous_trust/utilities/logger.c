@@ -38,7 +38,7 @@
 #define ORIGIN_FMT "\tfrom %s, line %ld\n"
 #define ORIGIN_LEN (MAX_FILENAME + MAX_INT_STR + 14)
 
-extern exception_t _exception;
+extern _Thread_local exception_t _exception;
 
 logger_t root_logger = {
     .max_level = DEBUG,
@@ -197,16 +197,18 @@ void _log_exception_extra(logger_t *logger, const char *srcfile, const size_t li
         addtnl = malloc(ORIGIN_LEN+1);
         snprintf(addtnl, ORIGIN_LEN, ORIGIN_FMT, srcfile, line);
     }
-    char *format = malloc(strlen(err_info) + strlen(fmt) + strlen(addtnl) + 1);
+    char *format = malloc(strlen(err_info) + 2 + strlen(addtnl) + 1);
     strcpy(format, err_info);
-    strcat(format, fmt);
+    strcat(format, "%s");
     if (add_stack)
         strcat(format, addtnl);
 
     va_list argp;
     va_start(argp, fmt);
-    _vlogging(logger, ERROR, _exception.file, _exception.line, format, argp);
+    char user_msg[1024] = {0};
+    vsnprintf(user_msg, sizeof(user_msg), fmt, argp);
     va_end(argp);
+    _logging(logger, ERROR, _exception.file, _exception.line, format, user_msg);
     _set_exception(0, 0, "");  // clear
     free(format);
     if (add_stack)

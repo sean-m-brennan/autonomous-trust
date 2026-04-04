@@ -1,8 +1,0 @@
-# Get the latest git tag for versioning
-# Default to 0.0.0 if no tags
-
-def git_version():
-    version = str(local('git describe', echo_off=True, quiet=True))
-    if not version.startswith('v'):
-        return '0.0.0'
-    return version[1:].split('-')[0]

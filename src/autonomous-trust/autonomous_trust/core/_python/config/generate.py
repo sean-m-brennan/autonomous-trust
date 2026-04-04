@@ -15,10 +15,13 @@
 # ******************
 
 import inspect
+import logging
 import os
 import sys
 import random
 import socket
+
+_logger = logging.getLogger(__name__)
 
 from .configuration import Configuration, InitializableConfig
 from .names import random_name
@@ -96,11 +99,11 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         if not os.path.exists(sub_sys_file):
             sub_sys_cfg.to_file(sub_sys_file)
         if not silent:
-            print('Wrote configs to %s' % cfg_dir)
+            _logger.debug('Wrote configs to %s', cfg_dir)
         return net_cfg, ident_cfg, sub_sys_cfg
 
     if not preserve:
-        print('Configuring an AutonomousTrust identity')
+        _logger.debug('Configuring an AutonomousTrust identity')
     if not os.path.exists(ident_file) or not preserve:
         try:
             fullname = input('  Fullname (FQDN) [%s]: ' % hostname)
@@ -156,7 +159,7 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
                     overwrite = True
             if overwrite:
                 cfg.to_file(cfg_file)
-                print('%s config written to %s' % (cfg_name.capitalize(), cfg_file))
+                _logger.debug('%s config written to %s', cfg_name.capitalize(), cfg_file)
 
     return net_cfg, ident_cfg, sub_sys_cfg
 
@@ -177,7 +180,7 @@ def random_config(base_dir, ident: str = None):
 def generate_worker_config(cfg_dir: str, proc_name: str, cfg_class: type[InitializableConfig], defaults: bool = False):
     cfg_file = os.path.join(cfg_dir, proc_name + Configuration.file_ext)
     if not os.path.exists(cfg_file):
-        print('Configure %s --' % proc_name)
+        _logger.debug('Configure %s --', proc_name)
         spec = inspect.getfullargspec(cfg_class.initialize)
         ann = inspect.get_annotations(cfg_class.initialize)
         arg_names = spec[0][1:]

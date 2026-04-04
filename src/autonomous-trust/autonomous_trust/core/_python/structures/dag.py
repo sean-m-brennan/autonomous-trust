@@ -95,7 +95,7 @@ class LinkedStep(Step, Configuration):
         uuid_bytes = self.message.uuid
         self.uuid = None
         if uuid_bytes:
-            self.uuid = uuid_bytes.decode('utf-8')
+            self.uuid = UUID(uuid_bytes.decode('utf-8'))
         self.payload = None
         self.timestamp = None
         self.previous = None

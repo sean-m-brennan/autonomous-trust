@@ -14,10 +14,13 @@
 #   limitations under the License.
 # ******************
 
+import logging
 import re
 import uuid
 from collections import Counter, OrderedDict, deque
 from enum import Enum
+
+_logger = logging.getLogger(__name__)
 
 from .token_list import TokenList
 from .data_service import Ident, DataService
@@ -87,7 +90,7 @@ class DataClient:
             target_len = len(set(list(machine_ask)))
             machine_answer = remove_ops(answer)
             if len(machine_answer) != target_len:
-                print(set(list(machine_ask)))
+                _logger.debug('%s', set(list(machine_ask)))
                 raise RuntimeError("That answer is the wrong size (actual %d, expected %d)." %
                                    (len(machine_answer), target_len))
             if machine_answer in machine_ask:

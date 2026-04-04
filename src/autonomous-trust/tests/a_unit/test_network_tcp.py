@@ -529,7 +529,6 @@ def test_reject(setup_teardown):
     tcp = _TCP(cfgs, dict({}), None)
     tcp.send_peer('test1', net_addr)
     msg_tpl = tcp.recv_peer()
-    print(msg_tpl)
     assert msg_tpl[0] is None
     #assert net_addr == msg_tpl[1][0]
 
