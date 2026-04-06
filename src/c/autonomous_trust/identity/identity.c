@@ -206,6 +206,17 @@ int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core_
     memcpy(proto->encryptor, &tmp_e, sizeof(tmp_e));
     proto->encryptor->hex_seed.data = identity->encryptor.public_hex;
     proto->encryptor->hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
+
+#ifdef AT_ZTA_ENABLED
+    if (identity->zta_credential_len > 0 && identity->zta_credential != NULL) {
+        proto->zta_credential_hash.data = identity->zta_credential_hash;
+        proto->zta_credential_hash.len = sizeof(identity->zta_credential_hash);
+        proto->zta_issuer = identity->zta_issuer;
+        proto->zta_credential.data = identity->zta_credential;
+        proto->zta_credential.len = identity->zta_credential_len;
+    }
+#endif
+
     return 0;
 }
 
@@ -216,6 +227,30 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
     strncpy(identity->fullname, proto->fullname, NAME_LEN);
     public_signature_init(&identity->signature, proto->signature->hex_seed.data);
     public_encryptor_init(&identity->encryptor, proto->encryptor->hex_seed.data);
+
+#ifdef AT_ZTA_ENABLED
+    memset(identity->zta_credential_hash, 0, sizeof(identity->zta_credential_hash));
+    identity->zta_issuer[0] = '\0';
+    identity->zta_credential = NULL;
+    identity->zta_credential_len = 0;
+
+    if (proto->zta_credential_hash.len > 0 && proto->zta_credential_hash.data != NULL) {
+        size_t copy_len = proto->zta_credential_hash.len;
+        if (copy_len > sizeof(identity->zta_credential_hash))
+            copy_len = sizeof(identity->zta_credential_hash);
+        memcpy(identity->zta_credential_hash, proto->zta_credential_hash.data, copy_len);
+    }
+    if (proto->zta_issuer != NULL)
+        snprintf(identity->zta_issuer, sizeof(identity->zta_issuer), "%s", proto->zta_issuer);
+    if (proto->zta_credential.len > 0 && proto->zta_credential.data != NULL) {
+        identity->zta_credential = malloc(proto->zta_credential.len);
+        if (identity->zta_credential) {
+            memcpy(identity->zta_credential, proto->zta_credential.data, proto->zta_credential.len);
+            identity->zta_credential_len = proto->zta_credential.len;
+        }
+    }
+#endif
+
     return 0;
 }
 

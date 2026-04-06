@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "require_at_admission": true,
+  "reverify_interval_sec": 3600,
+  "revocation_reputation_penalty": 0.8,
+  "allow_ddil_fallback": true,
+  "ddil_fallback_reputation_cap": 0.5,
+  "audit_deferred_verifications": true,
+  "delegated_verification_min_reputation": 0.7,
+  "delegated_verification_quorum": 1,
+  "verifier_type": "x509",
+  "ca_bundle_path": "/etc/pki/tls/certs/ca-bundle.crt",
+  "ocsp_url": "",
+  "crl_path": ""
+}
