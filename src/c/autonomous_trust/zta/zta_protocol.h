@@ -14,31 +14,25 @@
  *   limitations under the License.
  *******************/
 
-syntax = "proto3";
+#ifndef ZTA_PROTOCOL_H
+#define ZTA_PROTOCOL_H
 
-package autonomous_trust.core.protobuf.identity;
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-message Encryptor {
-  bytes hex_seed = 1;
-}
+/**
+ * @brief ZTA protocol message function names
+ *
+ * These are used in the network message 'function' field to identify
+ * ZTA-specific protocol messages exchanged between peers.
+ */
+#define ZTA_PROTO_REVOCATION_ALERT  "zta_revoked"     /* Alert group about a revocation */
+#define ZTA_PROTO_VERIFICATION      "zta_verified"    /* Share verification result */
+#define ZTA_PROTO_REVERIFY_REQ      "zta_reverify"    /* Request peers to re-verify a peer */
 
-message Signature {
-  bytes hex_seed = 1;
-}
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
-message Identity {
-  bytes uuid = 1;
-  string address = 2;
-  string fullname = 3;
-  Signature signature = 4;
-  Encryptor encryptor = 5;
-  bytes zta_credential_hash = 6;   // SHA-256 of ZTA credential at admission
-  string zta_issuer = 7;           // Credential issuer identifier
-  bytes zta_credential = 8;        // Raw credential for peer verification
-}
-
-message Group {
-  bytes uuid = 1;
-  string address = 2;  // Identity UUID to address
-  Encryptor encryptor = 3;  // group-shared key
-}
+#endif /* ZTA_PROTOCOL_H */

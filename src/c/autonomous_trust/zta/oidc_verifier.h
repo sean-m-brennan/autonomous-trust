@@ -14,31 +14,29 @@
  *   limitations under the License.
  *******************/
 
-syntax = "proto3";
+#ifndef OIDC_VERIFIER_H
+#define OIDC_VERIFIER_H
 
-package autonomous_trust.core.protobuf.identity;
+#include "zta_verifier.h"
 
-message Encryptor {
-  bytes hex_seed = 1;
-}
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-message Signature {
-  bytes hex_seed = 1;
-}
+/**
+ * @brief Create an OIDC verifier stub
+ *
+ * This is a placeholder that returns ZTA_UNAVAILABLE for all operations.
+ * It validates the verifier interface design for token-based credential
+ * types without implementing the full OIDC flow.
+ *
+ * @param out Output: newly allocated verifier (caller must destroy)
+ * @return 0 on success
+ */
+int oidc_verifier_create(zta_verifier_t **out);
 
-message Identity {
-  bytes uuid = 1;
-  string address = 2;
-  string fullname = 3;
-  Signature signature = 4;
-  Encryptor encryptor = 5;
-  bytes zta_credential_hash = 6;   // SHA-256 of ZTA credential at admission
-  string zta_issuer = 7;           // Credential issuer identifier
-  bytes zta_credential = 8;        // Raw credential for peer verification
-}
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
-message Group {
-  bytes uuid = 1;
-  string address = 2;  // Identity UUID to address
-  Encryptor encryptor = 3;  // group-shared key
-}
+#endif /* OIDC_VERIFIER_H */

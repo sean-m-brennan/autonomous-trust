@@ -42,6 +42,8 @@
 #define REP_PROTO_UPDATE   "update"
 #define REP_PROTO_REP_REQ  "reputation request"
 #define REP_PROTO_REP_RESP "reputation response"
+#define REP_PROTO_LOCAL_QUERY  "local_rep_query"    /* Local IPC: query a peer's score */
+#define REP_PROTO_LOCAL_RESP   "local_rep_response"  /* Local IPC: reply with score */
 
 /****************************
  * Transaction score (pending Paxos request)

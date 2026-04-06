@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1.3
+# ******************
+#  Copyright 2025 Sean M. Brennan and contributors
+#  Licensed under the Apache License, Version 2.0
+# ******************
+
+# ZTA-enabled AutonomousTrust C image
+# Multi-stage: build with AT_ZTA=ON, then copy to runtime image with test certs.
+#
+# Build from repo root:
+#   docker build --network host -t autonomous-trust-zta \
+#     -f examples/zta/Dockerfile.zta .
+
+####################
+# Stage 1: Builder
+####################
+FROM debian:bookworm AS builder
+
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG GIT_VERSION="unknown"
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+        python3 python-is-python3 \
+        cmake clang make pkg-config libc-dev \
+        uuid-dev libsodium-dev libjansson-dev \
+        libssl-dev openssl \
+        protobuf-compiler protobuf-c-compiler libprotobuf-c-dev libprotobuf-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY src/c /build/src/c
+COPY src/protobuf /build/src/protobuf
+COPY examples /build/examples
+
+# Build via examples/CMakeLists.txt which builds the library + demo
+# Remove any stale build artifacts that may have been copied from the host
+RUN rm -rf /build/examples/build && mkdir -p /build/examples/build && cd /build/examples/build && \
+    CC=clang CXX=clang++ cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DAT_ZTA=ON \
+        -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" \
+        -DCMAKE_CXX_FLAGS="-Wno-unknown-warning-option" && \
+    make -j$(nproc) at_zta_demo
+
+# Build mock OCSP responder (real DER OCSP protocol, requires OpenSSL)
+RUN cd /build/examples/zta/mock_ocsp && make clean && make
+
+# Generate test PKI
+RUN chmod +x /build/src/c/test/zta_test_ca/generate_test_ca.sh && \
+    /build/src/c/test/zta_test_ca/generate_test_ca.sh /build/test_pki
+
+####################
+# Stage 2: Runtime
+####################
+FROM debian:bookworm-slim
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+        libsodium23 libjansson4 libuuid1 \
+        libprotobuf-c1 libprotobuf32 \
+        libssl3 openssl \
+        iproute2 iputils-ping curl && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Copy built artifacts
+COPY --from=builder /build/examples/build/at_zta_demo /opt/at/bin/at_zta_demo
+COPY --from=builder /build/examples/zta/mock_ocsp/mock_ocsp /opt/at/bin/mock_ocsp
+
+# Copy test PKI
+COPY --from=builder /build/test_pki /opt/at/pki
+
+# The AT library is linked statically into at_zta_demo (--whole-archive),
+# so no .so is needed at runtime.
+
+ENV PATH="/opt/at/bin:$PATH"
+ENV AUTONOMOUS_TRUST_ROOT="/"
+
+# Pre-create data dirs
+RUN mkdir -p /etc/at /var/at && chmod 777 /etc/at /var/at
+
+# Default: show help
+CMD ["at_zta_demo", "--help"]

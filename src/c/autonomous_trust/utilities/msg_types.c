@@ -56,6 +56,11 @@ size_t message_size(message_type_t type)
         return sizeof(update_vote_msg_t);
     case UPDATE_ACCEPTED:
         return sizeof(update_accepted_msg_t);
+#ifdef AT_ZTA_ENABLED
+    case ZTA_REVOCATION_ALERT:
+    case ZTA_VERIFICATION_RESULT:
+        return sizeof(zta_event_msg_t);
+#endif
     default:
         return 0;
     }
@@ -89,6 +94,12 @@ char *message_type_to_string(message_type_t type)
         return (char*)"UPDATE_VOTE";
     case UPDATE_ACCEPTED:
         return (char*)"UPDATE_ACCEPTED";
+#ifdef AT_ZTA_ENABLED
+    case ZTA_REVOCATION_ALERT:
+        return (char*)"ZTA_REVOCATION_ALERT";
+    case ZTA_VERIFICATION_RESULT:
+        return (char*)"ZTA_VERIFICATION_RESULT";
+#endif
     default:
         return (char*)"";
     }
@@ -322,6 +333,17 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.update_accepted, subdata_len);
         break;
     }
+#ifdef AT_ZTA_ENABLED
+    case ZTA_REVOCATION_ALERT:
+    case ZTA_VERIFICATION_RESULT:
+    {
+        subdata_len = sizeof(zta_event_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.zta_event, subdata_len);
+        break;
+    }
+#endif
     case UPDATE_PROPOSAL:
         /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
         return -1;
@@ -451,6 +473,12 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
     case UPDATE_ACCEPTED:
         memcpy(&msg->info.update_accepted, pb_msg->value.data, sizeof(update_accepted_msg_t));
         return 0;
+#ifdef AT_ZTA_ENABLED
+    case ZTA_REVOCATION_ALERT:
+    case ZTA_VERIFICATION_RESULT:
+        memcpy(&msg->info.zta_event, pb_msg->value.data, sizeof(zta_event_msg_t));
+        return 0;
+#endif
     case UPDATE_PROPOSAL:
         /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
         return -1;
