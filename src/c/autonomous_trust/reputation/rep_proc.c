@@ -717,6 +717,69 @@ static bool handle_rep_response(const process_t *proc, directory_t *queues, gene
 }
 
 /****************************
+ * Handler: handle_local_rep_query (local IPC reputation query)
+ * Another local process (e.g. ZTA) asks for a peer's reputation score.
+ * Responds via local IPC to the requesting process.
+ ****************************/
+
+static bool handle_local_rep_query(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_error(proc->logger, "Reputation: handle_local_rep_query: failed to unpack JSON\n");
+        return false;
+    }
+
+    json_t *j_peer_uuid  = json_object_get(payload, "peer_uuid");
+    json_t *j_return_proc = json_object_get(payload, "return_process");
+
+    if (!j_peer_uuid || !j_return_proc)
+    {
+        json_decref(payload);
+        log_error(proc->logger, "Reputation: handle_local_rep_query: missing JSON fields\n");
+        return false;
+    }
+
+    const char *peer_uuid_str = json_string_value(j_peer_uuid);
+    const char *return_proc   = json_string_value(j_return_proc);
+
+    uuid_t peer_uuid;
+    double score = 0.0;
+    bool found = false;
+    if (uuid_parse(peer_uuid_str, peer_uuid) == 0)
+    {
+        pthread_mutex_lock(&rep_state.lock);
+        if (reputations_contains(&rep_state.reputations, peer_uuid))
+        {
+            reputations_get(&rep_state.reputations, peer_uuid, &score);
+            found = true;
+        }
+        pthread_mutex_unlock(&rep_state.lock);
+    }
+
+    /* Build response */
+    json_t *resp_json = json_object();
+    json_object_set_new(resp_json, "peer_uuid", json_string(peer_uuid_str));
+    json_object_set_new(resp_json, "score", json_real(score));
+    json_object_set_new(resp_json, "found", json_boolean(found));
+
+    json_decref(payload);
+
+    generic_msg_t resp = {0};
+    resp.type = NET_MESSAGE;
+    strncpy(resp.info.net_msg.process, return_proc, PROC_NAME_LEN);
+    resp.info.net_msg.function = (char *)REP_PROTO_LOCAL_RESP;
+    net_msg_pack_json(&resp.info.net_msg, resp_json);
+    json_decref(resp_json);
+
+    messaging_send(return_proc, NET_MESSAGE, &resp, false);
+    return true;
+}
+
+/****************************
  * Forward transaction: start Paxos for a local score
  * Called when TRANSACTION_SCORE message arrives from negotiation.
  ****************************/
@@ -797,6 +860,7 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
     process_register_handler(proc, (char *)REP_PROTO_UPDATE,    (handler_ptr_t)handle_update);
     process_register_handler(proc, (char *)REP_PROTO_REP_REQ,   (handler_ptr_t)handle_rep_request);
     process_register_handler(proc, (char *)REP_PROTO_REP_RESP,  (handler_ptr_t)handle_rep_response);
+    process_register_handler(proc, (char *)REP_PROTO_LOCAL_QUERY, (handler_ptr_t)handle_local_rep_query);
 
     proc->protocol.phase = 1;
 

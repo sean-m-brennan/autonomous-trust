@@ -59,6 +59,12 @@ typedef struct
     char fullname[NAME_LEN+1];
     signature_t signature;
     encryptor_t encryptor;
+#ifdef AT_ZTA_ENABLED
+    uint8_t zta_credential_hash[32];  /* SHA-256 of ZTA credential at admission */
+    char zta_issuer[64];              /* Credential issuer identifier */
+    uint8_t *zta_credential;          /* Raw credential bytes (heap-allocated) */
+    size_t zta_credential_len;        /* Length of zta_credential */
+#endif
 } public_identity_t;
 
 

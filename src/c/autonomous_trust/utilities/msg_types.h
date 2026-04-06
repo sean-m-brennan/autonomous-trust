@@ -38,7 +38,11 @@ typedef enum {
     TRANSACTION_SCORE,
     UPDATE_PROPOSAL,
     UPDATE_VOTE,
-    UPDATE_ACCEPTED
+    UPDATE_ACCEPTED,
+#ifdef AT_ZTA_ENABLED
+    ZTA_REVOCATION_ALERT,
+    ZTA_VERIFICATION_RESULT
+#endif
 } message_type_t;
 
 /**
@@ -108,7 +112,17 @@ typedef struct
     int sig;
 } signal_t;
 
-typedef struct 
+#ifdef AT_ZTA_ENABLED
+typedef struct {
+    uuid_t peer_uuid;
+    uuid_t voucher_uuid;            /* Identity of the peer that performed verification */
+    uint8_t credential_hash[32];
+    int status;                     /* zta_status_t cast to int */
+    char reason[64];
+} zta_event_msg_t;
+#endif
+
+typedef struct
 {
     long type;
     size_t size;
@@ -124,6 +138,9 @@ typedef struct
         tx_score_msg_t tx_score;
         update_vote_msg_t update_vote;
         update_accepted_msg_t update_accepted;
+#ifdef AT_ZTA_ENABLED
+        zta_event_msg_t zta_event;
+#endif
     } info;
 } generic_msg_t;
 
