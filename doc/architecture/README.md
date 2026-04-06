@@ -15,3 +15,4 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Adversarial Testing](adversarial-testing.md) -- Security validation via attack scenarios and CALDERA orchestration
 - [Space Communications](space-communications.md) -- Interplanetary link physics, delay routing, and orbital scenarios
 - [Security Hardening](security-hardening.md) -- Memory safety, RCE prevention, and input validation
+- [ZTA Integration](zta-integration.md) -- Zero Trust credential verification, DDIL fallback, and audit logging

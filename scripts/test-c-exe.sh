@@ -47,18 +47,40 @@ rm -rf "$build_dir"
 mkdir -p "$build_dir"
 
 cmake_flags=("-DCMAKE_BUILD_TYPE=Debug")
+# Enable ZTA integration (requires OpenSSL) so ZTA unit tests are built
+cmake_flags+=("-DAT_ZTA=ON")
 # Use clang if available (avoids GCC 14/15 + binutils 2.45 corrupt ELF bugs)
 if command -v clang >/dev/null 2>&1 && command -v clang++ >/dev/null 2>&1; then
     cmake_flags+=("-DCMAKE_C_COMPILER=clang" "-DCMAKE_CXX_COMPILER=clang++")
 fi
-# Use LLVM ar/ranlib/linker if available
-if command -v llvm-ar >/dev/null 2>&1; then
-    cmake_flags+=("-DCMAKE_AR=$(which llvm-ar)" "-DCMAKE_RANLIB=$(which llvm-ranlib)")
-    linker_flags="-fuse-ld=lld"
-    if [ $coverage -eq 1 ]; then
-        linker_flags="--coverage -fuse-ld=lld"
+# Use LLVM ar/ranlib/linker if available (try unversioned, then versioned)
+llvm_ar=""
+for tool in llvm-ar llvm-ar-20 llvm-ar-19 llvm-ar-18; do
+    if command -v "$tool" >/dev/null 2>&1; then
+        llvm_ar="$tool"
+        break
     fi
-    cmake_flags+=("-DCMAKE_EXE_LINKER_FLAGS=$linker_flags" "-DCMAKE_SHARED_LINKER_FLAGS=$linker_flags")
+done
+if [ -n "$llvm_ar" ]; then
+    ver_suffix="${llvm_ar#llvm-ar}"  # e.g. "-20" or ""
+    cmake_flags+=("-DCMAKE_AR=$(which "$llvm_ar")" "-DCMAKE_RANLIB=$(which "llvm-ranlib${ver_suffix}")")
+    # Only use lld if actually installed
+    lld_tool=""
+    for candidate in "lld${ver_suffix}" lld; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            lld_tool="$candidate"
+            break
+        fi
+    done
+    if [ -n "$lld_tool" ]; then
+        linker_flags="-fuse-ld=$lld_tool"
+        if [ $coverage -eq 1 ]; then
+            linker_flags="--coverage $linker_flags"
+        fi
+        cmake_flags+=("-DCMAKE_EXE_LINKER_FLAGS=$linker_flags" "-DCMAKE_SHARED_LINKER_FLAGS=$linker_flags")
+    elif [ $coverage -eq 1 ]; then
+        cmake_flags+=("-DCMAKE_EXE_LINKER_FLAGS=--coverage" "-DCMAKE_SHARED_LINKER_FLAGS=--coverage")
+    fi
 fi
 # Add coverage instrumentation flags
 if [ $coverage -eq 1 ]; then
