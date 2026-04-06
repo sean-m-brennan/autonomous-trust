@@ -30,6 +30,12 @@
 #include "peers.h"
 #include "id_proc_priv.h"
 
+#ifdef AT_ZTA_ENABLED
+#include "zta/zta_policy.h"
+#include "zta/zta_verifier.h"
+#include "zta/zta_audit.h"
+#endif
+
 DEFINE_ERROR(EID_NOQ, "Required process queue missing");
 
 #define MAJORITY(n) (((n) / 2) + 1)
@@ -192,6 +198,53 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
             return true;
         }
     }
+
+#ifdef AT_ZTA_ENABLED
+    /* ZTA credential verification at admission */
+    {
+        /* Look up ZTA policy from configs */
+        data_t *zta_cfg = NULL;
+        zta_policy_t *zta_policy = NULL;
+        char zta_key[] = "zta_policy";
+        if (map_get(proc->configs, zta_key, &zta_cfg) == 0 && zta_cfg)
+            zta_policy = (zta_policy_t *)zta_cfg;
+
+        if (zta_policy && zta_policy->enabled && zta_policy->require_at_admission) {
+            zta_verifier_t *verifier = NULL;
+            int zrc = zta_policy_create_verifier(zta_policy, &verifier);
+            if (zrc == 0 && verifier) {
+                zta_result_t zta_result;
+                verifier->verify_credential(
+                    verifier,
+                    nmsg->from_whom.zta_credential,
+                    nmsg->from_whom.zta_credential_len,
+                    &zta_result);
+
+                if (zta_result.status == ZTA_REJECTED || zta_result.status == ZTA_EXPIRED) {
+                    log_warn(proc->logger,
+                             "Identity: ZTA credential %s for %s: %s\n",
+                             zta_status_str(zta_result.status),
+                             nmsg->from_whom.fullname, zta_result.reason);
+                    verifier->destroy(verifier);
+                    return true; /* reject */
+                }
+                if (zta_result.status == ZTA_UNAVAILABLE || zta_result.status == ZTA_DEFERRED) {
+                    if (!zta_policy->allow_ddil_fallback) {
+                        log_warn(proc->logger,
+                                 "Identity: ZTA unavailable, DDIL fallback disabled; rejecting %s\n",
+                                 nmsg->from_whom.fullname);
+                        verifier->destroy(verifier);
+                        return true; /* reject */
+                    }
+                    log_info(proc->logger,
+                             "Identity: ZTA verification deferred (DDIL) for %s\n",
+                             nmsg->from_whom.fullname);
+                }
+                verifier->destroy(verifier);
+            }
+        }
+    }
+#endif
 
     /* Bootstrap: auto-accept when no existing peers (no one to vote) */
     if (proc->protocol.num_peers == 0)

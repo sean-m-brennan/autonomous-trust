@@ -13,7 +13,44 @@ We follow the Unix philosophy: do one thing well, work together, use a universal
 Architecture
 ------------
 
-For technical architecture documentation, see [doc/architecture/](doc/architecture/README.md).
+For technical architecture documentation, see [doc/architecture/](doc/architecture/README.md), covering:
+
+- System overview and cryptographic foundation
+- Process architecture and IPC
+- Networking, identity protocol, and group formation
+- Task negotiation and reputation consensus
+- Space communications (DTN, orbital mechanics)
+- Security hardening
+- [Zero Trust Architecture (ZTA) integration](doc/architecture/zta-integration.md) -- pluggable credential verification, DDIL fallback, and compliance audit logging
+
+
+Zero Trust Integration
+----------------------
+
+AutonomousTrust complements Zero Trust Architecture rather than replacing it. ZTA credentials gate admission; AT behavioral reputation governs ongoing trust. The ZTA plugin provides:
+
+- **Pluggable verifier interface** with X.509 (OpenSSL) and OIDC (stub) backends
+- **DDIL-aware fallback** -- peers are admitted with a reputation cap when verification infrastructure is unreachable, preserving network formation in disconnected environments
+- **Revocation as reputation event** -- certificate revocation applies a configurable reputation penalty rather than a binary disconnect
+- **Delegated verification** -- the AT group acts as a distributed PDP; peers with OCSP connectivity vouch for DDIL-admitted peers, lifting reputation caps without requiring every peer to reach external infrastructure
+- **Compliance audit trail** -- every verification, deferral, and resolution is logged to JSONL for post-incident review
+
+To build with ZTA support:
+
+```bash
+cd src/c && mkdir build && cd build
+cmake .. -DAT_ZTA=ON
+make -j$(nproc)
+```
+
+To run the 4-peer tactical demo (requires Docker):
+
+```bash
+cd examples/zta
+./run_demo.sh
+```
+
+See [doc/architecture/zta-integration.md](doc/architecture/zta-integration.md) for the full technical reference.
 
 
 QuickStart
@@ -36,7 +73,17 @@ Requires:
   * QEMU https://wiki.qemu.org/Hosts
 
 Downloads/installs (local to working dir):
-  * Unikraft
   * pyNaCl
   * libffi
 
+
+Documentation
+-------------
+
+| Document | Description |
+|----------|-------------|
+| [doc/architecture/](doc/architecture/README.md) | Technical architecture (identity, networking, reputation, ZTA, etc.) |
+| [doc/concept.md](doc/concept.md) | Conceptual overview |
+| [doc/security.md](doc/security.md) | Security model |
+| [doc/api.md](doc/api.md) | API reference |
+| [doc/testing.md](doc/testing.md) | Testing approach |

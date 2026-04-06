@@ -75,6 +75,9 @@ add_link_options(-pthread ${sysroot_flag})
 # Static linking option for embedded/IoT builds
 option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)" OFF)
 
+# Zero Trust Architecture integration (requires OpenSSL)
+option(AT_ZTA "Enable Zero Trust Architecture credential integration" OFF)
+
 if(AT_STATIC)
     set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
@@ -149,6 +152,16 @@ else()
     message(WARNING "Testing dependency libcheck not found. Tests will not be built.")
 endif()
 
+# OpenSSL (required only when AT_ZTA is ON)
+if(AT_ZTA)
+    find_package(OpenSSL REQUIRED)
+    if(OPENSSL_FOUND)
+        message("-- Found OpenSSL ${OPENSSL_VERSION} at ${OPENSSL_LIBRARIES}")
+    else()
+        message(FATAL_ERROR "AT_ZTA=ON requires OpenSSL. Install libssl-dev.")
+    endif()
+endif()
+
 set(DEPENDENCIES
     ${LIBUUID_LIBRARY}
     ${LIBSODIUM_LIBRARY}
@@ -159,6 +172,13 @@ set(DEPENDENCIES
     ${CMAKE_THREAD_LIBS_INIT}
     m
 )
+
+if(AT_ZTA)
+    list(APPEND DEPENDENCIES OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
+# Expose DEPENDENCIES to parent scope so examples/ can link them
+set(DEPENDENCIES "${DEPENDENCIES}" PARENT_SCOPE)
 
 set(TEST_DEPENDENCIES ${DEPENDENCIES})
 if(LIBCHECK_LIBRARY)
@@ -262,6 +282,19 @@ set(libsrc
     autonomous_trust/fleet/config_proc_helpers.c
     autonomous_trust/fleet/config_proc.c
 )
+
+# ZTA sources (only compiled when AT_ZTA is enabled)
+if(AT_ZTA)
+    list(APPEND libsrc
+        autonomous_trust/zta/zta_verifier.c
+        autonomous_trust/zta/x509_verifier.c
+        autonomous_trust/zta/oidc_verifier.c
+        autonomous_trust/zta/zta_policy.c
+        autonomous_trust/zta/zta_audit.c
+        autonomous_trust/zta/zta_process.c
+    )
+endif()
+
 set(libhdr
     autonomous_trust.h
     autonomous_trust/algorithms/agreement.h
@@ -299,6 +332,19 @@ set(libhdr
     autonomous_trust/fleet/update_proc.h
     autonomous_trust/fleet/config_proc.h
 )
+
+if(AT_ZTA)
+    list(APPEND libhdr
+        autonomous_trust/zta/zta_verifier.h
+        autonomous_trust/zta/x509_verifier.h
+        autonomous_trust/zta/oidc_verifier.h
+        autonomous_trust/zta/zta_policy.h
+        autonomous_trust/zta/zta_audit.h
+        autonomous_trust/zta/zta_process.h
+        autonomous_trust/zta/zta_protocol.h
+    )
+endif()
+
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust)
 
 ####################
@@ -316,7 +362,8 @@ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/version.h)
             set(REVISION ${VERSION} CACHE STRING "git tag" FORCE)
         else()
             message(WARNING "Git not found, cannot set version info")
-            SET(REVISION "unknown")
+            set(VERSION "unknown")
+            set(REVISION "unknown")
         endif()
     endif()
 endif()  
@@ -414,6 +461,14 @@ add_custom_target(proto_python DEPENDS ${proto_py_src})
 ####################
 # create libraries
 
+# When AT_ZTA is enabled, ALL targets must see AT_ZTA_ENABLED because it
+# changes the size of public_identity_t (adds ZTA credential fields).
+# A struct size mismatch between the library and consumers causes crashes.
+if(AT_ZTA)
+    add_compile_definitions(AT_ZTA_ENABLED)
+    include_directories(${OPENSSL_INCLUDE_DIR})
+endif()
+
 add_library(autonomous_trust SHARED ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
 set_target_properties(autonomous_trust PROPERTIES COMPILE_FLAGS "${lib_compile_flags}")
 target_sources(autonomous_trust PUBLIC ${libsrc}
@@ -433,155 +488,133 @@ target_sources(autonomous_trust PUBLIC ${libsrc}
 
 
 ####################
-# example app
+# Export library targets so examples/ can find them via add_subdirectory()
+# (demo and example executables live under examples/, not here)
 
-add_executable(at_example example.c)
-target_link_libraries(at_example PRIVATE -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive ${DEPENDENCIES})
-#target_link_libraries(at_example PRIVATE autonomous_trust ${DEPENDENCIES})
-target_compile_options(at_example PRIVATE -Wall ${sysroot_flag})
-target_link_options(at_example PRIVATE ${sysroot_flag})
-target_link_directories(at_example PRIVATE ${CMAKE_SYSROOT})
-
-
-####################
-# demo app (containerized)
-
-add_executable(at_demo at_demo.c)
-if(AT_STATIC)
-    target_link_libraries(at_demo PRIVATE
-        -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive
-        ${DEPENDENCIES}
-        -static
-    )
-    target_link_libraries(at_demo PRIVATE stdc++ m)
-else()
-    target_link_libraries(at_demo PRIVATE
-        -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive
-        ${DEPENDENCIES}
-    )
-endif()
-target_compile_options(at_demo PRIVATE -Wall ${sysroot_flag})
-target_link_options(at_demo PRIVATE ${sysroot_flag})
-target_link_directories(at_demo PRIVATE ${CMAKE_SYSROOT})
-install(TARGETS at_demo RUNTIME DESTINATION bin)
 
 
 ####################
 # tests (only built when libcheck is available)
+#
+# Test executables link against the static library archive.  With AT_ZTA=ON
+# the msg_types.c object acquires new dependencies on ZTA + proto symbols.
+# A single-pass linker may fail to resolve them because it only scans the
+# archive once.  Wrapping in --start-group/--end-group allows multiple passes.
+set(AT_TEST_LIBS -Wl,--start-group autonomous_trust_static ${TEST_DEPENDENCIES} -Wl,--end-group)
 
 if(LIBCHECK_LIBRARY)
 
 add_executable(array_test test/array_test.c)
 set_source_files_properties(test/array_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(array_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(array_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(exception_test test/exception_test.c)
 set_source_files_properties(test/exception_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(exception_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(exception_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(logger_test test/logging_test.c)
 set_source_files_properties(test/logging_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(logger_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(logger_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(map_test test/map_test.c)
 set_source_files_properties(test/map_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(map_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(map_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(msg_test test/messaging_test.c)
 set_source_files_properties(test/messaging_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(msg_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(msg_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(proc_track_test test/proc_track_test.c)
 set_source_files_properties(test/proc_track_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(proc_track_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(proc_track_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(rb_test test/rb_test.c)
 set_source_files_properties(test/rb_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(rb_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(rb_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(merkle_test test/merkle_test.c)
 set_source_files_properties(test/merkle_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(merkle_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(merkle_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(dag_test test/dag_test.c)
 set_source_files_properties(test/dag_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(dag_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(dag_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(agreement_test test/agreement_test.c)
 set_source_files_properties(test/agreement_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(agreement_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(agreement_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(net_message_test test/net_message_test.c)
 set_source_files_properties(test/net_message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(net_message_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(net_message_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(negotiation_test test/negotiation_test.c)
 set_source_files_properties(test/negotiation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(negotiation_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES} m)
+target_link_libraries(negotiation_test PRIVATE ${AT_TEST_LIBS} m)
 
 add_executable(reputation_test test/reputation_test.c)
 set_source_files_properties(test/reputation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(reputation_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES} m)
+target_link_libraries(reputation_test PRIVATE ${AT_TEST_LIBS} m)
 
 add_executable(history_test test/history_test.c)
 set_source_files_properties(test/history_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(history_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(history_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(queue_pool_test test/queue_pool_test.c)
 set_source_files_properties(test/queue_pool_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(queue_pool_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(queue_pool_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(network_test test/network_test.c)
 set_source_files_properties(test/network_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(network_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(network_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(identity_test test/identity_test.c)
 set_source_files_properties(test/identity_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(identity_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(identity_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(data_test test/data_test.c)
 set_source_files_properties(test/data_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(data_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(data_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(datetime_test test/datetime_test.c)
 set_source_files_properties(test/datetime_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(datetime_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(datetime_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(b64_test test/b64_test.c)
 set_source_files_properties(test/b64_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(b64_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(b64_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(group_test test/group_test.c)
 set_source_files_properties(test/group_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(group_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(group_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(data_json_test test/data_json_test.c)
 set_source_files_properties(test/data_json_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(data_json_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(data_json_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(datetime2_test test/datetime2_test.c)
 set_source_files_properties(test/datetime2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(datetime2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(datetime2_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(config_test test/config_test.c)
 set_source_files_properties(test/config_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(config_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(config_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(reputation2_test test/reputation2_test.c)
 set_source_files_properties(test/reputation2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(reputation2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(reputation2_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(map_json_test test/map_json_test.c)
 set_source_files_properties(test/map_json_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(map_json_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(map_json_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(array2_test test/array2_test.c)
 set_source_files_properties(test/array2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(array2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(array2_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(negotiation2_test test/negotiation2_test.c)
 set_source_files_properties(test/negotiation2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(negotiation2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(negotiation2_test PRIVATE ${AT_TEST_LIBS})
 
 enable_testing()
 
@@ -616,23 +649,23 @@ add_test(NAME negotiation2_test COMMAND $<TARGET_FILE:negotiation2_test>)
 
 add_executable(msg_types_test test/msg_types_test.c)
 set_source_files_properties(test/msg_types_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(msg_types_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(msg_types_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(network2_test test/network2_test.c)
 set_source_files_properties(test/network2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(network2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(network2_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(proc_tracker2_test test/proc_tracker2_test.c)
 set_source_files_properties(test/proc_tracker2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(proc_tracker2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(proc_tracker2_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(processes_test test/processes_test.c)
 set_source_files_properties(test/processes_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(processes_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(processes_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(capabilities_test test/capabilities_test.c)
 set_source_files_properties(test/capabilities_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(capabilities_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(capabilities_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME msg_types_test COMMAND $<TARGET_FILE:msg_types_test>)
 add_test(NAME network2_test COMMAND $<TARGET_FILE:network2_test>)
@@ -642,45 +675,45 @@ add_test(NAME capabilities_test COMMAND $<TARGET_FILE:capabilities_test>)
 
 add_executable(util_test test/util_test.c)
 set_source_files_properties(test/util_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(util_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(util_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(err_str_test test/err_str_test.c)
 set_source_files_properties(test/err_str_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(err_str_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(err_str_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME util_test COMMAND $<TARGET_FILE:util_test>)
 add_test(NAME err_str_test COMMAND $<TARGET_FILE:err_str_test>)
 
 add_executable(message_test test/message_test.c)
 set_source_files_properties(test/message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(message_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(message_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(rb2_test test/rb2_test.c)
 set_source_files_properties(test/rb2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(rb2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(rb2_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME message_test COMMAND $<TARGET_FILE:message_test>)
 add_test(NAME rb2_test COMMAND $<TARGET_FILE:rb2_test>)
 
 add_executable(map2_test test/map2_test.c)
 set_source_files_properties(test/map2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(map2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(map2_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(reputation3_test test/reputation3_test.c)
 set_source_files_properties(test/reputation3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(reputation3_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(reputation3_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(config2_test test/config2_test.c)
 set_source_files_properties(test/config2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(config2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(config2_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(util2_test test/util2_test.c)
 set_source_files_properties(test/util2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(util2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(util2_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(msg_types2_test test/msg_types2_test.c)
 set_source_files_properties(test/msg_types2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(msg_types2_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(msg_types2_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME map2_test COMMAND $<TARGET_FILE:map2_test>)
 add_test(NAME reputation3_test COMMAND $<TARGET_FILE:reputation3_test>)
@@ -690,34 +723,38 @@ add_test(NAME msg_types2_test COMMAND $<TARGET_FILE:msg_types2_test>)
 
 add_executable(msg_types3_test test/msg_types3_test.c)
 set_source_files_properties(test/msg_types3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(msg_types3_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(msg_types3_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME msg_types3_test COMMAND $<TARGET_FILE:msg_types3_test>)
 
 add_executable(task_proto_test test/task_proto_test.c)
 set_source_files_properties(test/task_proto_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(task_proto_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(task_proto_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME task_proto_test COMMAND $<TARGET_FILE:task_proto_test>)
 
 add_executable(paxos_test test/paxos_test.c)
 set_source_files_properties(test/paxos_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(paxos_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(paxos_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME paxos_test COMMAND $<TARGET_FILE:paxos_test>)
 
 add_executable(update_proposal_test test/update_proposal_test.c)
 set_source_files_properties(test/update_proposal_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(update_proposal_test PRIVATE autonomous_trust_static ${TEST_DEPENDENCIES})
+target_link_libraries(update_proposal_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME update_proposal_test COMMAND $<TARGET_FILE:update_proposal_test>)
 
+# Fleet tests compile their own .c files (not via the library), so they need
+# proto and table headers to exist before compilation starts.  Depend on the
+# static library target which already generates both.
 add_executable(fleet_proc_test
     test/fleet_proc_test.c
     autonomous_trust/fleet/fleet_helpers.c
     autonomous_trust/fleet/update_proposal.c)
 set_source_files_properties(test/fleet_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(fleet_proc_test PRIVATE ${TEST_DEPENDENCIES})
+add_dependencies(fleet_proc_test autonomous_trust_static)
 
 add_test(NAME fleet_proc_test COMMAND $<TARGET_FILE:fleet_proc_test>)
 
@@ -726,6 +763,7 @@ add_executable(artifact_store_test
     autonomous_trust/fleet/artifact_store.c)
 set_source_files_properties(test/artifact_store_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(artifact_store_test PRIVATE ${TEST_DEPENDENCIES})
+add_dependencies(artifact_store_test autonomous_trust_static)
 
 add_test(NAME artifact_store_test COMMAND $<TARGET_FILE:artifact_store_test>)
 
@@ -734,6 +772,7 @@ add_executable(artifact_proc_test
     autonomous_trust/fleet/artifact_proc_helpers.c)
 set_source_files_properties(test/artifact_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(artifact_proc_test PRIVATE ${TEST_DEPENDENCIES})
+add_dependencies(artifact_proc_test autonomous_trust_static)
 
 add_test(NAME artifact_proc_test COMMAND $<TARGET_FILE:artifact_proc_test>)
 
@@ -743,6 +782,7 @@ add_executable(update_proc_test
     autonomous_trust/fleet/update_selftest.c)
 set_source_files_properties(test/update_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(update_proc_test PRIVATE ${TEST_DEPENDENCIES})
+add_dependencies(update_proc_test autonomous_trust_static)
 
 add_test(NAME update_proc_test COMMAND $<TARGET_FILE:update_proc_test>)
 
@@ -752,8 +792,40 @@ add_executable(config_proc_test
     autonomous_trust/fleet/update_proc_helpers.c)
 set_source_files_properties(test/config_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(config_proc_test PRIVATE ${TEST_DEPENDENCIES})
+add_dependencies(config_proc_test autonomous_trust_static)
 
 add_test(NAME config_proc_test COMMAND $<TARGET_FILE:config_proc_test>)
+
+# ZTA tests (only when AT_ZTA is enabled)
+if(AT_ZTA)
+    add_executable(zta_verifier_test test/zta_verifier_test.c)
+    set_source_files_properties(test/zta_verifier_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(zta_verifier_test PRIVATE ${AT_TEST_LIBS})
+
+    add_executable(zta_policy_test test/zta_policy_test.c)
+    set_source_files_properties(test/zta_policy_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(zta_policy_test PRIVATE ${AT_TEST_LIBS})
+
+    add_executable(zta_audit_test test/zta_audit_test.c)
+    set_source_files_properties(test/zta_audit_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(zta_audit_test PRIVATE ${AT_TEST_LIBS})
+
+    add_executable(zta_ocsp_test test/zta_ocsp_test.c)
+    set_source_files_properties(test/zta_ocsp_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_compile_definitions(zta_ocsp_test PRIVATE
+        GEN_CA_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/test/zta_test_ca/generate_test_ca.sh")
+    target_link_libraries(zta_ocsp_test PRIVATE ${AT_TEST_LIBS})
+
+    add_executable(zta_delegation_test test/zta_delegation_test.c)
+    set_source_files_properties(test/zta_delegation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(zta_delegation_test PRIVATE ${AT_TEST_LIBS})
+
+    add_test(NAME zta_verifier_test COMMAND $<TARGET_FILE:zta_verifier_test>)
+    add_test(NAME zta_policy_test COMMAND $<TARGET_FILE:zta_policy_test>)
+    add_test(NAME zta_audit_test COMMAND $<TARGET_FILE:zta_audit_test>)
+    add_test(NAME zta_ocsp_test COMMAND $<TARGET_FILE:zta_ocsp_test>)
+    add_test(NAME zta_delegation_test COMMAND $<TARGET_FILE:zta_delegation_test>)
+endif() # AT_ZTA
 
 endif() # LIBCHECK_LIBRARY
 
