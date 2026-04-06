@@ -32,6 +32,9 @@ message Identity {
   string fullname = 3;
   Signature signature = 4;
   Encryptor encryptor = 5;
+  bytes zta_credential_hash = 6;   // SHA-256 of ZTA credential at admission
+  string zta_issuer = 7;           // Credential issuer identifier
+  bytes zta_credential = 8;        // Raw credential for peer verification
 }
 
 message Group {

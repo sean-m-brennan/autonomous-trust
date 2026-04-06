@@ -1,0 +1,113 @@
+# ZTA Demo: 4-peer tactical DDIL scenario
+#
+# Demonstrates ZTA credential verification, DDIL fallback, and revocation
+# detection integrated with AutonomousTrust behavioral reputation.
+#
+# Usage (from repo root):
+#   docker build --network host -t autonomous-trust-zta -f examples/zta/Dockerfile.zta .
+#   docker compose -f examples/zta/docker-compose.yml up
+#
+# Timeline:
+#   T+0:00   CP, SL, DA form network with ZTA verification via real OCSP
+#   T+30s    DB joins (OCSP initially unreachable — DDIL fallback, rep capped at 0.5)
+#   T+60s    DB's OCSP connectivity restored; CP's delegated verification lifts cap
+#   T+90s    DA's cert revoked via mock OCSP control endpoint
+#   T+120s   DA re-authenticates (restart with new cert)
+
+services:
+  # Mock OCSP responder — shared by all peers
+  # Uses real DER OCSP protocol; needs CA cert/key for signing responses
+  mock-ocsp:
+    image: autonomous-trust-zta
+    container_name: mock-ocsp
+    command:
+      - mock_ocsp
+      - "-p"
+      - "8888"
+      - "--ca-cert"
+      - "/opt/at/pki/intermediate/intermediate-ca.pem"
+      - "--ca-key"
+      - "/opt/at/pki/intermediate/intermediate-ca.key"
+    networks:
+      zta-net:
+        ipv4_address: 172.28.0.10
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8888/control/status"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Command Post — trust anchor, full OCSP connectivity
+  command-post:
+    image: autonomous-trust-zta
+    container_name: command-post
+    command: >
+      at_zta_demo --role command_post --log-level debug --test --generate-config
+    volumes:
+      - ./configs/command_post/zta_policy.cfg.json:/etc/at/zta_policy.cfg.json:ro
+    environment:
+      AUTONOMOUS_TRUST_ROOT: "/"
+    depends_on:
+      mock-ocsp:
+        condition: service_healthy
+    networks:
+      zta-net:
+        ipv4_address: 172.28.0.11
+
+  # Squad Leader — valid CAC/PIV credential
+  squad-leader:
+    image: autonomous-trust-zta
+    container_name: squad-leader
+    command: >
+      at_zta_demo --role squad_leader --log-level debug --test --generate-config
+    volumes:
+      - ./configs/squad_leader/zta_policy.cfg.json:/etc/at/zta_policy.cfg.json:ro
+    environment:
+      AUTONOMOUS_TRUST_ROOT: "/"
+    depends_on:
+      mock-ocsp:
+        condition: service_healthy
+    networks:
+      zta-net:
+        ipv4_address: 172.28.0.12
+
+  # Drone Alpha — machine cert, will be revoked mid-demo
+  drone-alpha:
+    image: autonomous-trust-zta
+    container_name: drone-alpha
+    command: >
+      at_zta_demo --role drone_alpha --log-level debug --test --generate-config
+    volumes:
+      - ./configs/drone_alpha/zta_policy.cfg.json:/etc/at/zta_policy.cfg.json:ro
+    environment:
+      AUTONOMOUS_TRUST_ROOT: "/"
+    depends_on:
+      mock-ocsp:
+        condition: service_healthy
+    networks:
+      zta-net:
+        ipv4_address: 172.28.0.13
+
+  # Drone Bravo — machine cert, starts in DDIL (no OCSP initially)
+  drone-bravo:
+    image: autonomous-trust-zta
+    container_name: drone-bravo
+    command: >
+      at_zta_demo --role drone_bravo --log-level debug --test --generate-config
+    volumes:
+      - ./configs/drone_bravo/zta_policy.cfg.json:/etc/at/zta_policy.cfg.json:ro
+    environment:
+      AUTONOMOUS_TRUST_ROOT: "/"
+    depends_on:
+      mock-ocsp:
+        condition: service_healthy
+    networks:
+      zta-net:
+        ipv4_address: 172.28.0.14
+
+networks:
+  zta-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
