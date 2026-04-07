@@ -35,7 +35,7 @@ def generate_compose(num_nodes: int, exclude_logs: str = "network",
         # "counterfeit").
         collect_metrics = metrics_dir and i == 1
         if collect_metrics:
-            exe = "-m autonomous_trust.simulator.instrumented"
+            exe = "-m autonomous_trust.evaluation.instrumented"
             metrics_args = f"--metrics-output /metrics/metrics.json {args}"
         else:
             exe = "-m autonomous_trust"
