@@ -27,7 +27,7 @@ from datetime import timedelta
 import pytest
 
 try:
-    from autonomous_trust.simulator.scenarios.asteroid_belt import (
+    from examples.asteroid_belt.scenario import (
         create_asteroid_belt_config,
     )
     from autonomous_trust.simulator.simulator import Simulator
