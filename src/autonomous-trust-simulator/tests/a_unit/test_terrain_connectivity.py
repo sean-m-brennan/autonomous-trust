@@ -270,7 +270,7 @@ def test_csv_round_trip(sample_csv, tmp_path):
 
 def test_appalachian_config_creation():
     """Appalachian scenario config creates without error."""
-    from autonomous_trust.simulator.scenarios.appalachian import create_appalachian_config
+    from examples.appalachia.scenario import create_appalachian_config
     with tempfile.NamedTemporaryFile(suffix='.cfg', delete=False) as f:
         cfg_path = f.name
     try:
@@ -284,7 +284,7 @@ def test_appalachian_config_creation():
 
 def test_appalachian_hilltop_only():
     """Hilltop-only scenario has 8 peers."""
-    from autonomous_trust.simulator.scenarios.appalachian import create_appalachian_config
+    from examples.appalachia.scenario import create_appalachian_config
     from autonomous_trust.simulator.sim_data import SimConfig
     with tempfile.NamedTemporaryFile(suffix='.cfg', delete=False) as f:
         cfg_path = f.name
@@ -301,7 +301,7 @@ def test_appalachian_hilltop_only():
 
 def test_appalachian_full_scenario():
     """Full scenario has 20 peers (8 hilltop + 12 valley)."""
-    from autonomous_trust.simulator.scenarios.appalachian import create_appalachian_config
+    from examples.appalachia.scenario import create_appalachian_config
     from autonomous_trust.simulator.sim_data import SimConfig
     with tempfile.NamedTemporaryFile(suffix='.cfg', delete=False) as f:
         cfg_path = f.name
@@ -321,7 +321,7 @@ def test_appalachian_full_scenario():
 
 def test_appalachian_splat_sites():
     """get_splat_sites() returns correct count and format."""
-    from autonomous_trust.simulator.scenarios.appalachian import get_splat_sites
+    from examples.appalachia.scenario import get_splat_sites
     sites = get_splat_sites()
     assert len(sites) == 20
     # Hilltop sites have 12m masts, valley sites have 6m

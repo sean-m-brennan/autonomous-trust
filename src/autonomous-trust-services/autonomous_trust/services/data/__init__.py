@@ -13,3 +13,5 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
+
+from autonomous_trust.services.data.reading import Reading  # noqa: F401

@@ -1,0 +1,218 @@
+# Multi-Agency Federal Data Sharing Demo
+#
+# 9 peers from NOAA, USGS, FEMA, EPA responding to Hurricane Helene
+# near Wilmington, NC.
+#
+# Prerequisites (build from repo root):
+#   docker build -t autonomous-trust-devel -f src/autonomous-trust/Dockerfile-devel .
+#   docker build -t autonomous-trust-full-devel -f src/Dockerfile-devel .
+#   docker build -t at-civilian-demo -f examples/multi_agency/deploy/Dockerfile .
+#
+# Run:
+#   docker compose -f examples/multi_agency/deploy/docker-compose.yml up
+#
+# Dashboard: http://localhost:8050
+
+x-common: &common
+  image: at-civilian-demo
+  networks:
+    - demo-net
+  restart: unless-stopped
+  environment: &common-env
+    PYTHONPATH: "/app"
+    POSTMORTEM: "true"
+
+x-participant: &participant
+  <<: *common
+  depends_on:
+    - simulator
+  cap_add:
+    - NET_ADMIN
+
+services:
+  # Simulator — computes network topology and peer connectivity
+  simulator:
+    <<: *common
+    container_name: civilian-simulator
+    environment:
+      <<: *common-env
+      AUTONOMOUS_TRUST_EXE: "-m autonomous_trust.simulator"
+      AUTONOMOUS_TRUST_ARGS: "--log simulator.log --log-level info --resolve-short-name scenario.yaml"
+      AUTONOMOUS_TRUST_ROOT: "/app/config"
+    volumes:
+      - ../simulator/scenario.yaml:/app/config/scenario.yaml:ro
+    ports:
+      - "8051:8051"
+    networks:
+      demo-net:
+        ipv4_address: 172.29.0.2
+
+  # Coordinator — runs the dashboard and aggregates data
+  coordinator:
+    <<: *common
+    container_name: civilian-coordinator
+    environment:
+      <<: *common-env
+      AUTONOMOUS_TRUST_EXE: "examples/multi_agency/coordinator.py"
+      AUTONOMOUS_TRUST_ARGS: "--log-level debug"
+      AUTONOMOUS_TRUST_ROOT: "/app/config/coordinator"
+    depends_on:
+      - simulator
+    ports:
+      - "8050:8050"
+      - "8000:8000"
+    volumes:
+      - ../configs/coordinator/:/app/config/coordinator/etc/at/:ro
+    networks:
+      demo-net:
+        ipv4_address: 172.29.0.3
+
+  # --- NOAA Weather Sensors ---
+  noaa-sensor-1:
+    <<: *participant
+    container_name: noaa-sensor-1
+    environment:
+      <<: *common-env
+      AUTONOMOUS_TRUST_EXE: "examples/multi_agency/participant.py"
+      AUTONOMOUS_TRUST_ARGS: "noaa-sensor-1 --log-level debug"
+      AUTONOMOUS_TRUST_ROOT: "/app/config/noaa-sensor-1"
+      AT_AGENCY: NOAA
+    volumes:
+      - ../configs/noaa-sensor-1/:/app/config/noaa-sensor-1/etc/at/:ro
+    networks:
+      demo-net:
+        ipv4_address: 172.29.0.10
+
+  noaa-sensor-2:
+    <<: *participant
+    container_name: noaa-sensor-2
+    environment:
+      <<: *common-env
+      AUTONOMOUS_TRUST_EXE: "examples/multi_agency/participant.py"
+      AUTONOMOUS_TRUST_ARGS: "noaa-sensor-2 --log-level debug"
+      AUTONOMOUS_TRUST_ROOT: "/app/config/noaa-sensor-2"
+      AT_AGENCY: NOAA
+    volumes:
+      - ../configs/noaa-sensor-2/:/app/config/noaa-sensor-2/etc/at/:ro
+    networks:
+      demo-net:
+        ipv4_address: 172.29.0.11
+
+  noaa-sensor-3:
+    <<: *participant
+    container_name: noaa-sensor-3
+    environment:
+      <<: *common-env
+      AUTONOMOUS_TRUST_EXE: "examples/multi_agency/participant.py"
+      AUTONOMOUS_TRUST_ARGS: "noaa-sensor-3 --log-level debug"
+      AUTONOMOUS_TRUST_ROOT: "/app/config/noaa-sensor-3"
+      AT_AGENCY: NOAA
+      AT_COMPROMISED: "true"
+    volumes:
+      - ../configs/noaa-sensor-3/:/app/config/noaa-sensor-3/etc/at/:ro
+    networks:
+      demo-net:
+        ipv4_address: 172.29.0.12
+
+  # --- USGS Seismic Monitors ---
+  usgs-monitor-1:
+    <<: *participant
+    container_name: usgs-monitor-1
+    environment:
+      <<: *common-env
+      AUTONOMOUS_TRUST_EXE: "examples/multi_agency/participant.py"
+      AUTONOMOUS_TRUST_ARGS: "usgs-monitor-1 --log-level debug"
+      AUTONOMOUS_TRUST_ROOT: "/app/config/usgs-monitor-1"
+      AT_AGENCY: USGS
+    volumes:
+      - ../configs/usgs-monitor-1/:/app/config/usgs-monitor-1/etc/at/:ro
+    networks:
+      demo-net:
+        ipv4_address: 172.29.0.13
+
+  usgs-monitor-2:
+    <<: *participant
+    container_name: usgs-monitor-2
+    environment:
+      <<: *common-env
+      AUTONOMOUS_TRUST_EXE: "examples/multi_agency/participant.py"
+      AUTONOMOUS_TRUST_ARGS: "usgs-monitor-2 --log-level debug"
+      AUTONOMOUS_TRUST_ROOT: "/app/config/usgs-monitor-2"
+      AT_AGENCY: USGS
+    volumes:
+      - ../configs/usgs-monitor-2/:/app/config/usgs-monitor-2/etc/at/:ro
+    networks:
+      demo-net:
+        ipv4_address: 172.29.0.14
+
+  # --- FEMA Field Stations + Fusion ---
+  fema-field-1:
+    <<: *participant
+    container_name: fema-field-1
+    environment:
+      <<: *common-env
+      AUTONOMOUS_TRUST_EXE: "examples/multi_agency/participant.py"
+      AUTONOMOUS_TRUST_ARGS: "fema-field-1 --log-level debug"
+      AUTONOMOUS_TRUST_ROOT: "/app/config/fema-field-1"
+      AT_AGENCY: FEMA
+    volumes:
+      - ../configs/fema-field-1/:/app/config/fema-field-1/etc/at/:ro
+    networks:
+      demo-net:
+        ipv4_address: 172.29.0.15
+
+  fema-field-2:
+    <<: *participant
+    container_name: fema-field-2
+    environment:
+      <<: *common-env
+      AUTONOMOUS_TRUST_EXE: "examples/multi_agency/participant.py"
+      AUTONOMOUS_TRUST_ARGS: "fema-field-2 --log-level debug"
+      AUTONOMOUS_TRUST_ROOT: "/app/config/fema-field-2"
+      AT_AGENCY: FEMA
+    volumes:
+      - ../configs/fema-field-2/:/app/config/fema-field-2/etc/at/:ro
+    networks:
+      demo-net:
+        ipv4_address: 172.29.0.16
+
+  fema-fusion:
+    <<: *participant
+    container_name: fema-fusion
+    environment:
+      <<: *common-env
+      AUTONOMOUS_TRUST_EXE: "examples/multi_agency/participant.py"
+      AUTONOMOUS_TRUST_ARGS: "fema-fusion --log-level debug"
+      AUTONOMOUS_TRUST_ROOT: "/app/config/fema-fusion"
+      AT_AGENCY: FEMA
+    volumes:
+      - ../configs/fema-fusion/:/app/config/fema-fusion/etc/at/:ro
+    networks:
+      demo-net:
+        ipv4_address: 172.29.0.17
+
+  # --- EPA Air Quality Monitor (joins late) ---
+  # AT_JOIN_DELAY_SEC causes the participant to sleep before connecting,
+  # simulating DDIL/late-arrival. Docker Compose has no native delayed start.
+  epa-monitor-1:
+    <<: *participant
+    container_name: epa-monitor-1
+    environment:
+      <<: *common-env
+      AUTONOMOUS_TRUST_EXE: "examples/multi_agency/participant.py"
+      AUTONOMOUS_TRUST_ARGS: "epa-monitor-1 --log-level debug"
+      AUTONOMOUS_TRUST_ROOT: "/app/config/epa-monitor-1"
+      AT_AGENCY: EPA
+      AT_JOIN_DELAY_SEC: "360"
+    volumes:
+      - ../configs/epa-monitor-1/:/app/config/epa-monitor-1/etc/at/:ro
+    networks:
+      demo-net:
+        ipv4_address: 172.29.0.18
+
+networks:
+  demo-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24

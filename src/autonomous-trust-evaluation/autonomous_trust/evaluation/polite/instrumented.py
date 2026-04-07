@@ -1,0 +1,34 @@
+# ******************
+#  Copyright 2025 Sean M. Brennan and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+
+"""Instrumented AT node with both MetricsCollector and PoliteObserver."""
+
+from autonomous_trust.evaluation.instrumented import InstrumentedAT
+from autonomous_trust.evaluation.polite.observer import PoliteObserver
+
+
+class PoliteInstrumentedAT(InstrumentedAT):
+    """AT node that tees messages to both MetricsCollector and PoliteObserver."""
+
+    _polite_policy = None
+    _polite_output = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self._polite_policy:
+            self.add_worker(PoliteObserver,
+                            policy=self._polite_policy,
+                            output_path=self._polite_output)
