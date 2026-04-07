@@ -20,7 +20,7 @@ import os
 import pytest
 import yaml
 
-from autonomous_trust.simulator.redteam.caldera_compose import (
+from autonomous_trust.evaluation.redteam.caldera_compose import (
     patch_caldera,
     CALDERA_IP, CALDERA_PORT, CALDERA_IMAGE,
 )

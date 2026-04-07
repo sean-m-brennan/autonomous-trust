@@ -25,7 +25,7 @@ try:
 except ImportError:
     pytest.skip("AT core not installed", allow_module_level=True)
 
-from autonomous_trust.simulator.metrics.collector import MetricsCollector
+from autonomous_trust.evaluation.metrics.collector import MetricsCollector
 
 
 class TestIdentityConvergence:

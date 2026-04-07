@@ -170,7 +170,7 @@ if [[ -n "$SPACE_MODE" ]]; then
     python -c "
 import sys
 sys.path.insert(0, '$SIM_DIR')
-from autonomous_trust.simulator.scenarios.asteroid_belt_compose import generate_asteroid_belt_compose
+from examples.asteroid_belt.compose import generate_asteroid_belt_compose
 content = generate_asteroid_belt_compose(
     backend='$BACKEND',
     metrics_dir='$METRICS_DIR',
@@ -188,7 +188,7 @@ else
     python -c "
 import sys
 sys.path.insert(0, '$SIM_DIR')
-from autonomous_trust.simulator.scenarios.appalachian_compose import generate_appalachian_compose
+from examples.appalachia.compose import generate_appalachian_compose
 content = generate_appalachian_compose(
     hilltop_only=$HILLTOP_ONLY,
     terrain_config=$TERRAIN_ARG,
@@ -207,7 +207,7 @@ if [[ -n "$CALDERA" ]]; then
     python -c "
 import sys, json, os
 sys.path.insert(0, '$SIM_DIR')
-from autonomous_trust.simulator.redteam.caldera_compose import patch_caldera
+from autonomous_trust.evaluation.redteam.caldera_compose import patch_caldera
 with open('$WORK_DIR/docker-compose.yaml') as f:
     base = f.read()
 attacks = '$CALDERA_ATTACKS'.split(',') if '$CALDERA_ATTACKS' else []
@@ -249,7 +249,7 @@ if [[ -n "$SPACE_MODE" ]]; then
 import sys
 from datetime import timedelta
 sys.path.insert(0, '$SIM_DIR')
-from autonomous_trust.simulator.scenarios.asteroid_belt import create_asteroid_belt_config
+from examples.asteroid_belt.scenario import create_asteroid_belt_config
 cfg = create_asteroid_belt_config(
     output_file='$WORK_DIR/asteroid_belt.cfg',
     duration=timedelta(seconds=$DURATION),
@@ -261,7 +261,7 @@ else
 import sys
 from datetime import timedelta
 sys.path.insert(0, '$SIM_DIR')
-from autonomous_trust.simulator.scenarios.appalachian import create_appalachian_config
+from examples.appalachia.scenario import create_appalachian_config
 cfg = create_appalachian_config(
     output_file='$WORK_DIR/appalachian.cfg',
     hilltop_only=$HILLTOP_ONLY,

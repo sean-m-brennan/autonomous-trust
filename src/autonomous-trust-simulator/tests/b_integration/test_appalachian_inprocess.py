@@ -28,8 +28,8 @@ import pytest
 
 try:
     from autonomous_trust.core import Configuration, ProcessTracker, Process
-    from autonomous_trust.simulator.metrics.collector import MetricsCollector
-    from autonomous_trust.simulator.scenarios.appalachian import create_appalachian_config
+    from autonomous_trust.evaluation.metrics.collector import MetricsCollector
+    from examples.appalachia.scenario import create_appalachian_config
 except ImportError:
     pytest.skip("AT packages not installed", allow_module_level=True)
 
