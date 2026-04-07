@@ -18,7 +18,7 @@ import yaml
 import pytest
 
 try:
-    from autonomous_trust.simulator.scenarios.appalachian_compose import (
+    from examples.appalachia.compose import (
         generate_appalachian_compose,
     )
 except ImportError:

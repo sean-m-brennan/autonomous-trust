@@ -24,7 +24,7 @@ try:
 except ImportError:
     pytest.skip("polite package not on PYTHONPATH", allow_module_level=True)
 
-from autonomous_trust.simulator.polite.observer import PoliteObserver
+from autonomous_trust.evaluation.polite.observer import PoliteObserver
 
 
 class TestEventParsing:

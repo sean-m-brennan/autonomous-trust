@@ -19,7 +19,7 @@ import json
 import pytest
 from unittest.mock import patch, MagicMock
 
-from autonomous_trust.simulator.redteam.caldera_bridge import (
+from autonomous_trust.evaluation.redteam.caldera_bridge import (
     ATTACK_MAP, dispatch_collect, main,
 )
 
@@ -28,15 +28,15 @@ class TestAttackMap:
     """ATTACK_MAP maps string names to AttackScenario classes."""
 
     def test_sybil_maps_to_sybil_attack(self):
-        from autonomous_trust.simulator.redteam.sybil_attack import SybilAttack
+        from autonomous_trust.evaluation.redteam.sybil_attack import SybilAttack
         assert ATTACK_MAP['sybil'] is SybilAttack
 
     def test_byzantine_maps_to_byzantine_node_attack(self):
-        from autonomous_trust.simulator.redteam.byzantine_node import ByzantineNodeAttack
+        from autonomous_trust.evaluation.redteam.byzantine_node import ByzantineNodeAttack
         assert ATTACK_MAP['byzantine'] is ByzantineNodeAttack
 
     def test_reputation_gaming_maps_to_gaming_attack(self):
-        from autonomous_trust.simulator.redteam.reputation_gaming import ReputationGamingAttack
+        from autonomous_trust.evaluation.redteam.reputation_gaming import ReputationGamingAttack
         assert ATTACK_MAP['reputation_gaming'] is ReputationGamingAttack
 
 

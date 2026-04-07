@@ -18,7 +18,7 @@
 import multiprocessing
 import pytest
 
-from autonomous_trust.simulator.instrumented import _TeeQueue
+from autonomous_trust.evaluation.instrumented import _TeeQueue
 
 
 def _get(q, timeout=2):

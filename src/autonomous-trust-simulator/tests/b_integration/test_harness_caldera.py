@@ -19,9 +19,9 @@ import json
 import pytest
 from unittest.mock import patch, MagicMock, call
 
-from autonomous_trust.simulator.redteam.harness import RedTeamHarness
-from autonomous_trust.simulator.redteam.sybil_attack import SybilAttack
-from autonomous_trust.simulator.redteam.byzantine_node import ByzantineNodeAttack
+from autonomous_trust.evaluation.redteam.harness import RedTeamHarness
+from autonomous_trust.evaluation.redteam.sybil_attack import SybilAttack
+from autonomous_trust.evaluation.redteam.byzantine_node import ByzantineNodeAttack
 
 
 class TestCalderaFlag:

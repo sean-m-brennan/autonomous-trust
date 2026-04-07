@@ -1,0 +1,15 @@
+- id: at-gaming-collect-001
+  name: AT Reputation Gaming - Collect Metrics
+  description: Collect reputation gaming penalty metrics from AT simulation
+  tactic: collection
+  technique:
+    attack_id: T1005
+    name: Data from Local System
+  executors:
+    - name: sh
+      platform: linux
+      command: >
+        python -m autonomous_trust.evaluation.redteam.caldera_bridge
+        --attack reputation_gaming --action collect
+        --config /tmp/caldera-config/attack-config.json
+      timeout: 120
