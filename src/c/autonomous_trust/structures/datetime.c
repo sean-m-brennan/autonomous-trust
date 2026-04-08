@@ -37,6 +37,14 @@ typedef struct
     const char *time_fmt;
 } time_res_config_t;
 
+/*@
+  requires \valid_read(dt);
+  requires \valid(proto);
+  assigns proto->nanosecond, proto->second, proto->minute, proto->hour,
+          proto->day, proto->month, proto->year, proto->weekday,
+          proto->day_of_year, proto->utc_offset;
+  ensures \result == 0;
+*/
 int datetime_sync_out(datetime_t *dt, AutonomousTrust__Core__Protobuf__Structures__DateTime *proto)
 {
     proto->nanosecond = dt->tm_nsec;
@@ -52,6 +60,14 @@ int datetime_sync_out(datetime_t *dt, AutonomousTrust__Core__Protobuf__Structure
     return 0;
 }
 
+/*@
+  requires \valid_read(proto);
+  requires \valid(dt);
+  assigns dt->tm_nsec, dt->tm_sec, dt->tm_min, dt->tm_hour,
+          dt->tm_mday, dt->tm_mon, dt->tm_year, dt->tm_wday,
+          dt->tm_yday, dt->tm_tz_offset;
+  ensures \result == 0;
+*/
 int datetime_sync_in(AutonomousTrust__Core__Protobuf__Structures__DateTime *proto, datetime_t *dt)
 {
     dt->tm_nsec = proto->nanosecond;
@@ -67,6 +83,12 @@ int datetime_sync_in(AutonomousTrust__Core__Protobuf__Structures__DateTime *prot
     return 0;
 }
 
+/*@
+  requires res == MILLISECONDS || res == MICROSECONDS || res == NANOSECONDS;
+  assigns \nothing;
+  ensures \result.res > 0;
+  ensures \result.time_fmt != \null;
+*/
 time_res_config_t set_time_resolution(time_resolution_t res)
 {
     time_res_config_t config = {0};
@@ -89,6 +111,17 @@ time_res_config_t set_time_resolution(time_resolution_t res)
     return config;
 }
 
+/*@
+  requires str != \null && \valid_read(str);
+  requires \valid(offset);
+  assigns *offset;
+  behavior success:
+    ensures \result == 0;
+    ensures *offset >= -14.0 && *offset <= 14.0;
+  behavior parse_error:
+    ensures \result == EDT_FMT;
+  disjoint behaviors;
+*/
 int str_to_offset(const char *str, float *offset)  // FIXME different sig for errors
 {
     char s[MAX_TZ_OFFSET_STR+1] = {0};
@@ -112,6 +145,11 @@ int str_to_offset(const char *str, float *offset)  // FIXME different sig for er
     return 0;
 }
 
+/*@
+  requires \valid(str + (0 .. MAX_TZ_OFFSET_STR));
+  assigns str[0 .. MAX_TZ_OFFSET_STR];
+  ensures \result >= 0;
+*/
 int offset_to_str(float offset, char *str)
 {
     const char *sign = "";
@@ -130,6 +168,15 @@ int offset_to_str(float offset, char *str)
 const char *conversions[] = {"%f", "%z", "%Z"};
 size_t c_size = sizeof(conversions) / sizeof(conversions[0]);
 
+/*@
+  requires \valid_read(dt);
+  requires \valid_read(format);
+  requires max > 0;
+  requires \valid(s + (0 .. max - 1));
+  requires tr == MILLISECONDS || tr == MICROSECONDS || tr == NANOSECONDS;
+  assigns s[0 .. max - 1];
+  ensures \result == 0 || \result == E2BIG;
+*/
 int datetime_strftime_res(const datetime_t *dt, const char *format, const time_resolution_t tr, char *s, size_t max)
 {
     time_res_config_t res_cfg = set_time_resolution(tr);
@@ -198,16 +245,46 @@ int datetime_strftime_res(const datetime_t *dt, const char *format, const time_r
     return err;
 }
 
+/*@
+  requires \valid_read(dt);
+  requires \valid_read(format);
+  requires max > 0;
+  requires \valid(s + (0 .. max - 1));
+  assigns s[0 .. max - 1];
+  ensures \result == 0 || \result == E2BIG;
+*/
 inline int datetime_strftime(const datetime_t *dt, const char *format, char *s, size_t max)
 {
     return datetime_strftime_res(dt, format, MICROSECONDS, s, max);
 }
 
+/*@
+  requires \valid_read(dt);
+  requires max > 0;
+  requires \valid(s + (0 .. max - 1));
+  assigns s[0 .. max - 1];
+  ensures \result == 0 || \result == E2BIG;
+*/
 inline int datetime_to_isoformat(const datetime_t *dt, char *s, size_t max)
 {
     return datetime_strftime(dt, iso8601_format, s, max);
 }
 
+/*@
+  requires s != \null && \valid_read(s);
+  requires format != \null && \valid_read(format);
+  requires dt != \null && \valid(dt);
+  assigns *dt;
+  behavior success:
+    ensures \result == 0;
+    ensures \initialized(dt);
+  behavior parse_error:
+    ensures \result == EDT_FMT;
+  behavior invalid:
+    assumes s == \null || format == \null || dt == \null;
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int datetime_strptime(const char *s, const char *format, datetime_t *dt)
 {
     if (s == NULL || format == NULL || dt == NULL)
@@ -315,11 +392,28 @@ int datetime_strptime(const char *s, const char *format, datetime_t *dt)
     return 0;
 }
 
+/*@
+  requires s != \null && \valid_read(s);
+  requires dt != \null && \valid(dt);
+  assigns *dt;
+  behavior success:
+    ensures \result == 0;
+    ensures \initialized(dt);
+  behavior parse_error:
+    ensures \result == EDT_FMT;
+  disjoint behaviors;
+*/
 inline int datetime_from_isostring(const char *s, datetime_t *dt)
 {
     return datetime_strptime(s, "%FT%T%f%z", dt);
 }
 
+/*@
+  requires dt != \null && \valid(dt);
+  requires nsec >= 0 && nsec < 1000000000;
+  assigns *dt;
+  ensures \result == 0 || \result != 0;
+*/
 int datetime_from_time(time_t time, long nsec, bool local, datetime_t *dt)
 {
     struct tm *tm;
@@ -343,6 +437,16 @@ int datetime_from_time(time_t time, long nsec, bool local, datetime_t *dt)
     return 0;
 }
 
+/*@
+  requires dt != \null && \valid(dt);
+  assigns *dt;
+  behavior success:
+    ensures \result == 0;
+    ensures \initialized(dt);
+  behavior error:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int datetime_now(bool local, datetime_t *dt)
 {
     struct timespec ts;
@@ -355,6 +459,12 @@ int datetime_now(bool local, datetime_t *dt)
     return datetime_from_time(now, ts.tv_nsec, local, dt);
 }
 
+/*@
+  requires \valid_read(td);
+  requires \valid(proto);
+  assigns proto->days, proto->seconds, proto->nanoseconds;
+  ensures \result == 0;
+*/
 int timedelta_sync_out(timedelta_t *td, AutonomousTrust__Core__Protobuf__Structures__TimeDelta *proto)
 {
     proto->days = td->days;
@@ -363,6 +473,12 @@ int timedelta_sync_out(timedelta_t *td, AutonomousTrust__Core__Protobuf__Structu
     return 0;
 }
 
+/*@
+  requires \valid_read(proto);
+  requires \valid(td);
+  assigns td->days, td->seconds, td->nsecs;
+  ensures \result == 0;
+*/
 int timedelta_sync_in(AutonomousTrust__Core__Protobuf__Structures__TimeDelta *proto, timedelta_t *td)
 {
     td->days = proto->days;
@@ -371,6 +487,18 @@ int timedelta_sync_in(AutonomousTrust__Core__Protobuf__Structures__TimeDelta *pr
     return 0;
 }
 
+/*@
+  requires s != \null && \valid_read(s);
+  requires td != \null && \valid(td);
+  assigns *td;
+  behavior success:
+    ensures \result == 0;
+    ensures \initialized(td);
+  behavior invalid:
+    assumes s == \null || td == \null;
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int timedelta_from_string(const char *s, timedelta_t *td)
 {
     if (s == NULL || td == NULL)
@@ -442,6 +570,21 @@ int timedelta_from_string(const char *s, timedelta_t *td)
     return 0;
 }
 
+/*@
+  requires td != \null && \valid_read(td);
+  requires s != \null && max > 0;
+  requires \valid(s + (0 .. max - 1));
+  assigns s[0 .. max - 1];
+  behavior success:
+    ensures \result == 0;
+    ensures (\exists integer i; 0 <= i < max && s[i] == '\0');
+  behavior too_small:
+    ensures \result == E2BIG;
+  behavior invalid:
+    assumes td == \null || s == \null || max == 0;
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int timedelta_to_string(const timedelta_t *td, char *s, size_t max)
 {
     if (td == NULL || s == NULL || max == 0)

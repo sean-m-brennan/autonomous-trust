@@ -16,33 +16,24 @@
 
 from uuid import UUID
 
+from nacl.exceptions import BadSignatureError
+
 from ...algorithms.agreement import VoterTracker
 from ...structures.merkle import MerkleTree, SimplestBlob
 from ...structures.dag import StepDAG, LinkedStep
-from ...config import Configuration, from_yaml_string
+from ...config import Configuration, from_yaml_string, to_yaml_string
 from ...processes import ProcessLogger
 from ...system import encoding
 from ..identity import Identity
 from autonomous_trust.core.protobuf.identity import identity_pb2, history_pb2
 
 
-# FIXME how does a DAG relate to the merkle tree?
-# git: file diffs are transactions, commit is a block, branches diverge
-# here: blobs are transactions, merkle root is a block, DAG tracks heads and branches
-
-# This should be a StepDAG of MerkleTree root_hash history, the Merkle leaf-blobs are Identities or Groups
-# Essentially an efficient, long-memory identity recognizer
-# With super-tree hierarchy (-ies?), can find anyone given (what? name, uuid?)
-
-# need to be able to exchange Identities plus position in memory (DAG placement [index?]), all else rebuilt
-# perhaps DAG branches are incomplete memories from others, mergeable once there is a lowest common ancestor
-# that implies undirected acyclic graph to stitch together histories
-# also answering queries: how to search among multiple branches
-# do non-main branches have no data backing?
-
-# At two or more peers, form Group with shared keys
-
-# attribution
+# Design note: the DAG tracks the *history* of Merkle-root changes over time.
+# Each DAG step payload is a Merkle root hash. The Merkle tree itself stores
+# IdentityObj blobs (peer identities). Branches in the DAG represent divergent
+# history views from different peers, which are merged once a lowest common
+# ancestor is established. This mirrors how git tracks file-diff transactions
+# (blobs) in commits (merkle roots) across branches (DAG heads).
 
 
 class IdentityObj(SimplestBlob, Configuration):
@@ -62,7 +53,20 @@ class IdentityObj(SimplestBlob, Configuration):
             self.identity.signature.publish()
 
     def validate(self):
-        pass  # FIXME
+        """Validate that the wrapped identity has the required fields."""
+        if self.identity is None:
+            return False
+        if not isinstance(self.identity, Identity):
+            return False
+        if self.identity.uuid is None:
+            return False
+        if not self.identity.fullname:
+            return False
+        if self.identity.signature is None:
+            return False
+        if self.identity.encryptor is None:
+            return False
+        return True
 
     def to_dict(self):
         return dict(identity=self.identity, originator=self.originator)
@@ -81,16 +85,17 @@ class IdentityObj(SimplestBlob, Configuration):
         self.uuid = self.identity.uuid
 
 
-class IdentityHistory(StepDAG, VoterTracker):  # FIXME config repr
+class IdentityHistory(StepDAG, VoterTracker):
     """
-    Tracks community identity history with provable membership
-    A StepDAG of MerkleTree root_hash history, the Merkle leaf-blobs are Identities or Groups
-    Essentially an efficient, long-memory identity recognizer
+    Tracks community identity history with provable membership.
+
+    A StepDAG of MerkleTree root_hash history where Merkle leaf-blobs
+    are Identities or Groups. Functions as an efficient, long-memory
+    identity recognizer.
     """
     def __init__(self, myself, peers, log_queue, timeout=0, blacklist=None):
         StepDAG.__init__(self)
         VoterTracker.__init__(self, myself)
-        #Configuration.__init__(self)
         self._peers = peers
         self.logger = ProcessLogger(self.__class__.__name__, log_queue)
         self._timeout = timeout
@@ -102,11 +107,10 @@ class IdentityHistory(StepDAG, VoterTracker):  # FIXME config repr
         self.add_step(LinkedStep(self._merkle.root_digest))  # history tracking
 
     def to_dict(self):
-        return {'step_dag': self.recite(), 'blacklist': self.blacklist} #, 'merkletree': self._merkle}
+        return {'step_dag': self.recite(), 'blacklist': self.blacklist}
 
     def populate(self, dictionary):
         self.blacklist = dictionary['blacklist']
-        #self._merkle = dictionary['merkle_tree']
         self.merge(self.ingest_branch(dictionary['step_dag']))
 
     @property
@@ -114,14 +118,23 @@ class IdentityHistory(StepDAG, VoterTracker):  # FIXME config repr
         return self._timeout
 
     def insert_peer(self, who, level=None):
-        # FIXME confirm eligibility i.e. uuid, fullname, signature all unique
+        if who.uuid is None or not who.fullname or who.signature is None:
+            self.logger.warning(f'Rejecting peer with incomplete identity')
+            return
+        existing = self._find_identity(who)
+        if existing is not None:
+            self.logger.warning(f'Peer {who.nickname} already in history')
+            return
         if who not in self._peers.all:
             self._merkle.insert(IdentityObj(who, self._merkle.root_digest))
             self.add_step(LinkedStep(self._merkle.root_digest))
         self._peers.add(who, level)
 
     def _find_identity(self, identity):
-        # FIXME minimum info
+        """Search the Merkle tree for a blob matching the given identity by UUID."""
+        for blob in self._merkle.blobs:
+            if isinstance(blob, IdentityObj) and blob.identity.uuid == identity.uuid:
+                return blob
         return None
 
     def __contains__(self, item):
@@ -132,67 +145,83 @@ class IdentityHistory(StepDAG, VoterTracker):  # FIXME config repr
     def prove_existence(self, item):
         identity_blob = self._find_identity(item)
         if identity_blob is not None:
-            return self._merkle.inclusion_proof(item)  # serialize?
+            return self._merkle.inclusion_proof(identity_blob)
 
     def verify_existence(self, item, proof):
         identity_blob = self._find_identity(item)
         if identity_blob is not None:
-            return self._merkle.audit(item, proof)
+            return self._merkle.audit(identity_blob, proof)
 
     def _validate(self, branch):
+        """Validate a branch of the DAG for structural integrity."""
+        if branch not in self._StepDAG__branch_lists:
+            self.logger.error(f'Branch {branch} not found')
+            return False
+        steps = self._StepDAG__branch_lists[branch]
+        if not steps:
+            return True
+        for i in range(1, len(steps)):
+            if steps[i].timestamp is not None and steps[i - 1].timestamp is not None:
+                if steps[i - 1].timestamp >= steps[i].timestamp:
+                    self.logger.error(f'Backdating at step {i}.')
+                    return False
         return True
-        # FIXME better validation
-        flag = True
-        blobs = self.__branch_lists[branch]  # root to head
-        for i in range(1, len(blobs)):
-            if not blobs[i].validate():
-                flag = False
-                self.logger.error(f'Wrong data type(s) at block {i}.')
-            if blobs[i-1].get_hash() != blobs[i].previous:
-                flag = False
-                self.logger.error(f'Wrong previous hash at block {i}.')
-            if blobs[i].hash != blobs[i].compute_hash():
-                flag = False
-                self.logger.error(f'Wrong hash at block {i}.')
-            if blobs[i-1].timestamp >= blobs[i].timestamp:
-                flag = False
-                self.logger.error(f'Backdating at block {i}.')
-        return flag
 
     def verify_object(self, blob, proof, sig):
+        """Verify that a blob is a valid IdentityObj with a correct signature."""
         if not isinstance(blob, IdentityObj) or not isinstance(blob.identity, Identity):
             self.logger.debug('Not Identity')
             return False
-        # FIXME verify sig
-        ident = blob
-        if isinstance(blob, IdentityObj):
-            ident = blob.identity
-        self.logger.debug("Verify existence")  # FIXME!! dump altogether
-        return True  # self.verify_existence(ident, proof)
+        if not blob.validate():
+            self.logger.debug('Identity validation failed')
+            return False
+        if sig is not None and proof is not None:
+            try:
+                blob.identity.verify(bytes(proof), sig)
+            except (BadSignatureError, Exception) as e:
+                self.logger.warning(f'Signature verification failed: {e}')
+                return False
+        return True
 
     def share(self):
         """
-        Transmit main branch to another
-        :return: tuple of steps list, signature
+        Serialize and sign the main branch for transmission.
+        :return: tuple of (serialized_bytes, signature)
         """
         steps = self.recite()
-        # FIXME to serialization
-        steps_msg = b''
-        sig = self.myself.sign(steps_msg)  # noqa
+        steps_msg = to_yaml_string(steps)
+        if isinstance(steps_msg, str):
+            steps_msg = steps_msg.encode(encoding)
+        sig = self.myself.sign(steps_msg)
         return steps_msg, sig
 
     def hear(self, steps_msg, sig=None):
         """
-        Receive main branch from another
-        :return: list of steps
+        Receive and verify a main branch from another peer.
+        :return: list of steps, or None if verification fails
         """
-        if sig is None:  # FIXME remove this, need sig
-            steps = from_yaml_string(steps_msg)
-            return steps
-        if self.myself.verify(steps_msg, sig):
-            steps = from_yaml_string(steps_msg)
-            return steps
-        return None
+        if isinstance(steps_msg, str):
+            steps_msg_bytes = steps_msg.encode(encoding)
+        else:
+            steps_msg_bytes = steps_msg
+        if sig is not None:
+            try:
+                result = self.myself.verify(steps_msg_bytes, sig)
+                if result is False:
+                    self.logger.warning('History signature verification failed')
+                    return None
+            except (BadSignatureError, Exception):
+                self.logger.warning('History signature verification failed')
+                return None
+        else:
+            if len(self._peers.all) > 0:
+                self.logger.warning('Rejecting unsigned history — not in bootstrap')
+                return None
+            self.logger.warning('Accepting unsigned history during bootstrap')
+        if isinstance(steps_msg, bytes):
+            steps_msg = steps_msg.decode(encoding)
+        steps = from_yaml_string(steps_msg)
+        return steps
 
     ####################
     # Agreement protocol
@@ -206,11 +235,8 @@ class IdentityHistory(StepDAG, VoterTracker):  # FIXME config repr
         if peer is not None and proof != peer.verify(sig):
             self.logger.error(f'Invalid proof signature.')
             return False
-        # previous_hash = self.main.root.digest
-        # FIXME handle divergence in branches (i.e. check other branch heads)
-        # steps have previous
-        # if previous_hash != blob.previous:
-        #    self.logger.error('Invalid previous hash')
-        #    self.logger.debug('%s vs %s' % (previous_hash, blob.previous))
-        #    return False
+        # TODO: Handle divergence in branches — check other branch heads
+        # to detect conflicting history views from different peers. This
+        # requires comparing the blob's previous hash against all known
+        # branch heads, not just the main branch.
         return True

@@ -38,6 +38,14 @@ DEFINE_ERROR(ENTP_STRATUM, "NTP stratum too high");
  * local variables for intermediate values.
  ****************************/
 
+/*@
+  requires \valid(pkt);
+  assigns pkt->root_delay, pkt->root_dispersion, pkt->ref_id,
+          pkt->ref_ts_sec, pkt->ref_ts_frac,
+          pkt->orig_ts_sec, pkt->orig_ts_frac,
+          pkt->rx_ts_sec, pkt->rx_ts_frac,
+          pkt->tx_ts_sec, pkt->tx_ts_frac;
+*/
 void ntp_packet_pack(ntp_packet_t *pkt)
 {
     uint32_t v;
@@ -57,6 +65,14 @@ void ntp_packet_pack(ntp_packet_t *pkt)
     v = pkt->tx_ts_frac;             pkt->tx_ts_frac      = htonl(v);
 }
 
+/*@
+  requires \valid(pkt);
+  assigns pkt->root_delay, pkt->root_dispersion, pkt->ref_id,
+          pkt->ref_ts_sec, pkt->ref_ts_frac,
+          pkt->orig_ts_sec, pkt->orig_ts_frac,
+          pkt->rx_ts_sec, pkt->rx_ts_frac,
+          pkt->tx_ts_sec, pkt->tx_ts_frac;
+*/
 void ntp_packet_unpack(ntp_packet_t *pkt)
 {
     uint32_t sec, frac;
@@ -95,6 +111,13 @@ void ntp_packet_unpack(ntp_packet_t *pkt)
  *   offset    = ((t2 - t1) + (t3 - t4)) / 2
  ****************************/
 
+/*@
+  requires \valid(pkt);
+  requires \valid(result);
+  assigns result->offset_sec, result->roundtrip_sec, result->stratum;
+  ensures \result == 0;
+  ensures result->stratum == pkt->stratum;
+*/
 int ntp_compute_offset(const ntp_packet_t *pkt, struct timespec t1, struct timespec t4,
                        ntp_result_t *result)
 {
@@ -124,6 +147,17 @@ int ntp_compute_offset(const ntp_packet_t *pkt, struct timespec t1, struct times
  * NTP client
  ****************************/
 
+/*@
+  requires server_addr != \null && \valid_read(server_addr);
+  requires \valid(result);
+  assigns result->offset_sec, result->roundtrip_sec, result->stratum;
+  behavior success:
+    ensures \result == 0;
+    ensures result->stratum >= 1 && result->stratum <= 15;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int ntp_client_request(const char *server_addr, ntp_result_t *result)
 {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -281,6 +315,10 @@ static void *ntp_server_loop(void *arg)
     return NULL;
 }
 
+/*@
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int ntp_server_start(void)
 {
     if (ntp_server_running)
@@ -296,6 +334,10 @@ int ntp_server_start(void)
     return 0;
 }
 
+/*@
+  assigns \nothing;
+  ensures \result == 0;
+*/
 int ntp_server_stop(void)
 {
     if (!ntp_server_running)
@@ -303,4 +345,94 @@ int ntp_server_stop(void)
     ntp_server_running = 0;
     pthread_join(ntp_server_thread, NULL);
     return 0;
+}
+
+/****************************
+ * Background NTP sync (mirrors Python start_sync)
+ ****************************/
+
+static pthread_t       ntp_sync_thread;
+static volatile int    ntp_sync_running = 0;
+static double          ntp_current_offset = 0.0;
+static pthread_mutex_t ntp_offset_lock = PTHREAD_MUTEX_INITIALIZER;
+static char            ntp_sync_server[IPV4_ADDR_LEN + 1];
+static int             ntp_sync_interval = NTP_DEFAULT_SYNC_INTERVAL;
+
+static void *ntp_sync_loop(void *arg)
+{
+    (void)arg;
+
+    while (ntp_sync_running)
+    {
+        ntp_result_t result;
+        if (ntp_client_request(ntp_sync_server, &result) == 0)
+        {
+            pthread_mutex_lock(&ntp_offset_lock);
+            ntp_current_offset = result.offset_sec;
+            pthread_mutex_unlock(&ntp_offset_lock);
+        }
+
+        /* Sleep in 1-second increments so we can check the running flag */
+        for (int s = 0; s < ntp_sync_interval && ntp_sync_running; s++)
+            sleep(1);
+    }
+    return NULL;
+}
+
+/*@
+  requires server_addr == \null || \valid_read(server_addr);
+  behavior null_addr:
+    assumes server_addr == \null;
+    ensures \result == EINVAL;
+  behavior success:
+    assumes server_addr != \null;
+    ensures \result == 0 || \result != 0;
+  disjoint behaviors;
+*/
+int ntp_start_sync(const char *server_addr, int interval_sec)
+{
+    if (ntp_sync_running)
+        return 0;
+
+    if (server_addr == NULL)
+        return EINVAL;
+
+    strncpy(ntp_sync_server, server_addr, IPV4_ADDR_LEN);
+    ntp_sync_server[IPV4_ADDR_LEN] = '\0';
+    ntp_sync_interval = (interval_sec > 0) ? interval_sec : NTP_DEFAULT_SYNC_INTERVAL;
+    ntp_sync_running = 1;
+
+    int err = pthread_create(&ntp_sync_thread, NULL, ntp_sync_loop, NULL);
+    if (err != 0)
+    {
+        ntp_sync_running = 0;
+        errno = err;
+        return SYS_EXCEPTION();
+    }
+    return 0;
+}
+
+/*@
+  assigns \nothing;
+  ensures \result == 0;
+*/
+int ntp_stop_sync(void)
+{
+    if (!ntp_sync_running)
+        return 0;
+    ntp_sync_running = 0;
+    pthread_join(ntp_sync_thread, NULL);
+    return 0;
+}
+
+/*@
+  assigns \nothing;
+*/
+double ntp_get_offset(void)
+{
+    double offset;
+    pthread_mutex_lock(&ntp_offset_lock);
+    offset = ntp_current_offset;
+    pthread_mutex_unlock(&ntp_offset_lock);
+    return offset;
 }

@@ -23,12 +23,23 @@ class AgreementByAuthority(AgreementProtocol, ABC):
     Agreement reached by vote, but only those above a certain rank count
     Still abstract
     """
-    def __init__(self, myself: AgreementVoter, peers: list[AgreementVoter], threshold_rank):
+    def __init__(self, myself: AgreementVoter, peers: list[AgreementVoter], threshold_rank=None):
         AgreementProtocol.__init__(self, myself, peers)
-        self.threshold_rank = threshold_rank
+        self._explicit_threshold = threshold_rank
+
+    @property
+    def threshold_rank(self):
+        """Derive threshold from voter ranks: top 1/3 of peers by rank qualify."""
+        if self._explicit_threshold is not None:
+            return self._explicit_threshold
+        if not self.voters:
+            return 0
+        ranks = sorted([v.rank for v in self.voters], reverse=True)
+        cutoff_idx = max(1, len(ranks) // 3) - 1
+        return ranks[cutoff_idx]
 
     def _count_vote(self, blob, proof, voter):
-        if voter.rank < self.threshold_rank:  # FIXME derive threshold
+        if voter.rank >= self.threshold_rank:
             return voter.rank, proof.approval
         return voter.rank, False
 

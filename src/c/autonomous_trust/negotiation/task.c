@@ -21,6 +21,7 @@
 #include <errno.h>
 
 #include "task_priv.h"
+#include "negotiation/negotiation.h"
 #include "negotiation/task.pb-c.h"
 
 typedef void * (*pthread_function_t)(void *);
@@ -29,7 +30,7 @@ int task_run(task_t *task)
 {
     capability_t *capability = find_capability(task->capability.name);
     if (capability == NULL)
-        return -1; // FIXME specific error
+        return EXCEPTION(ENEG_NOCAP);
 
     thread_args_t *args = smrt_create(sizeof(thread_args_t));
     if (args == NULL)
