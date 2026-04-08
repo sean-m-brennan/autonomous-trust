@@ -23,7 +23,7 @@ try:
 except ImportError:
     pytest.skip("polite package not on PYTHONPATH", allow_module_level=True)
 
-from autonomous_trust.simulator.polite.evaluator import compute_fitness
+from autonomous_trust.evaluation.polite.evaluator import compute_fitness
 
 
 class TestFitnessFunction:

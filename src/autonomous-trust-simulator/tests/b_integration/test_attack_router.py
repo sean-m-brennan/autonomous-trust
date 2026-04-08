@@ -19,8 +19,8 @@ import pytest
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timedelta
 
-from autonomous_trust.simulator.redteam import PartitionEvent
-from autonomous_trust.simulator.redteam.attack_router import AttackRouter, NetworkPartitionAttack
+from autonomous_trust.evaluation.redteam import PartitionEvent
+from autonomous_trust.evaluation.redteam.attack_router import AttackRouter, NetworkPartitionAttack
 
 
 class TestPartitionSchedule:

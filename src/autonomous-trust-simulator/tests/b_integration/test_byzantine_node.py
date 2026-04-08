@@ -19,10 +19,10 @@ import pytest
 from unittest.mock import MagicMock
 from uuid import uuid4
 
-from autonomous_trust.simulator.redteam.byzantine_node import (
+from autonomous_trust.evaluation.redteam.byzantine_node import (
     ByzantineNodeAttack,
 )
-from autonomous_trust.simulator.redteam import AttackScenario
+from autonomous_trust.evaluation.redteam import AttackScenario
 
 
 class TestByzantineNodeAttack:
@@ -49,7 +49,7 @@ class TestByzantineNodeAttack:
         assert 'consensus_integrity' in result['attack_specific']
 
 
-from autonomous_trust.simulator.redteam.reputation_gaming import ReputationGamingAttack
+from autonomous_trust.evaluation.redteam.reputation_gaming import ReputationGamingAttack
 
 
 class TestReputationGamingAttack:

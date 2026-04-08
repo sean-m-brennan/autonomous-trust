@@ -200,7 +200,7 @@ class TestSimulatorGatewayResolution:
         pos = GeoPosition(38.66, -80.71, 670).convert(UTMPosition)
         shape = PointData(pos)
         path = PathData(start, end, shape, Variability.UNIFORM, 0, Variability.UNIFORM)
-        from autonomous_trust.simulator.scenarios.appalachian import _generate_uuid
+        from examples.appalachia.scenario import _generate_uuid
         return PeerInfo(
             uuid=_generate_uuid(name), kind='valley_relay', nickname=name,
             ip4_addr='10.0.0.1', initial_position=pos, signal=20.0,
@@ -257,7 +257,7 @@ import tempfile
 
 class TestAppalachianGateways:
     def test_full_scenario_has_four_gateways(self):
-        from autonomous_trust.simulator.scenarios.appalachian import create_appalachian_config
+        from examples.appalachia.scenario import create_appalachian_config
         with tempfile.NamedTemporaryFile(suffix='.cfg', delete=False) as f:
             cfg_path = f.name
         try:
@@ -271,7 +271,7 @@ class TestAppalachianGateways:
                 os.remove(cfg_path)
 
     def test_gateway_technologies(self):
-        from autonomous_trust.simulator.scenarios.appalachian import create_appalachian_config
+        from examples.appalachia.scenario import create_appalachian_config
         with tempfile.NamedTemporaryFile(suffix='.cfg', delete=False) as f:
             cfg_path = f.name
         try:
@@ -288,7 +288,7 @@ class TestAppalachianGateways:
                 os.remove(cfg_path)
 
     def test_fiber_gateways_symmetric_bandwidth(self):
-        from autonomous_trust.simulator.scenarios.appalachian import create_appalachian_config
+        from examples.appalachia.scenario import create_appalachian_config
         with tempfile.NamedTemporaryFile(suffix='.cfg', delete=False) as f:
             cfg_path = f.name
         try:
@@ -303,7 +303,7 @@ class TestAppalachianGateways:
                 os.remove(cfg_path)
 
     def test_cable_gateway_asymmetric_bandwidth(self):
-        from autonomous_trust.simulator.scenarios.appalachian import create_appalachian_config
+        from examples.appalachia.scenario import create_appalachian_config
         with tempfile.NamedTemporaryFile(suffix='.cfg', delete=False) as f:
             cfg_path = f.name
         try:
@@ -318,7 +318,7 @@ class TestAppalachianGateways:
                 os.remove(cfg_path)
 
     def test_hilltop_only_no_gateways(self):
-        from autonomous_trust.simulator.scenarios.appalachian import create_appalachian_config
+        from examples.appalachia.scenario import create_appalachian_config
         with tempfile.NamedTemporaryFile(suffix='.cfg', delete=False) as f:
             cfg_path = f.name
         try:
