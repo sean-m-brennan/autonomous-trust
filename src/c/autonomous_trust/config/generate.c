@@ -248,7 +248,7 @@ int generate_identity(const char *fullname, const char *cfg_dir)
         strncpy(address, "127.0.0.1", ADDR_LEN);
 
     identity_t *ident = NULL;
-    int err = identity_create(&uuid, address, (char *)fullname, &ident);
+    int err = identity_create(&uuid, address, (char *)fullname, NULL, NULL, &ident);
     if (err != 0)
         return err;
 

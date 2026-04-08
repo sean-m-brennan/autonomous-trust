@@ -16,6 +16,7 @@
 
 #include "algorithms/paxos.h"
 #include "structures/data.h"
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,7 +27,7 @@ int paxos_init(paxos_instance_t *inst, int num_peers, logger_t *logger)
     memset(inst, 0, sizeof(*inst));
     inst->num_peers = num_peers;
     inst->logger = logger;
-    inst->last_id = 0.0;
+    inst->last_id = 0;
     inst->chain_len = 0;
     map_init(&inst->proposals);
     map_init(&inst->acceptances);
@@ -49,33 +50,19 @@ void paxos_destroy(paxos_instance_t *inst)
     inst->initialized = false;
 }
 
-double paxos_id_index(double id1, double id2)
+void paxos_id_index(char *buf, size_t len, int64_t id1, int64_t id2)
 {
-    if (fabs(id2) < 1e-15)
-        return id1;
-    int digits = 0;
-    double tmp = fabs(id2);
-    if (tmp < 1.0)
-        digits = 1;
-    else
-    {
-        while (tmp >= 1.0)
-        {
-            tmp /= 10.0;
-            digits++;
-        }
-    }
-    return id1 + id2 / pow(10.0, (double)digits);
+    snprintf(buf, len, "%" PRId64 ":%" PRId64, id1, id2);
 }
 
-static void make_key(char *buf, size_t buflen, double id1, double id2)
+static void make_key(char *buf, size_t buflen, int64_t id1, int64_t id2)
 {
-    snprintf(buf, buflen, "%.0f:%.0f", id1, id2);
+    paxos_id_index(buf, buflen, id1, id2);
 }
 
 paxos_response_t paxos_handle_request(paxos_instance_t *inst,
-                                      double id1, double id2,
-                                      double *out_last_id, int *out_chain_len)
+                                      int64_t id1, int64_t id2,
+                                      int64_t *out_last_id, int *out_chain_len)
 {
     pthread_mutex_lock(&inst->lock);
 
@@ -84,7 +71,7 @@ paxos_response_t paxos_handle_request(paxos_instance_t *inst,
 
     if (id1 > inst->last_id)
     {
-        if ((int)id2 == inst->chain_len + 1)
+        if (id2 == (int64_t)(inst->chain_len + 1))
         {
             data_t *id2_dat = integer_data((int)id2);
             array_append(&inst->granted_ids, id2_dat);
@@ -106,7 +93,7 @@ paxos_response_t paxos_handle_request(paxos_instance_t *inst,
 }
 
 int paxos_record_grant(paxos_instance_t *inst,
-                       double id1, double id2, double score)
+                       int64_t id1, int64_t id2, double score)
 {
     char key[PAXOS_KEY_LEN];
     make_key(key, sizeof(key), id1, id2);
@@ -139,7 +126,7 @@ int paxos_record_grant(paxos_instance_t *inst,
 }
 
 int paxos_record_acceptance(paxos_instance_t *inst,
-                            double id1, double id2)
+                            int64_t id1, int64_t id2)
 {
     char key[PAXOS_KEY_LEN];
     make_key(key, sizeof(key), id1, id2);
@@ -194,16 +181,19 @@ void paxos_advance_chain(paxos_instance_t *inst)
     pthread_mutex_unlock(&inst->lock);
 }
 
-void paxos_next_ids(paxos_instance_t *inst, double *out_id1, double *out_id2)
+void paxos_next_ids(paxos_instance_t *inst, int64_t *out_id1, int64_t *out_id2)
 {
     pthread_mutex_lock(&inst->lock);
-    inst->last_id += 1.0;
-    *out_id1 = paxos_id_index(inst->last_id, (double)inst->num_peers);
-    *out_id2 = (double)(inst->chain_len + 1);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t ms = (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+    inst->last_id = ms;
+    *out_id1 = ms;
+    *out_id2 = (int64_t)(inst->chain_len + 1);
     pthread_mutex_unlock(&inst->lock);
 }
 
-int paxos_record_nack(paxos_instance_t *inst, double id1, double id2)
+int paxos_record_nack(paxos_instance_t *inst, int64_t id1, int64_t id2)
 {
     char key[PAXOS_KEY_LEN];
     make_key(key, sizeof(key), id1, id2);

@@ -26,9 +26,20 @@
 #include "config/configuration.h"
 #include "utilities/util.h"
 
-// FIXME protobuf between hosts
+// TODO: Add protobuf serialization for inter-host network messages
 
 
+/*@
+  requires cidr != \null && \valid_read(cidr);
+  requires addr != \null && \valid(addr + (0 .. IPV4_ADDR_LEN - 1));
+  requires mask == \null || \valid(mask + (0 .. 2));
+  assigns addr[0 .. IPV4_ADDR_LEN - 1];
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int cidr_split(char * cidr, char *addr, char *mask)
 {
     if (addr == NULL)
@@ -51,6 +62,18 @@ int cidr_split(char * cidr, char *addr, char *mask)
     return 0;
 }
 
+/*@
+  requires cidr != \null && \valid_read(cidr);
+  requires \valid(ip);
+  requires \valid(mask);
+  assigns *ip, *mask;
+  behavior success:
+    ensures \result == 0;
+    ensures *mask <= 32;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int cidr4_to_ip4_binary(char *cidr, uint32_t *ip, uint8_t *mask)
 {
     char addr[IPV4_ADDR_LEN] = {0};
@@ -63,10 +86,19 @@ int cidr4_to_ip4_binary(char *cidr, uint32_t *ip, uint8_t *mask)
     *ip = addr_struct.s_addr;
     *mask = atoi(mask_str);
     if (*mask > 32)
-        return EXCEPTION(EINVAL);  // FIXME custom?
+        return EXCEPTION(ENET_INVALID_MASK);
     return 0;
 }
 
+/*@
+  requires \valid(addr + (0 .. IPV4_ADDR_LEN - 1));
+  assigns addr[0 .. IPV4_ADDR_LEN - 1];
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int ip4_binary_to_addr(uint32_t ip, char *addr)
 {
     struct in_addr addr_struct = {0};
@@ -76,6 +108,16 @@ int ip4_binary_to_addr(uint32_t ip, char *addr)
     return 0;
 }
 
+/*@
+  requires cidr != \null && \valid_read(cidr);
+  requires \valid(bcast_addr + (0 .. IPV4_ADDR_LEN - 1));
+  assigns bcast_addr[0 .. IPV4_ADDR_LEN - 1];
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int cidr4_to_broadcast(char *cidr, char *bcast_addr)
 {
     uint32_t ip = 0;
@@ -89,6 +131,18 @@ int cidr4_to_broadcast(char *cidr, char *bcast_addr)
     return ip4_binary_to_addr(bcast, bcast_addr);
 }
 
+/*@
+  requires cidr != \null && \valid_read(cidr);
+  requires \valid(ip);
+  requires \valid(mask);
+  assigns *ip, *mask;
+  behavior success:
+    ensures \result == 0;
+    ensures *mask <= 128;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int cidr6_to_ip6_binary(char *cidr, uint128_t *ip, uint8_t *mask)
 {
     char addr[IPV6_ADDR_LEN] = {0};
@@ -101,10 +155,19 @@ int cidr6_to_ip6_binary(char *cidr, uint128_t *ip, uint8_t *mask)
     memcpy(ip, &addr_struct.s6_addr, sizeof(uint128_t));  // keep in host order (internal only)
     *mask = atoi(mask_str);
     if (*mask > 128)
-        return EXCEPTION(EINVAL);  // FIXME custom?
+        return EXCEPTION(ENET_INVALID_MASK);
     return 0;
 }
 
+/*@
+  requires \valid(addr + (0 .. IPV6_ADDR_LEN - 1));
+  assigns addr[0 .. IPV6_ADDR_LEN - 1];
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int ip6_binary_to_addr(uint128_t ip, char *addr)
 {
     struct in6_addr addr_struct;

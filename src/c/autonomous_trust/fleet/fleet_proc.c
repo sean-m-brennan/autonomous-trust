@@ -122,12 +122,12 @@ static bool handle_update_proposal(const process_t *proc, directory_t *queues, g
     json_decref(payload);
 
     /* Initiate Paxos vote: broadcast vote request to all peers */
-    double id1, id2;
+    int64_t id1, id2;
     paxos_next_ids(&fleet_state.vote_paxos, &id1, &id2);
 
     json_t *req_json = json_object();
-    json_object_set_new(req_json, "id1", json_real(id1));
-    json_object_set_new(req_json, "id2", json_real(id2));
+    json_object_set_new(req_json, "id1", json_integer(id1));
+    json_object_set_new(req_json, "id2", json_integer(id2));
     json_object_set_new(req_json, "proposal_uuid", json_string(prop_uuid_str));
 
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
@@ -176,15 +176,15 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
         return false;
     }
 
-    double id1 = json_real_value(j_id1);
-    double id2 = json_real_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
     const char *prop_uuid_raw = json_string_value(j_prop_uuid);
     char prop_uuid_str[UUID_STRING_LEN + 1];
     strncpy(prop_uuid_str, prop_uuid_raw ? prop_uuid_raw : "", UUID_STRING_LEN);
     prop_uuid_str[UUID_STRING_LEN] = '\0';
     json_decref(payload);
 
-    double out_last_id = 0.0;
+    int64_t out_last_id = 0;
     int out_chain_len = 0;
     paxos_response_t result = paxos_handle_request(&fleet_state.vote_paxos, id1, id2,
                                                    &out_last_id, &out_chain_len);
@@ -193,10 +193,10 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
     {
         /* Build grant payload */
         json_t *grant_json = json_object();
-        json_object_set_new(grant_json, "id1", json_real(id1));
-        json_object_set_new(grant_json, "id2", json_real(id2));
+        json_object_set_new(grant_json, "id1", json_integer(id1));
+        json_object_set_new(grant_json, "id2", json_integer(id2));
         json_object_set_new(grant_json, "proposal_uuid", json_string(prop_uuid_str));
-        json_object_set_new(grant_json, "last_id", json_real(out_last_id));
+        json_object_set_new(grant_json, "last_id", json_integer(out_last_id));
         json_object_set_new(grant_json, "chain_len", json_integer(out_chain_len));
 
         generic_msg_t grant = {0};
@@ -216,8 +216,8 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
     {
         /* NACK */
         json_t *nack_json = json_object();
-        json_object_set_new(nack_json, "id1", json_real(id1));
-        json_object_set_new(nack_json, "id2", json_real(id2));
+        json_object_set_new(nack_json, "id1", json_integer(id1));
+        json_object_set_new(nack_json, "id2", json_integer(id2));
         json_object_set_new(nack_json, "proposal_uuid", json_string(prop_uuid_str));
 
         generic_msg_t nack = {0};
@@ -265,8 +265,8 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
         return false;
     }
 
-    double id1 = json_real_value(j_id1);
-    double id2 = json_real_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
     const char *prop_uuid_raw = json_string_value(j_prop_uuid);
     char prop_uuid_str[UUID_STRING_LEN + 1];
     strncpy(prop_uuid_str, prop_uuid_raw ? prop_uuid_raw : "", UUID_STRING_LEN);
@@ -295,8 +295,8 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
 
         /* Broadcast FLEET_PROTO_ACCEPTED to all peers (include artifact hash) */
         json_t *acc_json = json_object();
-        json_object_set_new(acc_json, "id1", json_real(id1));
-        json_object_set_new(acc_json, "id2", json_real(id2));
+        json_object_set_new(acc_json, "id1", json_integer(id1));
+        json_object_set_new(acc_json, "id2", json_integer(id2));
         json_object_set_new(acc_json, "proposal_uuid", json_string(prop_uuid_str));
         json_object_set_new(acc_json, "artifact_hash", json_string(artifact_hash_hex));
 
@@ -350,13 +350,13 @@ static bool handle_vote_nack(const process_t *proc, directory_t *queues, generic
     log_debug(proc->logger, "Fleet: vote nack from %s\n", nmsg->from_whom.fullname);
 
     json_t *payload = NULL;
-    double id1 = 0.0, id2 = 0.0;
+    int64_t id1 = 0, id2 = 0;
     if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL)
     {
         json_t *j_id1 = json_object_get(payload, "id1");
         json_t *j_id2 = json_object_get(payload, "id2");
-        if (j_id1) id1 = json_real_value(j_id1);
-        if (j_id2) id2 = json_real_value(j_id2);
+        if (j_id1) id1 = json_integer_value(j_id1);
+        if (j_id2) id2 = json_integer_value(j_id2);
         json_decref(payload);
     }
 

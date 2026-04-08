@@ -52,26 +52,74 @@ typedef struct {
 
 /* --- State file helpers (pure, no process deps) --- */
 
+/*@
+  requires data_dir != \null && \valid_read(data_dir);
+  requires \valid(state);
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int update_state_write(const char *data_dir, const update_state_t *state);
+
+/*@
+  requires data_dir != \null && \valid_read(data_dir);
+  requires \valid(state);
+  assigns *state;
+  ensures \result == 0 || \result == -1;
+*/
 int update_state_read(const char *data_dir, update_state_t *state);
+
+/*@
+  requires data_dir != \null && \valid_read(data_dir);
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int update_state_delete(const char *data_dir);
+
+/*@
+  requires data_dir != \null && \valid_read(data_dir);
+  assigns \nothing;
+  ensures \result == \true || \result == \false;
+*/
 bool update_state_exists(const char *data_dir);
 
-/* Returns true if attempt > 1 (previous rollback already ran) */
+/*@
+  requires \valid(state);
+  assigns \nothing;
+  ensures \result == (state->attempt > 1);
+*/
 bool update_should_abort(const update_state_t *state);
 
 /* --- Path helpers (pure, no process deps) --- */
 
-/* Build path to update staging directory: <data_dir>/update/ */
+/*@
+  requires data_dir != \null && \valid_read(data_dir);
+  requires \valid(buf + (0 .. buflen - 1));
+  assigns buf[0 .. buflen - 1];
+  ensures \result == 0 || \result == -1;
+*/
 int update_staging_dir(const char *data_dir, char *buf, size_t buflen);
 
-/* Build path to staged new binary: <data_dir>/update/at_demo.new */
+/*@
+  requires data_dir != \null && \valid_read(data_dir);
+  requires \valid(buf + (0 .. buflen - 1));
+  assigns buf[0 .. buflen - 1];
+  ensures \result == 0 || \result == -1;
+*/
 int update_staging_path(const char *data_dir, char *buf, size_t buflen);
 
-/* Build path to backup binary: <data_dir>/update/at_demo.backup */
+/*@
+  requires data_dir != \null && \valid_read(data_dir);
+  requires \valid(buf + (0 .. buflen - 1));
+  assigns buf[0 .. buflen - 1];
+  ensures \result == 0 || \result == -1;
+*/
 int update_backup_path(const char *data_dir, char *buf, size_t buflen);
 
-/* Get path of current running binary via /proc/self/exe */
+/*@
+  requires \valid(buf + (0 .. buflen - 1));
+  assigns buf[0 .. buflen - 1];
+  ensures \result == 0 || \result == -1;
+*/
 int update_current_binary_path(char *buf, size_t buflen);
 
 /* --- Self-test (pure functions, except peer handshake) --- */
@@ -85,12 +133,31 @@ typedef struct {
 } selftest_result_t;
 
 /* Individual self-tests */
+/*@
+  requires cfg_dir != \null && \valid_read(cfg_dir);
+  assigns \nothing;
+  ensures \result == \true || \result == \false;
+*/
 bool selftest_identity(const char *cfg_dir);
+
+/*@
+  assigns \nothing;
+  ensures \result == \true || \result == \false;
+*/
 bool selftest_crypto(void);
+
+/*@
+  requires cfg_dir != \null && \valid_read(cfg_dir);
+  assigns \nothing;
+  ensures \result == \true || \result == \false;
+*/
 bool selftest_config(const char *cfg_dir);
 
-/* --- Process entry point --- */
-
+/*@
+  requires \valid(proc);
+  assigns \nothing;
+  ensures \result == 0 || \result != 0;
+*/
 int update_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
 #ifdef __cplusplus

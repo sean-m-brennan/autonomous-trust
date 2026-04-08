@@ -36,7 +36,6 @@ class VizServer(object):
         self.finished = finished
         self.port = port
         _logger.debug('Directory on host: %s', directory)
-        #appname = __package__.split('.')[0]  # FIXME wrong for Quart, wrong also for SassASGI?
         appname = __name__
         # Create app without static files first to avoid Flask >=3.0 KeyError
         # on PROVIDE_AUTOMATIC_OPTIONS during add_url_rule in __init__.
@@ -58,8 +57,10 @@ class VizServer(object):
             response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
             return response
 
-        # PATH_INFO is required by SassASGIMiddleware for initial SCSS compilation at startup
-        os.environ['PATH_INFO'] = '/scss/tekfive.scss'
+        # PATH_INFO is required by SassASGIMiddleware for initial SCSS compilation at startup.
+        # Only set if not already present, to avoid overwriting a real request's PATH_INFO.
+        if 'PATH_INFO' not in os.environ:
+            os.environ['PATH_INFO'] = '/scss/tekfive.scss'
         if _sass_available:
             self.app.asgi_app = SassASGIMiddleware(self.app, {appname: (os.path.join(directory, 'scss'),
                                                                         os.path.join(directory, 'css'), '/css', True)})

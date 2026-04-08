@@ -22,6 +22,20 @@
 #include "data_priv.h"
 #include "utilities/exception.h"
 
+/*@
+  requires \valid(a);
+  assigns a->size, a->array;
+  behavior success:
+    assumes \is_allocable(sizeof(data_t));
+    ensures \result == 0;
+    ensures a->size == 0;
+    ensures a->array != \null;
+  behavior failure:
+    assumes !\is_allocable(sizeof(data_t));
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int array_init(array_t *a)
 {
     a->size = 0;
@@ -31,6 +45,23 @@ int array_init(array_t *a)
     return 0;
 }
 
+/*@
+  assigns *array_ptr;
+  allocates *array_ptr;
+  behavior null_ptr:
+    assumes array_ptr == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes array_ptr != \null && \is_allocable(sizeof(array_t));
+    ensures \result == 0;
+    ensures *array_ptr != \null;
+    ensures \fresh(*array_ptr, sizeof(array_t));
+    ensures (*array_ptr)->size == 0;
+  behavior failure:
+    assumes array_ptr != \null && !\is_allocable(sizeof(array_t));
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int array_create(array_t **array_ptr)
 {
     if (array_ptr == NULL)
@@ -43,6 +74,24 @@ int array_create(array_t **array_ptr)
     return err;
 }
 
+/*@
+  requires \valid(cpy);
+  assigns cpy->size, cpy->array;
+  behavior null_input:
+    assumes a == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes a != \null && \valid(a);
+    assumes \is_allocable(a->size * sizeof(data_t));
+    ensures \result == 0;
+    ensures cpy->size == a->size;
+    ensures cpy->array != \null;
+  behavior failure:
+    assumes a != \null && \valid(a);
+    assumes !\is_allocable(a->size * sizeof(data_t));
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int array_copy(array_t *a, array_t *cpy)
 {
     if (a == NULL)
@@ -55,8 +104,22 @@ int array_copy(array_t *a, array_t *cpy)
     return 0;
 }
 
+/*@
+  requires \valid(a);
+  requires \valid(element);
+  requires a->array != \null;
+  assigns \nothing;
+  ensures -1 <= \result < (int)a->size;
+*/
 int array_find(array_t *a, data_t *element)
 {
+    /*@
+      loop invariant 0 <= i <= a->size;
+      loop invariant \forall integer j; 0 <= j < i ==>
+                     !data_equal(a->array[j], element);
+      loop assigns i;
+      loop variant a->size - i;
+    */
     for (int i = 0; i < a->size; i++)
     {
         if (data_equal(a->array[i], element))
@@ -65,8 +128,20 @@ int array_find(array_t *a, data_t *element)
     return -1;
 }
 
+/*@
+  requires \valid(a);
+  requires filter != \null;
+  requires a->array != \null;
+  assigns \nothing;
+  ensures -1 <= \result < (int)a->size;
+*/
 int array_filter(array_t *a, bool (*filter)(data_t*))
 {
+    /*@
+      loop invariant 0 <= i <= a->size;
+      loop assigns i;
+      loop variant a->size - i;
+    */
     for (int i = 0; i < a->size; i++)
     {
         if (filter(a->array[i]))
@@ -75,21 +150,60 @@ int array_filter(array_t *a, bool (*filter)(data_t*))
     return -1;
 }
 
+/*@
+  requires \valid(a);
+  requires \valid(element);
+  assigns \nothing;
+  ensures \result == true || \result == false;
+*/
 bool array_contains(array_t *a, data_t *element)
 {
     return array_find(a, element) >= 0;
 }
 
+/*@
+  requires \valid(a);
+  assigns \nothing;
+  ensures \result == a->size;
+*/
 size_t array_size(array_t *a)
 {
     return a->size;
 }
 
+/*@
+  requires \valid(a);
+  requires \valid(element);
+  assigns a->size, a->array;
+  behavior success:
+    ensures \result == 0;
+    ensures a->size == \old(a->size) + 1;
+  behavior failure:
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int array_append(array_t *a, data_t *element)
 {
     return array_set(a, a->size, element);
 }
 
+/*@
+  requires \valid(a);
+  requires \valid(element);
+  assigns *element;
+  behavior in_bounds:
+    assumes (index >= 0 && (size_t)index <= a->size) ||
+            (index < 0 && (size_t)(-index) <= a->size);
+    ensures \result == 0;
+    ensures *element != \null;
+  behavior out_of_bounds:
+    assumes (index >= 0 && (size_t)index > a->size) ||
+            (index < 0 && (size_t)(-index) > a->size);
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int array_get(array_t *a, int index, data_t **element)
 {
     if (index < 0)
@@ -100,6 +214,25 @@ int array_get(array_t *a, int index, data_t **element)
     return 0;
 }
 
+/*@
+  requires \valid(a);
+  requires \valid(element);
+  assigns a->size, a->array;
+  behavior in_bounds:
+    assumes (index >= 0 && (size_t)index <= a->size) ||
+            (index < 0 && (size_t)(-index) <= a->size);
+    ensures \result == 0;
+    ensures (size_t)\old(index) == \old(a->size) ==>
+            a->size == \old(a->size) + 1;
+    ensures (size_t)\old(index) < \old(a->size) ==>
+            a->size == \old(a->size);
+  behavior out_of_bounds:
+    assumes (index >= 0 && (size_t)index > a->size) ||
+            (index < 0 && (size_t)(-index) > a->size);
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int array_set(array_t *a, int index, data_t *element)
 {
     if (index < 0)
@@ -121,6 +254,21 @@ int array_set(array_t *a, int index, data_t *element)
     return 0;
 }
 
+/*@
+  requires \valid(a);
+  requires \valid(element);
+  requires a->array != \null;
+  assigns a->size, a->array;
+  behavior found:
+    assumes array_find(a, element) >= 0;
+    ensures \result == 0;
+    ensures a->size == \old(a->size) - 1;
+  behavior not_found:
+    assumes array_find(a, element) < 0;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int array_remove(array_t *a, data_t *element)
 {
     int index = array_find(a, element);
@@ -134,8 +282,21 @@ int array_remove(array_t *a, data_t *element)
     return 0;
 }
 
+/*@
+  requires \valid(a);
+  requires a->array != \null;
+  assigns a->size, a->array;
+  frees a->array, a;
+  ensures a->array == \null;
+  ensures a->size == 0;
+*/
 void array_free(array_t *a)
 {
+    /*@
+      loop invariant 0 <= i <= a->size;
+      loop assigns i;
+      loop variant a->size - i;
+    */
     for (int i=0; i< a->size; i++)
         smrt_deref(a->array[i]);
     smrt_deref(a->array);
@@ -144,22 +305,42 @@ void array_free(array_t *a)
     smrt_deref(a);
 }
 
-int array_sync_out(array_t *array, AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t *n)
+int array_sync_out(array_t *array, AutonomousTrust__Core__Protobuf__Structures__Data ***parr_ptr, size_t *n)
 {
-    parr = calloc(array->size, sizeof(AutonomousTrust__Core__Protobuf__Structures__Data));
     *n = array->size;
-    for (int i=0; i<array->size; i++) {
-        data_t *elt;
+    if (array->size == 0) {
+        *parr_ptr = NULL;
+        return 0;
+    }
+    AutonomousTrust__Core__Protobuf__Structures__Data **parr =
+        calloc(array->size, sizeof(AutonomousTrust__Core__Protobuf__Structures__Data *));
+    if (parr == NULL)
+        return EXCEPTION(ENOMEM);
+    for (size_t i = 0; i < array->size; i++) {
+        parr[i] = malloc(sizeof(AutonomousTrust__Core__Protobuf__Structures__Data));
+        if (parr[i] == NULL)
+            return EXCEPTION(ENOMEM);
+        autonomous_trust__core__protobuf__structures__data__init(parr[i]);
+        data_t *elt = NULL;
         if (array_get(array, i, &elt) != 0)
             return -1;
         data_sync_out(elt, parr[i]);
     }
+    *parr_ptr = parr;
     return 0;
 }
 
-void array_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data **parr)
+void array_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t n)
 {
-    smrt_deref(parr);
+    if (parr == NULL)
+        return;
+    for (size_t i = 0; i < n; i++) {
+        if (parr[i] != NULL) {
+            data_proto_free(parr[i]);
+            free(parr[i]);
+        }
+    }
+    free(parr);
 }
 
 int array_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t n, array_t *array)

@@ -19,11 +19,33 @@
 
 #include "queue_pool.h"
 
+/*@
+  requires pool == \null || \valid(pool);
+  assigns pool->pool[0 .. QUEUE_POOL_SIZE - 1], pool->initialized;
+  behavior null_pool:
+    assumes pool == \null;
+    ensures \result == EINVAL;
+  behavior valid_pool:
+    assumes pool != \null;
+    ensures \result == 0;
+    ensures pool->initialized == 1;
+    ensures \forall integer i; 0 <= i < QUEUE_POOL_SIZE ==>
+              pool->pool[i].in_use == \false;
+  disjoint behaviors;
+  complete behaviors;
+*/
 int queue_pool_init(queue_pool_t *pool)
 {
     if (pool == NULL)
         return EINVAL;
     memset(pool, 0, sizeof(queue_pool_t));
+    /*@
+      loop invariant 0 <= i <= QUEUE_POOL_SIZE;
+      loop invariant \forall integer j; 0 <= j < i ==>
+                       pool->pool[j].in_use == \false;
+      loop assigns i, pool->pool[0 .. QUEUE_POOL_SIZE - 1];
+      loop variant QUEUE_POOL_SIZE - i;
+    */
     for (int i = 0; i < QUEUE_POOL_SIZE; i++)
     {
         pool->pool[i].in_use = false;
@@ -33,10 +55,35 @@ int queue_pool_init(queue_pool_t *pool)
     return 0;
 }
 
+/*@
+  requires pool == \null || \valid(pool);
+  assigns pool->pool[0 .. QUEUE_POOL_SIZE - 1].in_use;
+  behavior null_or_uninit:
+    assumes pool == \null || pool->initialized != 1;
+    ensures \result == \null;
+  behavior found:
+    assumes pool != \null && pool->initialized == 1;
+    assumes \exists integer i; 0 <= i < QUEUE_POOL_SIZE &&
+              pool->pool[i].in_use == \false;
+    ensures \result != \null;
+  behavior exhausted:
+    assumes pool != \null && pool->initialized == 1;
+    assumes \forall integer i; 0 <= i < QUEUE_POOL_SIZE ==>
+              pool->pool[i].in_use == \true;
+    ensures \result == \null;
+  disjoint behaviors;
+*/
 queue_t *queue_pool_next(queue_pool_t *pool)
 {
     if (pool == NULL || !pool->initialized)
         return NULL;
+    /*@
+      loop invariant 0 <= i <= QUEUE_POOL_SIZE;
+      loop invariant \forall integer j; 0 <= j < i ==>
+                       pool->pool[j].in_use == \true;
+      loop assigns i, pool->pool[0 .. QUEUE_POOL_SIZE - 1].in_use;
+      loop variant QUEUE_POOL_SIZE - i;
+    */
     for (int i = 0; i < QUEUE_POOL_SIZE; i++)
     {
         if (!pool->pool[i].in_use)
@@ -48,10 +95,34 @@ queue_t *queue_pool_next(queue_pool_t *pool)
     return NULL;
 }
 
+/*@
+  requires pool == \null || \valid(pool);
+  requires queue == \null || \valid(queue);
+  assigns pool->pool[0 .. QUEUE_POOL_SIZE - 1].in_use;
+  behavior null_args:
+    assumes pool == \null || queue == \null;
+    ensures \result == EINVAL;
+  behavior found:
+    assumes pool != \null && queue != \null;
+    assumes \exists integer i; 0 <= i < QUEUE_POOL_SIZE &&
+              &pool->pool[i].queue == queue;
+    ensures \result == 0;
+  behavior not_found:
+    assumes pool != \null && queue != \null;
+    assumes \forall integer i; 0 <= i < QUEUE_POOL_SIZE ==>
+              &pool->pool[i].queue != queue;
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int queue_pool_recycle(queue_pool_t *pool, queue_t *queue)
 {
     if (pool == NULL || queue == NULL)
         return EINVAL;
+    /*@
+      loop invariant 0 <= i <= QUEUE_POOL_SIZE;
+      loop assigns i, pool->pool[0 .. QUEUE_POOL_SIZE - 1].in_use;
+      loop variant QUEUE_POOL_SIZE - i;
+    */
     for (int i = 0; i < QUEUE_POOL_SIZE; i++)
     {
         if (&pool->pool[i].queue == queue)

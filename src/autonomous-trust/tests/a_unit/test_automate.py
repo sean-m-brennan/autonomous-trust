@@ -330,7 +330,9 @@ class TestHandleResults:
     def test_task_exception(self, setup_teardown):
         at = AutonomousTrust(multiproc=False, silent=True, logfile=Configuration.log_stdout)
         task = MagicMock()
-        task.uuid = uuid4()
+        task_uuid = uuid4()
+        task.uuid = task_uuid
+        task.to_dict.return_value = {'requestor': 'test', 'uuid': task_uuid, 'size': 1}
         at.active_tasks[str(task.uuid)] = task
         mock_result = MagicMock()
         mock_result.ready.return_value = True

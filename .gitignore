@@ -127,3 +127,7 @@ dist
 embedded/signing.key
 embedded/signing.pub
 /examples/build/
+/doc/tekfive/whitepaper/HighTrust.json
+/doc/tekfive/Figure_1.png
+/doc/tekfive/Figure_2.png
+/doc/tekfive/Figure_3.png

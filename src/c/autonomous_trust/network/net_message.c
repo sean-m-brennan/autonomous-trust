@@ -26,7 +26,21 @@
 #define ENET_WIRE 232
 DEFINE_ERROR(ENET_WIRE, "Wire message serialization error");
 
-int net_message_to_wire(const net_wire_msg_t *msg, uint8_t **wire_out, size_t *wire_len)
+/*@
+  requires msg == \null || \valid(msg);
+  requires \valid(wire_out);
+  requires \valid(wire_len);
+  allocates *wire_out;
+  behavior null_msg:
+    assumes msg == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes msg != \null;
+    ensures \result == 0 ==> *wire_out != \null && *wire_len > 0;
+  disjoint behaviors;
+*/
+int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
+                        uint8_t **wire_out, size_t *wire_len)
 {
     if (msg == NULL || wire_out == NULL || wire_len == NULL)
         return EXCEPTION(EINVAL);
@@ -40,25 +54,52 @@ int net_message_to_wire(const net_wire_msg_t *msg, uint8_t **wire_out, size_t *w
                         json_string(msg->function ? msg->function : ""));
     json_object_set_new(root, "encrypt", json_boolean(msg->encrypt));
 
+    /* base64-encode binary data */
+    char *data_b64 = NULL;
     if (msg->data != NULL && msg->data_len > 0)
     {
         size_t b64_len = sodium_base64_encoded_len(msg->data_len,
                                                     sodium_base64_VARIANT_ORIGINAL);
-        char *b64 = malloc(b64_len);
-        if (b64 == NULL)
+        data_b64 = malloc(b64_len);
+        if (data_b64 == NULL)
         {
             json_decref(root);
             return EXCEPTION(ENOMEM);
         }
-        sodium_bin2base64(b64, b64_len, msg->data, msg->data_len,
+        sodium_bin2base64(data_b64, b64_len, msg->data, msg->data_len,
                           sodium_base64_VARIANT_ORIGINAL);
-        json_object_set_new(root, "data", json_string(b64));
-        free(b64);
+        json_object_set_new(root, "data", json_string(data_b64));
     }
     else
     {
         json_object_set_new(root, "data", json_string(""));
     }
+
+    /* sign if signer provided (matching Python's _content_str: "process|function|data") */
+    if (signer != NULL)
+    {
+        const char *func_str = msg->function ? msg->function : "";
+        const char *data_str = data_b64 ? data_b64 : "";
+        size_t content_len = strlen(msg->process) + 1 + strlen(func_str) + 1 + strlen(data_str);
+        char *content = malloc(content_len + 1);
+        if (content != NULL)
+        {
+            snprintf(content, content_len + 1, "%s|%s|%s", msg->process, func_str, data_str);
+            unsigned char sig[crypto_sign_BYTES];
+            if (crypto_sign_detached(sig, NULL,
+                                     (const unsigned char *)content, content_len,
+                                     signer->signature.private) == 0)
+            {
+                char sig_hex[crypto_sign_BYTES * 2 + 1];
+                sodium_bin2hex(sig_hex, sizeof(sig_hex), sig, crypto_sign_BYTES);
+                json_object_set_new(root, "signature", json_string(sig_hex));
+            }
+            free(content);
+        }
+    }
+
+    if (data_b64 != NULL)
+        free(data_b64);
 
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
@@ -80,6 +121,18 @@ int net_message_to_wire(const net_wire_msg_t *msg, uint8_t **wire_out, size_t *w
     return 0;
 }
 
+/*@
+  requires data == \null || \valid_read(data + (0 .. len - 1));
+  requires msg_out == \null || \valid(msg_out);
+  assigns *msg_out;
+  behavior null_args:
+    assumes data == \null || msg_out == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes data != \null && msg_out != \null;
+    ensures \result == 0 || \result != 0;
+  disjoint behaviors;
+*/
 int net_message_from_wire(const uint8_t *data, size_t len,
                           const public_identity_t *peer, net_wire_msg_t *msg_out)
 {
@@ -159,10 +212,54 @@ int net_message_from_wire(const uint8_t *data, size_t len,
             public_encryptor_init(&msg_out->from_whom.encryptor, (const unsigned char *)from_enc);
     }
 
+    /* extract and verify signature if present */
+    msg_out->has_signature = false;
+    msg_out->verified = false;
+    const char *sig_hex = json_string_value(json_object_get(root, "signature"));
+    if (sig_hex != NULL && strlen(sig_hex) == crypto_sign_BYTES * 2)
+    {
+        sodium_hex2bin(msg_out->signature, crypto_sign_BYTES,
+                       sig_hex, crypto_sign_BYTES * 2,
+                       NULL, NULL, NULL);
+        msg_out->has_signature = true;
+
+        /* reconstruct content string: "process|function|data" */
+        const char *func_str = msg_out->function ? msg_out->function : "";
+        size_t content_len = strlen(msg_out->process) + 1 + strlen(func_str) + 1 +
+                             (data_b64 ? strlen(data_b64) : 0);
+        char *content = malloc(content_len + 1);
+        if (content != NULL)
+        {
+            snprintf(content, content_len + 1, "%s|%s|%s",
+                     msg_out->process, func_str, data_b64 ? data_b64 : "");
+            if (crypto_sign_verify_detached(msg_out->signature,
+                                            (const unsigned char *)content, content_len,
+                                            msg_out->from_whom.signature.public) == 0)
+            {
+                msg_out->verified = true;
+            }
+            free(content);
+        }
+    }
+
     json_decref(root);
     return 0;
 }
 
+/*@
+  requires msg == \null || \valid(msg);
+  behavior null_msg:
+    assumes msg == \null;
+    assigns \nothing;
+  behavior valid_msg:
+    assumes msg != \null;
+    assigns msg->function, msg->data;
+    frees msg->function, msg->data;
+    ensures msg->function == \null;
+    ensures msg->data == \null;
+  disjoint behaviors;
+  complete behaviors;
+*/
 void net_wire_msg_free(net_wire_msg_t *msg)
 {
     if (msg == NULL)

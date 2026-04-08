@@ -34,11 +34,28 @@ typedef struct
 typedef struct map_s map_t;
 
 /**
- * @brief
+ * @brief Initialize an existing map structure.
  *
- * @param map
- * @return int
+ * @param map Pointer to an already-allocated map_t.
+ * @return int 0 on success, ENOMEM on allocation failure.
  */
+/*@
+  requires \valid(map);
+  assigns map->length, map->capacity, map->items, map->keys,
+          map->hashkey[0 .. crypto_shorthash_KEYBYTES - 1],
+          map->alloc, map->refs;
+  behavior success:
+    assumes \is_allocable(sizeof(map_item_t));
+    ensures \result == 0;
+    ensures map->length == 0;
+    ensures map->capacity > 0;
+    ensures map->items != \null;
+  behavior failure:
+    assumes !\is_allocable(sizeof(map_item_t));
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int map_init(map_t *map);
 
 /**
@@ -47,22 +64,53 @@ int map_init(map_t *map);
  * @param map_ptr
  * @return int 0 on success, or error codes: EINVAL (bad pointer), ENOMEM (failed alloc)
  */
+/*@
+  requires \valid(map_ptr);
+  allocates *map_ptr;
+  assigns *map_ptr;
+  behavior null_ptr:
+    assumes map_ptr == \null;
+    ensures \result == EINVAL;
+  behavior success:
+    assumes map_ptr != \null && \is_allocable(sizeof(map_t));
+    ensures \result == 0;
+    ensures *map_ptr != \null;
+    ensures \fresh(*map_ptr, sizeof(map_t));
+    ensures (*map_ptr)->length == 0;
+    ensures (*map_ptr)->capacity > 0;
+  behavior failure:
+    assumes map_ptr != \null && !\is_allocable(sizeof(map_t));
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int map_create(map_t **map_ptr);
 
 /**
- * @brief
+ * @brief Return the number of entries in the map.
  *
- * @param map
- * @return size_t
+ * @param map Pointer to an initialized map.
+ * @return size_t Number of key-value pairs stored.
  */
+/*@
+  requires \valid(map);
+  assigns \nothing;
+  ensures \result == map->length;
+  ensures \result <= map->capacity;
+*/
 size_t map_size(map_t *map);
 
 /**
- * @brief
+ * @brief Return a pointer to the internal keys array.
  *
- * @param map
- * @return array_t*
+ * @param map Pointer to an initialized map.
+ * @return array_t* Pointer to the keys array (owned by the map).
  */
+/*@
+  requires \valid(map);
+  assigns \nothing;
+  ensures \result == &map->keys;
+  ensures \valid(\result);
+*/
 array_t *map_keys(map_t *map);
 
 // #define CONCAT_IMPL(x, y) x##y
@@ -111,39 +159,114 @@ array_t *map_keys(map_t *map);
     }
 
 /**
- * @brief
+ * @brief Retrieve a value by key from the map.
  *
- * @param map
- * @param key
- * @param value
- * @return int
+ * @param map Pointer to an initialized map.
+ * @param key Null-terminated string key to look up.
+ * @param value Output pointer; set to the stored data_t on success.
+ * @return int 0 on success, EMAP_NOKEY if the key is not present.
  */
+/*@
+  requires \valid(map);
+  requires \valid_read(key);
+  requires \valid(value);
+  requires map->length <= map->capacity;
+  assigns *value;
+  behavior found:
+    assumes \exists integer i; 0 <= i < map->capacity &&
+            map->items[i].key != \null &&
+            strcmp(key, map->items[i].key) == 0;
+    ensures \result == 0;
+    ensures *value != \null;
+  behavior not_found:
+    assumes \forall integer i; 0 <= i < map->capacity ==>
+            (map->items[i].key == \null ||
+             strcmp(key, map->items[i].key) != 0);
+    ensures \result == EMAP_NOKEY;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int map_get(map_t *map, const map_key_t key, data_t **value);
 
 /**
- * @brief
+ * @brief Insert or update a key-value pair in the map.
  *
- * @param map
- * @param key
- * @param value
- * @return int
+ * @param map Pointer to an initialized map.
+ * @param key Null-terminated string key.
+ * @param value Non-null data_t pointer to associate with the key.
+ * @return int 0 on success, EINVAL if value is null, ENOMEM on allocation failure.
  */
+/*@
+  requires \valid(map);
+  requires \valid_read(key);
+  requires \valid(value);
+  requires map->length <= map->capacity;
+  assigns map->items[0 .. map->capacity - 1],
+          map->length, map->capacity, map->keys;
+  behavior null_value:
+    assumes value == \null;
+    ensures \result == EINVAL;
+    assigns \nothing;
+  behavior update_existing:
+    assumes value != \null;
+    assumes \exists integer i; 0 <= i < map->capacity &&
+            map->items[i].key != \null &&
+            strcmp(key, map->items[i].key) == 0;
+    ensures \result == 0;
+    ensures map->length == \old(map->length);
+  behavior insert_new:
+    assumes value != \null;
+    assumes \forall integer i; 0 <= i < map->capacity ==>
+            (map->items[i].key == \null ||
+             strcmp(key, map->items[i].key) != 0);
+    ensures \result == 0 ==> map->length == \old(map->length) + 1;
+    ensures \result == 0 ==> map->length <= map->capacity;
+  disjoint behaviors;
+*/
 int map_set(map_t *map, const map_key_t key, data_t *value);
 
 /**
- * @brief
+ * @brief Remove a key-value pair from the map.
  *
- * @param map
- * @param key
- * @return int
+ * @param map Pointer to an initialized map.
+ * @param key Null-terminated string key to remove.
+ * @return int 0 on success, EMAP_NOKEY if the key is not present.
  */
+/*@
+  requires \valid(map);
+  requires \valid_read(key);
+  requires map->length <= map->capacity;
+  assigns map->items[0 .. map->capacity - 1], map->length;
+  behavior found:
+    assumes \exists integer i; 0 <= i < map->capacity &&
+            map->items[i].key != \null &&
+            strcmp(key, map->items[i].key) == 0;
+    ensures \result == 0;
+    ensures map->length == \old(map->length) - 1;
+    ensures map->length <= map->capacity;
+  behavior not_found:
+    assumes \forall integer i; 0 <= i < map->capacity ==>
+            (map->items[i].key == \null ||
+             strcmp(key, map->items[i].key) != 0);
+    ensures \result == EMAP_NOKEY;
+    ensures map->length == \old(map->length);
+  complete behaviors;
+  disjoint behaviors;
+*/
 int map_remove(map_t *map, map_key_t key);
 
 /**
- * @brief
+ * @brief Free all map resources (keys and internal storage).
  *
- * @param map
+ * @param map Pointer to an initialized map.
  */
+/*@
+  requires \valid(map);
+  requires map->items != \null;
+  requires map->length <= map->capacity;
+  assigns map->items[0 .. map->capacity - 1];
+  frees map->items, map;
+*/
 void map_free(map_t *map);
 
 #define EMAP_NOKEY 218

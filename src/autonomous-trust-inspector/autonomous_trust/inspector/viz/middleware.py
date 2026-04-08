@@ -57,7 +57,7 @@ class SassASGIMiddleware:
                     continue
                 css_path = os.path.join(css_dir, css_filename)
                 try:
-                    self.logger.info('Compile %s' % sass_path)
+                    self.logger.info(f'Compile {sass_path}')
                     result = sass.compile(
                         filename=sass_path,
                         output_style='nested',

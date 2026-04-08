@@ -33,9 +33,9 @@ struct array_s
     data_t **array;
 };
 
-int array_sync_out(array_t *array, AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t *n);
+int array_sync_out(array_t *array, AutonomousTrust__Core__Protobuf__Structures__Data ***parr_ptr, size_t *n);
 
-void array_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data **parr);
+void array_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t n);
 
 int array_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t n, array_t *array);
 

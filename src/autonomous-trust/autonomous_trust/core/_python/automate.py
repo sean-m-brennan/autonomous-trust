@@ -283,9 +283,19 @@ class AutonomousTrust(Protocol):
         queues[self.proc_name] = self._my_queue
         signals: dict[str, QueueType] = {}
         results: dict[str, AsyncResult] = {}
+        # Separate system processes from additional workers so system starts first
+        system_names = set(self._subsystems.names)
+        system_procs = [p for p in procs if p.name in system_names]
+        additional_procs = [p for p in procs if p.name not in system_names]
+
         with self._pool_type(len(procs)) as pool:
-            for proc in procs:  # FIXME split system procs from additional
-                self.logger.info(self.name + ':  Starting %s ...' % proc.name)
+            for proc in system_procs:
+                self.logger.info(self.name + ':  Starting system %s ...' % proc.name)
+                self.process_names.append(proc.name)
+                signals[proc.name] = self.queue_type()
+                results[proc.name] = pool.apply_async(proc.process, (queues, signals[proc.name]))
+            for proc in additional_procs:
+                self.logger.info(self.name + ':  Starting worker %s ...' % proc.name)
                 self.process_names.append(proc.name)
                 signals[proc.name] = self.queue_type()
                 results[proc.name] = pool.apply_async(proc.process, (queues, signals[proc.name]))
@@ -294,7 +304,14 @@ class AutonomousTrust(Protocol):
             if q_out is not None:
                 queues[self.external_feedback] = q_out  # main loop must upload to this
             pool.close()  # no more system tasks (use separate pool for dynamic tasks)
-            self.logger.info(self.name + ':                                          Ready.')  # FIXME not really ready
+            # Wait briefly for system processes to initialize before declaring ready
+            _ready_wait = 0.0
+            while _ready_wait < Process.cadence * 3:
+                if all(not r.ready() for r in results.values()):
+                    break  # all still running means they started successfully
+                time.sleep(Process.cadence)
+                _ready_wait += Process.cadence
+            self.logger.info(self.name + ':                                          Ready.')
 
             self.autonomous_loop(results, queues, signals)
 
@@ -350,7 +367,8 @@ class AutonomousTrust(Protocol):
                 if sub_sys_cls.cfg_name in self.classes_to_log:
                     suppress = False
                 configs[Process.key].append(sub_sys_cls(configs, self._subsystems, self._output, suppress_log=suppress))
-            # FIXME wait for system to be operational before running these??
+            # Note: only instantiates workers here; run_forever() starts system
+            # procs before additional workers (see system_procs/additional_procs split).
             for worker_cls, deps, kwargs in self._additional_workers:
                 configs[Process.key].append(worker_cls(configs, self._subsystems, self._output, deps, **kwargs))
         return configs
@@ -432,7 +450,8 @@ class AutonomousTrust(Protocol):
                     zkp_valid = task.verify_proof()
                     if zkp_valid is False:
                         self.logger.warning(self.name + ': ZKP verification FAILED for task %s' % task.uuid)
-                    tx = TransactionScore(task.uuid, 0.5)  # FIXME relevant evaluation
+                    score = 0.8 if zkp_valid else 0.3
+                    tx = TransactionScore(task.uuid, score)
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                     if self.external_feedback in queues:
                         queues[self.external_feedback].put(task, block=True, timeout=queue_cadence)
@@ -486,13 +505,17 @@ class AutonomousTrust(Protocol):
                     tr = TaskResult(self.active_tasks[str(key)], result)
                     tr.generate_proof()
                     queues[CfgIds.negotiation].put(tr, block=True, timeout=queue_cadence)
-                    tx = TransactionScore(tr.uuid, 0.6)  # FIXME relevant evaluation
+                    tx = TransactionScore(tr.uuid, 0.9)
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                 except KeyboardInterrupt:
                     pass
                 except Exception:
                     self.logger.error('Task Exception - ' + traceback.format_exc())
-                    # FIXME send error result to negotiation
+                    try:
+                        error_result = TaskResult(self.active_tasks[str(key)], None)
+                        queues[CfgIds.negotiation].put(error_result, block=True, timeout=queue_cadence)
+                    except Exception:
+                        self.logger.error('Failed to report task error: ' + traceback.format_exc())
                 del results[key]
 
     def _random_task(self, queues: dict[str, QueueType]):

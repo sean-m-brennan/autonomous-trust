@@ -198,6 +198,23 @@ EOF
     info "Rust conda hooks configured"
 }
 
+install-frama-c() {
+  #cat > "$ACTIVATE_DIR/frama-c.sh" << 'EOF'
+  export OPAMROOT="$CONDA_PREFIX/share/opam"
+  #  eval $(opam env --root="$OPAMROOT" --switch=default)
+  #  EOF
+
+  #  cat > "$DEACTIVATE_DIR/frama-c.sh" << 'EOF'
+  #  # opam env vars are cleared when conda env deactivates
+  #  unset OPAMROOT
+   # EOF
+  # Assumes opam installed
+  opam init -n --compiler 4.14.1 --root="$OPAMROOT" # may take a while
+  eval $(opam env --root="$OPAMROOT" --switch=4.14.1)
+  opam install -y frama-c --ignore-constraints-on=lablgtk3
+  opam install -y alt-ergo
+}
+
 # ---------------------------------------------------------------------------
 # 4. Docker
 # ---------------------------------------------------------------------------

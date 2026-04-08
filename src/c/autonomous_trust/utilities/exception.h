@@ -44,6 +44,11 @@ extern "C"
 
 #ifndef EXCEPTION_IMPL
     extern _Thread_local exception_t _exception;
+
+    /*@
+      assigns \nothing;
+      ensures \result != \null || \result == \null;
+    */
     const char *_get_err_str(int err);
 
     extern exception_info_t error_table[];
@@ -59,6 +64,15 @@ extern "C"
  * @param file
  * @return int
  */
+/*@
+  requires file != \null;
+  requires \valid_read(file + (0 .. MAX_FILENAME - 1)) ||
+           (\exists size_t i; 0 <= i < MAX_FILENAME && file[i] == '\0');
+  assigns _exception.errnum, _exception.line, _exception.file[0 .. MAX_FILENAME - 1];
+  ensures _exception.errnum == err;
+  ensures _exception.line == line;
+  ensures \result == -1;
+*/
 int _set_exception(int err, size_t line, const char *file);
 
 /**

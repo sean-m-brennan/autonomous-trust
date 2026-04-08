@@ -29,3 +29,12 @@ dependencies:
   - git
   - lcov
   - llvmdev
+  - opam
+  - autoconf
+  - cairo
+  - gmp
+  - gtk3
+  - gtksourceview
+  - libpng
+  - libjpeg
+  - pcre2

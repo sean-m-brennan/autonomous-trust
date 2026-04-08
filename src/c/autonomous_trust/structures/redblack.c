@@ -21,6 +21,12 @@
 #include "redblack_priv.h"
 #include "array_priv.h"
 
+/*@
+  requires dir == LEFT || dir == RIGHT;
+  assigns \nothing;
+  ensures dir == LEFT ==> \result == RIGHT;
+  ensures dir == RIGHT ==> \result == LEFT;
+*/
 enum Direction opposite_direction(enum Direction dir)
 {
     return (enum Direction)(dir + 1) % 2;
@@ -29,6 +35,25 @@ enum Direction opposite_direction(enum Direction dir)
 /**********************/
 // Red/Black node in tree (private)
 
+/*@
+  requires \valid(node_ptr);
+  allocates *node_ptr;
+  assigns *node_ptr;
+  behavior success:
+    assumes \is_allocable(sizeof(struct rbNode));
+    ensures \result == 0;
+    ensures *node_ptr != \null;
+    ensures (*node_ptr)->key == key;
+    ensures (*node_ptr)->data == data;
+    ensures (*node_ptr)->red == true;
+    ensures (*node_ptr)->left == \null;
+    ensures (*node_ptr)->right == \null;
+    ensures (*node_ptr)->parent == \null;
+  behavior failure:
+    assumes !\is_allocable(sizeof(struct rbNode));
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int createNode(tree_data_ptr_t data, int key, struct rbNode **node_ptr)
 {
     *node_ptr = smrt_create(sizeof(struct rbNode));
@@ -39,6 +64,7 @@ int createNode(tree_data_ptr_t data, int key, struct rbNode **node_ptr)
     node->key = key;
     node->red = true;
     node->parent = node->left = node->right = NULL;
+    //@ assert node->key == key && node->red == true;
     return 0;
 }
 
@@ -62,6 +88,16 @@ int copyNodes(struct rbNode *orig, struct rbNode *parent, struct rbNode **child)
     return 0;
 }
 
+/*@
+  requires \valid(tree);
+  assigns \nothing;
+  behavior found:
+    ensures \result != \null;
+    ensures \result->key == key;
+  behavior not_found:
+    ensures \result == \null;
+  disjoint behaviors;
+*/
 struct rbNode *findNode(tree_t *tree, int key)
 {
     struct rbNode *current = tree->root;
@@ -77,6 +113,13 @@ struct rbNode *findNode(tree_t *tree, int key)
     return NULL;
 }
 
+/*@
+  requires \valid(node);
+  requires which == LEFT || which == RIGHT;
+  assigns \nothing;
+  ensures which == LEFT ==> \result == node->left;
+  ensures which == RIGHT ==> \result == node->right;
+*/
 struct rbNode *getNodeChild(struct rbNode *node, enum Direction which)
 {
     if (which == LEFT)
@@ -84,6 +127,13 @@ struct rbNode *getNodeChild(struct rbNode *node, enum Direction which)
     return node->right;
 };
 
+/*@
+  requires \valid(node);
+  requires which == LEFT || which == RIGHT;
+  assigns node->left, node->right;
+  ensures which == LEFT ==> node->left == child;
+  ensures which == RIGHT ==> node->right == child;
+*/
 void setNodeChild(struct rbNode *node, enum Direction which, struct rbNode *child)
 {
     if (which == LEFT)
@@ -113,6 +163,11 @@ int nodeDepth(struct rbNode *node)
     return level;
 };
 
+/*@
+  requires \valid(node);
+  assigns \nothing;
+  ensures \result == (node->left == \null && node->right == \null);
+*/
 bool nodeIsLeaf(struct rbNode *node)
 {
     return node->left == NULL && node->right == NULL;
@@ -308,11 +363,32 @@ void recolorDelete(tree_t *tree, struct rbNode *node)
 /**********************/
 // public tree functions
 
+/*@
+  requires \valid(tree);
+  assigns \nothing;
+  ensures \result == 0;
+*/
 int tree_init(tree_t *tree)
 {
     return 0;
 }
 
+/*@
+  requires \valid(tree_ptr);
+  allocates *tree_ptr;
+  assigns *tree_ptr;
+  behavior null_ptr:
+    assumes tree_ptr == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes tree_ptr != \null && \is_allocable(sizeof(tree_t));
+    ensures \result == 0;
+    ensures *tree_ptr != \null;
+  behavior failure:
+    assumes tree_ptr != \null && !\is_allocable(sizeof(tree_t));
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int tree_create(tree_t **tree_ptr)
 {
     if (tree_ptr == NULL)
@@ -338,11 +414,24 @@ int tree_copy(tree_t *orig, tree_t **copy_ptr)
     return 0;
 }
 
+/*@
+  requires \valid(tree);
+  assigns \nothing;
+  ensures \result == tree->size;
+  ensures \result >= 0;
+*/
 int tree_size(tree_t *tree)
 {
     return tree->size;
 }
 
+/*@
+  requires node == \null || \valid(node);
+  assigns \nothing;
+  ensures \result >= 0;
+  ensures node == \null ==> \result == 0;
+  decreases \valid(node) ? 1 : 0;
+*/
 static int node_depth(struct rbNode *node)
 {
     if (node == NULL)
@@ -352,11 +441,25 @@ static int node_depth(struct rbNode *node)
     return 1 + (left_depth > right_depth ? left_depth : right_depth);
 }
 
+/*@
+  requires \valid(tree);
+  assigns \nothing;
+  ensures \result >= 0;
+*/
 int tree_depth(tree_t *tree)
 {
     return node_depth(tree->root);
 }
 
+/*@
+  requires \valid(tree);
+  assigns \nothing;
+  behavior found:
+    ensures \result != \null;
+  behavior not_found:
+    ensures \result == \null;
+  disjoint behaviors;
+*/
 tree_data_ptr_t tree_find(tree_t *tree, int key)
 {
     struct rbNode *node = findNode(tree, key);
@@ -371,6 +474,20 @@ int tree_insert_auto_key(tree_t *tree, tree_data_ptr_t data)
     return tree_insert(tree, data, key);
 }
 
+/*@
+  requires \valid(tree);
+  assigns tree->root, tree->size;
+  behavior success:
+    ensures \result == 0;
+    ensures tree->size == \old(tree->size) + 1;
+  behavior duplicate:
+    ensures \result == -1;
+    ensures tree->size == \old(tree->size);
+  behavior alloc_failure:
+    ensures \result == -1;
+    ensures tree->size == \old(tree->size);
+  disjoint behaviors;
+*/
 int tree_insert(tree_t *tree, void *data, int key)
 {
     struct rbNode *node;
@@ -404,6 +521,21 @@ int tree_insert(tree_t *tree, void *data, int key)
     return 0;
 }
 
+/*@
+  requires \valid(tree);
+  assigns tree->root, tree->size;
+  behavior success:
+    ensures \result == 0;
+    ensures tree->size == \old(tree->size) - 1;
+  behavior empty:
+    assumes tree->root == \null;
+    ensures \result == -1;
+    ensures tree->size == \old(tree->size);
+  behavior not_found:
+    ensures \result == -1;
+    ensures tree->size == \old(tree->size);
+  disjoint behaviors;
+*/
 int tree_delete(tree_t *tree, int key)
 {
     if (!tree->root)
@@ -456,6 +588,10 @@ int tree_delete(tree_t *tree, int key)
 }
 
 
+/*@
+  requires tree == \null || \valid(tree);
+  frees tree;
+*/
 void tree_free(tree_t *tree) {
     nodesFree(tree->root);
     tree->size = 0;

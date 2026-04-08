@@ -51,23 +51,52 @@ typedef struct {
 /* --- Testable helper functions (no process/messaging deps) --- */
 
 /* Compute total number of chunks for a given artifact size */
+/*@
+  requires chunk_size > 0;
+  assigns \nothing;
+  ensures \result >= 0;
+  ensures \result == (int)((total_size + chunk_size - 1) / chunk_size);
+*/
 int artifact_calc_total_chunks(size_t total_size, size_t chunk_size);
 
-/* Initialize a download_state_t from manifest fields */
+/*@
+  requires \valid(state);
+  requires hash_hex != \null && \valid_read(hash_hex);
+  requires total_chunks > 0;
+  requires \valid_read(expected_hash + (0 .. UPDATE_HASH_LEN - 1));
+  assigns *state;
+  ensures \result == 0;
+  ensures state->total_chunks == total_chunks;
+  ensures state->received_chunks == 0;
+*/
 int artifact_download_state_init(download_state_t *state,
                                  const char *hash_hex,
                                  int total_chunks,
                                  const uint8_t *expected_hash,
                                  const char *version);
 
-/* Record a received chunk; returns true when all chunks received */
+/*@
+  requires \valid(state);
+  assigns state->received_chunks;
+  ensures state->received_chunks == \old(state->received_chunks) + 1;
+  ensures \result == (state->received_chunks >= state->total_chunks);
+*/
 bool artifact_download_state_record(download_state_t *state);
 
-/* Verify a single chunk's blake2b hash.
-   Returns 0 if chunk_hash matches blake2b(data, len). */
+/*@
+  requires \valid_read(data + (0 .. len - 1));
+  requires \valid_read(chunk_hash + (0 .. UPDATE_HASH_LEN - 1));
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int artifact_verify_chunk_hash(const uint8_t *data, size_t len,
                                const uint8_t *chunk_hash);
 
+/*@
+  requires \valid(proc);
+  assigns \nothing;
+  ensures \result == 0 || \result != 0;
+*/
 int artifact_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
 #ifdef __cplusplus

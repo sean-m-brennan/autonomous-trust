@@ -67,6 +67,11 @@ int get_data_dir(char path[])
     return snprintf(path, 255, "%s/%s", rootDir(), DATA_PATH);
 }
 
+/*@
+  requires name != \null && \valid_read(name);
+  assigns \nothing;
+  ensures \result == \null || \valid(\result);
+*/
 config_t *find_configuration(const char *name)
 {
     for (size_t i = 0; i < configuration_table_size; i++)
@@ -137,17 +142,26 @@ int config_absolute_path(const char *path_in, char *path_out)
     {
         int remain = snprintf(path_out, 255, "%s/%s", cfg_dir, path_in);
         if (remain < 0)
-            return -1; // FIXME set error?
+            return EXCEPTION(EINVAL);
     }
     return 0;
 }
 
+/*@
+  requires filename != \null && \valid_read(filename);
+  requires data_struct != \null && \valid(data_struct);
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int read_config_file(const char *filename, void *data_struct)
 {
     char typename[CFG_NAME_SIZE + 1] = {0};
     json_t *root = json_load_file(filename, 0, NULL);
     if (root == NULL || !json_is_object(root))
-        return EXCEPTION(ECFG_BADFMT);  // FIXME 'network'
+        return EXCEPTION(ECFG_BADFMT);  // caller (load_config) logs the config name
 
     json_t *name_obj = json_object_get(root, "typename");
     if (name_obj == NULL || !json_is_string(name_obj))
@@ -166,6 +180,17 @@ int read_config_file(const char *filename, void *data_struct)
     return err;
 }
 
+/*@
+  requires \valid(cfg_obj);
+  requires data_struct != \null && \valid_read(data_struct);
+  requires filename != \null && \valid_read(filename);
+  assigns \nothing;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int write_config_file(const config_t *cfg_obj, const void *data_struct, const char *filename)
 {
     json_t *root;
@@ -245,6 +270,17 @@ int load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger)
     return num_err;
 }
 
+/*@
+  requires filepath == \null || \valid_read(filepath);
+  requires \valid(config_ptr);
+  behavior null_path:
+    assumes filepath == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes filepath != \null;
+    ensures \result == 0 ==> *config_ptr != \null;
+  disjoint behaviors;
+*/
 int load_config(char *filepath, config_t **config_ptr, char *cfg_name, logger_t *logger)
 {
     if (filepath == NULL)

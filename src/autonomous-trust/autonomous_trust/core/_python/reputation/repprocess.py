@@ -213,9 +213,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if idx not in self.requests:
                 return True  # not granted, drop
             self.requests.remove(idx)
-            # FIXME: Verify the sender's NaCl signature on the transaction score to prevent spoofed Paxos proposals
             if not message.verified:
-                self.logger.warning(f"Unverified Paxos proposal from {message.from_whom}")
+                self.logger.warning(f"Rejecting unverified Paxos proposal from {message.from_whom}")
+                return True  # drop unverified proposal
             if idx not in self.proposals:
                 self.proposals[idx] = score
                 self.logger.debug("Tx to proposals ")
@@ -244,9 +244,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if score.task_id not in self.acceptances:
                 self.acceptances[score.task_id] = []
             if message.from_whom not in self.acceptances[score.task_id]:
-                # FIXME: Validate the sender's NaCl signature on the acceptance message to ensure it came from an authorized peer
                 if not message.verified:
-                    self.logger.warning(f"Unverified Paxos acceptance from {message.from_whom}")
+                    self.logger.warning(f"Rejecting unverified Paxos acceptance from {message.from_whom}")
+                    return True  # drop unverified acceptance
                 self.acceptances[score.task_id].append(message.from_whom)
             if len(self.acceptances[score.task_id]) > len(self.peers.all) // 2:
                 self.history.update(score.task_id, peer_id, score.score)

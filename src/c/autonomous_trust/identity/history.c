@@ -20,8 +20,10 @@
 
 #include <sodium.h>
 #include <uuid/uuid.h>
+#include <jansson.h>
 
 #include "history.h"
+#include "identity_priv.h"
 #include "../utilities/allocation.h"
 
 /* IdentityObj blob interface implementations */
@@ -86,6 +88,20 @@ static int _identity_obj_get_hash(const merkle_blob_t *blob, const uint8_t *nonc
     return ret;
 }
 
+/*@
+  requires identity != \null && \valid(identity);
+  requires \valid(obj);
+  allocates *obj;
+  behavior success:
+    ensures \result == 0;
+    ensures *obj != \null;
+  behavior null_args:
+    assumes identity == \null || obj == \null;
+    ensures \result == EINVAL;
+  behavior oom:
+    ensures \result == ENOMEM;
+  disjoint behaviors null_args, success;
+*/
 int identity_obj_create(public_identity_t *identity, const char *originator_uuid,
                         identity_obj_t **obj)
 {
@@ -117,12 +133,29 @@ int identity_obj_designation(const identity_obj_t *obj, uint8_t **out, size_t *o
     return _identity_obj_designation((const merkle_blob_t *)obj, out, out_len);
 }
 
+/*@
+  requires obj == \null || \valid(obj);
+  frees obj;
+*/
 void identity_obj_free(identity_obj_t *obj)
 {
     if (obj != NULL)
         free(obj);
 }
 
+/*@
+  requires \valid(history);
+  allocates *history;
+  behavior success:
+    ensures \result == 0;
+    ensures *history != \null;
+  behavior null_out:
+    assumes history == \null;
+    ensures \result == EINVAL;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors null_out, success;
+*/
 int identity_history_create(agreement_voter_t *myself,
                             peers_t *peers,
                             logger_t *logger,
@@ -169,6 +202,17 @@ int identity_history_create(agreement_voter_t *myself,
     return 0;
 }
 
+/*@
+  requires history == \null || \valid(history);
+  requires who == \null || \valid(who);
+  behavior null_args:
+    assumes history == \null || who == \null;
+    ensures \result == EINVAL;
+  behavior success:
+    assumes history != \null && who != \null;
+    ensures \result == 0 || \result != 0;
+  disjoint behaviors;
+*/
 int identity_history_insert_peer(identity_history_t *history,
                                  public_identity_t *who)
 {
@@ -205,6 +249,19 @@ int identity_history_insert_peer(identity_history_t *history,
     return dag_add_step(&history->dag, step, NULL);
 }
 
+/*@
+  requires history == \null || \valid(history);
+  requires item == \null || \valid(item);
+  requires \valid(proof_out);
+  requires \valid(proof_len);
+  behavior null_args:
+    assumes history == \null || item == \null;
+    ensures \result == EINVAL;
+  behavior success:
+    assumes history != \null && item != \null;
+    ensures \result == 0 ==> *proof_out != \null && *proof_len >= 0;
+  disjoint behaviors;
+*/
 int identity_history_prove_existence(identity_history_t *history,
                                      merkle_blob_t *item,
                                      merkle_proof_step_t **proof_out,
@@ -215,6 +272,20 @@ int identity_history_prove_existence(identity_history_t *history,
     return merkle_inclusion_proof(history->merkle, item, proof_out, proof_len);
 }
 
+/*@
+  requires history == \null || \valid(history);
+  requires item == \null || \valid(item);
+  requires proof_len >= 0;
+  requires proof_len == 0 || \valid(proof + (0 .. proof_len - 1));
+  behavior null_args:
+    assumes history == \null || item == \null;
+    ensures \result == \false;
+  behavior valid_args:
+    assumes history != \null && item != \null;
+    ensures \result == \true || \result == \false;
+  disjoint behaviors;
+  complete behaviors;
+*/
 bool identity_history_verify_existence(identity_history_t *history,
                                        merkle_blob_t *item,
                                        merkle_proof_step_t *proof,
@@ -225,23 +296,237 @@ bool identity_history_verify_existence(identity_history_t *history,
     return merkle_audit(history->merkle, item, proof, proof_len);
 }
 
-int identity_history_share(identity_history_t *history,
-                           array_t **steps_out)
+/* JSON serialization helpers for wire-compatible history exchange */
+
+static json_t *linked_step_to_json(const linked_step_t *step)
 {
-    if (history == NULL || steps_out == NULL)
-        return EINVAL;
-    return dag_recite(&history->dag, NULL, NULL, steps_out);
+    if (step == NULL)
+        return NULL;
+
+    json_t *obj = json_object();
+    if (obj == NULL)
+        return NULL;
+
+    json_object_set_new(obj, "uuid", json_string(step->uuid));
+
+    char ts_buf[MAX_DT_STR];
+    if (datetime_to_isoformat(&step->timestamp, ts_buf, sizeof(ts_buf)) == 0)
+        json_object_set_new(obj, "timestamp", json_string(ts_buf));
+
+    /* payload is a merkle root digest (MERKLE_DIGEST_LEN bytes) */
+    if (step->payload != NULL)
+    {
+        size_t hex_len = MERKLE_DIGEST_LEN * 2 + 1;
+        char *hex = malloc(hex_len);
+        if (hex != NULL)
+        {
+            hexlify((const unsigned char *)step->payload, MERKLE_DIGEST_LEN,
+                    (unsigned char *)hex);
+            hex[MERKLE_DIGEST_LEN * 2] = '\0';
+            json_object_set_new(obj, "payload", json_string(hex));
+            free(hex);
+        }
+    }
+
+    return obj;
 }
 
-int identity_history_hear(identity_history_t *history,
-                          linked_step_t **steps, size_t count)
+static int linked_step_from_json(const json_t *obj, linked_step_t **step_out)
 {
-    if (history == NULL || steps == NULL || count == 0)
+    if (obj == NULL || step_out == NULL)
         return EINVAL;
+
+    const char *uuid_str = json_string_value(json_object_get(obj, "uuid"));
+    if (uuid_str == NULL)
+        return EINVAL;
+
+    linked_step_t *step = NULL;
+    int err = linked_step_create(uuid_str, NULL, &step);
+    if (err != 0)
+        return err;
+
+    const char *ts_str = json_string_value(json_object_get(obj, "timestamp"));
+    if (ts_str != NULL)
+        datetime_from_isostring(ts_str, &step->timestamp);
+
+    const char *payload_hex = json_string_value(json_object_get(obj, "payload"));
+    if (payload_hex != NULL)
+    {
+        uint8_t *digest = malloc(MERKLE_DIGEST_LEN);
+        if (digest != NULL)
+        {
+            unhexlify((const unsigned char *)payload_hex,
+                      MERKLE_DIGEST_LEN * 2, digest);
+            step->payload = digest;
+        }
+    }
+
+    *step_out = step;
+    return 0;
+}
+
+/*@
+  requires history == \null || \valid(history);
+  requires signer == \null || \valid(signer);
+  requires wire_out == \null || \valid(wire_out);
+  requires wire_len == \null || \valid(wire_len);
+  allocates *wire_out;
+  behavior null_args:
+    assumes history == \null || signer == \null ||
+            wire_out == \null || wire_len == \null;
+    ensures \result == EINVAL;
+  behavior success:
+    assumes history != \null && signer != \null &&
+            wire_out != \null && wire_len != \null;
+    ensures \result == 0 ==> *wire_out != \null && *wire_len > 0;
+  disjoint behaviors;
+*/
+int identity_history_share(identity_history_t *history,
+                           const identity_t *signer,
+                           uint8_t **wire_out, size_t *wire_len)
+{
+    if (history == NULL || signer == NULL || wire_out == NULL || wire_len == NULL)
+        return EINVAL;
+
+    array_t *steps = NULL;
+    int err = dag_recite(&history->dag, NULL, NULL, &steps);
+    if (err != 0)
+        return err;
+
+    /* serialize steps to JSON array */
+    json_t *arr = json_array();
+    if (arr == NULL)
+    {
+        array_free(steps);
+        return ENOMEM;
+    }
+
+    int idx;
+    data_t *val;
+    array_for_each(steps, idx, val)
+        ptr_t ptr = NULL;
+        if (data_object_ptr(val, &ptr) == 0 && ptr != NULL)
+        {
+            json_t *step_json = linked_step_to_json((const linked_step_t *)ptr);
+            if (step_json != NULL)
+                json_array_append_new(arr, step_json);
+        }
+    array_end_for_each
+
+    char *json_str = json_dumps(arr, JSON_COMPACT);
+    json_decref(arr);
+    array_free(steps);
+    if (json_str == NULL)
+        return ENOMEM;
+
+    /* sign the JSON payload */
+    size_t json_len = strlen(json_str);
+    size_t signed_len = crypto_sign_BYTES + json_len;
+    uint8_t *signed_buf = malloc(signed_len);
+    if (signed_buf == NULL)
+    {
+        free(json_str);
+        return ENOMEM;
+    }
+
+    unsigned long long actual_len = 0;
+    if (crypto_sign(signed_buf, &actual_len,
+                    (const uint8_t *)json_str, json_len,
+                    signer->signature.private) != 0)
+    {
+        free(json_str);
+        free(signed_buf);
+        return -1;
+    }
+    free(json_str);
+
+    *wire_out = signed_buf;
+    *wire_len = (size_t)actual_len;
+    return 0;
+}
+
+/*@
+  requires history == \null || \valid(history);
+  requires sender == \null || \valid(sender);
+  requires wire == \null || \valid_read(wire + (0 .. wire_len - 1));
+  behavior null_args:
+    assumes history == \null || sender == \null ||
+            wire == \null || wire_len == 0;
+    ensures \result == EINVAL;
+  behavior success:
+    assumes history != \null && sender != \null &&
+            wire != \null && wire_len > 0;
+    ensures \result == 0 || \result != 0;
+  disjoint behaviors;
+*/
+int identity_history_hear(identity_history_t *history,
+                          const public_identity_t *sender,
+                          const uint8_t *wire, size_t wire_len)
+{
+    if (history == NULL || sender == NULL || wire == NULL || wire_len == 0)
+        return EINVAL;
+
+    /* verify signature and extract JSON payload */
+    size_t json_max = wire_len;
+    uint8_t *json_buf = malloc(json_max);
+    if (json_buf == NULL)
+        return ENOMEM;
+
+    unsigned long long json_len = 0;
+    if (crypto_sign_open(json_buf, &json_len, wire, wire_len,
+                         sender->signature.public) != 0)
+    {
+        free(json_buf);
+        return -1;  /* signature verification failed */
+    }
+
+    /* parse JSON array back to linked steps */
+    json_error_t jerr;
+    json_t *arr = json_loadb((const char *)json_buf, (size_t)json_len, 0, &jerr);
+    free(json_buf);
+    if (arr == NULL || !json_is_array(arr))
+    {
+        if (arr != NULL)
+            json_decref(arr);
+        return EINVAL;
+    }
+
+    size_t count = json_array_size(arr);
+    if (count == 0)
+    {
+        json_decref(arr);
+        return 0;
+    }
+
+    linked_step_t **steps = calloc(count, sizeof(linked_step_t *));
+    if (steps == NULL)
+    {
+        json_decref(arr);
+        return ENOMEM;
+    }
+
+    for (size_t i = 0; i < count; i++)
+    {
+        int err = linked_step_from_json(json_array_get(arr, i), &steps[i]);
+        if (err != 0)
+        {
+            for (size_t j = 0; j < i; j++)
+                linked_step_free(steps[j]);
+            free(steps);
+            json_decref(arr);
+            return err;
+        }
+    }
+    json_decref(arr);
+
+    /* rebuild parent chain (recite outputs head-to-root order) */
+    for (size_t i = 0; i + 1 < count; i++)
+        steps[i]->parent = steps[i + 1];
 
     char name_out[32];
     int err = dag_ingest_branch(&history->dag, steps, count, NULL,
                                 name_out, sizeof(name_out));
+    free(steps);
     if (err != 0)
         return err;
 
@@ -249,6 +534,17 @@ int identity_history_hear(identity_history_t *history,
     return dag_merge(&history->dag, name_out, NULL, false);
 }
 
+/*@
+  requires history == \null || \valid(history);
+  behavior null_history:
+    assumes history == \null;
+    assigns \nothing;
+  behavior valid_history:
+    assumes history != \null;
+    frees history;
+  disjoint behaviors;
+  complete behaviors;
+*/
 void identity_history_free(identity_history_t *history)
 {
     if (history == NULL)

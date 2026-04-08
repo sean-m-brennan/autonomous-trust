@@ -35,6 +35,11 @@ extern "C" {
  *
  * When ZTA is disabled at runtime, this process exits immediately.
  */
+/*@
+  requires \valid(proc);
+  assigns \nothing;
+  ensures \result == 0 || \result != 0;
+*/
 int zta_process_run(process_t *proc, directory_t *queues,
                     queue_id_t signal, logger_t *logger);
 

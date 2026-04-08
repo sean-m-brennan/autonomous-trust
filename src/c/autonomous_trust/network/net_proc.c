@@ -15,6 +15,7 @@
  *******************/
 
 #define _XOPEN_SOURCE 700
+#define _DEFAULT_SOURCE
 #include <stdbool.h>
 #include <string.h>
 #include <sys/types.h>
@@ -22,6 +23,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <errno.h>
 
@@ -34,6 +36,7 @@
 #include "network/net_message.h"
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
+#include "identity/group.h"
 #include "structures/data_priv.h"
 
 #define ENET_SEND 230
@@ -44,6 +47,142 @@ DEFINE_ERROR(ENET_RECV, "Network receive failed");
 const bool use_mcast = false;
 static const int UDP_PACKET_SIZE = 65507;
 static const int TCP_CHUNK_SIZE = 2048;
+
+/****************************
+ * Blacklist / rejected addresses
+ ****************************/
+
+#define MAX_REJECTED 256
+static char rejected_addresses[MAX_REJECTED][IPV4_ADDR_LEN + 1];
+static size_t rejected_count = 0;
+static pthread_mutex_t rejected_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool reject_message(const char *address)
+{
+    bool found = false;
+    pthread_mutex_lock(&rejected_lock);
+    for (size_t i = 0; i < rejected_count; i++)
+    {
+        if (strcmp(rejected_addresses[i], address) == 0)
+        {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&rejected_lock);
+    return found;
+}
+
+__attribute__((unused))
+static void blacklist_address(const char *address)
+{
+    pthread_mutex_lock(&rejected_lock);
+    /* Check for duplicate */
+    for (size_t i = 0; i < rejected_count; i++)
+    {
+        if (strcmp(rejected_addresses[i], address) == 0)
+        {
+            pthread_mutex_unlock(&rejected_lock);
+            return;
+        }
+    }
+    if (rejected_count < MAX_REJECTED)
+    {
+        strncpy(rejected_addresses[rejected_count], address, IPV4_ADDR_LEN);
+        rejected_addresses[rejected_count][IPV4_ADDR_LEN] = '\0';
+        rejected_count++;
+    }
+    pthread_mutex_unlock(&rejected_lock);
+}
+
+/****************************
+ * Deferred encrypted message queue (mystery handler)
+ ****************************/
+
+#define MAX_DEFERRED 64
+
+typedef struct {
+    uint8_t data[65507]; /* UDP_PACKET_SIZE */
+    size_t len;
+    char from_addr[IPV4_ADDR_LEN + 1];
+} deferred_msg_t;
+
+static deferred_msg_t deferred_messages[MAX_DEFERRED];
+static size_t deferred_count = 0;
+static pthread_mutex_t deferred_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void defer_message(const uint8_t *data, size_t len, const char *from_addr)
+{
+    pthread_mutex_lock(&deferred_lock);
+    if (deferred_count < MAX_DEFERRED)
+    {
+        size_t idx = deferred_count;
+        if (len > sizeof(deferred_messages[0].data))
+            len = sizeof(deferred_messages[0].data);
+        memcpy(deferred_messages[idx].data, data, len);
+        deferred_messages[idx].len = len;
+        strncpy(deferred_messages[idx].from_addr, from_addr, IPV4_ADDR_LEN);
+        deferred_messages[idx].from_addr[IPV4_ADDR_LEN] = '\0';
+        deferred_count++;
+    }
+    pthread_mutex_unlock(&deferred_lock);
+}
+
+/****************************
+ * Per-peer statistics tracking
+ ****************************/
+
+typedef struct {
+    char address[IPV4_ADDR_LEN + 1];
+    size_t bytes_sent;
+    size_t bytes_recv;
+    size_t send_errors;
+    size_t recv_errors;
+} net_stat_t;
+
+#define MAX_STATS DEFAULT_MAX_PEERS
+static net_stat_t peer_stats[MAX_STATS];
+static size_t stats_count = 0;
+
+static net_stat_t *find_or_create_stat(const char *address)
+{
+    for (size_t i = 0; i < stats_count; i++)
+    {
+        if (strcmp(peer_stats[i].address, address) == 0)
+            return &peer_stats[i];
+    }
+    if (stats_count < MAX_STATS)
+    {
+        net_stat_t *st = &peer_stats[stats_count];
+        memset(st, 0, sizeof(*st));
+        strncpy(st->address, address, IPV4_ADDR_LEN);
+        st->address[IPV4_ADDR_LEN] = '\0';
+        stats_count++;
+        return st;
+    }
+    return NULL;
+}
+
+static void track_send(const char *address, size_t bytes)
+{
+    net_stat_t *st = find_or_create_stat(address);
+    if (st != NULL)
+        st->bytes_sent += bytes;
+}
+
+static void track_send_error(const char *address)
+{
+    net_stat_t *st = find_or_create_stat(address);
+    if (st != NULL)
+        st->send_errors++;
+}
+
+static void track_recv(const char *address, size_t bytes)
+{
+    net_stat_t *st = find_or_create_stat(address);
+    if (st != NULL)
+        st->bytes_recv += bytes;
+}
 
 typedef struct
 {
@@ -279,7 +418,7 @@ int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *msg,
 {
     uint8_t *wire = NULL;
     size_t wire_len = 0;
-    if (net_message_to_wire(msg, &wire, &wire_len) != 0)
+    if (net_message_to_wire(msg, myself, &wire, &wire_len) != 0)
         return -1;
 
     if (msg->to_whom.type == RECIPIENT_BROADCAST)
@@ -290,6 +429,10 @@ int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *msg,
             ret = _send_udp(wire, wire_len, msg->to_whom.target.peer.address, port, logger);
         else
             ret = _send_tcp(wire, wire_len, msg->to_whom.target.peer.address, port, logger);
+        if (ret == 0)
+            track_send(msg->to_whom.target.peer.address, wire_len);
+        else
+            track_send_error(msg->to_whom.target.peer.address);
         free(wire);
         return ret;
     }
@@ -334,6 +477,10 @@ int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *msg,
             ret = _send_udp(frame, frame_len, host, port, logger);
         else
             ret = _send_tcp(frame, frame_len, host, port, logger);
+        if (ret == 0)
+            track_send(host, frame_len);
+        else
+            track_send_error(host);
         free(frame);
         return ret;
     }
@@ -345,6 +492,10 @@ int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *msg,
         ret = _send_udp(wire, wire_len, host, port, logger);
     else
         ret = _send_tcp(wire, wire_len, host, port, logger);
+    if (ret == 0)
+        track_send(host, wire_len);
+    else
+        track_send_error(host);
     free(wire);
     return ret;
 }
@@ -461,6 +612,12 @@ static void *peer_receiver_thread(void *arg)
             if (strcmp(from_addr, my_addr) == 0)
                 continue;
 
+            /* Skip messages from blacklisted addresses */
+            if (reject_message(from_addr))
+                continue;
+
+            track_recv(from_addr, (size_t)nbytes);
+
             const public_identity_t *peer = find_peer_by_address(ctx->proc, from_addr);
             if (peer != NULL)
             {
@@ -496,7 +653,9 @@ static void *peer_receiver_thread(void *arg)
                 }
                 else
                 {
-                    log_debug(ctx->logger, "Encrypted message from unknown peer %s\n", from_addr);
+                    /* Encrypted message from unknown peer — defer for retry */
+                    log_debug(ctx->logger, "Deferred encrypted message from unknown peer %s\n", from_addr);
+                    defer_message(buf, (size_t)nbytes, from_addr);
                 }
             }
         }
@@ -563,6 +722,12 @@ static void *broadcast_receiver_thread(void *arg)
         if (strcmp(from_addr, my_addr) == 0)
             continue;
 
+        /* Skip messages from blacklisted addresses */
+        if (reject_message(from_addr))
+            continue;
+
+        track_recv(from_addr, (size_t)nbytes);
+
         log_info(ctx->logger, "Network: broadcast received %d bytes from %s\n", nbytes, from_addr);
 
         /* Broadcast messages are unencrypted */
@@ -580,6 +745,149 @@ static void *broadcast_receiver_thread(void *arg)
             log_error(ctx->logger, "Network: failed to deserialize broadcast from %s\n", from_addr);
         }
         net_wire_msg_free(&wmsg);
+    }
+    return NULL;
+}
+
+/****************************
+ * Group receiver thread
+ ****************************/
+
+static void *group_receiver_thread(void *arg)
+{
+    net_thread_ctx_t *ctx = (net_thread_ctx_t *)arg;
+    uint8_t buf[UDP_PACKET_SIZE];
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000; /* 0.1 seconds */
+    setsockopt(ctx->socks->recv_grp, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    while (!(*ctx->stop))
+    {
+        char from_addr[IPV4_ADDR_LEN] = {0};
+        int from_port = 0;
+
+        if (ctx->cfg->type == SOCK_DGRAM)
+        {
+            int nbytes = _recv_udp(ctx->socks->recv_grp, buf, sizeof(buf),
+                                   from_addr, sizeof(from_addr), &from_port);
+            if (nbytes == ENOMSG || nbytes < 0)
+                continue;
+
+            log_debug(ctx->logger, "Network: group_recv got %d bytes from %s\n",
+                      nbytes, from_addr);
+
+            /* Skip messages from self */
+            char my_addr[IPV4_ADDR_LEN] = {0};
+            cidr_split(ctx->net_cfg->ip4_cidr, my_addr, NULL);
+            if (strcmp(from_addr, my_addr) == 0)
+                continue;
+
+            /* Skip messages from blacklisted addresses */
+            if (reject_message(from_addr))
+                continue;
+
+            track_recv(from_addr, (size_t)nbytes);
+
+            /* Group messages are encrypted with the group key */
+            group_t *grp = &ctx->proc->protocol.group;
+            if (grp->address[0] == '\0')
+            {
+                log_debug(ctx->logger, "Network: group key not yet available, dropping msg from %s\n",
+                          from_addr);
+                continue;
+            }
+
+            /* Decrypt using group key: frame = nonce + ciphertext */
+            if ((size_t)nbytes <= crypto_box_NONCEBYTES + crypto_box_MACBYTES)
+            {
+                log_error(ctx->logger, "Network: group message too short from %s\n", from_addr);
+                continue;
+            }
+
+            const unsigned char *nonce = buf;
+            const unsigned char *cipher = buf + crypto_box_NONCEBYTES;
+            size_t cipher_len = (size_t)nbytes - crypto_box_NONCEBYTES;
+            size_t plain_len = cipher_len - crypto_box_MACBYTES;
+
+            unsigned char *plain = malloc(plain_len);
+            if (plain == NULL)
+                continue;
+
+            msg_str_t cmsg = {.msg = (unsigned char *)cipher, .len = cipher_len};
+            int dec_ret = group_decrypt(grp, &cmsg, grp, nonce, plain);
+            if (dec_ret != 0)
+            {
+                free(plain);
+                log_error(ctx->logger, "Network: group decrypt failed (%d) from %s\n",
+                          dec_ret, from_addr);
+                continue;
+            }
+
+            net_wire_msg_t wmsg;
+            if (net_message_from_wire(plain, plain_len, NULL, &wmsg) == 0)
+            {
+                strncpy(wmsg.from_whom.address, from_addr, ADDR_LEN);
+                route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+            }
+            free(plain);
+            net_wire_msg_free(&wmsg);
+        }
+        else
+        {
+            /* TCP */
+            uint8_t *data = NULL;
+            size_t data_len = 0;
+            int ret = _recv_tcp(ctx->socks->recv_grp, &data, &data_len,
+                                from_addr, sizeof(from_addr), &from_port);
+            if (ret == ENOMSG || ret < 0)
+                continue;
+
+            char my_addr[IPV4_ADDR_LEN] = {0};
+            cidr_split(ctx->net_cfg->ip4_cidr, my_addr, NULL);
+            if (strcmp(from_addr, my_addr) == 0)
+            {
+                free(data);
+                continue;
+            }
+
+            if (reject_message(from_addr))
+            {
+                free(data);
+                continue;
+            }
+
+            track_recv(from_addr, data_len);
+
+            group_t *grp = &ctx->proc->protocol.group;
+            if (grp->address[0] != '\0' &&
+                data_len > crypto_box_NONCEBYTES + crypto_box_MACBYTES)
+            {
+                const unsigned char *nonce = data;
+                const unsigned char *cipher = data + crypto_box_NONCEBYTES;
+                size_t cipher_len = data_len - crypto_box_NONCEBYTES;
+                size_t plain_len = cipher_len - crypto_box_MACBYTES;
+
+                unsigned char *plain = malloc(plain_len);
+                if (plain != NULL)
+                {
+                    msg_str_t cmsg = {.msg = (unsigned char *)cipher, .len = cipher_len};
+                    if (group_decrypt(grp, &cmsg, grp, nonce, plain) == 0)
+                    {
+                        net_wire_msg_t wmsg;
+                        if (net_message_from_wire(plain, plain_len, NULL, &wmsg) == 0)
+                        {
+                            strncpy(wmsg.from_whom.address, from_addr, ADDR_LEN);
+                            route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+                        }
+                        net_wire_msg_free(&wmsg);
+                    }
+                    free(plain);
+                }
+            }
+            free(data);
+        }
     }
     return NULL;
 }
@@ -781,7 +1089,28 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
             log_exception(logger);
             return -1;
         }
-        /* TODO: setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, req); */
+        if (ipv6) {
+            struct ipv6_mreq mreq6;
+            memcpy(&mreq6.ipv6mr_multiaddr,
+                   &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr,
+                   sizeof(mreq6.ipv6mr_multiaddr));
+            mreq6.ipv6mr_interface = 0;
+            err = setsockopt(socks.recv_cast, IPPROTO_IPV6, IPV6_JOIN_GROUP,
+                             &mreq6, sizeof(mreq6));
+        } else {
+            struct ip_mreq mreq4;
+            mreq4.imr_multiaddr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+            mreq4.imr_interface.s_addr = htonl(INADDR_ANY);
+            err = setsockopt(socks.recv_cast, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                             &mreq4, sizeof(mreq4));
+        }
+        if (err != 0) {
+            network_shutdown(&socks);
+            SYS_EXCEPTION();
+            log_exception(logger);
+            freeaddrinfo(res);
+            return -1;
+        }
         freeaddrinfo(res);
     }
     else
@@ -878,9 +1207,10 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
         .ipv6 = ipv6,
     };
 
-    pthread_t peer_thread, bcast_thread;
+    pthread_t peer_thread, bcast_thread, grp_thread;
     pthread_create(&peer_thread, NULL, peer_receiver_thread, &thread_ctx);
     pthread_create(&bcast_thread, NULL, broadcast_receiver_thread, &thread_ctx);
+    pthread_create(&grp_thread, NULL, group_receiver_thread, &thread_ctx);
 
     /* Network-specific message loop: handle outbound sends */
     char bcast_addr[IPV4_ADDR_LEN] = {0};
@@ -969,6 +1299,47 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
                     proc->protocol.num_peers++;
                     log_info(logger, "Network: added peer %s (%s) for encrypted messaging\n",
                              new_peer->fullname, new_peer->address);
+
+                    /* Retry deferred encrypted messages with the new peer */
+                    pthread_mutex_lock(&deferred_lock);
+                    size_t remaining = 0;
+                    for (size_t di = 0; di < deferred_count; di++)
+                    {
+                        deferred_msg_t *dm = &deferred_messages[di];
+                        if (strcmp(dm->from_addr, new_peer->address) == 0)
+                        {
+                            uint8_t *plain = NULL;
+                            size_t plain_len = 0;
+                            if (decrypt_message(myself, new_peer, dm->data, dm->len,
+                                                &plain, &plain_len) == 0)
+                            {
+                                net_wire_msg_t wmsg;
+                                if (net_message_from_wire(plain, plain_len, new_peer, &wmsg) == 0)
+                                {
+                                    route_to_process(&wmsg, proc, queues, logger);
+                                    log_info(logger, "Network: replayed deferred message from %s\n",
+                                             dm->from_addr);
+                                }
+                                free(plain);
+                                net_wire_msg_free(&wmsg);
+                            }
+                            else
+                            {
+                                /* Still can't decrypt, keep it */
+                                if (remaining != di)
+                                    deferred_messages[remaining] = *dm;
+                                remaining++;
+                            }
+                        }
+                        else
+                        {
+                            if (remaining != di)
+                                deferred_messages[remaining] = *dm;
+                            remaining++;
+                        }
+                    }
+                    deferred_count = remaining;
+                    pthread_mutex_unlock(&deferred_lock);
                 }
             }
         }
@@ -989,6 +1360,7 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
     stop = true;
     pthread_join(peer_thread, NULL);
     pthread_join(bcast_thread, NULL);
+    pthread_join(grp_thread, NULL);
     network_shutdown(&socks);
     if (my_public != NULL)
         smrt_deref(my_public);

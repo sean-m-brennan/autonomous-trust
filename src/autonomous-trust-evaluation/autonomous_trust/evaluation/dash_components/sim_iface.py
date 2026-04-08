@@ -93,13 +93,14 @@ class SimulationInterface(CohortInterface):
         """May be called only once per timestep, i.e. synced with UI; does not use state data"""
         state = self.queue.get()
         for obj in self.sync_objects:
-            obj.update()  # FIXME also sync paused
+            obj.update()
+            obj.paused = self.paused
         for handler in self.update_handlers:
             handler(state)
         if state.blank:
             self.logger.debug('Sim update; reset %s' % state.blank)
             self.paused = True
-            for obj in self.sync_objects:  # FIXME
+            for obj in self.sync_objects:
                 obj.paused = self.paused
             self.can_reset = True
             for handler in self.end_handlers:

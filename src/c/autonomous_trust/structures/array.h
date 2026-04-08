@@ -31,6 +31,20 @@ typedef struct array_s array_t;
  * @param a
  * @return int
  */
+/*@
+  requires \valid(a);
+  assigns a->size, a->array;
+  behavior success:
+    assumes \is_allocable(sizeof(data_t));
+    ensures \result == 0;
+    ensures a->size == 0;
+    ensures a->array != \null;
+  behavior failure:
+    assumes !\is_allocable(sizeof(data_t));
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int array_init(array_t *a);
 
 /**
@@ -39,6 +53,24 @@ int array_init(array_t *a);
  * @param a_ptr
  * @return int 0 on success, or error codes: EINVAL(bad pointer), ENOMEM (failed alloc)
  */
+/*@
+  requires \valid(a_ptr);
+  allocates *a_ptr;
+  assigns *a_ptr;
+  behavior null_ptr:
+    assumes a_ptr == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes a_ptr != \null && \is_allocable(sizeof(array_t));
+    ensures \result == 0;
+    ensures *a_ptr != \null;
+    ensures \fresh(*a_ptr, sizeof(array_t));
+    ensures (*a_ptr)->size == 0;
+  behavior failure:
+    assumes a_ptr != \null && !\is_allocable(sizeof(array_t));
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int array_create(array_t **a_ptr);
 
 /**
@@ -48,6 +80,23 @@ int array_create(array_t **a_ptr);
  * @param cpy_ptr
  * @return int
  */
+/*@
+  requires \valid(a);
+  requires \valid(cpy);
+  assigns cpy->size, cpy->array;
+  behavior success:
+    assumes \is_allocable(a->size * sizeof(data_t));
+    ensures \result == 0;
+    ensures cpy->size == a->size;
+    ensures cpy->array != \null;
+  behavior null_input:
+    assumes a == \null;
+    ensures \result != 0;
+  behavior failure:
+    assumes a != \null && !\is_allocable(a->size * sizeof(data_t));
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int array_copy(array_t *a, array_t *cpy);
 
 /**
@@ -58,6 +107,18 @@ int array_copy(array_t *a, array_t *cpy);
  * @return Success (0) or error code.
  *
  */
+/*@
+  requires \valid(a);
+  requires \valid(element);
+  assigns a->size, a->array;
+  behavior success:
+    ensures \result == 0;
+    ensures a->size == \old(a->size) + 1;
+  behavior failure:
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int array_append(array_t *a, data_t *element);
 
 /**
@@ -67,6 +128,19 @@ int array_append(array_t *a, data_t *element);
  * @param element Pointer to data.
  * @return Index of element or -1 if not present.
  */
+/*@
+  requires \valid(a);
+  requires \valid(element);
+  assigns \nothing;
+  ensures \result >= -1;
+  ensures \result < (int)a->size;
+  behavior found:
+    ensures \result >= 0 && \result < (int)a->size;
+  behavior not_found:
+    ensures \result == -1;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int array_find(array_t *a, data_t *element);
 
 /**
@@ -76,6 +150,19 @@ int array_find(array_t *a, data_t *element);
  * @param filter Pointer to function.
  * @return Index of first element that satisfies filter or -1 if none present.
  */
+/*@
+  requires \valid(a);
+  requires filter != \null;
+  assigns \nothing;
+  ensures \result >= -1;
+  ensures \result < (int)a->size;
+  behavior found:
+    ensures \result >= 0 && \result < (int)a->size;
+  behavior not_found:
+    ensures \result == -1;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int array_filter(array_t *a, bool (*filter)(data_t *));
 
 /**
@@ -85,6 +172,12 @@ int array_filter(array_t *a, bool (*filter)(data_t *));
  * @param element Pointer to data.
  * @return True/false
  */
+/*@
+  requires \valid(a);
+  requires \valid(element);
+  assigns \nothing;
+  ensures \result == true || \result == false;
+*/
 bool array_contains(array_t *a, data_t *element);
 
 /**
@@ -92,6 +185,12 @@ bool array_contains(array_t *a, data_t *element);
  *
  * @return size_t
  */
+/*@
+  requires \valid(a);
+  assigns \nothing;
+  ensures \result == a->size;
+  ensures \result >= 0;
+*/
 size_t array_size();
 
 /**
@@ -120,6 +219,22 @@ size_t array_size();
  * @param element Pointer to data
  * @return int Success (0) or not present (-1)
  */
+/*@
+  requires \valid(a);
+  requires \valid(element);
+  assigns *element;
+  behavior in_bounds:
+    assumes (index >= 0 && (size_t)index < a->size) ||
+            (index < 0 && (size_t)(-index) <= a->size);
+    ensures \result == 0;
+    ensures *element != \null;
+  behavior out_of_bounds:
+    assumes (index >= 0 && (size_t)index >= a->size) ||
+            (index < 0 && (size_t)(-index) > a->size);
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int array_get(array_t *a, int index, data_t **element);
 
 /**
@@ -130,6 +245,25 @@ int array_get(array_t *a, int index, data_t **element);
  * @param element Pointer to data.
  * @return Success (0) or error code.
  */
+/*@
+  requires \valid(a);
+  requires \valid(element);
+  assigns a->size, a->array;
+  behavior in_bounds:
+    assumes (index >= 0 && (size_t)index <= a->size) ||
+            (index < 0 && (size_t)(-index) <= a->size);
+    ensures \result == 0;
+    ensures (size_t)\old(index) == \old(a->size) ==>
+            a->size == \old(a->size) + 1;
+    ensures (size_t)\old(index) < \old(a->size) ==>
+            a->size == \old(a->size);
+  behavior out_of_bounds:
+    assumes (index >= 0 && (size_t)index > a->size) ||
+            (index < 0 && (size_t)(-index) > a->size);
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int array_set(array_t *a, int index, data_t *element);
 
 /**
@@ -139,6 +273,20 @@ int array_set(array_t *a, int index, data_t *element);
  * @param element Pointer to data.
  * @return Success (0) or error code.
  */
+/*@
+  requires \valid(a);
+  requires \valid(element);
+  assigns a->size, a->array;
+  behavior found:
+    assumes array_find(a, element) >= 0;
+    ensures \result == 0;
+    ensures a->size == \old(a->size) - 1;
+  behavior not_found:
+    assumes array_find(a, element) < 0;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int array_remove(array_t *a, data_t *element);
 
 /**
@@ -146,6 +294,14 @@ int array_remove(array_t *a, data_t *element);
  *
  * @param array Pointer to array.
  */
+/*@
+  requires \valid(a);
+  requires a->array != \null;
+  assigns a->size, a->array;
+  frees a->array, a;
+  ensures a->array == \null;
+  ensures a->size == 0;
+*/
 void array_free(array_t *a);
 
 /**

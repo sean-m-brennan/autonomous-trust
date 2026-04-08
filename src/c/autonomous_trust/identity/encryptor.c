@@ -22,6 +22,13 @@
 #include "identity_priv.h"
 #include "utilities/exception.h"
 
+/*@
+  requires \valid(encr);
+  requires \valid_read(hex_seed + (0 .. crypto_box_PUBLICKEYBYTES * 2 - 1));
+  assigns encr->private[0 .. crypto_box_SECRETKEYBYTES - 1],
+          encr->public[0 .. crypto_box_PUBLICKEYBYTES - 1],
+          encr->public_hex[0 .. crypto_box_PUBLICKEYBYTES * 2];
+*/
 void public_encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
 {
     memset(encr->private, 0, sizeof(encr->private));
@@ -29,6 +36,13 @@ void public_encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
     hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char *)encr->public_hex);
 }
 
+/*@
+  requires \valid(encr);
+  requires \valid_read(hex_seed + (0 .. crypto_box_SEEDBYTES * 2 - 1));
+  assigns encr->private[0 .. crypto_box_SECRETKEYBYTES - 1],
+          encr->public[0 .. crypto_box_PUBLICKEYBYTES - 1],
+          encr->public_hex[0 .. crypto_box_PUBLICKEYBYTES * 2];
+*/
 void encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
 {
     unsigned char seed[crypto_box_SEEDBYTES];
@@ -38,6 +52,13 @@ void encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
     hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char *)encr->public_hex);
 }
 
+/*@
+  requires \valid(encr);
+  allocates \result;
+  assigns \nothing;
+  ensures \result == \null ||
+          \valid(\result + (0 .. crypto_box_PUBLICKEYBYTES * 2 - 1));
+*/
 unsigned char *encryptor_publish(const encryptor_t *encr)
 {
     unsigned char *hex = malloc(crypto_box_PUBLICKEYBYTES * 2);
@@ -50,6 +71,12 @@ unsigned char *encryptor_publish(const encryptor_t *encr)
     return hex;
 }
 
+/*@
+  allocates \result;
+  assigns \nothing;
+  ensures \result == \null ||
+          \valid(\result + (0 .. crypto_box_SEEDBYTES * 2 - 1));
+*/
 unsigned char *encryptor_generate()
 {
     unsigned char key[crypto_box_SEEDBYTES];

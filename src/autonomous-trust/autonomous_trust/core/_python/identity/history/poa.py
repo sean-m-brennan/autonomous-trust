@@ -35,7 +35,7 @@ class IdentityByAuthority(AgreementByAuthority, IdentityHistory):
         return super().prove(blob)
 
     def _pre_verify(self, blob: IdentityObj, proof: AgreementProof, sig):
-        if not self.verify_object(blob, proof, sig):  # FIXME blob.validate(proof, sig)
+        if not self.verify_object(blob, proof, sig):
             return False
         return True
 

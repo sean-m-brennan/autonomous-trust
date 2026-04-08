@@ -32,6 +32,15 @@ typedef struct {
     bool flexible;
 } task_t;
 
+/*@
+  requires \valid(task);
+  assigns \nothing;
+  behavior success:
+    ensures \result == 0;
+  behavior no_capability:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int task_run(task_t *task);
 
 #endif  // TASK_H

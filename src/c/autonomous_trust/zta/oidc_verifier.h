@@ -33,6 +33,12 @@ extern "C" {
  * @param out Output: newly allocated verifier (caller must destroy)
  * @return 0 on success
  */
+/*@
+  requires \valid(out);
+  allocates *out;
+  ensures \result == 0;
+  ensures *out != \null;
+*/
 int oidc_verifier_create(zta_verifier_t **out);
 
 #ifdef __cplusplus

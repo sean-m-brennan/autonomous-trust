@@ -367,6 +367,7 @@ class TestHandleTransactionDeeper:
         msg = Message(CfgIds.reputation, ReputationProtocol.transaction,
                       to_yaml_string(((id1, id2, peer.uuid), score)),
                       from_whom=peer)
+        msg.verified = True  # simulate signed message (mock peer can't sign)
         result = rp.handle_transaction({CfgIds.network: net_q}, msg)
         assert result is True
         assert idx not in rp.requests
@@ -413,6 +414,7 @@ class TestHandleAcceptedDeeper:
         msg = Message(CfgIds.reputation, ReputationProtocol.accepted,
                       to_yaml_string((id1, id2, peer1.uuid)),
                       from_whom=peer1)
+        msg.verified = True  # simulate signed message (mock peer can't sign)
         rp.handle_accepted(None, msg)
         # 1 acceptance > 1//2=0, so transaction should be committed
         assert len(rp.history) > 0
@@ -982,6 +984,7 @@ class TestHandleAcceptedDeeper2:
         msg = Message(CfgIds.reputation, ReputationProtocol.accepted,
                       to_yaml_string((id1, id2, peer1.uuid)),
                       from_whom=peer1)
+        msg.verified = True  # simulate signed message (mock peer can't sign)
         result = rp.handle_accepted(None, msg)
         assert result is True
         # 1 acceptance > 1//2=0, so history should have been updated
