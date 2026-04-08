@@ -98,11 +98,11 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
         return false;
     }
 
-    double id1 = json_real_value(j_id1);
-    double id2 = json_real_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
 
-    double out_last_id = 0.0;
+    int64_t out_last_id = 0;
     int out_chain_len = 0;
     paxos_response_t result = paxos_handle_request(&rep_state.paxos, id1, id2,
                                                    &out_last_id, &out_chain_len);
@@ -113,10 +113,10 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     {
         /* Build grant payload: (id1, id2, peer_uuid, last_id, chain_len) */
         json_t *grant_json = json_object();
-        json_object_set_new(grant_json, "id1", json_real(id1));
-        json_object_set_new(grant_json, "id2", json_real(id2));
+        json_object_set_new(grant_json, "id1", json_integer(id1));
+        json_object_set_new(grant_json, "id2", json_integer(id2));
         json_object_set_new(grant_json, "peer_uuid", json_string(peer_uuid_str));
-        json_object_set_new(grant_json, "last_id", json_real(out_last_id));
+        json_object_set_new(grant_json, "last_id", json_integer(out_last_id));
         json_object_set_new(grant_json, "chain_len", json_integer(out_chain_len));
 
         generic_msg_t grant = {0};
@@ -136,8 +136,8 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     {
         /* BACKDATE: chain index mismatch */
         json_t *bd_json = json_object();
-        json_object_set_new(bd_json, "id1", json_real(id1));
-        json_object_set_new(bd_json, "id2", json_real(id2));
+        json_object_set_new(bd_json, "id1", json_integer(id1));
+        json_object_set_new(bd_json, "id2", json_integer(id2));
 
         generic_msg_t backdate = {0};
         backdate.type = NET_MESSAGE;
@@ -156,8 +156,8 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     {
         /* NACK: id1 <= last_id */
         json_t *nack_json = json_object();
-        json_object_set_new(nack_json, "id1", json_real(id1));
-        json_object_set_new(nack_json, "id2", json_real(id2));
+        json_object_set_new(nack_json, "id1", json_integer(id1));
+        json_object_set_new(nack_json, "id2", json_integer(id2));
 
         generic_msg_t nack = {0};
         nack.type = NET_MESSAGE;
@@ -205,8 +205,8 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
         return false;
     }
 
-    double id1 = json_real_value(j_id1);
-    double id2 = json_real_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
 
     pthread_mutex_lock(&rep_state.lock);
@@ -249,8 +249,8 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
     {
         /* Broadcast REP_PROTO_TX to all peers */
         json_t *tx_json = json_object();
-        json_object_set_new(tx_json, "id1", json_real(id1));
-        json_object_set_new(tx_json, "id2", json_real(id2));
+        json_object_set_new(tx_json, "id1", json_integer(id1));
+        json_object_set_new(tx_json, "id2", json_integer(id2));
         json_object_set_new(tx_json, "peer_uuid", json_string(peer_uuid_str));
         json_object_set_new(tx_json, "score", json_real(tx_score));
         if (task_uuid_str[0] != '\0')
@@ -288,13 +288,13 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
 
     /* Unpack (id1, id2) from payload for retry capability */
     json_t *payload = NULL;
-    double id1 = 0.0, id2 = 0.0;
+    int64_t id1 = 0, id2 = 0;
     if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL)
     {
         json_t *j_id1 = json_object_get(payload, "id1");
         json_t *j_id2 = json_object_get(payload, "id2");
-        if (j_id1) id1 = json_real_value(j_id1);
-        if (j_id2) id2 = json_real_value(j_id2);
+        if (j_id1) id1 = json_integer_value(j_id1);
+        if (j_id2) id2 = json_integer_value(j_id2);
         json_decref(payload);
     }
 
@@ -359,8 +359,8 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
         return false;
     }
 
-    double id2 = json_real_value(j_id2);
-    double id1 = json_real_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
     double score = json_real_value(j_score);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
     const char *task_uuid_str = json_string_value(json_object_get(payload, "task_uuid"));
@@ -378,8 +378,8 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
 
     /* Send ACCEPTED back */
     json_t *acc_json = json_object();
-    json_object_set_new(acc_json, "id1", json_real(id1));
-    json_object_set_new(acc_json, "id2", json_real(id2));
+    json_object_set_new(acc_json, "id1", json_integer(id1));
+    json_object_set_new(acc_json, "id2", json_integer(id2));
     json_object_set_new(acc_json, "peer_uuid", json_string(peer_uuid_str));
     if (task_uuid_str)
         json_object_set_new(acc_json, "task_uuid", json_string(task_uuid_str));
@@ -427,13 +427,13 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
         return false;
     }
 
-    double id1 = json_real_value(j_id1);
-    double id2 = json_real_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
 
     /* Look up score from paxos proposals */
     char paxos_key[PAXOS_KEY_LEN];
-    snprintf(paxos_key, sizeof(paxos_key), "%.0f:%.0f", id1, id2);
+    paxos_id_index(paxos_key, sizeof(paxos_key), id1, id2);
 
     pthread_mutex_lock(&rep_state.paxos.lock);
     data_t *prop_dat = NULL;
@@ -807,7 +807,7 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
     pthread_mutex_unlock(&rep_state.lock);
 
     /* Compute Paxos IDs via shared engine */
-    double id1, id2;
+    int64_t id1, id2;
     paxos_next_ids(&rep_state.paxos, &id1, &id2);
 
     /* Get identity UUID for the request */
@@ -827,8 +827,8 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
 
         /* Pack (id1, id2, identity_uuid) as JSON into the request */
         json_t *req_json = json_object();
-        json_object_set_new(req_json, "id1", json_real(id1));
-        json_object_set_new(req_json, "id2", json_real(id2));
+        json_object_set_new(req_json, "id1", json_integer(id1));
+        json_object_set_new(req_json, "id2", json_integer(id2));
         json_object_set_new(req_json, "peer_uuid", json_string(identity_uuid));
         net_msg_pack_json(&req.info.net_msg, req_json);
         json_decref(req_json);

@@ -52,7 +52,8 @@ class Net(object):
                 sock.close()
                 raise ReceiveError(str(err))
             if len(new_data) == 0:
-                raise ReceiveError('No data')  # FIXME need to reconnect
+                sock.close()
+                raise ReceiveError('No data, connection closed')
             data += new_data
         if self.logger is not None and self.verbose:
             self.logger.debug('Recv %s' % data)
@@ -86,8 +87,10 @@ class Client(Net):
             tmo = True
         try:
             data = self.sock.recv(1, flags)
-            #if len(data) == 0:  # FIXME what if there's no data en-route?
-            #    return False
+            # An empty recv with MSG_PEEK can mean the remote closed, but it
+            # can also occur when no data is currently in-flight.  We cannot
+            # distinguish reliably, so treat it as "still connected" and let
+            # subsequent send/recv operations detect an actual disconnect.
         except BlockingIOError:
             return True  # socket is open, and reading from it would block
         except TimeoutError:

@@ -242,12 +242,14 @@ class ProcessLogger(object):
         self.log(LogLevel.CRITICAL, msg)
 
 
-class Mockery(object):  # FIXME move to testing
-    def __init__(self, name, obj=None, value=None):
+class Mockery(object):
+    """Test mock wrapper for Process.mocks (kept here due to Process dependency)."""
+
+    def __init__(self, name, obj=None, value=None, assert_fn=None):
         self.name = name
         self.obj = obj
         self.value = value
-        # FIXME assert
+        self.assert_fn = assert_fn
 
     def patch(self, mocker):
         if self.obj is None:
@@ -259,4 +261,5 @@ class Mockery(object):  # FIXME move to testing
                 mocker.patch.object(self.obj, self.name, return_value=self.value)
 
     def assertion(self):
-        pass  # FIXME
+        if self.assert_fn is not None:
+            self.assert_fn()

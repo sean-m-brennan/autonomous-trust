@@ -52,6 +52,7 @@ class PeerDataAcq(object):
         self.data_stream = data_stream
         self.active = False
         self.network_history: dict[str, deque[NetworkStats]] = {}
+        self.total_network_history: deque[NetworkStats] = deque(maxlen=self.max_history)
         self.reputation_history: deque[float] = deque(maxlen=self.max_history)
 
     @property
@@ -153,7 +154,8 @@ class Cohort(CohortInterface):
         pass
 
     def acquire_data(self):
-        pass  # FIXME trouble??
+        # TODO implement live data acquisition from peer queues
+        self.logger.warning('Cohort.acquire_data is not yet implemented; no live data will be collected')
 
     def update_group(self, group_ids: dict[str, Identity]):
         for idx, uuid in enumerate(group_ids):
@@ -209,12 +211,15 @@ class CohortTracker(Process, metaclass=ProcMeta,
 
     def handle_stats(self, _, message):
         if message.function == CohortProtocol.stats:
-            data = from_json_string(message.obj)  # FIXME 'total' also
+            data = from_json_string(message.obj)
             uuid = message.from_whom.uuid
             if uuid in self.cohort.peers:
                 peer = self.cohort.peers[uuid]
-                for uuid in data:
-                    peer.network_history[uuid].append(data[uuid])
+                total = data.pop('total', None)
+                if total is not None:
+                    peer.total_network_history.append(total)
+                for peer_uuid in data:
+                    peer.network_history[peer_uuid].append(data[peer_uuid])
             return True
         return False
 
@@ -244,8 +249,8 @@ class CohortTracker(Process, metaclass=ProcMeta,
                     self.cohort.update_group(peer_idents)
                 elif not self.protocol.run_message_handlers(queues, message):
                     if isinstance(message, Message):
-                        self.logger.error('Unhandled message %s' % message.function)
+                        self.logger.error(f'Unhandled message {message.function}')
                     else:
-                        self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                        self.logger.error(f'Unhandled message of type {message.__class__.__name__}')  # noqa
 
             self.sleep_until(self.cadence)

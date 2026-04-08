@@ -28,6 +28,10 @@
 #include "negotiation/task.pb-c.h"
 #include "google/protobuf/any.pb-c.h"
 
+/*@
+  assigns \nothing;
+  ensures \result >= 0;
+*/
 size_t message_size(message_type_t type)
 {
     switch (type)
@@ -39,7 +43,7 @@ size_t message_size(message_type_t type)
     case PEER:
         return sizeof(public_identity_t);
     case PEER_CAPABILITIES:
-        return sizeof(capability_t) * MAX_PEERS * MAX_CAPABILITIES;
+        return sizeof(capability_t) * DEFAULT_MAX_PEERS * MAX_CAPABILITIES;
     case NET_MESSAGE:
         return sizeof(net_msg_t);
     case TASK:
@@ -66,6 +70,11 @@ size_t message_size(message_type_t type)
     }
 }
 
+/*@
+  assigns \nothing;
+  ensures \result != \null;
+  ensures \valid_read(\result);
+*/
 char *message_type_to_string(message_type_t type)
 {
     switch (type)
@@ -105,6 +114,10 @@ char *message_type_to_string(message_type_t type)
     }
 }
 
+/*@
+  requires str != \null && \valid_read(str);
+  assigns \nothing;
+*/
 message_type_t string_to_message_type(const char *str)
 {
     if (strcmp(str, "SIGNAL") == 0)

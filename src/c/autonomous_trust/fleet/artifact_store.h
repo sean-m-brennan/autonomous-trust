@@ -38,46 +38,100 @@ typedef struct {
 
 /* Initialize the store: create artifacts directory under data_dir if needed.
    data_dir is typically "$AUTONOMOUS_TRUST_ROOT/var/at". */
+/*@
+  requires data_dir != \null && \valid_read(data_dir);
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int artifact_store_init(const char *data_dir);
 
-/* Check if a complete, verified artifact exists for this hash. */
+/*@
+  requires hash_hex != \null && \valid_read(hash_hex);
+  assigns \nothing;
+  ensures \result == \true || \result == \false;
+*/
 bool artifact_store_has(const char *hash_hex);
 
-/* Save manifest JSON for an artifact being downloaded. */
+/*@
+  requires \valid(manifest);
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int artifact_store_save_manifest(const artifact_manifest_t *manifest);
 
-/* Load manifest from disk for a previously-seen artifact. */
+/*@
+  requires hash_hex != \null && \valid_read(hash_hex);
+  requires \valid(manifest);
+  assigns *manifest;
+  ensures \result == 0 || \result == -1;
+*/
 int artifact_store_load_manifest(const char *hash_hex, artifact_manifest_t *manifest);
 
-/* Save a single chunk to disk. */
+/*@
+  requires hash_hex != \null && \valid_read(hash_hex);
+  requires chunk_index >= 0;
+  requires \valid_read(data + (0 .. len - 1));
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int artifact_store_save_chunk(const char *hash_hex, int chunk_index,
                               const uint8_t *data, size_t len);
 
-/* Read a single chunk from disk (for serving to requesting peers). */
+/*@
+  requires hash_hex != \null && \valid_read(hash_hex);
+  requires chunk_index >= 0;
+  requires \valid(buf + (0 .. buflen - 1));
+  requires \valid(out_len);
+  assigns buf[0 .. buflen - 1], *out_len;
+  ensures \result == 0 || \result == -1;
+*/
 int artifact_store_read_chunk(const char *hash_hex, int chunk_index,
                               uint8_t *buf, size_t buflen, size_t *out_len);
 
-/* Check if a specific chunk file exists on disk. */
+/*@
+  requires hash_hex != \null && \valid_read(hash_hex);
+  requires chunk_index >= 0;
+  assigns \nothing;
+  ensures \result == \true || \result == \false;
+*/
 bool artifact_store_has_chunk(const char *hash_hex, int chunk_index);
 
-/* Count how many chunk files exist for a given hash. */
+/*@
+  requires hash_hex != \null && \valid_read(hash_hex);
+  assigns \nothing;
+  ensures \result >= 0;
+*/
 int artifact_store_chunk_count(const char *hash_hex);
 
-/* Reassemble all chunks, compute blake2b-256 of the whole artifact,
-   compare against expected_hash. Creates 'complete' marker on success.
-   Returns 0 on success, -1 on hash mismatch or I/O error. */
+/*@
+  requires hash_hex != \null && \valid_read(hash_hex);
+  requires \valid_read(expected_hash + (0 .. UPDATE_HASH_LEN - 1));
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int artifact_store_verify(const char *hash_hex, const uint8_t *expected_hash);
 
-/* Get path to the artifact directory (valid after verify succeeds).
-   Returns 0 on success, -1 if artifact is not complete. */
+/*@
+  requires hash_hex != \null && \valid_read(hash_hex);
+  requires \valid(path_buf + (0 .. buflen - 1));
+  assigns path_buf[0 .. buflen - 1];
+  ensures \result == 0 || \result == -1;
+*/
 int artifact_store_get_path(const char *hash_hex, char *path_buf, size_t buflen);
 
-/* Reassemble all chunks into a single file: <artifact_dir>/assembled.
-   Writes the assembled file path to out_path.
-   Returns 0 on success, -1 on error. */
+/*@
+  requires hash_hex != \null && \valid_read(hash_hex);
+  requires \valid(out_path + (0 .. out_path_len - 1));
+  assigns out_path[0 .. out_path_len - 1];
+  ensures \result == 0 || \result == -1;
+*/
 int artifact_store_reassemble(const char *hash_hex, char *out_path, size_t out_path_len);
 
-/* Delete an artifact: all chunk files, manifest, and complete marker. */
+/*@
+  requires hash_hex != \null && \valid_read(hash_hex);
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int artifact_store_delete(const char *hash_hex);
 
 #ifdef __cplusplus

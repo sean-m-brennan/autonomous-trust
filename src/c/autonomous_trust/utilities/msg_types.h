@@ -144,6 +144,10 @@ typedef struct
     } info;
 } generic_msg_t;
 
+/*@
+  assigns \nothing;
+  ensures \result >= 0;
+*/
 size_t message_size(message_type_t type);
 
 

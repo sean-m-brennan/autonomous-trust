@@ -37,9 +37,35 @@ typedef struct {
     uint8_t signature[UPDATE_SIG_LEN];
 } update_proposal_t;
 
+/*@
+  requires \valid(prop);
+  assigns \nothing;
+  ensures \result != \null || \result == \null;
+*/
 json_t *update_proposal_to_json(const update_proposal_t *prop);
+
+/*@
+  requires json != \null;
+  requires \valid(prop);
+  assigns *prop;
+  ensures \result == 0 || \result == -1;
+*/
 int update_proposal_from_json(const json_t *json, update_proposal_t *prop);
+
+/*@
+  requires \valid(prop);
+  requires \valid_read(sk + (0 .. crypto_sign_SECRETKEYBYTES - 1));
+  assigns prop->signature[0 .. UPDATE_SIG_LEN - 1];
+  ensures \result == 0 || \result == -1;
+*/
 int update_proposal_sign(update_proposal_t *prop, const uint8_t *sk);
+
+/*@
+  requires \valid(prop);
+  requires \valid_read(pk + (0 .. crypto_sign_PUBLICKEYBYTES - 1));
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int update_proposal_verify(const update_proposal_t *prop, const uint8_t *pk);
 
 #endif /* UPDATE_PROPOSAL_H */

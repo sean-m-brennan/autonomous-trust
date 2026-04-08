@@ -46,10 +46,27 @@ static double timespec_diff_ms(struct timespec start, struct timespec end)
  * Ping client
  ****************************/
 
-int ping(const char *host, ping_stats_t *stats)
+/*@
+  requires host != \null && \valid_read(host);
+  requires \valid(stats);
+  assigns *stats;
+  behavior success:
+    ensures \result == 0;
+    ensures stats->sent > 0;
+    ensures stats->received >= 0 && stats->received <= stats->sent;
+  behavior timeout:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
+int ping(const char *host, int count, ping_stats_t *stats)
 {
     memset(stats, 0, sizeof(ping_stats_t));
     strncpy(stats->host, host, IPV4_ADDR_LEN);
+    if (count <= 0)
+        count = PING_COUNT;
+    if (count > MAX_PING_COUNT)
+        count = MAX_PING_COUNT;
+    stats->count = count;
 
     /* Sender socket: sends to PING_SND_PORT on the target host */
     int snd_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -100,7 +117,7 @@ int ping(const char *host, ping_stats_t *stats)
 
     int timed_out = 0;
 
-    for (int i = 0; i < PING_COUNT; i++)
+    for (int i = 0; i < count; i++)
     {
         uint32_t seq     = (uint32_t)(i + 1);
         uint32_t net_seq = htonl(seq);
@@ -226,6 +243,10 @@ static void *ping_server_loop(void *arg)
     return NULL;
 }
 
+/*@
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int ping_server_start(void)
 {
     if (ping_server_running)
@@ -241,6 +262,10 @@ int ping_server_start(void)
     return 0;
 }
 
+/*@
+  assigns \nothing;
+  ensures \result == 0;
+*/
 int ping_server_stop(void)
 {
     if (!ping_server_running)

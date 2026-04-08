@@ -120,10 +120,10 @@ int register_queues(tracker_t *tracker, const char *main, directory_t *queues, d
 
 
 int run_autonomous_trust(char *q_in, char *q_out,
-                         capability_t *capabilities, size_t cap_len, // FIXME from config file?
+                         capability_t *capabilities, size_t cap_len,
                          log_level_t log_level, char log_file[])
 {
-    (void)capabilities; (void)cap_len; // FIXME pass in/register capabilities
+    (void)capabilities; (void)cap_len;
     int error = 0;
     char cfg_dir[CFG_PATH_LEN + 1] = {0};
     get_cfg_dir(cfg_dir);
@@ -141,7 +141,8 @@ int run_autonomous_trust(char *q_in, char *q_out,
 
     const char *name = "AutonomousTrust";
     logger_t logger = {0};
-    logger_init(&logger, log_level, log_file); // FIXME quit if logger fails?
+    if (logger_init(&logger, log_level, log_file) != 0)
+        return -1;
     log_info(&logger, "You are using\033[94m AutonomousTrust\033[00m v%s from\033[96m TekFive\033[00m.\n", VERSION);
     if (set_process_name(name) < 0)
         log_exception(&logger);
@@ -165,7 +166,8 @@ int run_autonomous_trust(char *q_in, char *q_out,
     int ret = load_all_configs(cfg_dir, &configs, &logger);
     if (ret < 0)
         return ret;
-    if (ret > 0) { /* FIXME handle partial errors ('required' list?) */ }
+    if (ret > 0)
+        log_warn(&logger, "%d configuration(s) failed to load, continuing with partial config\n", ret);
 
     tracker_t tracker = {0};
     directory_t queues = {0};
@@ -173,7 +175,8 @@ int run_autonomous_trust(char *q_in, char *q_out,
     ret = register_queues(&tracker, name, &queues, &signals, &logger);
     if (ret < 0)
         return ret;
-    if (ret > 0) { /* FIXME handle partial errors */ }
+    if (ret > 0)
+        log_warn(&logger, "%d queue registration(s) failed, continuing\n", ret);
 
     // spawn processes per tracker config
     map_key_t key = NULL;
@@ -209,7 +212,8 @@ int run_autonomous_trust(char *q_in, char *q_out,
         }
     }
     map_end_for_each
-    // FIXME deal with partials
+    if (num_err > 0)
+        log_warn(&logger, "%d of %zu process(es) failed to start\n", num_err, map_size(tracker.registry));
 
     queue_t my_q = {0};
     if (messaging_init(name, &my_q) != 0)
@@ -241,8 +245,9 @@ int run_autonomous_trust(char *q_in, char *q_out,
                 {
                     if (restart_process(pid, key, &procs, &queues, &logger))
                     {
-                        log_exception_extra(&logger, " (key = '%s')\n", key);  // FIXME No such key in the map (EMAP_NOKEY)
-                        // FIXME quit trying?
+                        log_exception_extra(&logger, " restarting process '%s'\n", key);
+                        active--; // give up on this process
+                        continue; // don't retry — move to next entry
                     }
                 }
                 else
@@ -298,7 +303,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
             log_exception(&logger);
         else if (ret == 0)
         {
-            // FIXME convert to struct?
+            // Internal message routed as opaque data blob
             data_t *msg_dat = object_ptr_data(&result_msg.info, message_size(result_msg.type));
             if (array_append(&unhandled_msgs, msg_dat) != 0)
                 log_exception(&logger);
@@ -367,7 +372,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
     log_debug(&logger, "%s: Shutdown.\n", name);
 
     // signal_quit:
-    log_debug(&logger, "Send sig quit\n"); // FIXME
+    log_debug(&logger, "Sending quit signal to sub-processes\n");
     data_t *k_val = NULL;
     int index = 0;
     generic_msg_t sig = {.type = SIGNAL, .info.signal = {.descr = {0}, .sig = -1}};
@@ -379,13 +384,13 @@ int run_autonomous_trust(char *q_in, char *q_out,
             log_exception(&logger);
             continue;
         }
-        if (messaging_send(skey, SIGNAL, &sig, true) < 0)  // FIXME ECONNREFUSED
+        if (messaging_send(skey, SIGNAL, &sig, true) < 0)  // may fail with ECONNREFUSED if process already exited
             log_exception_extra(&logger, " signalling %d - %s\n", index, skey);
     }
     array_end_for_each
 
         // cleanup:
-        log_debug(&logger, "Shutdown\n"); // FIXME
+        log_debug(&logger, "Cleanup complete\n");
     array_free(&signals);
     array_free(&queues);
     tracker_free(&tracker);

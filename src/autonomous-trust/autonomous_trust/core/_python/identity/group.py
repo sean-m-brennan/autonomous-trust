@@ -88,7 +88,11 @@ class Group(InitializableConfig):
         :param nonce: bytes
         :return: bytes
         """
-        return Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)  # TODO decode?
+        plaintext = Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)
+        try:
+            return plaintext.decode('utf-8')
+        except (UnicodeDecodeError, AttributeError):
+            return plaintext
 
     def publish(self):
         return Group(self.uuid, self.addresses, self.nickname, Encryptor(self.encryptor.publish(), True), True)

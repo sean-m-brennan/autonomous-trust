@@ -100,8 +100,8 @@ class UDPNetworkProcess(NetworkProcess):
 
     def send_peer(self, msg, host):
         if len(msg) > self.packet_size:
-            self.logger.warning(f"UDP message truncated from {len(msg)} to {self.packet_size - 1} bytes")
-            msg = msg[:self.packet_size-1]
+            raise TransmissionError(
+                f"Message too large for UDP ({len(msg)} > {self.packet_size} bytes)")
         self._send_udp(msg, host, self.port)
 
     def send_group(self, msg, host):

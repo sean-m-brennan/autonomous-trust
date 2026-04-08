@@ -160,21 +160,23 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_paxos_id_index)
 {
-    /* Basic combination: 5 + 3/10 = 5.3 */
-    double r = paxos_id_index(5.0, 3.0);
-    ck_assert_double_eq_tol(r, 5.3, 0.001);
+    char buf[PAXOS_KEY_LEN];
 
-    /* id2 = 0 → just id1 */
-    r = paxos_id_index(7.0, 0.0);
-    ck_assert_double_eq_tol(r, 7.0, 0.001);
+    /* Basic string key */
+    paxos_id_index(buf, sizeof(buf), 5, 3);
+    ck_assert_str_eq(buf, "5:3");
 
-    /* Multi-digit id2: 1 + 42/100 = 1.42 */
-    r = paxos_id_index(1.0, 42.0);
-    ck_assert_double_eq_tol(r, 1.42, 0.001);
+    /* id2 = 0 */
+    paxos_id_index(buf, sizeof(buf), 7, 0);
+    ck_assert_str_eq(buf, "7:0");
 
-    /* id2 < 1: 10 + 0.5/10 = 10.05 */
-    r = paxos_id_index(10.0, 0.5);
-    ck_assert_double_eq_tol(r, 10.05, 0.001);
+    /* Multi-digit id2 */
+    paxos_id_index(buf, sizeof(buf), 1, 42);
+    ck_assert_str_eq(buf, "1:42");
+
+    /* Large id1 (timestamp-like) */
+    paxos_id_index(buf, sizeof(buf), 1712345678000LL, 5);
+    ck_assert_str_eq(buf, "1712345678000:5");
 }
 END_TEST_DEFINITION()
 

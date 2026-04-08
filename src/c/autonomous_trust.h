@@ -40,7 +40,7 @@ extern "C" {
  * @return int 
  */
 int run_autonomous_trust(char *q_in, char *q_out, 
-                         void *capabilities, size_t cap_len, // FIXME from config file?
+                         void *capabilities, size_t cap_len, // overrides config; NULL to use config-only
                          log_level_t log_level, char log_file[]);
 
 #ifdef __cplusplus

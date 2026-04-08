@@ -19,8 +19,9 @@ import os
 import pytest
 import yaml
 
-_RT_DIR = os.path.join(os.path.dirname(__file__), '..', '..',
-                       'autonomous_trust', 'simulator', 'redteam')
+_RT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', '..',
+                       'autonomous-trust-evaluation',
+                       'autonomous_trust', 'evaluation', 'redteam')
 ABILITIES_DIR = os.path.join(_RT_DIR, 'caldera_abilities')
 PROFILES_DIR = os.path.join(_RT_DIR, 'adversary_profiles')
 

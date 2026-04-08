@@ -150,7 +150,10 @@ class AgreementProtocol(VoterTracker):
             if proof.uuid not in voters:
                 continue
             voter = voters[proof.uuid]
-            #if voter.verify(proof, sig):  # properly signed proof  # FIXME The signature must be exactly 64 bytes long
+            try:
+                voter.verify(bytes(proof), sig)
+            except Exception:
+                continue  # skip votes with invalid signatures
             approvals.append(self._count_vote(id_obj, proof, voter))
         del self._votes[blob.uuid]
         return self._accumulate_votes(approvals)

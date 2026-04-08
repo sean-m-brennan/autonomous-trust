@@ -125,7 +125,6 @@ def ping(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0) -
         for seq_num in range(1, count+1):
             init = now()
             sent = sock.sendto(data, (host, ping_rcv_port))
-            # FIXME this function needs a logger parameter; using print as a stopgap
             logging.getLogger(__name__).debug('Ping %s:%s from %s' % (host, ping_rcv_port, recv_sock.getsockname()))
             if sent == 0:
                 raise RuntimeError("Socket connection broken (no bytes sent)")

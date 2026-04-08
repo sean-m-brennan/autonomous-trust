@@ -42,7 +42,7 @@ class InspectorProcess(Process, metaclass=ProcMeta,
                 if isinstance(cmd, str):
                     if cmd in self.command_deck:
                         obj = self.configs[cmd]
-                        msg_str = str(obj)  # FIXME convert to json
+                        msg_str = to_json_string(obj)
                         # send straight to viz server
                         queues['main'].put(msg_str, block=True, timeout=self.q_cadence)
             except Empty:

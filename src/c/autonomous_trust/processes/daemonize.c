@@ -31,6 +31,19 @@
 #define MAX_CLOSE 8192
 
 
+/*@
+  requires data_dir != \null && \valid_read(data_dir);
+  requires \valid(fd1);
+  requires \valid(fd2);
+  assigns *fd1, *fd2;
+  behavior child:
+    ensures \result == 0;
+  behavior parent:
+    ensures \result > 0;
+  behavior failure:
+    ensures \result < 0;
+  disjoint behaviors;
+*/
 int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
 {
     int io[2] = {0};
@@ -118,30 +131,31 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
         }
     }
 
-#if 0 // FIXME
-    if (!(flags & NO_STDOUT_REDIRECT & NO_STDERR_REDIRECT))
+    if (!(flags & (NO_STDOUT_REDIRECT | NO_STDERR_REDIRECT)))
     {
-        // point stdout and/or stderr to /dev/null
-
-        int f_d = open("/dev/null", O_WRONLY);
-        if (f_d == -1)
+        int devnull_w = open("/dev/null", O_WRONLY);
+        if (devnull_w == -1)
             return -1;
         if (!(flags & NO_STDOUT_REDIRECT))
         {
-            if ((*fd1 = dup2(f_d, STDOUT_FILENO)) == -1)
+            *fd1 = dup2(devnull_w, STDOUT_FILENO);
+            if (*fd1 == -1)
+            {
+                close(devnull_w);
                 return -1;
-            //*fd1 = f_d;
+            }
         }
-        f_d = open("/dev/null", O_WRONLY);
-        if (f_d == -1)
-            return -1;
-         if (!(flags & NO_STDERR_REDIRECT))
+        if (!(flags & NO_STDERR_REDIRECT))
         {
-            if ((*fd2 = dup2(f_d, STDERR_FILENO)) == -1)  // FIXME fd leaks?
+            *fd2 = dup2(devnull_w, STDERR_FILENO);
+            if (*fd2 == -1)
+            {
+                close(devnull_w);
                 return -1;
-            //*fd2 = f_d;
+            }
         }
+        if (devnull_w != STDOUT_FILENO && devnull_w != STDERR_FILENO)
+            close(devnull_w);
     }
-#endif
     return 0;
 }

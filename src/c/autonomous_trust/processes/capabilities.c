@@ -18,9 +18,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <jansson.h>
+
+#include "config/configuration.h"
 #include "capabilities_priv.h"
 #include "capability_table_priv.h"
 
+/*@
+  requires name != \null && \valid_read(name);
+  assigns \nothing;
+  ensures \result == \null || \valid(\result);
+*/
 capability_t *find_capability(const char *name)
 {
     for (int i = 0; i < capability_table_size; i++)
@@ -39,13 +47,22 @@ capability_t *find_capability(const char *name)
 int capability_sync_out(capability_t *capability, AutonomousTrust__Core__Protobuf__Processes__Capability *proto)
 {
     proto->name = capability->name;
+    proto->arg_types = malloc(sizeof(AutonomousTrust__Core__Protobuf__Structures__DataMap));
+    if (proto->arg_types == NULL)
+        return EXCEPTION(ENOMEM);
+    AutonomousTrust__Core__Protobuf__Structures__DataMap tmp =
+        AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA_MAP__INIT;
+    memcpy(proto->arg_types, &tmp, sizeof(tmp));
     map_sync_out(&capability->arguments, proto->arg_types);
     return 0;
 }
 
 void capability_proto_free(AutonomousTrust__Core__Protobuf__Processes__Capability *proto)
 {
-    map_proto_free(proto->arg_types);
+    if (proto->arg_types != NULL) {
+        map_proto_free(proto->arg_types);
+        free(proto->arg_types);
+    }
 }
 
 int capability_sync_in(AutonomousTrust__Core__Protobuf__Processes__Capability *proto, capability_t *capability)
@@ -169,5 +186,180 @@ int proto_to_peer_capabilities(uint8_t *data, size_t len, peer_capabilities_matr
         autonomous_trust__core__protobuf__processes__peer_capabilities__unpack(NULL, len, data);
     peer_capabilities_sync_in(msg, peer_capabilities);
     free(msg);
+    return 0;
+}
+
+/*****************************
+ * JSON serialization for peer capabilities configuration
+ ****************************/
+
+static int capability_to_json_obj(const capability_t *cap, json_t **obj_ptr)
+{
+    *obj_ptr = json_object();
+    json_t *obj = *obj_ptr;
+    if (obj == NULL)
+        return EXCEPTION(ENOMEM);
+
+    if (json_object_set_new(obj, "name", json_string(cap->name)) != 0)
+        return EXCEPTION(EJSN_OBJ_SET);
+
+    /* Serialize arguments map as { arg_name: type_string, ... } */
+    json_t *args = json_object();
+    if (map_size((map_t *)&cap->arguments) > 0) {
+        char *key;
+        data_t *val;
+        map_entries_for_each((map_t *)&cap->arguments, key, val)
+            int type_val;
+            if (data_integer(val, &type_val) == 0)
+                json_object_set_new(args, key, json_integer(type_val));
+        map_end_for_each
+    }
+    json_object_set_new(obj, "arguments", args);
+
+    return 0;
+}
+
+static int capability_from_json_obj(const json_t *obj, capability_t *cap)
+{
+    const char *name = json_string_value(json_object_get(obj, "name"));
+    if (name == NULL)
+        return -1;
+    strncpy(cap->name, name, CAP_NAMELEN);
+    cap->local = false;
+
+    map_init(&cap->arguments);
+    json_t *args = json_object_get(obj, "arguments");
+    if (args != NULL && json_is_object(args)) {
+        const char *arg_key;
+        json_t *arg_val;
+        json_object_foreach(args, arg_key, arg_val) {
+            if (json_is_integer(arg_val)) {
+                data_t *d = integer_data((int)json_integer_value(arg_val));
+                char *k = smrt_create(strlen(arg_key) + 1);
+                strcpy(k, arg_key);
+                map_set(&cap->arguments, k, d);
+            }
+        }
+    }
+
+    return 0;
+}
+
+int peer_capabilities_to_json(const void *data_struct, json_t **obj_ptr)
+{
+    const peer_capabilities_matrix_t *matrix = data_struct;
+    *obj_ptr = json_object();
+    json_t *obj = *obj_ptr;
+    if (obj == NULL)
+        return EXCEPTION(ENOMEM);
+
+    if (json_object_set_new(obj, "typename", json_string("peer_capabilities")) != 0)
+        return EXCEPTION(EJSN_OBJ_SET);
+
+    json_t *peers = json_object();
+    if (map_size((map_t *)matrix) > 0) {
+        char *key;
+        data_t *val;
+        map_entries_for_each((map_t *)matrix, key, val)
+            void *caps_ptr;
+            if (data_object_ptr(val, &caps_ptr) != 0)
+                continue;
+            array_t *caps = caps_ptr;
+
+            json_t *cap_arr = json_array();
+            for (size_t i = 0; i < array_size(caps); i++) {
+                data_t *cap_dat = NULL;
+                if (array_get(caps, i, &cap_dat) != 0)
+                    continue;
+                capability_t *cap;
+                if (data_object_ptr(cap_dat, (void **)&cap) != 0)
+                    continue;
+                json_t *cap_obj = NULL;
+                if (capability_to_json_obj(cap, &cap_obj) == 0)
+                    json_array_append_new(cap_arr, cap_obj);
+            }
+            json_object_set_new(peers, key, cap_arr);
+        map_end_for_each
+    }
+    json_object_set_new(obj, "peers", peers);
+
+    return 0;
+}
+
+int peer_capabilities_from_json(const json_t *obj, void *data_struct)
+{
+    peer_capabilities_matrix_t *matrix = data_struct;
+    map_init(matrix);
+
+    json_t *peers = json_object_get(obj, "peers");
+    if (peers == NULL || !json_is_object(peers))
+        return 0;  /* empty config is valid */
+
+    const char *peer_uuid;
+    json_t *cap_arr;
+    json_object_foreach(peers, peer_uuid, cap_arr) {
+        if (!json_is_array(cap_arr))
+            continue;
+
+        array_t *arr;
+        if (array_create(&arr) != 0)
+            return EXCEPTION(ENOMEM);
+
+        for (size_t i = 0; i < json_array_size(cap_arr); i++) {
+            json_t *cap_obj = json_array_get(cap_arr, i);
+            capability_t *cap = smrt_create(sizeof(capability_t));
+            if (cap == NULL)
+                return EXCEPTION(ENOMEM);
+            if (capability_from_json_obj(cap_obj, cap) != 0) {
+                smrt_deref(cap);
+                continue;
+            }
+            data_t *cap_dat = object_ptr_data(cap, sizeof(capability_t));
+            array_append(arr, cap_dat);
+        }
+
+        data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
+        if (arr_dat == NULL)
+            return EXCEPTION(ENOMEM);
+        char *key = smrt_create(strlen(peer_uuid) + 1);
+        strcpy(key, peer_uuid);
+        map_set(matrix, key, arr_dat);
+    }
+    return 0;
+}
+
+DECLARE_CONFIGURATION(peer_capabilities, sizeof(peer_capabilities_matrix_t),
+                      peer_capabilities_to_json, peer_capabilities_from_json);
+
+/*@
+  requires my_uuid != \null && \valid_read(my_uuid);
+  requires \valid(caps_out);
+  allocates *caps_out;
+  behavior success:
+    ensures \result == 0;
+    ensures *caps_out != \null;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
+int build_local_capabilities(const char *my_uuid, array_t **caps_out)
+{
+    if (array_create(caps_out) != 0)
+        return EXCEPTION(ENOMEM);
+
+    for (size_t i = 0; i < capability_table_size; i++) {
+        capability_t *src = &capability_table[i];
+        if (!src->local)
+            continue;
+        capability_t *cap = smrt_create(sizeof(capability_t));
+        if (cap == NULL)
+            return EXCEPTION(ENOMEM);
+        strncpy(cap->name, src->name, CAP_NAMELEN);
+        map_init(&cap->arguments);
+        cap->local = true;
+        cap->function = NULL;  /* don't expose function pointer */
+        data_t *cap_dat = object_ptr_data(cap, sizeof(capability_t));
+        array_append(*caps_out, cap_dat);
+    }
     return 0;
 }

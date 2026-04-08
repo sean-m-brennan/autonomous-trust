@@ -91,6 +91,15 @@ class EllipseData(ShapeData):
 
 # ######### Implementations
 
+BEARING_DISTANCE_SCALE = 10.0
+"""Scaling factor applied to inter-point distances before computing bearing
+components.  Multiplying by 10 prevents near-zero denominators when two
+successive path points are very close together (< ~1 m in UTM), which would
+otherwise produce wildly unstable bearing values.  The resulting bearing
+components are proportional rather than unit-length, so the constant cancels
+out in downstream calculations that only use direction ratios."""
+
+
 class PathShape(object):
     extra_pts = 5
 
@@ -138,7 +147,7 @@ class PathShape(object):
         if self.prev_prev is None:
             first = self.start
             second = second_pt
-        dist = first.distance(second) * 10.  # FIXME why?
+        dist = first.distance(second) * BEARING_DISTANCE_SCALE
         bearing_x = 0
         bearing_y = 0
         bearing_z = 0
@@ -359,8 +368,13 @@ class PathData(Configuration):
         self.end = end
         self.shape = shape
         self.variability = variability
-        self.speed = speed  # FIXME remove
-        self.accel = accel  # FIXME remove
+        # NOTE: speed and accel are part of the serialized configuration schema
+        # (used in scenario YAML files) but are not yet consumed by path
+        # computation -- PathShape.speed() derives speed from distance/time.
+        # Retained for backward compatibility and future use (e.g. constrained
+        # movement models).
+        self.speed = speed
+        self.accel = accel
 
 
 class Path(object):

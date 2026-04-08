@@ -262,8 +262,13 @@ class TestStartTaskDeeper:
         tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
         msg = Message(CfgIds.negotiation, NegotiationProtocol.start, task)
-        result = np.start_task({CfgIds.network: queue.Queue()}, msg)
+        main_q = queue.Queue()
+        result = np.start_task({CfgIds.network: queue.Queue(), CfgIds.main: main_q}, msg)
         assert result is True
+        # Error should be reported to main queue
+        assert not main_q.empty()
+        error_result = main_q.get_nowait()
+        assert error_result.result == Status.no_peers
 
 
 class TestHandleInviteDeeper:

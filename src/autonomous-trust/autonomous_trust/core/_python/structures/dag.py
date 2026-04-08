@@ -57,7 +57,7 @@ class LinkedStep(Step, Configuration):
     _msg_class = dag_pb2.LinkedStep
 
     def __init__(self, payload=None, uuid: UUID = None, timestamp: datetime = None,
-                 parent: Step = None, previous=None):
+                 parent: Step = None):
         Configuration.__init__(self, dag_pb2.LinkedStep)
         if uuid is None:
             uuid = uuid4()
@@ -74,7 +74,6 @@ class LinkedStep(Step, Configuration):
             self._length = 1
         else:
             self._length = len(self.parent)  # noqa
-        self.previous = previous
 
     def __len__(self):
         return self._length
@@ -98,7 +97,6 @@ class LinkedStep(Step, Configuration):
             self.uuid = UUID(uuid_bytes.decode('utf-8'))
         self.payload = None
         self.timestamp = None
-        self.previous = None
         if self.message.HasField('parent'):
             self.parent = LinkedStep.__new__(LinkedStep)
             self.parent.message = dag_pb2.LinkedStep()

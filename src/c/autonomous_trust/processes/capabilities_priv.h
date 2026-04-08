@@ -16,6 +16,8 @@
 #ifndef CAPABILITIES_PRIV_H
 #define CAPABILITIES_PRIV_H
 
+#include <jansson.h>
+
 #include "structures/map_priv.h"
 #include "structures/data_priv.h"
 #include "structures/array_priv.h"
@@ -41,5 +43,8 @@ int peer_capabilities_to_proto(peer_capabilities_matrix_t *map, void **data_ptr,
 int peer_capabilities_sync_in(AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities *proto,
                               peer_capabilities_matrix_t *map);
 int proto_to_peer_capabilities(uint8_t *data, size_t len, peer_capabilities_matrix_t *peer_capabilities);
+
+int peer_capabilities_to_json(const void *data_struct, json_t **obj_ptr);
+int peer_capabilities_from_json(const json_t *obj, void *data_struct);
 
 #endif  /* CAPABILITIES_PRIV_H */

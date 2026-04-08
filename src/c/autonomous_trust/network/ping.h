@@ -27,7 +27,8 @@
  * Constants
  ****************************/
 
-#define PING_COUNT       4
+#define PING_COUNT       4      /* default count */
+#define MAX_PING_COUNT   64     /* maximum allowed count */
 #define PING_TIMEOUT_MS  2000
 
 /****************************
@@ -43,21 +44,45 @@ DECLARE_ERROR(EPING_TIMEOUT, "Ping timed out");
 
 typedef struct {
     char host[IPV4_ADDR_LEN + 1];
-    double rtt_ms[PING_COUNT];
+    double rtt_ms[MAX_PING_COUNT];
     double min_rtt;
     double max_rtt;
     double avg_rtt;
     double loss;
     int sent;
     int received;
+    int count;   /* actual count used */
 } ping_stats_t;
 
 /****************************
  * API
  ****************************/
 
-int ping(const char *host, ping_stats_t *stats);
+/*@
+  requires host != \null && \valid_read(host);
+  requires \valid(stats);
+  assigns *stats;
+  behavior success:
+    ensures \result == 0;
+    ensures stats->sent > 0;
+    ensures stats->received >= 0 && stats->received <= stats->sent;
+    ensures stats->loss >= 0.0 && stats->loss <= 1.0;
+  behavior timeout:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
+int ping(const char *host, int count, ping_stats_t *stats);
+
+/*@
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int ping_server_start(void);
+
+/*@
+  assigns \nothing;
+  ensures \result == 0;
+*/
 int ping_server_stop(void);
 
 #endif  /* PING_H */

@@ -796,6 +796,52 @@ add_dependencies(config_proc_test autonomous_trust_static)
 
 add_test(NAME config_proc_test COMMAND $<TARGET_FILE:config_proc_test>)
 
+add_executable(util3_test test/util3_test.c)
+set_source_files_properties(test/util3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(util3_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(capabilities2_test test/capabilities2_test.c)
+set_source_files_properties(test/capabilities2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(capabilities2_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(identity2_test test/identity2_test.c)
+set_source_files_properties(test/identity2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(identity2_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(group2_test test/group2_test.c)
+set_source_files_properties(test/group2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group2_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(map3_test test/map3_test.c)
+set_source_files_properties(test/map3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(map3_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(data_proto_test test/data_proto_test.c)
+set_source_files_properties(test/data_proto_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(data_proto_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(array3_test test/array3_test.c)
+set_source_files_properties(test/array3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(array3_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(message2_test test/message2_test.c)
+set_source_files_properties(test/message2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(message2_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(capabilities3_test test/capabilities3_test.c)
+set_source_files_properties(test/capabilities3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(capabilities3_test PRIVATE ${AT_TEST_LIBS})
+
+add_test(NAME util3_test COMMAND $<TARGET_FILE:util3_test>)
+add_test(NAME capabilities2_test COMMAND $<TARGET_FILE:capabilities2_test>)
+add_test(NAME identity2_test COMMAND $<TARGET_FILE:identity2_test>)
+add_test(NAME group2_test COMMAND $<TARGET_FILE:group2_test>)
+add_test(NAME map3_test COMMAND $<TARGET_FILE:map3_test>)
+add_test(NAME data_proto_test COMMAND $<TARGET_FILE:data_proto_test>)
+add_test(NAME array3_test COMMAND $<TARGET_FILE:array3_test>)
+add_test(NAME message2_test COMMAND $<TARGET_FILE:message2_test>)
+add_test(NAME capabilities3_test COMMAND $<TARGET_FILE:capabilities3_test>)
+
 # ZTA tests (only when AT_ZTA is enabled)
 if(AT_ZTA)
     add_executable(zta_verifier_test test/zta_verifier_test.c)

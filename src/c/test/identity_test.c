@@ -41,11 +41,15 @@ DEFINE_TEST(test_identity_create)
 
     char addr[] = "192.168.1.100";
     char name[] = "Test User";
+    char nick[] = "Tester";
+    char pet[] = "buddy";
     identity_t *ident = NULL;
-    ck_assert_ret_ok(identity_create(&uuid, addr, name, &ident));
+    ck_assert_ret_ok(identity_create(&uuid, addr, name, nick, pet, &ident));
     ck_assert_ptr_nonnull(ident);
 
     ck_assert_str_eq(ident->fullname, "Test User");
+    ck_assert_str_eq(ident->nickname, "Tester");
+    ck_assert_str_eq(ident->petname, "buddy");
     ck_assert_str_eq(ident->address, "192.168.1.100");
     ck_assert_mem_eq(ident->uuid, uuid, sizeof(uuid_t));
 
@@ -62,16 +66,20 @@ DEFINE_TEST(test_identity_publish_preserves_address)
 
     char addr[] = "172.27.3.14";
     char name[] = "Node Alpha";
+    char nick[] = "Alpha";
+    char pet[] = "node-a";
     identity_t *ident = NULL;
-    ck_assert_ret_ok(identity_create(&uuid, addr, name, &ident));
+    ck_assert_ret_ok(identity_create(&uuid, addr, name, nick, pet, &ident));
 
     public_identity_t *pub = NULL;
     ck_assert_ret_ok(identity_publish(ident, &pub));
     ck_assert_ptr_nonnull(pub);
 
-    /* Address must survive publish */
+    /* Address and names must survive publish */
     ck_assert_str_eq(pub->address, "172.27.3.14");
     ck_assert_str_eq(pub->fullname, "Node Alpha");
+    ck_assert_str_eq(pub->nickname, "Alpha");
+    ck_assert_str_eq(pub->petname, "node-a");
     ck_assert_mem_eq(pub->uuid, uuid, sizeof(uuid_t));
 
     smrt_deref(pub);
@@ -89,7 +97,9 @@ DEFINE_TEST(test_identity_json_roundtrip_address)
     char addr[] = "10.0.0.42";
     char name[] = "Agent Smith";
     identity_t *ident = NULL;
-    ck_assert_ret_ok(identity_create(&uuid, addr, name, &ident));
+    char nick3[] = "Smith";
+    char pet3[] = "agent-s";
+    ck_assert_ret_ok(identity_create(&uuid, addr, name, nick3, pet3, &ident));
 
     /* Serialize to JSON */
     json_t *obj = NULL;
@@ -132,7 +142,7 @@ DEFINE_TEST(test_identity_sign_verify)
     char addr[] = "127.0.0.1";
     char name[] = "Signer";
     identity_t *ident = NULL;
-    ck_assert_ret_ok(identity_create(&uuid, addr, name, &ident));
+    ck_assert_ret_ok(identity_create(&uuid, addr, name, NULL, NULL, &ident));
 
     /* Sign a message */
     const char *message = "Hello, world!";
@@ -178,8 +188,10 @@ DEFINE_TEST(test_identity_encrypt_decrypt)
     char name2[] = "Bob";
     identity_t *alice = NULL;
     identity_t *bob = NULL;
-    ck_assert_ret_ok(identity_create(&uuid1, addr1, name1, &alice));
-    ck_assert_ret_ok(identity_create(&uuid2, addr2, name2, &bob));
+    char nick_a[] = "Al";
+    char nick_b[] = "Bo";
+    ck_assert_ret_ok(identity_create(&uuid1, addr1, name1, nick_a, NULL, &alice));
+    ck_assert_ret_ok(identity_create(&uuid2, addr2, name2, nick_b, NULL, &bob));
 
     public_identity_t *bob_pub = NULL;
     public_identity_t *alice_pub = NULL;

@@ -24,19 +24,96 @@
 
 #define pod_cmp(a, b) ((a) < (b)) ? -1 : (((a) > (b)) ? 1 : 0)
 
+/*@
+  requires \valid(a) && \valid(b);
+  requires a->type == INT && b->type == INT;
+  assigns \nothing;
+  ensures a->intgr == b->intgr ==> \result == 0;
+*/
 int i_cmp(data_t *a, data_t *b) { return pod_cmp(a->intgr, b->intgr); }
+
+/*@
+  requires \valid(a) && \valid(b);
+  requires a->type == UINT && b->type == UINT;
+  assigns \nothing;
+  ensures a->uintr == b->uintr ==> \result == 0;
+*/
 int u_cmp(data_t *a, data_t *b) { return pod_cmp(a->uintr, b->uintr); }
+
+/*@
+  requires \valid(a) && \valid(b);
+  requires a->type == FLOAT && b->type == FLOAT;
+  assigns \nothing;
+  ensures a->flt_pt == b->flt_pt ==> \result == 0;
+*/
 int f_cmp(data_t *a, data_t *b) { return pod_cmp(a->flt_pt, b->flt_pt); }
+
+/*@
+  requires \valid(a) && \valid(b);
+  requires a->type == BOOL && b->type == BOOL;
+  assigns \nothing;
+  ensures a->bl == b->bl ==> \result == 0;
+*/
 int b_cmp(data_t *a, data_t *b) { return pod_cmp(a->bl, b->bl); }
+
+/*@
+  requires \valid(a) && \valid(b);
+  requires a->type == STRING && b->type == STRING;
+  requires \valid(a->str) && \valid(b->str);
+  assigns \nothing;
+*/
 int s_cmp(data_t *a, data_t *b) { return strcmp(a->str, b->str); }
+
+/*@
+  requires \valid(a) && \valid(b);
+  requires (a->type == BYTES && b->type == BYTES) ||
+           (a->type == STRING && b->type == STRING);
+  requires a->size > 0;
+  requires \valid(a->str + (0 .. a->size - 1));
+  requires \valid(b->str + (0 .. a->size - 1));
+  assigns \nothing;
+*/
 int d_cmp(data_t *a, data_t *b) { return memcmp(a->str, b->str, a->size); }
+
+/*@
+  requires \valid(a) && \valid(b);
+  requires a->type == OBJECT && b->type == OBJECT;
+  assigns \nothing;
+  ensures a->obj == b->obj ==> \result == 0;
+  ensures a->obj != b->obj ==> \result == 1;
+*/
 int o_cmp(data_t *a, data_t *b) { return a->obj != b->obj; }
 
+/*@
+  requires \valid(a);
+  requires \valid(b);
+  requires a->cmp != \null;
+  assigns \nothing;
+  ensures a == b ==> \result == true;
+*/
 bool data_equal(data_t *a, data_t *b)
 {
     return a->type == b->type && a->cmp(a, b) == 0;
 }
 
+/*@
+  allocates \result;
+  behavior success:
+    assumes \is_allocable(sizeof(data_t));
+    ensures \result != \null;
+    ensures \fresh(\result, sizeof(data_t));
+    ensures \result->type == INT;
+    ensures \result->intgr == val;
+    ensures \result->cmp == i_cmp;
+    ensures \result->size == 1;
+    assigns \nothing;
+  behavior failure:
+    assumes !\is_allocable(sizeof(data_t));
+    ensures \result == \null;
+    assigns \nothing;
+  complete behaviors;
+  disjoint behaviors;
+*/
 data_t *l_integer_data(long val)
 {
     data_t *dat = smrt_create(sizeof(data_t));
@@ -49,11 +126,46 @@ data_t *l_integer_data(long val)
     return dat;
 }
 
+/*@
+  allocates \result;
+  behavior success:
+    assumes \is_allocable(sizeof(data_t));
+    ensures \result != \null;
+    ensures \fresh(\result, sizeof(data_t));
+    ensures \result->type == INT;
+    ensures \result->intgr == (long)val;
+    ensures \result->cmp == i_cmp;
+    assigns \nothing;
+  behavior failure:
+    assumes !\is_allocable(sizeof(data_t));
+    ensures \result == \null;
+    assigns \nothing;
+  complete behaviors;
+  disjoint behaviors;
+*/
 data_t *integer_data(int val)
 {
     return l_integer_data((long)val);
 }
 
+/*@
+  allocates \result;
+  behavior success:
+    assumes \is_allocable(sizeof(data_t));
+    ensures \result != \null;
+    ensures \fresh(\result, sizeof(data_t));
+    ensures \result->type == UINT;
+    ensures \result->uintr == val;
+    ensures \result->cmp == u_cmp;
+    ensures \result->size == 1;
+    assigns \nothing;
+  behavior failure:
+    assumes !\is_allocable(sizeof(data_t));
+    ensures \result == \null;
+    assigns \nothing;
+  complete behaviors;
+  disjoint behaviors;
+*/
 data_t *ul_integer_data(unsigned long val)
 {
     data_t *dat = smrt_create(sizeof(data_t));
@@ -66,11 +178,46 @@ data_t *ul_integer_data(unsigned long val)
     return dat;
 }
 
+/*@
+  allocates \result;
+  behavior success:
+    assumes \is_allocable(sizeof(data_t));
+    ensures \result != \null;
+    ensures \fresh(\result, sizeof(data_t));
+    ensures \result->type == UINT;
+    ensures \result->uintr == (unsigned long)val;
+    ensures \result->cmp == u_cmp;
+    assigns \nothing;
+  behavior failure:
+    assumes !\is_allocable(sizeof(data_t));
+    ensures \result == \null;
+    assigns \nothing;
+  complete behaviors;
+  disjoint behaviors;
+*/
 data_t *u_integer_data(unsigned int val)
 {
     return ul_integer_data((unsigned long)val);
 }
 
+/*@
+  allocates \result;
+  behavior success:
+    assumes \is_allocable(sizeof(data_t));
+    ensures \result != \null;
+    ensures \fresh(\result, sizeof(data_t));
+    ensures \result->type == FLOAT;
+    ensures \result->flt_pt == val;
+    ensures \result->cmp == f_cmp;
+    ensures \result->size == 1;
+    assigns \nothing;
+  behavior failure:
+    assumes !\is_allocable(sizeof(data_t));
+    ensures \result == \null;
+    assigns \nothing;
+  complete behaviors;
+  disjoint behaviors;
+*/
 data_t *floating_pt_dbl_data(double val)
 {
     data_t *dat = smrt_create(sizeof(data_t));
@@ -83,11 +230,46 @@ data_t *floating_pt_dbl_data(double val)
     return dat;
 }
 
+/*@
+  allocates \result;
+  behavior success:
+    assumes \is_allocable(sizeof(data_t));
+    ensures \result != \null;
+    ensures \fresh(\result, sizeof(data_t));
+    ensures \result->type == FLOAT;
+    ensures \result->flt_pt == (double)val;
+    ensures \result->cmp == f_cmp;
+    assigns \nothing;
+  behavior failure:
+    assumes !\is_allocable(sizeof(data_t));
+    ensures \result == \null;
+    assigns \nothing;
+  complete behaviors;
+  disjoint behaviors;
+*/
 data_t *floating_pt_data(float val)
 {
     return floating_pt_dbl_data((double)val);
 }
 
+/*@
+  allocates \result;
+  behavior success:
+    assumes \is_allocable(sizeof(data_t));
+    ensures \result != \null;
+    ensures \fresh(\result, sizeof(data_t));
+    ensures \result->type == BOOL;
+    ensures \result->bl == val;
+    ensures \result->cmp == b_cmp;
+    ensures \result->size == 1;
+    assigns \nothing;
+  behavior failure:
+    assumes !\is_allocable(sizeof(data_t));
+    ensures \result == \null;
+    assigns \nothing;
+  complete behaviors;
+  disjoint behaviors;
+*/
 data_t *boolean_data(bool val)
 {
     data_t *dat = smrt_create(sizeof(data_t));
@@ -100,6 +282,25 @@ data_t *boolean_data(bool val)
     return dat;
 }
 
+/*@
+  requires len > 0;
+  requires \valid(val + (0 .. len - 1));
+  allocates \result;
+  behavior success:
+    assumes \is_allocable(sizeof(data_t));
+    ensures \result != \null;
+    ensures \fresh(\result, sizeof(data_t));
+    ensures \result->type == STRING;
+    ensures \result->size == len;
+    ensures \result->cmp == s_cmp;
+    assigns \nothing;
+  behavior failure:
+    assumes !\is_allocable(sizeof(data_t));
+    ensures \result == \null;
+    assigns \nothing;
+  complete behaviors;
+  disjoint behaviors;
+*/
 data_t *string_data(char *val, size_t len)
 {
     data_t *dat = smrt_create(sizeof(data_t));
@@ -113,6 +314,25 @@ data_t *string_data(char *val, size_t len)
     return dat;
 }
 
+/*@
+  requires len > 0;
+  requires \valid(val + (0 .. len - 1));
+  allocates \result;
+  behavior success:
+    assumes \is_allocable(sizeof(data_t));
+    ensures \result != \null;
+    ensures \fresh(\result, sizeof(data_t));
+    ensures \result->type == BYTES;
+    ensures \result->size == len;
+    ensures \result->cmp == d_cmp;
+    assigns \nothing;
+  behavior failure:
+    assumes !\is_allocable(sizeof(data_t));
+    ensures \result == \null;
+    assigns \nothing;
+  complete behaviors;
+  disjoint behaviors;
+*/
 data_t *bytes_data(unsigned char *val, size_t len)
 {
     data_t *dat = smrt_create(sizeof(data_t));
@@ -126,6 +346,26 @@ data_t *bytes_data(unsigned char *val, size_t len)
     return dat;
 }
 
+/*@
+  requires len > 0;
+  requires \valid((char *)val + (0 .. len - 1));
+  allocates \result;
+  behavior success:
+    assumes \is_allocable(sizeof(data_t));
+    ensures \result != \null;
+    ensures \fresh(\result, sizeof(data_t));
+    ensures \result->type == OBJECT;
+    ensures \result->obj == val;
+    ensures \result->cmp == o_cmp;
+    ensures \result->size == 1;
+    assigns \nothing;
+  behavior failure:
+    assumes !\is_allocable(sizeof(data_t));
+    ensures \result == \null;
+    assigns \nothing;
+  complete behaviors;
+  disjoint behaviors;
+*/
 data_t *object_ptr_data(void *val, size_t len)
 {
     data_t *dat = smrt_create(sizeof(data_t));
@@ -138,6 +378,20 @@ data_t *object_ptr_data(void *val, size_t len)
     return dat;
 }
 
+/*@
+  requires \valid(d);
+  requires \valid(i);
+  assigns *i;
+  behavior success:
+    assumes d->type == INT;
+    ensures \result == 0;
+    ensures *i == d->intgr;
+  behavior type_error:
+    assumes d->type != INT;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_l_integer(data_t *d, long *i)
 {
     if (d->type != INT)
@@ -146,6 +400,20 @@ int data_l_integer(data_t *d, long *i)
     return 0;
 }
 
+/*@
+  requires \valid(d);
+  requires \valid(i);
+  assigns *i;
+  behavior success:
+    assumes d->type == INT;
+    ensures \result == 0;
+    ensures *i == (int)d->intgr;
+  behavior type_error:
+    assumes d->type != INT;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_integer(data_t *d, int *i)
 {
     if (d->type != INT)
@@ -154,6 +422,20 @@ int data_integer(data_t *d, int *i)
     return 0;
 }
 
+/*@
+  requires \valid(d);
+  requires \valid(u);
+  assigns *u;
+  behavior success:
+    assumes d->type == UINT;
+    ensures \result == 0;
+    ensures *u == d->uintr;
+  behavior type_error:
+    assumes d->type != UINT;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_ul_integer(data_t *d, unsigned long *u)
 {
     if (d->type != UINT)
@@ -162,6 +444,20 @@ int data_ul_integer(data_t *d, unsigned long *u)
     return 0;
 }
 
+/*@
+  requires \valid(d);
+  requires \valid(u);
+  assigns *u;
+  behavior success:
+    assumes d->type == UINT;
+    ensures \result == 0;
+    ensures *u == (unsigned int)d->uintr;
+  behavior type_error:
+    assumes d->type != UINT;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_u_integer(data_t *d, unsigned int *u)
 {
     if (d->type != UINT)
@@ -170,6 +466,20 @@ int data_u_integer(data_t *d, unsigned int *u)
     return 0;
 }
 
+/*@
+  requires \valid(d);
+  requires \valid(f);
+  assigns *f;
+  behavior success:
+    assumes d->type == FLOAT;
+    ensures \result == 0;
+    ensures *f == d->flt_pt;
+  behavior type_error:
+    assumes d->type != FLOAT;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_floating_pt_dbl(data_t *d, double *f)
 {
     if (d->type != FLOAT)
@@ -178,6 +488,20 @@ int data_floating_pt_dbl(data_t *d, double *f)
     return 0;
 }
 
+/*@
+  requires \valid(d);
+  requires \valid(f);
+  assigns *f;
+  behavior success:
+    assumes d->type == FLOAT;
+    ensures \result == 0;
+    ensures *f == (float)d->flt_pt;
+  behavior type_error:
+    assumes d->type != FLOAT;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_floating_pt(data_t *d, float *f)
 {
     if (d->type != FLOAT)
@@ -186,6 +510,20 @@ int data_floating_pt(data_t *d, float *f)
     return 0;
 }
 
+/*@
+  requires \valid(d);
+  requires \valid(b);
+  assigns *b;
+  behavior success:
+    assumes d->type == BOOL;
+    ensures \result == 0;
+    ensures *b == d->bl;
+  behavior type_error:
+    assumes d->type != BOOL;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_boolean(data_t *d, bool *b)
 {
     if (d->type != BOOL)
@@ -194,6 +532,21 @@ int data_boolean(data_t *d, bool *b)
     return 0;
 }
 
+/*@
+  requires \valid(d);
+  requires max_len > 0;
+  requires \valid(s + (0 .. max_len - 1));
+  assigns s[0 .. max_len - 1];
+  behavior success:
+    assumes d->type == STRING;
+    assumes \valid(d->str + (0 .. d->size - 1));
+    ensures \result == 0;
+  behavior type_error:
+    assumes d->type != STRING;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_string(data_t *d, char *s, size_t max_len)
 {
     if (d->type != STRING)
@@ -202,6 +555,20 @@ int data_string(data_t *d, char *s, size_t max_len)
     return 0;
 }
 
+/*@
+  requires \valid(d);
+  requires \valid(s);
+  assigns *s;
+  behavior success:
+    assumes d->type == STRING;
+    ensures \result == 0;
+    ensures *s == d->str;
+  behavior type_error:
+    assumes d->type != STRING;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_string_ptr(data_t *d, char **s)
 {
     if (d->type != STRING)
@@ -210,6 +577,21 @@ int data_string_ptr(data_t *d, char **s)
     return 0;
 }
 
+/*@
+  requires \valid(d);
+  requires max_len > 0;
+  requires \valid(b + (0 .. max_len - 1));
+  assigns b[0 .. max_len - 1];
+  behavior success:
+    assumes d->type == BYTES;
+    assumes \valid(d->byt + (0 .. max_len - 1));
+    ensures \result == 0;
+  behavior type_error:
+    assumes d->type != BYTES;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_bytes(data_t *d, unsigned char *b, size_t max_len)
 {
     if (d->type != BYTES)
@@ -218,6 +600,20 @@ int data_bytes(data_t *d, unsigned char *b, size_t max_len)
     return 0;
 }
 
+/*@
+  requires \valid(d);
+  requires \valid(b);
+  assigns *b;
+  behavior success:
+    assumes d->type == BYTES;
+    ensures \result == 0;
+    ensures *b == d->byt;
+  behavior type_error:
+    assumes d->type != BYTES;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_bytes_ptr(data_t *d, unsigned char **b)
 {
     if (d->type != BYTES)
@@ -226,6 +622,21 @@ int data_bytes_ptr(data_t *d, unsigned char **b)
     return 0;
 }
 
+/*@
+  requires \valid(d);
+  requires max_len > 0;
+  requires \valid((char *)o + (0 .. max_len - 1));
+  assigns ((char *)o)[0 .. max_len - 1];
+  behavior success:
+    assumes d->type == OBJECT;
+    assumes \valid((char *)d->obj + (0 .. max_len - 1));
+    ensures \result == 0;
+  behavior type_error:
+    assumes d->type != OBJECT;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_object(data_t *d, void *o, size_t max_len)
 {
     if (d->type != OBJECT)
@@ -234,6 +645,20 @@ int data_object(data_t *d, void *o, size_t max_len)
     return 0;
 }
 
+/*@
+  requires \valid(d);
+  requires \valid(o);
+  assigns *o;
+  behavior success:
+    assumes d->type == OBJECT;
+    ensures \result == 0;
+    ensures *o == d->obj;
+  behavior type_error:
+    assumes d->type != OBJECT;
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int data_object_ptr(data_t *d, void **o)
 {
     if (d->type != OBJECT)

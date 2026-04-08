@@ -15,6 +15,7 @@
 # ******************
 
 import socket
+import struct
 
 from .netprocess import NetworkProtocol, TransmissionError
 from .udp import UDPNetworkProcess
@@ -68,7 +69,7 @@ class TCPNetworkProcess(UDPNetworkProcess):
             except socket.error as err:
                 raise TransmissionError('Connect - ' + str(err))
             try:
-                sent = sock.send(('%d|' % len(msg)).encode(self.enc))  # FIXME encoding
+                sent = sock.send(struct.pack('!I', len(msg)))
             except socket.error as err:
                 raise TransmissionError('Send - ' + str(err))
             if sent == 0:
@@ -92,12 +93,13 @@ class TCPNetworkProcess(UDPNetworkProcess):
         self._send_tcp(msg, host, self.group_port)
 
     def _recv(self, sock):
-        byte = b''
-        size_bytes = byte
-        while byte != '|'.encode(self.enc):
-            size_bytes += byte
-            byte = sock.recv(1)
-        msg_len = int(size_bytes.decode(self.enc))
+        size_data = b''
+        while len(size_data) < 4:
+            chunk = sock.recv(4 - len(size_data))
+            if chunk == b'':
+                raise TransmissionError("Socket connection broken reading length prefix")
+            size_data += chunk
+        msg_len = struct.unpack('!I', size_data)[0]
         max_msg_size = 64 * 1024 * 1024  # 64 MB
         if msg_len > max_msg_size:
             raise TransmissionError("Message size %d exceeds maximum allowed size %d" % (msg_len, max_msg_size))

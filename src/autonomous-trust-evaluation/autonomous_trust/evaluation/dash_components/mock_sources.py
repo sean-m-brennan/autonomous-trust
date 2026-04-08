@@ -20,7 +20,7 @@ import time
 from collections import deque
 
 _logger = logging.getLogger(__name__)
-from datetime import timedelta, datetime
+from datetime import datetime
 from typing import Optional
 
 import cv2
@@ -28,7 +28,6 @@ import numpy as np
 
 from autonomous_trust.inspector.peer.daq import PeerDataAcq
 from autonomous_trust.services.data.server import DataConfig
-from autonomous_trust.services.network_statistics import NetworkSource
 from autonomous_trust.services.video.server import VideoSource
 
 """
@@ -55,6 +54,7 @@ class SimVideoSource(VideoSource):
             extra_process = lambda x: x
         prev = 0
         while not self.halt:
+            frame_start = time.time()
             if self.peer is not None:
                 elapsed = int((self.peer.time - self.start).total_seconds())
                 if self.peer.active and not self.peer.cohort.paused and prev < elapsed:
@@ -64,7 +64,9 @@ class SimVideoSource(VideoSource):
                     if frame is not None:
                         _, frame = cv2.imencode('.jpg', frame)
                         self.buffer.append((frame_num, frame, 1))
-            time.sleep(1. / self.fps)  # FIXME ??
+            elapsed = time.time() - frame_start
+            remaining = max(0, (1.0 / self.fps) - elapsed)
+            time.sleep(remaining)
 
 
 class SimDataSource(object):
@@ -79,22 +81,3 @@ class SimDataSource(object):
             data = random.random()
             self.buffer.append(data)
             time.sleep(self.cadence)
-
-
-class SimNetSource(NetworkSource):  # FIXME unused
-    def __init__(self):
-        self.prev = {}
-        self.last_time = {}
-
-    def acquire(self, uuid: str) -> tuple[float, float, int, int, int, int]:
-        if uuid not in self.prev:
-            self.prev[uuid] = (0., 0., 0, 0, 0, 0)
-            self.last_time[uuid] = datetime.now() - timedelta(seconds=1)
-        up, down, sent, recv, out, in_ = self.prev[uuid]
-        now = datetime.now()
-        elapsed = (now - self.last_time[uuid]).total_seconds()
-        current = sent + random.randint(0, 500), recv + random.randint(0, 500), \
-            out + random.randint(0, 2), in_ + random.randint(0, 2)
-        up, down = (current[0] - self.prev[uuid][2]) / elapsed, (current[1] - self.prev[uuid][3]) / elapsed
-        self.prev[uuid] = up, down, *current
-        return self.prev[uuid]

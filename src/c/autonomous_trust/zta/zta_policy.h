@@ -58,6 +58,11 @@ typedef struct {
 /**
  * @brief Initialize a zta_policy_t with default values (disabled)
  */
+/*@
+  requires \valid(policy);
+  assigns *policy;
+  ensures policy->enabled == \false;
+*/
 void zta_policy_defaults(zta_policy_t *policy);
 
 /**
@@ -82,6 +87,17 @@ int zta_policy_from_json(const json_t *obj, void *data_struct);
  * @param out    Output: newly allocated verifier (caller must destroy)
  * @return 0 on success, error code on failure
  */
+/*@
+  requires \valid(policy);
+  requires \valid(out);
+  allocates *out;
+  behavior success:
+    ensures \result == 0;
+    ensures *out != \null;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int zta_policy_create_verifier(const zta_policy_t *policy, zta_verifier_t **out);
 
 #ifdef __cplusplus

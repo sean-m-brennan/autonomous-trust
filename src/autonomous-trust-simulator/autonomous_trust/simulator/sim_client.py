@@ -15,8 +15,8 @@
 # ******************
 
 import logging
+import multiprocessing
 import struct
-import threading
 from datetime import datetime, timedelta
 from typing import Optional, Callable
 
@@ -37,8 +37,7 @@ class SimClient(net.Client):
         self._tick = 1
         self._cadence = 1
         self._resolution = 0
-        # FIXME lock within multiprocessing does not work
-        #self.lock = threading.Lock()
+        self.lock = multiprocessing.Lock()
         self.last = None
 
     @property
@@ -49,18 +48,13 @@ class SimClient(net.Client):
     def cadence(self):
         return self._cadence
 
-    @cadence.setter
-    def cadence(self, val: int):  # FIXME remove
-        #with self.lock:
-            self._cadence = val
-
     @property
     def resolution(self):
         return self._resolution
 
     @resolution.setter
     def resolution(self, val: int):
-        #with self.lock:
+        with self.lock:
             self._resolution = val
 
     def recv_data(self, **kwargs) -> Optional[SimState]:  # asynchronous
@@ -87,9 +81,7 @@ class SimClient(net.Client):
                     self.callback(SimState(blank=True))
                     return
                 state = SimState.from_json_string(info)
-                #self.logger.debug('** Block')  # FIXME
                 self.callback(state)
-                #self.logger.debug('** Unblock')
                 if not self._passive:
                     self._tick += self._cadence  # successful, so can progress
                 now = datetime.now()

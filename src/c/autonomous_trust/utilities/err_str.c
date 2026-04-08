@@ -186,6 +186,11 @@ const char *gai_ext_strlist[] = {
 #define GAI_EXT_LIST_START 100
 #define GAI_EXT_LIST_LEN 6
 
+/*@
+  assigns \nothing;
+  ensures \result != \null;
+  ensures \valid_read(\result);
+*/
 const char *_get_err_str(int err)
 {
     if (err < 0)

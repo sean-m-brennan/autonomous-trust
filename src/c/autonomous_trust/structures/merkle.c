@@ -24,6 +24,12 @@ DEFINE_ERROR(EMRKL_NOTFOUND, "Blob not found in Merkle tree");
 
 #define INITIAL_NODE_CAPACITY 32
 
+/*@
+  requires data_len == 0 || \valid_read(data + (0 .. data_len - 1));
+  requires \valid(hash_out + (0 .. MERKLE_DIGEST_LEN - 1));
+  assigns hash_out[0 .. MERKLE_DIGEST_LEN - 1];
+  ensures \result == 0 || \result == -1;
+*/
 int merkle_hash(const uint8_t *data, size_t data_len, uint8_t *hash_out)
 {
     return crypto_generichash_blake2b(hash_out, MERKLE_DIGEST_LEN,
@@ -31,6 +37,13 @@ int merkle_hash(const uint8_t *data, size_t data_len, uint8_t *hash_out)
                                       NULL, 0);
 }
 
+/*@
+  requires valid_merkle_tree(tree);
+  requires blob != \null;
+  assigns \nothing;
+  ensures \result >= -1;
+  ensures \result < (int)array_size(tree->blobs);
+*/
 static int _find_blob_index(merkle_tree_t *tree, merkle_blob_t *blob)
 {
     int sz = (int)array_size(tree->blobs);
@@ -48,6 +61,22 @@ static int _find_blob_index(merkle_tree_t *tree, merkle_blob_t *blob)
     return -1;
 }
 
+/*@
+  requires tree != \null && \valid(tree);
+  requires needed >= 0;
+  assigns tree->nodes, tree->node_capacity;
+  behavior already_sufficient:
+    assumes needed <= tree->node_capacity;
+    ensures \result == 0;
+    ensures tree->node_capacity == \old(tree->node_capacity);
+  behavior grow:
+    assumes needed > tree->node_capacity;
+    ensures \result == 0 || \result == ENOMEM;
+    ensures \result == 0 ==> tree->node_capacity >= needed;
+    ensures \result == 0 ==> tree->nodes != \null;
+  disjoint behaviors;
+  complete behaviors;
+*/
 static int _ensure_node_capacity(merkle_tree_t *tree, int needed)
 {
     if (needed <= tree->node_capacity)
@@ -63,6 +92,23 @@ static int _ensure_node_capacity(merkle_tree_t *tree, int needed)
     return 0;
 }
 
+/*@
+  requires tree != \null && \valid(tree);
+  requires tree->node_count >= 0;
+  assigns tree->nodes, tree->node_count, tree->node_capacity;
+  ensures \result >= -1;
+  behavior success:
+    ensures \result >= 0;
+    ensures \result == \old(tree->node_count);
+    ensures tree->node_count == \old(tree->node_count) + 1;
+    ensures tree->nodes[\result].left == -1;
+    ensures tree->nodes[\result].right == -1;
+    ensures tree->nodes[\result].parent == -1;
+    ensures tree->nodes[\result].blob == \null;
+  behavior failure:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 static int _add_node(merkle_tree_t *tree)
 {
     int err = _ensure_node_capacity(tree, tree->node_count + 1);
@@ -77,6 +123,17 @@ static int _add_node(merkle_tree_t *tree)
     return idx;
 }
 
+/*@
+  requires valid_merkle_tree(tree);
+  assigns tree->nodes, tree->node_count, tree->node_capacity,
+          tree->root, tree->root_digest[0 .. MERKLE_DIGEST_LEN - 1],
+          tree->has_root_digest;
+  ensures array_size(tree->blobs) == 0 ==>
+            (tree->root == -1 && tree->has_root_digest == false);
+  ensures array_size(tree->blobs) > 0 ==>
+            (tree->has_root_digest == true &&
+             tree->root >= 0 && tree->root < tree->node_count);
+*/
 static void _rehash(merkle_tree_t *tree)
 {
     int blob_count = (int)array_size(tree->blobs);
@@ -185,6 +242,28 @@ static void _rehash(merkle_tree_t *tree)
         free(current_level);
 }
 
+/*@
+  requires \valid(tree);
+  allocates *tree;
+  assigns *tree;
+  behavior null_ptr:
+    assumes tree == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes tree != \null && \is_allocable(sizeof(merkle_tree_t));
+    ensures \result == 0;
+    ensures *tree != \null;
+    ensures \fresh(*tree, sizeof(merkle_tree_t));
+    ensures (*tree)->node_count == 0;
+    ensures (*tree)->root == -1;
+    ensures (*tree)->has_root_digest == false;
+    ensures (*tree)->blobs != \null;
+    ensures (*tree)->nodes != \null;
+  behavior failure:
+    assumes tree != \null && !\is_allocable(sizeof(merkle_tree_t));
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int merkle_tree_create(merkle_tree_t **tree)
 {
     if (tree == NULL)
@@ -216,6 +295,21 @@ int merkle_tree_create(merkle_tree_t **tree)
     return 0;
 }
 
+/*@
+  requires valid_merkle_tree(tree);
+  requires valid_merkle_blob(blob);
+  assigns tree->nodes, tree->node_count, tree->node_capacity,
+          tree->root, tree->root_digest[0 .. MERKLE_DIGEST_LEN - 1],
+          tree->has_root_digest;
+  behavior success:
+    ensures \result == 0;
+    ensures tree->has_root_digest == true;
+  behavior already_present:
+    ensures \result == 0;
+  behavior error:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int merkle_insert(merkle_tree_t *tree, merkle_blob_t *blob)
 {
     if (tree == NULL || blob == NULL)
@@ -234,6 +328,18 @@ int merkle_insert(merkle_tree_t *tree, merkle_blob_t *blob)
     return 0;
 }
 
+/*@
+  requires valid_merkle_tree(tree);
+  requires valid_merkle_blob(blob);
+  assigns tree->nodes, tree->node_count, tree->node_capacity,
+          tree->root, tree->root_digest[0 .. MERKLE_DIGEST_LEN - 1],
+          tree->has_root_digest;
+  behavior success:
+    ensures \result == 0;
+  behavior not_found:
+    ensures \result == EMRKL_NOTFOUND;
+  disjoint behaviors;
+*/
 int merkle_delete(merkle_tree_t *tree, merkle_blob_t *blob)
 {
     if (tree == NULL || blob == NULL)
@@ -250,6 +356,15 @@ int merkle_delete(merkle_tree_t *tree, merkle_blob_t *blob)
     return 0;
 }
 
+/*@
+  requires valid_merkle_tree(tree);
+  requires valid_merkle_tree(other);
+  requires \separated(tree, other);
+  assigns tree->nodes, tree->node_count, tree->node_capacity,
+          tree->root, tree->root_digest[0 .. MERKLE_DIGEST_LEN - 1],
+          tree->has_root_digest;
+  ensures \result == 0 || \result != 0;
+*/
 int merkle_merge(merkle_tree_t *tree, merkle_tree_t *other)
 {
     if (tree == NULL || other == NULL)
@@ -280,6 +395,21 @@ int merkle_merge(merkle_tree_t *tree, merkle_tree_t *other)
     return 0;
 }
 
+/*@
+  requires tree != \null && \valid(tree);
+  requires \valid(digest_out + (0 .. MERKLE_DIGEST_LEN - 1));
+  assigns digest_out[0 .. MERKLE_DIGEST_LEN - 1];
+  behavior has_root:
+    assumes tree->has_root_digest == true;
+    ensures \result == 0;
+    ensures \forall integer i; 0 <= i < MERKLE_DIGEST_LEN ==>
+              digest_out[i] == tree->root_digest[i];
+  behavior no_root:
+    assumes tree->has_root_digest == false;
+    ensures \result == EMRKL_NOTFOUND;
+  disjoint behaviors;
+  complete behaviors;
+*/
 int merkle_root_digest(merkle_tree_t *tree, uint8_t *digest_out)
 {
     if (tree == NULL || digest_out == NULL)
@@ -290,6 +420,23 @@ int merkle_root_digest(merkle_tree_t *tree, uint8_t *digest_out)
     return 0;
 }
 
+/*@
+  requires valid_merkle_tree(tree);
+  requires valid_merkle_blob(blob);
+  requires \valid(proof_out);
+  requires \valid(proof_len);
+  allocates *proof_out;
+  assigns *proof_out, *proof_len;
+  behavior found:
+    ensures \result == 0;
+    ensures *proof_len >= 0;
+    ensures *proof_len > 0 ==> *proof_out != \null;
+  behavior not_found:
+    ensures \result == EMRKL_NOTFOUND;
+  behavior error:
+    ensures \result != 0 && \result != EMRKL_NOTFOUND;
+  disjoint behaviors;
+*/
 int merkle_inclusion_proof(merkle_tree_t *tree, merkle_blob_t *blob,
                            merkle_proof_step_t **proof_out, int *proof_len)
 {
@@ -359,6 +506,23 @@ int merkle_inclusion_proof(merkle_tree_t *tree, merkle_blob_t *blob,
     return 0;
 }
 
+/*@
+  requires tree == \null || \valid(tree);
+  requires blob == \null || valid_merkle_blob(blob);
+  requires proof == \null || (proof_len > 0 && \valid_read(proof + (0 .. proof_len - 1)));
+  assigns \nothing;
+  behavior invalid_input:
+    assumes tree == \null || blob == \null || proof == \null || proof_len <= 0;
+    ensures \result == false;
+  behavior no_root:
+    assumes tree != \null && !tree->has_root_digest;
+    ensures \result == false;
+  behavior valid_check:
+    assumes tree != \null && blob != \null && proof != \null &&
+            proof_len > 0 && tree->has_root_digest;
+    ensures \result == true || \result == false;
+  disjoint behaviors;
+*/
 bool merkle_audit(merkle_tree_t *tree, merkle_blob_t *blob,
                   merkle_proof_step_t *proof, int proof_len)
 {
@@ -401,6 +565,24 @@ bool merkle_audit(merkle_tree_t *tree, merkle_blob_t *blob,
     return memcmp(digest, tree->root_digest, MERKLE_DIGEST_LEN) == 0;
 }
 
+/*@
+  requires tree == \null || \valid(tree);
+  requires other_root_digest == \null ||
+           \valid_read(other_root_digest + (0 .. MERKLE_DIGEST_LEN - 1));
+  assigns \nothing;
+  behavior invalid:
+    assumes tree == \null || other_root_digest == \null;
+    ensures \result == false;
+  behavior consistent:
+    assumes tree != \null && other_root_digest != \null &&
+            tree->has_root_digest;
+    ensures \result == true || \result == false;
+  behavior no_digest:
+    assumes tree != \null && other_root_digest != \null &&
+            !tree->has_root_digest;
+    ensures \result == false;
+  disjoint behaviors;
+*/
 bool merkle_consistent(merkle_tree_t *tree, int other_size,
                        const uint8_t *other_root_digest)
 {
@@ -413,6 +595,16 @@ bool merkle_consistent(merkle_tree_t *tree, int other_size,
     return memcmp(tree->root_digest, other_root_digest, MERKLE_DIGEST_LEN) == 0;
 }
 
+/*@
+  behavior null:
+    assumes tree == \null;
+    assigns \nothing;
+  behavior valid:
+    assumes tree != \null;
+    requires \valid(tree);
+    frees tree->nodes, tree->blobs, tree;
+  disjoint behaviors;
+*/
 void merkle_tree_free(merkle_tree_t *tree)
 {
     if (tree == NULL)
