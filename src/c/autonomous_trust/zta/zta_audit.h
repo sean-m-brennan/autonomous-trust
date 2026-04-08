@@ -66,6 +66,13 @@ typedef struct {
  * @param path File path for the JSONL log
  * @return 0 on success, -1 on failure
  */
+/*@
+  requires \valid(log);
+  requires path != \null && \valid_read(path);
+  assigns *log;
+  ensures \result == 0 || \result == -1;
+  ensures \result == 0 ==> log->initialized == \true;
+*/
 int zta_audit_init(zta_audit_log_t *log, const char *path);
 
 /**
@@ -77,11 +84,24 @@ int zta_audit_init(zta_audit_log_t *log, const char *path);
  * @param entry Entry to record
  * @return 0 on success, -1 on failure
  */
+/*@
+  requires \valid(log);
+  requires log->initialized == \true;
+  requires \valid(entry);
+  assigns log->deferred[0 .. ZTA_AUDIT_MAX_DEFERRED - 1],
+          log->deferred_count;
+  ensures \result == 0 || \result == -1;
+*/
 int zta_audit_record(zta_audit_log_t *log, const zta_audit_entry_t *entry);
 
 /**
  * @brief Get count of unresolved deferred entries
  */
+/*@
+  requires \valid(log);
+  assigns \nothing;
+  ensures \result >= 0 && \result <= ZTA_AUDIT_MAX_DEFERRED;
+*/
 int zta_audit_deferred_count(const zta_audit_log_t *log);
 
 /**
@@ -92,6 +112,19 @@ int zta_audit_deferred_count(const zta_audit_log_t *log);
  * @param out   Output: copy of the deferred entry
  * @return 0 on success, -1 if index out of range
  */
+/*@
+  requires \valid(log);
+  requires \valid(out);
+  assigns *out;
+  behavior valid_index:
+    assumes index >= 0 && index < log->deferred_count;
+    ensures \result == 0;
+  behavior invalid_index:
+    assumes index < 0 || index >= log->deferred_count;
+    ensures \result == -1;
+  disjoint behaviors;
+  complete behaviors;
+*/
 int zta_audit_get_deferred(const zta_audit_log_t *log, int index,
                            zta_audit_entry_t *out);
 
@@ -106,12 +139,24 @@ int zta_audit_get_deferred(const zta_audit_log_t *log, int index,
  * @param resolution The verification result that resolves the deferral
  * @return 0 on success, -1 if peer not found in deferred list
  */
+/*@
+  requires \valid(log);
+  requires log->initialized == \true;
+  requires \valid(resolution);
+  assigns log->deferred[0 .. ZTA_AUDIT_MAX_DEFERRED - 1];
+  ensures \result == 0 || \result == -1;
+*/
 int zta_audit_resolve(zta_audit_log_t *log, const uuid_t peer_uuid,
                       const zta_result_t *resolution);
 
 /**
  * @brief Close the audit log and release resources
  */
+/*@
+  requires log == \null || \valid(log);
+  assigns log->log_file, log->initialized;
+  ensures log != \null ==> log->initialized == \false;
+*/
 void zta_audit_close(zta_audit_log_t *log);
 
 #ifdef __cplusplus

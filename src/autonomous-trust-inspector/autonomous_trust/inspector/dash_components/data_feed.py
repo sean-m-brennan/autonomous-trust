@@ -33,7 +33,7 @@ class DataFeed(DashComponent):
         self.idx = 0
         self.fig = go.Figure()
         self.fig.add_trace(go.Scatter(x=[float(self.idx)], y=[0.0] * peer.metadata.data_channels, mode='lines',
-                                      name='data_%s' % self.number))
+                                      name=f'data_{self.number}'))
 
     def rcv(self):
         while not self.halt:
@@ -43,13 +43,13 @@ class DataFeed(DashComponent):
                 continue
             if data:
                 self.idx += 1
-                self.fig.update_traces(selector=dict(name='data_%s' % self.number,
+                self.fig.update_traces(selector=dict(name=f'data_{self.number}',
                                                      x=[float(self.idx)], y=data, mode='lines'))
 
     def div(self, title: str, style: dict = None) -> html.Div:
         if style is None:
             style = {'float': 'left', 'padding': 10}
         return html.Div([html.H1(title),
-                         dcc.Graph(id='data_graph_%d' % self.peer.index, config=dict(displayModeBar=False),
+                         dcc.Graph(id=f'data_graph_{self.peer.index}', config=dict(displayModeBar=False),
                                    style=dict(width='50%', height=320))],
                         style=style)

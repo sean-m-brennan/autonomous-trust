@@ -166,32 +166,23 @@ class TestSendPeer:
         UDPNetworkProcess.send_peer(proc, msg, '10.0.0.1')
         proc._send_udp.assert_called_once_with(msg, '10.0.0.1', 8000)
 
-    def test_oversized_msg_is_truncated(self):
-        """send_peer truncates messages longer than packet_size to packet_size-1 bytes."""
+    def test_oversized_msg_raises_error(self):
+        """send_peer raises TransmissionError for messages longer than packet_size."""
         proc = _make_proc(port=8000, packet_size=10)
         proc._send_udp = MagicMock()
         msg = b'x' * 20   # 20 bytes > packet_size of 10
-        UDPNetworkProcess.send_peer(proc, msg, '10.0.0.1')
-        sent_arg = proc._send_udp.call_args[0][0]
-        assert len(sent_arg) == 9   # packet_size - 1
+        with pytest.raises(TransmissionError):
+            UDPNetworkProcess.send_peer(proc, msg, '10.0.0.1')
+        proc._send_udp.assert_not_called()
 
-    def test_msg_exactly_packet_size_is_not_truncated(self):
-        """send_peer does not truncate a message of exactly packet_size bytes."""
+    def test_msg_exactly_packet_size_is_sent(self):
+        """send_peer sends a message of exactly packet_size bytes."""
         proc = _make_proc(port=8000, packet_size=10)
         proc._send_udp = MagicMock()
         msg = b'x' * 10
         UDPNetworkProcess.send_peer(proc, msg, '10.0.0.1')
         sent_arg = proc._send_udp.call_args[0][0]
         assert len(sent_arg) == 10
-
-    def test_truncation_preserves_leading_bytes(self):
-        """Truncated message is the first packet_size-1 bytes of the original."""
-        proc = _make_proc(port=8000, packet_size=5)
-        proc._send_udp = MagicMock()
-        msg = b'abcdefgh'
-        UDPNetworkProcess.send_peer(proc, msg, '10.0.0.1')
-        sent_arg = proc._send_udp.call_args[0][0]
-        assert sent_arg == b'abcd'
 
 
 # ---------------------------------------------------------------------------

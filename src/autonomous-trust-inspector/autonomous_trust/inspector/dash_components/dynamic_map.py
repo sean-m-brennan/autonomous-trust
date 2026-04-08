@@ -119,7 +119,7 @@ class DynamicMap(DashComponent):
                     # traces already created
                     self.fig.update_traces(selector=dict(name=uuid), mode='lines', overwrite=True,
                                            lat=list(self.coords[uuid].lat), lon=list(self.coords[uuid].lon))
-                    self.fig.update_traces(selector=dict(name='mark-%s' % uuid), mode='markers', overwrite=True,
+                    self.fig.update_traces(selector=dict(name=f'mark-{uuid}'), mode='markers', overwrite=True,
                                            lat=[self.coords[uuid].lat[-1]], lon=[self.coords[uuid].lon[-1]])
                 else:
                     self.add_traces(idx, uuid)
@@ -127,7 +127,7 @@ class DynamicMap(DashComponent):
                 if self.following == uuid:
                     # FIXME disable previous marker
                     self.center = GeoPosition(self.coords[uuid].lat[-1], self.coords[uuid].lon[-1])
-                    self.fig.update_traces(selector=dict(name='follow-%s' % uuid), mode='markers',
+                    self.fig.update_traces(selector=dict(name=f'follow-{uuid}'), mode='markers',
                                            overwrite=True,
                                            lat=[self.coords[uuid].lat[-1]], lon=[self.coords[uuid].lon[-1]])
         if self.z_scale != self.default_scale:  # FIXME or pitch/bearing/follow changes
@@ -196,13 +196,13 @@ class DynamicMap(DashComponent):
         self.color_map[uuid] = colors.qualitative.Light24[idx]
         self.fig.add_trace(scatter(lat=[position.lat], lon=[position.lon],
                                    mode='markers', marker=dict(color=self.color_map[uuid], opacity=.7),
-                                   name='mark-%s' % uuid))
+                                   name=f'mark-{uuid}'))
         self.fig.add_trace(scatter(lat=[position.lat], lon=[position.lon],
                                    mode='lines', line=dict(color=self.color_map[uuid], width=3),
                                    name=uuid))
         self.fig.add_trace(scatter(lat=[0], lon=[0],
                                    mode='markers', marker=dict(color='white', size=5, opacity=.5),
-                                   name='follow-%s' % uuid))
+                                   name=f'follow-{uuid}'))
 
     def acquire_initial_conditions(self):
         # reset
@@ -211,7 +211,7 @@ class DynamicMap(DashComponent):
         self.color_map: dict[str, str] = {}
 
         self.cohort.update(initial=True)  # FIXME initial - must not run components
-        self.logger.debug('Initialize map: %d peers' % len(self.cohort.peers))
+        self.logger.debug(f'Initialize map: {len(self.cohort.peers)} peers')
         center = self.cohort.center.convert(GeoPosition)
         if self.use_map:
             self.z_scale = 14  # TODO: compute, this is tuned for the example config

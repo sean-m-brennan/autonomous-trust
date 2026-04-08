@@ -20,6 +20,7 @@
 
 #include "autonomous_trust/identity/history.h"
 #include "autonomous_trust/identity/identity.h"
+#include "autonomous_trust/identity/identity_priv.h"
 #include "autonomous_trust/utilities/protobuf_shutdown.h"
 
 #define DEBUG_TESTS 1
@@ -102,13 +103,17 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_identity_history_share_hear)
 {
-    public_identity_t *me = make_test_peer("Sharer");
+    /* create a full identity for signing */
+    identity_t *signer = NULL;
+    ck_assert_ret_ok(identity_create(NULL, "127.0.0.1", "Sharer",
+                                     "sharer", "sharer", &signer));
+
     peers_t peers;
     memset(&peers, 0, sizeof(peers_t));
 
     agreement_voter_t voter = {.rank = 1};
     char uuid_str[37];
-    uuid_unparse_lower(me->uuid, uuid_str);
+    uuid_unparse_lower(signer->uuid, uuid_str);
     strncpy(voter.uuid, uuid_str, AGREEMENT_UUID_LEN - 1);
 
     logger_t logger = {0};
@@ -120,15 +125,25 @@ DEFINE_TEST(test_identity_history_share_hear)
     ck_assert_ret_ok(identity_history_insert_peer(history, p1));
     ck_assert_ret_ok(identity_history_insert_peer(history, p2));
 
-    /* share the history */
-    array_t *steps = NULL;
-    ck_assert_ret_ok(identity_history_share(history, &steps));
-    ck_assert_ptr_nonnull(steps);
-    ck_assert(array_size(steps) > 0);
+    /* share the history as a signed wire buffer */
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    ck_assert_ret_ok(identity_history_share(history, signer, &wire, &wire_len));
+    ck_assert_ptr_nonnull(wire);
+    ck_assert(wire_len > 0);
 
-    array_free(steps);
+    /* create a second history to receive into */
+    identity_history_t *receiver = NULL;
+    ck_assert_ret_ok(identity_history_create(&voter, &peers, &logger, 0, &receiver));
+
+    /* hear should verify signature and ingest */
+    public_identity_t *pub = (public_identity_t *)signer;
+    ck_assert_ret_ok(identity_history_hear(receiver, pub, wire, wire_len));
+
+    free(wire);
+    identity_history_free(receiver);
     identity_history_free(history);
-    free(me);
+    smrt_deref(signer);
     free(p1);
     free(p2);
 }

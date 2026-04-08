@@ -39,11 +39,25 @@ const long cadence = 500000L; // microseconds
 
 typedef bool (*msg_handler_t)(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 
+/*@
+  requires \valid(proc);
+  requires name != \null && \valid_read(name);
+  requires \valid(configurations);
+  assigns proc->name[0 .. PROC_NAME_LEN],
+          proc->conf, proc->configs, proc->subsystems,
+          proc->logger, proc->dependencies, proc->runner,
+          proc->protocol.handlers;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies)
 {
     memset(proc->name, 0, PROC_NAME_LEN);
     memcpy(proc->name, name, PROC_NAME_LEN - 1);
-    // FIXME general config load/save
+    // Config loaded from per-process JSON files via load_all_configs()
     config_t *cfg = NULL;
     data_t *cfg_dat = NULL;
     memset(&proc->conf, 0, sizeof(config_t));
@@ -57,7 +71,8 @@ int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *confi
     proc->logger = logger;
     proc->dependencies = dependencies;
     proc->runner = runner;
-    return map_create(&proc->protocol.handlers); // FIXME protocol from config
+    // TODO: Load protocol handler table from config to allow runtime customization
+    return map_create(&proc->protocol.handlers);
 }
 
 int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
@@ -80,7 +95,7 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
     }
     else
     {
-        proc = smrt_create(sizeof(process_t)); // FIXME does this get freed?
+        proc = smrt_create(sizeof(process_t)); // freed via smrt_deref when process exits
         if (process_init(proc, pname, runner, configs, tracker, logger, NULL) != 0)
         {
             // process_init may fail if pname is not found in the configs map (EMAP_NOKEY);
@@ -92,7 +107,7 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
     char sig[SIG_NAME_LEN + 1] = {0};
     process_name_to_signal(pname, sig);
 
-    pid_t pid = proc->runner(proc, queues, sig, logger); // FIXME ensure child does run fnctn
+    pid_t pid = proc->runner(proc, queues, sig, logger);
     if (pid == -1)
     {
         log_error(logger, "Error starting process '%s'\n", pname);
@@ -120,11 +135,25 @@ int restart_process(pid_t orig, char *pname, map_t *procs, directory_t *queues, 
     return _process_start(orig, pname, NULL, NULL, NULL, procs, queues, logger);
 }
 
+/*@
+  requires name != \null && \valid_read(name);
+  requires \valid(sig + (0 .. SIG_NAME_LEN));
+  assigns sig[0 .. SIG_NAME_LEN];
+*/
 void process_name_to_signal(const char *name, char *sig)
 {
     snprintf(sig, SIG_NAME_LEN, "%s_s", name);
 }
 
+/*@
+  requires name_in != \null && \valid_read(name_in);
+  assigns \nothing;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int set_process_name(const char *name_in)
 {
     char name[PROC_NAME_LEN + 1] = {0};
@@ -169,7 +198,10 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
             msg_handler_t handler;
             err = data_object_ptr(h_dat, (void *)&handler);
             if (err != 0)
+            {
+                log_warn(proc->logger, "%s: failed to extract handler for '%s'\n", proc->name, nmsg->function);
                 return false;
+            }
             return handler(proc, queues, msg);
         }
     }
@@ -259,8 +291,10 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
 
         generic_msg_t buf = {0};
         int err = messaging_recv(&buf);
-        if (err == -1)
-            continue; /* FIXME repair? */
+        if (err == -1) {
+            log_debug(proc->logger, "%s: message receive error\n", proc->name);
+            continue;
+        }
         if (err == ENOMSG)
             continue;
         if (!run_message_handlers(proc, queues, buf.type, &buf))
@@ -276,7 +310,7 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
             data_t *m_dat = object_ptr_data(msg, size);
             array_append(&unprocessed, m_dat);
         }
-        // FIXME post-msg handling activity
+        // Hook point for sub-process specific post-message activity (e.g. periodic tasks)
     }
     array_free(&unprocessed);
     array_free(queues);

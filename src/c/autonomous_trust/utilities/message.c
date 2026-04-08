@@ -38,10 +38,47 @@
 
 #define SOCK_PATH_LEN 108
 
+/*@
+  axiomatic messaging_thread_safety {
+    // Thread safety note: Unix domain SOCK_DGRAM provides atomic
+    // datagram delivery.  sendmsg/recvfrom on separate file descriptors
+    // are safe without additional locks.  The my_q static pointer is
+    // set once via messaging_assign() before any concurrent use.
+    // WP cannot verify concurrent properties; this axiom documents
+    // the design invariant.
+    axiom datagram_atomicity:
+      \true;
+  }
+*/
+
+static size_t _max_msg_size = DEFAULT_MAX_MSG_SIZE;
+
+size_t messaging_max_size(void)
+{
+    return _max_msg_size;
+}
+
+void messaging_set_max_size(size_t size)
+{
+    if (size > 0)
+        _max_msg_size = size;
+}
+
 #define htonll(x) ((1 == htonl(1)) ? (x) : (((uint64_t)htonl((x) & 0xFFFFFFFFUL)) << 32) | htonl((uint32_t)((x) >> 32)))
 
 #define ntohll(x) ((1 == ntohl(1)) ? (x) : (((uint64_t)ntohl((x) & 0xFFFFFFFFUL)) << 32) | ntohl((uint32_t)((x) >> 32)))
 
+/*@
+  requires key != \null && \valid_read(key);
+  requires \valid(addr);
+  assigns addr->sun_family, addr->sun_path[0 .. sizeof(addr->sun_path) - 1];
+  behavior success:
+    ensures \result == 0;
+    ensures addr->sun_family == AF_UNIX;
+  behavior failure:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int unix_addr(const char *key, struct sockaddr_un *addr)
 {
     char path[SOCK_PATH_LEN] = {0};
@@ -56,6 +93,17 @@ int unix_addr(const char *key, struct sockaddr_un *addr)
     return 0;
 }
 
+/*@
+  requires id != \null && \valid_read(id);
+  requires \valid(queue);
+  assigns queue->key[0 .. MSG_KEY_LEN - 1], queue->fd;
+  behavior success:
+    ensures \result == 0;
+    ensures queue->fd >= 0;
+  behavior failure:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int messaging_init(const char *id, queue_t *queue)
 {
     strncpy(queue->key, id, MSG_KEY_LEN - 1);
@@ -96,6 +144,20 @@ int messaging_recv_from(generic_msg_t *msg, struct sockaddr_storage *their_addr,
     return messaging_recv_on(my_q, msg, their_addr, blocking);
 }
 
+/*@
+  requires \valid(q);
+  requires q->fd > 0;
+  requires \valid(msg);
+  requires their_addr == \null || \valid(their_addr);
+  assigns msg->type, msg->size, msg->info;
+  behavior success:
+    ensures \result == 0;
+  behavior no_message:
+    ensures \result == ENOMSG;
+  behavior error:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int messaging_recv_on(queue_t *q, generic_msg_t *msg, struct sockaddr_storage *their_addr, bool blocking)
 {
     if (q->fd <= 0)
@@ -160,6 +222,18 @@ int signal_recv(queue_t *q, long *msg_type, signal_t *sig)
     return 0;
 }
 
+/*@
+  requires key != \null && \valid_read(key);
+  requires \valid(msg);
+  assigns \nothing;
+  behavior no_queue:
+    ensures \result == -1;
+  behavior success:
+    ensures \result == 0;
+  behavior would_block:
+    ensures \result == EAGAIN;
+  disjoint behaviors no_queue, success, would_block;
+*/
 int messaging_send(const char *key, const message_type_t type, generic_msg_t *msg, bool blocking)
 {
     if (my_q == NULL)
@@ -203,6 +277,16 @@ int messaging_send(const char *key, const message_type_t type, generic_msg_t *ms
     return 0;
 }
 
+/*@
+  requires queue == \null || \valid(queue);
+  behavior null_queue:
+    assumes queue == \null;
+    assigns \nothing;
+  behavior valid_queue:
+    assumes queue != \null;
+    assigns queue->fd;
+  disjoint behaviors;
+*/
 void messaging_qclose(queue_t *queue)
 {
     if (queue == NULL)
