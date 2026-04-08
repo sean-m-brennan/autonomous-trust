@@ -29,7 +29,7 @@ from autonomous_trust.inspector.peer.daq import Cohort, CohortTracker
 from autonomous_trust.services.data.client import DataRcvr
 from autonomous_trust.services.video.client import VideoRecv
 
-from autonomous_trust.simulator.dash_components.map_display import MapDisplay, MapUI
+from autonomous_trust.evaluation.dash_components.map_display import MapDisplay, MapUI
 from autonomous_trust.simulator.video.client import VideoSimRcvr
 
 THREADED = True

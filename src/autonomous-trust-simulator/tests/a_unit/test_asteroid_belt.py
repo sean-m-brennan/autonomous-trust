@@ -23,7 +23,7 @@ import math
 import pytest
 
 try:
-    from autonomous_trust.simulator.scenarios.asteroid_belt import (
+    from examples.asteroid_belt.scenario import (
         create_asteroid_belt_config, HABITATS, SUN_POSITION,
     )
     from autonomous_trust.simulator.sim_data import SimConfig

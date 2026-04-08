@@ -21,8 +21,8 @@ import pytest
 from unittest.mock import patch, MagicMock
 from datetime import datetime
 
-from autonomous_trust.simulator.redteam import AttackScenario, PartitionEvent
-from autonomous_trust.simulator.redteam.harness import RedTeamHarness
+from autonomous_trust.evaluation.redteam import AttackScenario, PartitionEvent
+from autonomous_trust.evaluation.redteam.harness import RedTeamHarness
 
 
 class FakeAttack(AttackScenario):
@@ -121,7 +121,7 @@ class TestHarnessReportGeneration:
         assert report['attacks'][0]['result'] == 'ERROR'
 
 
-from autonomous_trust.simulator.redteam.sybil_attack import SybilAttack
+from autonomous_trust.evaluation.redteam.sybil_attack import SybilAttack
 
 
 class TestSybilAttackSetup:
@@ -143,7 +143,7 @@ class TestSybilAttackSetup:
                 assert 'at-net' in svc.get('networks', {})
 
 
-from autonomous_trust.simulator.redteam.mitm_attack import MitmAttack
+from autonomous_trust.evaluation.redteam.mitm_attack import MitmAttack
 
 
 class TestMitmAttackSetup:
@@ -170,7 +170,7 @@ class TestMitmAttackSetup:
         assert 'ask permission' in result['attack_specific']['signatures_found']
 
 
-from autonomous_trust.simulator.redteam.report import generate_markdown_report
+from autonomous_trust.evaluation.redteam.report import generate_markdown_report
 
 
 class TestMarkdownReport:
