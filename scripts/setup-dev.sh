@@ -43,9 +43,7 @@ info()  { echo -e "${GREEN}[setup]${RESET} $*"; }
 warn()  { echo -e "${YELLOW}[setup]${RESET} $*"; }
 error() { echo -e "${RED}[setup]${RESET} $*" >&2; }
 
-# ---------------------------------------------------------------------------
 # Detect platform
-# ---------------------------------------------------------------------------
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
@@ -55,9 +53,7 @@ case "$OS" in
     *)      error "Unsupported OS: $OS"; exit 1 ;;
 esac
 
-# ---------------------------------------------------------------------------
-# 1. Miniforge (conda-forge only — no Anaconda defaults channel)
-# ---------------------------------------------------------------------------
+# Miniforge (conda-forge only — no Anaconda defaults channel)
 install_miniforge() {
     if command -v conda &>/dev/null; then
         info "conda already available: $(conda --version)"
@@ -96,9 +92,7 @@ activate_conda() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# 2. Conda environment
-# ---------------------------------------------------------------------------
+# Conda environment
 create_conda_env() {
     activate_conda
 
@@ -143,9 +137,7 @@ update_conda_env() {
     info "Environment updated"
 }
 
-# ---------------------------------------------------------------------------
-# 3. Rust toolchain (installed into the conda env)
-# ---------------------------------------------------------------------------
+# Rust toolchain (installed into the conda env)
 install_rust() {
     activate_conda
     conda activate "$ENV_NAME"
@@ -198,25 +190,81 @@ EOF
     info "Rust conda hooks configured"
 }
 
-install-frama-c() {
-  #cat > "$ACTIVATE_DIR/frama-c.sh" << 'EOF'
-  export OPAMROOT="$CONDA_PREFIX/share/opam"
-  #  eval $(opam env --root="$OPAMROOT" --switch=default)
-  #  EOF
+# Frama-C (installed into the conda env)
+install_frama_c() {
+    activate_conda
+    conda activate "$ENV_NAME"
 
-  #  cat > "$DEACTIVATE_DIR/frama-c.sh" << 'EOF'
-  #  # opam env vars are cleared when conda env deactivates
-  #  unset OPAMROOT
-   # EOF
-  # Assumes opam installed
-  opam init -n --compiler 4.14.1 --root="$OPAMROOT" # may take a while
-  eval $(opam env --root="$OPAMROOT" --switch=4.14.1)
-  opam install -y frama-c --ignore-constraints-on=lablgtk3
-  opam install -y alt-ergo
+    local env_prefix
+    env_prefix="$(conda info --json | python3 -c "
+import sys, json
+info = json.load(sys.stdin)
+for p in info['envs']:
+    if p.endswith('/$ENV_NAME') or '/$ENV_NAME' in p:
+        print(p); break
+" 2>/dev/null || echo "$CONDA_PREFIX")"
+
+    if [ -z "$env_prefix" ]; then
+        env_prefix="$CONDA_PREFIX"
+    fi
+
+    export OPAMROOT="$env_prefix/share/opam"
+
+    info "Initializing opam at $OPAMROOT ..."
+    opam init -n --root="$OPAMROOT" --compiler=4.14.1  # may take a while
+    eval $(opam env --root="$OPAMROOT" --switch=4.14.1)
+
+    # Frama-C lists lablgtk3 as a hard dependency on Linux, but the build
+    # system (dune) treats the GUI as optional.  Download the source, strip
+    # the GTK dependencies from the opam metadata, then pin-install so opam
+    # never tries to build lablgtk3.
+    info "Downloading Frama-C source ..."
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap "rm -rf '$tmpdir'" EXIT
+    opam source frama-c --dir="$tmpdir/frama-c"
+
+    info "Patching Frama-C opam file to remove GUI (lablgtk3) dependencies ..."
+    local opam_file="$tmpdir/frama-c/opam"
+    if [ ! -f "$opam_file" ]; then
+        opam_file="$tmpdir/frama-c/frama-c.opam"
+    fi
+    sed -i '/"lablgtk3/d'          "$opam_file"
+    sed -i '/"conf-gtksourceview3/d' "$opam_file"
+
+    info "Installing Frama-C (CLI only, no GUI) — this may take a while ..."
+    opam pin add frama-c "$tmpdir/frama-c" -y --assume-depexts
+
+    info "Installing Alt-Ergo SMT solver ..."
+    opam install -y alt-ergo
+
+    # Conda activate/deactivate hooks so OPAMROOT and opam PATH are set
+    local activate_dir="$env_prefix/etc/conda/activate.d"
+    local deactivate_dir="$env_prefix/etc/conda/deactivate.d"
+    mkdir -p "$activate_dir" "$deactivate_dir"
+
+    cat > "$activate_dir/frama-c.sh" << EOF
+#!/bin/sh
+export OPAMROOT="$env_prefix/share/opam"
+eval \$(opam env --root="\$OPAMROOT" --switch=4.14.1)
+EOF
+    chmod +x "$activate_dir/frama-c.sh"
+
+    cat > "$deactivate_dir/frama-c.sh" << 'EOF'
+#!/bin/sh
+unset OPAMROOT
+unset OPAM_SWITCH_PREFIX
+unset CAML_LD_LIBRARY_PATH
+unset OCAML_TOPLEVEL_PATH
+EOF
+    chmod +x "$deactivate_dir/frama-c.sh"
+
+    info "Frama-C installed. Reactivate the conda environment to pick up PATH changes:"
+    info "  conda deactivate && conda activate $ENV_NAME"
 }
 
 # ---------------------------------------------------------------------------
-# 4. Docker
+# Docker
 # ---------------------------------------------------------------------------
 check_docker() {
     if command -v docker &>/dev/null; then
@@ -242,6 +290,7 @@ main() {
     install_miniforge
     create_conda_env
     install_rust
+    install_frama_c
     check_docker
 
     echo
