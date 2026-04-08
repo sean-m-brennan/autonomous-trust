@@ -20,10 +20,15 @@ import pytest
 
 # Add sibling package source dirs to sys.path for monorepo development
 _repo_src = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-for _pkg in ('autonomous-trust', 'autonomous-trust-services', 'autonomous-trust-inspector'):
+for _pkg in ('autonomous-trust', 'autonomous-trust-services', 'autonomous-trust-inspector', 'autonomous-trust-evaluation'):
     _pkg_dir = os.path.join(_repo_src, _pkg)
     if _pkg_dir not in sys.path and os.path.isdir(_pkg_dir):
         sys.path.insert(0, _pkg_dir)
+
+# Add repo root for examples/ imports (e.g. examples.appalachia)
+_repo_root = os.path.abspath(os.path.join(_repo_src, '..'))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
 
 
 def pytest_addoption(parser):

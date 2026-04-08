@@ -48,6 +48,7 @@ class LiveNetwork(ng.NetworkGraph):
     def __init__(self, _, **kwargs):
         self.node_data = list(self.node_data) + ['persist']
         self.iteration = 0
+        self._stopped = False
         groups = ['a', '', ' ', 'trouble']
         self.data_q = kwargs.pop('data_q')
         super().__init__(nx.complete_graph, 1, delay=True, groups=groups, **kwargs)
@@ -58,12 +59,20 @@ class LiveNetwork(ng.NetworkGraph):
 
     @property
     def stop(self):
-        return False
+        return self._stopped
+
+    def shutdown(self):
+        """Signal the live network to stop on the next update cycle."""
+        self._stopped = True
 
     def get_update(self):
         try:
             label, data = self.data_q.get(block=True, timeout=queue_cadence)
-            LiveData.run_data_handlers(self.G, label, data)
+            if label is None:
+                # Sentinel value signals disconnect
+                self._stopped = True
+            else:
+                LiveData.run_data_handlers(self.G, label, data)
         except queue.Empty:
             pass
         return super().get_update()

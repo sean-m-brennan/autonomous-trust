@@ -33,6 +33,7 @@ from ..util import ClassEnumMeta
 
 
 _ALLOWED_CONFIG_TYPES: set = set()
+_ALLOWED_ENUM_TYPES: set = set()
 
 
 def register_config_type(cls):
@@ -40,12 +41,21 @@ def register_config_type(cls):
     _ALLOWED_CONFIG_TYPES.add(type_name)
 
 
+def register_enum_type(cls):
+    """Register an Enum type as allowed for deserialization."""
+    type_name = cls.__module__ + '.' + cls.__qualname__
+    _ALLOWED_ENUM_TYPES.add(type_name)
+    return cls
+
+
+@register_enum_type
 class SerializeMode(Enum):
     PROTO = 1
     JSON = 2
     PJSON = 3
 
 
+@register_enum_type
 class WireFormat(Enum):
     BINARY = 1
     JSON = 2
@@ -59,10 +69,11 @@ class Configuration(object):
     ROOT_VARIABLE_NAME = 'AUTONOMOUS_TRUST_ROOT'
     CFG_PATH = os.path.join('etc', 'at')
     DATA_PATH = os.path.join('var', 'at')
-    # FIXME from config
-    mode = SerializeMode.JSON
-    wire_format = WireFormat.JSON
-    file_ext = '.cfg.json'
+    mode = SerializeMode(int(os.environ.get('AT_SERIALIZE_MODE', SerializeMode.JSON.value)))
+    wire_format = WireFormat(int(os.environ.get('AT_WIRE_FORMAT', WireFormat.JSON.value)))
+    _file_ext_map = {SerializeMode.JSON: '.cfg.json', SerializeMode.PJSON: '.cfg.json',
+                     SerializeMode.PROTO: '.cfg.pb'}
+    file_ext = _file_ext_map.get(mode, '.cfg.json')
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
     _msg_class = None
 
@@ -261,6 +272,8 @@ def config_json_decoder(dct):
         return SignedMessage._from_parts(signature=sig, message=msg, combined=sig + msg)
     if type_name.startswith('Enumcfg:'):
         enum_path = type_name[len('Enumcfg:'):]
+        if enum_path not in _ALLOWED_ENUM_TYPES:
+            raise ValueError(f"Enum type '{enum_path}' not in allowed enum types")
         module_name, class_name = enum_path.rsplit('.', 1)
         try:
             module = sys.modules[module_name]

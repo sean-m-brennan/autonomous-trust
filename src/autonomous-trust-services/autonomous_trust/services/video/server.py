@@ -30,7 +30,8 @@ from autonomous_trust.core.network import Message
 from ..data.serialize import serialize
 from ..data.server import DataConfig, DataProcess, DataProtocol
 
-class VideoProtocol(DataProtocol):  # FIXME remove?
+class VideoProtocol(DataProtocol):
+    """Extends DataProtocol with the 'video' message type for video frame transport."""
     video = 'video'
 
 class VideoPosition(str, Enum):

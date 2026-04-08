@@ -1,0 +1,314 @@
+/**
+ * @file predicates.acsl
+ * @brief Shared ACSL predicates for AutonomousTrust Frama-C verification.
+ *
+ * These predicates model invariants for the project's core data structures
+ * (smart pointers, strings, arrays, data, maps) and are reused across
+ * multiple annotated modules.
+ *
+ * Include via:  //@ #include "frama-c/predicates.acsl"
+ *
+ * Copyright 2025 Sean M. Brennan and contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*@
+  // ----------------------------------------------------------------
+  // Smart-pointer validity (smrt_ptr_t is embedded anonymously via
+  // the C11 anonymous-struct idiom in every heap-allocated struct).
+  //
+  // Layout (from allocation.h):
+  //   typedef struct { bool alloc; size_t refs; } smrt_ptr_t;
+  //
+  // The smrt_ptr_t header sits at a *negative* offset from the
+  // user-visible pointer returned by smrt_create().  For modelling
+  // purposes we treat the pointer itself as the base of the
+  // containing struct and assume the anonymous smrt_ptr_t members
+  // (alloc, refs) are the first two fields.
+  // ----------------------------------------------------------------
+
+  predicate valid_smrt{L}(void *p) =
+    p != \null &&
+    \valid((char *)p) &&
+    ((smrt_ptr_t *)p)->alloc == \true &&
+    ((smrt_ptr_t *)p)->refs >= 1;
+
+  // ----------------------------------------------------------------
+  // Null-terminated string within a bounded buffer.
+  //
+  // The string must fit (including its terminator) within max bytes.
+  // ----------------------------------------------------------------
+
+  predicate valid_string{L}(char *s, size_t max) =
+    s != \null &&
+    max > 0 &&
+    \valid(s + (0 .. max - 1)) &&
+    (\exists size_t i; 0 <= i < max && s[i] == '\0');
+
+  // ----------------------------------------------------------------
+  // Valid dynamic array (array_t, opaque in public API).
+  //
+  // Private layout (from array_priv.h):
+  //   struct array_s {
+  //       smrt_ptr_t;   // anonymous: bool alloc; size_t refs;
+  //       size_t size;
+  //       data_t **array;
+  //   };
+  // ----------------------------------------------------------------
+
+  predicate valid_array{L}(array_t *a) =
+    a != \null &&
+    \valid(a) &&
+    valid_smrt((void *)a) &&
+    a->size >= 0 &&
+    (a->size == 0 ==> a->array == \null || \valid(a->array + (0 .. 0))) &&
+    (a->size > 0 ==>
+      a->array != \null &&
+      \valid(a->array + (0 .. a->size - 1)));
+
+  // ----------------------------------------------------------------
+  // Valid data_t (opaque in public API).
+  //
+  // Private layout (from data_priv.h):
+  //   struct data_s {
+  //       smrt_ptr_t;        // bool alloc; size_t refs;
+  //       data_type_t type;  // enum 0..7
+  //       size_t size;
+  //       union { long intgr; unsigned long uintr; double flt_pt;
+  //               bool bl; char *str; unsigned char *byt; void *obj; };
+  //       int (*cmp)(struct data_s *, struct data_s *);
+  //   };
+  // ----------------------------------------------------------------
+
+  predicate valid_data_type{L}(data_type_t t) =
+    t == NONE  || t == INT   || t == UINT  || t == FLOAT ||
+    t == BOOL  || t == STRING || t == BYTES || t == OBJECT;
+
+  predicate valid_data{L}(data_t *d) =
+    d != \null &&
+    \valid(d) &&
+    valid_smrt((void *)d) &&
+    valid_data_type(d->type);
+
+  // ----------------------------------------------------------------
+  // Valid map (map_t, opaque in public API).
+  //
+  // Private layout (from map_priv.h):
+  //   struct map_s {
+  //       smrt_ptr_t;
+  //       map_item_t *items;
+  //       size_t length;
+  //       size_t capacity;
+  //       array_t keys;
+  //       unsigned char hashkey[crypto_shorthash_KEYBYTES];
+  //   };
+  // ----------------------------------------------------------------
+
+  predicate valid_map{L}(map_t *m) =
+    m != \null &&
+    \valid(m) &&
+    valid_smrt((void *)m) &&
+    m->length <= m->capacity &&
+    (m->capacity > 0 ==>
+      m->items != \null &&
+      \valid(m->items + (0 .. m->capacity - 1)));
+
+  // ----------------------------------------------------------------
+  // Valid map_item_t.
+  //
+  //   typedef struct {
+  //       smrt_ptr_t;
+  //       map_key_t key;   // char *
+  //       data_t *value;
+  //       size_t hash;
+  //   } map_item_t;
+  // ----------------------------------------------------------------
+
+  predicate valid_map_item{L}(map_item_t *mi) =
+    mi != \null &&
+    \valid(mi) &&
+    mi->key != \null &&
+    \valid(mi->key) &&
+    mi->value != \null &&
+    valid_data(mi->value);
+
+  // ----------------------------------------------------------------
+  // Valid linked_step_t (DAG step).
+  //
+  // Layout (from dag.h):
+  //   struct linked_step_s {
+  //       char uuid[DAG_UUID_LEN];    // DAG_UUID_LEN == 37
+  //       datetime_t timestamp;
+  //       void *payload;
+  //       linked_step_t *parent;
+  //       int length;
+  //   };
+  // ----------------------------------------------------------------
+
+  predicate valid_step{L}(linked_step_t *s) =
+    s != \null && \valid(s) &&
+    s->length >= 0 &&
+    s->uuid[36] == '\0';
+
+  // ----------------------------------------------------------------
+  // Valid step_dag_t.
+  //
+  // Layout (from dag.h):
+  //   typedef struct {
+  //       map_t *heads;
+  //       map_t *branch_lists;
+  //   } step_dag_t;
+  // ----------------------------------------------------------------
+
+  predicate valid_dag{L}(step_dag_t *d) =
+    d != \null && \valid(d) &&
+    d->heads != \null && \valid(d->heads) &&
+    d->branch_lists != \null && \valid(d->branch_lists);
+
+  // ----------------------------------------------------------------
+  // Valid merkle_tree_t.
+  //
+  // Layout (from merkle.h):
+  //   typedef struct {
+  //       merkle_node_t *nodes;
+  //       int node_count;
+  //       int node_capacity;
+  //       int root;
+  //       array_t *blobs;
+  //       uint8_t root_digest[MERKLE_DIGEST_LEN];
+  //       bool has_root_digest;
+  //   } merkle_tree_t;
+  // ----------------------------------------------------------------
+
+  predicate valid_merkle_tree{L}(merkle_tree_t *t) =
+    t != \null && \valid(t) &&
+    t->node_capacity > 0 &&
+    t->node_count >= 0 &&
+    t->node_count <= t->node_capacity &&
+    t->nodes != \null &&
+    \valid(t->nodes + (0 .. t->node_capacity - 1)) &&
+    t->blobs != \null &&
+    (t->node_count == 0 ==> t->root == -1) &&
+    (t->node_count > 0  ==> t->root >= 0 && t->root < t->node_count);
+
+  // ----------------------------------------------------------------
+  // Valid merkle_blob_t.
+  //
+  // Layout (from merkle.h):
+  //   struct merkle_blob_s {
+  //       char uuid[MERKLE_UUID_LEN];     // 37
+  //       char originator[MERKLE_UUID_LEN];
+  //       blob_designation_fn designation;
+  //       blob_get_hash_fn get_hash;
+  //       void *user_data;
+  //   };
+  // ----------------------------------------------------------------
+
+  predicate valid_merkle_blob{L}(merkle_blob_t *b) =
+    b != \null && \valid(b) &&
+    b->uuid[36] == '\0';
+
+  // ----------------------------------------------------------------
+  // Valid datetime_t.
+  //
+  // Layout (from datetime.h):
+  //   typedef struct {
+  //       struct tm;            // anonymous
+  //       unsigned long tm_nsec;
+  //       float tm_tz_offset;
+  //       bool tm_utc;
+  //   } datetime_t;
+  // ----------------------------------------------------------------
+
+  predicate valid_datetime{L}(datetime_t *dt) =
+    dt != \null && \valid(dt) &&
+    dt->tm_sec >= 0 && dt->tm_sec <= 60 &&
+    dt->tm_min >= 0 && dt->tm_min <= 59 &&
+    dt->tm_hour >= 0 && dt->tm_hour <= 23 &&
+    dt->tm_mday >= 1 && dt->tm_mday <= 31 &&
+    dt->tm_mon >= 0 && dt->tm_mon <= 11 &&
+    dt->tm_tz_offset >= -14.0 && dt->tm_tz_offset <= 14.0;
+
+  // ----------------------------------------------------------------
+  // Valid timedelta_t.
+  //
+  // Layout (from datetime.h):
+  //   typedef struct {
+  //       long days;
+  //       unsigned int seconds;
+  //       unsigned int nsecs;
+  //   } timedelta_t;
+  // ----------------------------------------------------------------
+
+  predicate valid_timedelta{L}(timedelta_t *td) =
+    td != \null && \valid(td) &&
+    td->seconds < 86400 &&
+    td->nsecs < 1000000000;
+
+  // ----------------------------------------------------------------
+  // Valid red-black tree (tree_t / rbTree_s, opaque in public API).
+  //
+  // Private layout (from redblack_priv.h):
+  //   struct rbTree_s {
+  //       smrt_ptr_t;       // bool alloc; size_t refs;
+  //       struct rbNode *root;
+  //       int size;
+  //   };
+  // ----------------------------------------------------------------
+
+  predicate valid_tree{L}(tree_t *t) =
+    t != \null && \valid(t) &&
+    valid_smrt((void *)t) &&
+    t->size >= 0 &&
+    (t->size == 0 ==> t->root == \null) &&
+    (t->size > 0  ==> t->root != \null && t->root->red == \false);
+
+  // ----------------------------------------------------------------
+  // Valid exception_t.
+  //
+  // Layout (from exception.h):
+  //   typedef struct {
+  //       int errnum;
+  //       size_t line;
+  //       char file[MAX_FILENAME + 1];
+  //   } exception_t;
+  // ----------------------------------------------------------------
+
+  predicate valid_exception{L}(exception_t *e) =
+    e != \null && \valid(e) &&
+    \valid(e->file + (0 .. MAX_FILENAME));
+
+  // ----------------------------------------------------------------
+  // Valid queue_t.
+  //
+  // Layout (from message.h):
+  //   typedef struct {
+  //       int fd;
+  //       char key[MSG_KEY_LEN+1];
+  //   } queue_t;
+  // ----------------------------------------------------------------
+
+  predicate valid_queue{L}(queue_t *q) =
+    q != \null && \valid(q) &&
+    q->fd >= 0 &&
+    \valid(q->key + (0 .. MSG_KEY_LEN));
+
+  // ----------------------------------------------------------------
+  // Valid logger_t.
+  //
+  // Layout (from logger.h):
+  //   typedef struct {
+  //       log_level_t max_level;
+  //       char file_name[MAX_FILENAME+1];
+  //       FILE *file;
+  //       bool term;
+  //       bool local_time;
+  //       time_resolution_t resolution;
+  //   } logger_t;
+  // ----------------------------------------------------------------
+
+  predicate valid_logger{L}(logger_t *lg) =
+    lg != \null && \valid(lg) &&
+    lg->max_level >= 1 && lg->max_level <= 5 &&
+    lg->file != \null;
+*/

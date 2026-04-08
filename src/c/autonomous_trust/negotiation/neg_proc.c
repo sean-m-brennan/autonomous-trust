@@ -759,8 +759,10 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
             case NEG_DEAD:
             case NEG_ZOMBIE:
             case NEG_STOPPED:
+            case NEG_NO_PEERS:
+            case NEG_REJECTED:
                 log_warn(proc->logger,
-                         "Negotiation: task %s appears cancelled/dead (status=%d)\n",
+                         "Negotiation: task %s cancelled/dead/rejected (status=%d)\n",
                          task_uuid_str, (int)status);
                 break;
 

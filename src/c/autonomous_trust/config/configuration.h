@@ -42,6 +42,11 @@ extern "C" {
  * @param path char[CFG_PATH_LEN]
  * @return int
  */
+/*@
+  requires \valid(path + (0 .. CFG_PATH_LEN - 1));
+  assigns path[0 .. CFG_PATH_LEN - 1];
+  ensures \result >= 0 || \result < 0;
+*/
 int get_cfg_dir(char path[]);
 
 /**
@@ -50,6 +55,11 @@ int get_cfg_dir(char path[]);
  * @param path char[CFG_PATH_LEN]
  * @return int
  */
+/*@
+  requires \valid(path + (0 .. CFG_PATH_LEN - 1));
+  assigns path[0 .. CFG_PATH_LEN - 1];
+  ensures \result >= 0 || \result < 0;
+*/
 int get_data_dir(char path[]);
 
 /**
@@ -99,6 +109,16 @@ extern size_t configuration_table_size;
  * @param data_struct
  * @return int
  */
+/*@
+  requires filename != \null && \valid_read(filename);
+  requires data_struct != \null && \valid(data_struct);
+  assigns *((char *)data_struct);
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int read_config_file(const char *filename, void *data_struct);
 
 /**
@@ -109,12 +129,46 @@ int read_config_file(const char *filename, void *data_struct);
  * @param filename
  * @return int
  */
+/*@
+  requires \valid(config);
+  requires data_struct != \null && \valid_read(data_struct);
+  requires filename != \null && \valid_read(filename);
+  assigns \nothing;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int write_config_file(const config_t *config, const void *data_struct, const char *filename);
 
+/*@
+  requires name != \null && \valid_read(name);
+  assigns \nothing;
+  ensures \result == \null || \valid(\result);
+*/
 config_t *find_configuration(const char *name);
 
+/*@
+  requires filepath == \null || \valid_read(filepath);
+  requires \valid(config);
+  assigns *config;
+  behavior null_path:
+    assumes filepath == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes filepath != \null;
+    ensures \result == 0 ==> *config != \null;
+  disjoint behaviors;
+*/
 int load_config(char *filepath, config_t **config, char *cfg_name, logger_t *logger);
 
+/*@
+  requires cfg_dir != \null && \valid_read(cfg_dir);
+  requires \valid(configs);
+  assigns *configs;
+  ensures \result >= 0 || \result == -1;
+*/
 int load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger);
 
 /**

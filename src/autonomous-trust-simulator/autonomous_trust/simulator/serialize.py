@@ -18,9 +18,13 @@ import sys
 import threading
 from enum import Enum
 
+from autonomous_trust.core._python.config.configuration import register_enum_type
+
 
 class SerializableEnum(Enum):
-    pass
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        register_enum_type(cls)
 
 
 lock = threading.Lock()

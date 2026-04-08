@@ -93,43 +93,154 @@ struct agreement_protocol_s {
     } state;
 };
 
+/*@
+  requires \valid(proof);
+  allocates *proof;
+  behavior success:
+    ensures \result == 0;
+    ensures *proof != \null;
+    ensures (*proof)->approval == approval;
+  behavior null_out:
+    assumes proof == \null;
+    ensures \result == EINVAL;
+  behavior oom:
+    ensures \result == ENOMEM;
+  disjoint behaviors null_out, success;
+*/
 int agreement_proof_create(const char *uuid, const uint8_t *digest, size_t digest_len,
                            bool approval, const uint8_t *nonce, size_t nonce_len,
                            agreement_proof_t **proof);
 
+/*@
+  requires proof == \null || \valid(proof);
+  frees proof;
+*/
 void agreement_proof_free(agreement_proof_t *proof);
 
 int agreement_proof_sync_out(agreement_proof_t *proof, void *proto_msg);
 int agreement_proof_sync_in(void *proto_msg, agreement_proof_t *proof);
 
+/*@
+  requires myself == \null || \valid(myself);
+  requires \valid(proto);
+  requires other_count >= 0;
+  allocates *proto;
+  behavior null_self:
+    assumes myself == \null;
+    ensures \result == EINVAL;
+  behavior success:
+    assumes myself != \null;
+    ensures \result == 0 ==> *proto != \null;
+    ensures \result == 0 ==> (*proto)->voter_count == other_count + 1;
+  disjoint behaviors;
+*/
 int agreement_protocol_create(agreement_voter_t *myself,
                               agreement_voter_t *others, int other_count,
                               agreement_type_t type,
                               agreement_protocol_t **proto);
 
+/*@
+  requires myself != \null && \valid(myself);
+  requires \valid(proto);
+  allocates *proto;
+  behavior success:
+    ensures \result == 0;
+    ensures *proto != \null;
+    ensures (*proto)->type == AGREEMENT_AUTHORITY;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int agreement_by_authority_create(agreement_voter_t *myself,
                                   agreement_voter_t *others, int other_count,
                                   int threshold_rank,
                                   agreement_protocol_t **proto);
 
+/*@
+  requires myself != \null && \valid(myself);
+  requires \valid(proto);
+  allocates *proto;
+  behavior success:
+    ensures \result == 0;
+    ensures *proto != \null;
+    ensures (*proto)->type == AGREEMENT_STAKE;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int agreement_by_stake_create(agreement_voter_t *myself,
                               agreement_voter_t *others, int other_count,
                               double (*get_stake)(agreement_voter_t *voter),
                               agreement_protocol_t **proto);
 
+/*@
+  requires myself != \null && \valid(myself);
+  requires \valid(proto);
+  allocates *proto;
+  behavior success:
+    ensures \result == 0;
+    ensures *proto != \null;
+    ensures (*proto)->type == AGREEMENT_WORK;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int agreement_by_work_create(agreement_voter_t *myself,
                              agreement_voter_t *others, int other_count,
                              int difficulty,
                              agreement_protocol_t **proto);
 
+/*@
+  requires proto == \null || \valid(proto);
+  requires blob == \null || \valid(blob);
+  requires \valid(proof_out);
+  allocates *proof_out;
+  behavior null_args:
+    assumes proto == \null || blob == \null || proof_out == \null;
+    ensures \result == EINVAL;
+  behavior success:
+    assumes proto != \null && blob != \null && proof_out != \null;
+    ensures \result == 0 ==> *proof_out != \null;
+  disjoint behaviors;
+*/
 int agreement_prove(agreement_protocol_t *proto, merkle_blob_t *blob,
                     agreement_proof_t **proof_out);
 
+/*@
+  requires proto == \null || \valid(proto);
+  requires blob == \null || \valid(blob);
+  requires proof == \null || \valid(proof);
+  assigns \nothing;
+  behavior null_args:
+    assumes proto == \null || blob == \null || proof == \null;
+    ensures \result == \false;
+  behavior valid_args:
+    assumes proto != \null && blob != \null && proof != \null;
+    ensures \result == \true || \result == \false;
+  disjoint behaviors;
+  complete behaviors;
+*/
 bool agreement_verify(agreement_protocol_t *proto, merkle_blob_t *blob,
                       agreement_proof_t *proof, const uint8_t *sig, size_t sig_len);
 
+/*@
+  requires proto == \null || \valid(proto);
+  requires blob == \null || \valid(blob);
+  behavior null_args:
+    assumes proto == \null || blob == \null;
+    ensures \result == \false;
+  behavior valid_args:
+    assumes proto != \null && blob != \null;
+    ensures \result == \true || \result == \false;
+  disjoint behaviors;
+  complete behaviors;
+*/
 bool agreement_finalize(agreement_protocol_t *proto, merkle_blob_t *blob);
 
+/*@
+  requires proto == \null || \valid(proto);
+  frees proto;
+*/
 void agreement_protocol_free(agreement_protocol_t *proto);
 
 #ifdef __cplusplus

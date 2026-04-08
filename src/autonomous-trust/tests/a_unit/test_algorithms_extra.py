@@ -63,7 +63,7 @@ class TestAgreementByAuthority:
         blob = ConcreteBlob()
         proof = AgreementProof(peers[0].uuid, b'digest', True)
         result = ca._count_vote(blob, proof, peers[0])
-        assert result == (0, True)  # rank 0 < threshold 3
+        assert result == (0, False)  # rank 0 < threshold 3, vote not counted
 
     def test_count_vote_above_threshold(self):
         me = _mock_voter(rank=5)
@@ -72,7 +72,7 @@ class TestAgreementByAuthority:
         blob = ConcreteBlob()
         proof = AgreementProof(peer.uuid, b'digest', True)
         result = ca._count_vote(blob, proof, peer)
-        assert result == (5, False)  # rank >= threshold, returns False
+        assert result == (5, True)  # rank >= threshold, authority vote counts
 
     def test_accumulate_votes(self):
         me = _mock_voter(rank=5)
@@ -212,15 +212,15 @@ class TestAgreementByAuthorityAccumulateNoLeader:
         assert result is False
 
     def test_count_vote_at_exact_threshold(self):
-        """A voter at exactly threshold_rank is treated as below (rank < threshold is False)."""
+        """A voter at exactly threshold_rank has authority — vote counts."""
         me = _mock_voter(rank=5)
         peer = _mock_voter(rank=3)
         ca = ConcreteAuthority(me, [peer], threshold_rank=3)
         blob = ConcreteBlob()
         proof = AgreementProof(peer.uuid, b'digest', True)
-        # rank 3 < 3 is False, so takes the else branch → (rank, False)
+        # rank 3 >= 3, so vote counts
         result = ca._count_vote(blob, proof, peer)
-        assert result == (3, False)
+        assert result == (3, True)
 
 
 class TestAgreementByStakeEdgeCases:

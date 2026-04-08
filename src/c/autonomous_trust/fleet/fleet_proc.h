@@ -38,6 +38,12 @@
  * @signer_pk: public key of the expected signer (crypto_sign_PUBLICKEYBYTES)
  * Returns true if the signature is valid, false otherwise.
  */
+/*@
+  requires \valid(prop);
+  requires \valid_read(signer_pk + (0 .. crypto_sign_PUBLICKEYBYTES - 1));
+  assigns \nothing;
+  ensures \result == \true || \result == \false;
+*/
 bool fleet_validate_proposal(const update_proposal_t *prop, const uint8_t *signer_pk);
 
 /**
@@ -47,6 +53,10 @@ bool fleet_validate_proposal(const update_proposal_t *prop, const uint8_t *signe
  * @min_threshold:   the minimum required reputation
  * Returns true if peer_reputation >= min_threshold.
  */
+/*@
+  assigns \nothing;
+  ensures \result == (peer_reputation >= min_threshold);
+*/
 bool fleet_check_reputation_threshold(double peer_reputation, double min_threshold);
 
 /**
@@ -57,6 +67,12 @@ bool fleet_check_reputation_threshold(double peer_reputation, double min_thresho
  * Returns true only if the signature is valid AND reputation meets the
  * threshold embedded in the proposal (prop->min_proposer_reputation).
  */
+/*@
+  requires \valid(prop);
+  requires \valid_read(signer_pk + (0 .. crypto_sign_PUBLICKEYBYTES - 1));
+  assigns \nothing;
+  ensures \result == \true || \result == \false;
+*/
 bool fleet_should_accept_proposal(const update_proposal_t *prop,
                                   const uint8_t *signer_pk,
                                   double proposer_reputation);
@@ -74,6 +90,15 @@ bool fleet_should_accept_proposal(const update_proposal_t *prop,
  *
  * Returns 0 on success, -1 on error.
  */
+/*@
+  requires file_path != \null && \valid_read(file_path);
+  requires version != \null && \valid_read(version);
+  requires \valid(hash_out + (0 .. UPDATE_HASH_LEN - 1));
+  requires \valid(hash_hex_out + (0 .. UPDATE_HASH_LEN * 2));
+  assigns hash_out[0 .. UPDATE_HASH_LEN - 1],
+          hash_hex_out[0 .. UPDATE_HASH_LEN * 2];
+  ensures \result == 0 || \result == -1;
+*/
 int fleet_store_artifact(const char *file_path, const char *version,
                          logger_t *logger,
                          uint8_t *hash_out, char *hash_hex_out);
@@ -91,11 +116,25 @@ int fleet_store_artifact(const char *file_path, const char *version,
  *
  * Returns 0 on success, -1 on error.
  */
+/*@
+  requires \valid_read(artifact_hash + (0 .. UPDATE_HASH_LEN - 1));
+  requires version != \null && \valid_read(version);
+  requires target_arch != \null && \valid_read(target_arch);
+  requires \valid_read(signing_pk + (0 .. crypto_sign_PUBLICKEYBYTES - 1));
+  requires \valid_read(signing_sk + (0 .. crypto_sign_SECRETKEYBYTES - 1));
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
 int fleet_propose_update(const uint8_t *artifact_hash, const char *version,
                          const char *target_arch,
                          const uint8_t *signing_pk, const uint8_t *signing_sk,
                          logger_t *logger);
 
+/*@
+  requires \valid(proc);
+  assigns \nothing;
+  ensures \result == 0 || \result != 0;
+*/
 int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
 #endif /* FLEET_PROC_H */

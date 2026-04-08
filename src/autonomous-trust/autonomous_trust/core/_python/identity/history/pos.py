@@ -14,17 +14,23 @@
 #   limitations under the License.
 # ******************
 
+from typing import Callable, Optional, Union
+from uuid import UUID
+
 from ...algorithms.stake import AgreementByStake
 from .history import IdentityHistory
 
 
 class IdentityByStake(AgreementByStake, IdentityHistory):
     """
-    The identities vote with reputation weights for approval/disapproval
+    The identities vote with reputation weights for approval/disapproval.
+    Requires a reputation_fn callable that maps peer UUID -> score.
     """
-    def __init__(self, me, peers, log_queue, timeout, blacklist=None):
+    def __init__(self, me, peers, log_queue, timeout, blacklist=None,
+                 reputation_fn: Optional[Callable[[UUID], Union[int, float]]] = None):
         AgreementByStake.__init__(self, me, peers.all)
         IdentityHistory.__init__(self, me, peers, log_queue, timeout, blacklist)
+        self._reputation_fn = reputation_fn
 
     def prove(self, blob):
         if blob.identity.uuid in map(lambda x: x.uuid, self.blacklist):
@@ -39,8 +45,15 @@ class IdentityByStake(AgreementByStake, IdentityHistory):
         return True
 
     def _get_stake(self, who):
-        # FIXME get reputation
-        return 0
+        """Look up the voter's reputation score as their stake weight."""
+        if self._reputation_fn is not None:
+            try:
+                score = self._reputation_fn(who.uuid)
+                if score is not None:
+                    return score
+            except (KeyError, Exception):
+                pass
+        return 1.0  # default: equal weight for peers without reputation data
 
     def finalize(self, blob):
         approve = super().finalize(blob)
