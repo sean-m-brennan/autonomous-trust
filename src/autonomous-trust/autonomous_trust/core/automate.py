@@ -76,7 +76,7 @@ class AutonomousTrust(Protocol):
     external_feedback = 'extern_in'
 
     # default to production values
-    def __init__(self, multiproc: bool = True, log_level: int = LogLevel.WARNING,
+    def __init__(self, multiproc: bool = True, log_level: int = LogLevel.DEBUG, #WARNING,
                  logfile: str = None, log_classes: list[str] = None, syslog: bool = False,
                  context: str = Ctx.DEFAULT, testing: bool = False, silent: bool = False):
         self._stopped_procs: list[str] = []
