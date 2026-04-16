@@ -19,9 +19,9 @@
 #include <string.h>
 
 /* Full definitions needed before task.h (capabilities.h uses array_t/map_t as fields) */
-#include "structures/map_priv.h"
-#include "structures/data_priv.h"
-#include "structures/array_priv.h"
+#include "structures/map.h"
+#include "structures/data.h"
+#include "structures/array.h"
 
 #include "negotiation/task.h"
 #include "processes/capabilities_priv.h"

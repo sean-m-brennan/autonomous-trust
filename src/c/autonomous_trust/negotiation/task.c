@@ -26,6 +26,7 @@
 
 typedef void * (*pthread_function_t)(void *);
 
+/* Frama-C: skipped — [solver-timeout] complex lifecycle with logging/process/negotiation preconditions */
 int task_run(task_t *task)
 {
     capability_t *capability = find_capability(task->capability.name);
@@ -75,6 +76,7 @@ int task_to_proto(task_t *msg, size_t size, void **data_ptr, size_t *data_len_pt
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] protobuf deserialization */
 int proto_to_task(uint8_t *data, size_t len, task_t *task)
 {
     AutonomousTrust__Core__Protobuf__Negotiation__Task *proto =

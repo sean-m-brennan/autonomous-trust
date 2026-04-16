@@ -14,6 +14,7 @@
  *   limitations under the License.
  *******************/
 
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <stdint.h>
@@ -157,6 +158,7 @@ int signal_to_proto(const signal_t *msg, void **data_ptr, size_t *data_len_ptr)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] JSON + protobuf preconditions */
 int net_msg_pack_json(net_msg_t *msg, json_t *json)
 {
     char *str = json_dumps(json, JSON_COMPACT);
@@ -186,6 +188,7 @@ int net_msg_unpack_json(const net_msg_t *msg, json_t **json)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] protobuf serialization preconditions */
 int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr)
 {
     json_t *root = json_object();
@@ -240,6 +243,7 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] protobuf wrapper preconditions */
 int wrap_in_any(message_type_t type, void *data_in, size_t data_in_len, void **data_ptr, size_t *data_len_ptr)
 {
     Google__Protobuf__Any pb_msg = GOOGLE__PROTOBUF__ANY__INIT;
@@ -264,6 +268,7 @@ int wrap_in_any(message_type_t type, void *data_in, size_t data_in_len, void **d
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] protobuf pack with dynamic type switch */
 int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
 {
     void *subdata = NULL;
@@ -372,6 +377,7 @@ int proto_to_signal(uint8_t *data, size_t len, signal_t *sig)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] protobuf deserialization preconditions */
 int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
 {
     json_error_t error;
@@ -446,6 +452,7 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] protobuf unpack with union unpacking */
 int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
 {
     Google__Protobuf__Any *pb_msg;

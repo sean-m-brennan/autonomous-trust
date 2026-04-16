@@ -132,8 +132,9 @@ int fleet_propose_update(const uint8_t *artifact_hash, const char *version,
 
 /*@
   requires \valid(proc);
-  assigns \nothing;
-  ensures \result == 0 || \result != 0;
+  requires \valid_read(signal);
+  requires logger == \null || \valid(logger);
+  assigns *proc;
 */
 int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 

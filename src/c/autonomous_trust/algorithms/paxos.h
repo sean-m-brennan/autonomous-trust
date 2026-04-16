@@ -20,8 +20,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <pthread.h>
-#include "autonomous_trust/structures/map_priv.h"
-#include "autonomous_trust/structures/array_priv.h"
+#include "autonomous_trust/structures/map.h"
+#include "autonomous_trust/structures/array.h"
 #include "autonomous_trust/utilities/logger.h"
 
 #define PAXOS_MAJORITY(n) (((n) / 2) + 1)
@@ -69,8 +69,9 @@ int paxos_init(paxos_instance_t *inst, int num_peers, logger_t *logger);
 
 /*@
   requires \valid(inst);
-  assigns inst->proposals, inst->acceptances, inst->backoff,
-          inst->granted_ids, inst->lock, inst->initialized;
+  requires inst->proposals.length <= inst->proposals.capacity;
+  requires inst->acceptances.length <= inst->acceptances.capacity;
+  requires inst->backoff.length <= inst->backoff.capacity;
   ensures inst->initialized == \false;
 */
 void paxos_destroy(paxos_instance_t *inst);

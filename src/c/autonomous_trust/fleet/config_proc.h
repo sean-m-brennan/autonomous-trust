@@ -128,8 +128,9 @@ int config_backup_delete(const char *data_dir);
 
 /*@
   requires \valid(proc);
-  assigns \nothing;
-  ensures \result == 0 || \result != 0;
+  requires \valid_read(signal);
+  requires logger == \null || \valid(logger);
+  assigns *proc;
 */
 int config_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 

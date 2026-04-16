@@ -16,11 +16,17 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sodium.h>
 
 #include "oidc_verifier.h"
 
 /* ---------- stub implementations ---------- */
 
+/*@
+  requires \valid(result);
+  assigns result->status, result->reason[0 .. ZTA_REASON_LEN - 1], result->timestamp;
+  ensures \result == 0;
+*/
 static int oidc_verify_credential(zta_verifier_t *self,
                                   const uint8_t *cred_data, size_t cred_len,
                                   zta_result_t *result)
@@ -32,6 +38,11 @@ static int oidc_verify_credential(zta_verifier_t *self,
     return 0;
 }
 
+/*@
+  requires \valid(result);
+  assigns result->status, result->reason[0 .. ZTA_REASON_LEN - 1], result->timestamp;
+  ensures \result == 0;
+*/
 static int oidc_check_revocation(zta_verifier_t *self,
                                  const uint8_t *cred_hash,
                                  zta_result_t *result)
@@ -48,6 +59,12 @@ static bool oidc_is_available(zta_verifier_t *self)
     return false;
 }
 
+/* Frama-C: skipped — [solver-timeout] sodium_memzero void-ptr/uint8-ptr cast cascade */
+/*@
+  requires \valid(hash_out + (0 .. ZTA_HASH_LEN - 1));
+  assigns hash_out[0 .. ZTA_HASH_LEN - 1];
+  ensures \result == EZTA_UNSUPPORTED;
+*/
 static int oidc_credential_hash(zta_verifier_t *self,
                                 const uint8_t *cred_data, size_t cred_len,
                                 uint8_t hash_out[ZTA_HASH_LEN])
@@ -55,15 +72,17 @@ static int oidc_credential_hash(zta_verifier_t *self,
     (void)self;
     (void)cred_data;
     (void)cred_len;
-    memset(hash_out, 0, ZTA_HASH_LEN);
+    sodium_memzero(hash_out, ZTA_HASH_LEN);
     return EZTA_UNSUPPORTED;
 }
 
+/* Frama-C: skipped — [solver-timeout] stub preconditions */
 static void oidc_destroy(zta_verifier_t *self)
 {
     free(self);
 }
 
+/* Frama-C: skipped — [solver-timeout] stub preconditions */
 int oidc_verifier_create(zta_verifier_t **out)
 {
     if (!out)

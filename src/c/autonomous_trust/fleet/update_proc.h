@@ -155,8 +155,9 @@ bool selftest_config(const char *cfg_dir);
 
 /*@
   requires \valid(proc);
-  assigns \nothing;
-  ensures \result == 0 || \result != 0;
+  requires \valid_read(signal);
+  requires logger == \null || \valid(logger);
+  assigns *proc;
 */
 int update_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 

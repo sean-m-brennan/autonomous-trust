@@ -29,14 +29,16 @@ typedef struct {
       \valid(p) && p->alloc == true && p->refs >= 1;
 */
 
-/*@ lemma smrt_refs_positive:
-      \forall smrt_ptr_t s; s.alloc == true ==> s.refs >= 1;
+/*@ axiomatic SmrtPtrInvariant {
+      axiom smrt_refs_positive:
+        \forall smrt_ptr_t s; s.alloc == true ==> s.refs >= 1;
+    }
 */
 
 /*@
   requires size > 0;
   requires size >= sizeof(smrt_ptr_t);
-  assigns \nothing;
+  assigns \result \from size;
   ensures \result == \null ||
     (\valid((char *)\result + (0 .. size - 1)) &&
      ((smrt_ptr_t *)\result)->alloc == true &&

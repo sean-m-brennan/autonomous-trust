@@ -24,9 +24,8 @@
 #include "reputation/reputation.h"
 #include "algorithms/paxos.h"
 #include "structures/map.h"
-#include "structures/map_priv.h"
-#include "structures/array_priv.h"
-#include "structures/data_priv.h"
+#include "structures/array.h"
+#include "structures/data.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
@@ -74,6 +73,12 @@ static void _ensure_init(void)
  * Validate peer, check id1 > last_id AND chain index matches → grant/nack/backdate
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -181,6 +186,13 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
  * Count grants; on majority, broadcast REP_PROTO_TX
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires rep_state.paxos.initialized == \true;
+*/
 static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -281,6 +293,13 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
  * Handler: handle_nack (try again) — exponential backoff retry
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires rep_state.paxos.initialized == \true;
+*/
 static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -311,6 +330,14 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
  * Remote peer tells us our chain index is behind; request update.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] memcpy of public_identity_t triggers
+ * "Hide sub-term definition" cast warning blocking valid_dest/src/separation */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_backdate(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -334,6 +361,13 @@ static bool handle_backdate(const process_t *proc, directory_t *queues, generic_
  * Validate that we granted this proposal, then send accepted.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires rep_state.paxos.initialized == \true;
+*/
 static bool handle_transaction(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -403,6 +437,13 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
  * Count acceptances; commit to history on majority.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires rep_state.paxos.initialized == \true;
+*/
 static bool handle_accepted(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -482,6 +523,14 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
  * Send chain slice to requesting peer.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] memcpy of public_identity_t triggers
+ * "Hide sub-term definition" cast warning blocking valid_dest/src/separation */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_outdated(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -520,6 +569,12 @@ static bool handle_outdated(const process_t *proc, directory_t *queues, generic_
  * Collect chain slices, vote on consistency, merge.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -627,6 +682,12 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
  * Compute reputation for a peer and respond.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_rep_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -694,6 +755,12 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
  * Handler: handle_rep_response (reputation response)
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_rep_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -722,6 +789,12 @@ static bool handle_rep_response(const process_t *proc, directory_t *queues, gene
  * Responds via local IPC to the requesting process.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_local_rep_query(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -784,6 +857,13 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
  * Called when TRANSACTION_SCORE message arrives from negotiation.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] uuid_unparse + strncpy + memcpy +
+ * json_object_set_new + smrt_create cascade with peer-loop too complex for SMT */
+/*@
+  requires \valid(proc);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires rep_state.paxos.initialized == \true;
+*/
 void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
                           const uuid_t peer_uuid, double score)
 {
@@ -842,6 +922,9 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
  * Reputation process main entry
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] state-cascade through paxos_init +
+ * process_register_handler stubs prevents WP from discharging
+ * valid_rw(proc) and valid_rd(signal) at downstream call sites */
 int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();

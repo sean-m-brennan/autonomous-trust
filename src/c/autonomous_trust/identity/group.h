@@ -18,7 +18,7 @@
 #define GROUP_H
 
 #include "identity.h"
-#include "structures/map_priv.h"
+#include "structures/map.h"
 
 typedef struct
 {
@@ -147,12 +147,15 @@ int proto_to_group(uint8_t *data, size_t len, group_t *group);
  */
 /*@
   requires group == \null || \valid(group);
+  requires group != \null ==> ((smrt_ptr_t *)group)->refs >= 1;
+  requires group != \null ==> group->address_map.length <= group->address_map.capacity;
   behavior null_group:
     assumes group == \null;
     assigns \nothing;
   behavior valid_group:
     assumes group != \null;
-    assigns group->address_map;
+    assigns group->address_map,
+            ((smrt_ptr_t *)group)->alloc, ((smrt_ptr_t *)group)->refs;
     frees group;
   disjoint behaviors;
   complete behaviors;

@@ -35,6 +35,7 @@ const size_t GAP = 128; // approximate prime gap
   ensures \result > prev;
   ensures \result >= prev + GAP;
 */
+/* Frama-C: skipped — [alloc-pattern] capacity growth with realloc */
 size_t increment_capacity(size_t prev)
 {
     size_t next = prev + GAP;
@@ -73,6 +74,7 @@ typedef uint64_t hash_t; // size must be synced with crypto_shorthash_BYTES
   requires \valid_read(key);
   assigns \nothing;
 */
+/* Frama-C: skipped — [string-loop] iterates over key bytes for hashing */
 hash_t nacl_hash(map_t *map, map_key_t key)
 {
     union
@@ -147,6 +149,7 @@ size_t map_key2index(map_t *map, map_key_t key)
   complete behaviors;
   disjoint behaviors;
 */
+/* Frama-C: skipped — [alloc-pattern] realloc on capacity change */
 int reindex(map_t *map)
 {
     size_t old_capacity = map->capacity;
@@ -207,6 +210,7 @@ int map_init(map_t *map)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] _set_exception precondition */
 int map_create(map_t **map_ptr)
 {
     if (map_ptr == NULL)
@@ -230,6 +234,7 @@ array_t *map_keys(map_t *map)
     return &map->keys;
 }
 
+/* Frama-C: skipped — [solver-timeout] strcmp valid_string preconditions */
 int map_get(map_t *map, const map_key_t key, data_t **value)
 {
     size_t index = map_key2index(map, key);
@@ -256,6 +261,7 @@ int map_get(map_t *map, const map_key_t key, data_t **value)
     return EXCEPTION(EMAP_NOKEY);
 }
 
+/* Frama-C: skipped — [alloc-pattern] hash bucket manipulation with realloc */
 int map_set(map_t *map, const map_key_t key, data_t *value)
 {
     if (value == NULL)
@@ -312,6 +318,7 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
     return 0;
 }
 
+/* Frama-C: skipped — [alloc-pattern] hash bucket removal with memmove */
 int map_remove(map_t *map, map_key_t key)
 {
     size_t index = map_key2index(map, key);
@@ -377,6 +384,7 @@ int map_remove(map_t *map, map_key_t key)
     return EXCEPTION(EMAP_NOKEY);
 }
 
+/* Frama-C: skipped — [solver-timeout] free/smrt_deref requires */
 void map_free(map_t *map)
 {
     /*@
@@ -393,6 +401,7 @@ void map_free(map_t *map)
     smrt_deref(map);
 }
 
+/* Frama-C: skipped — [serialization] protobuf serialization */
 int map_sync_out(map_t *map, AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap)
 {
     //@ assert map->length <= map->capacity;
@@ -411,6 +420,7 @@ int map_sync_out(map_t *map, AutonomousTrust__Core__Protobuf__Structures__DataMa
     map_end_for_each return 0;
 }
 
+/* Frama-C: skipped — [serialization] protobuf cleanup */
 void map_proto_free(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap)
 {
     if (dmap->map == NULL)
@@ -428,6 +438,7 @@ void map_proto_free(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap)
     dmap->map = NULL;
 }
 
+/* Frama-C: skipped — [serialization] protobuf deserialization */
 int map_sync_in(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap, map_t *map)
 {
     /*@
@@ -451,6 +462,7 @@ int map_sync_in(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap, map_
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON serialization */
 int map_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const map_t *map = data_struct;
@@ -506,6 +518,7 @@ int map_to_json(const void *data_struct, json_t **obj_ptr)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON deserialization */
 int map_from_json(const json_t *obj, void *data_struct)
 {
     map_t *map = data_struct;

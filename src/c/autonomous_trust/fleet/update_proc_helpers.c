@@ -30,16 +30,18 @@
 #include <jansson.h>
 
 #include "fleet/update_proc.h"
+#include "utilities/util.h"
 
 /* ------------------------------------------------------------------ */
 /* State file I/O                                                      */
 /* ------------------------------------------------------------------ */
 
+/* Frama-C: skipped — [serialization] JSON file write via jansson */
 int update_state_write(const char *data_dir, const update_state_t *state)
 {
     /* Ensure <data_dir>/fleet_update/ exists */
     char dir_path[512];
-    snprintf(dir_path, sizeof(dir_path), "%s/fleet_update", data_dir);
+    path_join(dir_path, sizeof(dir_path), data_dir, "fleet_update");
 
     struct stat st;
     if (stat(dir_path, &st) != 0) {
@@ -62,17 +64,18 @@ int update_state_write(const char *data_dir, const update_state_t *state)
     json_object_set_new(root, "type",        json_string(state->type));
 
     char file_path[512];
-    snprintf(file_path, sizeof(file_path), "%s/fleet_update/state.json", data_dir);
+    path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json");
 
     int ret = json_dump_file(root, file_path, JSON_INDENT(2));
     json_decref(root);
     return ret;
 }
 
+/* Frama-C: skipped — [serialization] JSON file read via jansson */
 int update_state_read(const char *data_dir, update_state_t *state)
 {
     char file_path[512];
-    snprintf(file_path, sizeof(file_path), "%s/fleet_update/state.json", data_dir);
+    path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json");
 
     json_error_t err;
     json_t *root = json_load_file(file_path, 0, &err);
@@ -115,7 +118,7 @@ int update_state_read(const char *data_dir, update_state_t *state)
 int update_state_delete(const char *data_dir)
 {
     char file_path[512];
-    snprintf(file_path, sizeof(file_path), "%s/fleet_update/state.json", data_dir);
+    path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json");
 
     if (unlink(file_path) != 0) {
         if (errno == ENOENT)
@@ -128,7 +131,7 @@ int update_state_delete(const char *data_dir)
 bool update_state_exists(const char *data_dir)
 {
     char file_path[512];
-    snprintf(file_path, sizeof(file_path), "%s/fleet_update/state.json", data_dir);
+    path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json");
 
     struct stat st;
     return stat(file_path, &st) == 0;
@@ -145,17 +148,17 @@ bool update_should_abort(const update_state_t *state)
 
 int update_staging_dir(const char *data_dir, char *buf, size_t buflen)
 {
-    return snprintf(buf, buflen, "%s/fleet_update", data_dir) < (int)buflen ? 0 : -1;
+    return path_join(buf, buflen, data_dir, "fleet_update") >= 0 ? 0 : -1;
 }
 
 int update_staging_path(const char *data_dir, char *buf, size_t buflen)
 {
-    return snprintf(buf, buflen, "%s/fleet_update/at_demo.new", data_dir) < (int)buflen ? 0 : -1;
+    return path_join(buf, buflen, data_dir, "fleet_update/at_demo.new") >= 0 ? 0 : -1;
 }
 
 int update_backup_path(const char *data_dir, char *buf, size_t buflen)
 {
-    return snprintf(buf, buflen, "%s/fleet_update/at_demo.backup", data_dir) < (int)buflen ? 0 : -1;
+    return path_join(buf, buflen, data_dir, "fleet_update/at_demo.backup") >= 0 ? 0 : -1;
 }
 
 int update_current_binary_path(char *buf, size_t buflen)

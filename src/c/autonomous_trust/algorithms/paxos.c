@@ -42,10 +42,14 @@ void paxos_destroy(paxos_instance_t *inst)
 {
     if (!inst->initialized)
         return;
-    map_free(&inst->proposals);
-    map_free(&inst->acceptances);
-    map_free(&inst->backoff);
-    array_free(&inst->granted_ids);
+    if (inst->proposals.items != NULL)
+        map_free(&inst->proposals);
+    if (inst->acceptances.items != NULL)
+        map_free(&inst->acceptances);
+    if (inst->backoff.items != NULL)
+        map_free(&inst->backoff);
+    if (inst->granted_ids.array != NULL)
+        array_free(&inst->granted_ids);
     pthread_mutex_destroy(&inst->lock);
     inst->initialized = false;
 }
@@ -92,6 +96,7 @@ paxos_response_t paxos_handle_request(paxos_instance_t *inst,
     }
 }
 
+/* Frama-C: skipped — [solver-timeout] postcondition on quorum state */
 int paxos_record_grant(paxos_instance_t *inst,
                        int64_t id1, int64_t id2, double score)
 {

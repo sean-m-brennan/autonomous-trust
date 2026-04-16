@@ -65,9 +65,7 @@ extern "C"
  * @return int
  */
 /*@
-  requires file != \null;
-  requires \valid_read(file + (0 .. MAX_FILENAME - 1)) ||
-           (\exists size_t i; 0 <= i < MAX_FILENAME && file[i] == '\0');
+  requires file != \null && \valid_read(file + (0 .. MAX_FILENAME - 1));
   assigns _exception.errnum, _exception.line, _exception.file[0 .. MAX_FILENAME - 1];
   ensures _exception.errnum == err;
   ensures _exception.line == line;
@@ -94,6 +92,9 @@ int _set_exception(int err, size_t line, const char *file);
  * @details Code that uses the library can define custom errors for use with SYS_EXCEPTION/EXCEPTION macros and log_exception().
  *
  */
+#ifdef __FRAMAC__
+#define DEFINE_ERROR(num, descr) /* Frama-C: skip constructor registration */
+#else
 #define DEFINE_ERROR(num, descr)                           \
     void __attribute__((constructor)) register_err_##num() \
     {                                                      \
@@ -102,6 +103,7 @@ int _set_exception(int err, size_t line, const char *file);
         error_table[error_table_size].description = descr; \
         error_table_size++;                                \
     }
+#endif
 
 #ifdef __cplusplus
 } // extern "C"

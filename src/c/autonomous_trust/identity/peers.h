@@ -17,7 +17,8 @@
 #ifndef PEERS_H
 #define PEERS_H
 
-#include "structures/map_priv.h"
+#include <jansson.h>
+#include "structures/map.h"
 #include "identity.h"
 
 #define LEVELS 3

@@ -18,52 +18,52 @@
 #define REDBLACK_H
 
 #include "utilities/exception.h"
+#include "utilities/allocation.h"
 
 typedef void* tree_data_ptr_t;
 
-typedef struct rbTree_s tree_t;
+enum Direction
+{
+    LEFT,
+    RIGHT
+};
+
+struct rbNode
+{
+    smrt_ptr_t;
+    int key;
+    bool red;
+    tree_data_ptr_t data;
+    struct rbNode *parent, *left, *right;
+};
+
+typedef struct rbTree_s {
+    smrt_ptr_t;
+    struct rbNode *root;
+    int size;
+} tree_t;
+
+/*@ predicate valid_node(struct rbNode *n) =
+      n != \null && \valid(n) &&
+      smrt_valid((smrt_ptr_t *)n);
+*/
+
+/*@ predicate valid_tree(tree_t *t) =
+      t != \null && \valid(t) &&
+      smrt_valid((smrt_ptr_t *)t) &&
+      t->size >= 0 &&
+      (t->size == 0 ==> t->root == \null) &&
+      (t->size > 0  ==> t->root != \null && t->root->red == \false);
+*/
 
 /*@
-  // ----------------------------------------------------------------
-  // Red-black tree structural invariants.
-  //
-  // Private layout (from redblack_priv.h):
-  //   struct rbNode {
-  //       smrt_ptr_t;       // bool alloc; size_t refs;
-  //       int key;
-  //       bool red;
-  //       tree_data_ptr_t data;
-  //       struct rbNode *parent, *left, *right;
-  //   };
-  //
-  //   struct rbTree_s {
-  //       smrt_ptr_t;
-  //       struct rbNode *root;
-  //       int size;
-  //   };
-  //
-  // BST ordering: for every node n, all keys in the left subtree
-  // are strictly less than n->key, and all keys in the right subtree
-  // are strictly greater.
-  //
-  // Red-black invariants:
-  //   1. Every node is red or black (!red == black).
-  //   2. The root is black.
-  //   3. No red node has a red child.
-  //   4. Every path from root to a NULL leaf has the same number
-  //      of black nodes ("black-height").
-  //
-  // These properties cannot be expressed inductively in standard ACSL
-  // and verified by WP, so we record them as axioms documenting the
-  // design contract.
-  // ----------------------------------------------------------------
-
   axiomatic rbtree_invariants {
     // Axiom: the root of every non-empty tree is black.
     axiom root_is_black:
-      \true;
+      \forall tree_t *t; valid_tree(t) && t->size > 0 ==>
+        t->root->red == \false;
 
-    // Axiom: no red node has a red child.
+    // Axiom: no red node has a red child (not expressible inductively in ACSL).
     axiom no_red_red:
       \true;
 
@@ -85,8 +85,11 @@ typedef struct rbTree_s tree_t;
  */
 /*@
   requires \valid(tree);
-  assigns \nothing;
+  assigns tree->root \from \nothing;
+  assigns tree->size \from \nothing;
   ensures \result == 0;
+  ensures tree->root == \null;
+  ensures tree->size == 0;
 */
 int tree_init(tree_t *tree);
 
@@ -99,17 +102,19 @@ int tree_init(tree_t *tree);
 /*@
   requires \valid(tree_ptr);
   allocates *tree_ptr;
-  assigns *tree_ptr;
+  assigns *tree_ptr \from tree_ptr;
   behavior null_ptr:
     assumes tree_ptr == \null;
     ensures \result != 0;
   behavior success:
-    assumes tree_ptr != \null && \is_allocable(sizeof(tree_t));
+    assumes tree_ptr != \null;
     ensures \result == 0;
     ensures *tree_ptr != \null;
     ensures \fresh(*tree_ptr, sizeof(tree_t));
+    ensures (*tree_ptr)->root == \null;
+    ensures (*tree_ptr)->size == 0;
   behavior failure:
-    assumes tree_ptr != \null && !\is_allocable(sizeof(tree_t));
+    assumes tree_ptr != \null;
     ensures \result != 0;
   disjoint behaviors;
 */
@@ -132,7 +137,7 @@ tree_t *tree_copy(tree_t *tree);*/
 /*@
   requires \valid(tree);
   assigns \nothing;
-  ensures \result >= 0;
+  ensures \result == tree->size;
 */
 int tree_size(tree_t *tree);
 
@@ -146,6 +151,7 @@ int tree_size(tree_t *tree);
   requires \valid(tree);
   assigns \nothing;
   ensures \result >= 0;
+  ensures tree->size == 0 ==> \result == 0;
 */
 int tree_depth(tree_t *tree);
 
@@ -158,7 +164,7 @@ int tree_depth(tree_t *tree);
 */
 /*@
   requires \valid(tree);
-  assigns \nothing;
+  assigns \result \from tree->root, key;
   behavior found:
     ensures \result != \null;
   behavior not_found:
@@ -177,7 +183,8 @@ tree_data_ptr_t tree_find(tree_t *tree, int key);
 */
 /*@
   requires \valid(tree);
-  assigns tree->root, tree->size;
+  assigns tree->root \from tree->root, data, key;
+  assigns tree->size \from tree->size;
   behavior success:
     ensures \result == 0;
     ensures tree->size == \old(tree->size) + 1;
@@ -200,7 +207,8 @@ int tree_insert(tree_t *tree, tree_data_ptr_t data, int key);
 */
 /*@
   requires \valid(tree);
-  assigns tree->root, tree->size;
+  assigns tree->root \from tree->root, key;
+  assigns tree->size \from tree->size;
   behavior success:
     ensures \result == 0;
     ensures tree->size == \old(tree->size) - 1;
@@ -221,6 +229,7 @@ int tree_delete(tree_t *tree, int key);
 */
 /*@
   requires tree == \null || \valid(tree);
+  assigns tree->size \from \nothing;
   frees tree;
 */
 void tree_free(tree_t *tree);

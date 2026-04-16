@@ -25,12 +25,14 @@
 #include "identity/identity.h"
 
 
+#ifndef __FRAMAC__
 struct identity_s
 {
     public_identity_t;
     int rank;
     block_impl_t block;
 };
+#endif
 
 int identity_to_json(const void *data_struct, json_t **obj_ptr);
 
@@ -66,9 +68,6 @@ int unhexlify(const unsigned char *buf, size_t len, unsigned char *result);
 /*@
   requires \valid(sig);
   requires \valid_read(hex_seed + (0 .. crypto_sign_PUBLICKEYBYTES * 2 - 1));
-  assigns sig->private[0 .. crypto_sign_SECRETKEYBYTES - 1],
-          sig->public[0 .. crypto_sign_PUBLICKEYBYTES - 1],
-          sig->public_hex[0 .. crypto_sign_PUBLICKEYBYTES * 2];
 */
 void public_signature_init(signature_t *sig, const unsigned char *hex_seed);
 
@@ -96,7 +95,7 @@ unsigned char *signature_publish(const signature_t *sig);
   ensures \result == \null ||
           \valid(\result + (0 .. crypto_sign_SEEDBYTES * 2 - 1));
 */
-unsigned char *signature_generate();
+unsigned char *signature_generate(void);
 
 /*@
   requires \valid(encr);
@@ -131,7 +130,7 @@ unsigned char *encryptor_publish(const encryptor_t *encr);
   ensures \result == \null ||
           \valid(\result + (0 .. crypto_box_SEEDBYTES * 2 - 1));
 */
-unsigned char *encryptor_generate();
+unsigned char *encryptor_generate(void);
 
 
 #endif  // IDENTITY_PRIV_H

@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-"""PoliteEvaluator: orchestrates policy evaluation with fitness scoring.
+"""KithCovenantEvaluator: orchestrates policy evaluation with fitness scoring.
 
 Provides compute_fitness() for scoring and two evaluation backends:
 InProcessEvaluator (fast, mock peers) and DockerEvaluator (full simulation).
@@ -26,8 +26,8 @@ import subprocess
 import tempfile
 from typing import Optional
 
-from polite.interface import EvaluatorResult
-from polite.policy import PolitePolicy
+from kith_covenant.interface import EvaluatorResult
+from kith_covenant.policy import KithCovenantPolicy
 
 
 # Default normalization bounds
@@ -103,28 +103,28 @@ class InProcessEvaluator:
         self._duration_s = duration_s
         self._fitness_kwargs = fitness_kwargs
 
-    def evaluate(self, policy: PolitePolicy) -> EvaluatorResult:
-        from autonomous_trust.evaluation.polite.instrumented import (
-            PoliteInstrumentedAT,
+    def evaluate(self, policy: KithCovenantPolicy) -> EvaluatorResult:
+        from autonomous_trust.evaluation.kith_covenant.instrumented import (
+            KithCovenantInstrumentedAT,
         )
 
         with tempfile.TemporaryDirectory() as td:
             metrics_path = os.path.join(td, 'metrics.json')
-            observer_path = os.path.join(td, 'polite.json')
+            observer_path = os.path.join(td, 'kith_covenant.json')
 
-            PoliteInstrumentedAT._metrics_output = metrics_path
-            PoliteInstrumentedAT._polite_policy = policy
-            PoliteInstrumentedAT._polite_output = observer_path
+            KithCovenantInstrumentedAT._metrics_output = metrics_path
+            KithCovenantInstrumentedAT._kith_covenant_policy = policy
+            KithCovenantInstrumentedAT._kith_covenant_output = observer_path
 
             try:
-                at = PoliteInstrumentedAT(multiproc=True, testing=True)
+                at = KithCovenantInstrumentedAT(multiproc=True, testing=True)
                 at.run_forever()
             except (KeyboardInterrupt, SystemExit):
                 pass
             finally:
-                PoliteInstrumentedAT._metrics_output = None
-                PoliteInstrumentedAT._polite_policy = None
-                PoliteInstrumentedAT._polite_output = None
+                KithCovenantInstrumentedAT._metrics_output = None
+                KithCovenantInstrumentedAT._kith_covenant_policy = None
+                KithCovenantInstrumentedAT._kith_covenant_output = None
 
             metrics_report = {}
             if os.path.exists(metrics_path):
@@ -153,20 +153,20 @@ class DockerEvaluator:
         self._script = script_path
         self._extra_args = kwargs
 
-    def evaluate(self, policy: PolitePolicy) -> EvaluatorResult:
+    def evaluate(self, policy: KithCovenantPolicy) -> EvaluatorResult:
         with tempfile.TemporaryDirectory() as td:
             policy_path = os.path.join(td, 'policy.json')
             with open(policy_path, 'w') as f:
                 json.dump(policy.to_dict(), f)
 
             metrics_path = os.path.join(td, 'metrics.json')
-            observer_path = os.path.join(td, 'polite.json')
+            observer_path = os.path.join(td, 'kith_covenant.json')
 
             cmd = [
                 'bash', self._script,
                 '--python', '--quick',
-                '--polite-policy', policy_path,
-                '--polite-output', observer_path,
+                '--kith-covenant-policy', policy_path,
+                '--kith-covenant-output', observer_path,
                 '--output', metrics_path,
             ]
             subprocess.run(cmd, check=True, capture_output=True)

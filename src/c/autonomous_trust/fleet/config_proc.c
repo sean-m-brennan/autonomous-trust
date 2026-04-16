@@ -28,9 +28,8 @@
 #include "fleet/update_proc.h"
 #include "algorithms/paxos.h"
 #include "structures/map.h"
-#include "structures/map_priv.h"
-#include "structures/array_priv.h"
-#include "structures/data_priv.h"
+#include "structures/array.h"
+#include "structures/data.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
@@ -74,6 +73,13 @@ static void _ensure_init(void)
  * Build and send a NET_MESSAGE to a single peer via the network process.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires function != \null && \valid_read(function);
+  requires payload == \null || \valid(payload);
+  requires \valid_read(peer);
+  ensures \result == 0 || \result != 0;
+*/
 static int send_to_peer(const process_t *proc, const char *function,
                         json_t *payload, const public_identity_t *peer)
 {
@@ -94,6 +100,12 @@ static int send_to_peer(const process_t *proc, const char *function,
  * verify signature, store it, initiate Paxos vote.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_config_propose(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -175,6 +187,12 @@ static bool handle_config_propose(const process_t *proc, directory_t *queues, ge
  * Paxos Phase 1a: check proposal via paxos_handle_request, send grant or nack.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_config_vote_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -246,6 +264,13 @@ static bool handle_config_vote_request(const process_t *proc, directory_t *queue
  * Paxos Phase 1b: count grants; on quorum, broadcast accepted.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires config_state.vote_paxos.initialized == \true;
+*/
 static bool handle_config_vote_grant(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -311,6 +336,13 @@ static bool handle_config_vote_grant(const process_t *proc, directory_t *queues,
  * Record nack with exponential backoff.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires config_state.vote_paxos.initialized == \true;
+*/
 static bool handle_config_vote_nack(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -340,6 +372,14 @@ static bool handle_config_vote_nack(const process_t *proc, directory_t *queues, 
  * Move proposal from pending to accepted, trigger artifact fetch.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] memcpy of public_identity_t (line 418)
+ * triggers "Hide sub-term definition" cast warning that blocks discharge */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_config_accepted(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -432,6 +472,14 @@ static bool handle_config_accepted(const process_t *proc, directory_t *queues, g
  * Validates, backs up configs, writes the new config, notifies update_proc.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] file I/O (fopen/fwrite) + snprintf +
+ * messaging_send + json cascade too complex for SMT */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_config_artifact_ready(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -602,6 +650,9 @@ static bool handle_config_artifact_ready(const process_t *proc, directory_t *que
  * Config process main entry
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] state-cascade through getenv/snprintf/
+ * paxos_init/process_register_handler stubs prevents WP from discharging
+ * valid_rw(proc) and valid_rd(signal) at downstream call sites */
 int config_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();

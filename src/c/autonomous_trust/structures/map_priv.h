@@ -26,27 +26,9 @@
 #include "array_priv.h"
 #include "structures/map.pb-c.h"
 
-struct map_s
-{
-    smrt_ptr_t;
-    map_item_t *items;
-    size_t length;
-    size_t capacity;
-    array_t keys;
-    unsigned char hashkey[crypto_shorthash_KEYBYTES];
-};
-
-/*@ predicate map_valid(map_t *m) =
-      \valid(m) &&
-      m->items != \null &&
-      m->capacity > 0 &&
-      m->length <= m->capacity &&
-      \valid(m->items + (0 .. m->capacity - 1));
-*/
-
-/*@ type invariant map_length_bounded(struct map_s m) =
-      m.items != \null ==> m.length <= m.capacity;
-*/
+/* Verify our constant matches libsodium */
+_Static_assert(MAP_HASHKEY_BYTES == crypto_shorthash_KEYBYTES,
+               "MAP_HASHKEY_BYTES must match crypto_shorthash_KEYBYTES");
 
 
 /*@
@@ -105,7 +87,7 @@ int map_to_json(const void *data_struct, json_t **obj_ptr);
           ((map_t *)data_struct)->capacity,
           ((map_t *)data_struct)->items,
           ((map_t *)data_struct)->keys,
-          ((map_t *)data_struct)->hashkey[0 .. crypto_shorthash_KEYBYTES - 1];
+          ((map_t *)data_struct)->hashkey[0 .. MAP_HASHKEY_BYTES - 1];
   behavior success:
     ensures \result == 0;
     ensures ((map_t *)data_struct)->length <= ((map_t *)data_struct)->capacity;

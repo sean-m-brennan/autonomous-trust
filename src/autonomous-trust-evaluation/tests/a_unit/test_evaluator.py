@@ -17,13 +17,13 @@
 import pytest
 
 try:
-    from autonomous_trust.evaluation.polite.evaluator import compute_fitness
-    _has_polite = True
+    from autonomous_trust.evaluation.covenant.evaluator import compute_fitness
+    _has_covenant = True
 except ImportError:
-    _has_polite = False
+    _has_covenant = False
 
-pytestmark = pytest.mark.skipif(not _has_polite,
-                                reason='polite package not installed')
+pytestmark = pytest.mark.skipif(not _has_covenant,
+                                reason='covenant package not installed')
 
 
 class TestComputeFitness:
@@ -102,7 +102,7 @@ class TestComputeFitness:
 
     def test_weights_sum(self):
         """Default weights should sum to 1.0."""
-        from autonomous_trust.evaluation.polite.evaluator import _DEFAULT_WEIGHTS
+        from autonomous_trust.evaluation.covenant.evaluator import _DEFAULT_WEIGHTS
         assert sum(_DEFAULT_WEIGHTS.values()) == pytest.approx(1.0, abs=1e-9)
 
     def test_partial_observer_report(self):

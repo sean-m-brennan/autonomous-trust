@@ -94,7 +94,11 @@ int ip4_binary_to_addr(uint32_t ip, char *addr);
 */
 int cidr4_to_broadcast(char *cidr, char *bcast_addr);
 
+#ifdef __FRAMAC__
+typedef struct { uint64_t lo; uint64_t hi; } uint128_t;
+#else
 typedef unsigned __int128 uint128_t;
+#endif
 
 /*@
   requires cidr != \null && \valid_read(cidr);

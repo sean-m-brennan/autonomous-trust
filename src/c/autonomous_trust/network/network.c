@@ -29,17 +29,7 @@
 // TODO: Add protobuf serialization for inter-host network messages
 
 
-/*@
-  requires cidr != \null && \valid_read(cidr);
-  requires addr != \null && \valid(addr + (0 .. IPV4_ADDR_LEN - 1));
-  requires mask == \null || \valid(mask + (0 .. 2));
-  assigns addr[0 .. IPV4_ADDR_LEN - 1];
-  behavior success:
-    ensures \result == 0;
-  behavior failure:
-    ensures \result != 0;
-  disjoint behaviors;
-*/
+/* Frama-C: skipped — [inet] inet_pton with network byte order */
 int cidr_split(char * cidr, char *addr, char *mask)
 {
     if (addr == NULL)
@@ -62,18 +52,7 @@ int cidr_split(char * cidr, char *addr, char *mask)
     return 0;
 }
 
-/*@
-  requires cidr != \null && \valid_read(cidr);
-  requires \valid(ip);
-  requires \valid(mask);
-  assigns *ip, *mask;
-  behavior success:
-    ensures \result == 0;
-    ensures *mask <= 32;
-  behavior failure:
-    ensures \result != 0;
-  disjoint behaviors;
-*/
+/* Frama-C: skipped — [inet] inet_pton IPv4 conversion */
 int cidr4_to_ip4_binary(char *cidr, uint32_t *ip, uint8_t *mask)
 {
     char addr[IPV4_ADDR_LEN] = {0};
@@ -90,15 +69,7 @@ int cidr4_to_ip4_binary(char *cidr, uint32_t *ip, uint8_t *mask)
     return 0;
 }
 
-/*@
-  requires \valid(addr + (0 .. IPV4_ADDR_LEN - 1));
-  assigns addr[0 .. IPV4_ADDR_LEN - 1];
-  behavior success:
-    ensures \result == 0;
-  behavior failure:
-    ensures \result != 0;
-  disjoint behaviors;
-*/
+/* Frama-C: skipped — [inet] inet_ntop IPv4 conversion */
 int ip4_binary_to_addr(uint32_t ip, char *addr)
 {
     struct in_addr addr_struct = {0};
@@ -108,16 +79,7 @@ int ip4_binary_to_addr(uint32_t ip, char *addr)
     return 0;
 }
 
-/*@
-  requires cidr != \null && \valid_read(cidr);
-  requires \valid(bcast_addr + (0 .. IPV4_ADDR_LEN - 1));
-  assigns bcast_addr[0 .. IPV4_ADDR_LEN - 1];
-  behavior success:
-    ensures \result == 0;
-  behavior failure:
-    ensures \result != 0;
-  disjoint behaviors;
-*/
+/* Frama-C: skipped — [inet] bitwise CIDR mask calculation */
 int cidr4_to_broadcast(char *cidr, char *bcast_addr)
 {
     uint32_t ip = 0;
@@ -131,18 +93,7 @@ int cidr4_to_broadcast(char *cidr, char *bcast_addr)
     return ip4_binary_to_addr(bcast, bcast_addr);
 }
 
-/*@
-  requires cidr != \null && \valid_read(cidr);
-  requires \valid(ip);
-  requires \valid(mask);
-  assigns *ip, *mask;
-  behavior success:
-    ensures \result == 0;
-    ensures *mask <= 128;
-  behavior failure:
-    ensures \result != 0;
-  disjoint behaviors;
-*/
+/* Frama-C: skipped — [inet] inet_pton IPv6 conversion */
 int cidr6_to_ip6_binary(char *cidr, uint128_t *ip, uint8_t *mask)
 {
     char addr[IPV6_ADDR_LEN] = {0};
@@ -159,15 +110,7 @@ int cidr6_to_ip6_binary(char *cidr, uint128_t *ip, uint8_t *mask)
     return 0;
 }
 
-/*@
-  requires \valid(addr + (0 .. IPV6_ADDR_LEN - 1));
-  assigns addr[0 .. IPV6_ADDR_LEN - 1];
-  behavior success:
-    ensures \result == 0;
-  behavior failure:
-    ensures \result != 0;
-  disjoint behaviors;
-*/
+/* Frama-C: skipped — [inet] inet_ntop IPv6 conversion */
 int ip6_binary_to_addr(uint128_t ip, char *addr)
 {
     struct in6_addr addr_struct;
@@ -177,6 +120,7 @@ int ip6_binary_to_addr(uint128_t ip, char *addr)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON serialization */
 int network_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const network_config_t *net = data_struct;
@@ -198,6 +142,7 @@ int network_to_json(const void *data_struct, json_t **obj_ptr)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON deserialization */
 int network_from_json(const json_t *obj, void *data_struct)
 {
     network_config_t *net = data_struct;

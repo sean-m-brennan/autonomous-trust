@@ -169,6 +169,30 @@ int logger_init_local_time_res(logger_t *logger, log_level_t max_level, const ch
 */
 void _logging(logger_t *logger, log_level_t level, const char *srcfile, const size_t line, const char *fmt, ...);
 
+#ifdef __FRAMAC__
+/* Non-variadic logging stub — bypasses the Variadic plugin which
+   generates broken format_length specs for variadic _logging().
+   Same pattern as at_snprintf in fc_stdio_spec.h. */
+/*@
+  requires logger == \null || \valid(logger);
+  assigns \nothing;
+*/
+extern void _at_logging(logger_t *logger, log_level_t level,
+                        const char *srcfile, const size_t line,
+                        const char *fmt);
+
+/* Simplify __FILENAME__ to __FILE__ — avoids WP reasoning about
+   two strrchr calls at every log site. */
+#define __FILENAME__ __FILE__
+
+#define log_debug(logger, ...)    _at_logging(logger, DEBUG, __FILE__, __LINE__, "")
+#define log_info(logger, ...)     _at_logging(logger, INFO, __FILE__, __LINE__, "")
+#define log_warn(logger, ...)     _at_logging(logger, WARNING, __FILE__, __LINE__, "")
+#define log_error(logger, ...)    _at_logging(logger, ERROR, __FILE__, __LINE__, "")
+#define log_critical(logger, ...) _at_logging(logger, CRITICAL, __FILE__, __LINE__, "")
+
+#else /* !__FRAMAC__ */
+
 #define __FILENAME__ (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 
 #define log_debug(logger, ...) _logging(logger, DEBUG, __FILENAME__, __LINE__, __VA_ARGS__)
@@ -176,6 +200,8 @@ void _logging(logger_t *logger, log_level_t level, const char *srcfile, const si
 #define log_warn(logger, ...)  _logging(logger, WARNING, __FILENAME__, __LINE__, __VA_ARGS__)
 #define log_error(logger, ...) _logging(logger, ERROR, __FILENAME__, __LINE__, __VA_ARGS__)
 #define log_critical(logger, ...) _logging(logger, CRITICAL, __FILENAME__, __LINE__, __VA_ARGS__)
+
+#endif /* __FRAMAC__ */
 
 /*@
   requires logger == \null || \valid(logger);
