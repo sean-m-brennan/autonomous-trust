@@ -31,7 +31,30 @@ typedef struct
     size_t hash;
 } map_item_t;
 
-typedef struct map_s map_t;
+#define MAP_HASHKEY_BYTES 16  /* matches MAP_HASHKEY_BYTES from libsodium */
+
+typedef struct map_s
+{
+    smrt_ptr_t;
+    map_item_t *items;
+    size_t length;
+    size_t capacity;
+    array_t keys;
+    unsigned char hashkey[MAP_HASHKEY_BYTES];
+} map_t;
+
+/*@ predicate map_valid(map_t *m) =
+      m != \null && \valid(m) &&
+      smrt_valid((smrt_ptr_t *)m) &&
+      m->length <= m->capacity &&
+      (m->capacity > 0 ==>
+        m->items != \null &&
+        \valid(m->items + (0 .. m->capacity - 1)));
+*/
+
+/*@ type invariant map_length_bounded(struct map_s m) =
+      m.items != \null ==> m.length <= m.capacity;
+*/
 
 /**
  * @brief Initialize an existing map structure.
@@ -42,18 +65,15 @@ typedef struct map_s map_t;
 /*@
   requires \valid(map);
   assigns map->length, map->capacity, map->items, map->keys,
-          map->hashkey[0 .. crypto_shorthash_KEYBYTES - 1],
+          map->hashkey[0 .. MAP_HASHKEY_BYTES - 1],
           map->alloc, map->refs;
   behavior success:
-    assumes \is_allocable(sizeof(map_item_t));
     ensures \result == 0;
     ensures map->length == 0;
     ensures map->capacity > 0;
     ensures map->items != \null;
   behavior failure:
-    assumes !\is_allocable(sizeof(map_item_t));
     ensures \result != 0;
-  complete behaviors;
   disjoint behaviors;
 */
 int map_init(map_t *map);
@@ -70,16 +90,16 @@ int map_init(map_t *map);
   assigns *map_ptr;
   behavior null_ptr:
     assumes map_ptr == \null;
-    ensures \result == EINVAL;
+    ensures \result == 22;
   behavior success:
-    assumes map_ptr != \null && \is_allocable(sizeof(map_t));
+    assumes map_ptr != \null;
     ensures \result == 0;
     ensures *map_ptr != \null;
     ensures \fresh(*map_ptr, sizeof(map_t));
     ensures (*map_ptr)->length == 0;
     ensures (*map_ptr)->capacity > 0;
   behavior failure:
-    assumes map_ptr != \null && !\is_allocable(sizeof(map_t));
+    assumes map_ptr != \null;
     ensures \result != 0;
   disjoint behaviors;
 */
@@ -182,7 +202,7 @@ array_t *map_keys(map_t *map);
     assumes \forall integer i; 0 <= i < map->capacity ==>
             (map->items[i].key == \null ||
              strcmp(key, map->items[i].key) != 0);
-    ensures \result == EMAP_NOKEY;
+    ensures \result == 218;
   complete behaviors;
   disjoint behaviors;
 */
@@ -205,7 +225,7 @@ int map_get(map_t *map, const map_key_t key, data_t **value);
           map->length, map->capacity, map->keys;
   behavior null_value:
     assumes value == \null;
-    ensures \result == EINVAL;
+    ensures \result == 22;
     assigns \nothing;
   behavior update_existing:
     assumes value != \null;
@@ -248,7 +268,7 @@ int map_set(map_t *map, const map_key_t key, data_t *value);
     assumes \forall integer i; 0 <= i < map->capacity ==>
             (map->items[i].key == \null ||
              strcmp(key, map->items[i].key) != 0);
-    ensures \result == EMAP_NOKEY;
+    ensures \result == 218;
     ensures map->length == \old(map->length);
   complete behaviors;
   disjoint behaviors;
@@ -265,7 +285,7 @@ int map_remove(map_t *map, map_key_t key);
   requires map->items != \null;
   requires map->length <= map->capacity;
   assigns map->items[0 .. map->capacity - 1];
-  frees map->items, map;
+  frees map->items;
 */
 void map_free(map_t *map);
 

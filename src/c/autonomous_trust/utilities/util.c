@@ -27,6 +27,7 @@ inline long min(long a, long b) { return ((a) < (b) ? a : b); }
 
 inline long max(long a, long b) { return ((a) > (b) ? a : b); }
 
+/* Frama-C: skipped — [string-loop] nested strstr + memmove loop */
 char *strremove(char *str, const char *sub)
 {
     char *p, *q, *r;
@@ -43,12 +44,14 @@ char *strremove(char *str, const char *sub)
     return str;
 }
 
+/* Frama-C: skipped — [string-loop] for(*p;*p;p++) directory component walk */
 int makedirs(char *path, mode_t mode)
 {
     char tmp[MAX_FILENAME+1];
     char *p = NULL;
 
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
     size_t len = strlen(tmp);
     if (tmp[len - 1] == '/')
         tmp[len - 1] = 0;
@@ -67,6 +70,23 @@ int makedirs(char *path, mode_t mode)
     if (err != 0 && errno != EEXIST)
         return SYS_EXCEPTION();
     return 0;
+}
+
+/* Frama-C: skipped — [string-loop] strlen + memcpy; WP cannot discharge separation/bounds */
+int path_join(char *dest, size_t destlen,
+                 const char *dir, const char *suffix)
+{
+    size_t dlen = strlen(dir);
+    size_t slen = strlen(suffix);
+    size_t total = dlen + 1 + slen;
+    if (total >= destlen) {
+        dest[0] = '\0';
+        return -1;
+    }
+    memcpy(dest, dir, dlen);
+    dest[dlen] = '/';
+    memcpy(dest + dlen + 1, suffix, slen + 1);
+    return (int)total;
 }
 
 #define compare_flt_pt(f1, f2, epsilon)              \

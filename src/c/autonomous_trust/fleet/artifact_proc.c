@@ -23,11 +23,11 @@
 #include "fleet/artifact_proc.h"
 #include "fleet/artifact_store.h"
 #include "structures/map.h"
-#include "structures/map_priv.h"
-#include "structures/data_priv.h"
+#include "structures/data.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
+#include "utilities/util.h"
 #include "network/net_message.h"
 
 #define EARTIFACT 270
@@ -60,6 +60,13 @@ static void _ensure_init(void)
  * Send a JSON message via the network process.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires function != \null && \valid_read(function);
+  requires payload == \null || \valid(payload);
+  requires \valid_read(peer);
+  ensures \result == 0 || \result == -1;
+*/
 static int send_to_peer(const process_t *proc, const char *function,
                         json_t *payload, const public_identity_t *peer)
 {
@@ -87,6 +94,12 @@ static int send_to_peer(const process_t *proc, const char *function,
  * A peer asks us for an artifact we may have.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_artifact_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -150,6 +163,12 @@ static bool handle_artifact_request(const process_t *proc, directory_t *queues, 
  * We received manifest info for a requested artifact.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_artifact_manifest(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -274,6 +293,12 @@ static bool handle_artifact_manifest(const process_t *proc, directory_t *queues,
  * A peer wants a specific chunk from us.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_chunk_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -341,6 +366,12 @@ static bool handle_chunk_request(const process_t *proc, directory_t *queues, gen
  * We received a chunk for an in-progress download.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_chunk_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -517,6 +548,12 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
  * Informational: a peer finished downloading an artifact from us.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_artifact_complete(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -543,17 +580,24 @@ static bool handle_artifact_complete(const process_t *proc, directory_t *queues,
  * Artifact process main entry
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] state-cascade through getenv/path_join/
+ * artifact_store_init stubs prevents WP from discharging string-literal
+ * validity, valid_rw(proc), and valid_rd(signal) at downstream call sites */
 int artifact_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();
 
-    /* Initialize artifact store */
+    /* Initialize artifact store.
+     * Use path_join instead of snprintf to avoid variadic va_arg state
+     * transitions that prevent WP from propagating \valid(proc) across
+     * the call.  A single path_join call (with the branch choosing its
+     * arguments) avoids a WP typed-allocation discharge that times out
+     * when there are two path_join sites on distinct branches. */
     const char *root = getenv("AUTONOMOUS_TRUST_ROOT");
+    const char *base = (root != NULL) ? root   : "/tmp";
+    const char *sub  = (root != NULL) ? "var/at" : "at_artifacts";
     char data_dir[256];
-    if (root != NULL)
-        snprintf(data_dir, sizeof(data_dir), "%s/var/at", root);
-    else
-        snprintf(data_dir, sizeof(data_dir), "/tmp/at_artifacts");
+    path_join(data_dir, sizeof(data_dir), base, sub);
 
     if (artifact_store_init(data_dir) != 0)
     {

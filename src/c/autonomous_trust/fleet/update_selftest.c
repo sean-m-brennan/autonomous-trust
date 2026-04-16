@@ -27,6 +27,7 @@
 
 #include "fleet/update_proc.h"
 
+/* Frama-C: skipped — [syscall] file I/O + JSON parsing */
 bool selftest_identity(const char *cfg_dir)
 {
     char path[512];
@@ -48,6 +49,7 @@ bool selftest_identity(const char *cfg_dir)
     return true;
 }
 
+/* Frama-C: skipped — [syscall] file I/O + crypto operations */
 bool selftest_crypto(void)
 {
     if (sodium_init() < -1)
@@ -71,6 +73,7 @@ bool selftest_crypto(void)
     return true;
 }
 
+/* Frama-C: skipped — [syscall] file I/O + directory traversal */
 bool selftest_config(const char *cfg_dir)
 {
     DIR *d = opendir(cfg_dir);

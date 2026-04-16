@@ -18,6 +18,12 @@
 
 #include "processes/processes.h"
 
+/*@
+  requires \valid(proc);
+  requires \valid_read(signal);
+  requires logger == \null || \valid(logger);
+  assigns *proc;
+*/
 int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
 #define EREP_PAXOS 253

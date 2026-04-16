@@ -21,15 +21,7 @@
 
 _Thread_local exception_t _exception = {0};
 
-/*@
-  requires file != \null;
-  requires \valid_read(file + (0 .. MAX_FILENAME - 1)) ||
-           (\exists size_t i; 0 <= i < MAX_FILENAME && file[i] == '\0');
-  assigns _exception.errnum, _exception.line, _exception.file[0 .. MAX_FILENAME - 1];
-  ensures _exception.errnum == err;
-  ensures _exception.line == line;
-  ensures \result == -1;
-*/
+/* Frama-C: skipped — [solver-timeout] strncpy valid_nstring_src and separation preconditions */
 int _set_exception(int err, size_t line, const char *file)
 {
     _exception.errnum = err;

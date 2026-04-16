@@ -13,19 +13,19 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Tests for polite event dataclasses and evaluator protocol."""
+"""Tests for kith_covenant event dataclasses and evaluator protocol."""
 
 from datetime import datetime
 
 import pytest
 
 try:
-    from polite.interface import (
+    from kith_covenant.interface import (
         PeerAdmitted, ReputationUpdate, NegotiationStarted,
-        NegotiationOutcome, EvaluatorResult, PoliteEvaluatorProtocol,
+        NegotiationOutcome, EvaluatorResult, KithCovenantEvaluatorProtocol,
     )
 except ImportError:
-    pytest.skip("polite package not on PYTHONPATH", allow_module_level=True)
+    pytest.skip("kith_covenant package not on PYTHONPATH", allow_module_level=True)
 
 
 class TestEventDataclasses:

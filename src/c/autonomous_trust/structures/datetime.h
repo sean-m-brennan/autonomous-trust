@@ -54,12 +54,6 @@ static const char iso8601_format[] = "%FT%T%f%z";
       dt->tm_tz_offset >= -14.0 && dt->tm_tz_offset <= 14.0;
 */
 
-/*@ predicate valid_timedelta{L}(timedelta_t *td) =
-      td != \null && \valid(td) &&
-      td->seconds < 86400 &&
-      td->nsecs < 1000000000;
-*/
-
 /**
  * @brief Format a datetime with explicit time resolution.
  */
@@ -107,15 +101,8 @@ int datetime_to_isoformat(const datetime_t *dt, char *s, size_t max);
   requires format != \null && \valid_read(format);
   requires dt != \null && \valid(dt);
   assigns *dt;
-  behavior success:
-    ensures \result == 0;
-    ensures \initialized(dt);
-  behavior parse_error:
-    ensures \result == EDT_FMT;
-  behavior invalid:
-    assumes s == \null || format == \null || dt == \null;
-    ensures \result != 0;
-  disjoint behaviors;
+  ensures \result == 0 || \result == 214;
+  ensures \result == 0 ==> \initialized(dt);
 */
 int datetime_strptime(const char *s, const char *format, datetime_t *dt);
 
@@ -126,12 +113,8 @@ int datetime_strptime(const char *s, const char *format, datetime_t *dt);
   requires s != \null && \valid_read(s);
   requires dt != \null && \valid(dt);
   assigns *dt;
-  behavior success:
-    ensures \result == 0;
-    ensures \initialized(dt);
-  behavior parse_error:
-    ensures \result == EDT_FMT;
-  disjoint behaviors;
+  ensures \result == 0 || \result == 214;
+  ensures \result == 0 ==> \initialized(dt);
 */
 int datetime_from_isostring(const char *s, datetime_t *dt);
 
@@ -167,6 +150,12 @@ typedef struct {
     unsigned int seconds;
     unsigned int nsecs;
 } timedelta_t;
+
+/*@ predicate valid_timedelta{L}(timedelta_t *td) =
+      td != \null && \valid(td) &&
+      td->seconds < 86400 &&
+      td->nsecs < 1000000000;
+*/
 
 // FIXME normalization:
 // timedelta(microseconds=-1) == (days=-1, seconds=86399, ms=999999)

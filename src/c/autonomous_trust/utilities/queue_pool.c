@@ -38,7 +38,6 @@ int queue_pool_init(queue_pool_t *pool)
 {
     if (pool == NULL)
         return EINVAL;
-    memset(pool, 0, sizeof(queue_pool_t));
     /*@
       loop invariant 0 <= i <= QUEUE_POOL_SIZE;
       loop invariant \forall integer j; 0 <= j < i ==>
@@ -49,7 +48,6 @@ int queue_pool_init(queue_pool_t *pool)
     for (int i = 0; i < QUEUE_POOL_SIZE; i++)
     {
         pool->pool[i].in_use = false;
-        memset(&pool->pool[i].queue, 0, sizeof(queue_t));
     }
     pool->initialized = 1;
     return 0;

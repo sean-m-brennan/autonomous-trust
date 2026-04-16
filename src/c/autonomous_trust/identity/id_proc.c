@@ -25,7 +25,7 @@
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
-#include "structures/data_priv.h"
+#include "structures/data.h"
 #include "network/net_message.h"
 #include "peers.h"
 #include "id_proc_priv.h"
@@ -83,6 +83,7 @@ static void _ensure_id_init(void)
  * Internal helpers
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] logging/map preconditions */
 static int _remember_activity(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     /* Update proc configs with latest data; broadcast to all other processes */
@@ -107,6 +108,7 @@ static int _remember_activity(const process_t *proc, directory_t *queues, generi
  * Adds a new peer to the process's peer list and broadcasts to local processes.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] logging/identity/peers preconditions */
 static int _add_peer(process_t *proc, directory_t *queues, const public_identity_t *new_peer)
 {
     if (proc->protocol.num_peers >= MAX_PEERS)
@@ -127,6 +129,7 @@ static int _add_peer(process_t *proc, directory_t *queues, const public_identity
  * then adds the peer to our list.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] identity/peers preconditions */
 static int _peer_accepted(process_t *proc, directory_t *queues, const public_identity_t *new_peer)
 {
     /* Send ID_CONFIRM to existing group members with new_peer identity in JSON payload */
@@ -163,6 +166,12 @@ static int _peer_accepted(process_t *proc, directory_t *queues, const public_ide
  * Phase 3 only. Receives broadcast from new peer wanting to join.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_welcoming_committee(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -304,6 +313,12 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
  * Phase 2+. Receives acceptance from an existing peer.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_acceptance(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase < 2)
@@ -345,6 +360,12 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
  * Receives full history + group from established peer.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_receive_history(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -375,6 +396,12 @@ static bool handle_receive_history(const process_t *proc, directory_t *queues, g
  * Phase 3 only. Receives a peer proposal for voting.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -433,6 +460,12 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
  * Phase 3 only. Receives and counts votes on proposed peers.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -524,6 +557,12 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
  * Phase 3 only. Receives confirmation that a peer was accepted.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -575,6 +614,12 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
  * Phase 3 only. Receives and logs history diffs.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_history_diff(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -613,6 +658,12 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
  * Phase 3 only. Receives group address list updates.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_group_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -678,6 +729,7 @@ static int _acquire_capabilities(const process_t *proc, directory_t *queues)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] JSON + identity preconditions */
 static int _build_announcement(const process_t *proc, generic_msg_t *buf)
 {
     memset(buf, 0, sizeof(generic_msg_t));
@@ -709,6 +761,7 @@ static int _build_announcement(const process_t *proc, generic_msg_t *buf)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] logging/snprintf/json preconditions */
 static int _announce_identity(const process_t *proc, directory_t *queues)
 {
     data_t net = STRING_DATA("network");

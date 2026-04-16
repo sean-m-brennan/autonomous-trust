@@ -47,6 +47,18 @@ typedef struct json_t {
 /* json_dumps flags */
 #define JSON_COMPACT 0x20
 
+/* Error reporting */
+#define JSON_ERROR_TEXT_LENGTH   160
+#define JSON_ERROR_SOURCE_LENGTH 80
+
+typedef struct json_error_t {
+    int line;
+    int column;
+    int position;
+    char source[JSON_ERROR_SOURCE_LENGTH];
+    char text[JSON_ERROR_TEXT_LENGTH];
+} json_error_t;
+
 /* Type check macros — modelled as functions for ACSL */
 /*@ ghost
   /@ assigns \nothing;
@@ -89,6 +101,12 @@ typedef struct json_t {
          key = json_object_iter_key(json_object_iter_next(              \
                    object, json_object_key_to_iter(key))))
 
+#define json_array_foreach(array, index, value)                         \
+    for (index = 0;                                                     \
+         index < json_array_size(array) &&                              \
+             (value = json_array_get(array, index));                    \
+         index++)
+
 #endif /* JANSSON_H */
 
 /* ================================================================
@@ -117,6 +135,22 @@ json_t *json_array(void);
   ensures \result == \null || \valid(\result);
 */
 json_t *json_string(const char *value);
+
+/*@
+  requires \valid_read(value + (0 .. len - 1));
+  allocates \result;
+  assigns \nothing;
+  ensures \result == \null || \valid(\result);
+*/
+json_t *json_stringn(const char *value, size_t len);
+
+/*@
+  requires \valid_read(value + (0 .. len - 1));
+  allocates \result;
+  assigns \nothing;
+  ensures \result == \null || \valid(\result);
+*/
+json_t *json_stringn_nocheck(const char *value, size_t len);
 
 /*@
   allocates \result;
@@ -299,6 +333,13 @@ json_t *json_array_get(const json_t *array, size_t index);
 const char *json_string_value(const json_t *string);
 
 /*@
+  requires \valid_read(string);
+  assigns \nothing;
+  ensures \result >= 0;
+*/
+size_t json_string_length(const json_t *string);
+
+/*@
   requires \valid_read(integer);
   assigns \nothing;
 */
@@ -354,6 +395,32 @@ json_t *json_loadb(const char *buffer, size_t buflen,
   ensures \result == \null || \valid(\result);
 */
 json_t *json_loads(const char *input, size_t flags, void *error);
+
+/* ================================================================
+ * File I/O
+ * ================================================================ */
+
+/*@
+  requires \valid_read(path);
+  requires error == \null || \valid(error);
+  allocates \result;
+  assigns \nothing;
+  ensures \result == \null || \valid(\result);
+*/
+json_t *json_load_file(const char *path, size_t flags, json_error_t *error);
+
+/*@
+  requires \valid_read(root);
+  requires \valid_read(path);
+  assigns \nothing;
+  ensures \result == 0 || \result == -1;
+*/
+int json_dump_file(const json_t *root, const char *path, size_t flags);
+
+/* json_dumps flags used in the project */
+#ifndef JSON_INDENT
+#define JSON_INDENT(n) ((n) & 0x1F)
+#endif
 
 /* ================================================================
  * Reference counting

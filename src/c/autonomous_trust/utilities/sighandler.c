@@ -31,6 +31,7 @@ extern void user1_handler();
 
 extern void user2_handler();
 
+/* Frama-C: skipped — [syscall] signal handler callback */
 void handle_signal(int signum)
 {
     if (_logger != NULL)
@@ -74,6 +75,7 @@ void handle_signal(int signum)
     }
 }
 
+/* Frama-C: skipped — [syscall] sigaction signal registration */
 int init_sig_handling(logger_t *logger)
 {
     _logger = logger;
