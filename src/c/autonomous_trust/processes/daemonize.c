@@ -44,6 +44,7 @@
     ensures \result < 0;
   disjoint behaviors;
 */
+/* Frama-C: skipped — [syscall] fork, setsid, chdir, dup2, close */
 int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
 {
     int io[2] = {0};

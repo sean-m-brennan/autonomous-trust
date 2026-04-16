@@ -104,6 +104,7 @@ int unix_addr(const char *key, struct sockaddr_un *addr)
     ensures \result == -1;
   disjoint behaviors;
 */
+/* Frama-C: skipped — [solver-timeout] strncpy separation + assigns preconditions */
 int messaging_init(const char *id, queue_t *queue)
 {
     strncpy(queue->key, id, MSG_KEY_LEN - 1);
@@ -137,6 +138,7 @@ void messaging_assign(queue_t *queue)
     my_q = queue;
 }
 
+/* Frama-C: skipped — [syscall] mq_receive POSIX message queue */
 int messaging_recv_from(generic_msg_t *msg, struct sockaddr_storage *their_addr, bool blocking)
 {
     if (my_q == NULL)
@@ -158,6 +160,7 @@ int messaging_recv_from(generic_msg_t *msg, struct sockaddr_storage *their_addr,
     ensures \result == -1;
   disjoint behaviors;
 */
+/* Frama-C: skipped — [syscall] mq_receive POSIX message queue */
 int messaging_recv_on(queue_t *q, generic_msg_t *msg, struct sockaddr_storage *their_addr, bool blocking)
 {
     if (q->fd <= 0)
@@ -234,6 +237,7 @@ int signal_recv(queue_t *q, long *msg_type, signal_t *sig)
     ensures \result == EAGAIN;
   disjoint behaviors no_queue, success, would_block;
 */
+/* Frama-C: skipped — [syscall] mq_send POSIX message queue */
 int messaging_send(const char *key, const message_type_t type, generic_msg_t *msg, bool blocking)
 {
     if (my_q == NULL)

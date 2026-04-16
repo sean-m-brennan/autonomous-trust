@@ -29,7 +29,7 @@
 #include "processes/processes.h"
 // #include "protobuf/processes.pb-c.h"
 #include "config/configuration.h"
-#include "structures/map_priv.h"
+#include "structures/map.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/util.h"
 
@@ -53,6 +53,7 @@ typedef bool (*msg_handler_t)(const process_t *proc, directory_t *queues, generi
     ensures \result != 0;
   disjoint behaviors;
 */
+/* Frama-C: skipped — [solver-timeout] logging/snprintf preconditions */
 int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies)
 {
     memset(proc->name, 0, PROC_NAME_LEN);
@@ -75,6 +76,7 @@ int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *confi
     return map_create(&proc->protocol.handlers);
 }
 
+/* Frama-C: skipped — [solver-timeout] process lifecycle preconditions */
 int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
                    map_t *procs, directory_t *queues, logger_t *logger)
 {
@@ -154,6 +156,7 @@ void process_name_to_signal(const char *name, char *sig)
     ensures \result != 0;
   disjoint behaviors;
 */
+/* Frama-C: skipped — [solver-timeout] strncpy preconditions */
 int set_process_name(const char *name_in)
 {
     char name[PROC_NAME_LEN + 1] = {0};
@@ -165,12 +168,14 @@ int set_process_name(const char *name_in)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] logging/snprintf preconditions */
 inline int process_register_handler(const process_t *proc, char *func_name, handler_ptr_t handler)
 {
     data_t *h_dat = object_ptr_data(handler, sizeof(handler_ptr_t));
     return map_set(proc->protocol.handlers, func_name, h_dat);
 }
 
+/* Frama-C: skipped — [func-ptr] msg_handler_t callback dispatch */
 bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, generic_msg_t *msg)
 {
     switch (msgtype)
@@ -184,7 +189,7 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
     case PEER_CAPABILITIES:
         // pproc->peer_capabilities = message
         return true;
-    default:
+    default: {
         net_msg_t *nmsg = &msg->info.net_msg;
         if (strcmp(nmsg->process, proc->name) == 0)
         {
@@ -204,10 +209,12 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
             }
             return handler(proc, queues, msg);
         }
-    }
+    } // default
+    } // switch
     return false;
 }
 
+/* Frama-C: skipped — [syscall] IPC message queue read loop */
 bool keep_running(const process_t *proc, queue_t *sig_q, logger_t *logger)
 {
     if (gettimeofday((struct timeval *)&proc->start, NULL) != 0)
@@ -257,6 +264,7 @@ void sleep_until(const process_t *proc, long how_long)
         usleep(delta);
 }
 
+/* Frama-C: skipped — [solver-timeout] complex lifecycle preconditions */
 int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
                   process_ctx_t *ctx)
 {

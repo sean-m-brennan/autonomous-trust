@@ -37,7 +37,7 @@
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "identity/group.h"
-#include "structures/data_priv.h"
+#include "structures/data.h"
 
 #define ENET_SEND 230
 DEFINE_ERROR(ENET_SEND, "Network send failed");
