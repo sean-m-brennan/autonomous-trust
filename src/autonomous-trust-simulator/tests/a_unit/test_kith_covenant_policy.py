@@ -13,22 +13,22 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Tests for PolitePolicy dataclass, factories, and serialization."""
+"""Tests for KithCovenantPolicy dataclass, factories, and serialization."""
 
 import pytest
 
 try:
-    from polite.policy import (
-        PolitePolicy, null_policy, permissive_policy, strict_policy,
+    from kith_covenant.policy import (
+        KithCovenantPolicy, null_policy, permissive_policy, strict_policy,
     )
 except ImportError:
-    pytest.skip("polite package not on PYTHONPATH", allow_module_level=True)
+    pytest.skip("kith_covenant package not on PYTHONPATH", allow_module_level=True)
 
 
 class TestPolicyDefaults:
 
     def test_default_is_null(self):
-        p = PolitePolicy()
+        p = KithCovenantPolicy()
         assert p.min_reputation_to_negotiate is None
         assert p.defection_cooldown_s is None
         assert p.max_group_size is None
@@ -61,7 +61,7 @@ class TestSerialization:
     def test_round_trip(self):
         p = strict_policy()
         d = p.to_dict()
-        p2 = PolitePolicy.from_dict(d)
+        p2 = KithCovenantPolicy.from_dict(d)
         assert p == p2
 
     def test_to_dict_keys(self):
@@ -74,7 +74,7 @@ class TestSerialization:
     def test_from_dict_ignores_extra_keys(self):
         d = null_policy().to_dict()
         d['future_field'] = 42
-        p = PolitePolicy.from_dict(d)
+        p = KithCovenantPolicy.from_dict(d)
         assert p == null_policy()
 
     def test_frozen(self):

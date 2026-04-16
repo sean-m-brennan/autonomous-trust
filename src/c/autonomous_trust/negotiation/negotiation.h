@@ -22,8 +22,8 @@
 #include <time.h>
 #include <uuid/uuid.h>
 
-#include "structures/map_priv.h"
-#include "structures/data_priv.h"
+#include "structures/map.h"
+#include "structures/data.h"
 #include "identity/identity.h"
 #include "negotiation/task.h"
 #include "utilities/exception.h"
@@ -108,6 +108,7 @@ int  task_tracker_create(task_tracker_t **tracker, const uuid_t task_uuid, int e
 /*@
   requires \valid(tracker);
   requires expected >= 0;
+  requires \separated(tracker + (0 .. 0), task_uuid + (0 .. 15));
   assigns *tracker;
   ensures \result == 0 || \result != 0;
 */
@@ -137,6 +138,7 @@ int  task_tracker_result_count(const task_tracker_t *tracker);
 
 /*@
   requires \valid(tracker);
+  requires tracker->results.length <= tracker->results.capacity;
   assigns tracker->results;
 */
 void task_tracker_free(task_tracker_t *tracker);

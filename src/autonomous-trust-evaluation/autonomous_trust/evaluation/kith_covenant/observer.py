@@ -14,9 +14,9 @@
 #   limitations under the License.
 # ******************
 
-"""PoliteObserver: an AT Process plugin that receives protocol messages,
+"""KithCovenantObserver: an AT Process plugin that receives protocol messages,
 creates typed event dataclass instances, evaluates them against a
-PolitePolicy, and tracks compliance metrics.
+KithCovenantPolicy, and tracks compliance metrics.
 
 Tracked metrics:
   - Peer admission count and group size peak
@@ -37,25 +37,25 @@ from autonomous_trust.core._python.negotiation.negotiation import TaskInfo
 from autonomous_trust.core._python.reputation.reputation import Reputation
 from autonomous_trust.core.system import CfgIds, QueueType
 
-from polite.interface import (
+from kith_covenant.interface import (
     PeerAdmitted, ReputationUpdate, NegotiationStarted, NegotiationOutcome,
 )
-from polite.policy import PolitePolicy
+from kith_covenant.policy import KithCovenantPolicy
 
 
-class PoliteObserver(Process, metaclass=ProcMeta,
-                     proc_name='polite-observer',
-                     description='Polite policy compliance observation'):
+class KithCovenantObserver(Process, metaclass=ProcMeta,
+                     proc_name='kith-covenant-observer',
+                     description='Kith-Covenant policy compliance observation'):
 
     is_tee_observer = True
 
     def __init__(self, configurations: dict[str, Any], subsystems: ProcessTracker,
                  log_queue: QueueType, dependencies: list[str] = None,
-                 policy: Optional[PolitePolicy] = None,
+                 policy: Optional[KithCovenantPolicy] = None,
                  output_path: Optional[str] = None):
         super().__init__(configurations, subsystems, log_queue,
                          dependencies=dependencies)
-        self.policy = policy if policy is not None else PolitePolicy()
+        self.policy = policy if policy is not None else KithCovenantPolicy()
         self.output_path = output_path
         self._init_state()
 

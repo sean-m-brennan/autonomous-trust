@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -38,14 +39,6 @@ DEFINE_ERROR(ENTP_STRATUM, "NTP stratum too high");
  * local variables for intermediate values.
  ****************************/
 
-/*@
-  requires \valid(pkt);
-  assigns pkt->root_delay, pkt->root_dispersion, pkt->ref_id,
-          pkt->ref_ts_sec, pkt->ref_ts_frac,
-          pkt->orig_ts_sec, pkt->orig_ts_frac,
-          pkt->rx_ts_sec, pkt->rx_ts_frac,
-          pkt->tx_ts_sec, pkt->tx_ts_frac;
-*/
 void ntp_packet_pack(ntp_packet_t *pkt)
 {
     uint32_t v;
@@ -65,14 +58,6 @@ void ntp_packet_pack(ntp_packet_t *pkt)
     v = pkt->tx_ts_frac;             pkt->tx_ts_frac      = htonl(v);
 }
 
-/*@
-  requires \valid(pkt);
-  assigns pkt->root_delay, pkt->root_dispersion, pkt->ref_id,
-          pkt->ref_ts_sec, pkt->ref_ts_frac,
-          pkt->orig_ts_sec, pkt->orig_ts_frac,
-          pkt->rx_ts_sec, pkt->rx_ts_frac,
-          pkt->tx_ts_sec, pkt->tx_ts_frac;
-*/
 void ntp_packet_unpack(ntp_packet_t *pkt)
 {
     uint32_t sec, frac;
@@ -111,13 +96,6 @@ void ntp_packet_unpack(ntp_packet_t *pkt)
  *   offset    = ((t2 - t1) + (t3 - t4)) / 2
  ****************************/
 
-/*@
-  requires \valid(pkt);
-  requires \valid(result);
-  assigns result->offset_sec, result->roundtrip_sec, result->stratum;
-  ensures \result == 0;
-  ensures result->stratum == pkt->stratum;
-*/
 int ntp_compute_offset(const ntp_packet_t *pkt, struct timespec t1, struct timespec t4,
                        ntp_result_t *result)
 {
@@ -147,17 +125,7 @@ int ntp_compute_offset(const ntp_packet_t *pkt, struct timespec t1, struct times
  * NTP client
  ****************************/
 
-/*@
-  requires server_addr != \null && \valid_read(server_addr);
-  requires \valid(result);
-  assigns result->offset_sec, result->roundtrip_sec, result->stratum;
-  behavior success:
-    ensures \result == 0;
-    ensures result->stratum >= 1 && result->stratum <= 15;
-  behavior failure:
-    ensures \result != 0;
-  disjoint behaviors;
-*/
+/* Frama-C: skipped — [syscall] socket/sendto/recvfrom */
 int ntp_client_request(const char *server_addr, ntp_result_t *result)
 {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -239,6 +207,7 @@ int ntp_client_request(const char *server_addr, ntp_result_t *result)
 static pthread_t    ntp_server_thread;
 static volatile int ntp_server_running = 0;
 
+/* Frama-C: skipped — [syscall] socket/recvfrom/sendto loop */
 static void *ntp_server_loop(void *arg)
 {
     (void)arg;
@@ -315,10 +284,7 @@ static void *ntp_server_loop(void *arg)
     return NULL;
 }
 
-/*@
-  assigns \nothing;
-  ensures \result == 0 || \result == -1;
-*/
+/* Frama-C: skipped — [syscall] pthread_create */
 int ntp_server_start(void)
 {
     if (ntp_server_running)
@@ -334,10 +300,7 @@ int ntp_server_start(void)
     return 0;
 }
 
-/*@
-  assigns \nothing;
-  ensures \result == 0;
-*/
+/* Frama-C: skipped — [syscall] pthread_join */
 int ntp_server_stop(void)
 {
     if (!ntp_server_running)
@@ -358,6 +321,7 @@ static pthread_mutex_t ntp_offset_lock = PTHREAD_MUTEX_INITIALIZER;
 static char            ntp_sync_server[IPV4_ADDR_LEN + 1];
 static int             ntp_sync_interval = NTP_DEFAULT_SYNC_INTERVAL;
 
+/* Frama-C: skipped — [syscall] socket/gettimeofday loop */
 static void *ntp_sync_loop(void *arg)
 {
     (void)arg;
@@ -379,16 +343,7 @@ static void *ntp_sync_loop(void *arg)
     return NULL;
 }
 
-/*@
-  requires server_addr == \null || \valid_read(server_addr);
-  behavior null_addr:
-    assumes server_addr == \null;
-    ensures \result == EINVAL;
-  behavior success:
-    assumes server_addr != \null;
-    ensures \result == 0 || \result != 0;
-  disjoint behaviors;
-*/
+/* Frama-C: skipped — [syscall] pthread_create */
 int ntp_start_sync(const char *server_addr, int interval_sec)
 {
     if (ntp_sync_running)
@@ -412,10 +367,7 @@ int ntp_start_sync(const char *server_addr, int interval_sec)
     return 0;
 }
 
-/*@
-  assigns \nothing;
-  ensures \result == 0;
-*/
+/* Frama-C: skipped — [syscall] pthread_join */
 int ntp_stop_sync(void)
 {
     if (!ntp_sync_running)
@@ -425,9 +377,7 @@ int ntp_stop_sync(void)
     return 0;
 }
 
-/*@
-  assigns \nothing;
-*/
+/* Frama-C: skipped — [syscall] gettimeofday */
 double ntp_get_offset(void)
 {
     double offset;

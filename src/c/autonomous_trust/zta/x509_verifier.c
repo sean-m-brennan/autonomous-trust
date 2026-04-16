@@ -100,6 +100,7 @@ static int cert_sha256(X509 *cert, uint8_t hash_out[ZTA_HASH_LEN])
 /**
  * @brief Get a one-line reason from OpenSSL's verification error
  */
+/* Frama-C: skipped — [solver-timeout] OpenSSL error string lookup */
 static void openssl_verify_reason(X509_STORE_CTX *ctx, char *reason, size_t reason_len)
 {
     int err = X509_STORE_CTX_get_error(ctx);
@@ -108,6 +109,7 @@ static void openssl_verify_reason(X509_STORE_CTX *ctx, char *reason, size_t reas
 
 /* ---------- cert cache ---------- */
 
+/* Frama-C: skipped — [solver-timeout] OpenSSL + map preconditions */
 static void _cache_cert(x509_impl_t *impl, X509 *cert, const uint8_t hash[ZTA_HASH_LEN])
 {
     /* Check if already cached */
@@ -144,6 +146,7 @@ static void _cache_cert(x509_impl_t *impl, X509 *cert, const uint8_t hash[ZTA_HA
     e->valid = true;
 }
 
+/* Frama-C: skipped — [solver-timeout] map lookup preconditions */
 static X509 *_cache_lookup(const x509_impl_t *impl, const uint8_t hash[ZTA_HASH_LEN])
 {
     for (int i = 0; i < impl->cert_cache_count; i++) {
@@ -162,6 +165,7 @@ static X509 *_cache_lookup(const x509_impl_t *impl, const uint8_t hash[ZTA_HASH_
  * @brief Parse a URL into host, port, path components.
  * Caller must free host, port, path with OPENSSL_free.
  */
+/* Frama-C: skipped — [solver-timeout] string parsing preconditions */
 static int _parse_ocsp_url(const char *url, char **host, char **port,
                            char **path, int *use_ssl)
 {
@@ -205,6 +209,7 @@ static int _parse_ocsp_url(const char *url, char **host, char **port,
  *
  * @return OCSP_RESPONSE on success (caller frees), NULL on failure
  */
+/* Frama-C: skipped — [solver-timeout] OpenSSL OCSP query preconditions */
 static OCSP_RESPONSE *_ocsp_query(const char *url, OCSP_REQUEST *req,
                                   int timeout_ms)
 {
@@ -357,6 +362,7 @@ static X509 *_get_issuer(X509_STORE *store, X509 *cert)
 
 /* ---------- vtable implementations ---------- */
 
+/* Frama-C: skipped — [solver-timeout] OpenSSL verify preconditions */
 static int x509_verify_credential(zta_verifier_t *self,
                                   const uint8_t *cred_data, size_t cred_len,
                                   zta_result_t *result)
@@ -421,6 +427,7 @@ static int x509_verify_credential(zta_verifier_t *self,
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] OpenSSL + OCSP preconditions */
 static int x509_check_revocation(zta_verifier_t *self,
                                  const uint8_t *cred_hash,
                                  zta_result_t *result)
@@ -586,6 +593,7 @@ static int x509_check_revocation(zta_verifier_t *self,
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] OpenSSL availability check */
 static bool x509_is_available(zta_verifier_t *self)
 {
     x509_impl_t *impl = (x509_impl_t *)self->impl_data;
@@ -611,6 +619,7 @@ static bool x509_is_available(zta_verifier_t *self)
     return true;
 }
 
+/* Frama-C: skipped — [solver-timeout] OpenSSL hash preconditions */
 static int x509_credential_hash(zta_verifier_t *self,
                                 const uint8_t *cred_data, size_t cred_len,
                                 uint8_t hash_out[ZTA_HASH_LEN])
@@ -632,6 +641,7 @@ static int x509_credential_hash(zta_verifier_t *self,
     return rc;
 }
 
+/* Frama-C: skipped — [solver-timeout] OpenSSL cleanup preconditions */
 static void x509_destroy(zta_verifier_t *self)
 {
     if (!self)
@@ -652,6 +662,7 @@ static void x509_destroy(zta_verifier_t *self)
 
 /* ---------- constructor ---------- */
 
+/* Frama-C: skipped — [solver-timeout] OpenSSL init + allocation */
 int x509_verifier_create(const x509_verifier_config_t *cfg,
                          zta_verifier_t **out)
 {

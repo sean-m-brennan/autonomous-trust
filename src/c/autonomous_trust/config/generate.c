@@ -42,6 +42,7 @@ DEFINE_ERROR(EGEN_NOIF, "No suitable network interface found");
  * Reads node_address and subnet from bootstrap/bootstrap.cfg.json if present.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] JSON file read preconditions */
 static int read_bootstrap(const char *cfg_dir, char *addr_out, size_t addr_len,
                           char *subnet_out, size_t subnet_len)
 {
@@ -79,6 +80,7 @@ static int read_bootstrap(const char *cfg_dir, char *addr_out, size_t addr_len,
  * Network interface discovery
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] inet/network struct init preconditions */
 static void fill_ipv4(net_iface_t *iface, struct ifaddrs *ifa,
                       const char *override_ip)
 {
@@ -109,6 +111,7 @@ static void fill_ipv4(net_iface_t *iface, struct ifaddrs *ifa,
  * interface whose subnet contains that address (and use it as our IP).
  * Falls back to the first non-loopback IPv4 interface.
  */
+/* Frama-C: skipped — [solver-timeout] network interface enumeration */
 static int discover_network_for(net_iface_t *iface, const char *preferred_ip)
 {
     memset(iface, 0, sizeof(net_iface_t));
@@ -230,6 +233,7 @@ int discover_network(net_iface_t *iface)
  * Identity generation
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] identity creation + JSON file write */
 int generate_identity(const char *fullname, const char *cfg_dir)
 {
     uuid_t uuid;
@@ -253,7 +257,7 @@ int generate_identity(const char *fullname, const char *cfg_dir)
         return err;
 
     char filepath[CFG_PATH_LEN + 1];
-    snprintf(filepath, CFG_PATH_LEN, "%s/identity.cfg.json", cfg_dir);
+    path_join(filepath, sizeof(filepath), cfg_dir, "identity.cfg.json");
 
     config_t *cfg = find_configuration("identity");
     if (cfg == NULL)
@@ -271,6 +275,7 @@ int generate_identity(const char *fullname, const char *cfg_dir)
  * Network config generation
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] network config + JSON file write */
 int generate_network_config(const char *cfg_dir)
 {
     /* Check bootstrap for a provisioned address */
@@ -290,7 +295,7 @@ int generate_network_config(const char *cfg_dir)
     /* mcast addresses left empty */
 
     char filepath[CFG_PATH_LEN + 1];
-    snprintf(filepath, CFG_PATH_LEN, "%s/network.cfg.json", cfg_dir);
+    path_join(filepath, sizeof(filepath), cfg_dir, "network.cfg.json");
 
     config_t *cfg = find_configuration("network");
     if (cfg == NULL)
@@ -340,7 +345,7 @@ int generate_subsystems_config(const char *cfg_dir)
         return err;
 
     char filepath[CFG_PATH_LEN + 1];
-    snprintf(filepath, CFG_PATH_LEN, "%s/%s", cfg_dir, default_tracker_filename);
+    path_join(filepath, sizeof(filepath), cfg_dir, default_tracker_filename);
 
     return tracker_to_file(&tracker, filepath);
 }

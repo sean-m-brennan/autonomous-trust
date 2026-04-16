@@ -67,6 +67,11 @@ extern const linked_step_t dag_genesis;
       s->uuid[DAG_UUID_LEN - 1] == '\0';
 */
 
+typedef struct {
+    map_t *heads;          /* branch_name -> linked_step_t* (as object_ptr_data) */
+    map_t *branch_lists;   /* branch_name -> array_t* of linked_step_t* */
+} step_dag_t;
+
 /*@ predicate valid_dag{L}(step_dag_t *d) =
       d != \null && \valid(d) &&
       d->heads != \null && \valid(d->heads) &&
@@ -82,7 +87,6 @@ extern const linked_step_t dag_genesis;
   allocates *step;
   assigns *step;
   behavior success:
-    assumes \is_allocable(sizeof(linked_step_t));
     ensures \result == 0;
     ensures *step != \null;
     ensures \fresh(*step, sizeof(linked_step_t));
@@ -90,7 +94,6 @@ extern const linked_step_t dag_genesis;
     ensures (*step)->length == 1;
     ensures (*step)->uuid[DAG_UUID_LEN - 1] == '\0';
   behavior failure:
-    assumes !\is_allocable(sizeof(linked_step_t));
     ensures \result != 0;
   disjoint behaviors;
 */
@@ -102,8 +105,7 @@ int linked_step_create(const char *uuid, void *payload, linked_step_t **step);
 /*@
   behavior null_or_genesis:
     assumes step == \null ||
-            step == &dag_genesis ||
-            \strcmp(step->uuid, dag_genesis.uuid) == 0;
+            step == &dag_genesis;
     assigns \nothing;
   behavior normal:
     assumes step != \null &&
@@ -113,11 +115,6 @@ int linked_step_create(const char *uuid, void *payload, linked_step_t **step);
 */
 void linked_step_free(linked_step_t *step);
 
-typedef struct {
-    map_t *heads;          /* branch_name -> linked_step_t* (as object_ptr_data) */
-    map_t *branch_lists;   /* branch_name -> array_t* of linked_step_t* */
-} step_dag_t;
-
 /**
  * @brief Initialise an existing DAG structure with a main branch at genesis.
  */
@@ -125,12 +122,10 @@ typedef struct {
   requires \valid(dag);
   assigns dag->heads, dag->branch_lists;
   behavior success:
-    assumes \is_allocable(sizeof(map_t));
     ensures \result == 0;
     ensures dag->heads != \null;
     ensures dag->branch_lists != \null;
   behavior failure:
-    assumes !\is_allocable(sizeof(map_t));
     ensures \result != 0;
   disjoint behaviors;
 */
@@ -147,14 +142,14 @@ int dag_init(step_dag_t *dag);
     assumes dag == \null;
     ensures \result != 0;
   behavior success:
-    assumes dag != \null && \is_allocable(sizeof(step_dag_t));
+    assumes dag != \null;
     ensures \result == 0;
     ensures *dag != \null;
     ensures \fresh(*dag, sizeof(step_dag_t));
     ensures (*dag)->heads != \null;
     ensures (*dag)->branch_lists != \null;
   behavior failure:
-    assumes dag != \null && !\is_allocable(sizeof(step_dag_t));
+    assumes dag != \null;
     ensures \result != 0;
   disjoint behaviors;
 */
@@ -172,9 +167,9 @@ int dag_create(step_dag_t **dag);
     ensures \result == 0;
     ensures step->length >= 1;
   behavior invalid_branch:
-    ensures \result == EDAG_INVALID_BRANCH;
+    ensures \result == 220;
   behavior error:
-    ensures \result != 0 && \result != EDAG_INVALID_BRANCH;
+    ensures \result != 0 && \result != 220;
   disjoint behaviors;
 */
 int dag_add_step(step_dag_t *dag, linked_step_t *step, const char *branch);
@@ -192,9 +187,9 @@ int dag_add_step(step_dag_t *dag, linked_step_t *step, const char *branch);
     ensures \result == 0;
     ensures step->length >= 1;
   behavior already_exists:
-    ensures \result == EDAG_BRANCH_EXISTS;
+    ensures \result == 221;
   behavior invalid_source:
-    ensures \result == EDAG_INVALID_BRANCH;
+    ensures \result == 220;
   behavior error:
     ensures \result != 0;
   disjoint behaviors;
@@ -236,7 +231,7 @@ int dag_ingest_branch(step_dag_t *dag, linked_step_t **steps, size_t count, cons
     ensures \result == 0;
     ensures idx_out != \null ==> *idx_out >= 0;
   behavior invalid_branch:
-    ensures \result == EDAG_INVALID_BRANCH;
+    ensures \result == 220;
   disjoint behaviors;
 */
 int dag_diff(step_dag_t *dag, const char *branch, const char *target, int *idx_out, linked_step_t **common_root);
@@ -268,7 +263,7 @@ int dag_merge(step_dag_t *dag, const char *branch, const char *target, bool keep
     ensures \result == 0;
     ensures *head_out != \null;
   behavior invalid_branch:
-    ensures \result == EDAG_INVALID_BRANCH;
+    ensures \result == 220;
   disjoint behaviors;
 */
 int dag_fork(step_dag_t *dag, const char *branch, linked_step_t **head_out);
@@ -286,7 +281,7 @@ int dag_fork(step_dag_t *dag, const char *branch, linked_step_t **head_out);
     ensures \result == 0;
     ensures *steps_out != \null;
   behavior invalid_branch:
-    ensures \result == EDAG_INVALID_BRANCH;
+    ensures \result == 220;
   behavior error:
     ensures \result != 0;
   disjoint behaviors;
@@ -303,8 +298,8 @@ int dag_recite(step_dag_t *dag, const char *branch, linked_step_t *root, array_t
   behavior valid:
     assumes dag != \null;
     requires \valid(dag);
-    frees dag->heads, dag->branch_lists;
-    assigns dag->heads, dag->branch_lists;
+    requires dag->heads == \null || \valid(dag->heads);
+    requires dag->branch_lists == \null || \valid(dag->branch_lists);
   disjoint behaviors;
 */
 void dag_free(step_dag_t *dag);

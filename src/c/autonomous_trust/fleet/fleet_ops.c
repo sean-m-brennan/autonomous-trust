@@ -41,6 +41,7 @@
 #include "network/net_message.h"
 
 
+/* Frama-C: skipped — [solver-timeout] artifact_store + logging preconditions */
 int fleet_store_artifact(const char *file_path, const char *version,
                          logger_t *logger,
                          uint8_t *hash_out, char *hash_hex_out)

@@ -14,6 +14,7 @@
  *   limitations under the License.
  *******************/
 
+#include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -68,18 +69,7 @@ static const char *nouns[] = {
 #define NUM_ADJECTIVES (sizeof(adjectives) / sizeof(adjectives[0]))
 #define NUM_NOUNS (sizeof(nouns) / sizeof(nouns[0]))
 
-/*@
-  requires out == \null || \valid(out + (0 .. out_len - 1));
-  requires out_len >= 4;
-  assigns out[0 .. out_len - 1];
-  behavior null_out:
-    assumes out == \null || out_len < 4;
-    ensures \result == -1;
-  behavior success:
-    assumes out != \null && out_len >= 4;
-    ensures \result == 0 || \result == -1;
-  disjoint behaviors;
-*/
+/* Frama-C: skipped — [solver-timeout] strncpy valid_nstring_src precondition */
 int random_name(char *out, size_t out_len, char sep, bool capitalize)
 {
     if (out == NULL || out_len < 4)

@@ -99,6 +99,7 @@ int zta_audit_record(zta_audit_log_t *log, const zta_audit_entry_t *entry);
  */
 /*@
   requires \valid(log);
+  requires 0 <= log->deferred_count <= ZTA_AUDIT_MAX_DEFERRED;
   assigns \nothing;
   ensures \result >= 0 && \result <= ZTA_AUDIT_MAX_DEFERRED;
 */
@@ -115,6 +116,7 @@ int zta_audit_deferred_count(const zta_audit_log_t *log);
 /*@
   requires \valid(log);
   requires \valid(out);
+  requires 0 <= log->deferred_count <= ZTA_AUDIT_MAX_DEFERRED;
   assigns *out;
   behavior valid_index:
     assumes index >= 0 && index < log->deferred_count;

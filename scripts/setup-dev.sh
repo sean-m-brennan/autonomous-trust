@@ -190,6 +190,84 @@ EOF
     info "Rust conda hooks configured"
 }
 
+# Download a pre-built SMT solver binary from a GitHub release.
+#   $1 - repo (owner/name)      e.g. "Z3Prover/z3"
+#   $2 - release tag            e.g. "z3-4.13.4"
+#   $3 - binary name            e.g. "z3"
+#   $4 - destination directory  e.g. "/path/to/env/bin"
+install_smt_from_github() {
+    local repo="$1" tag="$2" binary="$3" dest="$4"
+
+    if [ -x "$dest/$binary" ]; then
+        info "$binary already installed: $("$dest/$binary" --version 2>&1 | head -1)"
+        return 0
+    fi
+
+    # Query the GitHub Releases API for the asset matching this platform
+    local api_url="https://api.github.com/repos/${repo}/releases/tags/${tag}"
+    local asset_url
+    asset_url=$(curl -fsSL "$api_url" | python3 -c "
+import json, platform, sys
+release = json.load(sys.stdin)
+machine, system = platform.machine(), platform.system()
+arch_tags = {
+    ('Linux',  'x86_64'):  ['x64', 'x86_64', 'amd64'],
+    ('Linux',  'aarch64'): ['arm64', 'aarch64'],
+    ('Darwin', 'x86_64'):  ['x64', 'x86_64'],
+    ('Darwin', 'arm64'):   ['arm64', 'aarch64'],
+}
+os_tags = {'Linux': ['linux', 'glibc'], 'Darwin': ['osx', 'macos', 'darwin']}
+arch_keys = arch_tags.get((system, machine), [])
+os_keys = os_tags.get(system, [])
+candidates = []
+for asset in release.get('assets', []):
+    name = asset['name'].lower()
+    if name.endswith(('.sha256', '.sig', '.asc', '.txt')):
+        continue
+    if not (any(k in name for k in os_keys) and any(k in name for k in arch_keys)):
+        continue
+    if not (name.endswith('.zip') or 'static' in name):
+        continue
+    # Rank: prefer static over shared, non-GPL over GPL
+    rank = ('static' in name) * 2 + ('gpl' not in name)
+    candidates.append((rank, asset['browser_download_url']))
+if candidates:
+    candidates.sort(reverse=True)
+    print(candidates[0][1])
+" 2>/dev/null) || true
+
+    if [ -z "$asset_url" ]; then
+        warn "Could not find $binary release asset for $PLATFORM-$ARCH"
+        warn "Install manually from: https://github.com/${repo}/releases/tag/${tag}"
+        return 0
+    fi
+
+    info "Downloading $binary from GitHub ($tag) ..."
+    local dl_tmp
+    dl_tmp=$(mktemp -d)
+    curl -fsSL -L "$asset_url" -o "$dl_tmp/artifact"
+
+    # Determine whether this is a zip archive or a standalone binary
+    if file -b "$dl_tmp/artifact" | grep -qi zip; then
+        unzip -q "$dl_tmp/artifact" -d "$dl_tmp/unpacked"
+        local found
+        found=$(find "$dl_tmp/unpacked" -name "$binary" -type f | head -1)
+        if [ -n "$found" ]; then
+            install -m 755 "$found" "$dest/$binary"
+        else
+            warn "$binary binary not found inside downloaded archive"
+            rm -rf "$dl_tmp"
+            return 0
+        fi
+    else
+        # Standalone static binary
+        install -m 755 "$dl_tmp/artifact" "$dest/$binary"
+    fi
+
+    rm -rf "$dl_tmp"
+    info "$binary installed to $dest/$binary"
+}
+
 # Frama-C (installed into the conda env)
 install_frama_c() {
     activate_conda
@@ -214,29 +292,45 @@ for p in info['envs']:
     opam init -n --root="$OPAMROOT" --compiler=4.14.1  # may take a while
     eval $(opam env --root="$OPAMROOT" --switch=4.14.1)
 
-    # Frama-C lists lablgtk3 as a hard dependency on Linux, but the build
-    # system (dune) treats the GUI as optional.  Download the source, strip
-    # the GTK dependencies from the opam metadata, then pin-install so opam
-    # never tries to build lablgtk3.
-    info "Downloading Frama-C source ..."
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    trap "rm -rf '$tmpdir'" EXIT
-    opam source frama-c --dir="$tmpdir/frama-c"
+    if command -v frama-c &>/dev/null; then
+        info "Frama-C already installed: $(frama-c -version 2>&1 | head -1)"
+    else
+        # Frama-C lists lablgtk3 as a hard dependency on Linux, but the build
+        # system (dune) treats the GUI as optional.  Download the source, strip
+        # the GTK dependencies from the opam metadata, then pin-install so opam
+        # never tries to build lablgtk3.
+        info "Downloading Frama-C source ..."
+        local tmpdir
+        tmpdir=$(mktemp -d)
+        trap "rm -rf '$tmpdir'" EXIT
+        opam source frama-c --dir="$tmpdir/frama-c"
 
-    info "Patching Frama-C opam file to remove GUI (lablgtk3) dependencies ..."
-    local opam_file="$tmpdir/frama-c/opam"
-    if [ ! -f "$opam_file" ]; then
-        opam_file="$tmpdir/frama-c/frama-c.opam"
+        info "Patching Frama-C opam file to remove GUI (lablgtk3) dependencies ..."
+        local opam_file="$tmpdir/frama-c/opam"
+        if [ ! -f "$opam_file" ]; then
+            opam_file="$tmpdir/frama-c/frama-c.opam"
+        fi
+        sed -i '/"lablgtk3/d'          "$opam_file"
+        sed -i '/"conf-gtksourceview3/d' "$opam_file"
+
+        info "Installing Frama-C (CLI only, no GUI) — this may take a while ..."
+        opam pin add frama-c "$tmpdir/frama-c" -y --assume-depexts
     fi
-    sed -i '/"lablgtk3/d'          "$opam_file"
-    sed -i '/"conf-gtksourceview3/d' "$opam_file"
 
-    info "Installing Frama-C (CLI only, no GUI) — this may take a while ..."
-    opam pin add frama-c "$tmpdir/frama-c" -y --assume-depexts
+    if command -v alt-ergo &>/dev/null; then
+        info "Alt-Ergo already installed: $(alt-ergo --version 2>&1 | head -1)"
+    else
+        info "Installing Alt-Ergo SMT solver ..."
+        opam install -y alt-ergo
+    fi
 
-    info "Installing Alt-Ergo SMT solver ..."
-    opam install -y alt-ergo
+    info "Installing Z3 SMT solver ..."
+    install_smt_from_github "Z3Prover/z3" "z3-4.13.4" "z3" "$env_prefix/bin"
+
+    info "Installing CVC5 SMT solver ..."
+    install_smt_from_github "cvc5/cvc5" "cvc5-1.2.0" "cvc5" "$env_prefix/bin"
+
+    why3 config detect
 
     # Conda activate/deactivate hooks so OPAMROOT and opam PATH are set
     local activate_dir="$env_prefix/etc/conda/activate.d"

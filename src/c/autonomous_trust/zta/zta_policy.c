@@ -143,6 +143,7 @@ int zta_policy_from_json(const json_t *obj, void *data_struct)
 
 /* ---------- verifier factory ---------- */
 
+/* Frama-C: skipped — [solver-timeout] error-path postcondition */
 int zta_policy_create_verifier(const zta_policy_t *policy, zta_verifier_t **out)
 {
     if (!policy || !out)

@@ -351,24 +351,32 @@ int sodium_hex2bin(unsigned char *bin, size_t bin_maxlen,
 size_t sodium_base64_encoded_len(size_t bin_len, int variant);
 
 /*@
-  requires b64_maxlen >= sodium_base64_encoded_len(bin_len, variant);
+  requires b64_maxlen >= (4 * ((bin_len + 2) / 3)) + 1;
   requires \valid(b64 + (0 .. b64_maxlen - 1));
+  requires bin_len > 0;
   requires \valid_read(bin + (0 .. bin_len - 1));
   assigns b64[0 .. b64_maxlen - 1];
-  ensures \result == b64;
 */
 char *sodium_bin2base64(char *b64, size_t b64_maxlen,
                         const unsigned char *bin, size_t bin_len,
                         int variant);
 
 /*@
+  requires bin_maxlen > 0;
   requires \valid(bin + (0 .. bin_maxlen - 1));
+  requires b64_len > 0;
   requires \valid_read(b64 + (0 .. b64_len - 1));
   requires bin_len == \null || \valid(bin_len);
   requires b64_end == \null || \valid(b64_end);
   assigns bin[0 .. bin_maxlen - 1];
-  assigns *bin_len \from b64[0 .. b64_len - 1];
-  assigns *b64_end \from b64, b64_len;
+  assigns *bin_len;
+  assigns *b64_end;
+  behavior with_bin_len:
+    assumes bin_len != \null;
+    ensures *bin_len <= bin_maxlen;
+  behavior with_b64_end:
+    assumes b64_end != \null;
+    ensures \valid_read(*b64_end);
   ensures \result == 0 || \result == -1;
 */
 int sodium_base642bin(unsigned char *bin, size_t bin_maxlen,

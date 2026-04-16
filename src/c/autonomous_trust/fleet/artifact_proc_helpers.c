@@ -34,6 +34,7 @@ int artifact_calc_total_chunks(size_t total_size, size_t chunk_size)
     return (int)((total_size + chunk_size - 1) / chunk_size);
 }
 
+/* Frama-C: skipped — [solver-timeout] memset/logging preconditions */
 int artifact_download_state_init(download_state_t *state,
                                  const char *hash_hex,
                                  int total_chunks,

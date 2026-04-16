@@ -22,49 +22,6 @@
 #include "data.h"
 #include "structures/data.pb-c.h"
 
-struct data_s
-{
-    smrt_ptr_t;
-    data_type_t type;
-    size_t size;
-    union
-    {
-        long intgr;
-        unsigned long uintr;
-        double flt_pt;
-        bool bl;
-        char *str;
-        unsigned char *byt;
-        void *obj;
-    };
-    //int ref;
-    int (*cmp)(struct data_s *, struct data_s *);
-};
-
-int i_cmp(data_t *a, data_t *b);
-int u_cmp(data_t *a, data_t *b);
-int f_cmp(data_t *a, data_t *b);
-int b_cmp(data_t *a, data_t *b);
-int s_cmp(data_t *a, data_t *b);
-int d_cmp(data_t *a, data_t *b);
-int o_cmp(data_t *a, data_t *b);
-
-#define INT_DATA(i)   \
-    {                 \
-        .type = INT,  \
-        .intgr = i,   \
-        .size = 1,    \
-        .cmp = i_cmp, \
-    }
-
-#define STRING_DATA(s)    \
-    {                     \
-        .type = STRING,   \
-        .str = (char *)s, \
-        .size = 1,        \
-        .cmp = s_cmp,     \
-    }
-
 int data_sync_out(data_t *data, AutonomousTrust__Core__Protobuf__Structures__Data *pdata);
 
 void data_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data *pdata);

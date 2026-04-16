@@ -59,12 +59,12 @@ const char *rootDir()
 
 int get_cfg_dir(char path[])
 {
-    return snprintf(path, 255, "%s/%s", rootDir(), CFG_PATH);
+    return path_join(path, 255, rootDir(), CFG_PATH);
 }
 
 int get_data_dir(char path[])
 {
-    return snprintf(path, 255, "%s/%s", rootDir(), DATA_PATH);
+    return path_join(path, 255, rootDir(), DATA_PATH);
 }
 
 /*@
@@ -140,7 +140,7 @@ int config_absolute_path(const char *path_in, char *path_out)
         return -1;
     if (strncmp(path_in, cfg_dir, strlen(cfg_dir)) != 0)
     {
-        int remain = snprintf(path_out, 255, "%s/%s", cfg_dir, path_in);
+        int remain = path_join(path_out, 255, cfg_dir, path_in);
         if (remain < 0)
             return EXCEPTION(EINVAL);
     }

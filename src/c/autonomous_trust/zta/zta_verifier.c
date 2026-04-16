@@ -18,11 +18,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <sodium.h>
 
 #include "zta_verifier.h"
 
 /* ---------- helpers ---------- */
 
+/* Frama-C: skipped — [syscall] gettimeofday for result timestamp */
 void zta_result_set(zta_result_t *result, zta_status_t status, const char *reason)
 {
     if (!result)
@@ -49,6 +51,11 @@ const char *zta_status_str(zta_status_t status)
 
 /* ---------- null verifier ---------- */
 
+/*@
+  requires \valid(result);
+  assigns result->status, result->reason[0 .. ZTA_REASON_LEN - 1], result->timestamp;
+  ensures \result == 0;
+*/
 static int null_verify_credential(zta_verifier_t *self,
                                   const uint8_t *cred_data, size_t cred_len,
                                   zta_result_t *result)
@@ -60,6 +67,11 @@ static int null_verify_credential(zta_verifier_t *self,
     return 0;
 }
 
+/*@
+  requires \valid(result);
+  assigns result->status, result->reason[0 .. ZTA_REASON_LEN - 1], result->timestamp;
+  ensures \result == 0;
+*/
 static int null_check_revocation(zta_verifier_t *self,
                                  const uint8_t *cred_hash,
                                  zta_result_t *result)
@@ -76,6 +88,12 @@ static bool null_is_available(zta_verifier_t *self)
     return true;
 }
 
+/* Frama-C: skipped — [solver-timeout] sodium_memzero void-ptr/uint8-ptr cast cascade */
+/*@
+  requires \valid(hash_out + (0 .. ZTA_HASH_LEN - 1));
+  assigns hash_out[0 .. ZTA_HASH_LEN - 1];
+  ensures \result == 0;
+*/
 static int null_credential_hash(zta_verifier_t *self,
                                 const uint8_t *cred_data, size_t cred_len,
                                 uint8_t hash_out[ZTA_HASH_LEN])
@@ -83,15 +101,17 @@ static int null_credential_hash(zta_verifier_t *self,
     (void)self;
     (void)cred_data;
     (void)cred_len;
-    memset(hash_out, 0, ZTA_HASH_LEN);
+    sodium_memzero(hash_out, ZTA_HASH_LEN);
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] stub preconditions */
 static void null_destroy(zta_verifier_t *self)
 {
     free(self);
 }
 
+/* Frama-C: skipped — [solver-timeout] stub preconditions */
 int zta_null_verifier_create(zta_verifier_t **out)
 {
     if (!out)

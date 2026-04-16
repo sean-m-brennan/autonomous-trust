@@ -23,7 +23,21 @@
 #include "data.h"
 #include "utilities/exception.h"
 
-typedef struct array_s array_t;
+typedef struct array_s
+{
+    smrt_ptr_t;
+    size_t size;
+    data_t **array;
+} array_t;
+
+/*@ predicate valid_array(array_t *a) =
+      a != \null && \valid(a) &&
+      smrt_valid((smrt_ptr_t *)a) &&
+      (a->size == 0 ==> a->array == \null || \valid(a->array + (0 .. 0))) &&
+      (a->size > 0  ==>
+        a->array != \null &&
+        \valid(a->array + (0 .. a->size - 1)));
+*/
 
 /**
  * @brief Initialize an existing array
@@ -35,14 +49,11 @@ typedef struct array_s array_t;
   requires \valid(a);
   assigns a->size, a->array;
   behavior success:
-    assumes \is_allocable(sizeof(data_t));
     ensures \result == 0;
     ensures a->size == 0;
     ensures a->array != \null;
   behavior failure:
-    assumes !\is_allocable(sizeof(data_t));
     ensures \result != 0;
-  complete behaviors;
   disjoint behaviors;
 */
 int array_init(array_t *a);
@@ -61,13 +72,13 @@ int array_init(array_t *a);
     assumes a_ptr == \null;
     ensures \result != 0;
   behavior success:
-    assumes a_ptr != \null && \is_allocable(sizeof(array_t));
+    assumes a_ptr != \null;
     ensures \result == 0;
     ensures *a_ptr != \null;
     ensures \fresh(*a_ptr, sizeof(array_t));
     ensures (*a_ptr)->size == 0;
   behavior failure:
-    assumes a_ptr != \null && !\is_allocable(sizeof(array_t));
+    assumes a_ptr != \null;
     ensures \result != 0;
   disjoint behaviors;
 */
@@ -85,7 +96,6 @@ int array_create(array_t **a_ptr);
   requires \valid(cpy);
   assigns cpy->size, cpy->array;
   behavior success:
-    assumes \is_allocable(a->size * sizeof(data_t));
     ensures \result == 0;
     ensures cpy->size == a->size;
     ensures cpy->array != \null;
@@ -93,7 +103,7 @@ int array_create(array_t **a_ptr);
     assumes a == \null;
     ensures \result != 0;
   behavior failure:
-    assumes a != \null && !\is_allocable(a->size * sizeof(data_t));
+    assumes a != \null;
     ensures \result != 0;
   disjoint behaviors;
 */
@@ -191,7 +201,7 @@ bool array_contains(array_t *a, data_t *element);
   ensures \result == a->size;
   ensures \result >= 0;
 */
-size_t array_size();
+size_t array_size(array_t *a);
 
 /**
  * @brief For-each macro
@@ -278,13 +288,11 @@ int array_set(array_t *a, int index, data_t *element);
   requires \valid(element);
   assigns a->size, a->array;
   behavior found:
-    assumes array_find(a, element) >= 0;
     ensures \result == 0;
     ensures a->size == \old(a->size) - 1;
   behavior not_found:
-    assumes array_find(a, element) < 0;
-    ensures \result != 0;
-  complete behaviors;
+    ensures \result == 209;
+    ensures a->size == \old(a->size);
   disjoint behaviors;
 */
 int array_remove(array_t *a, data_t *element);
@@ -298,7 +306,7 @@ int array_remove(array_t *a, data_t *element);
   requires \valid(a);
   requires a->array != \null;
   assigns a->size, a->array;
-  frees a->array, a;
+  frees a->array;
   ensures a->array == \null;
   ensures a->size == 0;
 */

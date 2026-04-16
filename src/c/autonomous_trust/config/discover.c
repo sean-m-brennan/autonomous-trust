@@ -19,6 +19,7 @@
 
 #include "discover.h"
 
+/* Frama-C: skipped — [syscall] basename(3) + string manipulation */
 int get_cfg_type(const char *path, char *type_out, size_t type_len)
 {
     if (path == NULL || type_out == NULL || type_len == 0)

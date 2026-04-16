@@ -46,14 +46,7 @@
     (\exists size_t i; 0 <= i < max && s[i] == '\0');
 
   // ----------------------------------------------------------------
-  // Valid dynamic array (array_t, opaque in public API).
-  //
-  // Private layout (from array_priv.h):
-  //   struct array_s {
-  //       smrt_ptr_t;   // anonymous: bool alloc; size_t refs;
-  //       size_t size;
-  //       data_t **array;
-  //   };
+  // Valid dynamic array (array_t, defined in array.h).
   // ----------------------------------------------------------------
 
   predicate valid_array{L}(array_t *a) =
@@ -67,17 +60,7 @@
       \valid(a->array + (0 .. a->size - 1)));
 
   // ----------------------------------------------------------------
-  // Valid data_t (opaque in public API).
-  //
-  // Private layout (from data_priv.h):
-  //   struct data_s {
-  //       smrt_ptr_t;        // bool alloc; size_t refs;
-  //       data_type_t type;  // enum 0..7
-  //       size_t size;
-  //       union { long intgr; unsigned long uintr; double flt_pt;
-  //               bool bl; char *str; unsigned char *byt; void *obj; };
-  //       int (*cmp)(struct data_s *, struct data_s *);
-  //   };
+  // Valid data_t (defined in data.h).
   // ----------------------------------------------------------------
 
   predicate valid_data_type{L}(data_type_t t) =
@@ -91,17 +74,7 @@
     valid_data_type(d->type);
 
   // ----------------------------------------------------------------
-  // Valid map (map_t, opaque in public API).
-  //
-  // Private layout (from map_priv.h):
-  //   struct map_s {
-  //       smrt_ptr_t;
-  //       map_item_t *items;
-  //       size_t length;
-  //       size_t capacity;
-  //       array_t keys;
-  //       unsigned char hashkey[crypto_shorthash_KEYBYTES];
-  //   };
+  // Valid map (map_t, defined in map.h).
   // ----------------------------------------------------------------
 
   predicate valid_map{L}(map_t *m) =
@@ -114,14 +87,7 @@
       \valid(m->items + (0 .. m->capacity - 1)));
 
   // ----------------------------------------------------------------
-  // Valid map_item_t.
-  //
-  //   typedef struct {
-  //       smrt_ptr_t;
-  //       map_key_t key;   // char *
-  //       data_t *value;
-  //       size_t hash;
-  //   } map_item_t;
+  // Valid map_item_t (defined in map.h).
   // ----------------------------------------------------------------
 
   predicate valid_map_item{L}(map_item_t *mi) =
@@ -133,16 +99,7 @@
     valid_data(mi->value);
 
   // ----------------------------------------------------------------
-  // Valid linked_step_t (DAG step).
-  //
-  // Layout (from dag.h):
-  //   struct linked_step_s {
-  //       char uuid[DAG_UUID_LEN];    // DAG_UUID_LEN == 37
-  //       datetime_t timestamp;
-  //       void *payload;
-  //       linked_step_t *parent;
-  //       int length;
-  //   };
+  // Valid linked_step_t (defined in dag.h).
   // ----------------------------------------------------------------
 
   predicate valid_step{L}(linked_step_t *s) =
@@ -151,13 +108,7 @@
     s->uuid[36] == '\0';
 
   // ----------------------------------------------------------------
-  // Valid step_dag_t.
-  //
-  // Layout (from dag.h):
-  //   typedef struct {
-  //       map_t *heads;
-  //       map_t *branch_lists;
-  //   } step_dag_t;
+  // Valid step_dag_t (defined in dag.h).
   // ----------------------------------------------------------------
 
   predicate valid_dag{L}(step_dag_t *d) =
@@ -166,18 +117,7 @@
     d->branch_lists != \null && \valid(d->branch_lists);
 
   // ----------------------------------------------------------------
-  // Valid merkle_tree_t.
-  //
-  // Layout (from merkle.h):
-  //   typedef struct {
-  //       merkle_node_t *nodes;
-  //       int node_count;
-  //       int node_capacity;
-  //       int root;
-  //       array_t *blobs;
-  //       uint8_t root_digest[MERKLE_DIGEST_LEN];
-  //       bool has_root_digest;
-  //   } merkle_tree_t;
+  // Valid merkle_tree_t (defined in merkle.h).
   // ----------------------------------------------------------------
 
   predicate valid_merkle_tree{L}(merkle_tree_t *t) =
@@ -192,16 +132,7 @@
     (t->node_count > 0  ==> t->root >= 0 && t->root < t->node_count);
 
   // ----------------------------------------------------------------
-  // Valid merkle_blob_t.
-  //
-  // Layout (from merkle.h):
-  //   struct merkle_blob_s {
-  //       char uuid[MERKLE_UUID_LEN];     // 37
-  //       char originator[MERKLE_UUID_LEN];
-  //       blob_designation_fn designation;
-  //       blob_get_hash_fn get_hash;
-  //       void *user_data;
-  //   };
+  // Valid merkle_blob_t (defined in merkle.h).
   // ----------------------------------------------------------------
 
   predicate valid_merkle_blob{L}(merkle_blob_t *b) =
@@ -209,15 +140,7 @@
     b->uuid[36] == '\0';
 
   // ----------------------------------------------------------------
-  // Valid datetime_t.
-  //
-  // Layout (from datetime.h):
-  //   typedef struct {
-  //       struct tm;            // anonymous
-  //       unsigned long tm_nsec;
-  //       float tm_tz_offset;
-  //       bool tm_utc;
-  //   } datetime_t;
+  // Valid datetime_t (defined in datetime.h).
   // ----------------------------------------------------------------
 
   predicate valid_datetime{L}(datetime_t *dt) =
@@ -230,14 +153,7 @@
     dt->tm_tz_offset >= -14.0 && dt->tm_tz_offset <= 14.0;
 
   // ----------------------------------------------------------------
-  // Valid timedelta_t.
-  //
-  // Layout (from datetime.h):
-  //   typedef struct {
-  //       long days;
-  //       unsigned int seconds;
-  //       unsigned int nsecs;
-  //   } timedelta_t;
+  // Valid timedelta_t (defined in datetime.h).
   // ----------------------------------------------------------------
 
   predicate valid_timedelta{L}(timedelta_t *td) =
@@ -246,14 +162,7 @@
     td->nsecs < 1000000000;
 
   // ----------------------------------------------------------------
-  // Valid red-black tree (tree_t / rbTree_s, opaque in public API).
-  //
-  // Private layout (from redblack_priv.h):
-  //   struct rbTree_s {
-  //       smrt_ptr_t;       // bool alloc; size_t refs;
-  //       struct rbNode *root;
-  //       int size;
-  //   };
+  // Valid red-black tree (tree_t, defined in redblack.h).
   // ----------------------------------------------------------------
 
   predicate valid_tree{L}(tree_t *t) =
@@ -264,14 +173,7 @@
     (t->size > 0  ==> t->root != \null && t->root->red == \false);
 
   // ----------------------------------------------------------------
-  // Valid exception_t.
-  //
-  // Layout (from exception.h):
-  //   typedef struct {
-  //       int errnum;
-  //       size_t line;
-  //       char file[MAX_FILENAME + 1];
-  //   } exception_t;
+  // Valid exception_t (defined in exception.h).
   // ----------------------------------------------------------------
 
   predicate valid_exception{L}(exception_t *e) =
@@ -279,13 +181,7 @@
     \valid(e->file + (0 .. MAX_FILENAME));
 
   // ----------------------------------------------------------------
-  // Valid queue_t.
-  //
-  // Layout (from message.h):
-  //   typedef struct {
-  //       int fd;
-  //       char key[MSG_KEY_LEN+1];
-  //   } queue_t;
+  // Valid queue_t (defined in message.h).
   // ----------------------------------------------------------------
 
   predicate valid_queue{L}(queue_t *q) =
@@ -294,17 +190,7 @@
     \valid(q->key + (0 .. MSG_KEY_LEN));
 
   // ----------------------------------------------------------------
-  // Valid logger_t.
-  //
-  // Layout (from logger.h):
-  //   typedef struct {
-  //       log_level_t max_level;
-  //       char file_name[MAX_FILENAME+1];
-  //       FILE *file;
-  //       bool term;
-  //       bool local_time;
-  //       time_resolution_t resolution;
-  //   } logger_t;
+  // Valid logger_t (defined in logger.h).
   // ----------------------------------------------------------------
 
   predicate valid_logger{L}(logger_t *lg) =

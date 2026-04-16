@@ -54,6 +54,22 @@ char *strremove(char *str, const char *sub);
 
 int makedirs(char *path, mode_t mode);
 
+/**
+ * @brief Join a directory and suffix with '/'.  Returns total length
+ *        written (excluding NUL) on success, -1 on overflow.
+ *        On overflow dest[0] is set to '\0'.
+ */
+/*@
+  requires destlen > 0;
+  requires \valid(dest + (0 .. destlen - 1));
+  requires dir != \null;
+  requires suffix != \null;
+  assigns dest[0 .. destlen - 1];
+  ensures \result >= -1;
+*/
+int path_join(char *dest, size_t destlen,
+                 const char *dir, const char *suffix);
+
 int compare_float_precision(float f1, float f2, float epsilon);
 
 #define compare_float(f1, f2) \

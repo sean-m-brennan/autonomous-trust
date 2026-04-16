@@ -22,8 +22,8 @@
 #include <uuid/uuid.h>
 #include <jansson.h>
 
-#include "structures/map_priv.h"
-#include "structures/array_priv.h"
+#include "structures/map.h"
+#include "structures/array.h"
 #include "identity/identity.h"
 #include "utilities/exception.h"
 #include "autonomous_trust/algorithms/paxos.h"
@@ -242,6 +242,7 @@ bool reputations_contains(const reputations_t *reps, const uuid_t peer_uuid);
 
 /*@
   requires \valid(reps);
+  requires reps->scores.length <= reps->scores.capacity;
   assigns reps->scores;
 */
 void reputations_free(reputations_t *reps);

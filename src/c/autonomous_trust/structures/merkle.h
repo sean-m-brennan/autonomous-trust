@@ -127,7 +127,7 @@ int merkle_hash(const uint8_t *data, size_t data_len, uint8_t *hash_out);
     assumes tree == \null;
     ensures \result != 0;
   behavior success:
-    assumes tree != \null && \is_allocable(sizeof(merkle_tree_t));
+    assumes tree != \null;
     ensures \result == 0;
     ensures *tree != \null;
     ensures \fresh(*tree, sizeof(merkle_tree_t));
@@ -137,7 +137,7 @@ int merkle_hash(const uint8_t *data, size_t data_len, uint8_t *hash_out);
     ensures (*tree)->blobs != \null;
     ensures (*tree)->nodes != \null;
   behavior failure:
-    assumes tree != \null && !\is_allocable(sizeof(merkle_tree_t));
+    assumes tree != \null;
     ensures \result != 0;
   disjoint behaviors;
 */
@@ -175,7 +175,7 @@ int merkle_insert(merkle_tree_t *tree, merkle_blob_t *blob);
   behavior success:
     ensures \result == 0;
   behavior not_found:
-    ensures \result == EMRKL_NOTFOUND;
+    ensures \result == 222;
   disjoint behaviors;
 */
 int merkle_delete(merkle_tree_t *tree, merkle_blob_t *blob);
@@ -208,7 +208,7 @@ int merkle_merge(merkle_tree_t *tree, merkle_tree_t *other);
               digest_out[i] == tree->root_digest[i];
   behavior no_root:
     assumes tree->has_root_digest == false;
-    ensures \result == EMRKL_NOTFOUND;
+    ensures \result == 222;
   disjoint behaviors;
   complete behaviors;
 */
@@ -229,9 +229,9 @@ int merkle_root_digest(merkle_tree_t *tree, uint8_t *digest_out);
     ensures *proof_len >= 0;
     ensures *proof_len > 0 ==> *proof_out != \null;
   behavior not_found:
-    ensures \result == EMRKL_NOTFOUND;
+    ensures \result == 222;
   behavior error:
-    ensures \result != 0 && \result != EMRKL_NOTFOUND;
+    ensures \result != 0 && \result != 222;
   disjoint behaviors;
 */
 int merkle_inclusion_proof(merkle_tree_t *tree, merkle_blob_t *blob,
