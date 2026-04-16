@@ -19,9 +19,9 @@
 
 #include "processes/processes.h"
 #include "negotiation/negotiation.h"
-#include "structures/map_priv.h"
-#include "structures/data_priv.h"
-#include "structures/array_priv.h"
+#include "structures/map.h"
+#include "structures/data.h"
+#include "structures/array.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
@@ -64,6 +64,7 @@ static void _ensure_init(void)
  * Helper: build a reply net_msg_t directed back to sender
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] JSON + logging preconditions */
 static void _build_reply(const net_msg_t *nmsg, const char *func, generic_msg_t *reply)
 {
     memset(reply, 0, sizeof(*reply));
@@ -91,6 +92,7 @@ static json_t *_task_uuid_json(const char *task_uuid_str)
  * Helper: serialize task_t fields into a JSON object
  ****************************/
 
+/* Frama-C: skipped — [serialization] jansson JSON serialization */
 static json_t *_task_to_json(const task_t *task)
 {
     char task_uuid_str[UUID_STRING_LEN + 1] = {0};
@@ -126,6 +128,7 @@ static json_t *_task_to_json(const task_t *task)
  * Helper: populate a task_t from a JSON object (partial – fills uuid, cap name, flexible, timeout)
  ****************************/
 
+/* Frama-C: skipped — [serialization] jansson JSON deserialization */
 static int _task_from_json(const json_t *j, task_t *task)
 {
     if (!j || !task)
@@ -183,6 +186,7 @@ static int _task_from_json(const json_t *j, task_t *task)
  * Returns true if peer_capabilities is NULL (fallback: assume capable).
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] capability iteration preconditions */
 static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_str,
                                   const char *cap_name)
 {
@@ -217,6 +221,12 @@ static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_st
  * Deserialize task JSON, create tracker, filter peers by capability, send invitations.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_start_task(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -312,6 +322,12 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
  * Check capability, flood counter, accept/refuse/haggle.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_invite(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -473,6 +489,12 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
  * If task is flexible, re-announce with adjusted params; otherwise refuse.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_haggle(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -538,6 +560,12 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
  * Extract task UUID, decrement expected count in tracker; log failure if insufficient.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_refuse(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -598,6 +626,12 @@ static bool handle_refuse(const process_t *proc, directory_t *queues, generic_ms
  * Extract task_uuid from payload; track count of confirmed peers per task.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_accept(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -647,6 +681,12 @@ static bool handle_accept(const process_t *proc, directory_t *queues, generic_ms
  * Look up task in task_stack, reply with current status.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -706,6 +746,12 @@ static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_
  * Update tracking: extend timeout if active; log cancellation if dead.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -800,6 +846,12 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
  * Collect result, forward to main process when all results arrive.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_results(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;

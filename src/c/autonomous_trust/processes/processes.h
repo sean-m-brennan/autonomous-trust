@@ -17,6 +17,8 @@
 #ifndef PROCESSES_H
 #define PROCESSES_H
 
+#include <sys/time.h>
+
 #include "utilities/message.h"
 #include "config/configuration.h"
 #include "identity/identity_priv.h"

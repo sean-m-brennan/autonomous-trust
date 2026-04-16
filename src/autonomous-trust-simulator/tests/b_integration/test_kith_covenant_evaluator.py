@@ -13,17 +13,17 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Tests for PoliteEvaluator fitness scoring."""
+"""Tests for KithCovenantEvaluator fitness scoring."""
 
 import pytest
 
 try:
-    from polite.policy import null_policy, strict_policy
-    from polite.interface import EvaluatorResult
+    from kith_covenant.policy import null_policy, strict_policy
+    from kith_covenant.interface import EvaluatorResult
 except ImportError:
-    pytest.skip("polite package not on PYTHONPATH", allow_module_level=True)
+    pytest.skip("kith_covenant package not on PYTHONPATH", allow_module_level=True)
 
-from autonomous_trust.evaluation.polite.evaluator import compute_fitness
+from autonomous_trust.evaluation.kith_covenant.evaluator import compute_fitness
 
 
 class TestFitnessFunction:

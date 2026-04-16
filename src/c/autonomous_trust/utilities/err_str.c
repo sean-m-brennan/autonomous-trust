@@ -191,6 +191,7 @@ const char *gai_ext_strlist[] = {
   ensures \result != \null;
   ensures \valid_read(\result);
 */
+/* Frama-C: skipped — [large-branch] static error string lookup over ~50 entries */
 const char *_get_err_str(int err)
 {
     if (err < 0)

@@ -69,6 +69,15 @@ typedef struct
 #endif
 } public_identity_t;
 
+#ifdef __FRAMAC__
+#include "algorithms/algorithms.h"
+struct identity_s
+{
+    public_identity_t;
+    int rank;
+    block_impl_t block;
+};
+#endif
 
 #define DEFAULT_MAX_PEERS 128  /* approx Dunbar number; compile-time array bound */
 #define MAX_PEERS (peers_max_count())  /* runtime-configurable limit (<= DEFAULT_MAX_PEERS) */

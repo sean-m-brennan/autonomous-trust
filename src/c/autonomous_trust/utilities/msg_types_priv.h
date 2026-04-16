@@ -18,9 +18,9 @@
 
 #include <jansson.h>
 
-#include "structures/map_priv.h"
-#include "structures/data_priv.h"
-#include "structures/array_priv.h"
+#include "structures/map.h"
+#include "structures/data.h"
+#include "structures/array.h"
 
 #include "utilities/msg_types.h"
 
