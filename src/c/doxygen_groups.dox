@@ -1,0 +1,96 @@
+/**
+ * @defgroup public_api Public API
+ * @brief Functions and types for embedding AutonomousTrust in an application.
+ *
+ * These are the only symbols an embedding application should call. They live
+ * in `autonomous_trust.h` and the headers it directly includes. All other
+ * headers under `src/c/autonomous_trust/` are internal and their ABI is not
+ * stable across releases.
+ *
+ * Typical use:
+ * @code
+ *   at_node_config_t cfg = { .app_name = "my_app", .log_level = INFO };
+ *   at_node_t node = {0};
+ *   at_node_init(&node, &cfg);
+ *   at_node_start(&node);
+ *   at_node_run(&node, my_tick, my_ctx);
+ *   at_node_shutdown(&node);
+ * @endcode
+ */
+
+/**
+ * @defgroup internal Internal
+ * @brief Implementation details not part of the public API.
+ *
+ * Everything in this group is subject to change without notice. Embedding
+ * applications should not depend on these symbols directly — go through the
+ * @ref public_api instead.
+ *
+ * Sub-groups match the source-tree layout.
+ */
+
+/**
+ * @defgroup internal_utilities Utilities
+ * @ingroup internal
+ * @brief Logging, messaging, allocation, exceptions, signal handling.
+ */
+
+/**
+ * @defgroup internal_structures Data structures
+ * @ingroup internal
+ * @brief Maps, arrays, red-black trees, DAGs, Merkle trees, datetime.
+ */
+
+/**
+ * @defgroup internal_identity Identity & peers
+ * @ingroup internal
+ * @brief Identity, group keys, peer tables, history ledger.
+ */
+
+/**
+ * @defgroup internal_network Network
+ * @ingroup internal
+ * @brief CIDR/IP helpers, NTP, ping, wire-format messaging.
+ */
+
+/**
+ * @defgroup internal_zta Zero-trust architecture
+ * @ingroup internal
+ * @brief Policy, audit, X.509 and OIDC verifiers.
+ */
+
+/**
+ * @defgroup internal_fleet Fleet management
+ * @ingroup internal
+ * @brief Artifact store, config proposals, update workflow.
+ */
+
+/**
+ * @defgroup internal_negotiation Negotiation
+ * @ingroup internal
+ * @brief Task/job queues for peer negotiation.
+ */
+
+/**
+ * @defgroup internal_reputation Reputation
+ * @ingroup internal
+ * @brief Reputation scoring and transaction log.
+ */
+
+/**
+ * @defgroup internal_algorithms Algorithms
+ * @ingroup internal
+ * @brief Consensus (Paxos, stake, work) and agreement protocols.
+ */
+
+/**
+ * @defgroup internal_processes Process management
+ * @ingroup internal
+ * @brief Daemon lifecycle, capability vtables, process tracker.
+ */
+
+/**
+ * @defgroup internal_config Configuration
+ * @ingroup internal
+ * @brief Config discovery, generation, serialization.
+ */

@@ -17,6 +17,10 @@
 #ifndef ARRAY_H
 #define ARRAY_H
 
+/** @addtogroup internal_structures
+ *  @{
+ */
+
 #include <stddef.h>
 #include <stdbool.h>
 
@@ -324,5 +328,8 @@ DECLARE_ERROR(EARR_OOB, "Array index out-of-bounds (beyond the final entry)");
  */
 #define EARR_NOELT 209
 DECLARE_ERROR(EARR_NOELT, "Element not present in array");
+
+
+/** @} */ /* end of internal_structures */
 
 #endif // ARRAY_H

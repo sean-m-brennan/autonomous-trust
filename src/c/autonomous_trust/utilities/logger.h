@@ -17,6 +17,10 @@
 #ifndef LOGGER_H
 #define LOGGER_H
 
+/** @addtogroup public_api
+ *  @{
+ */
+
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -241,5 +245,8 @@ void logger_close(logger_t *logger);
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of public_api */
 
 #endif  // LOGGER_H

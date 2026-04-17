@@ -101,7 +101,27 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
     }
     else
     {
-        /* Fill the other slot */
+        /* WHY a transaction has exactly two slots, and why an overflow is
+         * silently dropped:
+         *
+         * A task in this reputation model is a bilateral interaction: one
+         * requester (p1) and one worker (p2). The two peer UUIDs scoring
+         * each other are the full universe of participants in that task.
+         * When a third score arrives for the same task_uuid it almost
+         * always indicates one of: a replayed message, a protocol bug
+         * upstream, or a hostile peer trying to inflate another peer's
+         * score by re-submitting. None of those are worth aborting the
+         * chain over — but none should be counted either.
+         *
+         * Returning EXCEPTION(...) here would bubble up through the
+         * message dispatcher and terminate the reputation process on
+         * malformed peer input, which is a DoS vector. Silently ignoring
+         * is the intentional hardening choice.
+         *
+         * If the model ever admits >2 parties per task, change the chain
+         * entry from a struct-of-slots to an array keyed by peer UUID; do
+         * NOT extend the slot count — the asymmetric p1/p2 scoring
+         * semantics (requester ≠ worker) don't generalize. */
         transaction_t *tx = &hist->chain[idx];
         if (!tx->p1_set)
         {
