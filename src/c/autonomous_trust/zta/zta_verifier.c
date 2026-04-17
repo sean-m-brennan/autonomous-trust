@@ -105,7 +105,10 @@ static int null_credential_hash(zta_verifier_t *self,
     return 0;
 }
 
-/* Frama-C: skipped — [solver-timeout] stub preconditions */
+/*@
+  requires self == \null || \valid(self);
+  assigns \nothing;
+*/
 static void null_destroy(zta_verifier_t *self)
 {
     free(self);

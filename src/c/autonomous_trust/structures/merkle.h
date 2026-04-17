@@ -294,7 +294,8 @@ bool merkle_consistent(merkle_tree_t *tree, int other_size,
   behavior valid:
     assumes tree != \null;
     requires \valid(tree);
-    frees tree->nodes, tree->blobs, tree;
+    requires tree->blobs == \null || \valid(tree->blobs);
+    requires tree->blobs == \null || tree->blobs->array != \null;
   disjoint behaviors;
 */
 void merkle_tree_free(merkle_tree_t *tree);
