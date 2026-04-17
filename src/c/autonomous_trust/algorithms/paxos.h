@@ -17,6 +17,10 @@
 #ifndef PAXOS_H
 #define PAXOS_H
 
+/** @addtogroup internal_algorithms
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -31,30 +35,52 @@
 #define PAXOS_PROTOCOL_TIMEOUT_SEC  30
 #define PAXOS_EXPIRATION_SEC       300
 
+/**
+ * @brief Outcome of a Paxos-style request handled by paxos_handle_request().
+ */
 typedef enum {
-    PAXOS_GRANT = 0,
-    PAXOS_NACK,
-    PAXOS_BACKDATE,
+    PAXOS_GRANT = 0,   /**< Request accepted; ballot ID becomes the new @c last_id. */
+    PAXOS_NACK,        /**< Request rejected; ballot ID is stale or conflicting. */
+    PAXOS_BACKDATE,    /**< Request predates the current chain position. */
 } paxos_response_t;
 
+/**
+ * @brief Per-proposal bookkeeping: score contributed by the proposer and a
+ *        count of grants received from peers.
+ */
 typedef struct {
-    double score;
-    int grant_count;
+    double score;      /**< Proposer-supplied score used for tie-breaking. */
+    int grant_count;   /**< Number of peers that have granted this proposal. */
 } paxos_proposal_t;
 
+/**
+ * @brief State for a single Paxos consensus instance.
+ *
+ * Owns three maps (proposals, acceptances, backoff) keyed by `paxos_id_index`,
+ * an array of granted ballot IDs, and a mutex serializing all state-changing
+ * operations. Must be initialized with paxos_init() before use.
+ */
 typedef struct {
-    int64_t last_id;
-    int chain_len;
-    int num_peers;
-    map_t proposals;
-    map_t acceptances;
-    map_t backoff;
-    array_t granted_ids;
-    pthread_mutex_t lock;
-    logger_t *logger;
-    bool initialized;
+    int64_t last_id;           /**< Highest ballot ID accepted so far (monotonic). */
+    int chain_len;             /**< Length of the committed decision chain. */
+    int num_peers;             /**< Cluster size; quorum is @ref PAXOS_MAJORITY. */
+    map_t proposals;           /**< id_index → @ref paxos_proposal_t. */
+    map_t acceptances;         /**< id_index → acceptance count. */
+    map_t backoff;             /**< id_index → current backoff seconds. */
+    array_t granted_ids;       /**< Ballot IDs granted in the current chain. */
+    pthread_mutex_t lock;      /**< Serializes all mutating operations. */
+    logger_t *logger;          /**< Non-owning logger sink. */
+    bool initialized;          /**< @c true between paxos_init/paxos_destroy. */
 } paxos_instance_t;
 
+/**
+ * @brief Initialize a Paxos instance for a cluster of @p num_peers members.
+ *
+ * @param[out] inst       Caller-allocated instance to populate.
+ * @param[in]  num_peers  Peer count (excluding self is a caller convention).
+ * @param[in]  logger     Non-owning logger; may be NULL.
+ * @return 0 on success.
+ */
 /*@
   requires \valid(inst);
   requires num_peers >= 0;
@@ -67,6 +93,12 @@ typedef struct {
 */
 int paxos_init(paxos_instance_t *inst, int num_peers, logger_t *logger);
 
+/**
+ * @brief Release all resources owned by a Paxos instance.
+ *
+ * Clears the three maps and the granted-IDs array, destroys the mutex, and
+ * marks the instance uninitialized. Safe on a zero-initialized struct.
+ */
 /*@
   requires \valid(inst);
   requires inst->proposals.length <= inst->proposals.capacity;
@@ -76,6 +108,14 @@ int paxos_init(paxos_instance_t *inst, int num_peers, logger_t *logger);
 */
 void paxos_destroy(paxos_instance_t *inst);
 
+/**
+ * @brief Format a composite ballot key `"<id1>:<id2>"` used as a map key.
+ *
+ * @param[out] buf  Output buffer (NUL-terminated on return).
+ * @param[in]  len  Size of @p buf; @ref PAXOS_KEY_LEN is sufficient.
+ * @param[in]  id1  Primary ballot identifier.
+ * @param[in]  id2  Chain position / secondary identifier.
+ */
 /*@
   requires \valid(buf + (0 .. len - 1));
   requires len > 0;
@@ -83,6 +123,19 @@ void paxos_destroy(paxos_instance_t *inst);
 */
 void paxos_id_index(char *buf, size_t len, int64_t id1, int64_t id2);
 
+/**
+ * @brief Handle an incoming proposal request and decide grant/nack/backdate.
+ *
+ * On @ref PAXOS_GRANT, updates @c last_id to @p id1 and records the grant
+ * in @c granted_ids. Thread-safe under the instance lock.
+ *
+ * @param[in]  inst            Initialized instance.
+ * @param[in]  id1             Ballot ID proposed by the requester.
+ * @param[in]  id2             Chain position the requester believes is next.
+ * @param[out] out_last_id     Instance's @c last_id after handling.
+ * @param[out] out_chain_len   Instance's @c chain_len after handling.
+ * @return One of @ref paxos_response_t.
+ */
 /*@
   requires \valid(inst);
   requires inst->initialized == \true;
@@ -97,6 +150,15 @@ paxos_response_t paxos_handle_request(paxos_instance_t *inst,
                                       int64_t id1, int64_t id2,
                                       int64_t *out_last_id, int *out_chain_len);
 
+/**
+ * @brief Record a grant received from a peer for ballot (@p id1, @p id2).
+ *
+ * @param[in] inst   Initialized instance.
+ * @param[in] id1    Ballot primary ID.
+ * @param[in] id2    Chain position.
+ * @param[in] score  Peer-supplied score for tie-breaking.
+ * @return Current grant count for the ballot, or negative on error.
+ */
 /*@
   requires \valid(inst);
   requires inst->initialized == \true;
@@ -106,6 +168,11 @@ paxos_response_t paxos_handle_request(paxos_instance_t *inst,
 int paxos_record_grant(paxos_instance_t *inst,
                        int64_t id1, int64_t id2, double score);
 
+/**
+ * @brief Record an acceptance received from a peer for ballot (@p id1, @p id2).
+ *
+ * @return Current acceptance count for the ballot (always >= 1 on success).
+ */
 /*@
   requires \valid(inst);
   requires inst->initialized == \true;
@@ -115,6 +182,11 @@ int paxos_record_grant(paxos_instance_t *inst,
 int paxos_record_acceptance(paxos_instance_t *inst,
                             int64_t id1, int64_t id2);
 
+/**
+ * @brief Test whether a ballot at chain position @p id2 has already been granted.
+ *
+ * @return @c true if a grant exists for any ID at position @p id2.
+ */
 /*@
   requires \valid(inst);
   requires inst->initialized == \true;
@@ -123,6 +195,11 @@ int paxos_record_acceptance(paxos_instance_t *inst,
 */
 bool paxos_has_granted_id(paxos_instance_t *inst, int id2);
 
+/**
+ * @brief Commit the current position and advance @c chain_len by one.
+ *
+ * Called once a ballot has reached quorum and its value is durably chosen.
+ */
 /*@
   requires \valid(inst);
   requires inst->initialized == \true;
@@ -131,6 +208,15 @@ bool paxos_has_granted_id(paxos_instance_t *inst, int id2);
 */
 void paxos_advance_chain(paxos_instance_t *inst);
 
+/**
+ * @brief Generate the next (@c id1, @c id2) pair to propose.
+ *
+ * @p id1 is an instance-monotonic counter; @p id2 is @c chain_len + 1.
+ *
+ * @param[in]  inst     Initialized instance.
+ * @param[out] out_id1  New ballot primary ID.
+ * @param[out] out_id2  Next chain position.
+ */
 /*@
   requires \valid(inst);
   requires inst->initialized == \true;
@@ -141,6 +227,14 @@ void paxos_advance_chain(paxos_instance_t *inst);
 */
 void paxos_next_ids(paxos_instance_t *inst, int64_t *out_id1, int64_t *out_id2);
 
+/**
+ * @brief Record a NACK for ballot (@p id1, @p id2) and return the next backoff.
+ *
+ * Backoff grows by @ref PAXOS_BACKOFF_MULT per NACK, clamped to
+ * @ref PAXOS_BACKOFF_MAX_SEC.
+ *
+ * @return Seconds to wait before retrying (>= 2, <= @ref PAXOS_BACKOFF_MAX_SEC).
+ */
 /*@
   requires \valid(inst);
   requires inst->initialized == \true;
@@ -149,5 +243,8 @@ void paxos_next_ids(paxos_instance_t *inst, int64_t *out_id1, int64_t *out_id2);
   ensures \result <= PAXOS_BACKOFF_MAX_SEC;
 */
 int paxos_record_nack(paxos_instance_t *inst, int64_t id1, int64_t id2);
+
+
+/** @} */ /* end of internal_algorithms */
 
 #endif /* PAXOS_H */

@@ -17,6 +17,10 @@
 #ifndef ZTA_PROCESS_H
 #define ZTA_PROCESS_H
 
+/** @addtogroup internal_zta
+ *  @{
+ */
+
 #include "processes/processes.h"
 
 #ifdef __cplusplus
@@ -47,5 +51,8 @@ int zta_process_run(process_t *proc, directory_t *queues,
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+
+/** @} */ /* end of internal_zta */
 
 #endif /* ZTA_PROCESS_H */

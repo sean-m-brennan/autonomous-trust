@@ -16,9 +16,17 @@
 #ifndef B64_H
 #define B64_H
 
+/** @addtogroup internal_utilities
+ *  @{
+ */
+
 #include <stddef.h>
 #include <sodium.h>
 
+/**
+ * @brief Size in bytes required to base64-encode @p input_len raw bytes
+ *        (including trailing NUL), using libsodium's @c VARIANT_ORIGINAL.
+ */
 /*@
   requires input_len >= 0;
   assigns \nothing;
@@ -29,6 +37,13 @@ static inline size_t b64_encoded_len(size_t input_len)
     return sodium_base64_encoded_len(input_len, sodium_base64_VARIANT_ORIGINAL);
 }
 
+/**
+ * @brief Decoded byte count for an encoding of length @p enc_len, given only
+ *        the final character (used to detect a single `=` pad).
+ *
+ * Callers that have the full string should prefer @ref b64_decoded_len_s,
+ * which handles double padding correctly.
+ */
 /*@
   requires enc_len >= 4;
   requires enc_len % 4 == 0;
@@ -44,6 +59,11 @@ static inline size_t b64_decoded_len(size_t enc_len, char last_char)
     return len;
 }
 
+/**
+ * @brief Decoded byte count for base64 string @p enc_str of length @p enc_len.
+ *
+ * Correctly accounts for one or two `=` padding characters.
+ */
 /*@
   requires enc_len >= 4;
   requires enc_len % 4 == 0;
@@ -67,12 +87,24 @@ static inline size_t b64_decoded_len_s(size_t enc_len, const char *enc_str)
    WP cannot model the pointer-returning sodium_bin2base64 in an
    inline context.  Contracts for the underlying functions are in
    sodium_stubs.h; these wrappers are verified transitively. */
+
+/**
+ * @brief Base64-encode @p src_len bytes of @p src into @p dst using
+ *        libsodium's @c VARIANT_ORIGINAL (must match the Python side).
+ *
+ * @p dst must have at least @ref b64_encoded_len bytes.
+ */
 static inline void base64_encode(const unsigned char *src, size_t src_len,
                                   char *dst, size_t dst_len)
 {
     sodium_bin2base64(dst, dst_len, src, src_len, sodium_base64_VARIANT_ORIGINAL);
 }
 
+/**
+ * @brief Base64-decode @p src into @p dst (raw bytes).
+ *
+ * @p dst must have at least @ref b64_decoded_len_s bytes.
+ */
 static inline void base64_decode(const char *src, size_t src_len,
                                   unsigned char *dst, size_t dst_len)
 {
@@ -80,5 +112,8 @@ static inline void base64_decode(const char *src, size_t src_len,
     sodium_base642bin(dst, dst_len, src, src_len, NULL, &bin_len, NULL,
                       sodium_base64_VARIANT_ORIGINAL);
 }
+
+
+/** @} */ /* end of internal_utilities */
 
 #endif  /* B64_H */

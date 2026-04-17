@@ -17,6 +17,10 @@
 #ifndef QUEUE_POOL_H
 #define QUEUE_POOL_H
 
+/** @addtogroup internal_utilities
+ *  @{
+ */
+
 #include <stdbool.h>
 
 #include "message.h"
@@ -98,5 +102,8 @@ int queue_pool_recycle(queue_pool_t *pool, queue_t *queue);
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of internal_utilities */
 
 #endif  // QUEUE_POOL_H

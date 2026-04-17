@@ -64,6 +64,31 @@ static void make_key(char *buf, size_t buflen, int64_t id1, int64_t id2)
     paxos_id_index(buf, buflen, id1, id2);
 }
 
+/* WHY the ballot-ordering logic matters:
+ *
+ * Paxos safety requires that every accepted ballot carry a strictly higher
+ * ID than any previously accepted one. That invariant is maintained here by
+ * ONLY transitioning `inst->last_id = id1` when `id1 > inst->last_id`. The
+ * check is an INSTANCE-local monotonic comparison, not a uniqueness check:
+ * we do NOT verify that id1 has never been seen cluster-wide. Uniqueness
+ * has to be arranged by the ID generator in paxos_next_ids() (which
+ * combines a per-node counter with chain position so two nodes can't mint
+ * the same id1 for the same id2).
+ *
+ * Three distinct unlock sites exist because each return path leaves a
+ * different mutation visible:
+ *   GRANT     — last_id and granted_ids are updated; unlock after commit.
+ *   BACKDATE  — read-only; unlock with no state change.
+ *   NACK      — read-only; unlock with no state change.
+ * A single unlock at function tail would require wrapping the returns in a
+ * result variable, which WP then has to reason about across behaviors;
+ * keeping the unlock inline at each exit preserves the per-behavior
+ * postconditions in paxos.h with far fewer obligations.
+ *
+ * WHY `id2 == chain_len + 1` and not `>=`:
+ * A ballot must land at the NEXT free chain slot. If id2 is ahead of
+ * chain_len+1, the proposer has stale view; we BACKDATE (signal the peer
+ * to catch up) rather than NACK so they don't increase their backoff. */
 paxos_response_t paxos_handle_request(paxos_instance_t *inst,
                                       int64_t id1, int64_t id2,
                                       int64_t *out_last_id, int *out_chain_len)

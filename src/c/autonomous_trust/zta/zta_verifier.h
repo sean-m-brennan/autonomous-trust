@@ -17,6 +17,10 @@
 #ifndef ZTA_VERIFIER_H
 #define ZTA_VERIFIER_H
 
+/** @addtogroup internal_zta
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -166,5 +170,8 @@ DECLARE_ERROR(EZTA_UNSUPPORTED, "Operation not supported by this verifier");
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+
+/** @} */ /* end of internal_zta */
 
 #endif /* ZTA_VERIFIER_H */

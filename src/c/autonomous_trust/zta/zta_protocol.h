@@ -17,6 +17,10 @@
 #ifndef ZTA_PROTOCOL_H
 #define ZTA_PROTOCOL_H
 
+/** @addtogroup internal_zta
+ *  @{
+ */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -34,5 +38,8 @@ extern "C" {
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+
+/** @} */ /* end of internal_zta */
 
 #endif /* ZTA_PROTOCOL_H */

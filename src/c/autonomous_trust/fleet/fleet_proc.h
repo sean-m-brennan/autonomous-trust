@@ -17,6 +17,10 @@
 #ifndef FLEET_PROC_H
 #define FLEET_PROC_H
 
+/** @addtogroup internal_fleet
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -137,5 +141,8 @@ int fleet_propose_update(const uint8_t *artifact_hash, const char *version,
   assigns *proc;
 */
 int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
+
+
+/** @} */ /* end of internal_fleet */
 
 #endif /* FLEET_PROC_H */

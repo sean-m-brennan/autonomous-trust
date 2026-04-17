@@ -34,6 +34,10 @@
 #ifndef AT_NODE_H
 #define AT_NODE_H
 
+/** @addtogroup public_api
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -149,6 +153,13 @@ void at_node_shutdown(at_node_t *node);
 /* Accessors (for use inside tick callbacks)                           */
 /* ------------------------------------------------------------------ */
 
+/**
+ * @brief Return the PID of the AT daemon spawned by at_node_start().
+ *
+ * @param[in] node  Node handle.
+ * @return Daemon PID, or whatever was stored during start (typically -1 if
+ *         the daemon has not been launched).
+ */
 /*@
   requires \valid(node);
   assigns \nothing;
@@ -156,6 +167,15 @@ void at_node_shutdown(at_node_t *node);
 */
 int         at_node_daemon_pid(const at_node_t *node);
 
+/**
+ * @brief Return a pointer to the node's embedded logger.
+ *
+ * Intended for use from inside a tick callback so the application can log
+ * through the same sink as the daemon lifecycle code.
+ *
+ * @param[in] node  Node handle.
+ * @return Non-owning pointer to the node's logger.
+ */
 /*@
   requires \valid(node);
   assigns \nothing;
@@ -163,6 +183,15 @@ int         at_node_daemon_pid(const at_node_t *node);
 */
 logger_t   *at_node_logger(at_node_t *node);
 
+/**
+ * @brief Return the current monitor-loop iteration count.
+ *
+ * Incremented once per tick by at_node_run(). Useful for throttling work
+ * inside tick callbacks.
+ *
+ * @param[in] node  Node handle.
+ * @return Zero-based iteration counter.
+ */
 /*@
   requires \valid(node);
   assigns \nothing;
@@ -173,5 +202,8 @@ size_t      at_node_iteration(const at_node_t *node);
 #ifdef __cplusplus
 }
 #endif
+
+
+/** @} */ /* end of public_api */
 
 #endif /* AT_NODE_H */

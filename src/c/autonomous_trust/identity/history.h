@@ -17,6 +17,10 @@
 #ifndef HISTORY_H
 #define HISTORY_H
 
+/** @addtogroup internal_identity
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -251,5 +255,8 @@ int identity_history_by_work_create(public_identity_t *myself,
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of internal_identity */
 
 #endif  // HISTORY_H

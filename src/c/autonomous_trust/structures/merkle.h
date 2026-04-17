@@ -17,6 +17,10 @@
 #ifndef MERKLE_H
 #define MERKLE_H
 
+/** @addtogroup internal_structures
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -306,5 +310,8 @@ DECLARE_ERROR(EMRKL_NOTFOUND, "Blob not found in Merkle tree");
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of internal_structures */
 
 #endif // MERKLE_H

@@ -17,6 +17,10 @@
 #ifndef REPUTATION_H
 #define REPUTATION_H
 
+/** @addtogroup internal_reputation
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <uuid/uuid.h>
@@ -298,5 +302,8 @@ DECLARE_ERROR(EREP_NOPEER, "Peer not found in reputation map");
 
 #define EREP_CHAIN_FULL 252
 DECLARE_ERROR(EREP_CHAIN_FULL, "Transaction chain is full");
+
+
+/** @} */ /* end of internal_reputation */
 
 #endif  /* REPUTATION_H */

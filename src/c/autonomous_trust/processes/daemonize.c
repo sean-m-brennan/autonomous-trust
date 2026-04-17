@@ -44,6 +44,26 @@
     ensures \result < 0;
   disjoint behaviors;
 */
+/* WHY the double-fork pattern with a pipe, rather than the textbook version:
+ *
+ * Classic double-fork: parent forks child, child forks grandchild, child
+ * _exit()s, parent waitpid()s on child. The grandchild becomes the daemon
+ * orphaned to init. The parent never learns the grandchild's PID, which is
+ * fine for "nohup" use but useless here — our caller (node.h lifecycle)
+ * needs the grandchild PID so it can monitor liveness and signal graceful
+ * shutdown.
+ *
+ * So: the intermediate child writes the grandchild PID (positive int) OR a
+ * negative errno code back through `io` before _exit()ing. The original
+ * parent's read() blocks until that happens; the read is synchronous so
+ * when daemonize() returns, the grandchild is guaranteed to have been
+ * forked (and setsid'd) — the caller does not need to sleep-poll.
+ *
+ * The `(void)!write/read` casts are deliberate: the write side runs in the
+ * intermediate child where signal-interrupted short writes cannot usefully
+ * be retried (we're about to _exit), and the compiler's warn-unused-result
+ * on write() would otherwise force a dummy branch. `(void)!` is the idiom
+ * to suppress the warning while making intent visible. */
 /* Frama-C: skipped — [syscall] fork, setsid, chdir, dup2, close */
 int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
 {
