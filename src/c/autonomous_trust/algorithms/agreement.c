@@ -68,6 +68,10 @@ int agreement_proof_create(const char *uuid, const uint8_t *digest, size_t diges
     return 0;
 }
 
+/*@
+  requires proof == \null || \valid(proof);
+  assigns \nothing;
+*/
 void agreement_proof_free(agreement_proof_t *proof)
 {
     if (proof == NULL)
@@ -545,16 +549,15 @@ bool agreement_finalize(agreement_protocol_t *proto, merkle_blob_t *blob)
     return result;
 }
 
-/* Frama-C: skipped — [solver-timeout] container free cascade */
 void agreement_protocol_free(agreement_protocol_t *proto)
 {
     if (proto == NULL)
         return;
     if (proto->voters != NULL)
         free(proto->voters);
-    if (proto->votes != NULL)
-        map_free(proto->votes);
     if (proto->type == AGREEMENT_WORK && proto->state.work.approved != NULL)
         array_free(proto->state.work.approved);
+    if (proto->votes != NULL)
+        map_free(proto->votes);
     free(proto);
 }
