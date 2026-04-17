@@ -17,6 +17,10 @@
 #ifndef REDBLACK_H
 #define REDBLACK_H
 
+/** @addtogroup internal_structures
+ *  @{
+ */
+
 #include "utilities/exception.h"
 #include "utilities/allocation.h"
 
@@ -252,5 +256,8 @@ DECLARE_ERROR(ERBT_EMPTY, "Item deletion on empty tree");
 */
 #define ERBT_NO_KEY 213
 DECLARE_ERROR(ERBT_NO_KEY, "No such key found in the tree");
+
+
+/** @} */ /* end of internal_structures */
 
 #endif  // REDBLACK_H

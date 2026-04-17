@@ -17,6 +17,10 @@
 #ifndef PEERS_H
 #define PEERS_H
 
+/** @addtogroup internal_identity
+ *  @{
+ */
+
 #include <jansson.h>
 #include "structures/map.h"
 #include "identity.h"
@@ -119,5 +123,8 @@ int peers_count(peers_t *peers);
   complete behaviors;
 */
 void peers_free(peers_t *peers);
+
+
+/** @} */ /* end of internal_identity */
 
 #endif  // PEERS_H

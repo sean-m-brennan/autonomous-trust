@@ -51,6 +51,16 @@ int agreement_proof_create(const char *uuid, const uint8_t *digest, size_t diges
         p->digest_len = digest_len;
     }
 
+    /* WHY the cleanup here frees digest conditionally but not separately
+     * calloc'd fields: allocations happen in order (struct → digest → nonce);
+     * if we fail at the nonce step, digest may or may not have been
+     * allocated depending on whether digest_len > 0 above. The `if
+     * (p->digest)` guard handles both paths without needing a second
+     * control-flow branch. The struct itself came from calloc so all other
+     * pointer fields are guaranteed NULL — no risk of freeing uninitialized
+     * memory. Do NOT reorder the allocations; each error branch assumes
+     * everything earlier in the sequence is the *only* thing that might
+     * need freeing. */
     if (nonce != NULL && nonce_len > 0)
     {
         p->nonce = malloc(nonce_len);

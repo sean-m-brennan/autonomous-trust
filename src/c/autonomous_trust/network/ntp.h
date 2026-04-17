@@ -17,6 +17,10 @@
 #ifndef NTP_H
 #define NTP_H
 
+/** @addtogroup internal_network
+ *  @{
+ */
+
 #include <stdint.h>
 #include <time.h>
 
@@ -161,5 +165,8 @@ int    ntp_stop_sync(void);
   assigns \nothing;
 */
 double ntp_get_offset(void);
+
+
+/** @} */ /* end of internal_network */
 
 #endif  /* NTP_H */

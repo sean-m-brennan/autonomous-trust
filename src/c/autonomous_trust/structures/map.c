@@ -387,6 +387,19 @@ int map_remove(map_t *map, map_key_t key)
 /* Frama-C: skipped — [solver-timeout] free/smrt_deref requires */
 void map_free(map_t *map)
 {
+    /* WHY the two free phases are not interchangeable:
+     *   map->items[i].key points into heap memory that was strdup'd when the
+     *   entry was inserted (see map_set). Those key strings are independent
+     *   allocations from the items array itself. We MUST free every key
+     *   before smrt_deref'ing map->items, because once items is freed the
+     *   items[i].key pointers are no longer dereferenceable — even reading
+     *   them to pass to free() would be a use-after-free.
+     *
+     * Consequence: when composing map_free() inside a larger destructor that
+     * frees other fields pointing into the items array (arrays, nested
+     * maps), map_free() must be called LAST of the siblings, or the sibling
+     * frees will clobber WP state that assumes items-backed memory is still
+     * valid. See memory: reference_framac_free_ordering. */
     /*@
       loop invariant 0 <= i <= map->capacity;
       loop assigns i;

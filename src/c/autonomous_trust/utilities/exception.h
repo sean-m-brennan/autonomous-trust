@@ -17,6 +17,10 @@
 #ifndef EXCEPTION_H
 #define EXCEPTION_H
 
+/** @addtogroup internal_utilities
+ *  @{
+ */
+
 #include <stddef.h>
 #include <errno.h>
 
@@ -108,5 +112,8 @@ int _set_exception(int err, size_t line, const char *file);
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of internal_utilities */
 
 #endif // EXCEPTION_H

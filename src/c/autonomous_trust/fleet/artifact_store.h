@@ -17,6 +17,10 @@
 #ifndef ARTIFACT_STORE_H
 #define ARTIFACT_STORE_H
 
+/** @addtogroup internal_fleet
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -137,5 +141,8 @@ int artifact_store_delete(const char *hash_hex);
 #ifdef __cplusplus
 }
 #endif
+
+
+/** @} */ /* end of internal_fleet */
 
 #endif /* ARTIFACT_STORE_H */

@@ -17,6 +17,10 @@
 #ifndef CAPABILITIES_H
 #define CAPABILITIES_H
 
+/** @addtogroup internal_processes
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stdarg.h>
 
@@ -88,5 +92,8 @@ int build_local_capabilities(const char *my_uuid, array_t **caps_out);
         capability_table[capability_table_size].local = true;                     \
         capability_table_size++;                                                  \
     }
+
+
+/** @} */ /* end of internal_processes */
 
 #endif  // CAPABILITIES_H

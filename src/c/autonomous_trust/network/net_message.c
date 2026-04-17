@@ -58,6 +58,17 @@ int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
     char *data_b64 = NULL;
     if (msg->data != NULL && msg->data_len > 0)
     {
+        /* WHY sodium_base64_VARIANT_ORIGINAL and not _URLSAFE or _NOPAD:
+         *
+         * The Python side (autonomous_trust/network/net_message.py) uses
+         * stdlib `base64.b64encode`, which produces the "standard" alphabet
+         * with `+` and `/` and mandatory `=` padding. libsodium's ORIGINAL
+         * variant matches that byte-for-byte. The other variants differ in
+         * either alphabet (URLSAFE: `-` `_`) or padding (NOPAD: none), and
+         * even a single differing byte would cause the signature below to
+         * verify against a different canonical string on the Python side
+         * and fail every verification. Do not change this variant without
+         * also updating the Python encoder. */
         size_t b64_len = sodium_base64_encoded_len(msg->data_len,
                                                     sodium_base64_VARIANT_ORIGINAL);
         data_b64 = malloc(b64_len);
@@ -75,7 +86,19 @@ int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
         json_object_set_new(root, "data", json_string(""));
     }
 
-    /* sign if signer provided (matching Python's _content_str: "process|function|data") */
+    /* WHY the signed content is "<process>|<function>|<base64(data)>" in
+     * THIS exact order:
+     *
+     * This string is the canonical pre-image the Python side signs and
+     * verifies (`_content_str` in net_message.py). The order and the `|`
+     * separator are part of the protocol; if we reorder fields or use a
+     * different separator the peer's Ed25519 verifier will see a different
+     * byte sequence and reject every message with a "bad signature" that
+     * is NOT a bug in crypto but a canonicalization mismatch.
+     *
+     * `data` here is the *base64-encoded* bytes, not the raw payload —
+     * again matching Python. An empty data field contributes an empty
+     * string (not absent), so the trailing `|` is always present. */
     if (signer != NULL)
     {
         const char *func_str = msg->function ? msg->function : "";

@@ -17,6 +17,10 @@
 #ifndef NETWORK_H
 #define NETWORK_H
 
+/** @addtogroup internal_network
+ *  @{
+ */
+
 #include <stdint.h>
 #include <jansson.h>
 #include "utilities/allocation.h"
@@ -132,5 +136,8 @@ int network_from_json(const json_t *obj, void *data_struct);
 
 #define ENET_INVALID_MASK 220
 DECLARE_ERROR(ENET_INVALID_MASK, "CIDR prefix length exceeds maximum for address family");
+
+
+/** @} */ /* end of internal_network */
 
 #endif  // NETWORK_H

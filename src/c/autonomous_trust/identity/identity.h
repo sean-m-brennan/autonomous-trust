@@ -17,6 +17,10 @@
 #ifndef IDENTITY_H
 #define IDENTITY_H
 
+/** @addtogroup internal_identity
+ *  @{
+ */
+
 #include <stdlib.h>
 
 #include <uuid/uuid.h>
@@ -140,11 +144,14 @@ int identity_create(uuid_t *uuid, char *address, char *fullname,
                     char *nickname, char *petname, identity_t **ident);
 
 /**
- * @brief
+ * @brief Produce a shareable public copy of an identity.
  *
- * @param ident
- * @param pub_copy
- * @return int
+ * Strips private key material and returns a newly-allocated
+ * @ref public_identity_t suitable for sending to peers.
+ *
+ * @param[in]  ident     Full identity (source).
+ * @param[out] pub_copy  Receives the allocated public-only copy.
+ * @return 0 on success, @c EINVAL if @p ident is NULL, -1 on allocation error.
  */
 /*@
   requires ident == \null || \valid(ident);
@@ -164,12 +171,14 @@ int identity_create(uuid_t *uuid, char *address, char *fullname,
 int identity_publish(const identity_t *ident, public_identity_t **pub_copy);
 
 /**
- * @brief
+ * @brief Produce a detached Ed25519 signature prepended to the message.
  *
- * @param ident
- * @param in
- * @param out
- * @return int
+ * Output buffer must have room for @p in->len + @c crypto_sign_BYTES.
+ *
+ * @param[in]  ident  Identity providing the private signing key.
+ * @param[in]  in     Message to sign.
+ * @param[out] out    Receives the signed message (signature prefix + payload).
+ * @return 0 on success, non-zero on signing failure.
  */
 /*@
   requires \valid(ident);
@@ -184,12 +193,14 @@ int identity_publish(const identity_t *ident, public_identity_t **pub_copy);
 int identity_sign(const identity_t *ident, const msg_str_t *in, msg_str_t *out);
 
 /**
- * @brief
+ * @brief Verify an Ed25519-signed message produced by identity_sign().
  *
- * @param ident
- * @param in
- * @param out
- * @return int
+ * On success writes the original payload (signature stripped) into @p out.
+ *
+ * @param[in]  ident  Public identity of the purported signer.
+ * @param[in]  in     Signed message (signature prefix + payload).
+ * @param[out] out    Receives the verified payload and its length.
+ * @return 0 on successful verification, -1 on failure.
  */
 /*@
   requires \valid(ident);
@@ -207,14 +218,15 @@ int identity_sign(const identity_t *ident, const msg_str_t *in, msg_str_t *out);
 int identity_verify(const public_identity_t *ident, const msg_str_t *in, msg_str_t *out);
 
 /**
- * @brief
+ * @brief Authenticated-encrypt a message to a peer using libsodium crypto_box.
  *
- * @param ident
- * @param in
- * @param whom
- * @param nonce
- * @param cipher
- * @return int
+ * @param[in]  ident   Sender identity (holds private encryption key).
+ * @param[in]  in      Plaintext payload.
+ * @param[in]  whom    Recipient public identity (holds target public key).
+ * @param[in]  nonce   Caller-supplied nonce of @c crypto_box_NONCEBYTES. The
+ *                     caller is responsible for per-message uniqueness.
+ * @param[out] cipher  Output buffer of at least @c in->len + @c crypto_box_MACBYTES.
+ * @return 0 on success, -1 on failure.
  */
 /*@
   requires \valid(ident);
@@ -229,14 +241,14 @@ int identity_verify(const public_identity_t *ident, const msg_str_t *in, msg_str
 int identity_encrypt(const identity_t *ident, const msg_str_t *in, const public_identity_t *whom, const unsigned char *nonce, unsigned char *cipher);
 
 /**
- * @brief
+ * @brief Decrypt and verify a crypto_box ciphertext from a peer.
  *
- * @param ident
- * @param cipher
- * @param whom
- * @param nonce
- * @param out
- * @return int
+ * @param[in]  ident   Receiver identity (holds private key).
+ * @param[in]  cipher  Input ciphertext (length must include the MAC).
+ * @param[in]  whom    Sender public identity (holds source public key).
+ * @param[in]  nonce   Same nonce used by the encryptor.
+ * @param[out] out     Output buffer of at least @c cipher->len - @c crypto_box_MACBYTES.
+ * @return 0 on success, -1 on authentication failure.
  */
 /*@
   requires \valid(ident);
@@ -256,29 +268,31 @@ int identity_encrypt(const identity_t *ident, const msg_str_t *in, const public_
 int identity_decrypt(const identity_t *ident, const msg_str_t *cipher, const public_identity_t *whom, const unsigned char *nonce, unsigned char *out);
 
 /**
- * @brief
+ * @brief Serialize a public identity to its protobuf wire representation.
  *
- * @param msg
- * @param data_ptr
- * @param data_len_ptr
- * @return int
+ * @param[in]  msg           Public identity to serialize.
+ * @param[out] data_ptr      Receives a malloc'd buffer owned by the caller.
+ * @param[out] data_len_ptr  Receives the length of @p data_ptr in bytes.
+ * @return 0 on success, non-zero on serialization failure.
  */
 int peer_to_proto(public_identity_t *msg, void **data_ptr, size_t *data_len_ptr);
 
 /**
- * @brief
+ * @brief Parse protobuf-encoded bytes into a caller-allocated public identity.
  *
- * @param data
- * @param len
- * @param peer
- * @return int
+ * @param[in]  data  Serialized bytes (typically from peer_to_proto()).
+ * @param[in]  len   Length of @p data in bytes.
+ * @param[out] peer  Caller-allocated public identity to populate.
+ * @return 0 on success, non-zero on parse or validation failure.
  */
 int proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer);
 
 /**
- * @brief
+ * @brief Release an identity allocated by identity_create().
  *
- * @param ident
+ * Safe to call with NULL. Zeroes private-key material before freeing.
+ *
+ * @param[in] ident  Identity pointer, or NULL.
  */
 /*@
   requires ident == \null || \valid(ident);
@@ -296,5 +310,8 @@ int proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer);
   complete behaviors;
 */
 void identity_free(identity_t *ident);
+
+
+/** @} */ /* end of internal_identity */
 
 #endif  // IDENTITY_H

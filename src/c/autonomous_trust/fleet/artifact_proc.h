@@ -17,6 +17,10 @@
 #ifndef ARTIFACT_PROC_H
 #define ARTIFACT_PROC_H
 
+/** @addtogroup internal_fleet
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -103,5 +107,8 @@ int artifact_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
 #ifdef __cplusplus
 }
 #endif
+
+
+/** @} */ /* end of internal_fleet */
 
 #endif /* ARTIFACT_PROC_H */

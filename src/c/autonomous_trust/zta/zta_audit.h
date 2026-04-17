@@ -17,6 +17,10 @@
 #ifndef ZTA_AUDIT_H
 #define ZTA_AUDIT_H
 
+/** @addtogroup internal_zta
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stdio.h>
 #include <pthread.h>
@@ -32,17 +36,23 @@ extern "C" {
 #define ZTA_AUDIT_MAX_DEFERRED 256
 
 /**
- * @brief A single audit log entry for ZTA verification events
+ * @brief A single audit log entry for ZTA verification events.
+ *
+ * When @c deferred is @c false, the entry is terminal: @c result is the final
+ * verdict and @c resolved_at / @c resolution_result / @c resolved are unused.
+ * When @c deferred is @c true, the entry is provisional; a later
+ * `zta_audit_resolve()` call backfills @c resolved_at, @c resolution_result,
+ * and sets @c resolved to @c true.
  */
 typedef struct {
-    struct timeval timestamp;
-    uuid_t peer_uuid;
-    char action[ZTA_ACTION_LEN];    /* "admission_check", "periodic_reverify", etc. */
-    zta_result_t result;
-    bool deferred;
-    struct timeval resolved_at;
-    zta_result_t resolution_result;
-    bool resolved;
+    struct timeval timestamp;          /**< When the verification was attempted. */
+    uuid_t peer_uuid;                  /**< Subject of the verification. */
+    char action[ZTA_ACTION_LEN];       /**< e.g. "admission_check", "periodic_reverify". */
+    zta_result_t result;               /**< Initial verdict (or DEFERRED). */
+    bool deferred;                     /**< @c true when verification was postponed. */
+    struct timeval resolved_at;        /**< When resolution happened (deferred only). */
+    zta_result_t resolution_result;    /**< Final verdict after deferral. */
+    bool resolved;                     /**< @c true once the deferred entry is resolved. */
 } zta_audit_entry_t;
 
 /**
@@ -164,5 +174,8 @@ void zta_audit_close(zta_audit_log_t *log);
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+
+/** @} */ /* end of internal_zta */
 
 #endif /* ZTA_AUDIT_H */

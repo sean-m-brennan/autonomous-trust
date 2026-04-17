@@ -17,6 +17,10 @@
 #ifndef PROTOBUF_SHUTDOWN_H
 #define PROTOBUF_SHUTDOWN_H
 
+/** @addtogroup internal_utilities
+ *  @{
+ */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -26,5 +30,8 @@ void shutdown_protobuf_library();
 #ifdef __cplusplus
 }
 #endif
+
+
+/** @} */ /* end of internal_utilities */
 
 #endif  // PROTOBUF_SHUTDOWN_H

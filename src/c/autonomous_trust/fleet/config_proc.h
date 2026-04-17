@@ -17,6 +17,10 @@
 #ifndef CONFIG_PROC_H
 #define CONFIG_PROC_H
 
+/** @addtogroup internal_fleet
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -137,5 +141,8 @@ int config_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
 #ifdef __cplusplus
 }
 #endif
+
+
+/** @} */ /* end of internal_fleet */
 
 #endif /* CONFIG_PROC_H */

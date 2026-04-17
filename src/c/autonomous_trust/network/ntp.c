@@ -105,6 +105,23 @@ int ntp_compute_offset(const ntp_packet_t *pkt, struct timespec t1, struct times
     uint32_t tx_sec  = pkt->tx_ts_sec;
     uint32_t tx_frac = pkt->tx_ts_frac;
 
+    /* WHY the subtraction is done in uint32_t, not int64_t:
+     *
+     * NTP timestamps count seconds from 1900-01-01; Unix from 1970-01-01.
+     * NTP_EPOCH_DELTA = 2208988800 (70 years + leap days). Both `rx_sec`
+     * and NTP_EPOCH_DELTA fit in uint32_t, but their *difference* interpreted
+     * as signed would be negative for any NTP time before 1970 — which
+     * cannot occur in practice but would trap in signed overflow.
+     *
+     * By doing the subtract in uint32_t we get well-defined modular
+     * arithmetic. After 2036 the 32-bit NTP seconds field wraps (the "era 1
+     * rollover"); when that happens this code still computes the correct
+     * Unix seconds value in the NEW era, because both operands wrap
+     * together and the cast to double preserves the unsigned interpretation.
+     *
+     * The explicit `(uint32_t)NTP_EPOCH_DELTA` is required: without it the
+     * integer-promotion rules would pull the operand to signed long and
+     * defeat the guarantee. */
     /* Convert NTP timestamps to seconds since Unix epoch */
     double d_t1 = (double)t1.tv_sec + (double)t1.tv_nsec / 1.0e9;
     double d_t4 = (double)t4.tv_sec + (double)t4.tv_nsec / 1.0e9;

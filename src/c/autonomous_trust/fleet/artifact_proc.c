@@ -44,6 +44,20 @@ static struct {
     pthread_mutex_t lock;
 } artifact_state;
 
+/* WHY this is safe despite looking like a classic TOCTOU race:
+ *
+ * In the current deployment model the artifact process is single-threaded
+ * per node: all of its message-handling dispatch runs on one thread driven
+ * by the process event loop (see processes/processes.c). _ensure_init() is
+ * only invoked from that dispatch path, so the read/write on `initialized`
+ * cannot race with itself.
+ *
+ * If this ever grows a worker-thread pool, replace this with pthread_once()
+ * or a double-checked-lock that holds a separate bootstrap mutex — the
+ * in-struct mutex cannot guard its own initialization.
+ *
+ * The check is deliberately cheap (one load) on the hot path; the cost of
+ * wrong once-semantics would only show up on first call after startup. */
 static void _ensure_init(void)
 {
     if (!artifact_state.initialized)

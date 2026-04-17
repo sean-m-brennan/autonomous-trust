@@ -17,6 +17,10 @@
 #ifndef PROCESSES_H
 #define PROCESSES_H
 
+/** @addtogroup internal_processes
+ *  @{
+ */
+
 #include <sys/time.h>
 
 #include "utilities/message.h"
@@ -227,5 +231,8 @@ int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_
   frees proc;
 */
 void process_free(process_t *proc);
+
+
+/** @} */ /* end of internal_processes */
 
 #endif  // PROCESSES_H

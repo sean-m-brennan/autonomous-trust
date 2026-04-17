@@ -38,6 +38,20 @@ void *smrt_recreate(void *orig, size_t size)
     return ptr;
 }
 
+/* WHY no runtime overflow check on refs:
+ *
+ * refs is size_t (uint64 on all supported platforms). An overflow would
+ * require 2^64 live references to the same allocation, which is physically
+ * impossible — every reference occupies at least one machine word of real
+ * memory, so the pointer table alone would require 2^67 bytes. The ACSL
+ * precondition `refs < UINT64_MAX` is therefore a static claim the calling
+ * code trivially satisfies, not a runtime invariant that needs guarding.
+ *
+ * The assertions below carry that contract into WP so proofs of callers
+ * (who pass arbitrary smrt_ptr_t*) can discharge the precondition via the
+ * system-wide refcount axioms in allocation.h (SmrtPtrInvariant). Do not
+ * replace with a branch-and-abort; it would add a proof obligation WP
+ * cannot discharge without weakening the invariant. */
 void smrt_ref(void *ptr)
 {
     smrt_ptr_t *sptr = ptr;
