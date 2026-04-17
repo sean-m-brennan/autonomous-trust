@@ -241,7 +241,7 @@ while IFS= read -r line; do
 done <<< "$(find $PROTO_SRC/autonomous_trust/core/protobuf -type d)"
 
 INCLUDE_FLAGS=(
-    -cpp-extra-args="-fms-extensions -DAT_ZTA_ENABLED -include $STUBS_DIR/fc_stdio_spec.h -I $C_SRC -I $STUBS_DIR -I $PROJ_ROOT/src/c -I $PROTO_SRC $PROTO_INCLUDES -I $CONDA_PREFIX/include"
+    -cpp-extra-args="-fms-extensions -DAT_ZTA_ENABLED -include $STUBS_DIR/fc_stdio_spec.h -include $STUBS_DIR/fc_stdlib_spec.h -I $C_SRC -I $STUBS_DIR -I $PROJ_ROOT/src/c -I $PROTO_SRC $PROTO_INCLUDES -I $CONDA_PREFIX/include"
 )
 
 ####################
@@ -371,7 +371,7 @@ for src in "${files[@]}"; do
             # [solver-timeout] merkle_root_digest: memcpy separation;
             # merkle_consistent: memcmp danglingness; merkle_tree_free:
             # array_free requires
-            skip_fns="merkle_insert,merkle_delete,merkle_merge,_rehash,merkle_inclusion_proof,merkle_audit,_find_blob_index,_ensure_node_capacity,_add_node,merkle_tree_create,merkle_root_digest,merkle_consistent,merkle_tree_free" ;;
+            skip_fns="merkle_insert,merkle_delete,merkle_merge,_rehash,merkle_inclusion_proof,merkle_audit,_find_blob_index,_ensure_node_capacity,_add_node,merkle_tree_create,merkle_root_digest,merkle_consistent" ;;
         redblack.c)
             # [recursive-ds] BST rotations, recoloring, recursive copy/free
             # WP cannot maintain red-black invariants through rotations
@@ -468,9 +468,7 @@ for src in "${files[@]}"; do
             # [serialization] protobuf sync_out/sync_in
             # [solver-timeout] agreement lifecycle: smrt_ptr/map/paxos
             # precondition cascades through protocol operations
-            # agreement_proof_free: free(proof->digest/nonce) requires
-            # \freeable which WP does not implement
-            skip_fns="agreement_proof_sync_out,agreement_proof_sync_in,agreement_finalize,agreement_proof_create,agreement_proof_free,agreement_protocol_create,agreement_protocol_free,agreement_prove,agreement_verify" ;;
+            skip_fns="agreement_proof_sync_out,agreement_proof_sync_in,agreement_finalize,agreement_proof_create,agreement_protocol_create,agreement_prove,agreement_verify" ;;
 
         # -- fleet --
         fleet_proc.c)
@@ -569,11 +567,10 @@ for src in "${files[@]}"; do
         # -- zta --
         zta_verifier.c)
             # [syscall] zta_result_set: gettimeofday
-            # [solver-timeout] null_destroy: \freeable
             # [solver-timeout] zta_null_verifier_create: calloc
             # [solver-timeout] null_credential_hash: sodium_memzero void-ptr/uint8-ptr
             # cast cascade (same pattern as x509_credential_hash)
-            skip_fns="zta_result_set,null_destroy,zta_null_verifier_create,null_credential_hash" ;;
+            skip_fns="zta_result_set,zta_null_verifier_create,null_credential_hash" ;;
         zta_process.c)
             # zta_process_run + all helpers: [solver-timeout] memcpy of
             # public_identity_t/uuid_t (19 sites) + reputation cache + delegated
@@ -590,11 +587,10 @@ for src in "${files[@]}"; do
             # parsing — all heavily dependent on external library stubs
             skip_fns="_cache_cert,_cache_lookup,_ocsp_query,openssl_verify_reason,_parse_ocsp_url,x509_check_revocation,x509_credential_hash,x509_destroy,x509_is_available,x509_verifier_create,x509_verify_credential" ;;
         oidc_verifier.c)
-            # [solver-timeout] oidc_destroy: \freeable
             # [solver-timeout] oidc_verifier_create: calloc
             # [solver-timeout] oidc_credential_hash: sodium_memzero void-ptr/uint8-ptr
             # cast cascade (same pattern as x509_credential_hash)
-            skip_fns="oidc_destroy,oidc_verifier_create,oidc_credential_hash" ;;
+            skip_fns="oidc_verifier_create,oidc_credential_hash" ;;
         zta_policy.c)
             # [solver-timeout] failure-path postcondition in verifier
             # creation; WP cannot discharge ensures on error branch
