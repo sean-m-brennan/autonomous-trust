@@ -17,6 +17,10 @@
 #ifndef UPDATE_PROC_H
 #define UPDATE_PROC_H
 
+/** @addtogroup internal_fleet
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -39,15 +43,23 @@ extern "C" {
 
 /* --- Update state (persisted across restart) --- */
 
+/**
+ * @brief Persistent update state-machine record.
+ *
+ * Written to disk so in-flight updates can resume after a restart. The
+ * @c state string drives a linear state machine:
+ *   `IDLE` → `STAGING` → `APPLYING` → (`COMPLETE` | `ROLLBACK` → `IDLE`).
+ * Some fields only carry meaning in particular phases (see per-field docs).
+ */
 typedef struct {
-    char state[32];                             /* IDLE, STAGING, APPLYING, ROLLBACK, COMPLETE */
-    char version[UPDATE_VERSION_LEN + 1];
-    char hash_hex[UPDATE_HASH_LEN * 2 + 1];
-    char backup_path[256];
-    char binary_path[256];
-    long timestamp;
-    int attempt;
-    char type[16];                              /* "binary" or "config" */
+    char state[32];                        /**< One of IDLE, STAGING, APPLYING, ROLLBACK, COMPLETE. */
+    char version[UPDATE_VERSION_LEN + 1];  /**< Target version (IDLE leaves this empty). */
+    char hash_hex[UPDATE_HASH_LEN * 2 + 1];/**< SHA-256 hex of the staged artifact. */
+    char backup_path[256];                 /**< Pre-update backup location (APPLYING/ROLLBACK). */
+    char binary_path[256];                 /**< Path of the staged artifact (STAGING+). */
+    long timestamp;                        /**< Unix time of the last state transition. */
+    int attempt;                           /**< Retry counter for the current transition. */
+    char type[16];                         /**< "binary" or "config" — selects apply/rollback logic. */
 } update_state_t;
 
 /* --- State file helpers (pure, no process deps) --- */
@@ -164,5 +176,8 @@ int update_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
 #ifdef __cplusplus
 }
 #endif
+
+
+/** @} */ /* end of internal_fleet */
 
 #endif /* UPDATE_PROC_H */

@@ -17,6 +17,10 @@
 #ifndef DATA_H
 #define DATA_H
 
+/** @addtogroup internal_structures
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
@@ -487,5 +491,8 @@ bool data_equal(data_t *a, data_t *b);
 
 #define EDAT_INVL 210
 DECLARE_ERROR(EDAT_INVL, "Invalid data type");
+
+
+/** @} */ /* end of internal_structures */
 
 #endif  // DATA_H

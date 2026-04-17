@@ -17,6 +17,10 @@
 #ifndef UPDATE_PROPOSAL_H
 #define UPDATE_PROPOSAL_H
 
+/** @addtogroup internal_fleet
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <uuid/uuid.h>
@@ -67,5 +71,8 @@ int update_proposal_sign(update_proposal_t *prop, const uint8_t *sk);
   ensures \result == 0 || \result == -1;
 */
 int update_proposal_verify(const update_proposal_t *prop, const uint8_t *pk);
+
+
+/** @} */ /* end of internal_fleet */
 
 #endif /* UPDATE_PROPOSAL_H */

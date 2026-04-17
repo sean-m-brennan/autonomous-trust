@@ -17,6 +17,10 @@
 #ifndef DAG_H
 #define DAG_H
 
+/** @addtogroup internal_structures
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -313,5 +317,8 @@ DECLARE_ERROR(EDAG_BRANCH_EXISTS, "Branch already exists in DAG");
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of internal_structures */
 
 #endif  // DAG_H

@@ -17,6 +17,10 @@
 #ifndef NAMES_H
 #define NAMES_H
 
+/** @addtogroup internal_config
+ *  @{
+ */
+
 #include <stddef.h>
 #include <stdbool.h>
 
@@ -41,5 +45,8 @@ int random_name(char *out, size_t out_len, char sep, bool capitalize);
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of internal_config */
 
 #endif  // NAMES_H

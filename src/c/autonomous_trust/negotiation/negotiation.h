@@ -17,6 +17,10 @@
 #ifndef NEGOTIATION_H
 #define NEGOTIATION_H
 
+/** @addtogroup internal_negotiation
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
@@ -279,5 +283,8 @@ DECLARE_ERROR(ENEG_FULL, "Job queue is full");
 
 #define ENEG_NOTASK 242
 DECLARE_ERROR(ENEG_NOTASK, "Task not found");
+
+
+/** @} */ /* end of internal_negotiation */
 
 #endif  /* NEGOTIATION_H */

@@ -17,6 +17,10 @@
 #ifndef MESSAGE_H
 #define MESSAGE_H
 
+/** @addtogroup public_api
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <sys/socket.h>
 
@@ -199,5 +203,8 @@ void messaging_close();
 
 #define EMSG_NOCONN 204
 DECLARE_ERROR(EMSG_NOCONN, "Attempting to send/recv without a queue (see message_assign())");
+
+
+/** @} */ /* end of public_api */
 
 #endif  // MESSAGE_H

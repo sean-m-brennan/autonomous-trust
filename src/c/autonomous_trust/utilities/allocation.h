@@ -17,6 +17,10 @@
 #ifndef ALLOCATION_H
 #define ALLOCATION_H
 
+/** @addtogroup internal_utilities
+ *  @{
+ */
+
 #include <stdlib.h>
 #include <stdbool.h>
 
@@ -88,5 +92,8 @@ void _smrt_deref_impl(void *ptr);
 
 /* Macro NULLs the caller's pointer after free to prevent use-after-free */
 #define smrt_deref(ptr) do { _smrt_deref_impl(ptr); (ptr) = NULL; } while(0)
+
+
+/** @} */ /* end of internal_utilities */
 
 #endif  // ALLOCATION_H

@@ -17,6 +17,10 @@
 #ifndef PING_H
 #define PING_H
 
+/** @addtogroup internal_network
+ *  @{
+ */
+
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -84,5 +88,8 @@ int ping_server_start(void);
   ensures \result == 0;
 */
 int ping_server_stop(void);
+
+
+/** @} */ /* end of internal_network */
 
 #endif  /* PING_H */
