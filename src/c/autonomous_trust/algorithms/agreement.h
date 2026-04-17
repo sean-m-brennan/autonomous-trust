@@ -238,8 +238,19 @@ bool agreement_verify(agreement_protocol_t *proto, merkle_blob_t *blob,
 bool agreement_finalize(agreement_protocol_t *proto, merkle_blob_t *blob);
 
 /*@
-  requires proto == \null || \valid(proto);
-  frees proto;
+  behavior null:
+    assumes proto == \null;
+    assigns \nothing;
+  behavior valid:
+    assumes proto != \null;
+    requires \valid(proto);
+    requires proto->votes == \null || \valid(proto->votes);
+    requires proto->votes == \null || proto->votes->items != \null;
+    requires proto->votes == \null || proto->votes->length <= proto->votes->capacity;
+    requires (proto->type == AGREEMENT_WORK && proto->state.work.approved != \null)
+          ==> (\valid(proto->state.work.approved)
+               && proto->state.work.approved->array != \null);
+  disjoint behaviors;
 */
 void agreement_protocol_free(agreement_protocol_t *proto);
 

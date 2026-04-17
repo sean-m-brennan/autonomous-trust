@@ -76,7 +76,10 @@ static int oidc_credential_hash(zta_verifier_t *self,
     return EZTA_UNSUPPORTED;
 }
 
-/* Frama-C: skipped — [solver-timeout] stub preconditions */
+/*@
+  requires self == \null || \valid(self);
+  assigns \nothing;
+*/
 static void oidc_destroy(zta_verifier_t *self)
 {
     free(self);

@@ -476,7 +476,6 @@ bool merkle_consistent(merkle_tree_t *tree, int other_size,
     return memcmp(tree->root_digest, other_root_digest, MERKLE_DIGEST_LEN) == 0;
 }
 
-/* Frama-C: skipped — [solver-timeout] array_free preconditions */
 void merkle_tree_free(merkle_tree_t *tree)
 {
     if (tree == NULL)
