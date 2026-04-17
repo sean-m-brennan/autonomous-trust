@@ -17,6 +17,10 @@
 #ifndef MAP_H
 #define MAP_H
 
+/** @addtogroup internal_structures
+ *  @{
+ */
+
 #include "array.h"
 #include "data.h"
 #include "utilities/exception.h"
@@ -291,5 +295,8 @@ void map_free(map_t *map);
 
 #define EMAP_NOKEY 218
 DECLARE_ERROR(EMAP_NOKEY, "No such key in the map");
+
+
+/** @} */ /* end of internal_structures */
 
 #endif // MAP_H

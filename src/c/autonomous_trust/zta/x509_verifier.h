@@ -17,6 +17,10 @@
 #ifndef X509_VERIFIER_H
 #define X509_VERIFIER_H
 
+/** @addtogroup internal_zta
+ *  @{
+ */
+
 #include "zta_verifier.h"
 
 #ifdef __cplusplus
@@ -72,5 +76,8 @@ DECLARE_ERROR(EX509_VERIFY, "X.509 certificate verification failed");
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+
+/** @} */ /* end of internal_zta */
 
 #endif /* X509_VERIFIER_H */

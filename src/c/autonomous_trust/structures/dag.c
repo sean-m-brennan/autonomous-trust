@@ -28,6 +28,28 @@
 DEFINE_ERROR(EDAG_INVALID_BRANCH, "Invalid branch name in DAG");
 DEFINE_ERROR(EDAG_BRANCH_EXISTS, "Branch already exists in DAG");
 
+/* WHY two genesis constants (_genesis and dag_genesis):
+ *
+ * `_genesis` is the TU-local sentinel this file uses as the `.parent` of any
+ * newly-created step that has no explicit parent (see linked_step_create:
+ * s->parent = &dag_genesis). `dag_genesis` is the externally-visible copy
+ * other translation units (and the public header) may compare against.
+ *
+ * Both hold the all-zero UUID, but they live at DIFFERENT addresses in the
+ * binary (one static, one extern). Pointer equality alone is therefore not
+ * a sufficient genesis check: a step reached via this file's construction
+ * path will have parent == &dag_genesis, but a step reconstructed from
+ * serialized form elsewhere may have its own heap-allocated node whose uuid
+ * happens to be the zero-UUID, and any third caller may still hold a
+ * pointer to &_genesis from historical code.
+ *
+ * _is_genesis() therefore has to cover ALL three representations:
+ *   1. NULL                     — uninitialized or detached step
+ *   2. &dag_genesis / &_genesis — either in-binary sentinel
+ *   3. uuid match on zero-UUID  — any other object that serialized as genesis
+ *
+ * Do NOT collapse to a single check; removing (2) costs a strcmp in the hot
+ * path, and removing (3) silently breaks round-tripped DAGs. */
 static const linked_step_t _genesis = {
     .uuid = "00000000-0000-0000-0000-000000000000",
     .timestamp = {{0}},

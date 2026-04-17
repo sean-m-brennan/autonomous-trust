@@ -17,6 +17,10 @@
 #ifndef CONFIGURATION_H
 #define CONFIGURATION_H
 
+/** @addtogroup public_api
+ *  @{
+ */
+
 #include <stdio.h>
 
 #include <jansson.h>
@@ -63,16 +67,19 @@ int get_cfg_dir(char path[]);
 int get_data_dir(char path[]);
 
 /**
- * @brief
+ * @brief Registration entry for a named configuration section.
  *
+ * One entry per config section registered via DEFINE_CONFIGURATION(). The
+ * @c to_json / @c from_json callbacks marshal between the section's C
+ * struct and its on-disk JSON representation.
  */
 typedef struct
 {
-    const char *name;
-    int (*to_json)(const void *data_struct, json_t **obj_ptr);
-    int (*from_json)(const json_t *obj, void *data_struct);
-    size_t data_len;
-    void *data_struct;
+    const char *name;                                                      /**< Section name (JSON key). */
+    int (*to_json)(const void *data_struct, json_t **obj_ptr);             /**< Serialize @c data_struct → JSON. */
+    int (*from_json)(const json_t *obj, void *data_struct);                /**< Parse JSON → @c data_struct. */
+    size_t data_len;                                                       /**< Size of the backing struct in bytes. */
+    void *data_struct;                                                     /**< Pointer to the backing struct. */
 } config_t;
 
 #ifndef CONFIG_IMPL
@@ -88,8 +95,17 @@ extern size_t configuration_table_size;
 #define CONCAT(x, y) _CONCAT_NEXT(x, y)
 
 /**
- * @brief 
- * 
+ * @brief Register a named configuration section at program startup.
+ *
+ * Emits a `__attribute__((constructor))` function that appends an entry to
+ * @c configuration_table before main() runs. Use once per config section
+ * in the translation unit that owns the backing struct.
+ *
+ * @param cfg_name    Unquoted identifier used as the JSON section name.
+ * @param to          @c to_json callback (see @ref config_t).
+ * @param from        @c from_json callback.
+ * @param len         @c sizeof the backing struct.
+ * @param struct_ptr  Address of the backing struct instance.
  */
 #define DEFINE_CONFIGURATION(cfg_name, to, from, len, struct_ptr)                    \
     void __attribute__((constructor)) CONCAT(register_configuration_, __COUNTER__)() \
@@ -103,11 +119,14 @@ extern size_t configuration_table_size;
     }
 
 /**
- * @brief
+ * @brief Load a single config file into the provided struct.
  *
- * @param filename
- * @param data_struct
- * @return int
+ * Looks up the matching registered @ref config_t by the file's section name
+ * and invokes its @c from_json callback.
+ *
+ * @param[in]  filename     Absolute or cfg-relative path to the JSON file.
+ * @param[out] data_struct  Struct matching the section's registered layout.
+ * @return 0 on success, non-zero on I/O, parse, or dispatch failure.
  */
 /*@
   requires filename != \null && \valid_read(filename);
@@ -122,12 +141,12 @@ extern size_t configuration_table_size;
 int read_config_file(const char *filename, void *data_struct);
 
 /**
- * @brief
+ * @brief Write a struct back to its on-disk JSON config file.
  *
- * @param config
- * @param data_struct
- * @param filename
- * @return int
+ * @param[in] config       Registration entry identifying the section.
+ * @param[in] data_struct  Populated struct matching @p config->data_struct layout.
+ * @param[in] filename     Destination path.
+ * @return 0 on success, non-zero on I/O or serialization failure.
  */
 /*@
   requires \valid(config);
@@ -172,15 +191,13 @@ int load_config(char *filepath, config_t **config, char *cfg_name, logger_t *log
 int load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger);
 
 /**
- * @brief
- *
+ * @brief Error: no config implementation registered for the given name.
  */
 #define ECFG_NOIMPL 206
 DECLARE_ERROR(ECFG_NOIMPL, "No config implementation registered for the given name");
 
 /**
- * @brief
- *
+ * @brief Error: configuration file is malformed.
  */
 #define ECFG_BADFMT 207
 DECLARE_ERROR(ECFG_BADFMT, "Configuration incorrectly formatted")
@@ -188,5 +205,8 @@ DECLARE_ERROR(ECFG_BADFMT, "Configuration incorrectly formatted")
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of public_api */
 
 #endif  // CONFIGURATION_H

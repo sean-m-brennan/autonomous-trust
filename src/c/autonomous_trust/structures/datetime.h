@@ -17,6 +17,10 @@
 #ifndef DATETIME_H
 #define DATETIME_H
 
+/** @addtogroup internal_structures
+ *  @{
+ */
+
 #include <string.h>
 #include <stdbool.h>
 #include <time.h>
@@ -203,5 +207,8 @@ DECLARE_ERROR(EDT_FMT, "String in incorrect format for datetime parsing")
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of internal_structures */
 
 #endif  // DATETIME_H

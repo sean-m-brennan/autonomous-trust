@@ -76,6 +76,22 @@ int identity_init(uuid_t *uuid, char *address, char *fullname,
 int identity_create(uuid_t *uuid, char *address, char *fullname,
                     char *nickname, char *petname, identity_t **ident)
 {
+    /* WHY we call sodium_init() here rather than from a one-shot bootstrap:
+     *
+     * libsodium's sodium_init() is documented as idempotent and thread-safe:
+     * calling it repeatedly returns 1 (already initialized) after the first
+     * successful call, and concurrent callers are serialized internally.
+     * See https://libsodium.gitbook.io/doc/usage — "it is safe to call
+     * sodium_init() multiple times, or from different threads".
+     *
+     * We therefore do not keep a library-wide `at_init()` function: every
+     * entry point that needs crypto just calls sodium_init() defensively.
+     * This avoids bootstrap ordering bugs when the library is embedded in
+     * an application that does not know about AT's crypto dependency, and
+     * keeps each public function self-sufficient.
+     *
+     * A negative return here means libsodium failed to seed its RNG (no
+     * /dev/urandom, no getrandom, no CPU RDRAND) — unrecoverable; bail. */
     if (sodium_init() < 0)
     {
         // sodium_init() failed: libsodium could not be initialized

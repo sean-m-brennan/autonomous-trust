@@ -17,6 +17,10 @@
 #ifndef PROCESS_TRACKER_H
 #define PROCESS_TRACKER_H
 
+/** @addtogroup internal_processes
+ *  @{
+ */
+
 #include "structures/map.h"
 #include "utilities/logger.h"
 #include "utilities/message.h"
@@ -219,5 +223,8 @@ void tracker_free(tracker_t *tracker);
  */
 #define EPROC_NF 205
 DECLARE_ERROR(EPROC_NF, "Process not found in process table");
+
+
+/** @} */ /* end of internal_processes */
 
 #endif  // PROCESS_TRACKER_H

@@ -17,6 +17,10 @@
 #ifndef AGREEMENT_H
 #define AGREEMENT_H
 
+/** @addtogroup internal_algorithms
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -63,32 +67,42 @@ typedef void (*count_vote_fn)(agreement_protocol_t *proto, merkle_blob_t *blob,
                               int *rank_out, bool *approval_out);
 typedef bool (*accumulate_votes_fn)(agreement_protocol_t *proto, int *ranks, bool *approvals, int count);
 
+/**
+ * @brief Polymorphic agreement protocol — authority, stake, or work.
+ *
+ * The @c type field selects which union arm of @c state is live AND which
+ * vtable entries semantically apply. Construct with the matching
+ * `agreement_by_*_create()` helper; do not hand-initialize.
+ */
 struct agreement_protocol_s {
-    agreement_voter_t myself;
-    agreement_voter_t *voters;
-    int voter_count;
-    map_t *votes;       /* uuid -> array of (blob, proof, sig) */
-    agreement_type_t type;
+    agreement_voter_t myself;          /**< This participant's voter record. */
+    agreement_voter_t *voters;         /**< Array of all voters including self. */
+    int voter_count;                   /**< Length of @c voters. */
+    map_t *votes;                      /**< uuid → array of (blob, proof, sig). */
+    agreement_type_t type;             /**< Discriminates the @c state union. */
 
-    /* vtable */
-    pre_verify_fn pre_verify;
-    prep_vote_fn prep_vote;
-    count_vote_fn count_vote;
-    accumulate_votes_fn accumulate_votes;
+    /* vtable — populated by agreement_by_*_create(); must not be replaced. */
+    pre_verify_fn       pre_verify;       /**< Per-vote signature/proof check. */
+    prep_vote_fn        prep_vote;        /**< Reset transient tallies before a round. */
+    count_vote_fn       count_vote;       /**< Fold one incoming vote into tallies. */
+    accumulate_votes_fn accumulate_votes; /**< Decide final outcome from tallies. */
 
-    /* type-specific state */
+    /** @brief Type-specific state; only the arm matching @c type is live. */
     union {
+        /** @brief Valid when @c type == @ref AGREEMENT_AUTHORITY. */
         struct {
-            int threshold_rank;
+            int threshold_rank;                            /**< Minimum rank that counts as authority. */
         } authority;
+        /** @brief Valid when @c type == @ref AGREEMENT_STAKE. */
         struct {
-            double yea;
-            double nay;
-            double (*get_stake)(agreement_voter_t *voter);
+            double yea;                                    /**< Accumulated stake-weighted approvals. */
+            double nay;                                    /**< Accumulated stake-weighted rejections. */
+            double (*get_stake)(agreement_voter_t *voter); /**< Callback returning stake weight. */
         } stake;
+        /** @brief Valid when @c type == @ref AGREEMENT_WORK. */
         struct {
-            int difficulty;
-            array_t *approved;
+            int difficulty;                                /**< PoW target (leading-zero bits). */
+            array_t *approved;                             /**< UUIDs whose proof has cleared @c difficulty. */
         } work;
     } state;
 };
@@ -257,5 +271,8 @@ void agreement_protocol_free(agreement_protocol_t *proto);
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of internal_algorithms */
 
 #endif  // AGREEMENT_H
