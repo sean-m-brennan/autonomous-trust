@@ -31,6 +31,7 @@
 
 DEFINE_ERROR(ENTP_TIMEOUT, "NTP request timed out");
 DEFINE_ERROR(ENTP_STRATUM, "NTP stratum too high");
+DEFINE_ERROR(ENTP_SHORT, "NTP response truncated");
 
 /****************************
  * Byte-order conversion helpers
@@ -201,7 +202,7 @@ int ntp_client_request(const char *server_addr, ntp_result_t *result)
     }
 
     if (n < (ssize_t)sizeof(ntp_packet_t))
-        return -1;
+        return EXCEPTION(ENTP_SHORT);
 
     /* Record receive time (t4) */
     struct timespec t4;

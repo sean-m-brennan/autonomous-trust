@@ -22,6 +22,7 @@
  */
 
 #include <sys/time.h>
+#include <pthread.h>
 
 #include "utilities/message.h"
 #include "config/configuration.h"
@@ -48,11 +49,36 @@ struct process_s
         group_t group;
         public_identity_t peers[DEFAULT_MAX_PEERS];
         size_t num_peers;
+        /* Protects peers[] and num_peers against concurrent reader/writer
+         * threads within a single process (e.g., net_proc peer_receiver_thread
+         * writing while other threads iterate). */
+        pthread_rwlock_t peers_rwlock;
         map_t *peer_capabilities;
         int phase;
         array_t *unhandled_messages;
     } protocol;
 };
+
+static inline void peers_read_lock(const process_t *proc)
+{
+    if (proc != NULL)
+        pthread_rwlock_rdlock((pthread_rwlock_t *)&proc->protocol.peers_rwlock);
+}
+static inline void peers_read_unlock(const process_t *proc)
+{
+    if (proc != NULL)
+        pthread_rwlock_unlock((pthread_rwlock_t *)&proc->protocol.peers_rwlock);
+}
+static inline void peers_write_lock(process_t *proc)
+{
+    if (proc != NULL)
+        pthread_rwlock_wrlock(&proc->protocol.peers_rwlock);
+}
+static inline void peers_write_unlock(process_t *proc)
+{
+    if (proc != NULL)
+        pthread_rwlock_unlock(&proc->protocol.peers_rwlock);
+}
 
 #define SIG_NAME_LEN PROC_NAME_LEN + 2
 
@@ -116,9 +142,9 @@ extern const char *sig_quit;
 int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies);
 
 int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
-                  map_t *procs, directory_t *queues, logger_t *logger);
+                  map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger);
 
-int restart_process(pid_t orig, char *pname, map_t *procs, directory_t *queues, logger_t *logger);
+int restart_process(pid_t orig, char *pname, map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger);
 
 
 /**

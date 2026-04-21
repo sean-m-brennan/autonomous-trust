@@ -36,6 +36,9 @@
 #define CIDR6_LEN (IPV6_ADDR_LEN + 4)
 #define MAC_ADDR_LEN 17
 
+#define DEFAULT_MCAST4_ADDR "239.0.0.1"
+#define DEFAULT_MCAST6_ADDR "ff02::1"
+
 typedef struct
 {
     smrt_ptr_t;

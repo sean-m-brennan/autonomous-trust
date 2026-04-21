@@ -71,22 +71,28 @@ static int copy_file(const char *src, const char *dst)
 
     char buf[4096];
     size_t n;
+    int write_err = 0;
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
     {
         if (fwrite(buf, 1, n, out) != n)
         {
-            fclose(in);
-            fclose(out);
-            return -1;
+            write_err = 1;
+            break;
         }
     }
 
     int read_err = ferror(in);
     fclose(in);
-    fclose(out);
+    /* fclose on the output flushes stdio buffers; ENOSPC/EIO can surface
+     * only here. Treat a close error as a write error so we unlink below. */
+    if (fclose(out) != 0)
+        write_err = 1;
 
-    if (read_err)
+    if (read_err || write_err)
+    {
+        unlink(dst);
         return -1;
+    }
 
     chmod(dst, 0755);
     return 0;
@@ -159,6 +165,7 @@ static void broadcast_status(const process_t *proc,
     json_object_set_new(base, "status", json_string(status));
     json_object_set_new(base, "detail", json_string(detail));
 
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         json_t *copy = json_deep_copy(base);
@@ -180,6 +187,7 @@ static void broadcast_status(const process_t *proc,
         json_decref(copy);
         messaging_send("network", NET_MESSAGE, &out, false);
     }
+    peers_read_unlock(proc);
     json_decref(base);
 }
 
@@ -232,11 +240,15 @@ static int stage_and_apply(const process_t *proc,
     update_state_t state;
     memset(&state, 0, sizeof(state));
     strncpy(state.state, "APPLYING", sizeof(state.state) - 1);
+    state.state[sizeof(state.state) - 1] = '\0';
     strncpy(state.version, version, sizeof(state.version) - 1);
+    state.version[sizeof(state.version) - 1] = '\0';
     strncpy(state.hash_hex, hash_hex, sizeof(state.hash_hex) - 1);
-    strncpy(state.backup_path, backup_path, sizeof(state.backup_path) - 1);
-    strncpy(state.binary_path, binary_path, sizeof(state.binary_path) - 1);
+    state.hash_hex[sizeof(state.hash_hex) - 1] = '\0';
+    snprintf(state.backup_path, sizeof(state.backup_path), "%s", backup_path);
+    snprintf(state.binary_path, sizeof(state.binary_path), "%s", binary_path);
     strncpy(state.type, "binary", sizeof(state.type) - 1);
+    state.type[sizeof(state.type) - 1] = '\0';
     state.timestamp = (long)time(NULL);
     state.attempt = 1;
 
@@ -327,6 +339,7 @@ static void run_health_check(const process_t *proc, update_state_t *state)
 
     /* Peer handshake test: try to reach at least one peer */
     bool handshake_ok = false;
+    peers_read_lock(proc);
     if (proc->protocol.num_peers == 0)
     {
         handshake_ok = true;  /* no peers to test — consider OK */
@@ -363,6 +376,7 @@ static void run_health_check(const process_t *proc, update_state_t *state)
             json_decref(ping);
         }
     }
+    peers_read_unlock(proc);
 
     if (!handshake_ok)
     {
@@ -571,6 +585,7 @@ int update_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
             snprintf(data_dir, sizeof(data_dir), "/tmp/at_update");
     }
     strncpy(update_data_dir, data_dir, sizeof(update_data_dir) - 1);
+    update_data_dir[sizeof(update_data_dir) - 1] = '\0';
 
     /* Check for pending update state file */
     if (update_state_exists(update_data_dir))

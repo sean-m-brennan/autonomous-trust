@@ -51,13 +51,22 @@ typedef struct {
 void *smrt_create(size_t size);
 
 /*@
-  requires orig == \null || \valid((char *)orig + (0 .. size - 1));
+  requires \valid(pptr);
+  requires *pptr == \null || \valid((char *)*pptr + (0 .. size - 1));
   requires size > 0;
-  assigns \nothing;
-  ensures \result == \null ||
-    \valid((char *)\result + (0 .. size - 1));
+  assigns *pptr;
+  ensures \result == 0 || \result != 0;
 */
-void *smrt_recreate(void *orig, size_t size);
+/**
+ * @brief Resize @c *pptr to @p size bytes.
+ * @details On success (return 0), @c *pptr is replaced with the (possibly
+ * moved) new block. On failure (non-zero), @c *pptr is unchanged and still
+ * points at the original block — no memory is leaked and no dangling
+ * pointer is produced. This contract is enforced by the double-pointer
+ * API: callers cannot accidentally overwrite the original pointer on
+ * failure, unlike a plain realloc-shaped signature.
+ */
+int smrt_recreate(void **pptr, size_t size);
 
 /*@
   requires \valid((smrt_ptr_t *)ptr);

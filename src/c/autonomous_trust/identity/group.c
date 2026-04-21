@@ -36,6 +36,7 @@ int group_init(uuid_t *uuid, char *address, group_t *group)
     else
         memcpy(&group->uuid, uuid, sizeof(uuid_t));
     strncpy(group->address, address, ADDR_LEN);
+    group->address[ADDR_LEN] = '\0';   /* strncpy does not terminate when src is >= ADDR_LEN */
     map_init(&group->address_map);
     unsigned char *eseed = encryptor_generate();
     if (eseed == NULL)
@@ -145,7 +146,10 @@ int group_from_json(const json_t *obj, void *data_struct)
     {
         const char *addr = json_string_value(addr_obj);
         if (addr != NULL)
+        {
             strncpy(group->address, addr, ADDR_LEN);
+            group->address[ADDR_LEN] = '\0';
+        }
     }
 
     json_t *addr_map_obj = json_object_get(obj, "address_map");

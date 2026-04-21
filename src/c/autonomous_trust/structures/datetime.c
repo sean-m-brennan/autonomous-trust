@@ -126,6 +126,9 @@ time_res_config_t set_time_resolution(time_resolution_t res)
 int str_to_offset(const char *str, float *offset)  // FIXME different sig for errors
 {
     char s[MAX_TZ_OFFSET_STR+1] = {0};
+    /* strcpy is safe here because the only in-tree caller passes the
+     * output of strftime(..., "%z", ...), which is always 5 bytes
+     * ("+0000" format). If this helper ever becomes public, re-evaluate. */
     strcpy(s, str);
     char *first = strchr(s, ':');
     if (first == NULL)
@@ -163,7 +166,7 @@ int offset_to_str(float offset, char *str)
     int seconds = (int)(3600 * (frac - (60.0 / minutes)));
     if (seconds > 0)
         return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%s%d:%d:%d", sign, (int)hour, minutes, seconds);
-    return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%s%d:%d", sign, (int)hour, minutes, seconds);
+    return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%s%d:%d", sign, (int)hour, minutes);
 }
 
 const char *conversions[] = {"%f", "%z", "%Z"};

@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 #include <sys/select.h>
 #include <time.h>
 
@@ -73,6 +74,8 @@ static X509 *parse_cert(const uint8_t *data, size_t len)
         return cert;
 
     /* Try PEM */
+    if (len > INT_MAX)
+        return NULL;
     BIO *bio = BIO_new_mem_buf(data, (int)len);
     if (!bio)
         return NULL;
@@ -224,7 +227,9 @@ static OCSP_RESPONSE *_ocsp_query(const char *url, OCSP_REQUEST *req,
 
     /* Build host:port string for BIO_new_connect */
     char host_port[512];
-    snprintf(host_port, sizeof(host_port), "%s:%s", host, port);
+    int hp_written = snprintf(host_port, sizeof(host_port), "%s:%s", host, port);
+    if (hp_written < 0 || (size_t)hp_written >= sizeof(host_port))
+        goto cleanup;
 
     cbio = BIO_new_connect(host_port);
     if (!cbio)
@@ -547,7 +552,9 @@ static int x509_check_revocation(zta_verifier_t *self,
             return 0;
         }
 
-        /* Look up the status for our cert */
+        /* Look up the status for our cert.  lookup_id is freed once per
+         * control-flow path: in the error branch below (before return 0),
+         * OR in the success branch after the if.  Not a double-free. */
         OCSP_CERTID *lookup_id = OCSP_cert_to_id(EVP_sha256(), cert, issuer);
         int cert_status = -1, revoke_reason = 0;
         ASN1_GENERALIZEDTIME *revtime = NULL, *thisupd = NULL, *nextupd = NULL;

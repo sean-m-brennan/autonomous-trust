@@ -100,10 +100,15 @@ DEFINE_TEST(test_network_json_roundtrip)
     memset(&net_out, 0, sizeof(net_out));
     net_out.port = 27787;
     strncpy(net_out.ip4_cidr, "192.168.1.0/24", CIDR4_LEN);
+    net_out.ip4_cidr[CIDR4_LEN] = '\0';
     strncpy(net_out.ip6_cidr, "2001:db8::/64", CIDR6_LEN);
+    net_out.ip6_cidr[CIDR6_LEN] = '\0';
     strncpy(net_out.mcast4_addr, "239.0.0.1", IPV4_ADDR_LEN);
+    net_out.mcast4_addr[IPV4_ADDR_LEN] = '\0';
     strncpy(net_out.mcast6_addr, "ff02::1", IPV6_ADDR_LEN);
+    net_out.mcast6_addr[IPV6_ADDR_LEN] = '\0';
     strncpy(net_out.mac_address, "00:11:22:33:44:55", MAC_ADDR_LEN);
+    net_out.mac_address[MAC_ADDR_LEN] = '\0';
 
     json_t *obj = NULL;
     ck_assert_ret_ok(network_to_json(&net_out, &obj));
