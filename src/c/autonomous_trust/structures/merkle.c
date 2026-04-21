@@ -379,7 +379,17 @@ int merkle_inclusion_proof(merkle_tree_t *tree, merkle_blob_t *blob,
         tmp = tree->nodes[tmp].parent;
     }
 
-    merkle_proof_step_t *proof = malloc(sizeof(merkle_proof_step_t) * depth);
+    if (depth <= 0)
+    {
+        /* leaf IS root; empty proof */
+        *proof_out = NULL;
+        *proof_len = 0;
+        return 0;
+    }
+    size_t bytes;
+    if (__builtin_mul_overflow((size_t)depth, sizeof(merkle_proof_step_t), &bytes))
+        return ENOMEM;
+    merkle_proof_step_t *proof = malloc(bytes);
     if (proof == NULL)
         return ENOMEM;
 

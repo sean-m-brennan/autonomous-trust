@@ -163,6 +163,20 @@ DEFINE_TEST(test_paxos_next_ids)
     ck_assert(id2 == 1);
     ck_assert(id1 > 0);
 
+    /* Regression for paxos.c:214-223 — id1 must be strictly monotonic, even
+     * for back-to-back calls within the same millisecond.  Original code
+     * derived id1 from clock_gettime(ms), so a tight loop of calls all
+     * produced the same id1, violating Paxos safety.  Fix folds a per-
+     * instance counter (and the node_id) into id1. */
+    int64_t prev = id1;
+    for (int i = 0; i < 32; i++)
+    {
+        int64_t next_id1 = 0, next_id2 = 0;
+        paxos_next_ids(&inst, &next_id1, &next_id2);
+        ck_assert(next_id1 > prev);
+        prev = next_id1;
+    }
+
     paxos_destroy(&inst);
 }
 END_TEST_DEFINITION()

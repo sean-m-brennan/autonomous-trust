@@ -41,7 +41,7 @@ ffi.cdef("""
     typedef struct { bool alloc; size_t refs; } smrt_ptr_t;
 
     void *smrt_create(size_t size);
-    void *smrt_recreate(void *orig, size_t size);
+    int smrt_recreate(void **pptr, size_t size);
     void smrt_ref(void *ptr);
     void smrt_deref(void *ptr);
 

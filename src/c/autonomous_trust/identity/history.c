@@ -37,10 +37,15 @@ static int _identity_obj_designation(const merkle_blob_t *blob, uint8_t **out, s
     char uuid_str[37];
     uuid_unparse_lower(obj->identity->uuid, uuid_str);
 
-    /* originator + uuid + fullname + public_key */
-    size_t orig_len = strlen(obj->originator_uuid);
-    size_t uuid_len = strlen(uuid_str);
-    size_t name_len = strlen(obj->identity->fullname);
+    /* originator + uuid + fullname + public_key.  Use strnlen throughout
+     * so a wire-sourced identity that lacks a NUL terminator cannot walk
+     * past the field and read adjacent memory. */
+    size_t orig_len = strnlen(obj->originator_uuid, MERKLE_UUID_LEN);
+    size_t uuid_len = strnlen(uuid_str, sizeof(uuid_str));
+    size_t name_len = strnlen(obj->identity->fullname, NAME_LEN + 1);
+    if (orig_len >= MERKLE_UUID_LEN || uuid_len >= sizeof(uuid_str) ||
+        name_len > NAME_LEN)
+        return EINVAL;
     size_t key_len = crypto_sign_PUBLICKEYBYTES;
     size_t total = orig_len + uuid_len + name_len + key_len;
 
@@ -114,12 +119,18 @@ int identity_obj_create(public_identity_t *identity, const char *originator_uuid
 
     o->identity = identity;
     if (originator_uuid != NULL)
+    {
         strncpy(o->originator_uuid, originator_uuid, MERKLE_UUID_LEN - 1);
+        o->originator_uuid[MERKLE_UUID_LEN - 1] = '\0';
+    }
 
     /* set up blob interface */
     uuid_unparse_lower(identity->uuid, o->base.uuid);
     if (originator_uuid != NULL)
+    {
         strncpy(o->base.originator, originator_uuid, MERKLE_UUID_LEN - 1);
+        o->base.originator[MERKLE_UUID_LEN - 1] = '\0';
+    }
     o->base.designation = _identity_obj_designation;
     o->base.get_hash = _identity_obj_get_hash;
     o->base.user_data = identity;
@@ -316,16 +327,11 @@ static json_t *linked_step_to_json(const linked_step_t *step)
     /* payload is a merkle root digest (MERKLE_DIGEST_LEN bytes) */
     if (step->payload != NULL)
     {
-        size_t hex_len = MERKLE_DIGEST_LEN * 2 + 1;
-        char *hex = malloc(hex_len);
-        if (hex != NULL)
-        {
-            hexlify((const unsigned char *)step->payload, MERKLE_DIGEST_LEN,
-                    (unsigned char *)hex);
-            hex[MERKLE_DIGEST_LEN * 2] = '\0';
-            json_object_set_new(obj, "payload", json_string(hex));
-            free(hex);
-        }
+        char hex[MERKLE_DIGEST_LEN * 2 + 1];
+        hexlify((const unsigned char *)step->payload, MERKLE_DIGEST_LEN,
+                (unsigned char *)hex);
+        hex[MERKLE_DIGEST_LEN * 2] = '\0';
+        json_object_set_new(obj, "payload", json_string(hex));
     }
 
     return obj;

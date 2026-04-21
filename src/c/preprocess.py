@@ -17,13 +17,14 @@
 
 import os
 import sys
+from typing import List, Tuple
 
 
 class MalformedError(RuntimeError):
     pass
 
 
-def find_next_matching_parens(content, index) -> tuple[int, int]:
+def find_next_matching_parens(content, index) -> Tuple[int, int]:
     o_paren = content.find('(', index)
     if o_paren < 0:
         raise MalformedError
@@ -41,10 +42,12 @@ def find_next_matching_parens(content, index) -> tuple[int, int]:
     return o_paren, c_paren
 
 
-def preprocess(target_filepath: str, output_file: str, directory: str, rel_path: str = None):
+def preprocess(target_filepath: str, output_file: str, directory: str, rel_path: str = None, exclude_dirs: list = None):
     prefix = 'DECLARE_'
     if rel_path is None:
         rel_path = ''
+    if exclude_dirs is None:                                                                                
+        exclude_dirs = []  
     ignore_list = []
 
     definition = ''
@@ -84,9 +87,11 @@ def preprocess(target_filepath: str, output_file: str, directory: str, rel_path:
         definition = definition[:c_paren] + '"' + definition[c_paren + 1:]  # must come first
         definition = definition.replace('QUOTE(', '"', 1)
 
-    declarations: list[str] = []
-    includes: list[str] = []
+    declarations: List[str] = []
+    includes: List[str] = []
     for root, dirs, files in os.walk(os.path.abspath(directory)):
+        # Prune excluded subdirectories in-place so os.walk skips them entirely.
+        dirs[:] = [d for d in dirs if d not in exclude_dirs]  
         for filename in files:
             ignore = False
             for path in ignore_list:
@@ -154,5 +159,15 @@ def preprocess(target_filepath: str, output_file: str, directory: str, rel_path:
 
 
 if __name__ == '__main__':
-    # TODO argparse
-    preprocess(*sys.argv[1:])
+      import argparse                                                                                         
+      ap = argparse.ArgumentParser()
+      ap.add_argument('target')                                                                               
+      ap.add_argument('output')                                                                               
+      ap.add_argument('srcdir')
+      ap.add_argument('rel_path', nargs='?', default=None)                                                    
+      ap.add_argument('--exclude', action='append', default=[],                                               
+                      help='Subdirectory name to skip (may repeat)')
+      args = ap.parse_args()                                                                                  
+      preprocess(args.target, args.output, args.srcdir, args.rel_path,
+                 exclude_dirs=args.exclude)                                                                   
+ 

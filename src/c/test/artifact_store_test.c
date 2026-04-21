@@ -170,7 +170,7 @@ DEFINE_TEST(test_manifest_roundtrip)
 
     artifact_manifest_t m;
     memset(&m, 0, sizeof(m));
-    strncpy(m.hash_hex, hash_hex, sizeof(m.hash_hex) - 1);
+    snprintf(m.hash_hex, sizeof(m.hash_hex), "%s", hash_hex);
     m.total_chunks = 42;
     m.total_size = 40320;
     m.chunk_size = 960;
@@ -214,7 +214,7 @@ DEFINE_TEST(test_verify_valid)
     /* Save manifest */
     artifact_manifest_t m;
     memset(&m, 0, sizeof(m));
-    strncpy(m.hash_hex, hash_hex, sizeof(m.hash_hex) - 1);
+    snprintf(m.hash_hex, sizeof(m.hash_hex), "%s", hash_hex);
     m.total_chunks = 2;
     m.total_size = 64;
     m.chunk_size = 32;
@@ -264,7 +264,7 @@ DEFINE_TEST(test_verify_invalid)
     /* Save manifest + chunks under the real hash_hex */
     artifact_manifest_t m;
     memset(&m, 0, sizeof(m));
-    strncpy(m.hash_hex, hash_hex, sizeof(m.hash_hex) - 1);
+    snprintf(m.hash_hex, sizeof(m.hash_hex), "%s", hash_hex);
     m.total_chunks = 2;
     m.total_size = 64;
     m.chunk_size = 32;
@@ -303,7 +303,7 @@ DEFINE_TEST(test_delete)
     /* Save manifest + 1 chunk */
     artifact_manifest_t m;
     memset(&m, 0, sizeof(m));
-    strncpy(m.hash_hex, hash_hex, sizeof(m.hash_hex) - 1);
+    snprintf(m.hash_hex, sizeof(m.hash_hex), "%s", hash_hex);
     m.total_chunks = 1;
     m.total_size = 32;
     m.chunk_size = 32;

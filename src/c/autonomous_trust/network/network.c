@@ -41,11 +41,13 @@ int cidr_split(char * cidr, char *addr, char *mask)
     char *a = strtok_r(cidr_dup, "/", &saveptr);
     if (a == NULL)
         return EXCEPTION(EINVAL);  // empty string
-    strncpy(addr, a, IPV4_ADDR_LEN);
+    /* Callers pass addr[IPV4_ADDR_LEN] (16 bytes) and mask[3]; use snprintf
+     * to guarantee NUL termination and deterministic truncation. */
+    snprintf(addr, IPV4_ADDR_LEN, "%s", a);
     if (mask != NULL) {
         char *m = strtok_r(NULL, "/", &saveptr);
         if (m != NULL)
-            strncpy(mask, m, 3);
+            snprintf(mask, 3, "%s", m);
         // missing slash is acceptable
     }
     free(cidr_dup);

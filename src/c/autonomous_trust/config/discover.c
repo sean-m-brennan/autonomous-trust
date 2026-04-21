@@ -15,21 +15,21 @@
  *******************/
 
 #include <string.h>
-#include <libgen.h>
 
 #include "discover.h"
 
-/* Frama-C: skipped — [syscall] basename(3) + string manipulation */
+/* Frama-C: skipped — [syscall] string manipulation */
 int get_cfg_type(const char *path, char *type_out, size_t type_len)
 {
     if (path == NULL || type_out == NULL || type_len == 0)
         return -1;
 
-    /* get basename */
+    /* reentrant basename: POSIX basename(3) may use static storage */
     char path_copy[512];
     strncpy(path_copy, path, sizeof(path_copy) - 1);
     path_copy[sizeof(path_copy) - 1] = '\0';
-    const char *base = basename(path_copy);
+    const char *slash = strrchr(path_copy, '/');
+    const char *base = (slash != NULL) ? slash + 1 : path_copy;
 
     /* check for .cfg.json suffix and strip it */
     size_t base_len = strlen(base);

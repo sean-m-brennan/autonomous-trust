@@ -108,7 +108,7 @@ int array_get(array_t *a, int index, data_t **element)
 {
     if (index < 0)
         index = a->size + index;
-    if (index > a->size)
+    if (index >= (int)a->size)
         return EXCEPTION(EARR_OOB);
     *element = a->array[index];
     return 0;
@@ -123,12 +123,13 @@ int array_set(array_t *a, int index, data_t *element)
         return EXCEPTION(EARR_OOB);
 
     if (index == a->size) {
+        /* Skip realloc only on the first insert into a freshly-init'd array:
+         * array_init pre-allocates 1 slot, so size==0 && array!=NULL means
+         * that slot is still free. Every other case must grow. */
         if (a->size > 0 || a->array == NULL) {
             size_t new_size = (a->size + 1) * sizeof(data_t);
-            data_t **bigger_array = smrt_recreate(a->array, new_size);
-            if (bigger_array == NULL)
+            if (smrt_recreate((void **)&a->array, new_size) != 0)
                 return EXCEPTION(ENOMEM);
-            a->array = bigger_array;
         }
         a->size++;
     }

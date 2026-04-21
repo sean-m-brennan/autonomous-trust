@@ -94,6 +94,8 @@ int logger_init_time_res(logger_t *logger, log_level_t max_level, const char *lo
         logger->file = stderr;
     else
     {
+        /* logger->file_name was zero'd by the memset above; strncpy writes
+         * at most 255 bytes, leaving byte 255 as the NUL terminator. */
         strncpy(logger->file_name, log_file, 255);
         logger->file = fopen(logger->file_name, "a");
         if (logger->file == NULL)
@@ -268,6 +270,12 @@ void _log_exception_extra(logger_t *logger, const char *srcfile, const size_t li
         addtnl = malloc(ORIGIN_LEN+1);
         snprintf(addtnl, ORIGIN_LEN, ORIGIN_FMT, srcfile, line);
     }
+    /* Allocation size matches exactly what the three writes need:
+     *   strcpy err_info  → strlen(err_info) bytes + NUL
+     *   strcat "%s"      → 2 more bytes + NUL (overwrites prior NUL)
+     *   strcat addtnl    → strlen(addtnl) bytes + NUL (len=0 when !add_stack)
+     *   total            = strlen(err_info) + 2 + strlen(addtnl) + 1
+     * No overrun. */
     char *format = malloc(strlen(err_info) + 2 + strlen(addtnl) + 1);
     strcpy(format, err_info);
     strcat(format, "%s");

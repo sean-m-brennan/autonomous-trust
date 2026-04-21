@@ -30,7 +30,12 @@
         .arguments = args,                                \
     },
 
-capability_t capability_table[] = {
+
+#ifndef CAPABILITY_TABLE_CAPACITY
+#define CAPABILITY_TABLE_CAPACITY 128
+#endif
+
+capability_t capability_table[CAPABILITY_TABLE_CAPACITY] = {
     LIST__DECLARE_CAPABILITY
 };
 

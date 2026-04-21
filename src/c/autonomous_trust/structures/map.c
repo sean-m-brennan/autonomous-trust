@@ -169,6 +169,9 @@ int reindex(map_t *map)
         if (entry.key != NULL && entry.key[0] != 0)
         {
             size_t idx = map_hash2index(map, entry.hash);
+            /* Linear probe is guaranteed to terminate: reindex() runs at
+             * the 75%-full threshold and grows capacity, so we always have
+             * at least 25% empty slots to land in. */
             /*@
               loop invariant 0 <= idx < map->capacity;
               loop assigns idx;

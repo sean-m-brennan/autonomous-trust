@@ -19,10 +19,20 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
 
 #include "autonomous_trust/config/configuration.h"
+#include "autonomous_trust/utilities/logger.h"
 
 extern int config_absolute_path(const char *path_in, char *path_out);
+extern int load_config(char *filepath, config_t **config_ptr,
+                       char *cfg_name, logger_t *logger);
+
+static logger_t _m2_test_logger;
+static void __attribute__((constructor)) _init_m2_test_logger(void)
+{
+    logger_init(&_m2_test_logger, CRITICAL, NULL);
+}
 
 DEFINE_TEST(test_get_cfg_dir)
 {
@@ -108,6 +118,93 @@ DEFINE_TEST(test_config_absolute_path)
 }
 END_TEST_DEFINITION()
 
+/* Regression for configuration.c:141 — config_absolute_path used a prefix
+ * check that did not prevent ".." traversal.  Inputs like "../../etc/passwd"
+ * joined cleanly with cfg_dir and escaped the sandbox.  Fix rejects literal
+ * ".." substrings and requires absolute inputs to match cfg_dir followed by
+ * '/'. */
+DEFINE_TEST(test_config_absolute_path_rejects_traversal)
+{
+    setenv("AUTONOMOUS_TRUST_ROOT", "/tmp/at_test", 1);
+
+    char cfg_dir[CFG_PATH_LEN + 1] = {0};
+    ck_assert(get_cfg_dir(cfg_dir) > 0);
+    size_t cfg_dir_len = strlen(cfg_dir);
+
+    const char *attacks[] = {
+        "../../../etc/passwd",
+        "..",
+        "../secrets.cfg.json",
+        "subdir/../../escape.cfg.json",
+    };
+
+    for (size_t i = 0; i < sizeof(attacks) / sizeof(attacks[0]); i++)
+    {
+        char path_out[CFG_PATH_LEN + 1] = {0};
+        int rc = config_absolute_path(attacks[i], path_out);
+
+        if (rc == 0)
+        {
+            /* If the function accepted the path, the resolved path must
+             * still be rooted at cfg_dir.  If the file doesn't exist yet,
+             * at minimum the literal output must not contain "..". */
+            char resolved[PATH_MAX];
+            if (realpath(path_out, resolved) != NULL)
+                ck_assert(strncmp(resolved, cfg_dir, cfg_dir_len) == 0);
+            else
+                ck_assert(strstr(path_out, "..") == NULL);
+        }
+        /* rc != 0 means the function rejected the input; also acceptable. */
+    }
+
+    unsetenv("AUTONOMOUS_TRUST_ROOT");
+}
+END_TEST_DEFINITION()
+
+/* Regression for configuration.c:305-308 — load_config used
+ * `min(CFG_PATH_LEN - 1, …)` (= 255) as the copy cap, but the destination
+ * `cfg_name` is CFG_NAME_SIZE + 1 bytes (65).  A filename whose basename-
+ * without-extension exceeds CFG_NAME_SIZE overran cfg_name with no NUL
+ * termination.  Fix caps at CFG_NAME_SIZE and explicitly terminates.
+ *
+ * We don't need a real file: load_config's string-manipulation happens
+ * before any filesystem access. */
+DEFINE_TEST(test_load_config_cfg_name_bounded)
+{
+    setenv("AUTONOMOUS_TRUST_ROOT", "/tmp/at_major_test", 1);
+
+    /* Layout: [leading sentinel][cfg_name 65 B][trailing sentinel]. */
+    struct {
+        unsigned char leader[32];
+        char          cfg_name[CFG_NAME_SIZE + 1];
+        unsigned char trailer[32];
+    } box;
+    memset(&box, 0xCD, sizeof(box));
+    memset(box.cfg_name, 0, sizeof(box.cfg_name));
+
+    /* Relative filepath so config_absolute_path accepts it (joins under
+     * cfg_dir) and load_config proceeds to the strncpy of `filename` into
+     * `cfg_name`.  Basename-without-extension is 80 bytes — overflows
+     * cfg_name (65 B) by 16 bytes under the buggy cap. */
+    char filepath[256];
+    memset(filepath, 'X', 80);
+    strcpy(filepath + 80, ".cfg.json");
+
+    config_t *cfg_out = NULL;
+    (void)load_config(filepath, &cfg_out, box.cfg_name, &_m2_test_logger);
+
+    int trailer_clean = 1;
+    for (size_t i = 0; i < sizeof(box.trailer); i++)
+        if (box.trailer[i] != 0xCD) { trailer_clean = 0; break; }
+    ck_assert(trailer_clean);
+    ck_assert_int_eq((unsigned char)box.cfg_name[CFG_NAME_SIZE], 0);
+
+    unsetenv("AUTONOMOUS_TRUST_ROOT");
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Config, test_get_cfg_dir, test_get_data_dir,
           test_get_dirs_empty_root, test_find_configuration_missing,
-          test_find_configuration_exists, test_config_absolute_path)
+          test_find_configuration_exists, test_config_absolute_path,
+          test_config_absolute_path_rejects_traversal,
+          test_load_config_cfg_name_bounded)

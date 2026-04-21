@@ -14,6 +14,7 @@
  *   limitations under the License.
  *******************/
 
+#include <string.h>
 #include <sodium.h>
 #include "identity_priv.h"
 
@@ -26,6 +27,12 @@ void hexlify(const unsigned char *buf, size_t len, unsigned char *result)
 
 int unhexlify(const unsigned char *buf, size_t len, unsigned char *result)
 {
+    if (buf == NULL || result == NULL)
+        return -1;
+    /* Early NUL inside the first `len` bytes ⇒ hex string is truncated.
+     * This is a bounded read: we never touch buf[len] or later. */
+    if (strnlen((const char *)buf, len) < len)
+        return -1;
     size_t bin_len = 0;
     return sodium_hex2bin(result, len / 2, (const char *)buf, len,
                           NULL, &bin_len, NULL);

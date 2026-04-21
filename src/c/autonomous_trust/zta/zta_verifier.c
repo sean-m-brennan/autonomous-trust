@@ -32,8 +32,16 @@ void zta_result_set(zta_result_t *result, zta_status_t status, const char *reaso
     memset(result, 0, sizeof(*result));
     result->status = status;
     gettimeofday(&result->timestamp, NULL);
-    if (reason)
-        snprintf(result->reason, ZTA_REASON_LEN, "%s", reason);
+    if (reason) {
+        int n = snprintf(result->reason, ZTA_REASON_LEN, "%s", reason);
+        if (n < 0 || (size_t)n >= ZTA_REASON_LEN) {
+            /* truncated — mark with ellipsis so readers see incompleteness */
+            result->reason[ZTA_REASON_LEN - 4] = '.';
+            result->reason[ZTA_REASON_LEN - 3] = '.';
+            result->reason[ZTA_REASON_LEN - 2] = '.';
+            result->reason[ZTA_REASON_LEN - 1] = '\0';
+        }
+    }
 }
 
 const char *zta_status_str(zta_status_t status)

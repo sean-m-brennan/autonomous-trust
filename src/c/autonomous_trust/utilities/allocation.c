@@ -29,13 +29,16 @@ void *smrt_create(size_t size)
     return ptr;
 }
 
-void *smrt_recreate(void *orig, size_t size)
+int smrt_recreate(void **pptr, size_t size)
 {
-    void *ptr = realloc(orig, size);
+    if (pptr == NULL)
+        return -1;
+    void *ptr = realloc(*pptr, size);
     if (ptr == NULL)
-        return ptr;
+        return -1;
     //@ assert ptr != \null;
-    return ptr;
+    *pptr = ptr;
+    return 0;
 }
 
 /* WHY no runtime overflow check on refs:

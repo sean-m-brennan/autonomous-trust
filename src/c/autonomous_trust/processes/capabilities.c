@@ -130,7 +130,7 @@ void peer_capabilities_proto_free(AutonomousTrust__Core__Protobuf__Processes__Pe
 {
     for (int i = 0; i < proto->n_listing; i++)
     {
-        AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities__PeerCapacity *entry = proto->listing[i++];
+        AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities__PeerCapacity *entry = proto->listing[i];
         for (int j = 0; j < entry->n_capability; j++)
             capability_proto_free(entry->capability[j]);
     }

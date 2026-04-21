@@ -41,7 +41,8 @@ int update_state_write(const char *data_dir, const update_state_t *state)
 {
     /* Ensure <data_dir>/fleet_update/ exists */
     char dir_path[512];
-    path_join(dir_path, sizeof(dir_path), data_dir, "fleet_update");
+    if (path_join(dir_path, sizeof(dir_path), data_dir, "fleet_update") < 0)
+        return -1;
 
     struct stat st;
     if (stat(dir_path, &st) != 0) {
@@ -64,7 +65,10 @@ int update_state_write(const char *data_dir, const update_state_t *state)
     json_object_set_new(root, "type",        json_string(state->type));
 
     char file_path[512];
-    path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json");
+    if (path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json") < 0) {
+        json_decref(root);
+        return -1;
+    }
 
     int ret = json_dump_file(root, file_path, JSON_INDENT(2));
     json_decref(root);
@@ -75,7 +79,8 @@ int update_state_write(const char *data_dir, const update_state_t *state)
 int update_state_read(const char *data_dir, update_state_t *state)
 {
     char file_path[512];
-    path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json");
+    if (path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json") < 0)
+        return -1;
 
     json_error_t err;
     json_t *root = json_load_file(file_path, 0, &err);
@@ -118,7 +123,8 @@ int update_state_read(const char *data_dir, update_state_t *state)
 int update_state_delete(const char *data_dir)
 {
     char file_path[512];
-    path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json");
+    if (path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json") < 0)
+        return -1;
 
     if (unlink(file_path) != 0) {
         if (errno == ENOENT)
@@ -131,7 +137,8 @@ int update_state_delete(const char *data_dir)
 bool update_state_exists(const char *data_dir)
 {
     char file_path[512];
-    path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json");
+    if (path_join(file_path, sizeof(file_path), data_dir, "fleet_update/state.json") < 0)
+        return false;
 
     struct stat st;
     return stat(file_path, &st) == 0;

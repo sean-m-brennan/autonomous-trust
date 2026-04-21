@@ -119,7 +119,6 @@ int ping(const char *host, int count, ping_stats_t *stats)
                               (struct sockaddr *)&dst, sizeof(dst));
         if (sent < 0)
         {
-            stats->sent++;
             timed_out++;
             continue;
         }

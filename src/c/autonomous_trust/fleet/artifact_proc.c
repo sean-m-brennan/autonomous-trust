@@ -141,18 +141,24 @@ static bool handle_artifact_request(const process_t *proc, directory_t *queues, 
         return false;
     }
 
-    if (artifact_store_has(hash_hex))
+    /* Load-as-presence-check: a stat-then-load would race with concurrent
+     * deletion. load_manifest returns nonzero on ENOENT too, so treat its
+     * failure as "not cached" rather than an error. */
+    artifact_manifest_t manifest;
+    if (artifact_store_load_manifest(hash_hex, &manifest) != 0)
     {
-        /* Load manifest and send it back */
-        artifact_manifest_t manifest;
-        if (artifact_store_load_manifest(hash_hex, &manifest) != 0)
+        log_debug(proc->logger, "Artifact: we don't have artifact %s\n", hash_hex);
+        json_decref(payload);
+    }
+    else
+    {
+        json_t *resp = json_object();
+        if (!resp)
         {
+            log_error(proc->logger, "Artifact: json_object() OOM building manifest reply\n");
             json_decref(payload);
-            log_error(proc->logger, "Artifact: failed to load manifest for %s\n", hash_hex);
             return false;
         }
-
-        json_t *resp = json_object();
         json_object_set_new(resp, "hash", json_string(hash_hex));
         json_object_set_new(resp, "total_chunks", json_integer(manifest.total_chunks));
         json_object_set_new(resp, "total_size", json_integer((json_int_t)manifest.total_size));
@@ -161,11 +167,6 @@ static bool handle_artifact_request(const process_t *proc, directory_t *queues, 
 
         json_decref(payload);
         send_to_peer(proc, ARTIFACT_PROTO_MANIFEST, resp, &nmsg->from_whom);
-    }
-    else
-    {
-        log_debug(proc->logger, "Artifact: we don't have artifact %s\n", hash_hex);
-        json_decref(payload);
     }
 
     return true;
@@ -254,11 +255,11 @@ static bool handle_artifact_manifest(const process_t *proc, directory_t *queues,
     /* Save manifest to disk */
     artifact_manifest_t manifest;
     memset(&manifest, 0, sizeof(manifest));
-    strncpy(manifest.hash_hex, hash_hex, sizeof(manifest.hash_hex) - 1);
+    snprintf(manifest.hash_hex, sizeof(manifest.hash_hex), "%s", hash_hex);
     manifest.total_chunks = total_chunks;
     manifest.total_size = total_size;
     manifest.chunk_size = chunk_size;
-    strncpy(manifest.version, version, sizeof(manifest.version) - 1);
+    snprintf(manifest.version, sizeof(manifest.version), "%s", version);
 
     if (artifact_store_save_manifest(&manifest) != 0)
     {
@@ -294,6 +295,11 @@ static bool handle_artifact_manifest(const process_t *proc, directory_t *queues,
 
     /* Request first chunk */
     json_t *req = json_object();
+    if (!req)
+    {
+        log_error(proc->logger, "Artifact: json_object() OOM requesting first chunk\n");
+        return false;
+    }
     json_object_set_new(req, "hash", json_string(hash_hex));
     json_object_set_new(req, "chunk_index", json_integer(0));
     send_to_peer(proc, ARTIFACT_PROTO_CHUNK_REQ, req, &nmsg->from_whom);
@@ -363,6 +369,11 @@ static bool handle_chunk_request(const process_t *proc, directory_t *queues, gen
 
     /* Build response */
     json_t *resp = json_object();
+    if (!resp)
+    {
+        log_error(proc->logger, "Artifact: json_object() OOM building chunk reply\n");
+        return false;
+    }
     json_object_set_new(resp, "hash", json_string(hash_hex));
     json_object_set_new(resp, "chunk_index", json_integer(chunk_index));
     json_object_set_new(resp, "data", json_string(data_hex));
@@ -503,6 +514,11 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
 
         /* Send ARTIFACT_PROTO_COMPLETE to source peer */
         json_t *comp = json_object();
+        if (!comp)
+        {
+            log_error(proc->logger, "Artifact: json_object() OOM building complete notice\n");
+            return false;
+        }
         json_object_set_new(comp, "hash", json_string(hash_hex));
         json_object_set_new(comp, "verified", json_boolean(verify_ok));
         send_to_peer(proc, ARTIFACT_PROTO_COMPLETE, comp, &nmsg->from_whom);
@@ -512,6 +528,11 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         artifact_store_get_path(hash_hex, path_buf, sizeof(path_buf));
 
         json_t *ready = json_object();
+        if (!ready)
+        {
+            log_error(proc->logger, "Artifact: json_object() OOM building ready notice\n");
+            return false;
+        }
         json_object_set_new(ready, "hash", json_string(hash_hex));
         json_object_set_new(ready, "path", json_string(path_buf));
         json_object_set_new(ready, "version", json_string(version));
@@ -519,9 +540,9 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         generic_msg_t ready_msg = {0};
         ready_msg.type = NET_MESSAGE;
         net_msg_t *rnmsg = &ready_msg.info.net_msg;
-        strncpy(rnmsg->process, notify_target, PROC_NAME_LEN);
+        snprintf(rnmsg->process, sizeof(rnmsg->process), "%s", notify_target);
         rnmsg->function = (char *)ARTIFACT_PROTO_READY;
-        strncpy(rnmsg->return_to, "artifact", PROC_NAME_LEN);
+        snprintf(rnmsg->return_to, sizeof(rnmsg->return_to), "%s", "artifact");
 
         if (net_msg_pack_json(rnmsg, ready) == 0)
         {
@@ -547,6 +568,11 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         if (next_chunk < total)
         {
             json_t *req = json_object();
+            if (!req)
+            {
+                log_error(proc->logger, "Artifact: json_object() OOM requesting next chunk\n");
+                return false;
+            }
             json_object_set_new(req, "hash", json_string(hash_hex));
             json_object_set_new(req, "chunk_index", json_integer(next_chunk));
             send_to_peer(proc, ARTIFACT_PROTO_CHUNK_REQ, req, &nmsg->from_whom);
@@ -611,7 +637,11 @@ int artifact_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
     const char *base = (root != NULL) ? root   : "/tmp";
     const char *sub  = (root != NULL) ? "var/at" : "at_artifacts";
     char data_dir[256];
-    path_join(data_dir, sizeof(data_dir), base, sub);
+    if (path_join(data_dir, sizeof(data_dir), base, sub) < 0)
+    {
+        log_error(logger, "Artifact: data-dir path too long\n");
+        return -1;
+    }
 
     if (artifact_store_init(data_dir) != 0)
     {

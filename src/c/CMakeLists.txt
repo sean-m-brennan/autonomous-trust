@@ -20,12 +20,20 @@ if(DEFINED ENV{CONDA_PREFIX})
     set(CMAKE_C_COMPILE_OPTIONS_SYSROOT "--sysroot=")
     set(CMAKE_CXX_COMPILE_OPTIONS_SYSROOT "--sysroot=")
     set(CONDA_SYSROOT ${CONDA_ROOT}/x86_64-conda-linux-gnu/sysroot)
-    set(CMAKE_PREFIX_PATH ${CONDA_SYSROOT})
+    # Put conda's env root FIRST in CMAKE_PREFIX_PATH so find_library picks
+    # conda's libuuid/libsodium/libjansson before the system versions in
+    # /usr/lib/x86_64-linux-gnu — otherwise RPATH points at conda but we
+    # linked against system, creating a load-time mismatch risk.
+    list(PREPEND CMAKE_PREFIX_PATH ${CONDA_ROOT} ${CONDA_SYSROOT})
     #set(CMAKE_SYSROOT ${CONDA_SYSROOT})  # Doesn't work
     set(sysroot_flag --sysroot=${CONDA_SYSROOT})
-    # Ensure conda libs are found at runtime even without conda activated
+    # Ensure conda libs are found at runtime even without conda activated.
+    # Append link-time dirs so conda RPATH is preferred over system paths,
+    # and emit new-style DT_RUNPATH so LD_LIBRARY_PATH is still respected.
     set(CMAKE_INSTALL_RPATH "${CONDA_ROOT}/lib")
     set(CMAKE_BUILD_RPATH "${CONDA_ROOT}/lib")
+    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
     message("-- Conda is active; sysroot now at ${CONDA_SYSROOT}")
 endif()
 
@@ -55,7 +63,7 @@ set(useful_warnings
     -Winit-self
 )
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
-    list(APPEND useful_warnings -Wuse-after-free -Wfree-nonheap-object -Wno-cast-function-type -Wno-stringop-truncation -Wno-format-truncation)
+    list(APPEND useful_warnings -Wuse-after-free -Wfree-nonheap-object -Wno-cast-function-type)
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
     list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align -Wno-cast-function-type-mismatch)
@@ -79,6 +87,12 @@ option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)
 option(AT_ZTA "Enable Zero Trust Architecture credential integration" OFF)
 
 if(AT_STATIC)
+    # Prefer .a archives in subsequent find_library() calls AND pass -static to
+    # the linker so transitive deps resolve statically too. Must come BEFORE the
+    # find_package()/find_library() calls below for the suffix override to take
+    # effect. find_package(Protobuf) uses its own lookup logic that may still
+    # return the .so if no .a is available — verify with `ldd <binary>` after
+    # building; an AT_STATIC build should produce "not a dynamic executable".
     set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
 endif()
@@ -88,8 +102,8 @@ endif()
 # library/program dependencies
 
 # UUID
-find_path(LIBUUID_INCLUDE_DIR uuid.h PATH_SUFFIXES uuid PATHS ${CONDA_ROOT})
-find_library(LIBUUID_LIBRARY NAMES uuid PATHS ${CONDA_ROOT})
+find_path(LIBUUID_INCLUDE_DIR uuid.h PATH_SUFFIXES uuid HINTS ${CONDA_ROOT})
+find_library(LIBUUID_LIBRARY NAMES uuid HINTS ${CONDA_ROOT})
 include_directories(${LIBUUID_INCLUDE_DIR})
 if(LIBUUID_LIBRARY)
     message("-- Found libuuid at ${LIBUUID_LIBRARY}")
@@ -98,8 +112,8 @@ else()
 endif()
 
 # libsodium
-find_path(LIBSODIUM_INCLUDE_DIR sodium.h PATHS ${CONDA_ROOT})
-find_library(LIBSODIUM_LIBRARY NAMES sodium PATHS ${CONDA_ROOT})
+find_path(LIBSODIUM_INCLUDE_DIR sodium.h HINTS ${CONDA_ROOT})
+find_library(LIBSODIUM_LIBRARY NAMES sodium HINTS ${CONDA_ROOT})
 include_directories(${LIBSODIUM_INCLUDE_DIR})
 if(LIBSODIUM_LIBRARY)
     message("-- Found libsodium at ${LIBSODIUM_LIBRARY}")
@@ -108,8 +122,8 @@ else()
 endif()
 
 # jansson
-find_path(LIBJANSSON_INCLUDE_DIR jansson.h PATHS ${CONDA_ROOT})
-find_library(LIBJANSSON_LIBRARY NAMES jansson PATHS ${CONDA_ROOT})
+find_path(LIBJANSSON_INCLUDE_DIR jansson.h HINTS ${CONDA_ROOT})
+find_library(LIBJANSSON_LIBRARY NAMES jansson HINTS ${CONDA_ROOT})
 include_directories(${LIBJANSSON_INCLUDE_DIR})
 if(LIBJANSSON_LIBRARY)
     message("-- Found libjansson at ${LIBJANSSON_LIBRARY}")
@@ -119,10 +133,10 @@ endif()
 
 # protobuf
 find_package(Protobuf REQUIRED)  # paths doesn't work
-#find_path(Protobuf_INCLUDE_DIRS message.h PATH_SUFFIXES google/protobuf PATHS ${CONDA_ROOT})
-#find_library(Protobuf_LIBRARY libprotobuf.so PATHS ${CONDA_ROOT})
+#find_path(Protobuf_INCLUDE_DIRS message.h PATH_SUFFIXES google/protobuf HINTS ${CONDA_ROOT})
+#find_library(Protobuf_LIBRARY libprotobuf.so HINTS ${CONDA_ROOT})
 include_directories(${Protobuf_INCLUDE_DIRS})
-#find_program(Protobuf_PROTOC_EXECUTABLE protoc PATHS ${CONDA_ROOT})
+#find_program(Protobuf_PROTOC_EXECUTABLE protoc HINTS ${CONDA_ROOT})
 #string(REPLACE "/google/protobuf" "" PROTOBUF_INCLUDE_DIR ${Protobuf_INCLUDE_DIRS})
 #include_directories(${PROTOBUF_INCLUDE_DIR})
 if(Protobuf_LIBRARY)
@@ -132,10 +146,10 @@ else()
 endif()
 
 # protobuf-c
-find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c PATHS ${CONDA_ROOT})
-find_library(LIBPROTOBUF_C_LIBRARY NAMES protobuf-c PATHS ${CONDA_ROOT})
+find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c HINTS ${CONDA_ROOT})
+find_library(LIBPROTOBUF_C_LIBRARY NAMES protobuf-c HINTS ${CONDA_ROOT})
 include_directories(${LIBPROTOBUF_C_INCLUDE_DIR})
-#find_program(PROTOC_C_EXE protoc-c PATHS ${CONDA_ROOT})
+#find_program(PROTOC_C_EXE protoc-c HINTS ${CONDA_ROOT})
 if(LIBPROTOBUF_C_LIBRARY)
     message("-- Found libprotobuf-c at ${LIBPROTOBUF_C_LIBRARY}")
 else()
@@ -143,8 +157,8 @@ else()
 endif()
 
 # check (testing only — optional for non-test builds)
-find_path(LIBCHECK_INCLUDE_DIR check.h PATHS ${CONDA_ROOT})
-find_library(LIBCHECK_LIBRARY NAMES check libcheck.so libcheck.a PATHS ${CONDA_ROOT})
+find_path(LIBCHECK_INCLUDE_DIR check.h HINTS ${CONDA_ROOT})
+find_library(LIBCHECK_LIBRARY NAMES check libcheck.so libcheck.a HINTS ${CONDA_ROOT})
 if(LIBCHECK_LIBRARY)
     include_directories(${LIBCHECK_INCLUDE_DIR})
     message("-- Found libcheck at ${LIBCHECK_LIBRARY}")
@@ -165,7 +179,7 @@ endif()
 set(DEPENDENCIES
     ${LIBUUID_LIBRARY}
     ${LIBSODIUM_LIBRARY}
-    ${Protobuf_LIBRARY}
+    ${Protobuf_LIBRARIES}
     ${LIBPROTOBUF_LIBRARY}
     ${LIBPROTOBUF_C_LIBRARY}
     ${LIBJANSSON_LIBRARY}
@@ -177,8 +191,12 @@ if(AT_ZTA)
     list(APPEND DEPENDENCIES OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
-# Expose DEPENDENCIES to parent scope so examples/ can link them
-set(DEPENDENCIES "${DEPENDENCIES}" PARENT_SCOPE)
+# Expose DEPENDENCIES to parent scope so examples/ can link them — but only
+# when actually built via add_subdirectory(); a standalone build has no parent.
+get_directory_property(_has_parent PARENT_DIRECTORY)
+if(_has_parent)
+    set(DEPENDENCIES "${DEPENDENCIES}" PARENT_SCOPE)
+endif()
 
 set(TEST_DEPENDENCIES ${DEPENDENCIES})
 if(LIBCHECK_LIBRARY)
@@ -387,9 +405,13 @@ function(preprocess _file_in)
     set(_fullpath ${CMAKE_CURRENT_SOURCE_DIR}/${_file_in})
     set(_header_file ${CMAKE_CURRENT_BINARY_DIR}/${_base}.h)
     set(_src_dir ${CMAKE_CURRENT_SOURCE_DIR})
+    set(_exclude_args)                                                                                      
+    if(NOT AT_ZTA)                                              
+        list(APPEND _exclude_args --exclude zta)                                                            
+    endif()      
     add_custom_command(
         OUTPUT ${_header_file}
-        COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust
+        COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust ${_exclude_args}
         COMMENT "Preprocessing table header from ${_file_in}"
         DEPENDS ${_fullpath}
     )
@@ -739,6 +761,10 @@ target_link_libraries(paxos_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME paxos_test COMMAND $<TARGET_FILE:paxos_test>)
 
+# Critical and Major regression tests have been folded into the per-module
+# test files (array_test, array2_test, paxos_test, msg_types2_test,
+# identity2_test, config_test, group2_test).
+
 add_executable(update_proposal_test test/update_proposal_test.c)
 set_source_files_properties(test/update_proposal_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(update_proposal_test PRIVATE ${AT_TEST_LIBS})
@@ -748,10 +774,20 @@ add_test(NAME update_proposal_test COMMAND $<TARGET_FILE:update_proposal_test>)
 # Fleet tests compile their own .c files (not via the library), so they need
 # proto and table headers to exist before compilation starts.  Depend on the
 # static library target which already generates both.
+#
+# Fleet .c files call helpers from autonomous_trust/utilities/util.c
+# (path_join, makedirs, min/max, strremove).  Pulling those from the static
+# archive would cause duplicate-symbol conflicts against the directly-
+# compiled fleet sources, so compile util.c into each fleet test instead.
+set(fleet_test_util_srcs
+    autonomous_trust/utilities/util.c
+    autonomous_trust/utilities/exception.c)
+
 add_executable(fleet_proc_test
     test/fleet_proc_test.c
     autonomous_trust/fleet/fleet_helpers.c
-    autonomous_trust/fleet/update_proposal.c)
+    autonomous_trust/fleet/update_proposal.c
+    ${fleet_test_util_srcs})
 set_source_files_properties(test/fleet_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(fleet_proc_test PRIVATE ${TEST_DEPENDENCIES})
 add_dependencies(fleet_proc_test autonomous_trust_static)
@@ -760,7 +796,8 @@ add_test(NAME fleet_proc_test COMMAND $<TARGET_FILE:fleet_proc_test>)
 
 add_executable(artifact_store_test
     test/artifact_store_test.c
-    autonomous_trust/fleet/artifact_store.c)
+    autonomous_trust/fleet/artifact_store.c
+    ${fleet_test_util_srcs})
 set_source_files_properties(test/artifact_store_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(artifact_store_test PRIVATE ${TEST_DEPENDENCIES})
 add_dependencies(artifact_store_test autonomous_trust_static)
@@ -769,7 +806,8 @@ add_test(NAME artifact_store_test COMMAND $<TARGET_FILE:artifact_store_test>)
 
 add_executable(artifact_proc_test
     test/artifact_proc_test.c
-    autonomous_trust/fleet/artifact_proc_helpers.c)
+    autonomous_trust/fleet/artifact_proc_helpers.c
+    ${fleet_test_util_srcs})
 set_source_files_properties(test/artifact_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(artifact_proc_test PRIVATE ${TEST_DEPENDENCIES})
 add_dependencies(artifact_proc_test autonomous_trust_static)
@@ -779,7 +817,8 @@ add_test(NAME artifact_proc_test COMMAND $<TARGET_FILE:artifact_proc_test>)
 add_executable(update_proc_test
     test/update_proc_test.c
     autonomous_trust/fleet/update_proc_helpers.c
-    autonomous_trust/fleet/update_selftest.c)
+    autonomous_trust/fleet/update_selftest.c
+    ${fleet_test_util_srcs})
 set_source_files_properties(test/update_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(update_proc_test PRIVATE ${TEST_DEPENDENCIES})
 add_dependencies(update_proc_test autonomous_trust_static)
@@ -789,7 +828,8 @@ add_test(NAME update_proc_test COMMAND $<TARGET_FILE:update_proc_test>)
 add_executable(config_proc_test
     test/config_proc_test.c
     autonomous_trust/fleet/config_proc_helpers.c
-    autonomous_trust/fleet/update_proc_helpers.c)
+    autonomous_trust/fleet/update_proc_helpers.c
+    ${fleet_test_util_srcs})
 set_source_files_properties(test/config_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(config_proc_test PRIVATE ${TEST_DEPENDENCIES})
 add_dependencies(config_proc_test autonomous_trust_static)

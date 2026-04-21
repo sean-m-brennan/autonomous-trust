@@ -152,6 +152,42 @@ DEFINE_TEST(test_signal_proto_format)
 }
 END_TEST_DEFINITION()
 
+/* Regression for msg_types.c:376 — proto_to_signal used unbounded sscanf
+ * into sig->descr (char[SIGNAL_LEN+1] = 33 bytes).  A long remote payload
+ * overran the struct (remote memory-corruption primitive).  Fix is a
+ * bounded manual parse that respects both `len` and SIGNAL_LEN.  The test
+ * uses heap guards so a silent overflow is detected without smashing the
+ * test process's own stack. */
+DEFINE_TEST(test_proto_to_signal_bounds_descr)
+{
+    enum { GUARD = 128 };
+    uint8_t *mem = calloc(1, GUARD + sizeof(signal_t) + GUARD);
+    ck_assert_ptr_nonnull(mem);
+    memset(mem, 0xCD, GUARD);
+    memset(mem + GUARD + sizeof(signal_t), 0xCD, GUARD);
+    signal_t *sig = (signal_t *)(mem + GUARD);
+
+    /* "42-" + 48 'A's overruns SIGNAL_LEN=32 on any unbounded parser. */
+    char input[80];
+    int prefix = snprintf(input, sizeof(input), "42-");
+    memset(input + prefix, 'A', 48);
+    input[prefix + 48] = '\0';
+
+    proto_to_signal((uint8_t *)input, strlen(input), sig);
+
+    uint8_t *trail = mem + GUARD + sizeof(signal_t);
+    int trail_ok = 1;
+    for (int i = 0; i < GUARD; i++)
+        if (trail[i] != 0xCD) { trail_ok = 0; break; }
+    ck_assert(trail_ok);
+    ck_assert_int_eq(sig->descr[SIGNAL_LEN], '\0');
+    ck_assert_int_eq(sig->sig, 42);
+
+    free(mem);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(MsgTypes2, test_generic_msg_signal_proto_roundtrip, test_wrap_in_any,
           test_message_size_all_types, test_message_type_to_string_all,
-          test_string_to_message_type_all, test_signal_proto_format)
+          test_string_to_message_type_all, test_signal_proto_format,
+          test_proto_to_signal_bounds_descr)
