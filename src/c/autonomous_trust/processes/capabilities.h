@@ -22,6 +22,7 @@
  */
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdarg.h>
 
 #include "structures/map.h"
@@ -84,6 +85,11 @@ int build_local_capabilities(const char *my_uuid, array_t **caps_out);
 #define DEFINE_CAPABILITY(cap_name, func, args, arg_num)                          \
     void __attribute__((constructor)) CONCAT(register_capability_, __COUNTER__)() \
     {                                                                             \
+        if (capability_table_size >= CAPABILITY_TABLE_CAPACITY) {                 \
+          (void)fprintf(stderr,                                                   \
+                        "capability_table overflow at " QUOTE(cap_name) "\n");    \
+          return;                                                                 \
+        }                                                                         \
         capability_init(&capability_table[capability_table_size]);                \
         capability_table[capability_table_size].name = QUOTE(cap_name);           \
         capability_table[capability_table_size].function = func;                  \

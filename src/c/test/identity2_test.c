@@ -18,12 +18,14 @@
 #include "test_setup.h"
 
 #include <string.h>
+#include <pthread.h>
 #include <sodium.h>
 #include <uuid/uuid.h>
 #include <jansson.h>
 
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
+#include "identity/id_proc_priv.h"
 
 DEFINE_TEST(test_peers_max_count_default)
 {
@@ -164,6 +166,54 @@ DEFINE_TEST(test_identity_create_null_names)
 }
 END_TEST_DEFINITION()
 
+/* Regression for id_proc.c:522 — handle_count_vote used to do an
+ * unsynchronised read-modify-write of id_state.vote_collection AND call
+ * pthread_mutex_unlock without a matching lock (see BUGS.md C6).  The fix
+ * hoists the critical section into vote_collection_increment(), which takes
+ * id_state.lock internally.  This test spawns N threads that each call the
+ * helper M times for the same uuid_key; the final count must equal N*M
+ * exactly.  Under the original unsynchronised code, concurrent
+ * read-modify-writes would lose updates and the final count would be < N*M. */
+
+typedef struct {
+    const char *uuid_key;
+    int iterations;
+} _c6_ctx_t;
+
+static void *_c6_voter(void *arg)
+{
+    _c6_ctx_t *c = (_c6_ctx_t *)arg;
+    for (int i = 0; i < c->iterations; i++)
+        (void)vote_collection_increment(c->uuid_key);
+    return NULL;
+}
+
+DEFINE_TEST(test_vote_collection_increment_is_race_free)
+{
+    /* Warm-up: first-time id_state initialisation is not itself serialised
+     * (see _ensure_id_init), so call from the main thread once before
+     * spawning to avoid racing the init path.  A distinct uuid is used so
+     * the target key still starts at zero. */
+    (void)vote_collection_increment("c6-warmup-xxxx-xxxx-xxxx-xxxxxxxxxxxx");
+
+    const char *uuid_key = "c6-test-aaaa-bbbb-cccc-dddddddddddd";
+
+    enum { NTHREADS = 8, ITERS = 256 };
+    pthread_t threads[NTHREADS];
+    _c6_ctx_t ctx = { uuid_key, ITERS };
+
+    for (int i = 0; i < NTHREADS; i++)
+        ck_assert_int_eq(pthread_create(&threads[i], NULL, _c6_voter, &ctx), 0);
+    for (int i = 0; i < NTHREADS; i++)
+        ck_assert_int_eq(pthread_join(threads[i], NULL), 0);
+
+    int final_count = 0;
+    ck_assert_ret_ok(vote_collection_get(uuid_key, &final_count));
+    ck_assert_int_eq(final_count, NTHREADS * ITERS);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Identity2, test_peers_max_count_default, test_peers_set_max_count,
           test_identity_proto_roundtrip, test_identity_json_nickname_petname,
-          test_identity_create_null_names)
+          test_identity_create_null_names,
+          test_vote_collection_increment_is_race_free)

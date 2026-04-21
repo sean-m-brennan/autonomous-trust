@@ -270,6 +270,7 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
 
         log_debug(proc->logger, "Reputation: Submit transaction score\n");
 
+        peers_read_lock(proc);
         for (size_t i = 0; i < proc->protocol.num_peers; i++)
         {
             generic_msg_t tx_msg = {0};
@@ -282,6 +283,7 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
             net_msg_pack_json(&tx_msg.info.net_msg, tx_json);
             messaging_send("network", NET_MESSAGE, &tx_msg, false);
         }
+        peers_read_unlock(proc);
         json_decref(tx_json);
     }
 
@@ -895,6 +897,7 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
     uuid_unparse_lower(peer_uuid, identity_uuid);
 
     /* Broadcast Paxos Phase 1a: request permission from all peers */
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         generic_msg_t req = {0};
@@ -915,6 +918,7 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
 
         messaging_send("network", NET_MESSAGE, &req, false);
     }
+    peers_read_unlock(proc);
 
 }
 
@@ -929,7 +933,9 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
 {
     _ensure_init();
 
+    peers_read_lock(proc);
     rep_state.num_peers = (int)proc->protocol.num_peers;
+    peers_read_unlock(proc);
     paxos_init(&rep_state.paxos, rep_state.num_peers, logger);
 
     /* Register protocol handlers */

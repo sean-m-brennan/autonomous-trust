@@ -98,12 +98,18 @@ static void fill_ipv4(net_iface_t *iface, struct ifaddrs *ifa,
         uint32_t mask = ntohl(nm->sin_addr.s_addr);
         int bits = 0;
         while (mask & 0x80000000) { bits++; mask <<= 1; }
+        /* Format into a scratch buffer larger than any possible input, then
+         * copy the exact prefix that fits (silences -Wformat-truncation,
+         * which is pessimistic about the %d range). */
         char cidr_buf[64];
-        snprintf(cidr_buf, sizeof(cidr_buf), "%s/%d", iface->ip4_addr, bits);
-        strncpy(iface->ip4_cidr, cidr_buf, CIDR4_LEN);
+        int n = snprintf(cidr_buf, sizeof(cidr_buf), "%s/%d", iface->ip4_addr, bits);
+        if (n > 0 && (size_t)n < sizeof(iface->ip4_cidr))
+            memcpy(iface->ip4_cidr, cidr_buf, (size_t)n + 1);
+        else
+            iface->ip4_cidr[0] = '\0';
     }
 
-    strncpy(iface->if_name, ifa->ifa_name, sizeof(iface->if_name) - 1);
+    snprintf(iface->if_name, sizeof(iface->if_name), "%s", ifa->ifa_name);
 }
 
 /**
@@ -182,8 +188,12 @@ static int discover_network_for(net_iface_t *iface, const char *preferred_ip)
                 }
                 {
                     char cidr_buf[128];
-                    snprintf(cidr_buf, sizeof(cidr_buf), "%s/%d", iface->ip6_addr, bits);
-                    strncpy(iface->ip6_cidr, cidr_buf, CIDR6_LEN);
+                    int n = snprintf(cidr_buf, sizeof(cidr_buf),
+                                     "%s/%d", iface->ip6_addr, bits);
+                    if (n > 0 && (size_t)n < sizeof(iface->ip6_cidr))
+                        memcpy(iface->ip6_cidr, cidr_buf, (size_t)n + 1);
+                    else
+                        iface->ip6_cidr[0] = '\0';
                 }
             }
         }
@@ -204,7 +214,7 @@ static int discover_network_for(net_iface_t *iface, const char *preferred_ip)
         {
             struct ifreq ifr;
             memset(&ifr, 0, sizeof(ifr));
-            strncpy(ifr.ifr_name, iface->if_name, IFNAMSIZ - 1);
+            snprintf(ifr.ifr_name, IFNAMSIZ, "%s", iface->if_name);
             if (ioctl(sock, SIOCGIFHWADDR, &ifr) == 0)
             {
                 unsigned char *mac = (unsigned char *)ifr.ifr_hwaddr.sa_data;
@@ -257,7 +267,11 @@ int generate_identity(const char *fullname, const char *cfg_dir)
         return err;
 
     char filepath[CFG_PATH_LEN + 1];
-    path_join(filepath, sizeof(filepath), cfg_dir, "identity.cfg.json");
+    if (path_join(filepath, sizeof(filepath), cfg_dir, "identity.cfg.json") < 0)
+    {
+        identity_free(ident);
+        return -1;
+    }
 
     config_t *cfg = find_configuration("identity");
     if (cfg == NULL)
@@ -289,13 +303,16 @@ int generate_network_config(const char *cfg_dir)
 
     network_config_t net_cfg = {0};
     net_cfg.port = COMM_PORT;
-    strncpy(net_cfg.mac_address, iface.mac_addr, MAC_ADDR_LEN);
-    strncpy(net_cfg.ip4_cidr, iface.ip4_cidr, CIDR4_LEN);
-    strncpy(net_cfg.ip6_cidr, iface.ip6_cidr, CIDR6_LEN);
-    /* mcast addresses left empty */
+    snprintf(net_cfg.mac_address, sizeof(net_cfg.mac_address), "%s", iface.mac_addr);
+    snprintf(net_cfg.ip4_cidr, sizeof(net_cfg.ip4_cidr), "%s", iface.ip4_cidr);
+    snprintf(net_cfg.ip6_cidr, sizeof(net_cfg.ip6_cidr), "%s", iface.ip6_cidr);
+    /* default multicast groups; user may override in cfg file */
+    snprintf(net_cfg.mcast4_addr, sizeof(net_cfg.mcast4_addr), "%s", DEFAULT_MCAST4_ADDR);
+    snprintf(net_cfg.mcast6_addr, sizeof(net_cfg.mcast6_addr), "%s", DEFAULT_MCAST6_ADDR);
 
     char filepath[CFG_PATH_LEN + 1];
-    path_join(filepath, sizeof(filepath), cfg_dir, "network.cfg.json");
+    if (path_join(filepath, sizeof(filepath), cfg_dir, "network.cfg.json") < 0)
+        return -1;
 
     config_t *cfg = find_configuration("network");
     if (cfg == NULL)
@@ -345,7 +362,8 @@ int generate_subsystems_config(const char *cfg_dir)
         return err;
 
     char filepath[CFG_PATH_LEN + 1];
-    path_join(filepath, sizeof(filepath), cfg_dir, default_tracker_filename);
+    if (path_join(filepath, sizeof(filepath), cfg_dir, default_tracker_filename) < 0)
+        return -1;
 
     return tracker_to_file(&tracker, filepath);
 }

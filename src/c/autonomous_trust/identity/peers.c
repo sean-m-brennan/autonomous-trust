@@ -79,6 +79,10 @@ static const public_identity_t *_peer_from_data(data_t *value)
     return NULL;
 }
 
+/* Iteration is not under a lock because every in-tree caller reaches this
+ * through the identity-process message dispatcher, which serialises handler
+ * invocations.  If peers_t ever becomes visible to a second thread, add a
+ * reader/writer lock here and in peers_find_by_address below. */
 const public_identity_t *peers_find_by_uuid(peers_t *peers, const uuid_t uuid)
 {
     for (int lvl = 0; lvl < LEVELS; lvl++)

@@ -246,8 +246,11 @@ int config_backup_all(const char *cfg_dir, const char *data_dir)
             continue;
 
         char src[512], dst[512];
-        path_join(src, sizeof(src), cfg_dir, ent->d_name);
-        path_join(dst, sizeof(dst), backup, ent->d_name);
+        if (path_join(src, sizeof(src), cfg_dir, ent->d_name) < 0 ||
+            path_join(dst, sizeof(dst), backup, ent->d_name) < 0) {
+            closedir(d);
+            return -1;
+        }
         if (copy_file(src, dst) != 0) {
             closedir(d);
             return -1;
@@ -276,8 +279,11 @@ int config_restore_all(const char *cfg_dir, const char *data_dir)
             continue;
 
         char src[512], dst[512];
-        path_join(src, sizeof(src), backup, ent->d_name);
-        path_join(dst, sizeof(dst), cfg_dir, ent->d_name);
+        if (path_join(src, sizeof(src), backup, ent->d_name) < 0 ||
+            path_join(dst, sizeof(dst), cfg_dir, ent->d_name) < 0) {
+            closedir(d);
+            return -1;
+        }
         if (copy_file(src, dst) != 0) {
             closedir(d);
             return -1;
@@ -307,7 +313,8 @@ int config_backup_delete(const char *data_dir)
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
             continue;
         char path[512];
-        path_join(path, sizeof(path), backup, ent->d_name);
+        if (path_join(path, sizeof(path), backup, ent->d_name) < 0)
+            continue;  /* skip truncated entries; do not remove unrelated files */
         unlink(path);
     }
 

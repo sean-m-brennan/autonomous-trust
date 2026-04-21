@@ -352,6 +352,8 @@ struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode
         sibling = node->parent->left;
         other = node->parent->right;
     }
+    /* NULL leaves are conceptually black in a red-black tree; these guards
+     * encode that so the algorithm works without an explicit NIL sentinel. */
     if (sibling->red)
     {
         sibling->red = false;
@@ -360,7 +362,9 @@ struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode
         sibling = other;
     }
 
-    if (!sibling->left->red && !sibling->right->red)
+    bool left_black = (sibling->left == NULL) || !sibling->left->red;
+    bool right_black = (sibling->right == NULL) || !sibling->right->red;
+    if (left_black && right_black)
     {
         sibling->red = true;
         node = node->parent;
@@ -369,31 +373,35 @@ struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode
     {
         if (dir == LEFT)
         {
-            if (!sibling->right->red)
+            if (sibling->right == NULL || !sibling->right->red)
             {
-                sibling->left->red = false;
+                if (sibling->left != NULL)
+                    sibling->left->red = false;
                 sibling->red = true;
                 rotateTree(tree, opposite_direction(dir), sibling);
                 sibling = node->parent->right;
             }
             sibling->red = node->parent->red;
             node->parent->red = false;
-            sibling->right->red = false;
+            if (sibling->right != NULL)
+                sibling->right->red = false;
             rotateTree(tree, dir, node->parent);
             node = tree->root;
         }
         else
         {
-            if (!sibling->left->red)
+            if (sibling->left == NULL || !sibling->left->red)
             {
-                sibling->right->red = false;
+                if (sibling->right != NULL)
+                    sibling->right->red = false;
                 sibling->red = true;
                 rotateTree(tree, opposite_direction(dir), sibling);
                 sibling = node->parent->left;
             }
             sibling->red = node->parent->red;
             node->parent->red = false;
-            sibling->left->red = false;
+            if (sibling->left != NULL)
+                sibling->left->red = false;
             rotateTree(tree, dir, node->parent);
             node = tree->root;
         }

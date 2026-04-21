@@ -172,10 +172,12 @@ static bool handle_config_propose(const process_t *proc, directory_t *queues, ge
     json_object_set_new(req_json, "id2", json_integer(id2));
     json_object_set_new(req_json, "proposal_uuid", json_string(prop_uuid_str));
 
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         send_to_peer(proc, CONFIG_PROTO_VOTE_REQ, req_json, &proc->protocol.peers[i]);
     }
+    peers_read_unlock(proc);
     json_decref(req_json);
 
     log_info(proc->logger, "Config: Proposal %s stored, vote initiated\n", prop_uuid_str);
@@ -315,10 +317,12 @@ static bool handle_config_vote_grant(const process_t *proc, directory_t *queues,
         log_info(proc->logger, "Config: Quorum reached for proposal %s, broadcasting accepted\n",
                  prop_uuid_str);
 
+        peers_read_lock(proc);
         for (size_t i = 0; i < proc->protocol.num_peers; i++)
         {
             send_to_peer(proc, CONFIG_PROTO_ACCEPTED, acc_json, &proc->protocol.peers[i]);
         }
+        peers_read_unlock(proc);
         json_decref(acc_json);
 
         paxos_advance_chain(&config_state.vote_paxos);
@@ -579,7 +583,7 @@ static bool handle_config_artifact_ready(const process_t *proc, directory_t *que
                                prop->content_hash, UPDATE_HASH_LEN);
                 if (strcmp(prop_hash_hex, hash_hex) == 0)
                 {
-                    strncpy(config_name, prop->config_name, CFG_NAME_SIZE);
+                    snprintf(config_name, sizeof(config_name), "%s", prop->config_name);
                     break;
                 }
             }
@@ -657,7 +661,9 @@ int config_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
 {
     _ensure_init();
 
+    peers_read_lock(proc);
     config_state.num_peers = (int)proc->protocol.num_peers;
+    peers_read_unlock(proc);
     paxos_init(&config_state.vote_paxos, config_state.num_peers, logger);
 
     if (get_cfg_dir(config_cfg_dir) != 0)

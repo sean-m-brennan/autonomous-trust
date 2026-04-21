@@ -72,24 +72,30 @@ int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *confi
     proc->logger = logger;
     proc->dependencies = dependencies;
     proc->runner = runner;
+    if (pthread_rwlock_init(&proc->protocol.peers_rwlock, NULL) != 0)
+        return -1;
     // TODO: Load protocol handler table from config to allow runtime customization
     return map_create(&proc->protocol.handlers);
 }
 
 /* Frama-C: skipped — [solver-timeout] process lifecycle preconditions */
 int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
-                   map_t *procs, directory_t *queues, logger_t *logger)
+                   map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger)
 {
     process_t *proc;
     if (orig > 0)
     {
         char pid_str[32] = {0};
         snprintf(pid_str, 31, "%d", orig);
-        if (map_remove(procs, pid_str))
-            return -1;
-
-        data_t *proc_val;
-        if (map_get(procs, pname, &proc_val))
+        if (procs_lock != NULL)
+            pthread_mutex_lock(procs_lock);
+        int rc = map_remove(procs, pid_str);
+        data_t *proc_val = NULL;
+        if (rc == 0)
+            rc = map_get(procs, pname, &proc_val);
+        if (procs_lock != NULL)
+            pthread_mutex_unlock(procs_lock);
+        if (rc != 0)
             return -1;
         if (data_object_ptr(proc_val, (void **)&proc))
             return -1;
@@ -121,20 +127,25 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
     snprintf(pid_str, 31, "%d", pid);
     // data_t *key_val = string_data(pname, strlen(pname));
     data_t *proc_val = object_ptr_data(proc, sizeof(process_t));
-    if (map_set(procs, pid_str, proc_val) != 0)
+    if (procs_lock != NULL)
+        pthread_mutex_lock(procs_lock);
+    int rc = map_set(procs, pid_str, proc_val);
+    if (procs_lock != NULL)
+        pthread_mutex_unlock(procs_lock);
+    if (rc != 0)
         return -1;
     return 0;
 }
 
 int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
-                  map_t *procs, directory_t *queues, logger_t *logger)
+                  map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger)
 {
-    return _process_start(-1, pname, runner, configs, tracker, procs, queues, logger);
+    return _process_start(-1, pname, runner, configs, tracker, procs, procs_lock, queues, logger);
 }
 
-int restart_process(pid_t orig, char *pname, map_t *procs, directory_t *queues, logger_t *logger)
+int restart_process(pid_t orig, char *pname, map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger)
 {
-    return _process_start(orig, pname, NULL, NULL, NULL, procs, queues, logger);
+    return _process_start(orig, pname, NULL, NULL, NULL, procs, procs_lock, queues, logger);
 }
 
 /*@
@@ -184,7 +195,13 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
         proc->protocol.group = msg->info.group;
         return true;
     case PEER:
-        memcpy(&proc->protocol.peers[proc->protocol.num_peers++], &msg->info.peer, sizeof(public_identity_t));
+        peers_write_lock(proc);
+        if (proc->protocol.num_peers < DEFAULT_MAX_PEERS)
+        {
+            memcpy(&proc->protocol.peers[proc->protocol.num_peers], &msg->info.peer, sizeof(public_identity_t));
+            proc->protocol.num_peers++;
+        }
+        peers_write_unlock(proc);
         return true;
     case PEER_CAPABILITIES:
         // pproc->peer_capabilities = message

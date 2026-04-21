@@ -55,6 +55,11 @@ typedef struct
 
 #define UUID_STRING_LEN 36
 
+/* Hard cap on a ZTA credential blob carried on the wire.  Real X.509 chains
+ * and JWTs comfortably fit; a larger value almost certainly indicates a
+ * hostile or corrupted peer and would let a remote cause an OOM. */
+#define ZTA_CRED_MAX (64u * 1024u)
+
 typedef struct
 {
     smrt_ptr_t;
@@ -124,8 +129,8 @@ typedef struct
     ensures \result == -1;
   disjoint behaviors;
 */
-int identity_init(uuid_t *uuid, char *address, char *fullname,
-                  char *nickname, char *petname, identity_t *identity);
+int identity_init(uuid_t *uuid, const char *address, const char *fullname,
+                  const char *nickname, const char *petname, identity_t *identity);
 
 /*@
   requires uuid == \null || \valid(uuid);
@@ -140,8 +145,8 @@ int identity_init(uuid_t *uuid, char *address, char *fullname,
     ensures \result != 0;
   disjoint behaviors;
 */
-int identity_create(uuid_t *uuid, char *address, char *fullname,
-                    char *nickname, char *petname, identity_t **ident);
+int identity_create(uuid_t *uuid, const char *address, const char *fullname,
+                    const char *nickname, const char *petname, identity_t **ident);
 
 /**
  * @brief Produce a shareable public copy of an identity.

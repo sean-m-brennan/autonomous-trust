@@ -44,6 +44,9 @@ DECLARE_ERROR(ENTP_TIMEOUT, "NTP request timed out");
 #define ENTP_STRATUM 281
 DECLARE_ERROR(ENTP_STRATUM, "NTP stratum too high");
 
+#define ENTP_SHORT   282
+DECLARE_ERROR(ENTP_SHORT, "NTP response truncated");
+
 /****************************
  * NTP packet (48 bytes, network byte order)
  ****************************/

@@ -134,16 +134,47 @@ int all_config_files(char dir[], array_t *paths)
 
 int config_absolute_path(const char *path_in, char *path_out)
 {
+    if (path_in == NULL || path_out == NULL)
+        return EXCEPTION(EINVAL);
+
     char cfg_dir[CFG_PATH_LEN + 1];
     int len = get_cfg_dir(cfg_dir);
     if (len < 0 || len > CFG_PATH_LEN)
         return -1;
-    if (strncmp(path_in, cfg_dir, strlen(cfg_dir)) != 0)
+
+    /* Reject traversal segments outright.  Legitimate config names never
+     * contain "..", so a substring check is acceptable even though it
+     * also rejects oddities like "foo..bar.cfg.json". */
+    if (strstr(path_in, "..") != NULL)
     {
-        int remain = path_join(path_out, 255, cfg_dir, path_in);
-        if (remain < 0)
-            return EXCEPTION(EINVAL);
+        log_info(NULL, "config_absolute_path: rejected traversal in '%s'\n", path_in);
+        return EXCEPTION(EINVAL);
     }
+
+    /* Absolute inputs must already sit inside cfg_dir.  Require that the
+     * match is followed by '/' (or end of string) so "/etc/at_evil" is
+     * NOT accepted as prefixed by "/etc/at". */
+    if (path_in[0] == '/')
+    {
+        size_t dir_len = strlen(cfg_dir);
+        if (strncmp(path_in, cfg_dir, dir_len) != 0 ||
+            (path_in[dir_len] != '\0' && path_in[dir_len] != '/'))
+        {
+            log_info(NULL, "config_absolute_path: '%s' outside cfg_dir '%s'\n",
+                     path_in, cfg_dir);
+            return EXCEPTION(EINVAL);
+        }
+        size_t total = strlen(path_in);
+        if (total > CFG_PATH_LEN)
+            return EXCEPTION(EINVAL);
+        memcpy(path_out, path_in, total + 1);   /* includes NUL */
+        return 0;
+    }
+
+    /* Relative path: join under cfg_dir. */
+    int remain = path_join(path_out, CFG_PATH_LEN, cfg_dir, path_in);
+    if (remain < 0)
+        return EXCEPTION(EINVAL);
     return 0;
 }
 
@@ -160,8 +191,13 @@ int read_config_file(const char *filename, void *data_struct)
 {
     char typename[CFG_NAME_SIZE + 1] = {0};
     json_t *root = json_load_file(filename, 0, NULL);
-    if (root == NULL || !json_is_object(root))
+    if (root == NULL)
         return EXCEPTION(ECFG_BADFMT);  // caller (load_config) logs the config name
+    if (!json_is_object(root))
+    {
+        json_decref(root);
+        return EXCEPTION(ECFG_BADFMT);
+    }
 
     json_t *name_obj = json_object_get(root, "typename");
     if (name_obj == NULL || !json_is_string(name_obj))
@@ -173,7 +209,10 @@ int read_config_file(const char *filename, void *data_struct)
 
     config_t *cfg = find_configuration(typename);
     if (cfg == NULL)
+    {
+        json_decref(root);
         return EXCEPTION(ECFG_NOIMPL);
+    }
 
     int err = cfg->from_json(root, data_struct);
     json_decref(root); // frees created tree
@@ -199,10 +238,9 @@ int write_config_file(const config_t *cfg_obj, const void *data_struct, const ch
         return err;
 
     err = json_dump_file(root, filename, 0);
+    json_decref(root); // frees created tree
     if (err != 0)
         return EXCEPTION(EJSN_DUMP); // ECFG_BADFMT);
-
-    json_decref(root); // frees created tree
     return 0;
 }
 
@@ -305,7 +343,16 @@ int load_config(char *filepath, config_t **config_ptr, char *cfg_name, logger_t 
     char cfg_name_stack[CFG_NAME_SIZE + 1] = {0};
     if (cfg_name == NULL)
         cfg_name = cfg_name_stack;
-    strncpy(cfg_name, filename, min(CFG_PATH_LEN - 1, strlen(filename) - extlen));
+    /* Cap at the DESTINATION size (CFG_NAME_SIZE), not CFG_PATH_LEN — the
+     * latter is ~4x larger and was overflowing cfg_name for long basenames. */
+    size_t copy = (size_t)(strlen(filename) - extlen);
+    if (copy > CFG_NAME_SIZE)
+        copy = CFG_NAME_SIZE;
+    /* memcpy (not strncpy): `copy` is computed from src length, so there is
+     * never a NUL inside the range; explicit NUL at [copy]. Avoids
+     * -Wstringop-truncation false positive on length-from-source patterns. */
+    memcpy(cfg_name, filename, copy);
+    cfg_name[copy] = '\0';
     *config_ptr = find_configuration(cfg_name);
     config_t *config = *config_ptr;
     if (config == NULL)

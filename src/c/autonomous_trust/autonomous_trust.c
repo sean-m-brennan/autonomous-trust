@@ -41,11 +41,14 @@
 #include "reputation/reputation.h"
 
 
-void reread_configs() { /* do nothing */ }
+/* Weak-placeholder signal hooks required by sighandler.c. Reserved for
+ * future use (SIGHUP = reread config, SIGUSR1/2 = user-defined actions);
+ * intentionally no-op today — sighandler.h documents this contract. */
+void reread_configs() { /* reserved: SIGHUP — reload config at runtime */ }
 
-void user1_handler() { /* do nothing */ }
+void user1_handler() { /* reserved: SIGUSR1 — user-defined action */ }
 
-void user2_handler() { /* do nothing */ }
+void user2_handler() { /* reserved: SIGUSR2 — user-defined action */ }
 
 
 int register_queues(tracker_t *tracker, const char *main, directory_t *queues, directory_t *signals, logger_t *logger)
@@ -115,7 +118,9 @@ int register_queues(tracker_t *tracker, const char *main, directory_t *queues, d
         num_err++;
         continue;
     }
-    array_end_for_each return num_err;
+    array_end_for_each
+
+    return num_err;
 }
 
 
@@ -152,8 +157,9 @@ int run_autonomous_trust(char *q_in, char *q_out,
 
     /* Write PID file so update process can signal us for restart */
     char pid_path[CFG_PATH_LEN + 32];
-    snprintf(pid_path, sizeof(pid_path), "%s/at_daemon.pid", data_dir);
-    FILE *pid_fp = fopen(pid_path, "w");
+    if (path_join(pid_path, sizeof(pid_path), data_dir, "at_daemon.pid") < 0)
+        pid_path[0] = '\0';
+    FILE *pid_fp = (pid_path[0] != '\0') ? fopen(pid_path, "w") : NULL;
     if (pid_fp != NULL)
     {
         fprintf(pid_fp, "%d\n", my_pid);
@@ -187,6 +193,13 @@ int run_autonomous_trust(char *q_in, char *q_out,
         log_exception(&logger);
         return -1;
     }
+    pthread_mutex_t procs_lock;
+    if (pthread_mutex_init(&procs_lock, NULL) != 0)
+    {
+        SYS_EXCEPTION();
+        log_exception(&logger);
+        return -1;
+    }
     int num_err = 0;
     map_entries_for_each(tracker.registry, key, impl_val)
     {
@@ -205,7 +218,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
         }
 
         log_info(&logger, "%s:  Starting %s:%s ...\n", name, key, impl);
-        if (start_process(key, runner, &configs, &tracker, &procs, &queues, &logger))
+        if (start_process(key, runner, &configs, &tracker, &procs, &procs_lock, &queues, &logger))
         {
             log_exception_extra(&logger, " for process %s:%s\n", name, key);
             num_err++;
@@ -224,7 +237,9 @@ int run_autonomous_trust(char *q_in, char *q_out,
         log_exception(&logger);
 
     log_info(&logger, "%s:                                          Ready.\n", name);
+    pthread_mutex_lock(&procs_lock);
     size_t active = map_size(&procs);
+    pthread_mutex_unlock(&procs_lock);
     array_t unhandled_msgs;
     if (array_init(&unhandled_msgs) != 0)
         log_exception(&logger);
@@ -232,7 +247,13 @@ int run_autonomous_trust(char *q_in, char *q_out,
     while (!stop_process)
     {
         // monitor processes for early termination
+        // two-phase sweep, mutate after iteration
+        array_t dead_keys = {0};
+        if (array_init(&dead_keys) != 0)
+            log_exception(&logger);
+
         data_t *str_val = NULL;
+        pthread_mutex_lock(&procs_lock);
         map_entries_for_each(&procs, key, str_val)
         {
             pid_t pid = atoi(key);
@@ -243,24 +264,42 @@ int run_autonomous_trust(char *q_in, char *q_out,
             {
                 if (errno == ESRCH)
                 {
-                    if (restart_process(pid, key, &procs, &queues, &logger))
-                    {
-                        log_exception_extra(&logger, " restarting process '%s'\n", key);
-                        active--; // give up on this process
-                        continue; // don't retry — move to next entry
-                    }
+                    data_t *key_dat = string_data((char *)key, strlen(key) + 1);
+                    if (array_append(&dead_keys, key_dat) != 0)
+                        log_exception(&logger);
                 }
                 else
                 {
                     SYS_EXCEPTION();
                     log_exception(&logger);
-                    continue;
                 }
             }
         }
         map_end_for_each
+        pthread_mutex_unlock(&procs_lock);
 
-            if (active <= 0)
+        // second phase, remove dead process keys
+        int d_idx;
+        data_t *dead_dat;
+        array_for_each(&dead_keys, d_idx, dead_dat)
+        {
+            char *dead_key = NULL;
+            if (data_string_ptr(dead_dat, &dead_key) != 0)
+            {
+                log_exception(&logger);
+                continue;
+            }
+            pid_t dead_pid = (pid_t)atoi(dead_key);
+            if (restart_process(dead_pid, dead_key, &procs, &procs_lock, &queues, &logger))
+            {
+                log_exception_extra(&logger, " restarting process '%s'\n", dead_key);
+                active--; // give up on this process
+            }
+        }
+        array_end_for_each
+        array_free(&dead_keys);
+
+        if (active <= 0)
         {
             log_info(&logger, "%s: No remaining processes, exiting.\n", name);
             break;
@@ -309,14 +348,20 @@ int run_autonomous_trust(char *q_in, char *q_out,
                 log_exception(&logger);
         }
 
+        // Drain: process every pending message in FIFO order, removing as we go. 
         array_t extern_msgs = {0};
         if (array_init(&extern_msgs) != 0)
             log_exception(&logger);
         bool do_send = false;
-        int index;
-        data_t *msg_dat;
-        array_for_each(&unhandled_msgs, index, msg_dat)
-        {
+        while (array_size(&unhandled_msgs) > 0)
+        {                                                                                                           
+            data_t *msg_dat = NULL;                                                                                 
+            if (array_get(&unhandled_msgs, 0, &msg_dat) != 0)           
+            {                                                                                                       
+                log_exception(&logger);
+                break;  // read error — abandon
+            }                                                                                                       
+
             /* Route internal messages by type */
             generic_msg_t *inner = NULL;
             data_object_ptr(msg_dat, (void **)&inner);
@@ -350,12 +395,13 @@ int run_autonomous_trust(char *q_in, char *q_out,
                     break;
                 }
             }
-            if (array_remove(&unhandled_msgs, msg_dat) != 0)
+            if (array_remove(&unhandled_msgs, msg_dat) != 0) {
                 log_exception(&logger);
+                break;  // guard against infinite loop if remove fails
+            }
         }
-        array_end_for_each
 
-            if (do_send)
+        if (do_send)
         {
             if (messaging_send(q_out, result_msg.type, &result_msg, false) != 0)
                 log_exception(&logger);
@@ -376,6 +422,8 @@ int run_autonomous_trust(char *q_in, char *q_out,
     data_t *k_val = NULL;
     int index = 0;
     generic_msg_t sig = {.type = SIGNAL, .info.signal = {.descr = {0}, .sig = -1}};
+    /* descr was zero-initialised by the aggregate initialiser above, so
+     * byte 31 is always NUL even when sig_quit is 31 chars long. */
     strncpy(sig.info.signal.descr, sig_quit, 31);
     array_for_each(&signals, index, k_val)
     {
@@ -389,8 +437,53 @@ int run_autonomous_trust(char *q_in, char *q_out,
     }
     array_end_for_each
 
+    /* Wait up to shutdown_timeout_ms for sub-processes to exit cleanly;
+     * SIGKILL any that do not respond in time. */
+    {
+        const int shutdown_timeout_ms = 5000;
+        const int poll_interval_ms = 100;
+        int waited_ms = 0;
+        while (waited_ms < shutdown_timeout_ms)
+        {
+            bool any_alive = false;
+            map_key_t pkey = NULL;
+            data_t *pstr = NULL;
+            pthread_mutex_lock(&procs_lock);
+            map_entries_for_each(&procs, pkey, pstr)
+            {
+                if (kill((pid_t)atoi(pkey), 0) == 0)
+                {
+                    any_alive = true;
+                    break;
+                }
+            }
+            map_end_for_each
+            pthread_mutex_unlock(&procs_lock);
+            if (!any_alive)
+                break;
+            usleep(poll_interval_ms * 1000);
+            waited_ms += poll_interval_ms;
+        }
+
+        map_key_t pkey = NULL;
+        data_t *pstr = NULL;
+        pthread_mutex_lock(&procs_lock);
+        map_entries_for_each(&procs, pkey, pstr)
+        {
+            pid_t pid = (pid_t)atoi(pkey);
+            if (kill(pid, 0) == 0)
+            {
+                log_warn(&logger, "Shutdown: pid %d did not exit; sending SIGKILL\n", pid);
+                kill(pid, SIGKILL);
+            }
+        }
+        map_end_for_each
+        pthread_mutex_unlock(&procs_lock);
+    }
+
         // cleanup:
         log_debug(&logger, "Cleanup complete\n");
+    pthread_mutex_destroy(&procs_lock);
     array_free(&signals);
     array_free(&queues);
     tracker_free(&tracker);
@@ -401,7 +494,8 @@ int run_autonomous_trust(char *q_in, char *q_out,
     shutdown_protobuf_library();
 
     /* Clean up PID file */
-    unlink(pid_path);
+    if (pid_path[0] != '\0')
+        unlink(pid_path);
 
     return error;
 }

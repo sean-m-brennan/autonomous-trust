@@ -81,6 +81,7 @@ DEFINE_TEST(test_identity_history_create_and_insert)
     char uuid_str[37];
     uuid_unparse_lower(me->uuid, uuid_str);
     strncpy(voter.uuid, uuid_str, AGREEMENT_UUID_LEN - 1);
+    voter.uuid[AGREEMENT_UUID_LEN - 1] = '\0';
 
     logger_t logger = {0};
 
@@ -115,6 +116,7 @@ DEFINE_TEST(test_identity_history_share_hear)
     char uuid_str[37];
     uuid_unparse_lower(signer->uuid, uuid_str);
     strncpy(voter.uuid, uuid_str, AGREEMENT_UUID_LEN - 1);
+    voter.uuid[AGREEMENT_UUID_LEN - 1] = '\0';
 
     logger_t logger = {0};
     identity_history_t *history = NULL;
@@ -159,6 +161,7 @@ DEFINE_TEST(test_identity_history_merkle_changes)
     char uuid_str[37];
     uuid_unparse_lower(me->uuid, uuid_str);
     strncpy(voter.uuid, uuid_str, AGREEMENT_UUID_LEN - 1);
+    voter.uuid[AGREEMENT_UUID_LEN - 1] = '\0';
 
     logger_t logger = {0};
     identity_history_t *history = NULL;

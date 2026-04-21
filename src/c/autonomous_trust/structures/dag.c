@@ -346,7 +346,7 @@ int dag_ingest_branch(step_dag_t *dag, linked_step_t **steps, size_t count,
         return err;
 
     /* add remaining steps in reverse order (steps are head-to-root) */
-    for (int i = (int)count - 2; i >= 0; i--)
+    for (size_t i = count - 1; i-- > 0; )
     {
         err = dag_add_step(dag, steps[i], name);
         if (err != 0)

@@ -133,7 +133,7 @@ static void defer_message(const uint8_t *data, size_t len, const char *from_addr
  ****************************/
 
 typedef struct {
-    char address[IPV4_ADDR_LEN + 1];
+    char address[ADDR_LEN + 1];   /* sized for IPv4 or IPv6 via ADDR_LEN */
     size_t bytes_sent;
     size_t bytes_recv;
     size_t send_errors;
@@ -155,8 +155,8 @@ static net_stat_t *find_or_create_stat(const char *address)
     {
         net_stat_t *st = &peer_stats[stats_count];
         memset(st, 0, sizeof(*st));
-        strncpy(st->address, address, IPV4_ADDR_LEN);
-        st->address[IPV4_ADDR_LEN] = '\0';
+        /* snprintf truncates + NUL-terminates deterministically */
+        snprintf(st->address, sizeof(st->address), "%s", address);
         stats_count++;
         return st;
     }
@@ -234,6 +234,13 @@ static int _send_udp(const uint8_t *msg, size_t msg_len, const char *host, int p
     int one = 1;
     setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
 
+    /* Bounded send timeout so a stalled NIC / full kernel buffer cannot
+     * wedge the sender thread.  1s is generous for LAN paths while still
+     * surfacing a genuine stall as ENET_SEND below. */
+    struct timeval sndto = { .tv_sec = 1, .tv_usec = 0 };
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto)) != 0)
+        log_warn(logger, "UDP: failed to set SO_SNDTIMEO: %s\n", strerror(errno));
+
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -286,6 +293,24 @@ static int _recv_udp(int sock, uint8_t *buf, size_t buf_size,
  * TCP send/recv
  ****************************/
 
+/* Loop until `len` bytes are sent or an unrecoverable error occurs.
+ * Retries on EINTR; returns 0 on success, -1 on permanent error. */
+static int _send_all(int sock, const void *buf, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(sock, p + sent, len - sent, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;      /* peer closed */
+        sent += (size_t)n;
+    }
+    return 0;
+}
+
 static int _send_tcp(const uint8_t *msg, size_t msg_len, const char *host, int port, logger_t *logger)
 {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -307,16 +332,18 @@ static int _send_tcp(const uint8_t *msg, size_t msg_len, const char *host, int p
         return EXCEPTION(ENET_SEND);
     }
 
-    /* Send frame: "size|" header */
+    /* Send frame: "size|" header.  Loop-until-done via _send_all so short
+     * sends under buffer pressure and EINTR don't drop the whole frame. */
     char size_hdr[32];
     int hdr_len = snprintf(size_hdr, sizeof(size_hdr), "%zu|", msg_len);
-    if (send(sock, size_hdr, hdr_len, 0) != hdr_len)
+    if (_send_all(sock, size_hdr, (size_t)hdr_len) != 0)
     {
         close(sock);
         return EXCEPTION(ENET_SEND);
     }
 
-    /* Send data in chunks */
+    /* Send data in chunks. Chunking retained for any future migration to
+     * non-blocking sockets; EINTR retried, short sends absorbed naturally. */
     size_t total_sent = 0;
     while (total_sent < msg_len)
     {
@@ -324,12 +351,16 @@ static int _send_tcp(const uint8_t *msg, size_t msg_len, const char *host, int p
         if (chunk > (size_t)TCP_CHUNK_SIZE)
             chunk = TCP_CHUNK_SIZE;
         ssize_t sent = send(sock, msg + total_sent, chunk, 0);
-        if (sent <= 0)
-        {
+        if (sent < 0) {
+            if (errno == EINTR) continue;
             close(sock);
             return EXCEPTION(ENET_SEND);
         }
-        total_sent += sent;
+        if (sent == 0) {
+            close(sock);
+            return EXCEPTION(ENET_SEND);
+        }
+        total_sent += (size_t)sent;
     }
 
     close(sock);
@@ -356,7 +387,9 @@ static int _recv_tcp(int listen_sock, uint8_t **buf_out, size_t *buf_len,
     if (from_port != NULL)
         *from_port = ntohs(sender.sin_port);
 
-    /* Read size header: bytes until '|' */
+    /* Read size header: bytes until '|'.  Loop is bounded by si < 31 so the
+     * buffer cannot be overrun even under a malicious sender; data_size is
+     * then bounded by NET_MSG_MAX_DATA below. */
     char size_buf[32] = {0};
     int si = 0;
     while (si < 31)
@@ -439,6 +472,13 @@ int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *msg,
 
     if (msg->encrypt && msg->to_whom.type == RECIPIENT_PEER)
     {
+        /* libsodium init is idempotent; defensive per identity.c:79-94 */
+        if (sodium_init() < 0)
+        {
+            free(wire);
+            return SYS_EXCEPTION();
+        }
+
         /* Encrypt for a specific peer */
         unsigned char nonce[crypto_box_NONCEBYTES];
         randombytes_buf(nonce, sizeof(nonce));
@@ -535,12 +575,20 @@ static int decrypt_message(const identity_t *myself, const public_identity_t *pe
 
 static const public_identity_t *find_peer_by_address(const process_t *proc, const char *addr)
 {
+    /* peers[] is append-only & the underlying array is inline (never reallocated),
+     * so a pointer obtained under the read lock stays valid and stable afterward. */
+    peers_read_lock(proc);
+    const public_identity_t *match = NULL;
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         if (strcmp(proc->protocol.peers[i].address, addr) == 0)
-            return &proc->protocol.peers[i];
+        {
+            match = &proc->protocol.peers[i];
+            break;
+        }
     }
-    return NULL;
+    peers_read_unlock(proc);
+    return match;
 }
 
 /****************************
@@ -550,10 +598,14 @@ static const public_identity_t *find_peer_by_address(const process_t *proc, cons
 static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
                             directory_t *queues, logger_t *logger)
 {
-    /* Build a generic_msg_t with NET_MESSAGE type */
+    /* Build a generic_msg_t with NET_MESSAGE type.  obj/data are POINTER
+     * ASSIGNMENTS, not copies — no heap-overflow possible regardless of
+     * data_len.  Ownership of wmsg->data passes through to the downstream
+     * queue; function is the only owned string we need to strdup/free. */
     generic_msg_t gmsg = {0};
     gmsg.type = NET_MESSAGE;
-    strncpy(gmsg.info.net_msg.process, wmsg->process, PROC_NAME_LEN);
+    snprintf(gmsg.info.net_msg.process, sizeof(gmsg.info.net_msg.process),
+             "%s", wmsg->process);
     gmsg.info.net_msg.function = strdup(wmsg->function);
     gmsg.info.net_msg.obj = wmsg->data;
     gmsg.info.net_msg.len = wmsg->data_len;
@@ -589,7 +641,8 @@ static void *peer_receiver_thread(void *arg)
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 100000; /* 0.1 seconds */
-    setsockopt(ctx->socks->recv_ptp, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (setsockopt(ctx->socks->recv_ptp, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
+        log_warn(ctx->logger, "peer_receiver: SO_RCVTIMEO failed: %s\n", strerror(errno));
 
     while (!(*ctx->stop))
     {
@@ -705,7 +758,8 @@ static void *broadcast_receiver_thread(void *arg)
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 100000;
-    setsockopt(ctx->socks->recv_cast, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (setsockopt(ctx->socks->recv_cast, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
+        log_warn(ctx->logger, "broadcast_receiver: SO_RCVTIMEO failed: %s\n", strerror(errno));
 
     while (!(*ctx->stop))
     {
@@ -761,7 +815,8 @@ static void *group_receiver_thread(void *arg)
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 100000; /* 0.1 seconds */
-    setsockopt(ctx->socks->recv_grp, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (setsockopt(ctx->socks->recv_grp, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
+        log_warn(ctx->logger, "group_receiver: SO_RCVTIMEO failed: %s\n", strerror(errno));
 
     while (!(*ctx->stop))
     {
@@ -1233,7 +1288,7 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
 
             /* Convert IPC net_msg_t to wire format */
             net_wire_msg_t wmsg = {0};
-            strncpy(wmsg.process, nmsg->process, PROC_NAME_LEN);
+            snprintf(wmsg.process, sizeof(wmsg.process), "%s", nmsg->process);
             wmsg.function = nmsg->function;
             wmsg.data = nmsg->obj;
             wmsg.data_len = nmsg->len;
@@ -1280,6 +1335,8 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
         {
             /* A new peer was accepted — add to our peer list for encrypted messaging */
             public_identity_t *new_peer = &buf.info.peer;
+            peers_write_lock(proc);
+            bool appended = false;
             if (new_peer->fullname[0] != '\0' && proc->protocol.num_peers < MAX_PEERS)
             {
                 /* Check for duplicate */
@@ -1297,8 +1354,14 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
                     memcpy(&proc->protocol.peers[proc->protocol.num_peers],
                            new_peer, sizeof(public_identity_t));
                     proc->protocol.num_peers++;
-                    log_info(logger, "Network: added peer %s (%s) for encrypted messaging\n",
-                             new_peer->fullname, new_peer->address);
+                    appended = true;
+                }
+            }
+            peers_write_unlock(proc);
+            if (appended)
+            {
+                log_info(logger, "Network: added peer %s (%s) for encrypted messaging\n",
+                         new_peer->fullname, new_peer->address);
 
                     /* Retry deferred encrypted messages with the new peer */
                     pthread_mutex_lock(&deferred_lock);
@@ -1340,7 +1403,6 @@ int network_run(socket_t *cfg, process_t *proc, directory_t *queues, queue_id_t 
                     }
                     deferred_count = remaining;
                     pthread_mutex_unlock(&deferred_lock);
-                }
             }
         }
         else

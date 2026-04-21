@@ -218,10 +218,11 @@ int tracker_from_file(const char *filename, logger_t *logger, tracker_t **tracke
 int tracker_config(char config_file[])
 {
     get_cfg_dir(config_file);
-    strcat(config_file, "/");
-    int len = strlen(config_file);
-    strncpy(config_file + len, default_tracker_filename, CFG_PATH_LEN - len);
-    return len;
+    size_t len = strlen(config_file);
+    int n = snprintf(config_file + len, CFG_PATH_LEN - len, "/%s", default_tracker_filename);
+    if (n < 0 || (size_t)n >= CFG_PATH_LEN - len)
+        return -1;
+    return (int)(len + 1);
 }
 
 /*@
