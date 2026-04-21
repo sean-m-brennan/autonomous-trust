@@ -22,13 +22,21 @@
 #include <string.h>
 #include <time.h>
 
-int paxos_init(paxos_instance_t *inst, int num_peers, logger_t *logger)
+int paxos_init_with_node(paxos_instance_t *inst, int num_peers,
+                         uint16_t node_id, logger_t *logger)
 {
     memset(inst, 0, sizeof(*inst));
     inst->num_peers = num_peers;
     inst->logger = logger;
     inst->last_id = 0;
     inst->chain_len = 0;
+    inst->node_id = node_id;
+    /* Seed the counter from wall-clock ms so id1s are roughly time-ordered
+     * across restarts; paxos_next_ids only ever advances it. */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    inst->next_counter = (int64_t)ts.tv_sec * 1000 +
+                         (int64_t)(ts.tv_nsec / 1000000);
     map_init(&inst->proposals);
     map_init(&inst->acceptances);
     map_init(&inst->backoff);
@@ -36,6 +44,11 @@ int paxos_init(paxos_instance_t *inst, int num_peers, logger_t *logger)
     pthread_mutex_init(&inst->lock, NULL);
     inst->initialized = true;
     return 0;
+}
+
+int paxos_init(paxos_instance_t *inst, int num_peers, logger_t *logger)
+{
+    return paxos_init_with_node(inst, num_peers, 0, logger);
 }
 
 void paxos_destroy(paxos_instance_t *inst)
@@ -214,12 +227,28 @@ void paxos_advance_chain(paxos_instance_t *inst)
 void paxos_next_ids(paxos_instance_t *inst, int64_t *out_id1, int64_t *out_id2)
 {
     pthread_mutex_lock(&inst->lock);
+
+    /* Bump the counter to the greater of (wall-clock ms, last+1).  Gives
+     * strict monotonicity within an instance (tight-loop safe, backward-
+     * clock-step safe) while keeping id1 aligned with wall-clock time
+     * whenever the clock makes real progress. */
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    int64_t ms = (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
-    inst->last_id = ms;
-    *out_id1 = ms;
+    int64_t now_ms = (int64_t)ts.tv_sec * 1000 +
+                     (int64_t)(ts.tv_nsec / 1000000);
+    int64_t next = inst->next_counter + 1;
+    if (now_ms > next)
+        next = now_ms;
+    inst->next_counter = next;
+
+    /* Low 16 bits = node_id (unique per node); high 48 bits = counter.
+     * Two nodes minting at the same counter value produce different id1s. */
+    int64_t id1 = (next << 16) | (int64_t)inst->node_id;
+
+    inst->last_id = id1;
+    *out_id1 = id1;
     *out_id2 = (int64_t)(inst->chain_len + 1);
+
     pthread_mutex_unlock(&inst->lock);
 }
 

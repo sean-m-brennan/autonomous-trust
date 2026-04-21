@@ -27,6 +27,17 @@
 */
 int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
+/* Vote-collection critical section, exposed for concurrency regression tests.
+ * Both helpers are thread-safe; they internally acquire id_state.lock.
+ *
+ * vote_collection_increment: read-or-insert, increment, write back.  Returns
+ * the post-increment count.
+ *
+ * vote_collection_get: read-only lookup.  Returns 0 and writes the count on
+ * hit, -1 on miss or bad arguments. */
+int vote_collection_increment(const char *uuid_key);
+int vote_collection_get(const char *uuid_key, int *out_count);
+
 #define EID_NOQ 215
 DECLARE_ERROR(EID_NOQ, "Required process queue missing");
 

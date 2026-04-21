@@ -44,8 +44,8 @@ void peers_set_max_count(size_t count)
 
 
 /* Frama-C: skipped — [solver-timeout] complex multi-step initialization */
-int identity_init(uuid_t *uuid, char *address, char *fullname,
-                  char *nickname, char *petname, identity_t *identity)
+int identity_init(uuid_t *uuid, const char *address, const char *fullname,
+                  const char *nickname, const char *petname, identity_t *identity)
 {
     if (uuid == NULL)
         uuid_generate((unsigned char *)identity->uuid);
@@ -73,8 +73,8 @@ int identity_init(uuid_t *uuid, char *address, char *fullname,
 }
 
 /* Frama-C: skipped — [solver-timeout] smrt_ptr allocation postconditions */
-int identity_create(uuid_t *uuid, char *address, char *fullname,
-                    char *nickname, char *petname, identity_t **ident)
+int identity_create(uuid_t *uuid, const char *address, const char *fullname,
+                    const char *nickname, const char *petname, identity_t **ident)
 {
     /* WHY we call sodium_init() here rather than from a one-shot bootstrap:
      *
@@ -294,6 +294,8 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
     if (proto->zta_issuer != NULL)
         snprintf(identity->zta_issuer, sizeof(identity->zta_issuer), "%s", proto->zta_issuer);
     if (proto->zta_credential.len > 0 && proto->zta_credential.data != NULL) {
+        if (proto->zta_credential.len > ZTA_CRED_MAX)
+            return EXCEPTION(EINVAL);
         identity->zta_credential = malloc(proto->zta_credential.len);
         if (identity->zta_credential) {
             memcpy(identity->zta_credential, proto->zta_credential.data, proto->zta_credential.len);

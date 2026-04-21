@@ -155,6 +155,84 @@ DEFINE_TEST(test_array_large_append)
 }
 END_TEST_DEFINITION()
 
+/* --- Mutation-during-iteration safe patterns ---
+ *
+ * autonomous_trust.c previously had two sites that mutated their container
+ * inside array_for_each / map_entries_for_each (unhandled_msgs drain and
+ * procs sweep).  array_for_each increments `idx` each turn, but array_remove
+ * memmoves the tail down by one, so the element that was at idx+1 is now at
+ * idx and the next iteration skips it.  The raw pattern remains unsafe; two
+ * safe replacements are exercised below. */
+
+DEFINE_TEST(test_array_while_drain_visits_all_fifo)
+{
+    array_t arr;
+    ck_assert_ret_ok(array_init(&arr));
+    ck_assert_ret_ok(array_append(&arr, integer_data(10)));
+    ck_assert_ret_ok(array_append(&arr, integer_data(20)));
+    ck_assert_ret_ok(array_append(&arr, integer_data(30)));
+    ck_assert_uint_eq(array_size(&arr), 3);
+
+    int visited = 0;
+    int order[4] = {0};
+    while (array_size(&arr) > 0)
+    {
+        data_t *v = NULL;
+        ck_assert_ret_ok(array_get(&arr, 0, &v));
+        int val = 0;
+        if (data_integer(v, &val) == 0 && visited < 4)
+            order[visited] = val;
+        visited++;
+        ck_assert_ret_ok(array_remove(&arr, v));
+    }
+
+    ck_assert_int_eq(visited, 3);
+    ck_assert_uint_eq(array_size(&arr), 0);
+    ck_assert_int_eq(order[0], 10);
+    ck_assert_int_eq(order[1], 20);
+    ck_assert_int_eq(order[2], 30);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_array_two_phase_collect_then_remove)
+{
+    array_t arr;
+    ck_assert_ret_ok(array_init(&arr));
+    ck_assert_ret_ok(array_append(&arr, integer_data(10)));
+    ck_assert_ret_ok(array_append(&arr, integer_data(20)));
+    ck_assert_ret_ok(array_append(&arr, integer_data(30)));
+
+    array_t to_remove;
+    ck_assert_ret_ok(array_init(&to_remove));
+
+    int visited = 0;
+    int sum = 0;
+    int idx = 0;
+    data_t *v = NULL;
+    array_for_each(&arr, idx, v)
+        int val = 0;
+        if (data_integer(v, &val) == 0)
+            sum += val;
+        visited++;
+        ck_assert_ret_ok(array_append(&to_remove, v));
+    array_end_for_each
+
+    ck_assert_int_eq(visited, 3);
+    ck_assert_int_eq(sum, 10 + 20 + 30);
+
+    int r_idx = 0;
+    data_t *r = NULL;
+    array_for_each(&to_remove, r_idx, r)
+        ck_assert_ret_ok(array_remove(&arr, r));
+    array_end_for_each
+
+    ck_assert_uint_eq(array_size(&arr), 0);
+    array_free(&to_remove);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Array2, test_array_copy, test_array_filter,
           test_array_filter_no_match, test_array_for_each_macro,
-          test_array_json_roundtrip, test_array_large_append)
+          test_array_json_roundtrip, test_array_large_append,
+          test_array_while_drain_visits_all_fifo,
+          test_array_two_phase_collect_then_remove)

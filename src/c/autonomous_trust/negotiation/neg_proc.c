@@ -269,7 +269,9 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
 
     /* Create a task tracker for result collection (expect num_peers responses) */
     task_tracker_t *tracker = NULL;
+    peers_read_lock(proc);
     int expected = (int)proc->protocol.num_peers;
+    peers_read_unlock(proc);
     if (task_tracker_create(&tracker, task.uuid, expected) == 0 && tracker)
     {
         data_t *trk_dat = object_ptr_data(tracker, sizeof(task_tracker_t));
@@ -281,6 +283,7 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
 
     /* Send invitation to capable peers */
     int invited = 0;
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         char peer_uuid_str[UUID_STRING_LEN + 1] = {0};
@@ -305,6 +308,7 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
         messaging_send("network", NET_MESSAGE, &invite, false);
         invited++;
     }
+    peers_read_unlock(proc);
 
     if (invite_json)
         json_decref(invite_json);

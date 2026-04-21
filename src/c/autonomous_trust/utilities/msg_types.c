@@ -15,12 +15,15 @@
  *******************/
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <jansson.h>
 
 #include "msg_types_priv.h"
+#include "logger.h"
 
 #include "fleet/update_proposal.h"
 #include "identity/identity_priv.h"
@@ -373,7 +376,58 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
 
 int proto_to_signal(uint8_t *data, size_t len, signal_t *sig)
 {
-    sscanf((const char*)data, "%d-%s", &sig->sig, sig->descr);
+    if (data == NULL || sig == NULL || len == 0)
+    {
+        log_error(NULL, "proto_to_signal: null data/sig or zero len (len=%zu)\n", len);
+        return EXCEPTION(EINVAL);
+    }
+
+    /* Find the "N-" separator within the first `len` bytes; the payload is
+     * NOT guaranteed NUL-terminated (it is a raw protobuf value), so stay
+     * inside `len` throughout. */
+    const char *s = (const char *)data;
+    size_t dash = 0;
+    while (dash < len && s[dash] != '-')
+        dash++;
+    if (dash == 0 || dash >= len)
+    {
+        log_error(NULL, "proto_to_signal: malformed frame, no 'N-' separator in %zu bytes\n", len);
+        return EXCEPTION(EINVAL);
+    }
+
+    /* Parse the integer prefix through strtol.  Cap the prefix at enough
+     * digits to hold INT_MIN ("-2147483648" + NUL = 12 bytes). */
+    char num_buf[16];
+    if (dash >= sizeof(num_buf))
+    {
+        log_error(NULL, "proto_to_signal: signal int prefix %zu bytes exceeds limit\n", dash);
+        return EXCEPTION(EINVAL);
+    }
+    memcpy(num_buf, s, dash);
+    num_buf[dash] = '\0';
+
+    char *endp = NULL;
+    long v = strtol(num_buf, &endp, 10);
+    if (endp == num_buf || *endp != '\0' || v < INT_MIN || v > INT_MAX)
+    {
+        log_error(NULL, "proto_to_signal: unparseable signal int '%s'\n", num_buf);
+        return EXCEPTION(EINVAL);
+    }
+    sig->sig = (int)v;
+
+    /* Copy the descr body bounded by BOTH the wire length and SIGNAL_LEN,
+     * then explicitly NUL-terminate.  Stop at the first embedded NUL so we
+     * do not copy protobuf padding. */
+    size_t body_start = dash + 1;
+    size_t body_len = len - body_start;
+    if (body_len > SIGNAL_LEN)
+        body_len = SIGNAL_LEN;
+    size_t copy_len = 0;
+    while (copy_len < body_len && s[body_start + copy_len] != '\0')
+        copy_len++;
+    memcpy(sig->descr, s + body_start, copy_len);
+    sig->descr[copy_len] = '\0';
+
     return 0;
 }
 
@@ -392,6 +446,8 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     const char *func = json_string_value(json_object_get(root, "function"));
     if (func && func[0] != '\0')
     {
+        /* strcpy is bounded: the destination was just allocated for
+         * strlen(func) + 1 bytes.  Not a missing-bounds-check site. */
         net_msg->function = smrt_create(strlen(func) + 1);
         if (net_msg->function != NULL)
             strcpy(net_msg->function, func);

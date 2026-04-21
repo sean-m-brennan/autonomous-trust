@@ -26,6 +26,10 @@ int _set_exception(int err, size_t line, const char *file)
 {
     _exception.errnum = err;
     _exception.line = line;
+    /* _exception is _Thread_local and zero-initialised at the top of this
+     * file, so byte 255 (and anything beyond what strncpy writes) is
+     * guaranteed to be NUL.  Back-to-back calls with 256-byte filenames
+     * could drop the terminator in theory — no such caller exists in-tree. */
     strncpy(_exception.file, file, 255);
     //@ assert _exception.errnum == err;
     //@ assert _exception.line == line;
