@@ -88,5 +88,32 @@ DEFINE_TEST(test_group_publish_null)
 }
 END_TEST_DEFINITION()
 
+/* Regression for group.c:38 (and the sibling site at :148) — group_init
+ * used strncpy(group->address, address, ADDR_LEN) with no explicit NUL
+ * terminator. group_create() happens to zero the struct first, but direct
+ * callers of group_init with an uninitialised stack-allocated group_t and
+ * an address whose first ADDR_LEN bytes are non-NUL see garbage past the
+ * copy.  Fix explicitly NUL-terminates at byte ADDR_LEN. */
+DEFINE_TEST(test_group_init_nul_terminates_long_address)
+{
+    ck_assert(sodium_init() >= 0);
+
+    group_t group;
+    /* Pre-fill with non-NUL so we can detect a missing explicit NUL.  This
+     * models a stack-allocated struct passed directly to group_init. */
+    memset(&group, 0xAB, sizeof(group));
+
+    char addr[ADDR_LEN + 1];
+    memset(addr, 'X', ADDR_LEN);
+    addr[ADDR_LEN] = '\0';
+
+    (void)group_init(NULL, addr, &group);
+
+    ck_assert_int_eq((unsigned char)group.address[ADDR_LEN], 0);
+    ck_assert_uint_eq(strlen(group.address), (size_t)ADDR_LEN);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Group2, test_group_json_roundtrip, test_group_free_null,
-          test_group_publish_null)
+          test_group_publish_null,
+          test_group_init_nul_terminates_long_address)

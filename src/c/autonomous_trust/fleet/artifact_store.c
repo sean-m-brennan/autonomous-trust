@@ -169,11 +169,14 @@ int artifact_store_load_manifest(const char *hash_hex, artifact_manifest_t *mani
 
     memset(manifest, 0, sizeof(*manifest));
     strncpy(manifest->hash_hex, hex, sizeof(manifest->hash_hex) - 1);
+    manifest->hash_hex[sizeof(manifest->hash_hex) - 1] = '\0';
     strncpy(manifest->version, ver, sizeof(manifest->version) - 1);
+    manifest->version[sizeof(manifest->version) - 1] = '\0';
     manifest->total_chunks = (int)json_integer_value(tc);
     manifest->total_size   = (size_t)json_integer_value(ts);
     manifest->chunk_size   = (size_t)json_integer_value(cs);
     strncpy(manifest->base_dir, store_base_dir, sizeof(manifest->base_dir) - 1);
+    manifest->base_dir[sizeof(manifest->base_dir) - 1] = '\0';
 
     json_decref(root);
     return 0;

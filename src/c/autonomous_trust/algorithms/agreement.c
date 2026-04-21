@@ -185,6 +185,8 @@ static bool _authority_accumulate(agreement_protocol_t *proto, int *ranks, bool 
         if (ranks[i] == leader_rank)
             return approvals[i];
     }
+    /* count == 0 case falls through here — a deliberate "no leader vote
+     * yet, so not approved" — approvals[0] is NEVER read unread. */
     return false;
 }
 

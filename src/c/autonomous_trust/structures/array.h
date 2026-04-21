@@ -210,6 +210,7 @@ size_t array_size(array_t *a);
 /**
  * @brief For-each macro
  * @details requires array_t *array, int index, and data_t value to be defined.
+ * Be careful not to mutate (e.g. array_remove) inside the iteration.
  *
  */
 #define array_for_each(array, index, value)                      \

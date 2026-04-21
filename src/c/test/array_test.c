@@ -231,6 +231,24 @@ DEFINE_TEST(test_array_oob_errors)
 }
 END_TEST_DEFINITION()
 
+/* Regression for array.c:111 — the boundary index == size must be rejected.
+ * The backing buffer holds exactly `size` slots; reading at index == size
+ * is one past the end.  Original code used `index > a->size`, which allowed
+ * a silent OOB read.  Fix is `index >= a->size`. */
+DEFINE_TEST(test_array_get_rejects_index_equal_size)
+{
+    array_t arr;
+    ck_assert_ret_ok(array_init(&arr));
+    ck_assert_ret_ok(array_append(&arr, integer_data(10)));
+    ck_assert_ret_ok(array_append(&arr, integer_data(20)));
+    ck_assert_uint_eq(array_size(&arr), 2);
+
+    data_t *out = (data_t *)0xDEADBEEF;
+    ck_assert_ret_nonzero(array_get(&arr, (int)array_size(&arr), &out));
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Array, test_array_data, test_array_create_heap,
           test_array_find_contains, test_array_set_overwrite,
-          test_array_remove, test_array_oob_errors)
+          test_array_remove, test_array_oob_errors,
+          test_array_get_rejects_index_equal_size)
