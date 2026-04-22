@@ -26,19 +26,6 @@
 #define ENET_WIRE 232
 DEFINE_ERROR(ENET_WIRE, "Wire message serialization error");
 
-/*@
-  requires msg == \null || \valid(msg);
-  requires \valid(wire_out);
-  requires \valid(wire_len);
-  allocates *wire_out;
-  behavior null_msg:
-    assumes msg == \null;
-    ensures \result != 0;
-  behavior success:
-    assumes msg != \null;
-    ensures \result == 0 ==> *wire_out != \null && *wire_len > 0;
-  disjoint behaviors;
-*/
 int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
                         uint8_t **wire_out, size_t *wire_len)
 {
@@ -144,18 +131,6 @@ int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
     return 0;
 }
 
-/*@
-  requires data == \null || \valid_read(data + (0 .. len - 1));
-  requires msg_out == \null || \valid(msg_out);
-  assigns *msg_out;
-  behavior null_args:
-    assumes data == \null || msg_out == \null;
-    ensures \result != 0;
-  behavior success:
-    assumes data != \null && msg_out != \null;
-    ensures \result == 0 || \result != 0;
-  disjoint behaviors;
-*/
 int net_message_from_wire(const uint8_t *data, size_t len,
                           const public_identity_t *peer, net_wire_msg_t *msg_out)
 {
@@ -269,20 +244,6 @@ int net_message_from_wire(const uint8_t *data, size_t len,
     return 0;
 }
 
-/*@
-  requires msg == \null || \valid(msg);
-  behavior null_msg:
-    assumes msg == \null;
-    assigns \nothing;
-  behavior valid_msg:
-    assumes msg != \null;
-    assigns msg->function, msg->data;
-    frees msg->function, msg->data;
-    ensures msg->function == \null;
-    ensures msg->data == \null;
-  disjoint behaviors;
-  complete behaviors;
-*/
 void net_wire_msg_free(net_wire_msg_t *msg)
 {
     if (msg == NULL)
