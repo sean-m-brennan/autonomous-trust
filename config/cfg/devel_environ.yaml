@@ -33,3 +33,8 @@ dependencies:
   - autoconf
   - gmp
   - pcre2
+  - sqlite
+  - automake
+  - libtool
+  - pkg-config
+  - libexpat

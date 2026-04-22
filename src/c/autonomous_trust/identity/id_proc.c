@@ -25,6 +25,7 @@
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
+#include "utilities/timeout.h"
 #include "structures/data.h"
 #include "network/net_message.h"
 #include "peers.h"
@@ -787,7 +788,10 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
 
 static int _acquire_capabilities(const process_t *proc, directory_t *queues)
 {
-    int timeout_ms = 10000;
+    /* Scale the base 10s wait by the slowest peer's RTT so nodes reachable
+     * only via DTN (multi-minute bundle RTTs) still complete capability
+     * exchange without tripping this deadline. See utilities/timeout.h. */
+    int timeout_ms = at_timeout_scale_ms(10000, proc);
     int elapsed = 0;
     while (elapsed < timeout_ms)
     {
