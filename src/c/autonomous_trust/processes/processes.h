@@ -53,6 +53,12 @@ struct process_s
          * threads within a single process (e.g., net_proc peer_receiver_thread
          * writing while other threads iterate). */
         pthread_rwlock_t peers_rwlock;
+        /* Parallel array: expected one-way transport latency to peers[i] in
+         * milliseconds, as reported by the transport at admission time.
+         * Zero means "unknown; treat as fast LAN default when scaling".
+         * See at_timeout_scale_ms() in utilities/timeout.h. Indices align
+         * with peers[] and are covered by the same rwlock. */
+        int peer_rtt_ms[DEFAULT_MAX_PEERS];
         map_t *peer_capabilities;
         int phase;
         array_t *unhandled_messages;
