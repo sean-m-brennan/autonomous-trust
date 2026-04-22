@@ -1,0 +1,6 @@
+[submodule "src/c/autonomous_trust/network/dtn/ION-DTN"]
+	path = src/c/autonomous_trust/network/dtn/ION-DTN
+	url = https://github.com/nasa-jpl/ION-DTN.git
+[submodule "src/c/autonomous_trust/network/dtn/ud3tn"]
+	path = src/c/autonomous_trust/network/dtn/ud3tn
+	url = https://gitlab.com/d3tn/ud3tn.git
