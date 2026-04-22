@@ -86,6 +86,21 @@ option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)
 # Zero Trust Architecture integration (requires OpenSSL)
 option(AT_ZTA "Enable Zero Trust Architecture credential integration" OFF)
 
+# DTN / Bundle Protocol transport (see at-over-dtn.md). Adds the "dtn_bp"
+# network transport and compiles a DTN-specific receiver path.
+option(AT_NET_DTN "Enable DTN/Bundle-Protocol network transport" OFF)
+# Which BP backend to link — currently only "stub" (no external deps);
+# add ION / uD3TN backends by implementing dtn_backend.h and selecting here.
+set(AT_NET_DTN_BACKEND "stub" CACHE STRING "BP library backend: stub | ion | ud3tn")
+set_property(CACHE AT_NET_DTN_BACKEND PROPERTY STRINGS stub ion ud3tn)
+
+# Plaintext forwarding envelope (see at-over-dtn.md §4.3, net_envelope.h).
+# When ON, peer-to-peer wire frames carry a 36-byte plaintext routing header
+# so gateway nodes can bridge transports without decrypting the inner payload.
+# Default OFF so traffic on non-gateway deployments stays byte-for-byte
+# compatible with pre-2b builds until net_proc.c opts into wrapping.
+option(AT_NET_ENVELOPE "Enable plaintext forwarding envelope for gateway relay" OFF)
+
 if(AT_STATIC)
     # Prefer .a archives in subsequent find_library() calls AND pass -static to
     # the linker so transitive deps resolve statically too. Must come BEFORE the
@@ -264,6 +279,11 @@ set(libsrc
     autonomous_trust/network/ntp.c
     autonomous_trust/network/net_message.c
     autonomous_trust/network/net_proc.c
+    autonomous_trust/network/net_transport_ip.c
+    autonomous_trust/network/net_transport_udp.c
+    autonomous_trust/network/net_transport_tcp.c
+    autonomous_trust/network/net_transport_hybrid.c
+    autonomous_trust/network/net_transport_registry.c
     autonomous_trust/network/network.c
     autonomous_trust/processes/capabilities.c
     autonomous_trust/processes/daemonize.c
@@ -286,6 +306,7 @@ set(libsrc
     autonomous_trust/utilities/protobuf_shutdown.cpp
     autonomous_trust/utilities/queue_pool.c
     autonomous_trust/utilities/sighandler.c
+    autonomous_trust/utilities/timeout.c
     autonomous_trust/utilities/util.c
     autonomous_trust/fleet/update_proposal.c
     autonomous_trust/fleet/fleet_helpers.c
@@ -313,6 +334,143 @@ if(AT_ZTA)
     )
 endif()
 
+# DTN sources (only compiled when AT_NET_DTN is enabled). Files live in
+# a `dtn/` subdirectory so the process-table preprocessor can exclude them
+# cleanly when AT_NET_DTN is off (see `_exclude_args` in preprocess()).
+if(AT_NET_DTN)
+    list(APPEND libsrc
+        autonomous_trust/network/dtn/dtn_eid.c
+        autonomous_trust/network/dtn/net_transport_dtn.c
+    )
+    if(AT_NET_DTN_BACKEND STREQUAL "stub")
+        list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_stub.c)
+    elseif(AT_NET_DTN_BACKEND STREQUAL "ion")
+        # NASA ION bp_* API. Two modes:
+        #   (a) Submodule present at network/dtn/ION-DTN — we build it via
+        #       autotools into a build-local prefix. No sudo required.
+        #   (b) Submodule absent — fall back to system-installed ION (or
+        #       paths supplied explicitly via -DION_* cache vars).
+        # The node's local EID must be pre-provisioned via bpadmin before
+        # the transport is used at runtime.
+        set(ION_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/network/dtn/ION-DTN)
+        set(ION_PREFIX    ${CMAKE_BINARY_DIR}/ion-install)
+
+        if(EXISTS ${ION_SUBMODULE}/configure.ac)
+            message("-- ION: building from submodule into ${ION_PREFIX}")
+
+            # Surface autotools-missing failures at CMake-configure time
+            # with a useful message, rather than a cryptic build-time error.
+            find_program(AUTORECONF_EXEC autoreconf)
+            find_program(AUTOMAKE_EXEC   automake)
+            find_program(LIBTOOLIZE_EXEC NAMES libtoolize glibtoolize)
+            if(NOT AUTORECONF_EXEC OR NOT AUTOMAKE_EXEC OR NOT LIBTOOLIZE_EXEC)
+                message(FATAL_ERROR
+                    "AT_NET_DTN_BACKEND=ion needs autotools to build the submodule. "
+                    "Install: sudo apt-get install -y autoconf automake libtool pkg-config libexpat1-dev")
+            endif()
+
+            include(ExternalProject)
+            include(ProcessorCount)
+            ProcessorCount(ION_PARALLEL)
+            if(ION_PARALLEL EQUAL 0)
+                set(ION_PARALLEL 1)
+            endif()
+
+            # BUILD_IN_SOURCE because ION's autotools setup does not cleanly
+            # support out-of-tree builds. Artifacts land inside the submodule
+            # checkout (ION-DTN's own .gitignore covers them).
+            ExternalProject_Add(ion_external
+                SOURCE_DIR        ${ION_SUBMODULE}
+                BUILD_IN_SOURCE   1
+                CONFIGURE_COMMAND
+                    sh -c "cd <SOURCE_DIR> && autoreconf -fi && ./configure --prefix=${ION_PREFIX} --enable-shared --disable-static"
+                BUILD_COMMAND
+                    make -C <SOURCE_DIR> -j${ION_PARALLEL}
+                INSTALL_COMMAND
+                    make -C <SOURCE_DIR> install
+                BUILD_BYPRODUCTS
+                    ${ION_PREFIX}/lib/libbp${CMAKE_SHARED_LIBRARY_SUFFIX}
+                    ${ION_PREFIX}/lib/libici${CMAKE_SHARED_LIBRARY_SUFFIX}
+                LOG_CONFIGURE 1
+                LOG_BUILD     1
+                LOG_INSTALL   1
+            )
+            # Pre-create the include dir so include_directories() below has
+            # something to add even before the first build runs.
+            file(MAKE_DIRECTORY ${ION_PREFIX}/include)
+            set(ION_INCLUDE_DIR ${ION_PREFIX}/include)
+            set(ION_BP_LIB  ${ION_PREFIX}/lib/libbp${CMAKE_SHARED_LIBRARY_SUFFIX})
+            set(ION_ICI_LIB ${ION_PREFIX}/lib/libici${CMAKE_SHARED_LIBRARY_SUFFIX})
+            set(ION_EXTERNAL_TARGET ion_external)
+            # Propagate RPATH so AT executables can find the in-build ION
+            # shared libs at runtime without LD_LIBRARY_PATH.
+            list(APPEND CMAKE_BUILD_RPATH   ${ION_PREFIX}/lib)
+            list(APPEND CMAKE_INSTALL_RPATH ${ION_PREFIX}/lib)
+        else()
+            find_path(ION_INCLUDE_DIR bp.h PATH_SUFFIXES ion)
+            find_library(ION_BP_LIB  NAMES bp)
+            find_library(ION_ICI_LIB NAMES ici)
+            if(NOT ION_INCLUDE_DIR OR NOT ION_BP_LIB OR NOT ION_ICI_LIB)
+                message(FATAL_ERROR
+                    "AT_NET_DTN_BACKEND=ion selected but the ION-DTN submodule is missing "
+                    "AND no system install was found. Fix one of:\n"
+                    "  git submodule update --init src/c/autonomous_trust/network/dtn/ION-DTN\n"
+                    "  sudo make install (in a cloned ION-DTN)\n"
+                    "  cmake ... -DION_INCLUDE_DIR=... -DION_BP_LIB=... -DION_ICI_LIB=...")
+            endif()
+            message("-- Found ION bp at ${ION_BP_LIB}, ici at ${ION_ICI_LIB}")
+            set(ION_EXTERNAL_TARGET "")
+        endif()
+
+        list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_ion.c)
+        include_directories(${ION_INCLUDE_DIR})
+        list(APPEND DEPENDENCIES      ${ION_BP_LIB} ${ION_ICI_LIB})
+        list(APPEND TEST_DEPENDENCIES ${ION_BP_LIB} ${ION_ICI_LIB})
+    elseif(AT_NET_DTN_BACKEND STREQUAL "ud3tn")
+        # uD3TN legacy AAP v1 binary protocol over Unix-socket or TCP — no
+        # external library needed; the daemon must be reachable at runtime via
+        # AT_DTN_UD3TN_SOCKET (e.g. "unix:./ud3tn.aap.socket" or "tcp:host:port").
+        list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_ud3tn.c)
+    elseif(AT_NET_DTN_BACKEND STREQUAL "ud3tnv2")
+        # uD3TN AAP 2.0: protobuf-delimited framing. Schema lives at
+        # autonomous_trust/network/dtn/proto/aap2.proto, vendored verbatim
+        # from https://gitlab.com/d3tn/ud3tn/-/raw/master/components/aap2/aap2.proto
+        # Refresh by curl'ing that URL over the vendored copy.
+        #
+        # Codegen is a standalone protoc-c run — we don't reuse the main
+        # `protos` list because aap2.proto lives under the DTN tree, not the
+        # AT protobuf/ root. Generated sources land in the build tree.
+        set(AAP2_PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/network/dtn/proto)
+        set(AAP2_GEN_DIR   ${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust/network/dtn/proto)
+        add_custom_command(
+            OUTPUT ${AAP2_GEN_DIR}/aap2.pb-c.c ${AAP2_GEN_DIR}/aap2.pb-c.h
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${AAP2_GEN_DIR}
+            COMMAND ${Protobuf_PROTOC_EXECUTABLE}
+                --c_out=${AAP2_GEN_DIR}
+                -I${AAP2_PROTO_DIR}
+                ${AAP2_PROTO_DIR}/aap2.proto
+            COMMENT "Generating protobuf-c sources for aap2.proto"
+            DEPENDS ${AAP2_PROTO_DIR}/aap2.proto
+            VERBATIM
+        )
+        list(APPEND libsrc
+            autonomous_trust/network/dtn/dtn_backend_ud3tnv2.c
+            ${AAP2_GEN_DIR}/aap2.pb-c.c
+        )
+        include_directories(${AAP2_GEN_DIR})
+    else()
+        message(FATAL_ERROR "Unknown AT_NET_DTN_BACKEND: ${AT_NET_DTN_BACKEND}")
+    endif()
+    add_compile_definitions(AT_NET_DTN)
+endif()
+
+# Forwarding envelope (see at-over-dtn.md §4.3). Codec only — consumers of
+# the header are wired in net_proc.c in slice 2b.2.
+if(AT_NET_ENVELOPE)
+    list(APPEND libsrc autonomous_trust/network/net_envelope.c)
+    add_compile_definitions(AT_NET_ENVELOPE)
+endif()
+
 set(libhdr
     autonomous_trust.h
     autonomous_trust/algorithms/agreement.h
@@ -325,6 +483,7 @@ set(libhdr
     autonomous_trust/identity/identity.h
     autonomous_trust/identity/peers.h
     autonomous_trust/network/net_message.h
+    autonomous_trust/network/net_transport.h
     autonomous_trust/processes/capabilities.h
     autonomous_trust/structures/array.h
     autonomous_trust/structures/dag.h
@@ -406,9 +565,12 @@ function(preprocess _file_in)
     set(_header_file ${CMAKE_CURRENT_BINARY_DIR}/${_base}.h)
     set(_src_dir ${CMAKE_CURRENT_SOURCE_DIR})
     set(_exclude_args)                                                                                      
-    if(NOT AT_ZTA)                                              
-        list(APPEND _exclude_args --exclude zta)                                                            
-    endif()      
+    if(NOT AT_ZTA)
+        list(APPEND _exclude_args --exclude zta)
+    endif()
+    if(NOT AT_NET_DTN)
+        list(APPEND _exclude_args --exclude dtn)
+    endif()
     add_custom_command(
         OUTPUT ${_header_file}
         COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust ${_exclude_args}
@@ -507,6 +669,14 @@ target_sources(autonomous_trust PUBLIC ${libsrc}
     PUBLIC FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
     )
+
+# If ION is being built from the in-tree submodule, force the ExternalProject
+# to complete (install libs + headers) before either AT library starts
+# compiling — otherwise dtn_backend_ion.c would fail on #include <bp.h>.
+if(DEFINED ION_EXTERNAL_TARGET AND ION_EXTERNAL_TARGET)
+    add_dependencies(autonomous_trust        ${ION_EXTERNAL_TARGET})
+    add_dependencies(autonomous_trust_static ${ION_EXTERNAL_TARGET})
+endif()
 
 
 ####################
@@ -912,6 +1082,78 @@ if(AT_ZTA)
     add_test(NAME zta_ocsp_test COMMAND $<TARGET_FILE:zta_ocsp_test>)
     add_test(NAME zta_delegation_test COMMAND $<TARGET_FILE:zta_delegation_test>)
 endif() # AT_ZTA
+
+# Hybrid-transport routing unit tests — always compiled; no backend needed,
+# this is a pure-math test of the matcher logic.
+add_executable(hybrid_route_test test/hybrid_route_test.c)
+set_source_files_properties(test/hybrid_route_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(hybrid_route_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME hybrid_route_test COMMAND $<TARGET_FILE:hybrid_route_test>)
+
+# IPv6 CIDR matching — split into its own binary to stay under the
+# RUN_TESTS 9-arg cap in test_setup.h.
+add_executable(hybrid_route6_test test/hybrid_route6_test.c)
+set_source_files_properties(test/hybrid_route6_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(hybrid_route6_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME hybrid_route6_test COMMAND $<TARGET_FILE:hybrid_route6_test>)
+
+# Timeout-scaling tests — the pure-arithmetic kernel of the
+# timeout-adaptation layer (utilities/timeout.h).
+add_executable(timeout_scale_test test/timeout_scale_test.c)
+set_source_files_properties(test/timeout_scale_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(timeout_scale_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME timeout_scale_test COMMAND $<TARGET_FILE:timeout_scale_test>)
+
+# Envelope codec unit tests — gated by AT_NET_ENVELOPE since the codec TU
+# itself is only compiled when that option is ON.
+if(AT_NET_ENVELOPE)
+    add_executable(net_envelope_test test/net_envelope_test.c)
+    set_source_files_properties(test/net_envelope_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(net_envelope_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME net_envelope_test COMMAND $<TARGET_FILE:net_envelope_test>)
+
+    # Multi-hop relay test — exercises the envelope forwarding protocol
+    # end-to-end across simulated A -> G [-> G2] -> B paths without
+    # bringing up real transports or threads.
+    add_executable(envelope_relay_test test/envelope_relay_test.c)
+    set_source_files_properties(test/envelope_relay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(envelope_relay_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME envelope_relay_test COMMAND $<TARGET_FILE:envelope_relay_test>)
+
+    # Cross-leg broadcast forwarding gate + dedup fingerprint. Split from
+    # envelope_relay_test to stay under the 9-test RUN_TESTS cap.
+    add_executable(envelope_bcast_test test/envelope_bcast_test.c)
+    set_source_files_properties(test/envelope_bcast_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(envelope_bcast_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME envelope_bcast_test COMMAND $<TARGET_FILE:envelope_bcast_test>)
+
+    # Integration-ish test: drives the real net_proc handle_inbound_peer()
+    # through a mock transport, asserting forward/drop/local behavior
+    # end-to-end without bringing up daemonize()'d processes or sockets.
+    add_executable(net_proc_relay_test test/net_proc_relay_test.c)
+    set_source_files_properties(test/net_proc_relay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(net_proc_relay_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME net_proc_relay_test COMMAND $<TARGET_FILE:net_proc_relay_test>)
+endif()
+
+# DTN tests (only when AT_NET_DTN is enabled). dtn_eid_test is pure string
+# math so it runs against any backend. dtn_transport_test exercises the
+# transport's send/recv paths through the backend vtable; it assumes the
+# no-op stub (send returns 0, recv returns ENOMSG) and would misbehave
+# against a real daemon, so it is gated to the stub backend only.
+if(AT_NET_DTN)
+    add_executable(dtn_eid_test test/dtn_eid_test.c)
+    set_source_files_properties(test/dtn_eid_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(dtn_eid_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME dtn_eid_test COMMAND $<TARGET_FILE:dtn_eid_test>)
+
+    if(AT_NET_DTN_BACKEND STREQUAL "stub")
+        add_executable(dtn_transport_test test/dtn_transport_test.c)
+        set_source_files_properties(test/dtn_transport_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+        target_link_libraries(dtn_transport_test PRIVATE ${AT_TEST_LIBS})
+        add_test(NAME dtn_transport_test COMMAND $<TARGET_FILE:dtn_transport_test>)
+    endif()
+endif()
 
 endif() # LIBCHECK_LIBRARY
 
