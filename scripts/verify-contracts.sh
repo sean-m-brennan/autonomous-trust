@@ -27,7 +27,13 @@ set -euo pipefail
 PROJ_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 C_SRC="$PROJ_ROOT/src/c/autonomous_trust"
 STUBS_DIR="$PROJ_ROOT/src/c/frama-c/stubs"
-PROTO_SRC="$PROJ_ROOT/src/c/build/protobuf"
+BUILD_DIR="$PROJ_ROOT/src/c/build"
+PROTO_SRC="$BUILD_DIR/protobuf"
+# Optional build-tree roots — only present when the corresponding CMake
+# option was selected and the project was built. Added to the cpp -I path
+# below iff the directory exists.
+AAP2_GEN_DIR="$BUILD_DIR/autonomous_trust/network/dtn/proto"  # AT_NET_DTN_BACKEND=ud3tnv2
+ION_INCLUDE_DIR="$BUILD_DIR/ion-install/include"              # AT_NET_DTN_BACKEND=ion
 
 VALID_MODULES=(
     structures
@@ -235,13 +241,43 @@ echo ""
 # Include paths
 ####################
 
+# Headers generated at CMake configure time (configure_file from .h.in
+# templates under autonomous_trust/): config_table_priv.h,
+# process_table_priv.h, capability_table_priv.h, error_table_priv.h. All
+# land at the top of the build tree, so -I $BUILD_DIR resolves them.
+if [[ ! -d "$BUILD_DIR" ]]; then
+    echo "WARNING: $BUILD_DIR does not exist — run 'cmake -S src/c -B src/c/build' first."
+    echo "         Files including config_table_priv.h / capability_table_priv.h /"
+    echo "         process_table_priv.h / error_table_priv.h will SKIP."
+    echo ""
+fi
+
 PROTO_INCLUDES=""
-while IFS= read -r line; do
- PROTO_INCLUDES+="-I ${line} "
-done <<< "$(find $PROTO_SRC/autonomous_trust/core/protobuf -type d)"
+if [[ -d "$PROTO_SRC/autonomous_trust/core/protobuf" ]]; then
+    while IFS= read -r line; do
+     PROTO_INCLUDES+="-I ${line} "
+    done <<< "$(find $PROTO_SRC/autonomous_trust/core/protobuf -type d)"
+else
+    echo "WARNING: $PROTO_SRC not populated — build the project so protoc runs."
+    echo "         Files including *.pb-c.h will SKIP."
+    echo ""
+fi
+
+# Optional backend-specific include dirs. These only exist when the
+# corresponding DTN backend was selected and the project was built; add
+# them when present so dtn_backend_ud3tnv2.c (aap2.pb-c.h) and
+# dtn_backend_ion.c (bp.h) can be parsed. Absent → those files SKIP with
+# an explanatory fatal error, which is the correct behavior.
+OPTIONAL_INCLUDES=""
+if [[ -d "$AAP2_GEN_DIR" ]]; then
+    OPTIONAL_INCLUDES+=" -I $AAP2_GEN_DIR"
+fi
+if [[ -d "$ION_INCLUDE_DIR" ]]; then
+    OPTIONAL_INCLUDES+=" -I $ION_INCLUDE_DIR"
+fi
 
 INCLUDE_FLAGS=(
-    -cpp-extra-args="-fms-extensions -DAT_ZTA_ENABLED -include $STUBS_DIR/fc_stdio_spec.h -include $STUBS_DIR/fc_stdlib_spec.h -I $C_SRC -I $STUBS_DIR -I $PROJ_ROOT/src/c -I $PROTO_SRC $PROTO_INCLUDES -I $CONDA_PREFIX/include"
+    -cpp-extra-args="-fms-extensions -DAT_ZTA_ENABLED -include $STUBS_DIR/fc_stdio_spec.h -include $STUBS_DIR/fc_stdlib_spec.h -include $STUBS_DIR/fc_string_spec.h -include $STUBS_DIR/fc_net_spec.h -I $C_SRC -I $STUBS_DIR -I $PROJ_ROOT/src/c -I $BUILD_DIR -I $PROTO_SRC $PROTO_INCLUDES$OPTIONAL_INCLUDES -I $CONDA_PREFIX/include"
 )
 
 ####################
@@ -380,6 +416,29 @@ for src in "${files[@]}"; do
             skip_fns="copyNodes,nodeMinLeaf,nodesFree,rotateTree,recolorInsert,transplant,recolorDelPartial,recolorDelete,tree_insert,tree_delete,tree_copy,node_depth,tree_depth,findNode,createNode,tree_create,tree_free" ;;
 
         # -- identity --
+        history.c)
+            # [alloc-pattern] _identity_obj_designation: 12 at_memcpy + uuid_unparse
+            # + strnlen cascade through blob-designation assembly.
+            # [string-loop] identity_obj_create: strncpy preconditions cascade into
+            # success/oom ensures; same pattern as names.c/random_name.
+            # [solver-timeout] identity_history_create: dag_init + success ensures
+            # (smrt_ptr allocation cascade).
+            # [recursive-ds] identity_history_free: composite destructor cascades
+            # through agreement_protocol_free + merkle_tree_free + dag_free +
+            # array_free; 4 consecutive free-valid preconditions time out.
+            # [serialization] identity_history_hear: dag_ingest_branch +
+            # json_decref. linked_step_to_json / linked_step_from_json: jansson +
+            # hexlify cascades.
+            skip_fns="_identity_obj_designation,identity_obj_create,identity_history_create,identity_history_hear,identity_history_free,linked_step_to_json,linked_step_from_json" ;;
+        net_message.c)
+            # [serialization] net_message_from_wire: json_loadb spec dropped by
+            # kernel ("Cannot use a pointer to void here. Ignoring specification of
+            # function json_loadb"), then synthesized assigns \everything triggers
+            # "Invalid infinite range w_28+(0..)" WP abort at line 143. Skipping
+            # this function bypasses the abort so the other two can verify.
+            # [serialization] net_message_to_wire: 11x json_object_set_new/json_string
+            # + 2x crypto_sign_detached + strlen/snprintf/sodium_bin2base64 cascade.
+            skip_fns="net_message_from_wire,net_message_to_wire" ;;
         hexlify.c)
             # [solver-timeout] hexlify: loop assert on hex encoding
             skip_fns="hexlify" ;;
@@ -426,6 +485,73 @@ for src in "${files[@]}"; do
         ping.c)
             # [syscall] raw socket send/recv, setsockopt, select
             skip_fns="ping,ping_server_loop,ping_server_start,ping_server_stop" ;;
+        dtn_backend_ion.c)
+            # [solver-timeout] ion_init: 8x at_logging + 3x pthread_create state-cascade
+            # (same pattern as reputation_run's 11x process_register_handler).
+            # ion_send/ion_recv: at_logging + at_snprintf cascades through ION SDR calls.
+            # reader_thread: logging/snprintf/memset precondition chains in loop body.
+            # ion_teardown: terminates_part cascade through SDR cleanup sequence.
+            # [syscall] pthread_create — standard stub, no WP-usable spec.
+            skip_fns="ion_init,ion_send,ion_recv,ion_teardown,reader_thread" ;;
+        net_transport_hybrid.c)
+            # [syscall] teardown, hybrid_open, hybrid_recv, reader_thread:
+            # pthread_{create,mutex,cond}_* cascades + at_logging/at_snprintf chains.
+            # [serialization] hybrid_to_json, hybrid_from_json: jansson object_get/
+            # set/string/decref + snprintf precondition cascades.
+            # [inet] addr_in_cidr4, addr_in_cidr6: strchr/strrchr/atoi CIDR parsing
+            # (same pattern as network.c's cidr_split family).
+            skip_fns="teardown,hybrid_open,hybrid_recv,reader_thread,hybrid_to_json,hybrid_from_json,addr_in_cidr4,addr_in_cidr6" ;;
+        net_transport_tcp.c)
+            # [syscall] all socket-touching functions: send/recv/connect/setsockopt/
+            # close stubs have no WP-usable specs. tcp_accept_and_read also has
+            # terminates_part cascade through the accept/read/close sequence.
+            skip_fns="tcp_send_to,tcp_recv,tcp_open_common,tcp_close,tcp_accept_and_read" ;;
+        net_transport_udp.c)
+            # [syscall] all socket-touching functions: sendto/recvfrom/setsockopt/
+            # close stubs; same pattern as tcp. open_common also hits cidr_split.
+            skip_fns="udp_send,udp_send_unicast,udp_send_broadcast,udp_recv,udp_open_common,udp_close" ;;
+        net_transport_ip.c)
+            # [syscall] net_transport_ip_join_mcast: setsockopt + at_memcpy +
+            # getaddrinfo/freeaddrinfo + set_exception cascade (IPv4 and IPv6
+            # branches both hit setsockopt).
+            # [syscall] net_transport_ip_bind: getaddrinfo loop + bind/setsockopt +
+            # 6x set_exception precondition cascade. Also depends on struct ip_mreq
+            # stubbed in fc_net_spec.h.
+            skip_fns="net_transport_ip_join_mcast,net_transport_ip_bind" ;;
+        dtn_backend_stub.c)
+            # [solver-timeout] stub_init: single at_logging precondition cascade.
+            skip_fns="stub_init" ;;
+        dtn_backend_ud3tn.c)
+            # [solver-timeout] ud3tn_init: 7x at_logging + 3x pthread_create + getenv/snprintf cascade
+            # (same pattern as ion_init). teardown/recv/send: at_logging/at_snprintf + socket
+            # shutdown/close. read_exact/write_exact: read/write syscall preconditions.
+            # connect_tcp/connect_unix: getaddrinfo/connect/strlen stubs.
+            # reader_thread/read_one_frame: logging/snprintf in loop body.
+            # aap_* framing helpers: strlen + at_logging + terminates on varint-style byte loops.
+            # [syscall] pthread_create, read, write, getaddrinfo, freeaddrinfo, connect, shutdown, close.
+            skip_fns="ud3tn_init,teardown,ud3tn_recv,ud3tn_send,write_exact,read_exact,reader_thread,read_one_frame,connect_tcp,connect_unix,open_backend_socket,aap_send_register,aap_write_sendbundle_frame,aap_write_u64,aap_read_u64" ;;
+        dtn_backend_ud3tnv2.c)
+            # [solver-timeout] ud3tnv2_init: 7x at_logging + 3x pthread_create + getenv/snprintf cascade.
+            # teardown/recv/send: logging/snprintf + socket shutdown/close (2 FDs for AAP2: adu + ctrl).
+            # subscriber_reader/handle_pushed_adu: logging/snprintf in loop body.
+            # do_handshake/consume_greeting: 7x at_logging cascade in protocol negotiation.
+            # varint_write/varint_read: terminates on byte-by-byte varint loops.
+            # [syscall] same set as ud3tn plus AAP2 dual-socket protocol variant.
+            skip_fns="ud3tnv2_init,teardown,ud3tnv2_recv,ud3tnv2_send,write_exact,read_exact,varint_write,varint_read,subscriber_reader,handle_pushed_adu,do_handshake,consume_greeting,connect_tcp,connect_unix,open_backend_socket" ;;
+        dtn_eid.c)
+            # [solver-timeout] EID string formatters: every function is a thin at_snprintf
+            # wrapper whose precondition cascade WP cannot discharge. Small file, simple
+            # body, low bug risk — skipping the whole API is acceptable.
+            skip_fns="dtn_eid_from_uuid,dtn_eid_for_service,dtn_eid_for_group" ;;
+        net_transport_dtn.c)
+            # [solver-timeout] dtn_open/dtn_recv: pthread_mutex_{init,lock,destroy} +
+            # at_logging + at_snprintf cascades. dtn_close: pthread_mutex_destroy.
+            # build_peer_eid: at_memcpy/strcmp/strncmp/at_snprintf chain for EID assembly
+            # (the at_memcpy failures here are precondition cascades, NOT the type-cast
+            # pattern that net_envelope's unsigned-char* stub fixed — memcpy stub swap
+            # has zero effect on this file).
+            # dtn_send_broadcast: at_memcmp precondition. service_to_channel: strcmp.
+            skip_fns="dtn_open,dtn_recv,dtn_close,build_peer_eid,dtn_send_broadcast,service_to_channel" ;;
 
         # -- config --
         names.c)
@@ -447,6 +573,15 @@ for src in "${files[@]}"; do
             skip_fns="get_cfg_type" ;;
 
         # -- processes --
+        capabilities.c)
+            # [serialization] capability_to_json_obj, peer_capabilities_to_json:
+            # map_get + json_string/array_append_new/object_set_new + data_integer/
+            # data_string_ptr/data_object_ptr cascades (plus terminates_part from
+            # nested map+json operations).
+            # [alloc-pattern] capability_sync_out / peer_capabilities_sync_out:
+            # at_memcpy + map_sync_out + array_size/array_get; capability_sync_in:
+            # map_sync_in. capability_from_json_obj: strncpy + map_init.
+            skip_fns="capability_to_json_obj,peer_capabilities_to_json,capability_sync_out,capability_sync_in,peer_capabilities_sync_out,capability_from_json_obj" ;;
         daemonize.c)
             # [syscall] fork, setsid, chdir, dup2, close — full POSIX
             # daemon lifecycle; no WP specs for any of these

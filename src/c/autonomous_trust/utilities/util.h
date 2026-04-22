@@ -26,7 +26,7 @@
 #include "exception.h"
 #include "compiler.h"
 
-#if defined __GNUC__
+#if defined __GNUC__ && !defined __FRAMAC__
 #define IGNORE_GCC_DIAGNOSTIC(which) \
     _Pragma("GCC diagnostic push")   \
         _Pragma(_GCC_DIAGNOSTIC(which))
@@ -41,6 +41,7 @@
 #define END_IGNORE_GCC_DIAGNOSTIC _Pragma("GCC diagnostic pop")
 #else
 #define IGNORE_GCC_DIAGNOSTIC(x)
+#define IGNORE_GCC_VER_DIAGNOSTIC(v, x)
 #define END_IGNORE_GCC_DIAGNOSTIC
 #endif
 

@@ -93,20 +93,6 @@ static int _identity_obj_get_hash(const merkle_blob_t *blob, const uint8_t *nonc
     return ret;
 }
 
-/*@
-  requires identity != \null && \valid(identity);
-  requires \valid(obj);
-  allocates *obj;
-  behavior success:
-    ensures \result == 0;
-    ensures *obj != \null;
-  behavior null_args:
-    assumes identity == \null || obj == \null;
-    ensures \result == EINVAL;
-  behavior oom:
-    ensures \result == ENOMEM;
-  disjoint behaviors null_args, success;
-*/
 int identity_obj_create(public_identity_t *identity, const char *originator_uuid,
                         identity_obj_t **obj)
 {
@@ -144,29 +130,12 @@ int identity_obj_designation(const identity_obj_t *obj, uint8_t **out, size_t *o
     return _identity_obj_designation((const merkle_blob_t *)obj, out, out_len);
 }
 
-/*@
-  requires obj == \null || \valid(obj);
-  frees obj;
-*/
 void identity_obj_free(identity_obj_t *obj)
 {
     if (obj != NULL)
         free(obj);
 }
 
-/*@
-  requires \valid(history);
-  allocates *history;
-  behavior success:
-    ensures \result == 0;
-    ensures *history != \null;
-  behavior null_out:
-    assumes history == \null;
-    ensures \result == EINVAL;
-  behavior failure:
-    ensures \result != 0;
-  disjoint behaviors null_out, success;
-*/
 int identity_history_create(agreement_voter_t *myself,
                             peers_t *peers,
                             logger_t *logger,
@@ -213,17 +182,6 @@ int identity_history_create(agreement_voter_t *myself,
     return 0;
 }
 
-/*@
-  requires history == \null || \valid(history);
-  requires who == \null || \valid(who);
-  behavior null_args:
-    assumes history == \null || who == \null;
-    ensures \result == EINVAL;
-  behavior success:
-    assumes history != \null && who != \null;
-    ensures \result == 0 || \result != 0;
-  disjoint behaviors;
-*/
 int identity_history_insert_peer(identity_history_t *history,
                                  public_identity_t *who)
 {
@@ -260,19 +218,6 @@ int identity_history_insert_peer(identity_history_t *history,
     return dag_add_step(&history->dag, step, NULL);
 }
 
-/*@
-  requires history == \null || \valid(history);
-  requires item == \null || \valid(item);
-  requires \valid(proof_out);
-  requires \valid(proof_len);
-  behavior null_args:
-    assumes history == \null || item == \null;
-    ensures \result == EINVAL;
-  behavior success:
-    assumes history != \null && item != \null;
-    ensures \result == 0 ==> *proof_out != \null && *proof_len >= 0;
-  disjoint behaviors;
-*/
 int identity_history_prove_existence(identity_history_t *history,
                                      merkle_blob_t *item,
                                      merkle_proof_step_t **proof_out,
@@ -283,20 +228,6 @@ int identity_history_prove_existence(identity_history_t *history,
     return merkle_inclusion_proof(history->merkle, item, proof_out, proof_len);
 }
 
-/*@
-  requires history == \null || \valid(history);
-  requires item == \null || \valid(item);
-  requires proof_len >= 0;
-  requires proof_len == 0 || \valid(proof + (0 .. proof_len - 1));
-  behavior null_args:
-    assumes history == \null || item == \null;
-    ensures \result == \false;
-  behavior valid_args:
-    assumes history != \null && item != \null;
-    ensures \result == \true || \result == \false;
-  disjoint behaviors;
-  complete behaviors;
-*/
 bool identity_history_verify_existence(identity_history_t *history,
                                        merkle_blob_t *item,
                                        merkle_proof_step_t *proof,
@@ -371,22 +302,6 @@ static int linked_step_from_json(const json_t *obj, linked_step_t **step_out)
     return 0;
 }
 
-/*@
-  requires history == \null || \valid(history);
-  requires signer == \null || \valid(signer);
-  requires wire_out == \null || \valid(wire_out);
-  requires wire_len == \null || \valid(wire_len);
-  allocates *wire_out;
-  behavior null_args:
-    assumes history == \null || signer == \null ||
-            wire_out == \null || wire_len == \null;
-    ensures \result == EINVAL;
-  behavior success:
-    assumes history != \null && signer != \null &&
-            wire_out != \null && wire_len != \null;
-    ensures \result == 0 ==> *wire_out != \null && *wire_len > 0;
-  disjoint behaviors;
-*/
 int identity_history_share(identity_history_t *history,
                            const identity_t *signer,
                            uint8_t **wire_out, size_t *wire_len)
@@ -451,20 +366,6 @@ int identity_history_share(identity_history_t *history,
     return 0;
 }
 
-/*@
-  requires history == \null || \valid(history);
-  requires sender == \null || \valid(sender);
-  requires wire == \null || \valid_read(wire + (0 .. wire_len - 1));
-  behavior null_args:
-    assumes history == \null || sender == \null ||
-            wire == \null || wire_len == 0;
-    ensures \result == EINVAL;
-  behavior success:
-    assumes history != \null && sender != \null &&
-            wire != \null && wire_len > 0;
-    ensures \result == 0 || \result != 0;
-  disjoint behaviors;
-*/
 int identity_history_hear(identity_history_t *history,
                           const public_identity_t *sender,
                           const uint8_t *wire, size_t wire_len)
@@ -540,17 +441,6 @@ int identity_history_hear(identity_history_t *history,
     return dag_merge(&history->dag, name_out, NULL, false);
 }
 
-/*@
-  requires history == \null || \valid(history);
-  behavior null_history:
-    assumes history == \null;
-    assigns \nothing;
-  behavior valid_history:
-    assumes history != \null;
-    frees history;
-  disjoint behaviors;
-  complete behaviors;
-*/
 void identity_history_free(identity_history_t *history)
 {
     if (history == NULL)

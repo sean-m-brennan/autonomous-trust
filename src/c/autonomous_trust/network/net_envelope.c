@@ -140,10 +140,20 @@ uint64_t net_envelope_broadcast_fingerprint(const net_envelope_t *env,
     /* FNV-1a-64. The offset basis is non-zero, so a valid fingerprint can
      * never collide with the 0 sentinel this function returns on NULL. */
     uint64_t h = 0xcbf29ce484222325ULL;
+    /*@
+      loop invariant 0 <= i <= 16;
+      loop assigns i, h;
+      loop variant 16 - i;
+    */
     for (size_t i = 0; i < 16; i++) {
         h ^= (uint64_t)env->src_uuid[i];
         h *= 0x100000001b3ULL;
     }
+    /*@
+      loop invariant 0 <= i <= payload_len;
+      loop assigns i, h;
+      loop variant payload_len - i;
+    */
     for (size_t i = 0; i < payload_len; i++) {
         h ^= (uint64_t)payload[i];
         h *= 0x100000001b3ULL;

@@ -95,6 +95,25 @@ typedef struct {
  * @return 0 on success, -1 on NULL args, oversize frame, or insufficient
  *         buffer capacity.
  */
+/*@
+  requires \valid_read(env);
+  requires \valid_read(env->dst_uuid + (0 .. 15));
+  requires \valid_read(env->src_uuid + (0 .. 15));
+  requires \valid(out_frame + (0 .. out_frame_cap - 1));
+  requires \valid(out_frame_len);
+  requires payload_len == 0 || \valid_read(payload + (0 .. payload_len - 1));
+  requires out_frame_cap >= NET_ENV_HEADER_LEN + payload_len;
+  requires \separated(out_frame + (0 .. out_frame_cap - 1), env->dst_uuid + (0 .. 15));
+  requires \separated(out_frame + (0 .. out_frame_cap - 1), env->src_uuid + (0 .. 15));
+  requires payload_len == 0 ||
+           \separated(out_frame + (0 .. out_frame_cap - 1),
+                      payload + (0 .. payload_len - 1));
+  requires \separated(out_frame_len, out_frame + (0 .. out_frame_cap - 1));
+  assigns out_frame[0 .. NET_ENV_HEADER_LEN + payload_len - 1];
+  assigns *out_frame_len;
+  ensures \result == 0 || \result == -1;
+  ensures \result == 0 ==> *out_frame_len == NET_ENV_HEADER_LEN + payload_len;
+*/
 int net_envelope_pack(const net_envelope_t *env,
                       const uint8_t *payload, size_t payload_len,
                       uint8_t *out_frame, size_t out_frame_cap,
@@ -114,6 +133,29 @@ int net_envelope_pack(const net_envelope_t *env,
  * @return 0 on success, -1 if @p frame_len is too short, version is
  *         unrecognized, or any argument is NULL.
  */
+/*@
+  requires frame_len == 0 || \valid_read(frame + (0 .. frame_len - 1));
+  requires \valid(env_out);
+  requires \valid(env_out->dst_uuid + (0 .. 15));
+  requires \valid(env_out->src_uuid + (0 .. 15));
+  requires \valid(payload_out);
+  requires \valid(payload_len_out);
+  requires frame_len < NET_ENV_HEADER_LEN ||
+           \separated(env_out, frame + (0 .. frame_len - 1));
+  requires frame_len < NET_ENV_HEADER_LEN ||
+           \separated(env_out->dst_uuid + (0 .. 15), frame + (0 .. frame_len - 1));
+  requires frame_len < NET_ENV_HEADER_LEN ||
+           \separated(env_out->src_uuid + (0 .. 15), frame + (0 .. frame_len - 1));
+  requires \separated(env_out, payload_out, payload_len_out);
+  assigns *env_out;
+  assigns env_out->dst_uuid[0 .. 15];
+  assigns env_out->src_uuid[0 .. 15];
+  assigns *payload_out;
+  assigns *payload_len_out;
+  ensures \result == 0 || \result == -1;
+  ensures \result == 0 ==> frame_len >= NET_ENV_HEADER_LEN;
+  ensures \result == 0 ==> *payload_len_out == frame_len - NET_ENV_HEADER_LEN;
+*/
 int net_envelope_unpack(const uint8_t *frame, size_t frame_len,
                         net_envelope_t *env_out,
                         const uint8_t **payload_out,
@@ -134,6 +176,17 @@ int net_envelope_unpack(const uint8_t *frame, size_t frame_len,
  * @param frame_len   Length of @p frame in bytes (must be >= NET_ENV_HEADER_LEN).
  * @return 0 on success, -1 on NULL args or undersized frame.
  */
+/*@
+  requires \valid_read(env);
+  requires \valid_read(env->dst_uuid + (0 .. 15));
+  requires \valid_read(env->src_uuid + (0 .. 15));
+  requires \valid(frame + (0 .. frame_len - 1));
+  requires frame_len >= NET_ENV_HEADER_LEN;
+  requires \separated(frame + (0 .. frame_len - 1), env->dst_uuid + (0 .. 15));
+  requires \separated(frame + (0 .. frame_len - 1), env->src_uuid + (0 .. 15));
+  assigns frame[0 .. NET_ENV_HEADER_LEN - 1];
+  ensures \result == 0 || \result == -1;
+*/
 int net_envelope_rewrite_header(const net_envelope_t *env,
                                 uint8_t *frame, size_t frame_len);
 
@@ -143,6 +196,10 @@ int net_envelope_rewrite_header(const net_envelope_t *env,
  * Broadcast envelopes carry dst_uuid = NIL. Receivers compare against
  * this to distinguish broadcast from unicast routing.
  */
+/*@
+  requires \valid_read(uuid + (0 .. 15));
+  assigns \nothing;
+*/
 bool net_envelope_is_nil_uuid(const uuid_t uuid);
 
 /** Disposition a receiver should apply to an unpacked envelope. */
@@ -177,6 +234,16 @@ typedef enum {
  *                         May be NULL (treated as NIL).
  * @param am_gateway       True iff this node is operating as a gateway.
  */
+/*@
+  requires env == \null || \valid_read(env);
+  requires env == \null || \valid_read(env->dst_uuid + (0 .. 15));
+  requires \valid_read(my_uuid + (0 .. 15));
+  requires my_group_uuid == \null || \valid_read(my_group_uuid + (0 .. 15));
+  assigns \nothing;
+  ensures \result == NET_ENV_DISPOSITION_LOCAL ||
+          \result == NET_ENV_DISPOSITION_FORWARD ||
+          \result == NET_ENV_DISPOSITION_DROP;
+*/
 net_env_disposition_t net_envelope_disposition(const net_envelope_t *env,
                                                const uuid_t my_uuid,
                                                const uuid_t my_group_uuid,
@@ -196,6 +263,10 @@ net_env_disposition_t net_envelope_disposition(const net_envelope_t *env,
  * forwarding for those types is handled via
  * @ref net_envelope_disposition.
  */
+/*@
+  requires env == \null || \valid_read(env);
+  assigns \nothing;
+*/
 bool net_envelope_should_forward_broadcast(const net_envelope_t *env,
                                            bool am_gateway);
 
@@ -216,6 +287,13 @@ bool net_envelope_should_forward_broadcast(const net_envelope_t *env,
  *         treat 0 as "do not dedup" — a real fingerprint of empty input
  *         is the FNV offset basis, which is non-zero).
  */
+/*@
+  requires env == \null || \valid_read(env);
+  requires env == \null || \valid_read(env->src_uuid + (0 .. 15));
+  requires payload_len == 0 || \valid_read(payload + (0 .. payload_len - 1));
+  assigns \nothing;
+  ensures env == \null ==> \result == 0;
+*/
 uint64_t net_envelope_broadcast_fingerprint(const net_envelope_t *env,
                                             const uint8_t *payload,
                                             size_t payload_len);
