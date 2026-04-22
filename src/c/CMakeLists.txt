@@ -346,13 +346,13 @@ if(AT_NET_DTN)
         list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_stub.c)
     elseif(AT_NET_DTN_BACKEND STREQUAL "ion")
         # NASA ION bp_* API. Two modes:
-        #   (a) Submodule present at network/dtn/ION-DTN — we build it via
+        #   (a) Submodule present at ./ION-DTN — we build it via
         #       autotools into a build-local prefix. No sudo required.
         #   (b) Submodule absent — fall back to system-installed ION (or
         #       paths supplied explicitly via -DION_* cache vars).
         # The node's local EID must be pre-provisioned via bpadmin before
         # the transport is used at runtime.
-        set(ION_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/network/dtn/ION-DTN)
+        set(ION_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/ION-DTN)
         set(ION_PREFIX    ${CMAKE_BINARY_DIR}/ion-install)
 
         if(EXISTS ${ION_SUBMODULE}/configure.ac)
@@ -383,7 +383,7 @@ if(AT_NET_DTN)
                 SOURCE_DIR        ${ION_SUBMODULE}
                 BUILD_IN_SOURCE   1
                 CONFIGURE_COMMAND
-                    sh -c "cd <SOURCE_DIR> && autoreconf -fi && ./configure --prefix=${ION_PREFIX} --enable-shared --disable-static"
+                    sh -c "cd <SOURCE_DIR> && (make distclean 2>/dev/null || true) && rm -f *.la libtool config.status && autoreconf -fi && ./configure --prefix=${ION_PREFIX} --enable-shared --disable-static"
                 BUILD_COMMAND
                     make -C <SOURCE_DIR> -j${ION_PARALLEL}
                 INSTALL_COMMAND
@@ -435,7 +435,7 @@ if(AT_NET_DTN)
         # uD3TN AAP 2.0: protobuf-delimited framing. Schema lives at
         # autonomous_trust/network/dtn/proto/aap2.proto, vendored verbatim
         # from https://gitlab.com/d3tn/ud3tn/-/raw/master/components/aap2/aap2.proto
-        # Refresh by curl'ing that URL over the vendored copy.
+        # Currently symlinked to submodule location in ./ud3tn/
         #
         # Codegen is a standalone protoc-c run — we don't reuse the main
         # `protos` list because aap2.proto lives under the DTN tree, not the
@@ -1134,6 +1134,14 @@ if(AT_NET_ENVELOPE)
     set_source_files_properties(test/net_proc_relay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
     target_link_libraries(net_proc_relay_test PRIVATE ${AT_TEST_LIBS})
     add_test(NAME net_proc_relay_test COMMAND $<TARGET_FILE:net_proc_relay_test>)
+
+    # Deferred-message uuid-keyed retry (stage G). Verifies that under
+    # envelope mode the deferred-message ring keys by envelope src_uuid,
+    # not the gateway's transport from_addr.
+    add_executable(net_proc_defer_test test/net_proc_defer_test.c)
+    set_source_files_properties(test/net_proc_defer_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(net_proc_defer_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME net_proc_defer_test COMMAND $<TARGET_FILE:net_proc_defer_test>)
 endif()
 
 # DTN tests (only when AT_NET_DTN is enabled). dtn_eid_test is pure string
