@@ -108,13 +108,20 @@ typedef struct {
     uint8_t data[DEFERRED_MSG_MAX];
     size_t len;
     char from_addr[ADDR_LEN + 1];
+    uuid_t src_uuid;        /* Original sender's UUID (envelope mode). */
+    bool   has_src_uuid;    /* True iff src_uuid is meaningful. */
 } deferred_msg_t;
 
 static deferred_msg_t deferred_messages[MAX_DEFERRED];
 static size_t deferred_count = 0;
 static pthread_mutex_t deferred_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void defer_message(const uint8_t *data, size_t len, const char *from_addr)
+/* @p src_uuid is optional — pass NULL in non-envelope mode. When non-NULL,
+ * the entry will be matched against a newly-admitted peer's UUID (the
+ * from_addr field alone is ambiguous under gateway forwarding because the
+ * transport reports the gateway's address, not the original sender's). */
+static void defer_message(const uint8_t *data, size_t len,
+                          const char *from_addr, const uuid_t src_uuid)
 {
     pthread_mutex_lock(&deferred_lock);
     if (deferred_count < MAX_DEFERRED) {
@@ -125,9 +132,54 @@ static void defer_message(const uint8_t *data, size_t len, const char *from_addr
         deferred_messages[idx].len = len;
         snprintf(deferred_messages[idx].from_addr,
                  sizeof(deferred_messages[idx].from_addr), "%s", from_addr);
+        if (src_uuid != NULL) {
+            memcpy(deferred_messages[idx].src_uuid, src_uuid, 16);
+            deferred_messages[idx].has_src_uuid = true;
+        } else {
+            memset(deferred_messages[idx].src_uuid, 0, 16);
+            deferred_messages[idx].has_src_uuid = false;
+        }
         deferred_count++;
     }
     pthread_mutex_unlock(&deferred_lock);
+}
+
+/* Match predicate: a deferred entry matches a newly-admitted peer iff
+ * the entry's src_uuid is set AND equals the peer's UUID, OR (fallback,
+ * non-envelope mode) its from_addr matches the peer's address. */
+static bool deferred_matches_peer(const deferred_msg_t *dm,
+                                  const public_identity_t *new_peer)
+{
+    if (dm->has_src_uuid)
+        return memcmp(dm->src_uuid, new_peer->uuid, 16) == 0;
+    return strcmp(dm->from_addr, new_peer->address) == 0;
+}
+
+/* Test-only hooks — declarations in net_proc_priv.h. */
+size_t net_proc_test_deferred_count(void)
+{
+    pthread_mutex_lock(&deferred_lock);
+    size_t n = deferred_count;
+    pthread_mutex_unlock(&deferred_lock);
+    return n;
+}
+
+void net_proc_test_reset_deferred(void)
+{
+    pthread_mutex_lock(&deferred_lock);
+    deferred_count = 0;
+    pthread_mutex_unlock(&deferred_lock);
+}
+
+bool net_proc_test_deferred_matches_peer(size_t idx,
+                                         const public_identity_t *new_peer)
+{
+    bool m = false;
+    pthread_mutex_lock(&deferred_lock);
+    if (idx < deferred_count)
+        m = deferred_matches_peer(&deferred_messages[idx], new_peer);
+    pthread_mutex_unlock(&deferred_lock);
+    return m;
 }
 
 /****************************
@@ -661,10 +713,18 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
             route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
             net_wire_msg_free(&wmsg);
         } else {
-            /* Encrypted message from unknown peer — defer for retry */
+            /* Encrypted message from unknown peer — defer for retry. In
+             * envelope mode the retry key is env.src_uuid (the originator),
+             * NOT from_addr — the latter is the gateway's address under a
+             * forwarded frame, and the future peer IPC arrives carrying
+             * the original sender's own address, not the gateway's. */
             log_debug(ctx->logger, "Deferred encrypted message from unknown peer %s\n",
                       from_addr);
-            defer_message(inner_buf, inner_len, from_addr);
+#ifdef AT_NET_ENVELOPE
+            defer_message(inner_buf, inner_len, from_addr, env.src_uuid);
+#else
+            defer_message(inner_buf, inner_len, from_addr, NULL);
+#endif
         }
     }
 }
@@ -1062,12 +1122,15 @@ static int network_run(const net_transport_t *transport,
                 log_info(logger, "Network: added peer %s (%s)\n",
                          new_peer->fullname, new_peer->address);
 
-                /* Retry deferred encrypted messages with the new peer */
+                /* Retry deferred encrypted messages with the new peer. Match
+                 * by envelope src_uuid when the entry has one (gateway-
+                 * forwarded traffic under AT_NET_ENVELOPE); otherwise by
+                 * the transport-reported from_addr (legacy / non-envelope). */
                 pthread_mutex_lock(&deferred_lock);
                 size_t remaining = 0;
                 for (size_t di = 0; di < deferred_count; di++) {
                     deferred_msg_t *dm = &deferred_messages[di];
-                    if (strcmp(dm->from_addr, new_peer->address) == 0) {
+                    if (deferred_matches_peer(dm, new_peer)) {
                         uint8_t *plain = NULL;
                         size_t plain_len = 0;
                         if (decrypt_message(myself, new_peer, dm->data, dm->len,

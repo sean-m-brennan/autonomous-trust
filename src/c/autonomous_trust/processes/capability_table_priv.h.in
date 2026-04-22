@@ -37,6 +37,7 @@
 
 capability_t capability_table[CAPABILITY_TABLE_CAPACITY] = {
     LIST__DECLARE_CAPABILITY
+    { 0 }
 };
 
 #endif // CAPABILITY_TABLE_PRIV_H_IN
