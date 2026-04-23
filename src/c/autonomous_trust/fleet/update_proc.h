@@ -21,6 +21,7 @@
  *  @{
  */
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -95,16 +96,19 @@ int update_state_delete(const char *data_dir);
 bool update_state_exists(const char *data_dir);
 
 /*@
-  requires \valid(state);
+  requires \valid_read(state);
   assigns \nothing;
   ensures \result == (state->attempt > 1);
 */
 bool update_should_abort(const update_state_t *state);
 
-/* --- Path helpers (pure, no process deps) --- */
+/* --- Path helpers (pure, no process deps) ---
+ * buflen upper bound matches path_join's contract so WP's typed memory
+ * model can satisfy valid_rw on the caller's buffer. */
 
 /*@
   requires data_dir != \null && \valid_read(data_dir);
+  requires 0 < buflen <= INT_MAX;
   requires \valid(buf + (0 .. buflen - 1));
   assigns buf[0 .. buflen - 1];
   ensures \result == 0 || \result == -1;
@@ -113,6 +117,7 @@ int update_staging_dir(const char *data_dir, char *buf, size_t buflen);
 
 /*@
   requires data_dir != \null && \valid_read(data_dir);
+  requires 0 < buflen <= INT_MAX;
   requires \valid(buf + (0 .. buflen - 1));
   assigns buf[0 .. buflen - 1];
   ensures \result == 0 || \result == -1;
@@ -121,6 +126,7 @@ int update_staging_path(const char *data_dir, char *buf, size_t buflen);
 
 /*@
   requires data_dir != \null && \valid_read(data_dir);
+  requires 0 < buflen <= INT_MAX;
   requires \valid(buf + (0 .. buflen - 1));
   assigns buf[0 .. buflen - 1];
   ensures \result == 0 || \result == -1;
@@ -128,6 +134,7 @@ int update_staging_path(const char *data_dir, char *buf, size_t buflen);
 int update_backup_path(const char *data_dir, char *buf, size_t buflen);
 
 /*@
+  requires 0 < buflen <= INT_MAX;
   requires \valid(buf + (0 .. buflen - 1));
   assigns buf[0 .. buflen - 1];
   ensures \result == 0 || \result == -1;

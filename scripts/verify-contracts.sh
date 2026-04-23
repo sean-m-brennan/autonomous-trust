@@ -59,6 +59,7 @@ timeout=120
 prover="alt-ergo,z3,cvc5"
 do_report=0
 verbose=0
+smoke_tests=0
 
 ####################
 # Usage
@@ -80,6 +81,11 @@ Options:
                         Common choices: alt-ergo, z3, cvc4, cvc5
   --report            Write results to frama-c-report.csv in the repo root
   --verbose           Print full Frama-C command and output
+  --smoke-tests       Enable -wp-smoke-tests (opt-in audit pass).
+                      Intentionally off by default. Best for targeted audits
+                      on pure-logic files; produces false positives on
+                      pointer-parameter functions due to a WP Typed-model
+                      artifact. See WP_FLAGS comment for details.
   -h, --help          Show this help message and exit
 
 Examples:
@@ -131,6 +137,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--verbose)
             verbose=1
+            shift
+            ;;
+        --smoke-tests)
+            smoke_tests=1
             shift
             ;;
         -h|--help)
@@ -288,19 +298,38 @@ WP_FLAGS=(
     -wp
     -wp-prover "$prover"
     -wp-timeout "$timeout"
-    # -wp-smoke-tests intentionally disabled.
-    # In this codebase smoke-tests cascade into "Doomed" failures on every
-    # function that calls libc/syscall stubs (unlink, stat, readlink, json_*,
-    # path_join chains, etc.) because their stub specs leave WP unable to
-    # prove forward reachability. The result was that nearly every function
-    # with side effects produced spurious smoke failures, while the real
-    # proof obligations (contracts, postconditions, loop invariants) were
-    # already covered by the rest of WP. Re-enable as a separate audit pass
-    # once the stub set has tighter ensures clauses.
+    # -wp-smoke-tests intentionally off by default — opt in via --smoke-tests.
+    #
+    # Smoke tests flag dead code / unreachable statements by trying to prove
+    # `false` at each program point. They catch real bugs (e.g. missing
+    # upper bounds on size_t params that make a callee's contract
+    # unsatisfiable — see the path_join `destlen <= INT_MAX` fix), but in
+    # this codebase they ALSO produce systematic false positives on any
+    # function whose declared `requires` is just `\valid(ptr)` or
+    # `\valid_read(ptr)` on a pointer parameter.
+    #
+    # Root cause: WP's default Typed memory model encodes the malloc
+    # validity predicate with an implicit "region > 0" constraint, while
+    # pointer parameters default to `region <= 0` (they could be stack
+    # locals, globals, or literals — not malloc-tracked). The conjunction
+    # `linked(malloc) /\ valid_*(malloc, p, n>0) /\ region(p.base) <= 0`
+    # is provably false. Smoke tests latch onto this and classify the
+    # function's default precondition block as doomed.
+    #
+    # Because of that, `--smoke-tests` is best used as a targeted audit
+    # on pure-logic / pure-math files (util.c, net_envelope.c's
+    # fingerprint helpers, etc.) — not as a full-suite gate. Addressing
+    # the false positives globally would require either a different
+    # -wp-model or systematic `\allocable` / region annotations on every
+    # pointer-taking function.
     -kernel-warn-key annot-error=active
     -kernel-warn-key annot:missing-spec=active
     -wp-print
 )
+
+if [[ $smoke_tests -eq 1 ]]; then
+    WP_FLAGS+=(-wp-smoke-tests)
+fi
 
 ####################
 # Run verification
