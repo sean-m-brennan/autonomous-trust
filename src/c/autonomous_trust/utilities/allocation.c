@@ -29,6 +29,9 @@ void *smrt_create(size_t size)
     return ptr;
 }
 
+/* Frama-C: skipped — [solver-timeout] realloc libc spec + the non-null
+ * assertion reshape WP's inferred assigns so assigns_normal_part2 times
+ * out. No header contract. */
 int smrt_recreate(void **pptr, size_t size)
 {
     if (pptr == NULL)
