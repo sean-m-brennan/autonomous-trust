@@ -85,6 +85,7 @@ class SensorComparisonChart:
 
     def figure(self, width: int = 900, height: int = 300) -> go.Figure:
         """Build the Plotly figure."""
+        fig_width, fig_height = width, height
         fig = go.Figure()
 
         # Determine current time window
@@ -146,16 +147,16 @@ class SensorComparisonChart:
             vs = [v for t, v in zip(trace.times, trace.values) if t >= t_min]
 
             dash = "solid"
-            width = 2
+            line_width = 2
             if trace.anomalous_since is not None:
                 dash = "dash"
-                width = 3
+                line_width = 3
 
             fig.add_trace(go.Scatter(
                 x=ts, y=vs,
                 mode="lines",
                 name=name,
-                line=dict(color=trace.color, width=width, dash=dash),
+                line=dict(color=trace.color, width=line_width, dash=dash),
             ))
 
         # Anomaly shading
@@ -178,8 +179,8 @@ class SensorComparisonChart:
             xaxis=dict(range=[t_min, t_max]),
             yaxis_title=f"{self._data_type.replace('_', ' ').title()} ({self._unit})",
             template="plotly_dark",
-            width=width,
-            height=height,
+            width=fig_width,
+            height=fig_height,
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
