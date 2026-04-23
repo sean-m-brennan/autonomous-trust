@@ -124,6 +124,12 @@ static struct {
 
 /* ---------- I/O primitives ---------- */
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tnv2_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade. teardown/recv/send: logging/snprintf + socket shutdown/close (2 FDs for AAP2:
+ * adu + ctrl). subscriber_reader/handle_pushed_adu: logging/snprintf in loop body.
+ * do_handshake/consume_greeting: 7x at_logging cascade in protocol…
+ */
 static int read_exact(int fd, void *buf, size_t n)
 {
     uint8_t *p = buf;
@@ -140,6 +146,12 @@ static int read_exact(int fd, void *buf, size_t n)
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tnv2_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade. teardown/recv/send: logging/snprintf + socket shutdown/close (2 FDs for AAP2:
+ * adu + ctrl). subscriber_reader/handle_pushed_adu: logging/snprintf in loop body.
+ * do_handshake/consume_greeting: 7x at_logging cascade in protocol…
+ */
 static int write_exact(int fd, const void *buf, size_t n)
 {
     const uint8_t *p = buf;
@@ -156,6 +168,7 @@ static int write_exact(int fd, const void *buf, size_t n)
 }
 
 /* Proto3 varint (LEB128, 7 bits per byte, MSB = continuation). */
+/* Frama-C: skipped — varint_write/varint_read: terminates on byte-by-byte varint loops. */
 static int varint_write(int fd, uint64_t v)
 {
     uint8_t buf[10];
@@ -168,6 +181,7 @@ static int varint_write(int fd, uint64_t v)
     return write_exact(fd, buf, n);
 }
 
+/* Frama-C: skipped — varint_write/varint_read: terminates on byte-by-byte varint loops. */
 static int varint_read(int fd, uint64_t *out)
 {
     uint64_t v = 0;
@@ -184,6 +198,12 @@ static int varint_read(int fd, uint64_t *out)
 
 /* ---------- Socket URL parsing (shared shape with v1 backend) ---------- */
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tnv2_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade. teardown/recv/send: logging/snprintf + socket shutdown/close (2 FDs for AAP2:
+ * adu + ctrl). subscriber_reader/handle_pushed_adu: logging/snprintf in loop body.
+ * do_handshake/consume_greeting: 7x at_logging cascade in protocol…
+ */
 static int connect_unix(const char *path)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -200,6 +220,12 @@ static int connect_unix(const char *path)
     return fd;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tnv2_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade. teardown/recv/send: logging/snprintf + socket shutdown/close (2 FDs for AAP2:
+ * adu + ctrl). subscriber_reader/handle_pushed_adu: logging/snprintf in loop body.
+ * do_handshake/consume_greeting: 7x at_logging cascade in protocol…
+ */
 static int connect_tcp(const char *host, const char *port)
 {
     struct addrinfo hints = {0}, *res = NULL;
@@ -217,6 +243,12 @@ static int connect_tcp(const char *host, const char *port)
     return fd;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tnv2_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade. teardown/recv/send: logging/snprintf + socket shutdown/close (2 FDs for AAP2:
+ * adu + ctrl). subscriber_reader/handle_pushed_adu: logging/snprintf in loop body.
+ * do_handshake/consume_greeting: 7x at_logging cascade in protocol…
+ */
 static int open_backend_socket(const char *url, logger_t *logger)
 {
     if (url == NULL || url[0] == '\0')
@@ -331,6 +363,9 @@ static int read_aap_response(int fd, Aap2__AAPResponse **out)
 
 /* Consume the v1-reject greeting byte. Returns 0 on success, -1 on
  * mismatch (server isn't AAP 2.0). */
+/* Frama-C: skipped —
+ * do_handshake/consume_greeting: 7x at_logging cascade in protocol negotiation.
+ */
 static int consume_greeting(int fd, logger_t *logger)
 {
     uint8_t byte;
@@ -346,6 +381,9 @@ static int consume_greeting(int fd, logger_t *logger)
 
 /* Perform the Welcome + ConnectionConfig handshake on @p fd.
  * @p is_subscriber controls which role the client takes after SUCCESS. */
+/* Frama-C: skipped —
+ * do_handshake/consume_greeting: 7x at_logging cascade in protocol negotiation.
+ */
 static int do_handshake(int fd, const char *eid, bool is_subscriber,
                         logger_t *logger)
 {
@@ -435,6 +473,7 @@ typedef struct {
     size_t sub_idx;
 } reader_arg_t;
 
+/* Frama-C: skipped — subscriber_reader/handle_pushed_adu: logging/snprintf in loop body. */
 static int handle_pushed_adu(subscriber_t *sub, Aap2__AAPMessage *msg)
 {
     Aap2__BundleADU *adu = msg->adu;
@@ -468,6 +507,7 @@ static int handle_pushed_adu(subscriber_t *sub, Aap2__AAPMessage *msg)
     return 0;
 }
 
+/* Frama-C: skipped — subscriber_reader/handle_pushed_adu: logging/snprintf in loop body. */
 static void *subscriber_reader(void *arg)
 {
     reader_arg_t *a = (reader_arg_t *)arg;
@@ -525,6 +565,10 @@ static void *subscriber_reader(void *arg)
 
 /* ---------- Teardown ---------- */
 
+/* Frama-C: skipped —
+ * teardown/recv/send: logging/snprintf + socket shutdown/close (2 FDs for AAP2: adu +
+ * ctrl).
+ */
 static void teardown(void)
 {
     pthread_mutex_lock(&g.q_lock);
@@ -569,6 +613,10 @@ static void teardown(void)
 
 /* ---------- Backend vtable ---------- */
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tnv2_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade.
+ */
 static int ud3tnv2_init(const dtn_endpoint_t *endpoints, size_t n_endpoints,
                         logger_t *logger)
 {
@@ -646,6 +694,12 @@ static void ud3tnv2_shutdown(void)
     teardown();
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tnv2_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade. teardown/recv/send: logging/snprintf + socket shutdown/close (2 FDs for AAP2:
+ * adu + ctrl). subscriber_reader/handle_pushed_adu: logging/snprintf in loop body.
+ * do_handshake/consume_greeting: 7x at_logging cascade in protocol…
+ */
 static int ud3tnv2_send(const char *dest_eid,
                         const uint8_t *payload, size_t payload_len,
                         uint32_t lifetime_sec)
@@ -685,6 +739,12 @@ static int ud3tnv2_send(const char *dest_eid,
     return rc;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tnv2_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade. teardown/recv/send: logging/snprintf + socket shutdown/close (2 FDs for AAP2:
+ * adu + ctrl). subscriber_reader/handle_pushed_adu: logging/snprintf in loop body.
+ * do_handshake/consume_greeting: 7x at_logging cascade in protocol…
+ */
 static int ud3tnv2_recv(uint8_t **out_payload, size_t *out_len,
                         char *src_eid, size_t src_eid_len,
                         char *dest_service, size_t dest_service_len,

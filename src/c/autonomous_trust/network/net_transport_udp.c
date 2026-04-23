@@ -42,6 +42,10 @@
  * the flag historically in net_proc.c — kept constant here for now. */
 static const bool use_mcast = false;
 
+/* Frama-C: skipped —
+ * [syscall] all socket-touching functions: sendto/recvfrom/setsockopt/ close stubs; same
+ * pattern as tcp. open_common also hits cidr_split.
+ */
 static int udp_send(int sock, const uint8_t *msg, size_t msg_len,
                     const char *host, int port, bool ipv6, logger_t *logger)
 {
@@ -95,6 +99,10 @@ static int channel_sock(net_transport_ctx_t *ctx, net_channel_t ch)
 
 /* ---------- Vtable methods ---------- */
 
+/* Frama-C: skipped —
+ * [syscall] all socket-touching functions: sendto/recvfrom/setsockopt/ close stubs; same
+ * pattern as tcp. open_common also hits cidr_split.
+ */
 static int udp_open_common(net_transport_ctx_t **out_ctx,
                            const net_transport_params_t *params,
                            bool ipv6)
@@ -174,6 +182,10 @@ static int udp4_open(net_transport_ctx_t **out_ctx, const net_transport_params_t
 static int udp6_open(net_transport_ctx_t **out_ctx, const net_transport_params_t *p)
 { return udp_open_common(out_ctx, p, true); }
 
+/* Frama-C: skipped —
+ * [syscall] all socket-touching functions: sendto/recvfrom/setsockopt/ close stubs; same
+ * pattern as tcp. open_common also hits cidr_split.
+ */
 static int udp_send_unicast(net_transport_ctx_t *ctx,
                             const uint8_t *wire, size_t wire_len,
                             const char *target, int port)
@@ -190,6 +202,10 @@ static int udp_send_unicast(net_transport_ctx_t *ctx,
     return ret;
 }
 
+/* Frama-C: skipped —
+ * [syscall] all socket-touching functions: sendto/recvfrom/setsockopt/ close stubs; same
+ * pattern as tcp. open_common also hits cidr_split.
+ */
 static int udp_send_broadcast(net_transport_ctx_t *ctx, net_channel_t channel,
                               const uint8_t *wire, size_t wire_len, int port)
 {
@@ -225,6 +241,10 @@ static int udp_send_broadcast(net_transport_ctx_t *ctx, net_channel_t channel,
     return ret;
 }
 
+/* Frama-C: skipped —
+ * [syscall] all socket-touching functions: sendto/recvfrom/setsockopt/ close stubs; same
+ * pattern as tcp. open_common also hits cidr_split.
+ */
 static int udp_recv(net_transport_ctx_t *ctx, net_channel_t channel,
                     uint8_t **out_buf, size_t *out_len,
                     char *peer_addr_out, size_t peer_addr_len,
@@ -274,6 +294,10 @@ static int udp_recv(net_transport_ctx_t *ctx, net_channel_t channel,
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [syscall] all socket-touching functions: sendto/recvfrom/setsockopt/ close stubs; same
+ * pattern as tcp. open_common also hits cidr_split.
+ */
 static void udp_close(net_transport_ctx_t *ctx)
 {
     if (ctx == NULL) return;

@@ -30,6 +30,7 @@
 
 #include "network/dtn/dtn_backend.h"
 
+/* Frama-C: skipped — [solver-timeout] stub_init: single at_logging precondition cascade. */
 static int stub_init(const dtn_endpoint_t *endpoints, size_t n_endpoints,
                      logger_t *logger)
 {

@@ -127,6 +127,7 @@ static struct {
 
 /* ---------- socket helpers ---------- */
 
+/* Frama-C: skipped — read_exact/write_exact: read/write syscall preconditions. */
 static int read_exact(int fd, void *buf, size_t n)
 {
     uint8_t *p = buf;
@@ -143,6 +144,7 @@ static int read_exact(int fd, void *buf, size_t n)
     return 0;
 }
 
+/* Frama-C: skipped — read_exact/write_exact: read/write syscall preconditions. */
 static int write_exact(int fd, const void *buf, size_t n)
 {
     const uint8_t *p = buf;
@@ -158,6 +160,7 @@ static int write_exact(int fd, const void *buf, size_t n)
     return 0;
 }
 
+/* Frama-C: skipped — connect_tcp/connect_unix: getaddrinfo/connect/strlen stubs. */
 static int connect_unix(const char *path)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -177,6 +180,7 @@ static int connect_unix(const char *path)
     return fd;
 }
 
+/* Frama-C: skipped — connect_tcp/connect_unix: getaddrinfo/connect/strlen stubs. */
 static int connect_tcp(const char *host, const char *port)
 {
     struct addrinfo hints = {0}, *res = NULL;
@@ -200,6 +204,12 @@ static int connect_tcp(const char *host, const char *port)
  *   unix:/path
  *   tcp:host:port
  * Anything else is treated as a Unix path (backwards-compatible default). */
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tn_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade (same pattern as ion_init). teardown/recv/send: at_logging/at_snprintf + socket
+ * shutdown/close. read_exact/write_exact: read/write syscall preconditions.
+ * connect_tcp/connect_unix: getaddrinfo/connect/strlen stubs.…
+ */
 static int open_backend_socket(const char *url, logger_t *logger)
 {
     if (url == NULL || url[0] == '\0')
@@ -259,6 +269,12 @@ static int aap_read_u16(int fd, uint16_t *out)
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tn_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade (same pattern as ion_init). teardown/recv/send: at_logging/at_snprintf + socket
+ * shutdown/close. read_exact/write_exact: read/write syscall preconditions.
+ * connect_tcp/connect_unix: getaddrinfo/connect/strlen stubs.…
+ */
 static int aap_write_u64(int fd, uint64_t v)
 {
     uint8_t be[8];
@@ -266,6 +282,12 @@ static int aap_write_u64(int fd, uint64_t v)
     return write_exact(fd, be, 8);
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tn_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade (same pattern as ion_init). teardown/recv/send: at_logging/at_snprintf + socket
+ * shutdown/close. read_exact/write_exact: read/write syscall preconditions.
+ * connect_tcp/connect_unix: getaddrinfo/connect/strlen stubs.…
+ */
 static int aap_read_u64(int fd, uint64_t *out)
 {
     uint8_t be[8];
@@ -276,6 +298,12 @@ static int aap_read_u64(int fd, uint64_t *out)
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tn_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade (same pattern as ion_init). teardown/recv/send: at_logging/at_snprintf + socket
+ * shutdown/close. read_exact/write_exact: read/write syscall preconditions.
+ * connect_tcp/connect_unix: getaddrinfo/connect/strlen stubs.…
+ */
 static int aap_send_register(int fd, const char *eid, logger_t *logger)
 {
     size_t eid_len = strlen(eid);
@@ -304,6 +332,12 @@ static int aap_send_register(int fd, const char *eid, logger_t *logger)
  * arrive asynchronously on the same fd and is consumed by the primary
  * endpoint's reader thread (see read_one_frame()). Caller must hold
  * g.send_lock so only one frame is in flight at a time. */
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tn_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade (same pattern as ion_init). teardown/recv/send: at_logging/at_snprintf + socket
+ * shutdown/close. read_exact/write_exact: read/write syscall preconditions.
+ * connect_tcp/connect_unix: getaddrinfo/connect/strlen stubs.…
+ */
 static int aap_write_sendbundle_frame(int fd, const char *dst_eid,
                                       const uint8_t *payload, size_t payload_len)
 {
@@ -383,6 +417,7 @@ static void publish_send_reply(int status)
     pthread_mutex_unlock(&g.send_lock);
 }
 
+/* Frama-C: skipped — reader_thread/read_one_frame: logging/snprintf in loop body. */
 static int read_one_frame(int fd, const char *service, logger_t *logger)
 {
     uint8_t type;
@@ -450,6 +485,7 @@ static int read_one_frame(int fd, const char *service, logger_t *logger)
     }
 }
 
+/* Frama-C: skipped — reader_thread/read_one_frame: logging/snprintf in loop body. */
 static void *reader_thread(void *arg)
 {
     reader_arg_t *a = (reader_arg_t *)arg;
@@ -482,6 +518,7 @@ static void *reader_thread(void *arg)
 
 /* ---------- backend vtable ---------- */
 
+/* Frama-C: skipped — teardown/recv/send: at_logging/at_snprintf + socket shutdown/close. */
 static void teardown(void)
 {
     /* Wake every reader. Closing the fd is the only reliable way to
@@ -521,6 +558,10 @@ static void teardown(void)
     g.n_eps = 0;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tn_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade (same pattern as ion_init).
+ */
 static int ud3tn_init(const dtn_endpoint_t *endpoints, size_t n_endpoints,
                       logger_t *logger)
 {
@@ -599,6 +640,12 @@ static void ud3tn_shutdown(void)
  * the primary reader thread decodes SENDCONFIRM/NACK off the wire and
  * publishes the status. This keeps fd reads single-owner so there is
  * no race with inbound RECVBUNDLE frames. */
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tn_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade (same pattern as ion_init). teardown/recv/send: at_logging/at_snprintf + socket
+ * shutdown/close. read_exact/write_exact: read/write syscall preconditions.
+ * connect_tcp/connect_unix: getaddrinfo/connect/strlen stubs.…
+ */
 static int ud3tn_send(const char *dest_eid,
                       const uint8_t *payload, size_t payload_len,
                       uint32_t lifetime_sec)
@@ -627,6 +674,12 @@ static int ud3tn_send(const char *dest_eid,
     return status;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] ud3tn_init: 7x at_logging + 3x pthread_create + getenv/snprintf
+ * cascade (same pattern as ion_init). teardown/recv/send: at_logging/at_snprintf + socket
+ * shutdown/close. read_exact/write_exact: read/write syscall preconditions.
+ * connect_tcp/connect_unix: getaddrinfo/connect/strlen stubs.…
+ */
 static int ud3tn_recv(uint8_t **out_payload, size_t *out_len,
                       char *src_eid, size_t src_eid_len,
                       char *dest_service, size_t dest_service_len,

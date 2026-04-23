@@ -44,6 +44,10 @@ capability_t *find_capability(const char *name)
     return NULL;
 }
 
+/* Frama-C: skipped —
+ * [alloc-pattern] capability_sync_out / peer_capabilities_sync_out: at_memcpy +
+ * map_sync_out + array_size/array_get; capability_sync_in: map_sync_in.
+ */
 int capability_sync_out(capability_t *capability, AutonomousTrust__Core__Protobuf__Processes__Capability *proto)
 {
     proto->name = capability->name;
@@ -65,6 +69,10 @@ void capability_proto_free(AutonomousTrust__Core__Protobuf__Processes__Capabilit
     }
 }
 
+/* Frama-C: skipped —
+ * [alloc-pattern] capability_sync_out / peer_capabilities_sync_out: at_memcpy +
+ * map_sync_out + array_size/array_get; capability_sync_in: map_sync_in.
+ */
 int capability_sync_in(AutonomousTrust__Core__Protobuf__Processes__Capability *proto, capability_t *capability)
 {
     strncpy(capability->name, proto->name, CAP_NAMELEN);
@@ -95,6 +103,10 @@ int proto_to_capability(uint8_t *data, size_t len, capability_t *capability)
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [alloc-pattern] capability_sync_out / peer_capabilities_sync_out: at_memcpy +
+ * map_sync_out + array_size/array_get; capability_sync_in: map_sync_in.
+ */
 int peer_capabilities_sync_out(peer_capabilities_matrix_t *map, AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities *proto)
 {
     size_t size = map_size(map);
@@ -193,6 +205,12 @@ int proto_to_peer_capabilities(uint8_t *data, size_t len, peer_capabilities_matr
  * JSON serialization for peer capabilities configuration
  ****************************/
 
+/* Frama-C: skipped —
+ * [serialization] capability_to_json_obj, peer_capabilities_to_json: map_get +
+ * json_string/array_append_new/object_set_new + data_integer/
+ * data_string_ptr/data_object_ptr cascades (plus terminates_part from nested map+json
+ * operations).
+ */
 static int capability_to_json_obj(const capability_t *cap, json_t **obj_ptr)
 {
     *obj_ptr = json_object();
@@ -219,6 +237,7 @@ static int capability_to_json_obj(const capability_t *cap, json_t **obj_ptr)
     return 0;
 }
 
+/* Frama-C: skipped — capability_from_json_obj: strncpy + map_init. */
 static int capability_from_json_obj(const json_t *obj, capability_t *cap)
 {
     const char *name = json_string_value(json_object_get(obj, "name"));
@@ -245,6 +264,12 @@ static int capability_from_json_obj(const json_t *obj, capability_t *cap)
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [serialization] capability_to_json_obj, peer_capabilities_to_json: map_get +
+ * json_string/array_append_new/object_set_new + data_integer/
+ * data_string_ptr/data_object_ptr cascades (plus terminates_part from nested map+json
+ * operations).
+ */
 int peer_capabilities_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const peer_capabilities_matrix_t *matrix = data_struct;

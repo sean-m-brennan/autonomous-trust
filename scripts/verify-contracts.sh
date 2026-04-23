@@ -834,15 +834,16 @@ for src in "${files[@]}"; do
         sighandler.c)
             # [syscall] sigaction, signal handler registration
             skip_fns="handle_signal,init_sig_handling" ;;
-        exception.c)
-            # [solver-timeout] _set_exception: strncpy valid_nstring_src
-            # and separation preconditions
-            skip_fns="_set_exception" ;;
         allocation.c)
             # [solver-timeout] smrt_recreate assigns_normal_part2 — realloc's
-            # libc spec plus the /*@ assert ptr != \null */ line reshape WP's
-            # default inferred assigns so the part2 obligation times out.
-            # No header contract; single caller uses the void ** API.
+            # libc spec plus WP's inferred \from on `assigns *pptr;` pull in
+            # the unbounded heap state (Malloc_0) and time out on the
+            # frame-exit normal-path obligation.  Confirmed 2026-04-23 that
+            # neither removing the redundant `assert ptr != \null` nor adding
+            # an explicit `assigns *pptr \from pptr, *pptr, size;` clause on
+            # the header relaxes the cascade.  No header contract tightening
+            # short of splitting into success/failure behaviors has been
+            # tried; single caller (array.c:131) works at runtime.
             skip_fns="smrt_recreate" ;;
         err_str.c)
             # [large-branch] static error string lookup over ~50 entries;

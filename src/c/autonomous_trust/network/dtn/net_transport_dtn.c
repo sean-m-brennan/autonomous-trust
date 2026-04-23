@@ -90,6 +90,7 @@ static const char *channel_suffix(net_channel_t ch)
     return NULL;
 }
 
+/* Frama-C: skipped — service_to_channel: strcmp. */
 static net_channel_t service_to_channel(const char *dest_service)
 {
     if (dest_service == NULL) return NET_CHAN__COUNT;
@@ -101,6 +102,10 @@ static net_channel_t service_to_channel(const char *dest_service)
 
 /* ---------- Vtable methods ---------- */
 
+/* Frama-C: skipped —
+ * [solver-timeout] dtn_open/dtn_recv: pthread_mutex_{init,lock,destroy} + at_logging +
+ * at_snprintf cascades.
+ */
 static int dtn_open(net_transport_ctx_t **out_ctx,
                     const net_transport_params_t *params)
 {
@@ -217,6 +222,12 @@ static int dtn_open(net_transport_ctx_t **out_ctx,
  *   3. Fallback: use @p target as an opaque host string in our default
  *      scheme. Keeps early unit tests and standalone sends functional.
  */
+/* Frama-C: skipped —
+ * build_peer_eid: at_memcpy/strcmp/strncmp/at_snprintf chain for EID assembly (the
+ * at_memcpy failures here are precondition cascades, NOT the type-cast pattern that
+ * net_envelope's unsigned-char* stub fixed — memcpy stub swap has zero effect on this
+ * file).
+ */
 static int build_peer_eid(const dtn_ctx_t *ctx, const char *target,
                           char *out, size_t out_len)
 {
@@ -268,6 +279,7 @@ static int dtn_send_unicast(net_transport_ctx_t *ctx_opaque,
     return dtn_backend.send(dest_eid, wire, wire_len, ctx->default_lifetime_sec);
 }
 
+/* Frama-C: skipped — dtn_send_broadcast: at_memcmp precondition. */
 static int dtn_send_broadcast(net_transport_ctx_t *ctx_opaque, net_channel_t channel,
                               const uint8_t *wire, size_t wire_len, int port)
 {
@@ -316,6 +328,10 @@ static int dtn_send_broadcast(net_transport_ctx_t *ctx_opaque, net_channel_t cha
     return dtn_backend.send(dest_eid, wire, wire_len, ctx->default_lifetime_sec);
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] dtn_open/dtn_recv: pthread_mutex_{init,lock,destroy} + at_logging +
+ * at_snprintf cascades.
+ */
 static int dtn_recv(net_transport_ctx_t *ctx_opaque, net_channel_t channel,
                     uint8_t **out_buf, size_t *out_len,
                     char *peer_addr_out, size_t peer_addr_len,
@@ -379,6 +395,7 @@ static int dtn_recv(net_transport_ctx_t *ctx_opaque, net_channel_t channel,
     return ENOMSG;
 }
 
+/* Frama-C: skipped — dtn_close: pthread_mutex_destroy. */
 static void dtn_close(net_transport_ctx_t *ctx_opaque)
 {
     if (ctx_opaque == NULL) return;

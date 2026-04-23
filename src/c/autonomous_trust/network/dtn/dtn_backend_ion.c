@@ -182,6 +182,7 @@ static int zco_to_buffer(Object adu, uint8_t **out, size_t *out_len)
 
 /* ---------- Reader thread ---------- */
 
+/* Frama-C: skipped — reader_thread: logging/snprintf/memset precondition chains in loop body. */
 static void *reader_thread(void *arg)
 {
     reader_arg_t *a = (reader_arg_t *)arg;
@@ -245,6 +246,7 @@ exit_loop:
 
 /* ---------- Backend vtable ---------- */
 
+/* Frama-C: skipped — ion_teardown: terminates_part cascade through SDR cleanup sequence. */
 static void ion_teardown(void)
 {
     pthread_mutex_lock(&g.q_lock);
@@ -287,6 +289,10 @@ static void ion_teardown(void)
     g.n_eps = 0;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] ion_init: 8x at_logging + 3x pthread_create state-cascade (same
+ * pattern as reputation_run's 11x process_register_handler).
+ */
 static int ion_init(const dtn_endpoint_t *endpoints, size_t n_endpoints,
                     logger_t *logger)
 {
@@ -364,6 +370,7 @@ static void ion_shutdown(void)
     ion_teardown();
 }
 
+/* Frama-C: skipped — ion_send/ion_recv: at_logging + at_snprintf cascades through ION SDR calls. */
 static int ion_send(const char *dest_eid,
                     const uint8_t *payload, size_t payload_len,
                     uint32_t lifetime_sec)
@@ -429,6 +436,7 @@ static int ion_send(const char *dest_eid,
     return 0;
 }
 
+/* Frama-C: skipped — ion_send/ion_recv: at_logging + at_snprintf cascades through ION SDR calls. */
 static int ion_recv(uint8_t **out_payload, size_t *out_len,
                     char *src_eid, size_t src_eid_len,
                     char *dest_service, size_t dest_service_len,

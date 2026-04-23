@@ -337,6 +337,12 @@ int proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer)
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] identity lifecycle + serialization: smrt_ptr allocation
+ * postconditions, JSON/protobuf encode/decode, libsodium decrypt preconditions
+ * identity_free: 4x sodium_memzero accumulates state; smrt_deref precondition times out
+ * (9 warnings)
+ */
 void identity_free(identity_t *ident)
 {
     if (ident == NULL)

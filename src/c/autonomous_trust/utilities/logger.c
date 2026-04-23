@@ -67,6 +67,9 @@ const char *colors[] = {
     TERM_PURPLE,
 };
 
+/* Frama-C: skipped —
+ * logger_init_time_res also has direct strncpy + fopen + set_exception preconditions.
+ */
 /*@
   requires \valid(logger);
   requires max_level >= DEBUG && max_level <= CRITICAL;
@@ -105,11 +108,22 @@ int logger_init_time_res(logger_t *logger, log_level_t max_level, const char *lo
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] all 4 logger_init* variants time out on disjoint_failure_success — the
+ * disjoint-behaviors check between the success and failure branches involves path-join +
+ * fopen + strncpy state that the solver can't fully eliminate.
+ */
 inline int logger_init(logger_t *logger, log_level_t max_level, const char *log_file)
 {
     return logger_init_time_res(logger, max_level, log_file, MILLISECONDS);
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] all 4 logger_init* variants time out on disjoint_failure_success — the
+ * disjoint-behaviors check between the success and failure branches involves path-join +
+ * fopen + strncpy state that the solver can't fully eliminate. logger_init_time_res also
+ * has direct strncpy + fopen + set_exception preconditions.
+ */
 /*@
   requires \valid(logger);
   requires max_level >= DEBUG && max_level <= CRITICAL;
@@ -135,6 +149,12 @@ int logger_init_local_time_res(logger_t *logger, log_level_t max_level, const ch
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] all 4 logger_init* variants time out on disjoint_failure_success — the
+ * disjoint-behaviors check between the success and failure branches involves path-join +
+ * fopen + strncpy state that the solver can't fully eliminate. logger_init_time_res also
+ * has direct strncpy + fopen + set_exception preconditions.
+ */
 inline int logger_init_local_time(logger_t *logger, log_level_t max_level, const char *log_file)
 {
     return logger_init_local_time_res(logger, max_level, log_file, MILLISECONDS);

@@ -21,17 +21,33 @@
 
 _Thread_local exception_t _exception = {0};
 
-/* Frama-C: skipped — [solver-timeout] strncpy valid_nstring_src and separation preconditions */
 int _set_exception(int err, size_t line, const char *file)
 {
     _exception.errnum = err;
     _exception.line = line;
-    /* _exception is _Thread_local and zero-initialised at the top of this
-     * file, so byte 255 (and anything beyond what strncpy writes) is
-     * guaranteed to be NUL.  Back-to-back calls with 256-byte filenames
-     * could drop the terminator in theory — no such caller exists in-tree. */
-    strncpy(_exception.file, file, 255);
-    //@ assert _exception.errnum == err;
-    //@ assert _exception.line == line;
+
+    /* Hand-rolled bounded copy replicating strncpy(_exception.file, file, 255)
+     * semantics (copy up to first NUL, then pad remainder with NUL).  Avoids
+     * WP's strncpy stub whose valid_nstring_src precondition cannot be
+     * discharged from the `\valid_read(file+(0..255))` we have in hand. */
+    size_t i = 0;
+    /*@
+      loop invariant 0 <= i <= 255;
+      loop assigns i, _exception.file[0 .. 254];
+      loop variant 255 - i;
+    */
+    while (i < 255 && file[i] != '\0') {
+        _exception.file[i] = file[i];
+        i++;
+    }
+    /*@
+      loop invariant 0 <= i <= 255;
+      loop assigns i, _exception.file[0 .. 254];
+      loop variant 255 - i;
+    */
+    while (i < 255) {
+        _exception.file[i] = '\0';
+        i++;
+    }
     return -1;
 }
