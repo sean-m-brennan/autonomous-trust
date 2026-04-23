@@ -120,6 +120,8 @@ int update_state_read(const char *data_dir, update_state_t *state)
     return 0;
 }
 
+/* Frama-C: skipped — [syscall] unlink requires valid_string(path); path_join's
+ * assigns-only clause doesn't establish NUL-termination. */
 int update_state_delete(const char *data_dir)
 {
     char file_path[512];
@@ -134,6 +136,8 @@ int update_state_delete(const char *data_dir)
     return 0;
 }
 
+/* Frama-C: skipped — [syscall] stat requires valid_pathname(path); path_join's
+ * assigns-only clause doesn't establish NUL-termination. */
 bool update_state_exists(const char *data_dir)
 {
     char file_path[512];
