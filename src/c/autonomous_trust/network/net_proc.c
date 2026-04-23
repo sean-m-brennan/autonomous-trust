@@ -53,6 +53,7 @@
 #include "identity/identity_priv.h"
 #include "identity/group.h"
 #include "structures/data.h"
+#include "structures/array.h"
 
 DEFINE_ERROR(ENET_SEND, "Network send failed");
 DEFINE_ERROR(ENET_RECV, "Network receive failed");
@@ -1020,6 +1021,43 @@ void handle_inbound_group(net_thread_ctx_t *ctx,
     free(plain);
 }
 
+/* Fan out a PEER_RTT_UPDATE to every sibling queue (excluding our own).
+ * Called after net_proc stores peer_rtt_ms[idx] for a freshly-added peer,
+ * so identity/negotiation/reputation/fleet processes can keep their
+ * parallel peer_rtt_ms[] arrays in sync. IPC-only; the struct does not
+ * traverse the network transport. Non-fatal on per-queue send errors —
+ * this is telemetry, not protocol correctness.
+ *
+ * Known race (documented in BUGS / caveats): if the PEER_RTT_UPDATE
+ * arrives at a sibling BEFORE the corresponding PEER message, the handler
+ * won't find the peer and logs-and-drops. Periodic re-emission from
+ * net_proc is a future refinement. */
+static void broadcast_rtt_update(const process_t *proc, directory_t *queues,
+                                 const uuid_t peer_uuid, int rtt_ms,
+                                 logger_t *logger)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_RTT_UPDATE;
+    msg.size = sizeof(peer_rtt_update_msg_t);
+    memcpy(msg.info.peer_rtt_update.peer_uuid, peer_uuid, 16);
+    msg.info.peer_rtt_update.rtt_ms = rtt_ms;
+
+    size_t qsize = array_size(queues);
+    for (size_t i = 0; i < qsize; i++) {
+        data_t *name_val = NULL;
+        if (array_get(queues, (int)i, &name_val) != 0)
+            continue;
+        char *qname = NULL;
+        if (data_string_ptr(name_val, &qname) != 0)
+            continue;
+        if (strcmp(qname, proc->name) == 0)
+            continue;
+        int rc = messaging_send(qname, PEER_RTT_UPDATE, &msg, false);
+        if (rc != 0)
+            log_debug(logger, "Network: rtt_update to %s returned %d\n", qname, rc);
+    }
+}
+
 /****************************
  * Network process main
  ****************************/
@@ -1169,6 +1207,7 @@ static int network_run(const net_transport_t *transport,
             public_identity_t *new_peer = &buf.info.peer;
             peers_write_lock(proc);
             bool appended = false;
+            int snapshot_rtt = 0;  /* captured under lock for rtt fan-out */
             if (new_peer->fullname[0] != '\0' &&
                 proc->protocol.num_peers < MAX_PEERS) {
                 bool found = false;
@@ -1193,6 +1232,7 @@ static int network_run(const net_transport_t *transport,
                         if (est >= 0) rtt = est;
                     }
                     proc->protocol.peer_rtt_ms[idx] = rtt;
+                    snapshot_rtt = rtt;
                     proc->protocol.num_peers++;
                     appended = true;
                 }
@@ -1202,6 +1242,12 @@ static int network_run(const net_transport_t *transport,
             if (appended) {
                 log_info(logger, "Network: added peer %s (%s)\n",
                          new_peer->fullname, new_peer->address);
+
+                /* Push the freshly-computed rtt to sibling processes so their
+                 * peer_rtt_ms[] arrays track net_proc's view. Local IPC only.
+                 * Uses the snapshot captured under the write lock above. */
+                broadcast_rtt_update(proc, queues, new_peer->uuid,
+                                     snapshot_rtt, logger);
 
                 /* Retry deferred encrypted messages with the new peer. Match
                  * by envelope src_uuid when the entry has one (gateway-

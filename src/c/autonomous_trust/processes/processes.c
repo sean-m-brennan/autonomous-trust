@@ -203,6 +203,27 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
         }
         peers_write_unlock(proc);
         return true;
+    case PEER_RTT_UPDATE: {
+        /* Net-proc → us: the authoritative RTT estimate for a peer. Look
+         * up by uuid and stash into peer_rtt_ms[]. If the PEER_RTT_UPDATE
+         * outran the PEER message, the peer isn't here yet — drop and
+         * rely on net_proc's future re-emission (or accept stale RTT).
+         * Scope of write lock is intentionally narrow: no callouts. */
+        const peer_rtt_update_msg_t *rtt = &msg->info.peer_rtt_update;
+        peers_write_lock(proc);
+        bool matched = false;
+        for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+            if (memcmp(proc->protocol.peers[i].uuid, rtt->peer_uuid, 16) == 0) {
+                proc->protocol.peer_rtt_ms[i] = rtt->rtt_ms;
+                matched = true;
+                break;
+            }
+        }
+        peers_write_unlock(proc);
+        if (!matched)
+            log_debug(proc->logger, "%s: rtt_update for unknown peer\n", proc->name);
+        return true;
+    }
     case PEER_CAPABILITIES:
         // pproc->peer_capabilities = message
         return true;
