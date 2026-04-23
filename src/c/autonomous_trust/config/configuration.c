@@ -57,16 +57,19 @@ const char *rootDir()
     return root;
 }
 
+/* Frama-C: skipped — get_data_dir / get_cfg_dir: path_join with assigns. */
 int get_cfg_dir(char path[])
 {
     return path_join(path, 255, rootDir(), CFG_PATH);
 }
 
+/* Frama-C: skipped — get_data_dir / get_cfg_dir: path_join with assigns. */
 int get_data_dir(char path[])
 {
     return path_join(path, 255, rootDir(), DATA_PATH);
 }
 
+/* Frama-C: skipped — find_configuration: 3x assigns + ensures. */
 /*@
   requires name != \null && \valid_read(name);
   assigns \nothing;
@@ -83,6 +86,7 @@ config_t *find_configuration(const char *name)
     return NULL;
 }
 
+/* Frama-C: skipped — num_config_files: terminates. */
 int num_config_files(char path[])
 {
     DIR *d = opendir(path);
@@ -100,6 +104,10 @@ int num_config_files(char path[])
     return i;
 }
 
+/* Frama-C: skipped —
+ * all_config_files: readdir + strncpy/strlen/strcmp/strchr + string_data + set_exception
+ * cascade.
+ */
 int all_config_files(char dir[], array_t *paths)
 {
     DIR *d = opendir(dir);
@@ -132,6 +140,10 @@ int all_config_files(char dir[], array_t *paths)
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [alloc-pattern] config_absolute_path: at_memcpy + strstr/strlen + 4x set_exception
+ * cascade.
+ */
 int config_absolute_path(const char *path_in, char *path_out)
 {
     if (path_in == NULL || path_out == NULL)
@@ -178,6 +190,10 @@ int config_absolute_path(const char *path_in, char *path_out)
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [syscall] read_config_file: file I/O + strncpy + 3x set_exception + terminates_part
+ * cascade.
+ */
 /*@
   requires filename != \null && \valid_read(filename);
   requires data_struct != \null && \valid(data_struct);
@@ -308,6 +324,10 @@ int load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger)
     return num_err;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] load_config: 9x assigns + smrt_deref/smrt_create + at_memcpy + success
+ * ensures + log_exception_extra precondition cascade.
+ */
 /*@
   requires filepath == \null || \valid_read(filepath);
   requires \valid(config_ptr);

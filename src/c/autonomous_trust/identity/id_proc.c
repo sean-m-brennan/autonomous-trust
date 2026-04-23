@@ -174,6 +174,12 @@ static int _peer_accepted(process_t *proc, directory_t *queues, const public_ide
  * Phase 3 only. Receives broadcast from new peer wanting to join.
  ****************************/
 
+/* Frama-C: skipped —
+ * identity_run + all handlers + helpers: [solver-timeout] every function copies
+ * public_identity_t structs (memcpy of struct→struct triggers WP "Hide sub-term
+ * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
+ * Helpers also touch filesystem/network/identity stubs.
+ */
 /*@
   requires \valid(proc);
   requires \valid(queues);
@@ -334,6 +340,12 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
  * Phase 2+. Receives acceptance from an existing peer.
  ****************************/
 
+/* Frama-C: skipped —
+ * identity_run + all handlers + helpers: [solver-timeout] every function copies
+ * public_identity_t structs (memcpy of struct→struct triggers WP "Hide sub-term
+ * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
+ * Helpers also touch filesystem/network/identity stubs.
+ */
 /*@
   requires \valid(proc);
   requires \valid(queues);
@@ -427,6 +439,12 @@ static bool handle_receive_history(const process_t *proc, directory_t *queues, g
  * Phase 3 only. Receives a peer proposal for voting.
  ****************************/
 
+/* Frama-C: skipped —
+ * identity_run + all handlers + helpers: [solver-timeout] every function copies
+ * public_identity_t structs (memcpy of struct→struct triggers WP "Hide sub-term
+ * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
+ * Helpers also touch filesystem/network/identity stubs.
+ */
 /*@
   requires \valid(proc);
   requires \valid(queues);
@@ -733,6 +751,12 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
  * Phase 3 only. Receives group address list updates.
  ****************************/
 
+/* Frama-C: skipped —
+ * identity_run + all handlers + helpers: [solver-timeout] every function copies
+ * public_identity_t structs (memcpy of struct→struct triggers WP "Hide sub-term
+ * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
+ * Helpers also touch filesystem/network/identity stubs.
+ */
 /*@
   requires \valid(proc);
   requires \valid(queues);
@@ -874,6 +898,11 @@ static int _announce_identity(const process_t *proc, directory_t *queues)
  * Identity process main entry
  ****************************/
 
+/* Frama-C: skipped —
+ * identity_run + all handlers + helpers: [solver-timeout] every function copies
+ * public_identity_t structs (memcpy of struct→struct triggers WP "Hide sub-term
+ * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
+ */
 int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_id_init();

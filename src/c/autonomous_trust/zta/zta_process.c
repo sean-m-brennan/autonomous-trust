@@ -155,6 +155,11 @@ static void _broadcast_revocation_alert(process_t *proc, const uuid_t peer_uuid,
 /**
  * @brief Find or create a vouch tracker for a peer
  */
+/* Frama-C: skipped —
+ * zta_process_run + all helpers: [solver-timeout] memcpy of public_identity_t/uuid_t (19
+ * sites) + reputation cache + delegated vouch lifecycle + peer iteration + json/network
+ * cascades.
+ */
 /*@
   requires zta_state.vouch_count >= 0;
   requires zta_state.vouch_count <= MAX_DELEGATED_PEERS;
@@ -195,6 +200,11 @@ static bool _has_voucher(const delegated_vouch_t *v, const uuid_t voucher_uuid)
  * @brief Look up a peer's reputation in the local cache.
  * @return true if found and not expired, with score written to *score_out
  */
+/* Frama-C: skipped —
+ * zta_process_run + all helpers: [solver-timeout] memcpy of public_identity_t/uuid_t (19
+ * sites) + reputation cache + delegated vouch lifecycle + peer iteration + json/network
+ * cascades.
+ */
 /*@
   requires \valid(score_out);
   requires zta_state.rep_cache_count >= 0;
@@ -226,6 +236,11 @@ static bool _rep_cache_lookup(const uuid_t peer_uuid, double *score_out)
 
 /**
  * @brief Insert or update a reputation cache entry.
+ */
+/* Frama-C: skipped —
+ * zta_process_run + all helpers: [solver-timeout] memcpy of public_identity_t/uuid_t (19
+ * sites) + reputation cache + delegated vouch lifecycle + peer iteration + json/network
+ * cascades.
  */
 /*@
   requires zta_state.rep_cache_count >= 0;
@@ -608,6 +623,11 @@ static void _resolve_deferred(process_t *proc, logger_t *logger)
  * Re-evaluates each pending vouch whose voucher now has a cached score.
  * Accepted vouches are fed back through _handle_delegated_verification;
  * rejected ones are logged and discarded.
+ */
+/* Frama-C: skipped —
+ * zta_process_run + all helpers: [solver-timeout] memcpy of public_identity_t/uuid_t (19
+ * sites) + reputation cache + delegated vouch lifecycle + peer iteration + json/network
+ * cascades.
  */
 static void _process_pending_vouches(process_t *proc, logger_t *logger)
 {

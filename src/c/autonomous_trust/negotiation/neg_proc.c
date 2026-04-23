@@ -221,6 +221,11 @@ static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_st
  * Deserialize task JSON, create tracker, filter peers by capability, send invitations.
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
 /*@
   requires \valid(proc);
   requires \valid(queues);
@@ -326,6 +331,11 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
  * Check capability, flood counter, accept/refuse/haggle.
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
 /*@
   requires \valid(proc);
   requires \valid(queues);
@@ -493,6 +503,11 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
  * If task is flexible, re-announce with adjusted params; otherwise refuse.
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
 /*@
   requires \valid(proc);
   requires \valid(queues);
@@ -630,6 +645,11 @@ static bool handle_refuse(const process_t *proc, directory_t *queues, generic_ms
  * Extract task_uuid from payload; track count of confirmed peers per task.
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
 /*@
   requires \valid(proc);
   requires \valid(queues);
@@ -685,6 +705,11 @@ static bool handle_accept(const process_t *proc, directory_t *queues, generic_ms
  * Look up task in task_stack, reply with current status.
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
 /*@
   requires \valid(proc);
   requires \valid(queues);
@@ -850,6 +875,11 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
  * Collect result, forward to main process when all results arrive.
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
 /*@
   requires \valid(proc);
   requires \valid(queues);
@@ -951,6 +981,11 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
  * Negotiation process main entry
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
 int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();
