@@ -31,6 +31,10 @@
 #include "net_transport_priv.h"
 #include "utilities/exception.h"
 
+/* Frama-C: skipped —
+ * [syscall] net_transport_ip_bind: getaddrinfo loop + bind/setsockopt + 6x set_exception
+ * precondition cascade.
+ */
 int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
                           int port, bool listen_sock, int *out_fd,
                           logger_t *logger)
@@ -102,6 +106,11 @@ int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [syscall] net_transport_ip_join_mcast: setsockopt + at_memcpy +
+ * getaddrinfo/freeaddrinfo + set_exception cascade (IPv4 and IPv6 branches both hit
+ * setsockopt).
+ */
 int net_transport_ip_join_mcast(int sock, bool ipv6, const char *mcast_address,
                                 int port, logger_t *logger)
 {

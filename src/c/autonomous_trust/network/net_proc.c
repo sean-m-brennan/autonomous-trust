@@ -124,6 +124,10 @@ static pthread_mutex_t deferred_lock = PTHREAD_MUTEX_INITIALIZER;
  * the entry will be matched against a newly-admitted peer's UUID (the
  * from_addr field alone is ambiguous under gateway forwarding because the
  * transport reports the gateway's address, not the original sender's). */
+/* Frama-C: skipped —
+ * [solver-timeout] find_or_create_stat/defer_message: memset + memcpy + strcmp
+ * preconditions.
+ */
 static void defer_message(const uint8_t *data, size_t len,
                           const char *from_addr, const uuid_t src_uuid)
 {
@@ -151,6 +155,7 @@ static void defer_message(const uint8_t *data, size_t len,
 /* Match predicate: a deferred entry matches a newly-admitted peer iff
  * the entry's src_uuid is set AND equals the peer's UUID, OR (fallback,
  * non-envelope mode) its from_addr matches the peer's address. */
+/* Frama-C: skipped — deferred_matches_peer: strcmp cascade. */
 static bool deferred_matches_peer(const deferred_msg_t *dm,
                                   const public_identity_t *new_peer)
 {
@@ -224,6 +229,10 @@ typedef struct {
 static net_stat_t peer_stats[MAX_STATS];
 static size_t stats_count = 0;
 
+/* Frama-C: skipped —
+ * [solver-timeout] find_or_create_stat/defer_message: memset + memcpy + strcmp
+ * preconditions.
+ */
 static net_stat_t *find_or_create_stat(const char *address)
 {
     for (size_t i = 0; i < stats_count; i++) {
@@ -300,6 +309,7 @@ static const public_identity_t *find_peer_by_uuid(const process_t *proc, const u
  * Decrypt helper (peer-to-peer messages)
  ****************************/
 
+/* Frama-C: skipped — decrypt_message: identity_decrypt stub precondition. */
 static int decrypt_message(const identity_t *myself, const public_identity_t *peer,
                            const uint8_t *frame, size_t frame_len,
                            uint8_t **plain_out, size_t *plain_len)
@@ -328,6 +338,7 @@ static int decrypt_message(const identity_t *myself, const public_identity_t *pe
  * Route a decoded wire message to the target process queue
  ****************************/
 
+/* Frama-C: skipped — [alloc-pattern] route_to_process: at_memcpy + strdup + messaging_send. */
 static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
                             directory_t *queues, logger_t *logger)
 {
@@ -690,6 +701,10 @@ static void my_address(const network_config_t *net_cfg, bool ipv6, char *out)
         cidr_split((char *)net_cfg->ip4_cidr, out, NULL);
 }
 
+/* Frama-C: skipped —
+ * [serialization] handle_inbound_peer/handle_inbound_group: net_message_from_wire +
+ * group_decrypt + at_logging.
+ */
 void handle_inbound_peer(net_thread_ctx_t *ctx,
                          uint8_t *buf, size_t nbytes,
                          const char *from_addr)
@@ -942,6 +957,10 @@ static void *group_receiver_thread(void *arg)
     return NULL;
 }
 
+/* Frama-C: skipped —
+ * [serialization] handle_inbound_peer/handle_inbound_group: net_message_from_wire +
+ * group_decrypt + at_logging.
+ */
 void handle_inbound_group(net_thread_ctx_t *ctx,
                           uint8_t *buf, size_t nbytes,
                           const char *from_addr)
@@ -1076,6 +1095,11 @@ static void broadcast_rtt_update(const process_t *proc, directory_t *queues,
  * Network process main
  ****************************/
 
+/* Frama-C: skipped —
+ * [solver-timeout] network_run: state-cascade through smrt_deref/
+ * process_setup/map_get/identity_publish/at_logging (same pattern as
+ * reputation_run/fleet_run/artifact_run).
+ */
 static int network_run(const net_transport_t *transport,
                        process_t *proc, directory_t *queues,
                        queue_id_t signal, logger_t *logger)
