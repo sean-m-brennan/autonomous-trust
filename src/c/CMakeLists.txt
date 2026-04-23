@@ -1135,6 +1135,14 @@ set_source_files_properties(test/timeout_scale_test.c PROPERTIES COMPILE_FLAGS "
 target_link_libraries(timeout_scale_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME timeout_scale_test COMMAND $<TARGET_FILE:timeout_scale_test>)
 
+# PEER_RTT_UPDATE propagation (at-over-dtn §4.3 B-followup).
+# Drives run_message_handlers with a PEER_RTT_UPDATE and asserts the
+# target peer's peer_rtt_ms[] slot changes.
+add_executable(peer_rtt_update_test test/peer_rtt_update_test.c)
+set_source_files_properties(test/peer_rtt_update_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(peer_rtt_update_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME peer_rtt_update_test COMMAND $<TARGET_FILE:peer_rtt_update_test>)
+
 # Envelope codec unit tests — gated by AT_NET_ENVELOPE since the codec TU
 # itself is only compiled when that option is ON.
 if(AT_NET_ENVELOPE)

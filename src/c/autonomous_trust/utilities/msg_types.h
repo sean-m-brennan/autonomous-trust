@@ -46,6 +46,7 @@ typedef enum {
     UPDATE_PROPOSAL,         /**< Fleet update proposal. */
     UPDATE_VOTE,             /**< Vote on an update proposal. */
     UPDATE_ACCEPTED,         /**< Announcement that an update was accepted. */
+    PEER_RTT_UPDATE,         /**< Net-proc → sibling processes: peer RTT telemetry. Local IPC only — not part of identity.proto / public_identity_t network serialization. */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
     ZTA_VERIFICATION_RESULT  /**< Outcome of a deferred ZTA verification. */
@@ -111,6 +112,20 @@ typedef struct {
     int reject_count;
 } update_accepted_msg_t;
 
+/**
+ * @brief Net-proc → sibling processes: latest per-peer RTT estimate.
+ *
+ * Emitted after net_proc stores @c peer_rtt_ms[idx] for a new or
+ * re-measured peer. Carries (peer uuid, rtt_ms) so sibling processes
+ * can look up the peer in their own @c peers[] and update the matching
+ * @c peer_rtt_ms[] slot. Local IPC only — not serialized via
+ * identity.proto on the network transport.
+ */
+typedef struct {
+    uuid_t  peer_uuid;
+    int32_t rtt_ms;
+} peer_rtt_update_msg_t;
+
 #define SIGNAL_LEN 32
 
 typedef struct
@@ -152,6 +167,7 @@ typedef struct
         tx_score_msg_t tx_score;
         update_vote_msg_t update_vote;
         update_accepted_msg_t update_accepted;
+        peer_rtt_update_msg_t peer_rtt_update;
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;
 #endif
