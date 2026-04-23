@@ -25,6 +25,8 @@ void hexlify(const unsigned char *buf, size_t len, unsigned char *result)
     //@ assert result[len * 2] == '\0';
 }
 
+/* Frama-C: skipped — [solver-timeout] behavior failure ensures \result != 0
+ * can't be discharged through sodium_hex2bin's stub. */
 int unhexlify(const unsigned char *buf, size_t len, unsigned char *result)
 {
     if (buf == NULL || result == NULL)

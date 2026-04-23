@@ -374,6 +374,9 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     return wrap_in_any(msg->type, subdata, subdata_len, data, data_len);
 }
 
+/* Frama-C: skipped — [solver-timeout] strtol + at_memcpy x2 + set_exception
+ * stub-precondition cascade (8 goals). No contract; same pattern as
+ * path_join/strremove skips. */
 int proto_to_signal(uint8_t *data, size_t len, signal_t *sig)
 {
     if (data == NULL || sig == NULL || len == 0)

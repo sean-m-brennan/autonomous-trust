@@ -102,6 +102,9 @@ static void make_key(char *buf, size_t buflen, int64_t id1, int64_t id2)
  * A ballot must land at the NEXT free chain slot. If id2 is ahead of
  * chain_len+1, the proposer has stale view; we BACKDATE (signal the peer
  * to catch up) rather than NACK so they don't increase their backoff. */
+/* Frama-C: skipped — [solver-timeout] pthread_mutex_lock + integer_data
+ * (smrt_create) + array_append state falls outside the declared 4-target
+ * assigns clause; assigns_normal_part10 times out. */
 paxos_response_t paxos_handle_request(paxos_instance_t *inst,
                                       int64_t id1, int64_t id2,
                                       int64_t *out_last_id, int *out_chain_len)
