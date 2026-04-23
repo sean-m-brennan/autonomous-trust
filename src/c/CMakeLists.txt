@@ -1201,6 +1201,16 @@ if(AT_NET_ENVELOPE)
         target_link_libraries(discovery_cross_cluster_test PRIVATE ${AT_TEST_LIBS})
         add_test(NAME discovery_cross_cluster_test COMMAND $<TARGET_FILE:discovery_cross_cluster_test>)
     endif()
+
+    # Per-leg broadcast exclusion (stage D-followup). Verifies
+    # handle_inbound_broadcast uses send_broadcast_except_leg when the
+    # transport reports a known last_recv_leg, and falls back to
+    # send_broadcast otherwise. Compiled whenever envelope mode is on —
+    # the refinement is zero-cost when irrelevant, so no separate option.
+    add_executable(broadcast_except_leg_test test/broadcast_except_leg_test.c)
+    set_source_files_properties(test/broadcast_except_leg_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(broadcast_except_leg_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME broadcast_except_leg_test COMMAND $<TARGET_FILE:broadcast_except_leg_test>)
 endif()
 
 # DTN tests (only when AT_NET_DTN is enabled). dtn_eid_test is pure string

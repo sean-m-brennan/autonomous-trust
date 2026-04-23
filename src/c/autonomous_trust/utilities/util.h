@@ -21,6 +21,7 @@
  *  @{
  */
 
+#include <limits.h>
 #include <sys/types.h>
 
 #include "exception.h"
@@ -83,6 +84,7 @@ int makedirs(char *path, mode_t mode);
  */
 /*@
   requires destlen > 0;
+  requires destlen <= INT_MAX;
   requires \valid(dest + (0 .. destlen - 1));
   requires dir != \null;
   requires suffix != \null;
