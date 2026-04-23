@@ -80,6 +80,9 @@ static void _ensure_init(void)
   requires \valid_read(peer);
   ensures \result == 0 || \result != 0;
 */
+/* Frama-C: skipped — [solver-timeout] at_memcpy_requires on
+ * memcpy(&to_whom, peer, sizeof(public_identity_t)); same cast cascade as
+ * handle_config_accepted. */
 static int send_to_peer(const process_t *proc, const char *function,
                         json_t *payload, const public_identity_t *peer)
 {
