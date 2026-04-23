@@ -160,3 +160,52 @@ uint64_t net_envelope_broadcast_fingerprint(const net_envelope_t *env,
     }
     return h;
 }
+
+bool net_envelope_should_forward_group(const net_envelope_t *env,
+                                       bool am_gateway)
+{
+    if (env == NULL || !am_gateway)
+        return false;
+    if (env->type != NET_ENV_TYPE_GROUP)
+        return false;
+    if (net_envelope_is_nil_uuid(env->dst_uuid))
+        return false;
+    return env->hop_count < NET_ENV_MAX_HOPS;
+}
+
+uint64_t net_envelope_group_fingerprint(const net_envelope_t *env,
+                                        const uint8_t *payload,
+                                        size_t payload_len)
+{
+    if (env == NULL)
+        return 0;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    /*@
+      loop invariant 0 <= i <= 16;
+      loop assigns i, h;
+      loop variant 16 - i;
+    */
+    for (size_t i = 0; i < 16; i++) {
+        h ^= (uint64_t)env->src_uuid[i];
+        h *= 0x100000001b3ULL;
+    }
+    /*@
+      loop invariant 0 <= i <= 16;
+      loop assigns i, h;
+      loop variant 16 - i;
+    */
+    for (size_t i = 0; i < 16; i++) {
+        h ^= (uint64_t)env->dst_uuid[i];
+        h *= 0x100000001b3ULL;
+    }
+    /*@
+      loop invariant 0 <= i <= payload_len;
+      loop assigns i, h;
+      loop variant payload_len - i;
+    */
+    for (size_t i = 0; i < payload_len; i++) {
+        h ^= (uint64_t)payload[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}

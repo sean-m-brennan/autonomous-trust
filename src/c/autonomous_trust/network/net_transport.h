@@ -192,6 +192,26 @@ typedef struct net_transport_s {
      *   - Hybrid: delegates to whichever inner would send to @p target.
      */
     int (*link_class_ms)(const net_transport_ctx_t *ctx, const char *target);
+
+    /**
+     * @brief Optional: send a broadcast/group wire frame via a specific
+     *        inner leg.
+     *
+     * Meaningful only for multi-leg transports (currently just hybrid).
+     * NULL for single-leg transports. Used by AT_NET_GROUP_FORWARD, where
+     * a gateway must route a GROUP-addressed envelope to the configured
+     * upstream leg rather than fanning out.
+     *
+     * @p leg_index is opaque to the caller; it is the value stored in the
+     * transport's configuration table (for hybrid, the entry in
+     * hybrid_config_t::group_routes). Out-of-range values return -1.
+     *
+     * Only NET_CHAN_BROADCAST and NET_CHAN_GROUP are valid here;
+     * NET_CHAN_PEER returns -1.
+     */
+    int (*send_on_leg)(net_transport_ctx_t *ctx, size_t leg_index,
+                       net_channel_t channel,
+                       const uint8_t *wire, size_t wire_len, int port);
 } net_transport_t;
 
 /**

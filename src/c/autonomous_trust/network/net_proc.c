@@ -46,6 +46,9 @@
 #ifdef AT_NET_ENVELOPE
 #include "network/net_envelope.h"
 #endif
+#ifdef AT_NET_GROUP_FORWARD
+#include "network/net_transport_hybrid.h"
+#endif
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "identity/group.h"
@@ -182,6 +185,28 @@ bool net_proc_test_deferred_matches_peer(size_t idx,
     return m;
 }
 
+/* Capture of the most recent from_whom.address handed to route_to_process,
+ * so cross-cluster discovery tests can observe whether the envelope-based
+ * overwrite suppression preserved the wire payload's self-reported
+ * address (AT_DISCOVERY_CROSS_CLUSTER). Empty string after reset. */
+static char          _test_last_routed_from_addr[ADDR_LEN + 1] = {0};
+static pthread_mutex_t _test_last_routed_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void net_proc_test_reset_last_routed_from_addr(void)
+{
+    pthread_mutex_lock(&_test_last_routed_lock);
+    _test_last_routed_from_addr[0] = '\0';
+    pthread_mutex_unlock(&_test_last_routed_lock);
+}
+
+void net_proc_test_get_last_routed_from_addr(char *out, size_t outlen)
+{
+    if (out == NULL || outlen == 0) return;
+    pthread_mutex_lock(&_test_last_routed_lock);
+    snprintf(out, outlen, "%s", _test_last_routed_from_addr);
+    pthread_mutex_unlock(&_test_last_routed_lock);
+}
+
 /****************************
  * Per-peer statistics tracking
  ****************************/
@@ -306,6 +331,13 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
                             directory_t *queues, logger_t *logger)
 {
     (void)proc; (void)queues;
+    /* Test-hook capture: record the from_whom.address the downstream
+     * handler will observe. See net_proc_test_get_last_routed_from_addr. */
+    pthread_mutex_lock(&_test_last_routed_lock);
+    snprintf(_test_last_routed_from_addr, sizeof(_test_last_routed_from_addr),
+             "%s", wmsg->from_whom.address);
+    pthread_mutex_unlock(&_test_last_routed_lock);
+
     /* Build a generic_msg_t with NET_MESSAGE type.  obj/data are POINTER
      * ASSIGNMENTS, not copies — no heap-overflow possible regardless of
      * data_len.  Ownership of wmsg->data passes through to the downstream
@@ -783,8 +815,20 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
     /* Broadcast messages are unencrypted */
     net_wire_msg_t wmsg;
     if (net_message_from_wire(inner_buf, inner_len, NULL, &wmsg) == 0) {
-        snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
-                 "%s", from_addr);
+        bool preserve_self_reported = false;
+#ifdef AT_DISCOVERY_CROSS_CLUSTER
+        /* Cross-cluster discovery: when the envelope was forwarded by a
+         * gateway, from_addr is the gateway — NOT the original announcer.
+         * Preserve the announcer's self-reported address from the wire
+         * payload so replies (ID_ACCEPT, etc.) route back through the
+         * same gateway via the hybrid CIDR matcher rather than landing
+         * at the gateway itself. */
+        if ((env.flags & NET_ENV_FLAG_FORWARDED) != 0)
+            preserve_self_reported = true;
+#endif
+        if (!preserve_self_reported)
+            snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
+                     "%s", from_addr);
         route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
         net_wire_msg_free(&wmsg);
     } else {
@@ -888,11 +932,6 @@ void handle_inbound_group(net_thread_ctx_t *ctx,
                           const char *from_addr)
 {
     group_t *grp = &ctx->proc->protocol.group;
-    if (grp->address[0] == '\0') {
-        log_debug(ctx->logger, "Network: group key not yet available, dropping msg from %s\n",
-                  from_addr);
-        return;
-    }
 
     const uint8_t *inner_buf = buf;
     size_t         inner_len = nbytes;
@@ -903,12 +942,53 @@ void handle_inbound_group(net_thread_ctx_t *ctx,
         log_debug(ctx->logger, "Network: dropping malformed group envelope from %s\n", from_addr);
         return;
     }
-    env_decision_t d = classify_envelope(&env, ctx->myself, grp, false);
+    bool am_gateway = (ctx->transport->is_gateway != NULL &&
+                       ctx->transport->is_gateway(ctx->ctx));
+    env_decision_t d = classify_envelope(&env, ctx->myself, grp, am_gateway);
     if (d != ENV_DELIVER_LOCAL) {
-        /* Not our group and cross-group bridging isn't in this slice. */
+#ifdef AT_NET_GROUP_FORWARD
+        /* Cross-group bridging: if we're a gateway and the operator has
+         * configured a route for this dst_uuid, forward via the target
+         * leg. Dedup ring is shared with broadcast relay — fingerprints
+         * occupy disjoint 2^64 spaces in practice, and the "recently
+         * forwarded" semantic is identical. */
+        if (am_gateway &&
+            net_envelope_should_forward_group(&env, am_gateway) &&
+            ctx->transport->send_on_leg != NULL &&
+            ctx->transport_cfg != NULL) {
+            const hybrid_config_t *hcfg = ctx->transport_cfg;
+            size_t leg_index = 0;
+            if (hybrid_group_route_lookup(hcfg, env.dst_uuid, &leg_index) == 0) {
+                uint64_t fp = net_envelope_group_fingerprint(&env, inner_buf, inner_len);
+                if (bcast_may_forward(fp)) {
+                    net_envelope_t next = env;
+                    next.hop_count = (uint8_t)(next.hop_count + 1);
+                    next.flags     = (uint8_t)(next.flags | NET_ENV_FLAG_FORWARDED);
+                    if (net_envelope_rewrite_header(&next, buf, nbytes) == 0) {
+                        int rc = ctx->transport->send_on_leg(
+                            ctx->ctx, leg_index, NET_CHAN_GROUP,
+                            buf, nbytes, ctx->net_cfg->port);
+                        if (rc != 0 && rc != -1)
+                            log_debug(ctx->logger,
+                                      "Network: group forward send returned %d\n", rc);
+                    }
+                }
+            }
+        }
+#endif
+        /* Not our group and either not a gateway or no route matches. */
         return;
     }
 #endif
+
+    /* Local-delivery path requires group membership (need the group key
+     * to decrypt). A gateway forwarding without being in the group takes
+     * the branch above and returns before reaching here. */
+    if (grp->address[0] == '\0') {
+        log_debug(ctx->logger, "Network: group key not yet available, dropping msg from %s\n",
+                  from_addr);
+        return;
+    }
 
     if (inner_len <= crypto_box_NONCEBYTES + crypto_box_MACBYTES) {
         log_error(ctx->logger, "Network: group message too short from %s\n", from_addr);
@@ -1011,14 +1091,15 @@ static int network_run(const net_transport_t *transport,
     /* Spawn receiver threads (in the daemonized child) */
     bool stop = false;
     net_thread_ctx_t thread_ctx = {
-        .transport = transport,
-        .ctx       = tctx,
-        .proc      = proc,
-        .queues    = queues,
-        .logger    = logger,
-        .net_cfg   = net_cfg,
-        .myself    = myself,
-        .stop      = &stop,
+        .transport     = transport,
+        .ctx           = tctx,
+        .proc          = proc,
+        .queues        = queues,
+        .logger        = logger,
+        .net_cfg       = net_cfg,
+        .myself        = myself,
+        .stop          = &stop,
+        .transport_cfg = transport_specific,
     };
 
     pthread_t peer_thread, bcast_thread, grp_thread;
