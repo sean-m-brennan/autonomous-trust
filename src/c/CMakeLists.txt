@@ -101,6 +101,29 @@ set_property(CACHE AT_NET_DTN_BACKEND PROPERTY STRINGS stub ion ud3tn)
 # compatible with pre-2b builds until net_proc.c opts into wrapping.
 option(AT_NET_ENVELOPE "Enable plaintext forwarding envelope for gateway relay" OFF)
 
+# Group UUID -> gateway leg routing for cross-group bridging
+# (at-over-dtn.md §4.3 stage F). Gateway receives a GROUP-addressed envelope
+# for a remote group UUID, looks up a configured leg, and re-emits via that
+# leg. Requires AT_NET_ENVELOPE since envelope-less wire frames carry no
+# destination UUID for the routing lookup.
+option(AT_NET_GROUP_FORWARD "Enable group UUID -> gateway routing for cross-leg bridging" OFF)
+
+# Cross-cluster peer discovery (at-over-dtn.md §4.3 stage E). When ON,
+# gateway-forwarded ID_ANNOUNCE broadcasts carrying NET_ENV_FLAG_FORWARDED
+# register the originating peer as a remote peer whose address is left as-is
+# so the hybrid CIDR matcher routes replies back via the gateway. Requires
+# AT_NET_ENVELOPE since the forwarding trust signal comes from the envelope
+# flag byte.
+option(AT_DISCOVERY_CROSS_CLUSTER "Enable cross-cluster peer discovery via gateway forwarding" OFF)
+
+if(AT_NET_GROUP_FORWARD AND NOT AT_NET_ENVELOPE)
+    message(FATAL_ERROR "AT_NET_GROUP_FORWARD=ON requires AT_NET_ENVELOPE=ON")
+endif()
+
+if(AT_DISCOVERY_CROSS_CLUSTER AND NOT AT_NET_ENVELOPE)
+    message(FATAL_ERROR "AT_DISCOVERY_CROSS_CLUSTER=ON requires AT_NET_ENVELOPE=ON")
+endif()
+
 if(AT_STATIC)
     # Prefer .a archives in subsequent find_library() calls AND pass -static to
     # the linker so transitive deps resolve statically too. Must come BEFORE the
@@ -469,6 +492,14 @@ endif()
 if(AT_NET_ENVELOPE)
     list(APPEND libsrc autonomous_trust/network/net_envelope.c)
     add_compile_definitions(AT_NET_ENVELOPE)
+endif()
+
+if(AT_NET_GROUP_FORWARD)
+    add_compile_definitions(AT_NET_GROUP_FORWARD)
+endif()
+
+if(AT_DISCOVERY_CROSS_CLUSTER)
+    add_compile_definitions(AT_DISCOVERY_CROSS_CLUSTER)
 endif()
 
 set(libhdr
@@ -1142,6 +1173,26 @@ if(AT_NET_ENVELOPE)
     set_source_files_properties(test/net_proc_defer_test.c PROPERTIES COMPILE_FLAGS "-Wall")
     target_link_libraries(net_proc_defer_test PRIVATE ${AT_TEST_LIBS})
     add_test(NAME net_proc_defer_test COMMAND $<TARGET_FILE:net_proc_defer_test>)
+
+    # Cross-group forward path (stage F) — gated on AT_NET_GROUP_FORWARD
+    # because it drives the code in handle_inbound_group that only exists
+    # under that option. Envelope is still needed for envelope pack/unpack.
+    if(AT_NET_GROUP_FORWARD)
+        add_executable(envelope_group_forward_test test/envelope_group_forward_test.c)
+        set_source_files_properties(test/envelope_group_forward_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+        target_link_libraries(envelope_group_forward_test PRIVATE ${AT_TEST_LIBS})
+        add_test(NAME envelope_group_forward_test COMMAND $<TARGET_FILE:envelope_group_forward_test>)
+    endif()
+
+    # Cross-cluster peer discovery (stage E) — verifies that forwarded
+    # ID_ANNOUNCE broadcasts preserve the announcer's self-reported
+    # address (so replies route back through the gateway).
+    if(AT_DISCOVERY_CROSS_CLUSTER)
+        add_executable(discovery_cross_cluster_test test/discovery_cross_cluster_test.c)
+        set_source_files_properties(test/discovery_cross_cluster_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+        target_link_libraries(discovery_cross_cluster_test PRIVATE ${AT_TEST_LIBS})
+        add_test(NAME discovery_cross_cluster_test COMMAND $<TARGET_FILE:discovery_cross_cluster_test>)
+    endif()
 endif()
 
 # DTN tests (only when AT_NET_DTN is enabled). dtn_eid_test is pure string

@@ -298,4 +298,57 @@ uint64_t net_envelope_broadcast_fingerprint(const net_envelope_t *env,
                                             const uint8_t *payload,
                                             size_t payload_len);
 
+/**
+ * @brief Pure predicate: may a gateway relay this GROUP envelope to a
+ *        configured forwarding leg?
+ *
+ * Returns true iff @p env is a GROUP type, @p am_gateway is true, the
+ * destination UUID is non-NIL (i.e., a real group), and hop_count is
+ * strictly below @ref NET_ENV_MAX_HOPS. The caller is responsible for
+ * consulting the group-routing table (see hybrid_group_route_lookup) to
+ * decide WHICH leg receives the forward, and for dedup bookkeeping.
+ *
+ * For PEER / BROADCAST / UNKNOWN envelopes the function always returns
+ * false; forwarding for those types is handled elsewhere
+ * (net_envelope_disposition for PEER, net_envelope_should_forward_broadcast
+ * for BROADCAST).
+ */
+/*@
+  requires env == \null || \valid_read(env);
+  requires env == \null || \valid_read(env->dst_uuid + (0 .. 15));
+  assigns \nothing;
+*/
+bool net_envelope_should_forward_group(const net_envelope_t *env,
+                                       bool am_gateway);
+
+/**
+ * @brief Compute a stable 64-bit fingerprint for group-relay dedup.
+ *
+ * FNV-1a-64 over src_uuid || dst_uuid || payload. Unlike the broadcast
+ * fingerprint, dst_uuid participates because group envelopes are
+ * destination-discriminated: two GROUP frames that share source and
+ * payload but target different groups must NOT dedup together. hop_count
+ * and flags are intentionally excluded so the same logical frame hashes
+ * identically before and after a gateway rewrites the header.
+ *
+ * @param env          Unpacked envelope header (must be non-NULL).
+ * @param payload      Payload bytes that followed the header on the wire;
+ *                     may be NULL iff @p payload_len == 0.
+ * @param payload_len  Length of @p payload in bytes.
+ * @return The 64-bit fingerprint, or 0 if @p env is NULL (callers should
+ *         treat 0 as "do not dedup" — a real fingerprint of empty input
+ *         is the FNV offset basis, which is non-zero).
+ */
+/*@
+  requires env == \null || \valid_read(env);
+  requires env == \null || \valid_read(env->src_uuid + (0 .. 15));
+  requires env == \null || \valid_read(env->dst_uuid + (0 .. 15));
+  requires payload_len == 0 || \valid_read(payload + (0 .. payload_len - 1));
+  assigns \nothing;
+  ensures env == \null ==> \result == 0;
+*/
+uint64_t net_envelope_group_fingerprint(const net_envelope_t *env,
+                                        const uint8_t *payload,
+                                        size_t payload_len);
+
 #endif /* NET_ENVELOPE_H */

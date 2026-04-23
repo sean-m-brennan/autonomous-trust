@@ -58,6 +58,13 @@ typedef struct {
     network_config_t      *net_cfg;
     identity_t            *myself;
     bool                  *stop;
+
+    /** Optional pointer to the transport's extra-config struct (e.g.
+     *  hybrid_config_t for hybrid_net). NULL for transports that don't
+     *  use one, or when the matching config entry is absent. Consumed by
+     *  the AT_NET_GROUP_FORWARD path in handle_inbound_group to reach
+     *  hybrid_config_t::group_routes. */
+    const void            *transport_cfg;
 } net_thread_ctx_t;
 
 /**
@@ -106,5 +113,19 @@ void net_proc_test_reset_deferred(void);
  *         of range. */
 bool net_proc_test_deferred_matches_peer(size_t idx,
                                          const public_identity_t *new_peer);
+
+/* ---- Test-only: route_to_process capture ----
+ * Tests for AT_DISCOVERY_CROSS_CLUSTER observe whether a forwarded
+ * broadcast preserved the wire payload's self-reported from_whom.address
+ * or clobbered it with the gateway's transport address. */
+
+/** @brief Clear the capture buffer. Call before exercising a handler so
+ *         stale residue from a prior test doesn't confuse assertions. */
+void net_proc_test_reset_last_routed_from_addr(void);
+
+/** @brief Copy the most recent address observed by route_to_process into
+ *         @p out (NUL-terminated, truncated to @p outlen). Empty string
+ *         if no call has happened since the last reset. */
+void net_proc_test_get_last_routed_from_addr(char *out, size_t outlen);
 
 #endif  // NET_PROC_PRIV_H
