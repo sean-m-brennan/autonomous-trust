@@ -212,6 +212,39 @@ typedef struct net_transport_s {
     int (*send_on_leg)(net_transport_ctx_t *ctx, size_t leg_index,
                        net_channel_t channel,
                        const uint8_t *wire, size_t wire_len, int port);
+
+    /**
+     * @brief Optional: the leg index that delivered the most recent recv()
+     *        on @p channel. Returns -1 if unknown or not applicable.
+     *
+     * Single-leg transports (udp, tcp, dtn) have no meaningful leg index
+     * and leave this NULL. Hybrid implements it so gateway forwarders can
+     * exclude the origin leg when re-broadcasting (see
+     * @ref send_broadcast_except_leg).
+     *
+     * Per-channel: the index returned applies only to the last recv on
+     * the same channel; other channels retain their own last_recv_leg
+     * state. Safe without locking because net_proc runs one reader
+     * thread per channel.
+     */
+    int (*last_recv_leg)(const net_transport_ctx_t *ctx, net_channel_t channel);
+
+    /**
+     * @brief Optional: like @ref send_broadcast, but skip the inner
+     *        identified by @p except_leg.
+     *
+     * Used by gateway forwarders to avoid echoing a received broadcast
+     * back onto its origin leg — at-over-dtn.md §4.3 D-followup.
+     *
+     * NULL for single-leg transports. @p except_leg out-of-range is
+     * treated as "no exclusion" (equivalent to regular send_broadcast).
+     * Only NET_CHAN_BROADCAST / NET_CHAN_GROUP are valid here;
+     * NET_CHAN_PEER returns -1.
+     */
+    int (*send_broadcast_except_leg)(net_transport_ctx_t *ctx,
+                                     net_channel_t channel,
+                                     const uint8_t *wire, size_t wire_len,
+                                     int port, size_t except_leg);
 } net_transport_t;
 
 /**

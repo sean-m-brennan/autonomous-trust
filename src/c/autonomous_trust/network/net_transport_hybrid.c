@@ -141,6 +141,7 @@ typedef struct hybrid_bundle_s {
     uint8_t *buf;
     size_t   len;
     char     peer_addr[ADDR_LEN + 1];
+    size_t   origin_leg;  /**< Which inner delivered this bundle (for D-followup per-leg exclusion). */
     struct hybrid_bundle_s *next;
 } hybrid_bundle_t;
 
@@ -167,6 +168,12 @@ typedef struct {
     const hybrid_config_t *cfg;  /* borrowed */
     logger_t *logger;
     chan_queue_t queues[NET_CHAN__COUNT];
+    /* Origin leg of the most recent recv() on each channel, for the
+     * D-followup per-leg broadcast exclusion. -1 means "no recv yet, or
+     * unknown". Safe without locking because net_proc runs exactly one
+     * reader thread per channel, so there's no concurrent recv on the
+     * same (ctx, channel). */
+    int last_recv_leg[NET_CHAN__COUNT];
     bool stop;
 } hybrid_ctx_t;
 
@@ -226,6 +233,7 @@ static void *reader_thread(void *arg)
             b->buf = buf;
             b->len = len;
             snprintf(b->peer_addr, sizeof(b->peer_addr), "%s", peer_addr);
+            b->origin_leg = a->inner_idx;
             enqueue_bundle(&ctx->queues[ch], b);
         } else if (rc == ENOMSG) {
             /* Normal timeout — loop. */
@@ -318,6 +326,7 @@ static int hybrid_open(net_transport_ctx_t **out_ctx,
     for (int ch = 0; ch < NET_CHAN__COUNT; ch++) {
         pthread_mutex_init(&ctx->queues[ch].lock, NULL);
         pthread_cond_init(&ctx->queues[ch].cond, NULL);
+        ctx->last_recv_leg[ch] = -1;
     }
 
     /* 1) Open each inner transport. */
@@ -470,8 +479,21 @@ static int hybrid_recv(net_transport_ctx_t *ctx_opaque, net_channel_t channel,
     *out_buf = b->buf;
     *out_len = b->len;
     snprintf(peer_addr_out, peer_addr_len, "%s", b->peer_addr);
+    /* Stash origin leg so a subsequent send_broadcast_except_leg can skip
+     * the leg that delivered this frame. See hybrid_last_recv_leg below.
+     * Safe without locking because net_proc runs exactly one consumer
+     * thread per channel (per-channel receiver loop). */
+    ctx->last_recv_leg[channel] = (int)b->origin_leg;
     free(b);
     return 0;
+}
+
+static int hybrid_last_recv_leg(const net_transport_ctx_t *ctx_opaque,
+                                net_channel_t channel)
+{
+    if (channel >= NET_CHAN__COUNT) return -1;
+    const hybrid_ctx_t *ctx = (const hybrid_ctx_t *)ctx_opaque;
+    return ctx->last_recv_leg[channel];
 }
 
 static void hybrid_close(net_transport_ctx_t *ctx_opaque)
@@ -520,16 +542,39 @@ static int hybrid_send_on_leg(net_transport_ctx_t *ctx_opaque,
                              channel, wire, wire_len, port);
 }
 
+static int hybrid_send_broadcast_except_leg(net_transport_ctx_t *ctx_opaque,
+                                            net_channel_t channel,
+                                            const uint8_t *wire, size_t wire_len,
+                                            int port, size_t except_leg)
+{
+    if (channel == NET_CHAN_PEER) return -1;
+    hybrid_ctx_t *ctx = (hybrid_ctx_t *)ctx_opaque;
+    /* Fan out to every inner except except_leg. Success if at least one
+     * inner accepted the send (same semantics as hybrid_send_broadcast).
+     * An out-of-range except_leg means "no exclusion" — behaves identically
+     * to hybrid_send_broadcast. */
+    int any_ok = -1;
+    for (size_t i = 0; i < ctx->n_inners; i++) {
+        if (i == except_leg) continue;
+        int rc = ctx->inners[i].t->send_broadcast(ctx->inners[i].ctx,
+                                                  channel, wire, wire_len, port);
+        if (rc == 0) any_ok = 0;
+    }
+    return any_ok;
+}
+
 const net_transport_t hybrid_net_transport = {
-    .name           = "hybrid_net",
-    .open           = hybrid_open,
-    .send_unicast   = hybrid_send_unicast,
-    .send_broadcast = hybrid_send_broadcast,
-    .recv           = hybrid_recv,
-    .close          = hybrid_close,
-    .is_gateway     = hybrid_is_gateway,
-    .link_class_ms  = hybrid_link_class_ms,
-    .send_on_leg    = hybrid_send_on_leg,
+    .name                     = "hybrid_net",
+    .open                     = hybrid_open,
+    .send_unicast             = hybrid_send_unicast,
+    .send_broadcast           = hybrid_send_broadcast,
+    .recv                     = hybrid_recv,
+    .close                    = hybrid_close,
+    .is_gateway               = hybrid_is_gateway,
+    .link_class_ms            = hybrid_link_class_ms,
+    .send_on_leg              = hybrid_send_on_leg,
+    .last_recv_leg            = hybrid_last_recv_leg,
+    .send_broadcast_except_leg = hybrid_send_broadcast_except_leg,
 };
 
 /* ---------- JSON serialization ---------- */

@@ -840,8 +840,11 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
 #ifdef AT_NET_ENVELOPE
     /* Gateway cross-leg relay: deliver-and-forward. The frame buffer is
      * mutated (hop++ + FORWARDED flag) before we re-emit via the same
-     * transport. On a hybrid transport, send_broadcast fans out to all
-     * inners — which is exactly what makes cross-leg bridging work. */
+     * transport. On a hybrid transport, send_broadcast_except_leg fans
+     * out to every leg except the one that delivered this frame — so
+     * nodes on the origin leg don't receive a duplicate of the broadcast
+     * they sent (§4.3 D-followup). Single-leg transports leave the
+     * except_leg method NULL and fall back to send_broadcast. */
     bool gw = (ctx->transport->is_gateway != NULL &&
                ctx->transport->is_gateway(ctx->ctx));
     if (!net_envelope_should_forward_broadcast(&env, gw))
@@ -857,8 +860,19 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
     if (net_envelope_rewrite_header(&next, buf, nbytes) != 0)
         return;
 
-    int rc = ctx->transport->send_broadcast(ctx->ctx, NET_CHAN_BROADCAST,
+    int origin_leg = -1;
+    if (ctx->transport->last_recv_leg != NULL)
+        origin_leg = ctx->transport->last_recv_leg(ctx->ctx, NET_CHAN_BROADCAST);
+
+    int rc;
+    if (origin_leg >= 0 && ctx->transport->send_broadcast_except_leg != NULL) {
+        rc = ctx->transport->send_broadcast_except_leg(
+            ctx->ctx, NET_CHAN_BROADCAST, buf, nbytes,
+            ctx->net_cfg->port, (size_t)origin_leg);
+    } else {
+        rc = ctx->transport->send_broadcast(ctx->ctx, NET_CHAN_BROADCAST,
                                             buf, nbytes, ctx->net_cfg->port);
+    }
     if (rc != 0 && rc != -1)
         log_debug(ctx->logger, "Network: broadcast relay send returned %d\n", rc);
 #endif
