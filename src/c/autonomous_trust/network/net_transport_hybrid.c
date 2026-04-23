@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <uuid/uuid.h>
 
 #include "identity/identity.h"  /* ADDR_LEN */
 #include "network/net_transport.h"
@@ -505,6 +506,20 @@ static int hybrid_link_class_ms(const net_transport_ctx_t *ctx_opaque,
     return inner_t->link_class_ms(inner_ctx, target);
 }
 
+static int hybrid_send_on_leg(net_transport_ctx_t *ctx_opaque,
+                              size_t leg_index,
+                              net_channel_t channel,
+                              const uint8_t *wire, size_t wire_len, int port)
+{
+    if (channel == NET_CHAN_PEER) return -1;
+    hybrid_ctx_t *ctx = (hybrid_ctx_t *)ctx_opaque;
+    if (leg_index >= ctx->n_inners) return -1;
+    const net_transport_t *t = ctx->inners[leg_index].t;
+    if (t == NULL || t->send_broadcast == NULL) return -1;
+    return t->send_broadcast(ctx->inners[leg_index].ctx,
+                             channel, wire, wire_len, port);
+}
+
 const net_transport_t hybrid_net_transport = {
     .name           = "hybrid_net",
     .open           = hybrid_open,
@@ -514,6 +529,7 @@ const net_transport_t hybrid_net_transport = {
     .close          = hybrid_close,
     .is_gateway     = hybrid_is_gateway,
     .link_class_ms  = hybrid_link_class_ms,
+    .send_on_leg    = hybrid_send_on_leg,
 };
 
 /* ---------- JSON serialization ---------- */
@@ -555,6 +571,22 @@ int hybrid_to_json(const void *data_struct, json_t **obj_ptr)
     }
     json_object_set_new(obj, "inners", arr);
     json_object_set_new(obj, "is_gateway", json_boolean(cfg->is_gateway));
+
+    if (cfg->n_group_routes > 0) {
+        json_t *jroutes = json_array();
+        if (jroutes == NULL) { json_decref(obj); return EXCEPTION(ENOMEM); }
+        for (size_t i = 0; i < cfg->n_group_routes; i++) {
+            json_t *jr = json_object();
+            if (jr == NULL) { json_decref(jroutes); json_decref(obj); return EXCEPTION(ENOMEM); }
+            char uuid_str[37];
+            uuid_unparse_lower(cfg->group_routes[i].group_uuid, uuid_str);
+            json_object_set_new(jr, "group_uuid", json_string(uuid_str));
+            json_object_set_new(jr, "leg_index", json_integer((json_int_t)cfg->group_routes[i].leg_index));
+            json_array_append_new(jroutes, jr);
+        }
+        json_object_set_new(obj, "group_routes", jroutes);
+    }
+
     *obj_ptr = obj;
     return 0;
 }
@@ -602,7 +634,46 @@ int hybrid_from_json(const json_t *obj, void *data_struct)
     if (jgw != NULL)
         cfg->is_gateway = json_boolean_value(jgw);
 
+    /* Optional group-UUID routing table (AT_NET_GROUP_FORWARD). Read even
+     * when the feature is compiled out — keeps config schema stable. Entries
+     * with an unparseable UUID or out-of-range leg_index are rejected. */
+    const json_t *jroutes = json_object_get(obj, "group_routes");
+    if (json_is_array(jroutes)) {
+        size_t nr = json_array_size(jroutes);
+        if (nr > HYBRID_MAX_GROUP_ROUTES)
+            return EXCEPTION(EINVAL);
+        for (size_t i = 0; i < nr; i++) {
+            const json_t *jr = json_array_get(jroutes, i);
+            if (!json_is_object(jr))
+                return EXCEPTION(EINVAL);
+            const char *us = json_string_value(json_object_get(jr, "group_uuid"));
+            if (us == NULL || uuid_parse(us, cfg->group_routes[i].group_uuid) != 0)
+                return EXCEPTION(EINVAL);
+            json_int_t leg = json_integer_value(json_object_get(jr, "leg_index"));
+            if (leg < 0 || (size_t)leg >= cfg->n_inners)
+                return EXCEPTION(EINVAL);
+            cfg->group_routes[i].leg_index = (size_t)leg;
+        }
+        cfg->n_group_routes = nr;
+    }
+
     return 0;
+}
+
+int hybrid_group_route_lookup(const hybrid_config_t *cfg,
+                              const uint8_t *dst_uuid,
+                              size_t *out_leg_index)
+{
+    if (cfg == NULL || dst_uuid == NULL)
+        return -1;
+    for (size_t i = 0; i < cfg->n_group_routes; i++) {
+        if (memcmp(cfg->group_routes[i].group_uuid, dst_uuid, 16) == 0) {
+            if (out_leg_index != NULL)
+                *out_leg_index = cfg->group_routes[i].leg_index;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 /* The config-table entry key matches the transport's name ("hybrid_net")
