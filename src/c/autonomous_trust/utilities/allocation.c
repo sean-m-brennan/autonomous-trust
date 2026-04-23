@@ -29,9 +29,11 @@ void *smrt_create(size_t size)
     return ptr;
 }
 
-/* Frama-C: skipped — [solver-timeout] realloc libc spec + the non-null
- * assertion reshape WP's inferred assigns so assigns_normal_part2 times
- * out. No header contract. */
+/* Frama-C: skipped — [solver-timeout] realloc libc spec inference of
+ * assigns \from (unbounded heap state) causes assigns_normal_part2 to
+ * time out regardless of explicit \from clauses or body simplification.
+ * Experiments 2026-04-23: removing the `assert ptr != \null` and adding
+ * `\from pptr, *pptr, size` both left the timeout unchanged. */
 int smrt_recreate(void **pptr, size_t size)
 {
     if (pptr == NULL)
@@ -39,7 +41,6 @@ int smrt_recreate(void **pptr, size_t size)
     void *ptr = realloc(*pptr, size);
     if (ptr == NULL)
         return -1;
-    //@ assert ptr != \null;
     *pptr = ptr;
     return 0;
 }

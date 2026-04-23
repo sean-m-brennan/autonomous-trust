@@ -60,6 +60,11 @@ static int send_all(int sock, const void *buf, size_t len)
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [syscall] all socket-touching functions: send/recv/connect/setsockopt/ close stubs have
+ * no WP-usable specs. tcp_accept_and_read also has terminates_part cascade through the
+ * accept/read/close sequence.
+ */
 static int tcp_send_to(const uint8_t *msg, size_t msg_len,
                        const char *host, int port, bool ipv6, logger_t *logger)
 {
@@ -123,6 +128,10 @@ static int tcp_send_to(const uint8_t *msg, size_t msg_len,
     return 0;
 }
 
+/* Frama-C: skipped —
+ * tcp_accept_and_read also has terminates_part cascade through the accept/read/close
+ * sequence.
+ */
 static int tcp_accept_and_read(int listen_sock, uint8_t **buf_out, size_t *buf_len,
                                char *from_addr, size_t addr_len, bool ipv6)
 {
@@ -205,6 +214,11 @@ static int channel_sock(net_transport_ctx_t *ctx, net_channel_t ch)
     return -1;
 }
 
+/* Frama-C: skipped —
+ * [syscall] all socket-touching functions: send/recv/connect/setsockopt/ close stubs have
+ * no WP-usable specs. tcp_accept_and_read also has terminates_part cascade through the
+ * accept/read/close sequence.
+ */
 static int tcp_open_common(net_transport_ctx_t **out_ctx,
                            const net_transport_params_t *params, bool ipv6)
 {
@@ -276,6 +290,11 @@ static int tcp_send_broadcast(net_transport_ctx_t *ctx, net_channel_t channel,
     return -1;
 }
 
+/* Frama-C: skipped —
+ * [syscall] all socket-touching functions: send/recv/connect/setsockopt/ close stubs have
+ * no WP-usable specs. tcp_accept_and_read also has terminates_part cascade through the
+ * accept/read/close sequence.
+ */
 static int tcp_recv(net_transport_ctx_t *ctx, net_channel_t channel,
                     uint8_t **out_buf, size_t *out_len,
                     char *peer_addr_out, size_t peer_addr_len,
@@ -296,6 +315,11 @@ static int tcp_recv(net_transport_ctx_t *ctx, net_channel_t channel,
                                peer_addr_out, peer_addr_len, ctx->ipv6);
 }
 
+/* Frama-C: skipped —
+ * [syscall] all socket-touching functions: send/recv/connect/setsockopt/ close stubs have
+ * no WP-usable specs. tcp_accept_and_read also has terminates_part cascade through the
+ * accept/read/close sequence.
+ */
 static void tcp_close(net_transport_ctx_t *ctx)
 {
     if (ctx == NULL) return;

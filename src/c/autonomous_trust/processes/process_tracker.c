@@ -27,6 +27,9 @@
 const char *default_tracker_filename = "subsystems.cfg.json";
 
 
+/* Frama-C: skipped —
+ * find_process_name/find_process: strncmp/strlen cascade through process-name lookup.
+ */
 /*@
   requires name != \null && \valid_read(name);
   assigns \nothing;
@@ -43,6 +46,9 @@ handler_ptr_t find_process(const char *name)
     return NULL;
 }
 
+/* Frama-C: skipped —
+ * find_process_name/find_process: strncmp/strlen cascade through process-name lookup.
+ */
 /*@
   assigns \nothing;
   ensures \result == \null || \valid_read(\result);
@@ -75,6 +81,7 @@ int tracker_init(logger_t *logger, tracker_t *tracker)
     return map_create(&tracker->registry);
 }
 
+/* Frama-C: skipped — tracker_create: set_exception precondition. */
 /*@
   requires \valid(tracker_ptr);
   allocates *tracker_ptr;
@@ -99,6 +106,10 @@ int tracker_create(logger_t *logger, tracker_t **tracker_ptr)
     return err;
 }
 
+/* Frama-C: skipped —
+ * [serialization] tracker_to_json: map_keys + map_get + json_string +
+ * json_array_append_new + json_decref + data_string_ptr + 2x set_exception cascade.
+ */
 int tracker_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const tracker_t *tracker = data_struct;
@@ -166,6 +177,7 @@ int tracker_to_json(const void *data_struct, json_t **obj_ptr)
     return err;
 }
 
+/* Frama-C: skipped — tracker_from_json: string_data + set_exception + terminates. */
 int tracker_from_json(const json_t *obj, void *data_struct)
 {
     tracker_t *tracker = data_struct;
@@ -215,6 +227,9 @@ int tracker_from_file(const char *filename, logger_t *logger, tracker_t **tracke
     return read_config_file(filename, tracker);
 }
 
+/* Frama-C: skipped —
+ * [syscall] tracker_config: at_snprintf + ensures + assigns (filesystem path formatting).
+ */
 int tracker_config(char config_file[])
 {
     get_cfg_dir(config_file);
@@ -253,6 +268,7 @@ int tracker_to_file(const tracker_t *tracker, const char *filename)
     return write_config_file(&cfg, tracker, filename);
 }
 
+/* Frama-C: skipped — [recursive-ds] tracker_free: map_free precondition + valid_tracker assigns. */
 /*@
   requires tracker == \null || \valid(tracker);
   behavior null_tracker:

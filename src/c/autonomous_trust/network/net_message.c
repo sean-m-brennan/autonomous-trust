@@ -26,6 +26,10 @@
 #define ENET_WIRE 232
 DEFINE_ERROR(ENET_WIRE, "Wire message serialization error");
 
+/* Frama-C: skipped —
+ * [serialization] net_message_to_wire: 11x json_object_set_new/json_string + 2x
+ * crypto_sign_detached + strlen/snprintf/sodium_bin2base64 cascade.
+ */
 int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
                         uint8_t **wire_out, size_t *wire_len)
 {
@@ -131,6 +135,10 @@ int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [serialization] net_message_from_wire: json_loadb spec dropped by kernel ("Cannot use a
+ * pointer to void here.
+ */
 int net_message_from_wire(const uint8_t *data, size_t len,
                           const public_identity_t *peer, net_wire_msg_t *msg_out)
 {

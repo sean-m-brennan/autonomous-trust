@@ -292,6 +292,12 @@ long timeval_subtract(struct timeval *a, struct timeval *b)
     return (sec * 1000L) + usec;
 }
 
+/* Frama-C: skipped —
+ * [func-ptr] run_message_handlers dispatches via msg_handler_t [syscall] keep_running
+ * reads from IPC message queue [solver-timeout] process_init/setup/start/loop/run:
+ * complex lifecycle with fork/queue/snprintf/strncpy preconditions; set_process_name:
+ * strncpy preconditions
+ */
 void sleep_until(const process_t *proc, long how_long)
 {
     struct timeval now;
@@ -326,6 +332,12 @@ int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [func-ptr] run_message_handlers dispatches via msg_handler_t [syscall] keep_running
+ * reads from IPC message queue [solver-timeout] process_init/setup/start/loop/run:
+ * complex lifecycle with fork/queue/snprintf/strncpy preconditions; set_process_name:
+ * strncpy preconditions
+ */
 int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
                  process_ctx_t *ctx)
 {

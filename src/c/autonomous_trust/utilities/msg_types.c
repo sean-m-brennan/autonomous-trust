@@ -122,6 +122,12 @@ char *message_type_to_string(message_type_t type)
     }
 }
 
+/* Frama-C: skipped —
+ * [serialization] protobuf pack/unpack with dynamic type switch [solver-timeout]
+ * net_msg_pack_json/to_proto/from_proto: JSON+protobuf; string_to_message_type: string
+ * comparison cascade; wrap_in_any: protobuf wrapper string_to_message_type: strcmp
+ * valid_string predicate mismatch + protobuf descriptor c_name validity…
+ */
 /*@
   requires str != \null && \valid_read(str);
   assigns \nothing;

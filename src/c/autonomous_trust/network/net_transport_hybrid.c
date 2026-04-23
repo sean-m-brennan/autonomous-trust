@@ -51,6 +51,10 @@ static bool is_eid_literal(const char *target)
 /* Return true if @p ip_str (dotted-quad) falls inside @p cidr
  * ("a.b.c.d/prefix"). False on any parse failure — we silently skip rather
  * than route-mismatch; the default leg catches un-matchable targets. */
+/* Frama-C: skipped —
+ * [inet] addr_in_cidr4, addr_in_cidr6: strchr/strrchr/atoi CIDR parsing (same pattern as
+ * network.c's cidr_split family).
+ */
 static bool addr_in_cidr4(const char *ip_str, const char *cidr)
 {
     if (ip_str == NULL || cidr == NULL) return false;
@@ -76,6 +80,10 @@ static bool addr_in_cidr4(const char *ip_str, const char *cidr)
  * "::ffff:a.b.c.d") falls inside @p cidr ("prefix/len"). Prefix length is
  * measured against the full 128-bit address; the mask is applied
  * byte-wise so it handles any prefix without endianness gymnastics. */
+/* Frama-C: skipped —
+ * [inet] addr_in_cidr4, addr_in_cidr6: strchr/strrchr/atoi CIDR parsing (same pattern as
+ * network.c's cidr_split family).
+ */
 static bool addr_in_cidr6(const char *ip_str, const char *cidr)
 {
     if (ip_str == NULL || cidr == NULL) return false;
@@ -211,6 +219,10 @@ typedef struct {
 
 static const int READER_POLL_MS = 100;
 
+/* Frama-C: skipped —
+ * [syscall] teardown, hybrid_open, hybrid_recv, reader_thread:
+ * pthread_{create,mutex,cond}_* cascades + at_logging/at_snprintf chains.
+ */
 static void *reader_thread(void *arg)
 {
     reader_arg_t *a = (reader_arg_t *)arg;
@@ -258,6 +270,10 @@ static void *reader_thread(void *arg)
 
 /* ---------- Teardown ---------- */
 
+/* Frama-C: skipped —
+ * [syscall] teardown, hybrid_open, hybrid_recv, reader_thread:
+ * pthread_{create,mutex,cond}_* cascades + at_logging/at_snprintf chains.
+ */
 static void teardown(hybrid_ctx_t *ctx)
 {
     ctx->stop = true;
@@ -300,6 +316,10 @@ static void teardown(hybrid_ctx_t *ctx)
 
 /* ---------- Vtable ---------- */
 
+/* Frama-C: skipped —
+ * [syscall] teardown, hybrid_open, hybrid_recv, reader_thread:
+ * pthread_{create,mutex,cond}_* cascades + at_logging/at_snprintf chains.
+ */
 static int hybrid_open(net_transport_ctx_t **out_ctx,
                        const net_transport_params_t *params)
 {
@@ -432,6 +452,10 @@ static int hybrid_send_broadcast(net_transport_ctx_t *ctx_opaque,
     return any_ok;
 }
 
+/* Frama-C: skipped —
+ * [syscall] teardown, hybrid_open, hybrid_recv, reader_thread:
+ * pthread_{create,mutex,cond}_* cascades + at_logging/at_snprintf chains.
+ */
 static int hybrid_recv(net_transport_ctx_t *ctx_opaque, net_channel_t channel,
                        uint8_t **out_buf, size_t *out_len,
                        char *peer_addr_out, size_t peer_addr_len,
@@ -587,6 +611,10 @@ const net_transport_t hybrid_net_transport = {
  * (included at the top of this file). network_to_json / network_from_json
  * are declared in network.h. */
 
+/* Frama-C: skipped —
+ * [serialization] hybrid_to_json, hybrid_from_json: jansson object_get/ set/string/decref
+ * + snprintf precondition cascades.
+ */
 int hybrid_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const hybrid_config_t *cfg = data_struct;
@@ -636,6 +664,10 @@ int hybrid_to_json(const void *data_struct, json_t **obj_ptr)
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [serialization] hybrid_to_json, hybrid_from_json: jansson object_get/ set/string/decref
+ * + snprintf precondition cascades.
+ */
 int hybrid_from_json(const json_t *obj, void *data_struct)
 {
     hybrid_config_t *cfg = data_struct;

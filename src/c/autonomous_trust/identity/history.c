@@ -28,6 +28,10 @@
 
 /* IdentityObj blob interface implementations */
 
+/* Frama-C: skipped —
+ * [alloc-pattern] _identity_obj_designation: 12 at_memcpy + uuid_unparse + strnlen
+ * cascade through blob-designation assembly.
+ */
 static int _identity_obj_designation(const merkle_blob_t *blob, uint8_t **out, size_t *out_len)
 {
     const identity_obj_t *obj = (const identity_obj_t *)blob;
@@ -93,6 +97,10 @@ static int _identity_obj_get_hash(const merkle_blob_t *blob, const uint8_t *nonc
     return ret;
 }
 
+/* Frama-C: skipped —
+ * [string-loop] identity_obj_create: strncpy preconditions cascade into success/oom
+ * ensures; same pattern as names.c/random_name.
+ */
 int identity_obj_create(public_identity_t *identity, const char *originator_uuid,
                         identity_obj_t **obj)
 {
@@ -136,6 +144,10 @@ void identity_obj_free(identity_obj_t *obj)
         free(obj);
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] identity_history_create: dag_init + success ensures (smrt_ptr
+ * allocation cascade).
+ */
 int identity_history_create(agreement_voter_t *myself,
                             peers_t *peers,
                             logger_t *logger,
@@ -240,6 +252,7 @@ bool identity_history_verify_existence(identity_history_t *history,
 
 /* JSON serialization helpers for wire-compatible history exchange */
 
+/* Frama-C: skipped — linked_step_to_json / linked_step_from_json: jansson + hexlify cascades. */
 static json_t *linked_step_to_json(const linked_step_t *step)
 {
     if (step == NULL)
@@ -268,6 +281,7 @@ static json_t *linked_step_to_json(const linked_step_t *step)
     return obj;
 }
 
+/* Frama-C: skipped — linked_step_to_json / linked_step_from_json: jansson + hexlify cascades. */
 static int linked_step_from_json(const json_t *obj, linked_step_t **step_out)
 {
     if (obj == NULL || step_out == NULL)
@@ -366,6 +380,7 @@ int identity_history_share(identity_history_t *history,
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] identity_history_hear: dag_ingest_branch + json_decref. */
 int identity_history_hear(identity_history_t *history,
                           const public_identity_t *sender,
                           const uint8_t *wire, size_t wire_len)
@@ -441,6 +456,11 @@ int identity_history_hear(identity_history_t *history,
     return dag_merge(&history->dag, name_out, NULL, false);
 }
 
+/* Frama-C: skipped —
+ * [recursive-ds] identity_history_free: composite destructor cascades through
+ * agreement_protocol_free + merkle_tree_free + dag_free + array_free; 4 consecutive
+ * free-valid preconditions time out.
+ */
 void identity_history_free(identity_history_t *history)
 {
     if (history == NULL)
