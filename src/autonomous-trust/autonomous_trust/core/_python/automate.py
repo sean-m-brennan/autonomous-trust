@@ -116,6 +116,7 @@ class AutonomousTrust(Protocol):
         if not silent:
             handlers.append(logging.StreamHandler(sys.stdout))
         if logfile != Configuration.log_stdout:
+            os.makedirs(os.path.dirname(logfile), exist_ok=True)
             handlers.append(TimedRotatingFileHandler(logfile, when="midnight", interval=1, backupCount=5))
         if not handlers:
             handlers.append(logging.NullHandler())

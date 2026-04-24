@@ -112,7 +112,8 @@ class NetworkGraph(object):
     def max_node_id(self):
         return max(self.node_ids)
 
-    _link_key = 'edges'  # networkx 3.x uses 'edges'; older used 'links'
+    # force.js expects 'links' throughout (20+ call sites); normalize on emit.
+    _link_key = 'links'
 
     def _record_state(self):
         previous_state = self._to_dict(False)
@@ -359,6 +360,9 @@ class NetworkGraph(object):
     def _to_dict(self, track_change=True):
         # node-link format to serialize
         data_obj = nx.json_graph.node_link_data(self.G)
+        # networkx 3.x emits the edges under the 'edges' key; our JS reads 'links'.
+        if 'edges' in data_obj and 'links' not in data_obj:
+            data_obj['links'] = data_obj.pop('edges')
         lk = self._link_key
         data_obj['groups'] = self.groupLabels
         if track_change and self.change_type is not None:
