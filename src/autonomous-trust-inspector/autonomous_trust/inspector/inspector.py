@@ -50,15 +50,17 @@ class InspectorProcess(Process, metaclass=ProcMeta,
 
 
 class Inspector(AutonomousTrust):
-    def __init__(self, **kwargs):
+    def __init__(self, port=None, **kwargs):
         super().__init__(**kwargs)
         self.add_worker(InspectorProcess, self.system_dependencies)
         self.viz = None
         self.data_queue = self.queue_type()
+        self._viz_port = port if port is not None else VizServer.default_port
 
     def init_tasking(self, queues):
         viz_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), 'viz'))
-        self.viz = VizServer(viz_dir, 8000, data_q=self.data_queue, finished=self.cleanup)
+        self.viz = VizServer(viz_dir, self._viz_port,
+                             data_q=self.data_queue, finished=self.cleanup)
         self.viz.run()
 
     def autonomous_tasking(self, queues):

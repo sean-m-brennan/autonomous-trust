@@ -44,11 +44,17 @@ set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here"
 
+# Put the namespace-package sources on PYTHONPATH so host-side python can
+# import autonomous_trust.{evaluation,inspector,...} without a pip install.
+AT_SRC_PATHS="$here/src/autonomous-trust:$here/src/autonomous-trust-evaluation:$here/src/autonomous-trust-inspector:$here/src/autonomous-trust-services:$here/src/autonomous-trust-simulator"
+export PYTHONPATH="${AT_SRC_PATHS}${PYTHONPATH:+:$PYTHONPATH}"
+
 DEPLOY_DIR="${DEPLOY_DIR:-deploy/civilian}"
 NAMESPACE="${NAMESPACE:-disaster-demo}"
 INSPECTOR_PORT="${INSPECTOR_PORT:-8050}"
 REGISTRY="${REGISTRY:-}"
-IMAGE_TAG="${IMAGE_TAG:-}"
+IMAGE_TAG="${IMAGE_TAG:-:dev}"
+IMAGE_NAME="${IMAGE_NAME:-autonomous-trust}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 BACKEND_MODE="compose"
 PLAYBACK_FILE=""
@@ -70,7 +76,7 @@ Options:
                              (default: $DEPLOY_DIR)
   --port PORT                Inspector port (default: $INSPECTOR_PORT)
   --registry PREFIX          Image registry (include trailing /)
-  --image-tag TAG            Image tag (include leading :)
+  --image-tag TAG            Image tag, include leading : (default: $IMAGE_TAG)
   --log-level LEVEL          info | debug | warning (default: info)
   --no-browser               Don't auto-open the browser
   --clean                    Remove generated deploy dir and exit
@@ -153,6 +159,21 @@ case "$BACKEND_MODE" in
     compose)
         command -v docker &>/dev/null \
             || { echo "docker not found"; exit 1; }
+
+        # Ensure the pinned local image exists; build if not.
+        # IMAGE_TAG includes the leading ":" (e.g. ":dev") by convention
+        # of disaster_response_compose.py. Uses Dockerfile-native to match
+        # AUTONOMOUS_TRUST_BACKEND=native in the generated compose env (and
+        # tilt/python.tiltfile's native-backend path).
+        full_ref="${REGISTRY}${IMAGE_NAME}${IMAGE_TAG}"
+        if ! docker image inspect "$full_ref" &>/dev/null; then
+            echo "=== Image $full_ref not found locally — building ==="
+            docker build \
+                -t "$full_ref" \
+                -f "$here/src/autonomous-trust/Dockerfile-native" \
+                "$here"
+        fi
+
         pushd "$DEPLOY_DIR" >/dev/null
         echo "=== docker compose up (10 peers + inspector) ==="
         docker compose up -d
@@ -161,6 +182,7 @@ case "$BACKEND_MODE" in
         python3 -m autonomous_trust.inspector \
             --demo-civilian \
             --port "$INSPECTOR_PORT" \
+            --log-level "$LOG_LEVEL" \
             &>/tmp/demo-inspector.log &
         INSPECTOR_PID=$!
         popd >/dev/null
