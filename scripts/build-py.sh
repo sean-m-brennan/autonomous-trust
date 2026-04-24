@@ -48,6 +48,7 @@ if [[ "$*" != *"proto-only"* ]]; then
   poetry build --format sdist -C src/autonomous-trust-inspector -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-services -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-simulator -o $dist_dir
+  poetry build --format sdist -C src/autonomous-trust-evaluation -o $dist_dir
   for tarball in "$dist_dir"/autonomous_trust*.tar.gz; do
     tar xzf "$tarball" -C "$dist_dir" --strip-components 1
   done
