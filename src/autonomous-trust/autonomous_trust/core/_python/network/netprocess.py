@@ -141,6 +141,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.statistics[uuid].sent(num_bytes)
 
     def track_send_error(self, uuid):
+        if uuid not in self.statistics:
+            self.statistics[uuid] = NetStat()
         self.statistics[uuid].sent(0, 1)
 
     def track_recv_stats(self, uuid, num_bytes, errors=0):
@@ -218,6 +220,15 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 self.track_recv_error()
                 continue
             except TimeoutError:
+                continue
+            except Exception as err:
+                # Belt-and-suspenders: a single malformed frame should
+                # not kill the listener thread for the rest of the run.
+                # (Used to lose every subsequent inbound after the first
+                # encrypted message because tcp._recv .decode'd raw
+                # bytes and crashed the thread.)
+                self.logger.error('Network recv crashed: %s' % err)
+                self.track_recv_error()
                 continue
             if raw_msg is not None:
                 msg_queue.append((raw_msg, from_addr))
@@ -306,19 +317,25 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         from_addr = from_whom
         if isinstance(from_whom, Identity):
             from_addr = from_whom.address
-        processed = False
-        for sub_sys_proc in self.subsystems:
-            if message.process == sub_sys_proc:
-                try:
-                    processed = True
-                    queues[sub_sys_proc].put(message, block=True, timeout=self.q_cadence)
-                    self.logger.debug('Recvd %s message for %s:%s from %s' %
-                                      (rcvd_by, sub_sys_proc, message.function, from_addr))
-                except Full:
-                    self.logger.error('Network: %s queue is full' % sub_sys_proc)
-        if not processed:
+        # Deliver to any known process queue, not just subsystems.
+        # Cross-instance request/response patterns (e.g. an inspector
+        # bridge soliciting peer-to-peer reputation: rep_req carries
+        # req_proc='main', the peer's rep_resp comes back addressed to
+        # 'main') need 'main' as a valid destination. Restricting to
+        # subsystems silently dropped those responses with "Recvd
+        # message for unknown main process".
+        target = message.process
+        if target in queues:
+            try:
+                queues[target].put(
+                    message, block=True, timeout=self.q_cadence)
+                self.logger.debug('Recvd %s message for %s:%s from %s' %
+                                  (rcvd_by, target, message.function, from_addr))
+            except Full:
+                self.logger.error('Network: %s queue is full' % target)
+        else:
             self.logger.error('Recvd message for unknown %s process from %s. Ignoring.' %
-                              (message.process, from_addr))
+                              (target, from_addr))
             self.logger.debug('Message: %s' % str(message))
 
     def process(self, queues, signal):
@@ -356,12 +373,27 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                 msg = Message(CfgIds.network, Network.stats_resp, self.net_stats)
                                 queues[message.process].put(msg, block=True, timeout=self.q_cadence)
                             elif message.function == Network.ping:
-                                try:
-                                    stats = ping(message.to_whom.address, count=message.obj)  # noqa
-                                    msg = Message(self.name, Network.ping, stats)  # noqa
-                                    queues[message.return_to].put(msg, block=True, timeout=self.q_cadence)
-                                except TransmissionError as err:
-                                    self.logger.error('Network: %s' % err)
+                                # Message.__init__ wraps a single Identity
+                                # to_whom in a list; pull the head out
+                                # before dereferencing .address.
+                                target = message.to_whom
+                                if isinstance(target, list):
+                                    target = target[0] if target else None
+                                if target is None:
+                                    self.logger.warning(
+                                        'Ping: empty to_whom; skipping')
+                                elif message.return_to not in queues:
+                                    self.logger.warning(
+                                        'Ping: unknown return_to %r '
+                                        '(expected a queue key); skipping' %
+                                        message.return_to)
+                                else:
+                                    try:
+                                        stats = ping(target.address, count=message.obj)  # noqa
+                                        msg = Message(self.name, Network.ping, stats)  # noqa
+                                        queues[message.return_to].put(msg, block=True, timeout=self.q_cadence)
+                                    except TransmissionError as err:
+                                        self.logger.error('Network: %s' % err)
                             elif message.to_whom == Network.broadcast:
                                 msg = bytes(message)
                                 try:
@@ -411,14 +443,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     raw_msg, from_addr = self.peer_messages.popleft()
                     peers = self.configs[CfgIds.peers]
                     from_whom = peers.find_by_address(from_addr)
-                    if len(peers.all) < 1:
-                        # bootstrapping will not (cannot) be encrypted
-                        try:
-                            self._msg_to_queue(raw_msg, from_addr, queues, 'point-to-point', validate=False)
-                        except UnicodeDecodeError:
-                            self.logger.debug('Out-of-order message detected, retry later')
-                            self.encrypted_messages.append((raw_msg, from_addr))
-                    elif from_whom is not None:
+                    if from_whom is not None:
                         try:
                             decrypt_msg = self.myself.decrypt(raw_msg, from_whom)
                             self._msg_to_queue(decrypt_msg, from_whom, queues, 'point-to-point')
@@ -426,9 +451,17 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             self.logger.error('Decryption failed for known peer %s, rejecting message' %
                                               from_whom.nickname)
                     else:
-                        self.logger.error(
-                            'Recvd transmission from %s - not recognized as a peer. Ignoring.' % from_addr)
-                        self.logger.debug('Ignored message: %s' % str(message))
+                        # Unknown sender — bootstrap (empty peers) or a
+                        # late joiner welcoming us. Try unencrypted parse;
+                        # legitimate handshake messages (identity:accept)
+                        # are encrypt=False. If bytes don't decode, it's
+                        # an encrypted message from a peer we don't know
+                        # yet — defer to mystery_handler.
+                        try:
+                            self._msg_to_queue(raw_msg, from_addr, queues, 'point-to-point', validate=False)
+                        except UnicodeDecodeError:
+                            self.logger.debug('Out-of-order message from %s detected, retry later' % from_addr)
+                            self.encrypted_messages.append((raw_msg, from_addr))
                 except IndexError:
                     pass
 

@@ -212,7 +212,15 @@ class ProcessLogger(object):
         if self.logger.handlers:
             self.logger.handlers[0].flush()
 
-    def log(self, level, msg):
+    def log(self, level, msg, *args):
+        # Match stdlib Logger semantics: formatting is deferred until a
+        # handler actually emits. Here we pre-format because the message
+        # travels through a queue as a plain string.
+        if args:
+            try:
+                msg = msg % args
+            except Exception:
+                msg = f"{msg} {args!r}"
         if self.suppress:
             return
         if self.log_queue is not None:
@@ -223,23 +231,23 @@ class ProcessLogger(object):
         else:
             self.logger.log(level, msg)
 
-    def verbose(self, msg):
-        self.log(LogLevel.VERBOSE, msg)
+    def verbose(self, msg, *args):
+        self.log(LogLevel.VERBOSE, msg, *args)
 
-    def debug(self, msg):
-        self.log(LogLevel.DEBUG, msg)
+    def debug(self, msg, *args):
+        self.log(LogLevel.DEBUG, msg, *args)
 
-    def info(self, msg):
-        self.log(LogLevel.INFO, msg)
+    def info(self, msg, *args):
+        self.log(LogLevel.INFO, msg, *args)
 
-    def warning(self, msg):
-        self.log(LogLevel.WARNING, msg)
+    def warning(self, msg, *args):
+        self.log(LogLevel.WARNING, msg, *args)
 
-    def error(self, msg):
-        self.log(LogLevel.ERROR, msg)
+    def error(self, msg, *args):
+        self.log(LogLevel.ERROR, msg, *args)
 
-    def critical(self, msg):
-        self.log(LogLevel.CRITICAL, msg)
+    def critical(self, msg, *args):
+        self.log(LogLevel.CRITICAL, msg, *args)
 
 
 class Mockery(object):
