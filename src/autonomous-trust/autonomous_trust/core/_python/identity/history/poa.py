@@ -23,7 +23,13 @@ class IdentityByAuthority(AgreementByAuthority, IdentityHistory):
     """
     The eldest identity has final say in approval/disapproval
     """
-    def __init__(self, me, peers, log_queue, timeout, threshold_rank=3, blacklist=None):
+    def __init__(self, me, peers, log_queue, timeout, threshold_rank=0, blacklist=None):
+        # threshold_rank=0 lets any voter count toward approval. Rank
+        # IS now propagated on the wire (identity_pb2.Identity.rank,
+        # round-tripped via sync_to_message / sync_from_message), but
+        # every Identity is still constructed with _rank=0 and there is
+        # no elevation mechanism yet. Once a policy raises individual
+        # ranks above 0, this default can be raised in lockstep.
         IdentityHistory.__init__(self, me, peers, log_queue, timeout, blacklist)
         AgreementByAuthority.__init__(self, me, peers.all, threshold_rank)  # noqa
 
