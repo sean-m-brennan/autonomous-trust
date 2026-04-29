@@ -37,7 +37,15 @@ class AgreementProof(Configuration):
         self.nonce = nonce
 
     def __bytes__(self):
-        return str(self.uuid).encode(encoding) + self.digest + bytes(self.approval) + self.nonce
+        # nonce defaults to None; sync_from_message also stores None for
+        # an empty wire field. Treat None as the empty byte string so
+        # callers don't blow up with "can't concat NoneType to bytes".
+        # bytes(approval) gives b'\x00' for True, b'' for False — kept as
+        # is for wire-format stability.
+        return (str(self.uuid).encode(encoding)
+                + (self.digest or b'')
+                + bytes(self.approval)
+                + (self.nonce or b''))
 
     def sync_to_message(self):
         self.message.uuid = str(self.uuid).encode('utf-8')
@@ -150,8 +158,16 @@ class AgreementProtocol(VoterTracker):
             if proof.uuid not in voters:
                 continue
             voter = voters[proof.uuid]
+            # Vote sig is a (signed_message_hex, signature_hex) tuple
+            # produced by Identity.sign — see history.verify_object for
+            # the same reconstruction.
+            if isinstance(sig, tuple) and len(sig) == 2:
+                sig_msg, sig_signature = sig
+                smessage = sig_signature + sig_msg
+            else:
+                smessage = sig
             try:
-                voter.verify(bytes(proof), sig)
+                voter.verify(smessage)
             except Exception:
                 continue  # skip votes with invalid signatures
             approvals.append(self._count_vote(id_obj, proof, voter))

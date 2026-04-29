@@ -63,6 +63,18 @@ class IdentityProcess(Process, metaclass=ProcMeta,
 
     def __init__(self, configurations, subsystems, log_q, **kwargs):
         super().__init__(configurations, subsystems, log_q, dependencies=[CfgIds.network], **kwargs)
+        # Optional override of the choose_group bootstrap window. The
+        # default 5s is fine for the bootstrap node of a fresh group, but
+        # late joiners that need an existing group's history to arrive
+        # over UDP broadcast (e.g. an observer container coming up beside
+        # an already-running peer mesh) routinely lose the race and end
+        # up self-grouping. Set AT_INIT_TIMEOUT_SEC on those containers.
+        try:
+            override = float(os.environ.get('AT_INIT_TIMEOUT_SEC', '0'))
+            if override > 0:
+                self.init_timeout = override
+        except (TypeError, ValueError):
+            pass
         self.identity = configurations[self.cfg_name]
         self.protocol = IdentityProtocol(self.name, self.logger, configurations)
         self.peers = self.protocol.peers
@@ -118,10 +130,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         else:
                             json.dump((obj[0], obj[1]), cfg, cls=ConfigJSONEncoder, indent=2)
                     self.update(obj[0], queues)
-                    try:
-                        self.update(obj[1], queues)
-                    except Exception as broadcast_err:
-                        self.logger.warning('Failed to broadcast group history: %s' % broadcast_err)
+                    # The history (obj[1]) is intentionally NOT broadcast.
+                    # protocol.run_message_handlers has no isinstance branch
+                    # for IdentityHistory / IdentityByAuthority, so every
+                    # consumer logs "Unhandled message of type
+                    # IdentityByAuthority" and discards it. The history is
+                    # already persisted to disk above for any process that
+                    # needs to reload it.
         except Exception as err:
             self.logger.error('Error saving %s for %s: %s' % (name, obj.__class__.__name__, err))
             try:
@@ -133,7 +148,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     def _record_group(self, queues):
         if self.group is None:
             return
-        self.logger.debug('Add group')
+        # Demoted to verbose: every peer-acceptance triggers _add_peer →
+        # _record_group, which cascades log lines O(N²) across the mesh.
+        # The meaningful event ("Process accepted peer:") is logged by
+        # _peer_accepted at debug level, which is enough.
+        self.logger.verbose('Add group')
         self._remember_activity(queues, CfgIds.group, (self.group, self._history))
 
     def _record_peers(self, queues):
@@ -247,7 +266,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         self.logger.debug('No history/group key: generate my own.')
                         self.group = Group.initialize({self.identity.uuid: self.identity.address},
                                                       names.random_name())
-                    self.logger.debug('Generated group: %s', self.group.nickname)
+                    self.logger.debug('Generated group: %s' % self.group.nickname)
                     self._record_group(queues)
             except Full:
                 self.logger.error('choose_group: Network queue full')

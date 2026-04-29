@@ -16,9 +16,14 @@
 
 import os
 
-from ..processes import Process
 from ..config import Configuration
 from ..config import ConfigMap
+
+# NB: ..processes.Process is imported lazily below. Eagerly importing
+# at module scope creates a cycle when multiprocessing.Manager spawns
+# a server subprocess: pickle re-imports autonomous_trust.core, which
+# triggers _python/__init__.py → automate.py → here → ..processes,
+# but ..processes hasn't finished loading yet, raising ImportError.
 
 
 def get_cfg_type(path: str):
@@ -28,6 +33,7 @@ def get_cfg_type(path: str):
 
 
 def load_configs():
+    from ..processes import Process  # deferred; see top-of-module note
     configs: ConfigMap = {}
     cfg_dir = Configuration.get_cfg_dir()
     config_files = [x for x in os.listdir(cfg_dir) if x.endswith(Configuration.file_ext)]

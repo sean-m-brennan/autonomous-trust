@@ -112,6 +112,9 @@ class PlaybackEngine:
         self._event_listeners: list[EventListener] = []
         self._tick_listeners: list[TickListener] = []
         self._wired = False
+        # PLAYBACK mode: recorded events buffered here, consumed by tick()
+        # as scenario time crosses each event's timestamp.
+        self._deferred_events: list[ScenarioEvent] = []
         self._wire_scenario_listener()
 
     # --- wiring ------------------------------------------------------
@@ -234,7 +237,15 @@ class PlaybackEngine:
             self._playing = False
 
         self._scenario_time = new_t
-        self._scenario.advance_to(new_t)
+        if self._mode == PlaybackMode.PLAYBACK:
+            # In playback mode the recording is the source of truth --
+            # don't let the scripted timeline fire its own events on top.
+            while (self._deferred_events
+                   and self._deferred_events[0].timestamp <= new_t):
+                ev = self._deferred_events.pop(0)
+                self._scenario._apply_event(ev)  # noqa: SLF001
+        else:
+            self._scenario.advance_to(new_t)
 
         for lst in self._tick_listeners:
             try:
@@ -272,30 +283,27 @@ class PlaybackEngine:
         if not isinstance(events, list):
             raise ValueError("recorded playback: expected list of events")
 
-        # Replay: sort by timestamp, then fire each into the scenario's
-        # event-log so existing listeners see them as if they happened
-        # live. Peer state changes are re-applied via the dispatch path.
-        events.sort(key=lambda e: e.get("t", 0))
+        # Buffer the events in-order; tick() consumes them as scenario
+        # time crosses each one's timestamp. That gives animated
+        # replay instead of jumping straight to final state.
+        from .scenario import PhaseEvent
+        buf: list[ScenarioEvent] = []
         for rec in events:
-            # Re-construct a ScenarioEvent-like dataclass instance and
-            # replay via _apply_event (mirrors scenario.advance_to path).
             try:
-                from .scenario import PhaseEvent
                 et = getattr(PhaseEvent, rec["type"], None)
                 if et is None:
                     continue
-                ev = ScenarioEvent(
+                buf.append(ScenarioEvent(
                     timestamp=timedelta(seconds=float(rec.get("t", 0))),
                     event_type=et,
                     peer_name=rec.get("peer"),
                     description=rec.get("description", ""),
                     data=dict(rec.get("data", {})),
-                )
-                # _apply_event also emits to listeners via _emit; that's
-                # exactly what we want so the dashboard re-renders.
-                self._scenario._apply_event(ev)  # noqa: SLF001
+                ))
             except Exception:
-                logger.exception("Replay failed for event: %r", rec)
+                logger.exception("Replay parse failed for event: %r", rec)
+        buf.sort(key=lambda ev: ev.timestamp)
+        self._deferred_events = buf
 
     # --- helpers -----------------------------------------------------
 

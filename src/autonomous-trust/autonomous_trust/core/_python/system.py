@@ -85,15 +85,23 @@ class PackageHash(object):
         self.debug = debug
         self.modules = {}
         if pkg_path is None or pkg_name is None:
-            package = sys.modules[__name__.split('.')[0]]
+            # Scope the default to autonomous_trust.core so the digest is
+            # stable regardless of which sibling autonomous_trust.* packages
+            # happen to be merged into the namespace via PYTHONPATH (e.g.
+            # the inspector container layers in inspector/evaluation/
+            # services/simulator). Identity verification only cares that
+            # peers are running the same protocol/core.
+            # __name__ here is autonomous_trust.core._python.system; trim
+            # to autonomous_trust.core.
+            package = sys.modules[__name__.rsplit('.', 2)[0]]
             if pkg_path is None:
                 pkg_path = package.__path__
             if pkg_name is None:
                 pkg_name = package.__name__
         for loader, name, is_pkg in pkgutil.walk_packages(pkg_path, pkg_name + '.'):
-            for ex in self.excludes:
-                if name.endswith('.' + ex) or '.%s.' % ex in name:
-                    continue
+            if any(name.endswith('.' + ex) or ('.%s.' % ex) in name
+                   for ex in self.excludes):
+                continue
             try:
                 module_path = loader.find_spec(name).origin
                 with open(module_path, 'r') as src:

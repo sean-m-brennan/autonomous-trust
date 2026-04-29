@@ -64,6 +64,18 @@ class Message(object):
             else:
                 raise RuntimeError('Invalid to_whom arg. Must be an Identity, but got %s' % type(to_whom))
         self.from_whom = from_whom
+        # Pickle workaround: from_whom (Identity) is mysteriously dropped
+        # when this Message round-trips through manager.Queue (tested:
+        # 2361 puts with Identity, 408 gets with NoneType — default
+        # pickle, no custom hooks). Store a simple string mirror that
+        # pickles reliably; consumers (e.g. ReputationProcess) can fall
+        # back to peers.find_by_address(from_whom_address) when from_whom
+        # is None but from_whom_address is set.
+        self.from_whom_address = None
+        if from_whom is not None and isinstance(from_whom, Identity):
+            self.from_whom_address = getattr(from_whom, 'address', None)
+        elif isinstance(from_whom, str):
+            self.from_whom_address = from_whom
         self.return_to = return_to
         if isinstance(obj, str):
             check = obj.lstrip()

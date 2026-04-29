@@ -24,7 +24,10 @@ from autonomous_trust.core.structures.merkle import SimplestBlob
 
 
 class ConcreteVoter(AgreementVoter):
-    def verify(self, proof, sig):
+    def verify(self, *args, **kwargs):
+        # Accept both legacy (proof, sig) and SignedMessage-style (smessage)
+        # call conventions; AgreementProtocol.finalize was updated to pass
+        # the latter to align with Identity.verify.
         return True
 
 
@@ -194,13 +197,28 @@ class TestAgreementFinalizeUnknownVoter:
 
 
 class TestAgreementProofNoneNonce:
-    """Cover AgreementProof bytes conversion path with None nonce (raises TypeError)."""
+    """Cover AgreementProof bytes conversion path with a None nonce.
 
-    def test_bytes_with_none_nonce_raises(self):
+    Originally the path raised TypeError ("can't concat NoneType to bytes")
+    when nonce defaulted to None. __bytes__ now treats None as the empty
+    byte string so callers don't have to defend against the default.
+    """
+
+    def test_bytes_with_none_nonce_ok(self):
         uid = uuid4()
         proof = AgreementProof(uid, b'digest', True, nonce=None)
-        with pytest.raises(TypeError):
-            _ = bytes(proof)
+        b = bytes(proof)
+        assert isinstance(b, bytes)
+        # uuid (36) + digest (6) + bytes(True) (1) + nonce (0) == 43
+        assert len(b) == 43
+
+    def test_bytes_with_none_digest_ok(self):
+        uid = uuid4()
+        proof = AgreementProof(uid, None, False, nonce=None)
+        b = bytes(proof)
+        assert isinstance(b, bytes)
+        # uuid (36) + digest (0) + bytes(False) (0) + nonce (0) == 36
+        assert len(b) == 36
 
 
 class TestAgreementImplEnum:

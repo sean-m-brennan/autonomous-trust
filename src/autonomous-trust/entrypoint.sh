@@ -45,9 +45,17 @@ fi
 export PYTHONPATH="/app:$PYTHONPATH"
 #conda run -n autonomous_trust pip3 install --upgrade pip wheel setuptools requests protobuf
 
-# Activate conda environment directly so that exec replaces this shell
-# with python (PID 1), allowing proper SIGTERM delivery.
-conda activate autonomous_trust
+# Activate the autonomous_trust conda environment if it exists; fall
+# back to the base env (already initialized via the conda hook above)
+# otherwise. The Dockerfile-native pip-installs deps into base and
+# never creates the named env, so the original `conda activate
+# autonomous_trust` printed `EnvironmentNameNotFound` on every
+# container start and polluted stderr / our diagnostics. See BUGS.md
+# entry "Dockerfile-native does not create autonomous_trust conda env"
+# for the proper fix (RUN `conda env create -f environment.yaml`).
+if conda env list 2>/dev/null | awk '{print $1}' | grep -qx autonomous_trust; then
+    conda activate autonomous_trust
+fi
 
 export AUTONOMOUS_TRUST_EXE="${AUTONOMOUS_TRUST_EXE:-"-m autonomous_trust"}"
 # Use CMD args ($@) if provided, otherwise fall back to AUTONOMOUS_TRUST_ARGS env var

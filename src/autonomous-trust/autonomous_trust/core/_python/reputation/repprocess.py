@@ -363,8 +363,19 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 ident, req_proc = from_json_string(message.obj)
             else:
                 ident, req_proc = message.obj
+            requestor = message.from_whom
+            # Rehydrate Identity from address mirror when pickling
+            # dropped the original (manager.Queue weirdness).
+            if requestor is None:
+                addr = getattr(message, 'from_whom_address', None)
+                if addr:
+                    requestor = self.peers.find_by_address(addr)
+            self.logger.debug('handle_rep_req: from_whom type=%s addr=%s requestor=%s' %
+                              (type(message.from_whom).__name__,
+                               getattr(message, 'from_whom_address', None),
+                               type(requestor).__name__))
             threading.Thread(target=self._compute_reputation,
-                             args=(ident, req_proc, message.from_whom), daemon=True).start()
+                             args=(ident, req_proc, requestor), daemon=True).start()
             return True
         return False
 
@@ -373,8 +384,25 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             reputation, req_proc, requestor = self.requested_reps.pop(0)
             self.logger.debug('Forward reps to %s at %s' % (req_proc, requestor))
             try:
-                msg = Message(req_proc, ReputationProtocol.rep_resp, reputation, requestor)
-                queues[req_proc].put(msg, block=True, timeout=self.q_cadence)
+                # Route the rep_resp back where the rep_req came from.
+                # If the requestor is a remote Identity (e.g. an Inspector
+                # bridge issuing peer-to-peer rep_req over the network),
+                # the response must traverse the network too — the
+                # original code put the response on the LOCAL `main`
+                # queue, where it was absorbed by this peer's own AT
+                # main loop and never left the responder. For local
+                # (loopback) requests, requestor is None or our own
+                # identity, and the historical local-queue path is fine.
+                msg = Message(req_proc, ReputationProtocol.rep_resp,
+                              reputation, requestor, from_whom=self.identity)
+                if (requestor is not None
+                        and getattr(requestor, 'uuid', None) is not None
+                        and str(requestor.uuid) != str(self.identity.uuid)):
+                    queues[CfgIds.network].put(
+                        msg, block=True, timeout=self.q_cadence)
+                else:
+                    queues[req_proc].put(
+                        msg, block=True, timeout=self.q_cadence)
             except Full:
                 self.logger.error('forward_reputation: %s queue full' % req_proc)
 

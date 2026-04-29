@@ -52,7 +52,7 @@ class ComposeOptions:
     registry: str = ""                   # e.g. "ghcr.io/tekfive/"
     image_tag: str = ""                  # e.g. ":demo" or "@sha256:..."
     log_level: str = "info"
-    exclude_logs: str = "network"
+    exclude_logs: str = "none"  # "network"
     backend: str = "native"
     subnet: str = _DEMO_SUBNET
     router: str = _DEMO_ROUTER
@@ -60,6 +60,13 @@ class ComposeOptions:
     scenario_mount: str = "/app/scenario"  # path where scenario.json is mounted
     metrics_mount: Optional[str] = None    # host path for metrics-collector dir
     extra_env: dict[str, str] = field(default_factory=dict)
+    # Civilian-demo inspector container. Runs the Dash server + bridge
+    # on the same demo-net so it can observe peer traffic. Shares the
+    # registry/image_tag of the peer image.
+    inspector_image: str = "autonomous-trust-inspector"
+    inspector_last_octet: int = 250        # subnet host byte for the inspector
+    inspector_host_port: int = 8050        # published to host
+    include_inspector: bool = True         # set False to suppress the service
 
 
 # ----------------------------------------------------------------------
@@ -78,6 +85,7 @@ def _peer_entry(peer_name: str, role, ip: str, delay_sec: int,
         "ROUTER": opts.router,
         "AUTONOMOUS_TRUST_ARGS": at_args,
         "AUTONOMOUS_TRUST_BACKEND": opts.backend,
+        "AT_TRANSPORT": "autonomous_trust.core.network.TCPNetworkProcess",
         "AT_PEER_NAME": peer_name,
         "AT_AGENCY": role.agency,
         "AT_ROLE_KIND": role.kind,
@@ -132,6 +140,66 @@ def _peer_entry(peer_name: str, role, ip: str, delay_sec: int,
     return lines
 
 
+def _inspector_entry(opts: ComposeOptions) -> list[str]:
+    """Build the compose service for the civilian inspector container."""
+    image = f"{opts.registry}{opts.inspector_image}{opts.image_tag}"
+    ip = f"{opts.subnet.rsplit('.', 1)[0]}.{opts.inspector_last_octet}"
+    env_lines = [
+        f'      AT_PEER_NAME: "inspector"',
+        f'      AUTONOMOUS_TRUST_BACKEND: "{opts.backend}"',
+        f'      AT_TRANSPORT: "autonomous_trust.core.network.TCPNetworkProcess"',
+        f'      LOG_LEVEL: "{opts.log_level}"',
+        # The inspector joins a peer mesh that's already bootstrapping;
+        # the default 5s choose_group window loses the race against UDP
+        # broadcast + vote + finalize. 30s gives the existing peers
+        # time to vote-and-respond. Peers themselves keep the default.
+        f'      AT_INIT_TIMEOUT_SEC: "30"',
+        # Hold inspector startup until peer TCP listeners are bound.
+        # Peer 5s stagger × 9 = 40s for the synchronous batch (epa-1
+        # joins at scenario T+360s regardless). 45s gives a safety
+        # margin so the inspector's single request_access multicast
+        # doesn't race peers' socket bind().
+        f'      STARTUP_DELAY: "45"',
+    ]
+    # Forward Mapbox-related host env so the dashboard can opt into
+    # tiled basemaps. MAPBOX is a truthy feature toggle (and may also
+    # carry an access token for branded styles); MAPBOX_STYLE picks
+    # the style. Only emitted when set on the host running the
+    # compose generator.
+    for var in ("MAPBOX", "MAPBOX_STYLE"):
+        val = os.environ.get(var)
+        if val:
+            safe = val.replace('"', '\\"')
+            env_lines.append(f'      {var}: "{safe}"')
+    # Override the Dockerfile CMD so the inspector log level tracks
+    # opts.log_level (the Dockerfile bakes in --log-level info).
+    return [
+        "  inspector:",
+        f"    image: {image}",
+        "    container_name: civilian-inspector",
+        "    hostname: civilian-inspector",
+        "    environment:",
+        *env_lines,
+        "    command:",
+        '      - "python3"',
+        '      - "-m"',
+        '      - "autonomous_trust.inspector"',
+        '      - "--demo-civilian"',
+        '      - "--port"',
+        '      - "8050"',
+        '      - "--log-level"',
+        f'      - "{opts.log_level}"',
+        "    ports:",
+        f'      - "{opts.inspector_host_port}:8050"',
+        "    volumes:",
+        f"      - ./scenario:{opts.scenario_mount}:ro",
+        "    networks:",
+        "      demo-net:",
+        f"        ipv4_address: {ip}",
+        "",
+    ]
+
+
 def generate_compose(scenario, opts: Optional[ComposeOptions] = None) -> str:
     """Return a docker-compose.yaml body for the given scenario."""
     opts = opts or ComposeOptions()
@@ -149,6 +217,9 @@ def generate_compose(scenario, opts: Optional[ComposeOptions] = None) -> str:
         else:
             delay = i * 5
         lines.extend(_peer_entry(name, role, ip, delay, opts))
+
+    if opts.include_inspector:
+        lines.extend(_inspector_entry(opts))
 
     lines.extend([
         "networks:",
@@ -249,6 +320,7 @@ def generate_k8s_manifests(scenario, namespace: str = "disaster-demo",
                     f"--live --test --exclude-logs {opts.exclude_logs} "
                     f"--log-level {opts.log_level}"),
                 "AUTONOMOUS_TRUST_BACKEND": opts.backend,
+                "AT_TRANSPORT": "autonomous_trust.core.network.TCPNetworkProcess",
                 "AT_PEER_NAME": name,
                 "AT_AGENCY": role.agency,
                 "AT_ROLE_KIND": role.kind,
