@@ -14,9 +14,14 @@
 #   limitations under the License.
 # ******************
 
-from .automate import AutonomousTrust  # noqa
-
-from .processes import ProcessTracker, Process, ProcMeta, LogLevel
+# Load order matters: automate imports from .processes at module
+# scope, so .processes must be fully loaded before .automate runs.
+# When multiprocessing.Manager's spawned server subprocess re-imports
+# autonomous_trust.core to unpickle queue payloads, automate's
+# module-level `from .processes import Process` would otherwise hit
+# a partially-initialized .processes (cycle).
 from .config import Configuration, InitializableConfig, EmptyObject, \
     to_json_string, from_json_string, to_yaml_string, from_yaml_string
 from .system import CfgIds, QueueType
+from .processes import ProcessTracker, Process, ProcMeta, LogLevel
+from .automate import AutonomousTrust  # noqa

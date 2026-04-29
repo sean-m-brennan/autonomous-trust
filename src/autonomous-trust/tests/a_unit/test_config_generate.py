@@ -78,6 +78,52 @@ def test_generate_randomize_with_string_seed(setup_teardown):
     assert ident is not None
 
 
+def test_generate_randomize_honors_at_peer_name(setup_teardown):
+    """When AT_PEER_NAME is set, the generated identity uses it as the
+    nickname (so deployment-side container labels survive into the AT
+    identity protocol)."""
+    cfg_dir = os.path.join(TEST_DIR, 'gen_at_peer_name')
+    os.makedirs(cfg_dir, exist_ok=True)
+    mock_addrs = {
+        'ip4': '192.168.1.100',
+        'ip6': '::1',
+        'mac': '00:11:22:33:44:55',
+        'ip4_subnet': '255.255.255.0',
+        'ip6_subnet': 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+        'mac_bcast': 'ff:ff:ff:ff:ff:ff',
+    }
+    with patch.dict(os.environ, {'AT_PEER_NAME': 'noaa-1'}):
+        with patch('autonomous_trust.core.config.generate.Network.get_addresses',
+                   return_value=mock_addrs):
+            net, ident, subsys = generate_identity(
+                cfg_dir, randomize=True, seed=1, silent=True)
+    assert ident.nickname == 'noaa-1'
+    assert ident.fullname == 'noaa-1@tekfive.com'
+
+
+def test_generate_randomize_no_at_peer_name_uses_random(setup_teardown):
+    """Sanity: with AT_PEER_NAME unset, the random-pool nickname survives."""
+    cfg_dir = os.path.join(TEST_DIR, 'gen_no_at_peer_name')
+    os.makedirs(cfg_dir, exist_ok=True)
+    mock_addrs = {
+        'ip4': '192.168.1.100',
+        'ip6': '::1',
+        'mac': '00:11:22:33:44:55',
+        'ip4_subnet': '255.255.255.0',
+        'ip6_subnet': 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+        'mac_bcast': 'ff:ff:ff:ff:ff:ff',
+    }
+    env = {k: v for k, v in os.environ.items() if k != 'AT_PEER_NAME'}
+    with patch.dict(os.environ, env, clear=True):
+        with patch('autonomous_trust.core.config.generate.Network.get_addresses',
+                   return_value=mock_addrs):
+            net, ident, subsys = generate_identity(
+                cfg_dir, randomize=True, seed=1, silent=True)
+    # Random-pool surnames; never 'noaa-1'.
+    assert ident.nickname != 'noaa-1'
+    assert '@tekfive.com' in ident.fullname
+
+
 def test_generate_randomize_verbose(setup_teardown, caplog):
     import logging
     cfg_dir = os.path.join(TEST_DIR, 'gen_verbose')

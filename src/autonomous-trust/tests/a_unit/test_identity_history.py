@@ -139,7 +139,12 @@ class TestIdentityHistory:
         h = self._make_history()
         ident = _make_mock_identity()
         blob = IdentityObj(ident, uuid4())
-        result = h.verify_object(blob, MagicMock(), b'sig')
+        # The verifier looks up the voter by proof.uuid; point it at
+        # ourselves so the look-up resolves to h.myself (whose mocked
+        # .verify returns True).
+        proof = MagicMock()
+        proof.uuid = h.myself.uuid
+        result = h.verify_object(blob, proof, b'sig')
         assert result is True
 
     def test_verify_object_not_identity_obj(self):
@@ -239,7 +244,10 @@ class TestIdentityByAuthority:
     def test_pre_verify(self):
         h = self._make()
         blob = IdentityObj(_make_mock_identity(), uuid4())
+        # verify_object now looks the voter up by proof.uuid; aim it at
+        # ourselves so it resolves.
         proof = MagicMock()
+        proof.uuid = h.myself.uuid
         result = h._pre_verify(blob, proof, b'sig')
         assert result is True
 
@@ -289,7 +297,9 @@ class TestIdentityByStake:
     def test_pre_verify(self):
         h = self._make()
         blob = IdentityObj(_make_mock_identity(), uuid4())
-        result = h._pre_verify(blob, MagicMock(), b'sig')
+        proof = MagicMock()
+        proof.uuid = h.myself.uuid
+        result = h._pre_verify(blob, proof, b'sig')
         assert result is True
 
 

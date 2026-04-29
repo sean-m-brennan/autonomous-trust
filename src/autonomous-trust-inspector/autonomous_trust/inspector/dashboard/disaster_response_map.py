@@ -135,8 +135,9 @@ class AgencyMap:
 
         # Scattermap (mapbox) renders tiles; Scattergeo draws a vector
         # globe. We default to Scattergeo since MAPBOX requires an
-        # access token; users can opt in via MAPBOX env.
-        self._use_tiles = os.environ.get("MAPBOX") is not None
+        # access token; users can opt in by setting MAPBOX to a truthy
+        # value. An empty-string export won't count.
+        self._use_tiles = bool(os.environ.get("MAPBOX"))
 
     # ------------------------------------------------------------------
     # Builder API (called once per peer at scenario setup)
@@ -283,8 +284,11 @@ class AgencyMap:
                 size=self._style.marker_size,
                 symbol=(_AGENCY_SYMBOLS.get(agency, "circle")
                         if not self._use_tiles else "circle"),
-                line=dict(width=1, color=color),
             )
+            # Scattergeo.marker supports .line (outline); Scattermap's
+            # does not — validator rejects it.
+            if not self._use_tiles:
+                marker["line"] = dict(width=1, color=color)
             fig.add_trace(scatter(
                 lat=[p.lat for p in peers],
                 lon=[p.lon for p in peers],
