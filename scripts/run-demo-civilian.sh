@@ -49,6 +49,11 @@ cd "$here"
 AT_SRC_PATHS="$here/src/autonomous-trust:$here/src/autonomous-trust-evaluation:$here/src/autonomous-trust-inspector:$here/src/autonomous-trust-services:$here/src/autonomous-trust-simulator"
 export PYTHONPATH="${AT_SRC_PATHS}${PYTHONPATH:+:$PYTHONPATH}"
 
+# Force native backend on the host so it matches the peer containers.
+# Overridable for debug; fallback to _python still applies per-module
+# via the core redirector.
+export AUTONOMOUS_TRUST_BACKEND="${AUTONOMOUS_TRUST_BACKEND:-native}"
+
 DEPLOY_DIR="${DEPLOY_DIR:-deploy/civilian}"
 NAMESPACE="${NAMESPACE:-disaster-demo}"
 INSPECTOR_PORT="${INSPECTOR_PORT:-8050}"
@@ -155,16 +160,35 @@ open_browser() {
     fi
 }
 
+# Kill any stale inspector processes or port-holders left over from a
+# previous run that didn't shut down cleanly. Called preflight and on
+# exit. Safe to run with nothing to clean.
+cleanup_inspector_procs() {
+    local pids
+    if command -v lsof &>/dev/null; then
+        pids=$(lsof -ti ":$INSPECTOR_PORT" 2>/dev/null || true)
+        if [[ -n "$pids" ]]; then
+            kill $pids 2>/dev/null || true
+            sleep 0.5
+            pids=$(lsof -ti ":$INSPECTOR_PORT" 2>/dev/null || true)
+            [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true
+        fi
+    elif command -v fuser &>/dev/null; then
+        fuser -k "$INSPECTOR_PORT/tcp" 2>/dev/null || true
+    fi
+    # Also sweep any AT worker processes that may have outlived their
+    # parent. Scoped to this repo path so we don't touch unrelated envs.
+    pkill -f "autonomous_trust\\.inspector" 2>/dev/null || true
+}
+
 case "$BACKEND_MODE" in
     compose)
         command -v docker &>/dev/null \
             || { echo "docker not found"; exit 1; }
 
-        # Ensure the pinned local image exists; build if not.
-        # IMAGE_TAG includes the leading ":" (e.g. ":dev") by convention
-        # of disaster_response_compose.py. Uses Dockerfile-native to match
-        # AUTONOMOUS_TRUST_BACKEND=native in the generated compose env (and
-        # tilt/python.tiltfile's native-backend path).
+        # Ensure the peer image exists; build with Dockerfile-native
+        # (matches AUTONOMOUS_TRUST_BACKEND=native in the generated
+        # compose env and tilt/python.tiltfile's native path).
         full_ref="${REGISTRY}${IMAGE_NAME}${IMAGE_TAG}"
         if ! docker image inspect "$full_ref" &>/dev/null; then
             echo "=== Image $full_ref not found locally — building ==="
@@ -174,21 +198,30 @@ case "$BACKEND_MODE" in
                 "$here"
         fi
 
+        # Ensure the civilian-inspector image exists. Extends the peer
+        # image with Dash deps + sibling AT subpackages.
+        inspector_ref="${REGISTRY}autonomous-trust-inspector${IMAGE_TAG}"
+        if ! docker image inspect "$inspector_ref" &>/dev/null; then
+            echo "=== Image $inspector_ref not found locally — building ==="
+            docker build \
+                --build-arg "BASE_IMAGE=$full_ref" \
+                -t "$inspector_ref" \
+                -f "$here/src/autonomous-trust-inspector/Dockerfile-civilian" \
+                "$here"
+        fi
+
+        # Preflight: nothing to clean process-wise now (inspector runs
+        # inside the compose stack), but free the host port in case an
+        # older host-run inspector is still bound.
+        cleanup_inspector_procs
+
         pushd "$DEPLOY_DIR" >/dev/null
         echo "=== docker compose up (10 peers + inspector) ==="
         docker compose up -d
-
-        echo "Starting inspector on :$INSPECTOR_PORT"
-        python3 -m autonomous_trust.inspector \
-            --demo-civilian \
-            --port "$INSPECTOR_PORT" \
-            --log-level "$LOG_LEVEL" \
-            &>/tmp/demo-inspector.log &
-        INSPECTOR_PID=$!
         popd >/dev/null
 
-        # Wait until the port is listening before opening the browser.
-        for _ in $(seq 1 30); do
+        # Wait until the inspector container publishes its port.
+        for _ in $(seq 1 60); do
             if (echo >/dev/tcp/127.0.0.1/$INSPECTOR_PORT) &>/dev/null; then
                 break
             fi
@@ -198,10 +231,15 @@ case "$BACKEND_MODE" in
 
         echo ""
         echo "--- Running. Ctrl-C to stop ---"
+        echo "Inspector logs: docker logs -f civilian-inspector"
         trap 'echo; echo "Stopping..."; \
-              kill $INSPECTOR_PID 2>/dev/null || true; \
               (cd "$DEPLOY_DIR" && docker compose down)' INT TERM
-        wait $INSPECTOR_PID
+        # Keep the script in the foreground so the trap fires on Ctrl-C.
+        # Poll the compose stack; exits naturally if all containers stop.
+        while (cd "$DEPLOY_DIR" && docker compose ps --services --filter \
+                status=running | grep -q .); do
+            sleep 5
+        done
         ;;
 
     k8s)

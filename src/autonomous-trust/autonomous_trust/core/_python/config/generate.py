@@ -72,6 +72,9 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
     ip4_address, ip6_address, mac_address = list(Network.get_addresses().values())[:3]  # TODO multi-device
 
     mod, cls = communications.rsplit('.', 1)
+    if mod not in sys.modules:
+        from importlib import import_module
+        import_module(mod)
     proto_cls = getattr(sys.modules[mod], cls)
     address = None
     if proto_cls.net_proto == NetworkProtocol.IPV4:
@@ -88,6 +91,17 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         idx = seed % len(_names)
         fullname = _names[idx]
         nickname = fullname.split('@')[0].rsplit('.', 1)[1]
+        # If the deployment supplies AT_PEER_NAME (e.g. the civilian
+        # demo's compose generator labels each container 'noaa-1',
+        # 'fema-fusion', ...), honor it as the AT identity nickname so
+        # downstream observers — the inspector bridge, dashboards,
+        # scenario timelines — can match an AT peer to its scenario
+        # role without an extra mapping table. fullname follows so log
+        # output stays consistent.
+        env_name = os.environ.get('AT_PEER_NAME', '').strip()
+        if env_name:
+            nickname = env_name
+            fullname = f'{env_name}@tekfive.com'
         # FIXME always dynamic
         net_cfg = Network.initialize(ip4_address, ip6_address, mac_address)
         ident_cfg = Identity.initialize(fullname, nickname, address)

@@ -17,6 +17,7 @@
 import argparse
 import os
 import sys
+import time
 
 from autonomous_trust.core import LogLevel
 from autonomous_trust.core.config import Configuration
@@ -71,10 +72,51 @@ def _run_stock(port, log_level):
     Inspector(log_level=log_level, port=port).run_forever()
 
 
-def _run_civilian(port, playback_file):
+def _run_civilian(port, playback_file, log_level):
     # Lazy import — evaluation pulls in Dash deps we don't need in stock mode.
     from .civilian import CivilianDemo
-    CivilianDemo(port=port, playback_file=playback_file).run()
+
+    bridge_queue = None
+    if playback_file is None:
+        # Live mode: spawn a CivilianInspectorBridge in a daemon thread
+        # to observe real AT peers and pipe events to the Dash callback.
+        # The bridge is an AutonomousTrust subclass and needs the same
+        # config-dir setup as the stock inspector (_run_stock).
+        cfg_dir = os.path.join(os.path.dirname(__file__),
+                               'inspector', Configuration.CFG_PATH)
+        if Configuration.ROOT_VARIABLE_NAME in os.environ:
+            cfg_dir = Configuration.get_cfg_dir()
+        has_config = os.path.isdir(cfg_dir) and any(
+            f.endswith(Configuration.file_ext) for f in os.listdir(cfg_dir))
+        if not has_config:
+            random_config(os.path.join(os.path.dirname(__file__)),
+                          'inspector')
+        os.environ.setdefault(Configuration.ROOT_VARIABLE_NAME, cfg_dir)
+
+        import multiprocessing as _mp
+        from .civilian_bridge import spawn_bridge, BRIDGE_QUEUE_MAX
+        bridge_queue = _mp.Queue(maxsize=BRIDGE_QUEUE_MAX)
+        spawn_bridge(bridge_queue, log_level=log_level)
+
+    CivilianDemo(port=port, playback_file=playback_file,
+                 bridge_queue=bridge_queue).run()
+
+
+def _await_peers():
+    # Inspector's compose entry overrides `command:` and bypasses
+    # entrypoint.sh, so the peer-image's STARTUP_DELAY plumbing doesn't
+    # apply. Honor the same env var here so the inspector can be held
+    # back until peer TCP listeners are bound — otherwise its single
+    # request_access multicast at T+0 races peers' bind() and is lost,
+    # leaving peers' accept_peer_message rejecting every later TCP frame.
+    delay = os.environ.get('STARTUP_DELAY') or os.environ.get('AT_STARTUP_DELAY')
+    try:
+        secs = int(delay) if delay else 0
+    except ValueError:
+        secs = 0
+    if secs > 0:
+        print('Inspector: waiting %ds for peers to bind...' % secs, flush=True)
+        time.sleep(secs)
 
 
 if __name__ == '__main__':
@@ -84,7 +126,11 @@ if __name__ == '__main__':
     civilian = args.demo_civilian or args.playback is not None
     port = args.port if args.port is not None else (8050 if civilian else 8000)
 
+    if args.playback is None:
+        _await_peers()
+
     if civilian:
-        _run_civilian(port=port, playback_file=args.playback)
+        _run_civilian(port=port, playback_file=args.playback,
+                      log_level=log_level)
     else:
         _run_stock(port=port, log_level=log_level)

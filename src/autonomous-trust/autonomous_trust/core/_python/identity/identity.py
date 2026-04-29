@@ -138,12 +138,14 @@ class Identity(InitializableConfig, AgreementVoter):
     def publish(self):
         return Identity(self.uuid, self.address, self.fullname, self.nickname,
                         Signature(self.signature.publish(), True), Encryptor(self.encryptor.publish(), True),
-                        self.petname, True)
+                        self.petname, True, _rank=self._rank,
+                        _block_impl=self._block_impl)
 
     def sync_to_message(self):
         self.message.uuid = str(self.uuid).encode('utf-8')
         self.message.address = self.address
         self.message.fullname = self._fullname
+        self.message.rank = self._rank
         self._signature.message = self.message.signature
         self._signature.sync_to_message()
         self._encryptor.message = self.message.encryptor
@@ -156,7 +158,7 @@ class Identity(InitializableConfig, AgreementVoter):
         self._nickname = ''
         self.petname = ''
         self._public_only = True
-        self._rank = 0
+        self._rank = self.message.rank
         self._block_impl = agreement_impl
         self._signature = Signature.__new__(Signature)
         self._signature.message = identity_pb2.Signature()

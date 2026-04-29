@@ -30,6 +30,16 @@ class UDPNetworkProcess(NetworkProcess):
 
     def __init__(self, configurations, subsystems, log_q, acceptance_func=None, udp=True, use_mcast=False, **kwargs):
         super().__init__(configurations, subsystems, log_q, acceptance_func, **kwargs)
+        # Set the per-process default timeout BEFORE socket creation so
+        # the listener / recv sockets land in proper "timeout" mode.
+        # Per-socket settimeout(positive_value) AFTER the fact is meant
+        # to do the same thing, but on Python 3.13 it appears to leave
+        # the socket in non-blocking mode — accept()/recvfrom() then
+        # raise BlockingIOError immediately and the receiver threads
+        # die at startup. The TCPNetworkProcess subclass overrides this
+        # for its outbound _send_tcp client sockets via per-socket
+        # settimeout(send_timeout) — that codepath is short-lived and
+        # explicit, so the global default doesn't poison it.
         socket.setdefaulttimeout(self.socket_timeout)
         self.packet_size = 65507
         self.my_address = self.net_cfg.ip4
