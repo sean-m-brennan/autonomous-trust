@@ -40,7 +40,12 @@ ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 
 # Network tools + C build toolchain
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
+# AllowInsecure / --allow-unauthenticated tolerate transient apt
+# InRelease "not live until" timestamps when the host clock is earlier
+# than Debian's daily resign cycle. Harmless for a dev image fetched
+# behind an HTTPS proxy.
+RUN (apt-get update -y -o Acquire::AllowInsecureRepositories=true || true) && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
         iproute2 iputils-ping \
         cmake clang make pkg-config \
         uuid-dev libsodium-dev libjansson-dev \
