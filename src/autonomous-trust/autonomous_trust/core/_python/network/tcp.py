@@ -19,6 +19,7 @@ import struct
 
 from .netprocess import NetworkProtocol, TransmissionError
 from .udp import UDPNetworkProcess
+from .. import _probes
 
 
 class TCPNetworkProcess(UDPNetworkProcess):
@@ -161,10 +162,13 @@ class TCPNetworkProcess(UDPNetworkProcess):
         # BlockingIOError. clientsock inherits the listener's timeout,
         # which is the global default (0.1s) — tight, but works.
         if addr == self.my_address:
+            _probes.counter('net.tcp.peer', 'drop', 'own_address')
             return None, None, None  # my own message
         if self.reject_message(addr):
+            _probes.counter('net.tcp.peer', 'drop', 'blacklisted')
             clientsock.close()
             return None, addr, port  # blacklisted
+        _probes.counter('net.tcp.peer', 'accepted')
         return self._recv(clientsock), addr, port
 
     def recv_group(self):
@@ -175,8 +179,11 @@ class TCPNetworkProcess(UDPNetworkProcess):
         # stranger.
         (clientsock, (addr, port)) = self.recv_grp_sock.accept()
         if addr == self.my_address:
+            _probes.counter('net.tcp.group', 'drop', 'own_address')
             return None, None, None  # my own message
         if self.reject_message(addr):
+            _probes.counter('net.tcp.group', 'drop', 'blacklisted')
             clientsock.close()
             return None, addr, port  # blacklisted
+        _probes.counter('net.tcp.group', 'accepted')
         return self._recv(clientsock), addr, port

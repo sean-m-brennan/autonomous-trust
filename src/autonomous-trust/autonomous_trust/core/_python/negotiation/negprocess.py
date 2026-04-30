@@ -24,6 +24,7 @@ from ..processes import Process, ProcMeta
 from .protocol import NegotiationProtocol
 from .negotiation import Job, JobQueue, Task, TaskStatus, TaskTracker, TaskCounter, TaskResult, Status
 from ..system import CfgIds, max_concurrency, now
+from .. import _probes
 
 
 class NegotiationProcess(Process, metaclass=ProcMeta,
@@ -306,8 +307,11 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                                     self.peer_capabilities[message[0]] = message[1]
                                 else:
                                     if isinstance(message, Message):
+                                        _probes.counter('proc.negotiation', 'unhandled', message.function)
+                                        _probes.trace_msg(message, 'unhandled', proc='negotiation')
                                         self.logger.error('Unhandled message %s' % message.function)
                                     else:
+                                        _probes.counter('proc.negotiation', 'unhandled', 'type:' + message.__class__.__name__)
                                         self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
 
                 for job in self._get_jobs():  # local jobs

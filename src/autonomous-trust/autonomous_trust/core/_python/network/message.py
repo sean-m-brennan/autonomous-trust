@@ -16,6 +16,7 @@
 
 import json
 import logging
+import uuid as _uuid
 from base64 import b64encode, b64decode
 
 from nacl.encoding import HexEncoder
@@ -23,6 +24,7 @@ from nacl.exceptions import BadSignatureError
 
 from ..config import Configuration
 from .network import Network
+from .. import _probes
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +38,17 @@ class Message(object):
     | size | process | function | data | signature  |
     =================================================
     """
-    def __init__(self, process, function, obj, to_whom=None, from_whom=None, encrypt=True, return_to=None):
+    def __init__(self, process, function, obj, to_whom=None, from_whom=None, encrypt=True, return_to=None,
+                 trace_id=None):
         # Deferred import to break circular dependency:
         # network.__init__ -> message -> identity -> idprocess -> network
         from ..identity import Identity, Group
+
+        # Always-on field (Stage 2 of debug-tooling subproject). Caller
+        # may supply trace_id to preserve identity across a parse hop;
+        # otherwise we mint a new one. Stored as a 32-char hex (UUID4
+        # without dashes) so JSON-wire and log greps stay tidy.
+        self.trace_id = trace_id or _uuid.uuid4().hex
 
         self.verified = False
         self.signature = None
@@ -64,18 +73,6 @@ class Message(object):
             else:
                 raise RuntimeError('Invalid to_whom arg. Must be an Identity, but got %s' % type(to_whom))
         self.from_whom = from_whom
-        # Pickle workaround: from_whom (Identity) is mysteriously dropped
-        # when this Message round-trips through manager.Queue (tested:
-        # 2361 puts with Identity, 408 gets with NoneType — default
-        # pickle, no custom hooks). Store a simple string mirror that
-        # pickles reliably; consumers (e.g. ReputationProcess) can fall
-        # back to peers.find_by_address(from_whom_address) when from_whom
-        # is None but from_whom_address is set.
-        self.from_whom_address = None
-        if from_whom is not None and isinstance(from_whom, Identity):
-            self.from_whom_address = getattr(from_whom, 'address', None)
-        elif isinstance(from_whom, str):
-            self.from_whom_address = from_whom
         self.return_to = return_to
         if isinstance(obj, str):
             check = obj.lstrip()
@@ -96,6 +93,13 @@ class Message(object):
                 self.verified = True  # we just signed it ourselves
             except (RuntimeError, AttributeError):
                 pass  # public-only identity or mock — leave unsigned
+
+        # Trace event: 'new' = freshly minted; 'parse' = revived from wire.
+        # Distinguish via whether the caller supplied trace_id (parse path
+        # sets it, direct construction leaves None).
+        _probes.emit('msg', 'new' if trace_id is None else 'parse',
+                     trace_id=self.trace_id, process=self.process,
+                     function=self.function, has_from=self.from_whom is not None)
 
     def _content_str(self):
         """The signable content: process|function|obj_str"""
@@ -124,6 +128,7 @@ class Message(object):
             'function': self.function,
             'encrypt': self.encrypt,
             'data': data_b64,
+            'trace_id': self.trace_id,
             'from_uuid': '',
             'from_name': '',
             'from_address': '',
@@ -171,8 +176,13 @@ class Message(object):
                 else:
                     obj_str = ''
 
+                # Preserve wire trace_id across the hop. Old peers (no
+                # field) → trace_id falls back to a fresh UUID, breaking
+                # the chain at that hop but not the message.
+                wire_trace = wire.get('trace_id') or None
                 msg = Message(process, function, obj_str, from_whom=sender,
-                              encrypt=wire.get('encrypt', False))
+                              encrypt=wire.get('encrypt', False),
+                              trace_id=wire_trace)
                 msg.verified = False
 
                 # Verify signature if present
@@ -203,6 +213,7 @@ class Message(object):
             obj_str = parts[2]
             sig_hex = parts[3]
 
+        # Legacy pipe format carries no trace_id; fresh UUID at this hop.
         msg = Message(process, function, obj_str, from_whom=sender,
                       encrypt=False)
         msg.verified = False
