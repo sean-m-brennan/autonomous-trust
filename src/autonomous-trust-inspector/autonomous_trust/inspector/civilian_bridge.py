@@ -37,6 +37,7 @@ from autonomous_trust.core.config import to_json_string
 from autonomous_trust.core.network import Network, Message
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.system import queue_cadence
+from autonomous_trust.core._python import _probes
 
 from .inspector import Inspector
 
@@ -110,8 +111,11 @@ class CivilianInspectorBridge(Inspector):
         return uuid_str
 
     def autonomous_tasking(self, queues):
+        _probes.counter('bridge.task', 'enter')
+        _probes.counter('bridge.task', 'peers_all', str(len(self.peers.all)))
         # Reuse the stock inspector's per-peer query cadence (rep+ping).
         if self.tasking_tick(1):  # ~30s
+            _probes.counter('bridge.task', 'tick1_fired')
             for peer in self.peers.all:
                 try:
                     query = Message(
@@ -119,12 +123,15 @@ class CivilianInspectorBridge(Inspector):
                         ReputationProtocol.rep_req,
                         to_json_string((peer, self.proc_name)),
                         self.identity,
+                        from_whom=self.identity,
                     )
                     queues[CfgIds.reputation].put(
                         query, block=True, timeout=queue_cadence)
                     # return_to is a *queue name*, not the class display
                     # name. proc_name resolves to 'main' (the AT
                     # top-level queue) via Protocol.__init__.
+                    # netproc dispatches ping() into a thread pool, so
+                    # this no longer blocks the main loop.
                     ping = Message(CfgIds.network, Network.ping, 5,
                                    peer, return_to=self.proc_name)
                     queues[CfgIds.network].put(
@@ -146,7 +153,9 @@ class CivilianInspectorBridge(Inspector):
         # forward_reputation can route the rep_resp back over the
         # network (else requestor=None and the response stays local).
         if self.tasking_tick(3, PEER_PAIR_QUERY_SEC):
+            _probes.counter('bridge.task', 'tick3_fired')
             peers = list(self.peers.all)
+            _probes.counter('bridge.task', 'tick3_peers', str(len(peers)))
             for observer in peers:
                 for subject in peers:
                     if str(observer.uuid) == str(subject.uuid):
@@ -159,9 +168,12 @@ class CivilianInspectorBridge(Inspector):
                             observer,  # routed over the network
                             from_whom=self.identity,
                         )
+                        _probes.counter('bridge.task', 'tick3_msg_built')
                         queues[CfgIds.network].put(
                             query, block=True, timeout=queue_cadence)
+                        _probes.counter('bridge.task', 'tick3_msg_queued')
                     except Exception:
+                        _probes.counter('bridge.task', 'tick3_exc')
                         logger.exception(
                             "[bridge] failed peer-pair rep_req %r->%r",
                             observer, subject)
