@@ -51,6 +51,7 @@ from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, N
 from .network import Message
 from .reputation import TransactionScore, ReputationProtocol
 from .queue_pool import QueuePool
+from . import _probes
 
 PoolType = Union[ProcessPool, ThreadPool]
 
@@ -233,14 +234,16 @@ class AutonomousTrust(Protocol):
                     # check reputation for all known peers on first sighting
                     for peer in list(self.peers.all) + [self.identity]:
                         query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
-                                        to_json_string((peer, self.proc_name)), self.identity)
+                                        to_json_string((peer, self.proc_name)), self.identity,
+                                        from_whom=self.identity)
                         queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
                 elif self.tasking_tick(0):
                     self._random_task(queues)
                     # check reputation for all known peers (including self)
                     for peer in list(self.peers.all) + [self.identity]:
                         query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
-                                        to_json_string((peer, self.proc_name)), self.identity)
+                                        to_json_string((peer, self.proc_name)), self.identity,
+                                        from_whom=self.identity)
                         queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
         self._report_unhandled()
 
@@ -511,8 +514,11 @@ class AutonomousTrust(Protocol):
         while len(self.unhandled_messages) > 0:
             message = self.unhandled_messages.pop()
             if isinstance(message, Message):
+                _probes.counter('proc.automate', 'unhandled', message.function)
+                _probes.trace_msg(message, 'unhandled', proc='automate')
                 self.logger.error(self.name + ': Unhandled message %s' % message.function)
             else:
+                _probes.counter('proc.automate', 'unhandled', 'type:' + message.__class__.__name__)
                 self.logger.error(self.name + ': Unhandled message of type %s' % message.__class__.__name__)  # noqa
 
     def _handle_results(self, queues: dict[str, QueueType], results: dict[str, AsyncResult]):

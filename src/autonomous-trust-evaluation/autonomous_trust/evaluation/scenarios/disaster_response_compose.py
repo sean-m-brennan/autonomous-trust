@@ -67,6 +67,14 @@ class ComposeOptions:
     inspector_last_octet: int = 250        # subnet host byte for the inspector
     inspector_host_port: int = 8050        # published to host
     include_inspector: bool = True         # set False to suppress the service
+    # Debug-probes wiring (see core/_python/_probes/). When `probes` is
+    # true, every container gets AT_PROBES=1 and the host directory
+    # `probes_host_dir` is bind-mounted at `probes_container_dir`. Defaults
+    # honor host env so callers can flip probes on with
+    # `AT_PROBES=1 ./scripts/run-demo-civilian.sh` without code changes.
+    probes: bool = field(default_factory=lambda: bool(os.environ.get('AT_PROBES')))
+    probes_host_dir: str = field(default_factory=lambda: os.environ.get('AT_PROBES_HOST_DIR', './at-probes'))
+    probes_container_dir: str = '/var/at-probes'
 
 
 # ----------------------------------------------------------------------
@@ -96,6 +104,9 @@ def _peer_entry(peer_name: str, role, ip: str, delay_sec: int,
         "LOG_LEVEL": opts.log_level,
         "STARTUP_DELAY": str(delay_sec),
     }
+    if opts.probes:
+        env["AT_PROBES"] = "1"
+        env["AT_PROBES_DIR"] = opts.probes_container_dir
     env.update(opts.extra_env)
 
     # Compromised-sensor plumbing: the envdata service reads these flags
@@ -126,6 +137,10 @@ def _peer_entry(peer_name: str, role, ip: str, delay_sec: int,
         volumes.append(f"./scenario:{opts.scenario_mount}:ro")
     if opts.metrics_mount:
         volumes.append(f"{opts.metrics_mount}:/metrics")
+    if opts.probes:
+        # Shared host-bind so `scripts/probe-tail.py --dir <host_dir>`
+        # can read every peer's JSONL without docker volume cp.
+        volumes.append(f"{opts.probes_host_dir}:{opts.probes_container_dir}")
     if volumes:
         lines.append("    volumes:")
         for v in volumes:
@@ -161,6 +176,9 @@ def _inspector_entry(opts: ComposeOptions) -> list[str]:
         # doesn't race peers' socket bind().
         f'      STARTUP_DELAY: "45"',
     ]
+    if opts.probes:
+        env_lines.append(f'      AT_PROBES: "1"')
+        env_lines.append(f'      AT_PROBES_DIR: "{opts.probes_container_dir}"')
     # Forward Mapbox-related host env so the dashboard can opt into
     # tiled basemaps. MAPBOX is a truthy feature toggle (and may also
     # carry an access token for branded styles); MAPBOX_STYLE picks
@@ -171,6 +189,9 @@ def _inspector_entry(opts: ComposeOptions) -> list[str]:
         if val:
             safe = val.replace('"', '\\"')
             env_lines.append(f'      {var}: "{safe}"')
+    volume_lines = [f"      - ./scenario:{opts.scenario_mount}:ro"]
+    if opts.probes:
+        volume_lines.append(f"      - {opts.probes_host_dir}:{opts.probes_container_dir}")
     # Override the Dockerfile CMD so the inspector log level tracks
     # opts.log_level (the Dockerfile bakes in --log-level info).
     return [
@@ -192,7 +213,7 @@ def _inspector_entry(opts: ComposeOptions) -> list[str]:
         "    ports:",
         f'      - "{opts.inspector_host_port}:8050"',
         "    volumes:",
-        f"      - ./scenario:{opts.scenario_mount}:ro",
+        *volume_lines,
         "    networks:",
         "      demo-net:",
         f"        ipv4_address: {ip}",

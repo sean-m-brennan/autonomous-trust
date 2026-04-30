@@ -215,6 +215,19 @@ case "$BACKEND_MODE" in
         # older host-run inspector is still bound.
         cleanup_inspector_procs
 
+        # Probes shared volume: compose generator emits a relative bind
+        # `./at-probes:/var/at-probes` on every service, which docker
+        # resolves against $DEPLOY_DIR. Create it (and start fresh)
+        # before `up` so peers don't write to a stale aggregation.
+        if [[ -n "${AT_PROBES:-}" ]]; then
+            probe_host_dir="${AT_PROBES_HOST_DIR:-./at-probes}"
+            probe_abs="$DEPLOY_DIR/${probe_host_dir#./}"
+            mkdir -p "$probe_abs"
+            find "$probe_abs" -name 'probes_*.jsonl' -type f -delete 2>/dev/null || true
+            echo "=== Probes ON: writing to $probe_abs ==="
+            echo "    after run:  scripts/probe-tail.py --dir $probe_abs"
+        fi
+
         pushd "$DEPLOY_DIR" >/dev/null
         echo "=== docker compose up (10 peers + inspector) ==="
         docker compose up -d

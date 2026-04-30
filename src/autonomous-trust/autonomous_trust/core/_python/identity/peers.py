@@ -15,6 +15,7 @@
 # ******************
 
 from ..config.configuration import Configuration
+from .. import _probes
 
 
 class Peers(Configuration):
@@ -103,6 +104,7 @@ class Peers(Configuration):
     def add(self, who, level=None):
         if level is None:
             level = self.mid_level
+        was_new = who.address not in self.listing
         if who.address not in self.listing:
             self.listing[who.address] = who
         if who not in self.all:
@@ -110,6 +112,12 @@ class Peers(Configuration):
         index = self._index_by(who)
         self.hierarchy[level][index] = who
         self.valuation[-1][index] = who
+        if was_new:
+            _probes.emit('peer.set', 'added',
+                         peer_uuid=str(getattr(who, 'uuid', None)),
+                         peer_addr=getattr(who, 'address', None),
+                         peer_nick=getattr(who, 'nickname', None))
+            _probes.counter('peer.set', 'added')
 
     def delete(self, who):
         index = self._index_by(who)
