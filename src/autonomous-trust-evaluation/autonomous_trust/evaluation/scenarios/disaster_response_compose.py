@@ -287,6 +287,10 @@ spec:
           image: {image}
           imagePullPolicy: IfNotPresent
           env:
+            - name: AT_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
 {env_block}
           volumeMounts:
             - name: scenario-cfg
