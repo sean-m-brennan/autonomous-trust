@@ -157,6 +157,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.statistics[uuid].rcvd(num_bytes, errors)
 
     def track_recv_error(self):
+        # Mirror track_send_error: the unknown_peer key may not exist
+        # yet on the very first inbound error, and a KeyError here
+        # crashes the receiver thread for the rest of the run.
+        if self.unknown_peer not in self.statistics:
+            self.statistics[self.unknown_peer] = NetStat()
         self.statistics[self.unknown_peer].rcvd(0, 1)
 
     @property
@@ -249,15 +254,35 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     def _encr_recv(self, method, msg_queue):
         # Tag counters by recv_peer/recv_group to distinguish ptp vs group.
         layer = 'net.recv.' + method.__name__.replace('recv_', '')
+        # Lazy import — only the TCP transport defines PeerDisconnect.
+        # UDP-only deployments don't have a tcp module loaded.
+        try:
+            from .tcp import PeerDisconnect
+        except ImportError:  # pragma: no cover
+            PeerDisconnect = ()  # type: ignore[assignment]
         while not self.stop:
             try:
                 raw_msg, from_addr, from_port = method()
+            except PeerDisconnect as err:
+                # Clean close before any framing bytes — routine during
+                # onboarding/teardown. Counter-only, no error log.
+                _probes.counter(layer, 'recv_error', 'peer_disconnect')
+                self.logger.debug('Network: %s' % err)
+                continue
             except TransmissionError as err:
                 _probes.counter(layer, 'recv_error', 'transmission')
                 self.logger.error('Network: %s' % err)
                 self.track_recv_error()
                 continue
             except TimeoutError:
+                continue
+            except BlockingIOError:
+                # Socket fell into non-blocking mode — observed under
+                # forkserver when default-timeout inheritance doesn't
+                # take. Tracked but quiet; sleep keeps the thread off
+                # the CPU until the next recv has a real chance.
+                _probes.counter(layer, 'recv_error', 'blocking_io')
+                time.sleep(self.socket_timeout)
                 continue
             except Exception as err:
                 # Belt-and-suspenders: a single malformed frame should
@@ -311,9 +336,20 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             try:
                 raw_msg, from_addr, from_port = self.recv_any()
             except TransmissionError as err:
+                _probes.counter('net.recv.any', 'recv_error', 'transmission')
                 self.logger.error('Network: %s' % err)
                 continue
             except TimeoutError:
+                continue
+            except BlockingIOError:
+                _probes.counter('net.recv.any', 'recv_error', 'blocking_io')
+                time.sleep(self.socket_timeout)
+                continue
+            except Exception as err:
+                # Mirror _encr_recv: never let a malformed inbound kill
+                # the listener thread for the rest of the run.
+                _probes.counter('net.recv.any', 'recv_error', err.__class__.__name__)
+                self.logger.error('Network recv_any crashed: %s' % err)
                 continue
             if raw_msg is not None:
                 self.unknown_messages.append((raw_msg, from_addr))
@@ -404,6 +440,19 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         :param signal: IPC queue for signalling halt
         :return:
         """
+        # Re-establish receiver-socket timeouts here, in the worker
+        # subprocess. The sockets are created in __init__ (which runs
+        # in the parent) and transferred via fd-passing during the
+        # forkserver pickle. The OS-level non-blocking flag survives,
+        # but the Python-level timeout tracking does not — without
+        # this rebinding, recvfrom raises BlockingIOError on the very
+        # first call. (Surfaced 2026-05-01 by tests/diag/harness.py.)
+        for _sock in (self.recv_ptp_sock, self.recv_grp_sock,
+                      self.recv_cast_sock):
+            try:
+                _sock.settimeout(self.socket_timeout)
+            except (OSError, AttributeError):
+                pass
         threading.Thread(target=self.peer_receiver, daemon=True).start()
         threading.Thread(target=self.group_receiver, daemon=True).start()
         threading.Thread(target=self.unknown_receiver, daemon=True).start()
@@ -566,7 +615,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     _probes.counter('net.group', 'drop', 'sender_not_in_peers')
                                     self.logger.warning(
                                         'Recvd transmission from %s - not in peers. Ignoring.' % from_addr)
-                                    self.logger.debug('Ignored message: %s' % str(message))
+                                    self.logger.debug('Ignored payload: %d bytes from %s' % (len(raw_msg), from_addr))
                             except nacl.exceptions.CryptoError as e:
                                 _probes.counter('net.group', 'drop', 'crypto_error')
                                 name = from_addr
@@ -579,7 +628,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         else:
                             _probes.counter('net.group', 'drop', 'sender_not_in_group')
                             self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
-                            self.logger.debug('Ignored message: %s' % str(message))
+                            self.logger.debug('Ignored payload: %d bytes from %s' % (len(raw_msg), from_addr))
                             # TODO: Query other group members for the unknown sender's
                             # identity — they may have admitted this peer while we were
                             # partitioned. Requires a group-level identity gossip protocol.
