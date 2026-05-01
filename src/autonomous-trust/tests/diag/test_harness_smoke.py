@@ -96,6 +96,36 @@ def test_harness_three_peers_converge():
 
 @_skip_loopback
 @pytest.mark.slow
+def test_harness_drain_loop_actually_bursts():
+    """Probe-driven counterpart to test_drain_loop_pacing_not_reverted:
+    confirm that the drain loop in idproc / negproc / repproc actually
+    drains >1 message per iter when the queue has a backlog. With the
+    old sleep_until(cadence) pattern this would be near-zero — every
+    iter would dequeue at most one. Bootstrap traffic is bursty enough
+    that at least the identity process should hit `iter_drained=N>=2`
+    in some snapshots."""
+    with MultiPeerHarness(n_peers=3, runtime_sec=45, log_level='warning',
+                          capture_probes=True) as h:
+        h.wait_until_all_peers_grouped(timeout=40, poll=2.0)
+    # The drained-count snapshot reason can be a small int
+    # (typically 0 / 1 in steady state; 2+ during bootstrap bursts).
+    # Sum across peers and snapshots; we only need ONE bursty snapshot
+    # to prove the loop is drain-shaped.
+    total_id_bursts = h.drain_bursts('proc.identity', min_drained=2)
+    total_neg_bursts = h.drain_bursts('proc.negotiation', min_drained=2)
+    total_rep_bursts = h.drain_bursts('proc.reputation', min_drained=2)
+    total_net_bursts = h.drain_bursts('proc.network', min_drained=2)
+    # Identity + network are the most reliably bursty during bootstrap.
+    # Neg + rep may be quiet on a 3-peer mesh — count them all together.
+    total = (total_id_bursts + total_neg_bursts +
+             total_rep_bursts + total_net_bursts)
+    assert total > 0, (
+        f'no drain-loop bursts observed across id/neg/rep/net — drain '
+        f'pattern may have regressed. Configs at {h.tmp_root}')
+
+
+@_skip_loopback
+@pytest.mark.slow
 def test_harness_two_peers_no_unhandled_cascade():
     """Probe-driven invariant: bootstrap should not produce a flood of
     `unhandled:*` events (the dispatch-table mismatch cascade we hit

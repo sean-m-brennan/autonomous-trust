@@ -378,6 +378,60 @@ def test_unknown_receiver_survives_blocking_io_error():
 # first call.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Drain-loop pacing must NOT be reverted to sleep_until(self.cadence).
+# See project_proc_loop_throttle.md: the 0.5 s cadence + 1-msg-per-iter
+# shape capped each subsystem at ~2 msgs/s. repproc was fixed first;
+# idproc + negproc fixed in the same sweep. A static check is enough —
+# the harness convergence tests catch any bootstrap-timing regression.
+# ---------------------------------------------------------------------------
+
+def test_drain_loop_pacing_not_reverted():
+    import inspect
+    import re
+    from autonomous_trust.core.identity.idprocess import IdentityProcess
+    from autonomous_trust.core.negotiation.negprocess import NegotiationProcess
+    from autonomous_trust.core.reputation.repprocess import ReputationProcess
+    # Strip comment lines so the historical mention in module-level
+    # block comments doesn't trip this static check.
+    code_only = lambda src: '\n'.join(
+        ln for ln in src.splitlines()
+        if not re.match(r'\s*#', ln))
+    for cls in (IdentityProcess, NegotiationProcess, ReputationProcess):
+        src = code_only(inspect.getsource(cls.process))
+        assert 'self.sleep_until(self.cadence)' not in src, (
+            f'{cls.__name__}.process re-introduced cadence-throttle '
+            f'self.sleep_until(self.cadence) — see '
+            f'project_proc_loop_throttle.md')
+        assert 'DRAIN_BUDGET' in src, (
+            f'{cls.__name__}.process should drain with DRAIN_BUDGET '
+            f'(see repprocess.py for the canonical shape)')
+
+
+def test_netproc_inbound_deques_are_drained_per_iter():
+    """The three netproc inbound deques (peer_messages, group_messages,
+    unknown_messages) used to be popleft'd once per iter — capping
+    inbound throughput at ~6 msgs/s on a busy peer. The fix is a
+    per-channel INBOUND_BUDGET drain loop. Pin the source shape so a
+    revert that brings back the single popleft pattern fails here."""
+    import inspect
+    import re
+    from autonomous_trust.core.network.netprocess import NetworkProcess
+    code_only = '\n'.join(
+        ln for ln in inspect.getsource(NetworkProcess.process).splitlines()
+        if not re.match(r'\s*#', ln))
+    assert 'INBOUND_BUDGET' in code_only, (
+        'NetworkProcess.process should drain inbound deques with an '
+        'INBOUND_BUDGET — see project_proc_loop_throttle.md')
+    # All three deque names must appear inside while-drain blocks; the
+    # while...popleft pattern is the load-bearing change. Counting
+    # `while` occurrences is a proxy for "per-channel drain loop".
+    while_count = len(re.findall(r'^\s*while\s', code_only, re.M))
+    assert while_count >= 4, (
+        f'NetworkProcess.process should have at least 4 while-loops '
+        f'(outer keep_running + 3 inbound drains), found {while_count}')
+
+
 def test_process_rebinds_receiver_socket_timeouts():
     from autonomous_trust.core.network.netprocess import NetworkProcess
 

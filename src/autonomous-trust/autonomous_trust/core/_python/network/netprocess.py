@@ -571,9 +571,24 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                           type(message))
                         self.logger.debug('Ignored message: %s' % str(message))
 
+                # Drain inbound deques. Each receiver thread can only
+                # push ~1 msg/0.1s per channel (recv-socket timeout),
+                # but during welcome bursts all three channels run hot
+                # and the old 1-popleft-per-iter pattern left messages
+                # in the deque for whole iters. Per-channel budget caps
+                # any single channel at INBOUND_BUDGET pops per iter so
+                # one noisy channel can't starve the others.
+                INBOUND_BUDGET = 32
+                total_inbound = 0
+
                 # async recv point-to-point messages
-                try:
-                    raw_msg, from_addr = self.peer_messages.popleft()
+                drained_ptp = 0
+                while drained_ptp < INBOUND_BUDGET:
+                    try:
+                        raw_msg, from_addr = self.peer_messages.popleft()
+                    except IndexError:
+                        break
+                    drained_ptp += 1
                     peers = self.configs[CfgIds.peers]
                     from_whom = peers.find_by_address(from_addr)
                     if from_whom is not None:
@@ -598,49 +613,59 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             _probes.counter('net.ptp', 'unknown_sender', 'deferred_encrypted')
                             self.logger.debug('Out-of-order message from %s detected, retry later' % from_addr)
                             self.encrypted_messages.append((raw_msg, from_addr))
-                except IndexError:
-                    pass
+                total_inbound += drained_ptp
 
                 # async recv group messages
-                try:
-                    if self.group is not None:  # otherwise, skip for now
+                drained_grp = 0
+                while drained_grp < INBOUND_BUDGET:
+                    if self.group is None:
+                        break  # otherwise, skip for now
+                    try:
                         raw_msg, from_addr = self.group_messages.popleft()
-                        if from_addr in self.group.addresses:
-                            from_whom = self.peers.find_by_address(from_addr)
-                            try:
-                                decrypt_msg = self.group.decrypt(raw_msg, self.group)
-                                if from_whom is not None:
-                                    self._msg_to_queue(decrypt_msg, from_whom, queues, 'group')
-                                else:
-                                    _probes.counter('net.group', 'drop', 'sender_not_in_peers')
-                                    self.logger.warning(
-                                        'Recvd transmission from %s - not in peers. Ignoring.' % from_addr)
-                                    self.logger.debug('Ignored payload: %d bytes from %s' % (len(raw_msg), from_addr))
-                            except nacl.exceptions.CryptoError as e:
-                                _probes.counter('net.group', 'drop', 'crypto_error')
-                                name = from_addr
-                                if from_whom is not None:
-                                    name = '%s (%s)' % (from_whom.nickname, name)
-                                count = self._crypto_error_counts.get(name, 0) + 1
-                                self._crypto_error_counts[name] = count
-                                if count == 1 or count % 10 == 0:
-                                    self.logger.error('CryptoError decrypting message from %s (count: %d)' % (name, count))
-                        else:
-                            _probes.counter('net.group', 'drop', 'sender_not_in_group')
-                            self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
-                            self.logger.debug('Ignored payload: %d bytes from %s' % (len(raw_msg), from_addr))
-                            # TODO: Query other group members for the unknown sender's
-                            # identity — they may have admitted this peer while we were
-                            # partitioned. Requires a group-level identity gossip protocol.
-                except IndexError:
-                    pass
+                    except IndexError:
+                        break
+                    drained_grp += 1
+                    if from_addr in self.group.addresses:
+                        from_whom = self.peers.find_by_address(from_addr)
+                        try:
+                            decrypt_msg = self.group.decrypt(raw_msg, self.group)
+                            if from_whom is not None:
+                                self._msg_to_queue(decrypt_msg, from_whom, queues, 'group')
+                            else:
+                                _probes.counter('net.group', 'drop', 'sender_not_in_peers')
+                                self.logger.warning(
+                                    'Recvd transmission from %s - not in peers. Ignoring.' % from_addr)
+                                self.logger.debug('Ignored payload: %d bytes from %s' % (len(raw_msg), from_addr))
+                        except nacl.exceptions.CryptoError as e:
+                            _probes.counter('net.group', 'drop', 'crypto_error')
+                            name = from_addr
+                            if from_whom is not None:
+                                name = '%s (%s)' % (from_whom.nickname, name)
+                            count = self._crypto_error_counts.get(name, 0) + 1
+                            self._crypto_error_counts[name] = count
+                            if count == 1 or count % 10 == 0:
+                                self.logger.error('CryptoError decrypting message from %s (count: %d)' % (name, count))
+                    else:
+                        _probes.counter('net.group', 'drop', 'sender_not_in_group')
+                        self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
+                        self.logger.debug('Ignored payload: %d bytes from %s' % (len(raw_msg), from_addr))
+                        # TODO: Query other group members for the unknown sender's
+                        # identity — they may have admitted this peer while we were
+                        # partitioned. Requires a group-level identity gossip protocol.
+                total_inbound += drained_grp
 
                 # async recv stranger messages (separate channel)
-                try:
-                    raw_msg, from_addr = self.unknown_messages.popleft()
+                drained_unk = 0
+                while drained_unk < INBOUND_BUDGET:
+                    try:
+                        raw_msg, from_addr = self.unknown_messages.popleft()
+                    except IndexError:
+                        break
+                    drained_unk += 1
                     self._msg_to_queue(raw_msg, from_addr, queues, 'multicast', validate=False)
-                except IndexError:
-                    pass
+                total_inbound += drained_unk
+
+                _probes.counter('proc.network', 'iter_drained', str(total_inbound))
             except Exception as err:
                 self.logger.error(err)
                 self.logger.error(traceback.format_exc())
