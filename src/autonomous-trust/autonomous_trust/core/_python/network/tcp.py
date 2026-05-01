@@ -22,6 +22,14 @@ from .udp import UDPNetworkProcess
 from .. import _probes
 
 
+class PeerDisconnect(TransmissionError):
+    """Peer closed the TCP connection cleanly before sending any bytes
+    of the length prefix. A normal protocol event (e.g. during onboarding
+    when peers cycle accept/connect), surfaced as a distinct exception
+    type so the listener can log it at debug rather than error."""
+    pass
+
+
 class TCPNetworkProcess(UDPNetworkProcess):
     """
     Implementation of NetworkProcess that uses TCP for point-to-point, and UDP for one-to-many
@@ -123,7 +131,17 @@ class TCPNetworkProcess(UDPNetworkProcess):
         while len(size_data) < 4:
             chunk = sock.recv(4 - len(size_data))
             if chunk == b'':
-                raise TransmissionError("Socket connection broken reading length prefix")
+                # A clean close before any bytes is a normal protocol
+                # event during onboarding (peers reset connections as
+                # they cycle accept/connect). A close *after* partial
+                # length-prefix bytes indicates a broken peer. The
+                # listener side classifies the two differently so
+                # routine resets don't surface as ERROR-level noise.
+                if len(size_data) == 0:
+                    raise PeerDisconnect("Peer closed before length prefix")
+                raise TransmissionError(
+                    "Socket connection broken reading length prefix "
+                    "(got %d/4 bytes)" % len(size_data))
             size_data += chunk
         msg_len = struct.unpack('!I', size_data)[0]
         max_msg_size = 64 * 1024 * 1024  # 64 MB
