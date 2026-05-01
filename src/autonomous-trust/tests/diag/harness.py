@@ -342,6 +342,29 @@ class MultiPeerHarness:
                 total += int(item.get('count') or 0)
         return total
 
+    def drain_bursts(self, layer: str, min_drained: int = 2) -> int:
+        """Sum, across all peers, the number of `iter_drained` counter
+        snapshots whose reason (the drain count, stringified) was at
+        least `min_drained`. Used to assert the drain-loop pattern is
+        actually doing real burst draining, not 1-msg-per-iter pacing.
+        Returns total burst count across all snapshots."""
+        total = 0
+        for ev in self.read_probes():
+            if ev.get('layer') != 'counters' or ev.get('event') != 'snapshot':
+                continue
+            for item in ev.get('items', []):
+                if item.get('layer') != layer:
+                    continue
+                if item.get('event') != 'iter_drained':
+                    continue
+                try:
+                    drained = int(item.get('reason') or 0)
+                except (TypeError, ValueError):
+                    continue
+                if drained >= min_drained:
+                    total += int(item.get('count') or 0)
+        return total
+
     def assert_no_unhandled_cascade(self, max_count: int = 5) -> None:
         """An 'unhandled' counter fires when a process gets a message
         type its registered handlers don't claim. A handful per run is
