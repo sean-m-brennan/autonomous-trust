@@ -775,6 +775,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if not self.choosing:
             # initial run, may be called again
             threading.Thread(target=self.choose_group, args=(queues,), daemon=True).start()
+        # Drain budget per iter — same shape as repprocess.py /
+        # negprocess.py. The 0.5 s cadence-pacing sleep used to cap
+        # each subsystem at ~2 msgs/s; welcoming-committee + confirm
+        # broadcast volume during convergence routinely exceeds that,
+        # leaving messages in the deferred backlog for whole rounds.
+        # vote_response and the deferred `self.messages` drain run
+        # once per iter — both are non-blocking and don't need the
+        # outer cadence to pace them.
+        DRAIN_BUDGET = 64
         while self.keep_running(signal):
             try:
                 if self.phase != phase:
@@ -787,13 +796,23 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     message = self.messages.pop(0)
                     if not self.protocol.run_message_handlers(queues, message):
                         untouched.append(message)
-                try:
-                    message = queues[self.name].get(block=True, timeout=self.q_cadence)
+
+                drained = 0
+                first = True
+                while drained < DRAIN_BUDGET:
+                    try:
+                        if first:
+                            message = queues[self.name].get(
+                                block=True, timeout=self.q_cadence)
+                            first = False
+                        else:
+                            message = queues[self.name].get_nowait()
+                    except Empty:
+                        break
+                    drained += 1
                     if message and not self.protocol.run_message_handlers(queues, message):
                         untouched.append(message)
-                except Empty:
-                    pass
+                _probes.counter('proc.identity', 'iter_drained', str(drained))
                 self.messages += untouched
-                self.sleep_until(self.cadence)
             except Exception as err:
                 self.report_exception(err, 'process')

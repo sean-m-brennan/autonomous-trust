@@ -292,13 +292,29 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         return False
 
     def process(self, queues, signal):
+        # Drain budget per iter — same shape as repprocess.py. The
+        # periodic local-jobs / status-pending sweeps below run after
+        # the drain, so they fire roughly every q_cadence-ish (when
+        # the queue is idle) or as fast as the drain budget allows
+        # (when there's a backlog). The old sleep_until(self.cadence)
+        # capped throughput at ~2 msgs/s; pacing now comes from the
+        # blocking get's q_cadence timeout when there's no work.
+        DRAIN_BUDGET = 64
         while self.keep_running(signal):
             try:
-                try:
-                    message = queues[self.name].get(block=True, timeout=self.q_cadence)
-                except Empty:
-                    message = None
-                if message:
+                drained = 0
+                first = True
+                while drained < DRAIN_BUDGET:
+                    try:
+                        if first:
+                            message = queues[self.name].get(
+                                block=True, timeout=self.q_cadence)
+                            first = False
+                        else:
+                            message = queues[self.name].get_nowait()
+                    except Empty:
+                        break
+                    drained += 1
                     if not self.protocol.run_message_handlers(queues, message):
                         if not self.forward_status(queues, message):
                             if not self.forward_result(queues, message):
@@ -313,6 +329,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                                     else:
                                         _probes.counter('proc.negotiation', 'unhandled', 'type:' + message.__class__.__name__)
                                         self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                _probes.counter('proc.negotiation', 'iter_drained', str(drained))
 
                 for job in self._get_jobs():  # local jobs
                     try:
@@ -336,8 +353,6 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                             self.status_pending.append(task)
                     except Full:
                         self.logger.error('process: Network queue full')
-
-                self.sleep_until(self.cadence)
             except Exception as err:
                 self.logger.error(err)
                 self.logger.error(traceback.format_exc())
