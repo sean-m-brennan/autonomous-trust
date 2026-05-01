@@ -51,8 +51,11 @@ def _parse_args(argv):
     p.add_argument("--playback", metavar="FILE", default=None,
                    help="Replay a recorded scenario event log JSON file. "
                         "Implies --demo-civilian and skips the AT runtime.")
-    p.add_argument("--namespace", default=None,
-                   help="(reserved) Kubernetes namespace of peer deployment.")
+    p.add_argument("--namespace", default=os.environ.get("AT_K8S_NAMESPACE"),
+                   help="Kubernetes namespace the peers run in. Defaults to "
+                        "$AT_K8S_NAMESPACE if set (k8s downward-API can "
+                        "populate it). Exported back to env so the bridge "
+                        "subprocess and any downstream consumer can read it.")
     return p.parse_args(argv)
 
 
@@ -122,6 +125,13 @@ def _await_peers():
 if __name__ == '__main__':
     args = _parse_args(sys.argv[1:])
     log_level = _LOG_LEVEL_BY_NAME[args.log_level]
+
+    # Republish namespace into env so the bridge subprocess (and any
+    # downstream code that needs it for service-name resolution / log
+    # context) inherits the same value the operator passed on the CLI.
+    if args.namespace:
+        os.environ["AT_K8S_NAMESPACE"] = args.namespace
+        print(f'Inspector: k8s namespace = {args.namespace}', flush=True)
 
     civilian = args.demo_civilian or args.playback is not None
     port = args.port if args.port is not None else (8050 if civilian else 8000)
