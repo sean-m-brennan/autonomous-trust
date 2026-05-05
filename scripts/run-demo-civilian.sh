@@ -60,9 +60,18 @@ INSPECTOR_PORT="${INSPECTOR_PORT:-8050}"
 REGISTRY="${REGISTRY:-}"
 IMAGE_TAG="${IMAGE_TAG:-:dev}"
 IMAGE_NAME="${IMAGE_NAME:-autonomous-trust}"
+# Peer image (disaster overlay = base + evaluation + services packages).
+# The compose generator references this name for every peer service.
+PEER_IMAGE_NAME="${PEER_IMAGE_NAME:-autonomous-trust-disaster}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 BACKEND_MODE="compose"
 PLAYBACK_FILE=""
+
+# Default probes to ON for the demo so every peer + the inspector emits
+# JSONL counters into deploy/civilian/at-probes. Export so the compose
+# generator (which reads os.environ['AT_PROBES']) bakes the env vars +
+# volume mount into every service. Override with AT_PROBES= to disable.
+export AT_PROBES="${AT_PROBES:-1}"
 
 # --- Argument parsing ----------------------------------------------------
 
@@ -140,6 +149,7 @@ python3 -m autonomous_trust.evaluation.scenarios.disaster_response_compose \
     --out "$DEPLOY_DIR" \
     --namespace "$NAMESPACE" \
     --registry "$REGISTRY" \
+    --image "$PEER_IMAGE_NAME" \
     --image-tag "$IMAGE_TAG" \
     --log-level "$LOG_LEVEL"
 
@@ -158,6 +168,53 @@ open_browser() {
     else
         echo "Dashboard available at: $url"
     fi
+}
+
+# Block until the inspector is actually serving HTTP, not just until the
+# port is bound. The compose port-publish proxy and the k8s service IP
+# come up immediately, so a TCP-only probe fires before Dash is ready
+# inside the container — the browser then opens to a "connection reset".
+# Inspector's container also sleeps STARTUP_DELAY=45s before launching
+# python, so this needs a generous timeout.
+#
+# Usage: wait_for_inspector_http <url> [timeout_sec]
+wait_for_inspector_http() {
+    local url="$1"
+    local timeout="${2:-180}"
+    local start now elapsed code last_progress=0
+    start=$(date +%s)
+    if ! command -v curl &>/dev/null; then
+        # Fall back to TCP probe if curl is missing; less precise but
+        # better than nothing.
+        for _ in $(seq 1 $((timeout * 2))); do
+            (echo >/dev/tcp/127.0.0.1/$INSPECTOR_PORT) &>/dev/null && return 0
+            sleep 0.5
+        done
+        return 1
+    fi
+    while :; do
+        # `--max-time 2` keeps each probe short so we can iterate; we
+        # want the response code, not the body. 200/302 means Dash is
+        # up; anything else (000 connection refused, 502 from a docker
+        # proxy with no backend, 503 from Quart still booting) means
+        # keep waiting.
+        code=$(curl --silent --output /dev/null --max-time 2 \
+                    --write-out '%{http_code}' "$url" || echo "000")
+        if [[ "$code" == "200" || "$code" == "302" ]]; then
+            return 0
+        fi
+        now=$(date +%s)
+        elapsed=$(( now - start ))
+        if (( elapsed >= timeout )); then
+            return 1
+        fi
+        # Progress line every 10s so the user knows we're alive.
+        if (( elapsed - last_progress >= 10 )); then
+            echo "  ... waiting for inspector (${elapsed}s, http=$code)"
+            last_progress=$elapsed
+        fi
+        sleep 1
+    done
 }
 
 # Kill any stale inspector processes or port-holders left over from a
@@ -181,12 +238,19 @@ cleanup_inspector_procs() {
     pkill -f "autonomous_trust\\.inspector" 2>/dev/null || true
 }
 
+# Safety net: ensure leftover inspector / AT-worker processes are reaped
+# even if the python-side atexit handler can't run (SIGKILL, segfault,
+# or the user killing this script before the launched process exits).
+# The python-side cleanup in inspector.__main__ is the primary mechanism;
+# this trap catches the residual.
+trap 'cleanup_inspector_procs' EXIT
+
 case "$BACKEND_MODE" in
     compose)
         command -v docker &>/dev/null \
             || { echo "docker not found"; exit 1; }
 
-        # Ensure the peer image exists; build with Dockerfile-native
+        # Ensure the base peer image exists; build with Dockerfile-native
         # (matches AUTONOMOUS_TRUST_BACKEND=native in the generated
         # compose env and tilt/python.tiltfile's native path).
         full_ref="${REGISTRY}${IMAGE_NAME}${IMAGE_TAG}"
@@ -198,8 +262,24 @@ case "$BACKEND_MODE" in
                 "$here"
         fi
 
-        # Ensure the civilian-inspector image exists. Extends the peer
-        # image with Dash deps + sibling AT subpackages.
+        # Ensure the disaster peer image exists. Extends the base with
+        # the evaluation + services packages so peer containers can
+        # launch via `-m autonomous_trust.evaluation.scenarios.
+        # disaster_response_demo`. The base image only ships
+        # autonomous_trust.core, so without this overlay every peer
+        # ModuleNotFoundError's at startup.
+        peer_ref="${REGISTRY}${PEER_IMAGE_NAME}${IMAGE_TAG}"
+        if ! docker image inspect "$peer_ref" &>/dev/null; then
+            echo "=== Image $peer_ref not found locally — building ==="
+            docker build \
+                --build-arg "BASE_IMAGE=$full_ref" \
+                -t "$peer_ref" \
+                -f "$here/src/autonomous-trust-evaluation/Dockerfile-disaster" \
+                "$here"
+        fi
+
+        # Ensure the civilian-inspector image exists. Extends the base
+        # with Dash deps + sibling AT subpackages.
         inspector_ref="${REGISTRY}autonomous-trust-inspector${IMAGE_TAG}"
         if ! docker image inspect "$inspector_ref" &>/dev/null; then
             echo "=== Image $inspector_ref not found locally — building ==="
@@ -233,14 +313,14 @@ case "$BACKEND_MODE" in
         docker compose up -d
         popd >/dev/null
 
-        # Wait until the inspector container publishes its port.
-        for _ in $(seq 1 60); do
-            if (echo >/dev/tcp/127.0.0.1/$INSPECTOR_PORT) &>/dev/null; then
-                break
-            fi
-            sleep 0.5
-        done
-        open_browser "http://localhost:$INSPECTOR_PORT/"
+        echo "=== Waiting for inspector HTTP to come up ==="
+        if wait_for_inspector_http "http://localhost:$INSPECTOR_PORT/" 180; then
+            open_browser "http://localhost:$INSPECTOR_PORT/"
+        else
+            echo "Inspector did not respond within 180s; opening anyway."
+            echo "Check 'docker logs civilian-inspector' for startup errors."
+            open_browser "http://localhost:$INSPECTOR_PORT/"
+        fi
 
         echo ""
         echo "--- Running. Ctrl-C to stop ---"
@@ -287,13 +367,14 @@ case "$BACKEND_MODE" in
             --namespace "$NAMESPACE" \
             &>/tmp/demo-inspector.log &
         INSPECTOR_PID=$!
-        for _ in $(seq 1 30); do
-            if (echo >/dev/tcp/127.0.0.1/$INSPECTOR_PORT) &>/dev/null; then
-                break
-            fi
-            sleep 0.5
-        done
-        open_browser "http://localhost:$INSPECTOR_PORT/"
+        echo "=== Waiting for inspector HTTP to come up ==="
+        if wait_for_inspector_http "http://localhost:$INSPECTOR_PORT/" 180; then
+            open_browser "http://localhost:$INSPECTOR_PORT/"
+        else
+            echo "Inspector did not respond within 180s; opening anyway."
+            echo "Check /tmp/demo-inspector.log for startup errors."
+            open_browser "http://localhost:$INSPECTOR_PORT/"
+        fi
 
         echo ""
         echo "--- Running. Ctrl-C to tear down ---"
