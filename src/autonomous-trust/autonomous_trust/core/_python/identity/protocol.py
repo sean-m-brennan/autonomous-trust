@@ -63,6 +63,13 @@ class IdentityProtocol(Protocol):
     vote = 'vote_on_peer'  # msg.obj <- (identityobj, proof, signature)
     confirm = 'peer_accepted'  # msg.obj <- identityobj
     update = 'group_key_update'  # msg.obj <- group
+    # Recovery path for the announce-broadcast loss case: when a peer
+    # admits another via confirm but never received its announce
+    # (no_prior_potential), it sends caps_query directly. The target
+    # responds with caps_response carrying its capability list. Both
+    # messages flow via reliable group/TCP, not UDP broadcast.
+    caps_query = 'peer_caps_query'  # msg.obj <- '' (sender just asks)
+    caps_response = 'peer_caps_response'  # msg.obj <- caps list (json)
 
 
 if __name__ == '__main__':

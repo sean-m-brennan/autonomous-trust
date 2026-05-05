@@ -33,6 +33,7 @@ from __future__ import annotations
 import statistics
 from collections import defaultdict, deque
 from datetime import timedelta
+from functools import partial
 from typing import Callable, Optional
 
 from autonomous_trust.core import ProcMeta
@@ -58,8 +59,13 @@ class DataFusionProcess(EnvDataProcess, metaclass=ProcMeta,
     def __init__(self, configurations, subsystems, log_queue, dependencies):
         super().__init__(configurations, subsystems, log_queue,
                          dependencies=dependencies)
+        # partial(...) instead of `lambda: deque(maxlen=_FUSION_WINDOW)`
+        # because the AT framework pickles the Process instance across
+        # the multiprocessing.pool fork boundary, and a lambda factory
+        # crashes every fema-fusion worker with `Can't get local object`
+        # at startup. partial is picklable; lambdas in __init__ are not.
         self._inbound: dict[tuple[str, str], deque] = defaultdict(
-            lambda: deque(maxlen=_FUSION_WINDOW))
+            partial(deque, maxlen=_FUSION_WINDOW))
         self._reputation: Optional[ReputationLookup] = None
         self._last_emit: float = -_FUSION_EMIT_CADENCE
 
