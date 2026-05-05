@@ -135,6 +135,10 @@ class CivilianDemo:
         # panel so we only mark once (mark_inactive is idempotent, but
         # avoiding the scan each tick is cheap).
         self._streams_inactive: set[str] = set()
+        # Stage 3b.4: peers whose readings have arrived from real
+        # EnvData* services via the bridge. _update_streams falls back
+        # to synthesis only for peers we haven't yet observed.
+        self._live_stream_peers: set[str] = set()
 
         self._dash = DashControl(
             name="autonomous_trust.inspector.civilian",
@@ -596,7 +600,20 @@ class CivilianDemo:
                 name = str(ev[1])
                 rtt = float(ev[2])
                 desc = f"[live] {name} rtt = {rtt:.0f}ms"
-            else:
+            elif tag == "reading" and len(ev) >= 3:
+                # Stage 3b.4: forward an envdata reading into the streams
+                # panel and mark the peer as live so _update_streams
+                # stops synthesizing for it.
+                name = str(ev[1])
+                rd = ev[2] if isinstance(ev[2], dict) else {}
+                reading = _reading_from_dict(name, rd)
+                if reading is None:
+                    continue
+                self._streams_panel.update(reading)
+                self._live_stream_peers.add(name)
+                # Skip event-log emission for streams (they fire ~1 Hz
+                # per peer per data type — would drown the log). Other
+                # tags are far less frequent.
                 continue
             self._scenario._event_log.append({     # noqa: SLF001
                 "t": scenario_time,
@@ -626,6 +643,11 @@ class CivilianDemo:
         for name, role in self._scenario.peers.items():
             state = peer_states.get(name, PeerState.PENDING)
             if state in (PeerState.PENDING, PeerState.EXCLUDED):
+                continue
+            # Stage 3b.4: when the bridge has delivered any real reading
+            # from this peer, stop overlaying synthesized data on top of
+            # it. This mirrors how _live_rep_peers gates _sample_reputation.
+            if name in self._live_stream_peers:
                 continue
             quality = _peer_state_to_quality(state)
             for reading in _readings_for_role(name, role, ts, quality,
@@ -839,6 +861,37 @@ _STREAM_SPECS: dict[str, tuple[str, str, float, float]] = {
     "situation_report":   ("incidents",   "count",     4.0, 2.0),
     "data_fusion":        ("fused_conf",  "score",     0.85, 0.05),
 }
+
+
+def _reading_from_dict(peer_name: str, d: dict) -> Optional[Reading]:
+    """Inverse of Reading.to_dict() — used by the Stage 3b.4 bridge path
+    to rehydrate envdata readings serialized over the wire.
+
+    Returns None when required fields are missing; callers drop the
+    event silently in that case (the streams panel is best-effort).
+    """
+    try:
+        t = float(d.get("t", 0.0))
+        dtype = str(d.get("type", ""))
+        value = float(d.get("value", 0.0))
+        unit = str(d.get("unit", ""))
+        quality = float(d.get("quality", 1.0))
+        # to_dict omits peer when peer_name is empty in some paths;
+        # prefer the bridge's tagged name (carries the scenario nickname).
+        peer = peer_name or str(d.get("peer", "?"))
+    except (TypeError, ValueError):
+        return None
+    if not dtype:
+        return None
+    return Reading(
+        timestamp=timedelta(seconds=t),
+        peer_name=peer,
+        data_type=dtype,
+        value=value,
+        unit=unit,
+        quality=quality,
+        metadata=dict(d.get("metadata") or {}),
+    )
 
 
 def _readings_for_role(name: str, role, ts: timedelta,

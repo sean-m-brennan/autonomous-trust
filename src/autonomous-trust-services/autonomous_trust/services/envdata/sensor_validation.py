@@ -31,6 +31,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict, deque
 from datetime import timedelta
+from functools import partial
 from typing import Optional
 
 from autonomous_trust.core import ProcMeta
@@ -54,8 +55,11 @@ class SensorValidationProcess(EnvDataProcess, metaclass=ProcMeta,
         super().__init__(configurations, subsystems, log_queue,
                          dependencies=dependencies)
         # Per-peer, per-type running windows. `deque` with maxlen trims old.
+        # Uses functools.partial (not a lambda) so the defaultdict pickles
+        # cleanly when the AT pool ships this Process instance to a
+        # forkserver worker.
         self._windows: dict[tuple[str, str], deque] = defaultdict(
-            lambda: deque(maxlen=_DEFAULT_WINDOW))
+            partial(deque, maxlen=_DEFAULT_WINDOW))
 
     # --- Statistical helpers ---
 
