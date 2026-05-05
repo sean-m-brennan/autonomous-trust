@@ -112,6 +112,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.vote, self.count_vote)
         self.protocol.register_handler(IdentityProtocol.confirm, self.handle_confirm_peer)
         self.protocol.register_handler(IdentityProtocol.update, self.handle_group_update)
+        self.protocol.register_handler(IdentityProtocol.caps_query, self.handle_caps_query)
+        self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
         self.lock = None
 
     @property
@@ -125,8 +127,19 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 if isinstance(obj, Peers) or isinstance(obj, PeerCapabilities):
                     self.configs[name] = obj
                     obj.to_file(filename)
-                    if isinstance(obj, Peers):
-                        self.update(obj, queues)
+                    # Fan-put BOTH Peers and PeerCapabilities. Previously
+                    # only Peers was broadcast here; PeerCapabilities was
+                    # saved to file but never propagated, so any cap
+                    # registered outside the _add_peer-with-explicit-put
+                    # path (e.g. recovery via handle_caps_response or
+                    # welcoming_committee amnesia branch) would land in
+                    # idprocess's view but never reach the main proc /
+                    # bridge.rcvr — manifesting as the EPA airquality_stream
+                    # gap in the civilian demo (idproc had 9 keys, main
+                    # proc stayed at 8). The _add_peer path's explicit
+                    # put to main+negotiation queues becomes redundant
+                    # but harmless after this change.
+                    self.update(obj, queues)
                 else:
                     self.configs[name] = obj[0]
                     with open(filename, 'w') as cfg:
@@ -425,6 +438,32 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 existing = self.peers.find_by_uuid(new_id.uuid)
                 if new_id == existing:  # don't care if it's a different address
                     self.logger.debug('Amnesiac peer: %s' % new_id.nickname)
+                    # Late-arrival cap recovery: if this peer was added
+                    # to self.peers via a confirm broadcast that arrived
+                    # before its announce (no_prior_potential path), its
+                    # capabilities never registered — _add_peer needs the
+                    # announce-time peer_potentials cache. The announce
+                    # we just got carries those caps; register them now
+                    # if they aren't already in peer_capabilities.
+                    # Without this, late-joiner peers (e.g. EPA in the
+                    # disaster demo) end up in peers but invisible to
+                    # any cap-driven discovery (DataRcvr subscribes,
+                    # task negotiation participant lookup, etc.).
+                    with self.lock:
+                        # Per-cap dedup: register only the caps for
+                        # which this peer's uuid isn't already recorded.
+                        # A coarse "uuid anywhere?" check would skip
+                        # missing caps when the peer is already in the
+                        # mapping under any other cap.
+                        missing = [
+                            c for c in (caps or [])
+                            if new_id.uuid not in self.peer_capabilities.get(c, [])
+                        ]
+                    if missing:
+                        self.peer_capabilities.register(new_id.uuid, missing)
+                        self._record_peers(queues)
+                        _probes.counter('peer.set', 'amnesia_caps_registered',
+                                        str(len(missing)))
                     if self.border_guard_mode:
                         self._peer_accepted(queues, id_obj, amnesia=True)
                     return True
@@ -706,6 +745,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 _probes.emit('peer.set', 'no_prior_potential',
                              peer_uuid=str(peer.uuid),
                              peer_addr=getattr(peer, 'address', None))
+                # Recovery for UDP-loss of the new peer's announce. The
+                # confirm broadcast (group/TCP) is reliable; the
+                # announce (broadcast/UDP) isn't. Send a directed
+                # caps_query — peer responds via group/TCP with its
+                # capability list, which we register on receipt. Without
+                # this, late joiners (e.g. EPA in the disaster demo)
+                # stay invisible to cap-driven discovery: in self.peers
+                # but missing from peer_capabilities, so DataRcvr never
+                # subscribes to their streams.
+                self._send_caps_query(queues, peer)
             _probes.emit('peer.set', 'add_request',
                          peer_uuid=str(peer.uuid),
                          peer_addr=getattr(peer, 'address', None),
@@ -713,6 +762,125 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self._add_peer(queues, peer)
             return True
         return False
+
+    def _send_caps_query(self, queues, peer):
+        """Ask `peer` directly for its capability list.
+
+        Used as the recovery path when this node's `peer_potentials`
+        cache is empty for a peer that's being admitted via confirm
+        broadcast — i.e. the peer's UDP announce was lost. Unlike the
+        announce path, this query goes to `peer` (group/TCP), so it's
+        reliable.
+        """
+        try:
+            message = Message(self.name, IdentityProtocol.caps_query,
+                              '', to_whom=peer)
+            queues[CfgIds.network].put(message, block=True,
+                                       timeout=self.q_cadence)
+            _probes.counter('peer.set', 'caps_query_sent')
+        except Full:
+            _probes.counter('peer.set', 'caps_query_q_full')
+            self.logger.error('_send_caps_query: Network queue full')
+
+    def handle_caps_query(self, queues, message):
+        """Respond to a peer's caps_query with our own capability list."""
+        if message.function != IdentityProtocol.caps_query:
+            return False
+        try:
+            caps_list = self.capabilities.to_list() \
+                if self.capabilities is not None else []
+            # Diagnostic: emit the actual caps we're about to send so we
+            # can verify that the responder's idprocess capabilities have
+            # been populated by the autonomous_ability fan-put. If
+            # caps_list is missing the role-specific cap (e.g. EPA's
+            # airquality_stream), the fan-put hasn't propagated to
+            # idprocess in time.
+            _probes.emit('peer.set', 'caps_query_responding',
+                         caps_count=len(caps_list),
+                         caps=','.join(sorted(caps_list)) if caps_list else '')
+            payload = to_json_string(caps_list)
+            sender = getattr(message, 'from_whom', None)
+            if sender is None:
+                _probes.counter('peer.set', 'caps_query_no_sender')
+                return True
+            reply = Message(self.name, IdentityProtocol.caps_response,
+                            payload, to_whom=sender)
+            queues[CfgIds.network].put(reply, block=True,
+                                       timeout=self.q_cadence)
+            _probes.counter('peer.set', 'caps_response_sent')
+        except Full:
+            _probes.counter('peer.set', 'caps_response_q_full')
+            self.logger.error('handle_caps_query: Network queue full')
+        except Exception as err:
+            _probes.counter('peer.set', 'caps_query_exc')
+            self.report_exception(err, 'handle_caps_query')
+        return True
+
+    def handle_caps_response(self, queues, message):
+        """Receive caps from a peer we previously queried; register any
+        caps that aren't already recorded for this peer.
+
+        Per-cap dedup is important: a peer may already be registered
+        under SOME of its caps (e.g. `sensor_validation`) but missing
+        from OTHERS (e.g. `airquality_stream`). A coarse "is the uuid
+        anywhere?" check would silently skip registering the missing
+        ones — exactly the EPA late-joiner bug we're recovering from."""
+        if message.function != IdentityProtocol.caps_response:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            _probes.counter('peer.set', 'caps_response_no_sender')
+            return True
+        try:
+            caps_list = from_json_string(message.obj)
+            if not isinstance(caps_list, list) or not caps_list:
+                _probes.counter('peer.set', 'caps_response_bad_shape')
+                return True
+            # Compute the set of caps this peer is missing from.
+            # Snapshot under lock; emit diagnostics OUTSIDE the lock to
+            # avoid contention with the identity proc's fan-put path.
+            with self.lock:
+                missing = [
+                    c for c in caps_list
+                    if sender.uuid not in self.peer_capabilities.get(c, [])
+                ]
+                pc_size_idproc = len(self.peer_capabilities)
+                # Has airquality_stream as a key in idprocess's view?
+                ids_has_aqs = 'airquality_stream' in self.peer_capabilities
+            _probes.counter('peer.set', 'caps_response_idproc_pc_size',
+                            str(pc_size_idproc))
+            _probes.counter('peer.set', 'caps_response_aqs_in_idproc',
+                            str(int(ids_has_aqs)))
+            if missing:
+                self.peer_capabilities.register(sender.uuid, missing)
+                self._record_peers(queues)
+                _probes.counter('peer.set', 'caps_response_registered',
+                                str(len(missing)))
+            else:
+                _probes.counter('peer.set', 'caps_response_redundant')
+            # Always re-broadcast peer_capabilities to main + negotiation,
+            # mirroring _add_peer's explicit puts. _record_peers's
+            # update() fan-put has been observed to silently drop under
+            # main proc queue contention — q_cadence=10ms is too short
+            # when main proc is processing thousands of rep_resp msgs.
+            # Use a 1s timeout here so the put rides through bursty
+            # contention; it's still bounded, so it won't deadlock.
+            try:
+                queues[CfgIds.main].put(
+                    self.peer_capabilities, block=True, timeout=1.0)
+                _probes.counter('peer.set', 'caps_explicit_main_put')
+            except Full:
+                _probes.counter('peer.set', 'caps_explicit_main_full')
+            try:
+                queues[CfgIds.negotiation].put(
+                    self.peer_capabilities, block=True, timeout=1.0)
+                _probes.counter('peer.set', 'caps_explicit_neg_put')
+            except Full:
+                _probes.counter('peer.set', 'caps_explicit_neg_full')
+        except Exception as err:
+            _probes.counter('peer.set', 'caps_response_exc')
+            self.report_exception(err, 'handle_caps_response')
+        return True
 
     def handle_history_diff(self, queues, message):
         """
@@ -750,13 +918,34 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if message.function == IdentityProtocol.update:
             self.logger.debug('Received group update')
             group = message.obj  # from self._update_group()
-            if (self.group.uuid != group.uuid and len(group.addresses) >= len(self.group.addresses)) or \
-                    (self.group.uuid == group.uuid and len(group.addresses) > len(self.group.addresses)):
-                self.logger.debug('Replace %s group with %s group' % (self.group.nickname, group.nickname))
-                self.group = group
-                self._record_group(queues)
+            mine, theirs = self.group, group
+            if mine.uuid == theirs.uuid:
+                # Same group: adopt strictly larger membership, otherwise no-op.
+                if len(theirs.addresses) > len(mine.addresses):
+                    adopt = True
+                else:
+                    return True   # quiet no-op; never echo on equal/smaller
             else:
-                self._update_group(queues, self.group, self.peers.mid_level)  # counter with my superior group
+                # Different groups: adopt strictly larger membership; on a tie,
+                # break it deterministically by uuid (smaller wins). Without
+                # the tiebreaker, two peers with same-size groups each fall
+                # through to _update_group, generating a network-wide
+                # group_key_update ping-pong (~10k msgs/sec under load).
+                if len(theirs.addresses) > len(mine.addresses):
+                    adopt = True
+                elif len(theirs.addresses) < len(mine.addresses):
+                    adopt = False
+                else:
+                    adopt = str(theirs.uuid) < str(mine.uuid)
+            if adopt:
+                self.logger.debug('Replace %s group with %s group' % (mine.nickname, theirs.nickname))
+                self.group = theirs
+                self._record_group(queues)
+                return True
+            # We are the canonical winner — push our group to peers below us
+            # in the hierarchy so they converge on it. Don't echo on every
+            # equal-size update we receive; that's the flood.
+            self._update_group(queues, self.group, self.peers.mid_level)
             return True
         return False
 
