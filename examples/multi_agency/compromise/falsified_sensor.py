@@ -1,5 +1,5 @@
 """
-Compromised NOAA sensor behavior for the civilian demo.
+Compromised NOAA sensor behavior for the multi-agency demo.
 
 noaa-sensor-3 at Topsail Beach is compromised at T+4:00 (Phase 4).
 Its temperature readings diverge from the other two NOAA sensors.

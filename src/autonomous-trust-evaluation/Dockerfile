@@ -9,14 +9,16 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 # ******************
 
-# Civilian-demo peer image: extends the AT-native peer image with the
-# evaluation + services packages so peer containers can launch via
-# `python -m autonomous_trust.evaluation.scenarios.disaster_response_demo`.
+# AT peer image overlay: extends the AT-native peer image with the
+# evaluation + services packages so peer containers can launch any
+# scenario module under autonomous_trust.evaluation.scenarios (e.g.
+# `python -m autonomous_trust.evaluation.scenarios.disaster_response_demo`).
 # Without this overlay the base image only ships autonomous_trust.core.
+# Reusable across scenarios; the caller chooses the image tag.
 #
 # Build from the repo root (context must include src/):
-#   docker build -t autonomous-trust-disaster:dev \
-#                -f src/autonomous-trust-evaluation/Dockerfile-disaster .
+#   docker build -t autonomous-trust-peer:dev \
+#                -f src/autonomous-trust-evaluation/Dockerfile .
 
 ARG BASE_IMAGE=autonomous-trust:dev
 FROM ${BASE_IMAGE}

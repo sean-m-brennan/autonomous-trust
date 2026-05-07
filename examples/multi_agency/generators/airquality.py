@@ -1,5 +1,5 @@
 """
-EPA air quality data generators for the civilian disaster response demo.
+EPA air quality data generators for the multi-agency disaster response demo.
 
 Produces air quality readings for coastal NC during hurricane conditions.
 EPA joins the network late (Phase 7, T+6:00) so these generators only

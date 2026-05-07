@@ -97,7 +97,7 @@ class TrustNetworkGraph:
     """
 
     RING_RADIUS = 1.0
-    SUB_RADIUS = 0.25
+    SUB_RADIUS = 0.6
 
     def __init__(self,
                  agency_colors: Optional[dict[str, str]] = None,
@@ -144,9 +144,11 @@ class TrustNetworkGraph:
                 peers[0].x, peers[0].y = cx, cy
                 continue
             # Spread peers on a small arc inside the sector. Arc spans
-            # +/- pi/6 around the sector midline -- tight enough to read
-            # as one cluster, loose enough that the nodes don't overlap.
-            spread = math.pi / 6
+            # +/- pi/3.5 around the sector midline -- wide enough that
+            # 4-peer agencies (NOAA) keep clean elbow room between
+            # markers (chord per 12-15° gap > marker size at typical
+            # render scales).
+            spread = math.pi / 3.5
             for j, peer in enumerate(sorted(peers, key=lambda p: p.name)):
                 frac = (j - (len(peers) - 1) / 2) / max(1, len(peers) - 1)
                 a = theta + spread * frac
@@ -309,8 +311,8 @@ class TrustNetworkGraph:
             margin=dict(l=10, r=10, t=10, b=10),
             paper_bgcolor="#121a2e",
             plot_bgcolor="#121a2e",
-            xaxis=dict(visible=False, range=[-1.6, 1.6]),
-            yaxis=dict(visible=False, range=[-1.6, 1.6],
+            xaxis=dict(visible=False, range=[-1.9, 1.9]),
+            yaxis=dict(visible=False, range=[-1.9, 1.9],
                        scaleanchor="x", scaleratio=1),
             legend=dict(
                 orientation="h",

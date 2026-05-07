@@ -45,6 +45,7 @@ IDS = {
     "topbar_clock":      "demo-topbar-clock",
     "topbar_phase":      "demo-topbar-phase",
     "topbar_status":     "demo-topbar-status",
+    "topbar_keystats":   "demo-topbar-keystats",
     "panel_map":         "demo-panel-map",
     "panel_graph":       "demo-panel-graph",
     "panel_log":         "demo-panel-log",
@@ -93,6 +94,12 @@ def _topbar(scenario_title: str, scenario_subtitle: str) -> html.Div:
                      className="demo-topbar__clock"),
             html.Div("-- / --", id=IDS["topbar_phase"],
                      className="demo-topbar__phase"),
+            # Key-stat callouts (KeyStatTracker output). Pushed right via
+            # margin-left:auto in CSS so it sits between the phase
+            # indicator and the status chip. Empty by default; populated
+            # each tick.
+            html.Div(id=IDS["topbar_keystats"], children=[],
+                     className="demo-topbar__keystats"),
             html.Div("MONITORING", id=IDS["topbar_status"],
                      className="demo-topbar__status"),
         ],
@@ -100,6 +107,10 @@ def _topbar(scenario_title: str, scenario_subtitle: str) -> html.Div:
 
 
 def _grid(peer_count: int, phase_count: int) -> html.Div:
+    # Row-handle divs sit on dedicated grid rows between panel rows; a
+    # JS asset (assets/row_resize.js) attaches drag handlers that
+    # rewrite grid-template-rows in px so the user can rebalance row
+    # heights interactively.
     return html.Div(
         className="demo-grid",
         children=[
@@ -124,6 +135,8 @@ def _grid(peer_count: int, phase_count: int) -> html.Div:
                 body_id=IDS["panel_log"],
                 placeholder="No events yet",
             ),
+            html.Div(className="demo-row-handle demo-row-handle--1",
+                     title="Drag to resize rows"),
             _panel(
                 area_class="time",
                 title="Trust Dynamics",
@@ -139,6 +152,8 @@ def _grid(peer_count: int, phase_count: int) -> html.Div:
                 body_id=IDS["panel_streams"],
                 placeholder="No streams negotiated yet",
             ),
+            html.Div(className="demo-row-handle demo-row-handle--2",
+                     title="Drag to resize rows"),
             _panel(
                 area_class="detail",
                 title="Peer Detail",

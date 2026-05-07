@@ -1,12 +1,12 @@
 """
-Civilian demo dashboard configuration.
+Multi-agency demo dashboard configuration.
 
-Instantiates the reusable dashboard components with civilian-specific
+Instantiates the reusable dashboard components with multi-agency-specific
 settings: agency colors, map center (coastal NC), data types, and
 scenario phase markers.
 
 This module is the glue between the generic dashboard components and
-the civilian scenario.  A DoD demo would have a similar file with
+the multi-agency scenario.  A DoD demo would have a similar file with
 military-specific colors, map styles, and data types.
 """
 
@@ -30,7 +30,7 @@ def build_peer_colors(scenario: DisasterResponseScenario) -> dict[str, str]:
 
 
 def build_dashboard(scenario: DisasterResponseScenario) -> dict:
-    """Create all dashboard components configured for the civilian demo.
+    """Create all dashboard components configured for the multi-agency demo.
 
     Returns a dict of component name -> component instance.
     """

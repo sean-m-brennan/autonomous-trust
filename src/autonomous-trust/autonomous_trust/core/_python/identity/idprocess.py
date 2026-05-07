@@ -135,7 +135,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     # welcoming_committee amnesia branch) would land in
                     # idprocess's view but never reach the main proc /
                     # bridge.rcvr — manifesting as the EPA airquality_stream
-                    # gap in the civilian demo (idproc had 9 keys, main
+                    # gap in the multi-agency demo (idproc had 9 keys, main
                     # proc stayed at 8). The _add_peer path's explicit
                     # put to main+negotiation queues becomes redundant
                     # but harmless after this change.

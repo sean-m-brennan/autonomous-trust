@@ -1,5 +1,5 @@
 """
-FEMA data fusion task for the civilian disaster response demo.
+FEMA data fusion task for the multi-agency disaster response demo.
 
 The fusion center (fema-fusion in Raleigh) and field stations aggregate
 data from weather and seismic streams to produce situational awareness

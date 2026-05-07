@@ -1,1 +1,1 @@
-# Civilian demo dashboard configuration.
+# Multi-agency demo dashboard configuration.
