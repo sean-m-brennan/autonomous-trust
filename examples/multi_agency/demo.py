@@ -8,18 +8,24 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 # ******************
 
-"""Civilian-demo runtime (Stages 1 + 2a + 2b + 2c).
+"""Multi-agency-demo runtime.
 
 Wires a Dash app to a PlaybackEngine driving DisasterResponseScenario.
 
-Stage 1 wired: topbar clock / phase / status.
-Stage 2a wired: playback controls, event log, narration overlay.
-Stage 2b wired: agency map, trust timeline, peer detail drawer.
-Stage 2c wired: trust network graph, data streams panel.
-Stage 3 deferred: bridging real AT peer messages into the scenario.
+Stage 1: topbar clock / phase / status.
+Stage 2a: playback controls (play/pause, speed, phase jumps, progress,
+          reset, spacebar shortcut), event log, narration overlay.
+Stage 2b: agency map, trust timeline, peer detail drawer.
+Stage 2c: trust network graph, data streams panel, sensor comparison
+          chart embedded in the peer-detail drawer.
+Stage 3 (live bridge): peer_seen, reputation, rep_pair, and reading
+          observations from real AT peers are drained from
+          `bridge_queue` each tick into the scenario event log,
+          trust matrix, reputation samples, and streams panel.
 
 Two modes:
-    live        real wall clock; scripted scenario.advance_to events.
+    live        real wall clock; scripted scenario.advance_to events
+                augmented by live bridge observations.
     playback    recorded JSON event log buffered + replayed over time
                 via PlaybackEngine.load_recorded.
 """
@@ -28,39 +34,52 @@ from __future__ import annotations
 
 import logging
 import math
-import queue as _queue
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Optional
 
-from autonomous_trust.evaluation.scenarios.disaster_response import (
-    DisasterResponseScenario,
-)
 from autonomous_trust.services.data import Reading
 from autonomous_trust.evaluation.scenarios.disaster_response_narration import (
     build_narration_script,
 )
-from autonomous_trust.evaluation.scenarios.playback_engine import (
-    PlaybackEngine, PlaybackMode, ALLOWED_SPEEDS,
-)
+from autonomous_trust.evaluation.scenarios.playback_engine import ALLOWED_SPEEDS
+from autonomous_trust.evaluation.scenarios.playback_iface import PlaybackInterface
+from autonomous_trust.evaluation.scenarios.recording import KeyStatTracker
 from autonomous_trust.evaluation.scenarios.scenario import PeerState
 
 from dash import callback_context as ctx
+from dash_extensions import Keyboard
 from dash_extensions.enrich import (
     html, dcc, Input, Output, State, ALL, no_update,
 )
 
-from .dash_components.core import DashControl
-from .dashboard.disaster_response_layout import (
+from autonomous_trust.inspector.dash_components.core import DashControl
+from autonomous_trust.inspector.dashboard.disaster_response_layout import (
     IDS, build_dashboard, classify_status, format_clock, format_phase,
 )
-from .dashboard.data_streams import DataStreamsPanel
-from .dashboard.disaster_response_graph import build_graph_from_scenario
-from .dashboard.disaster_response_map import build_map_from_scenario
-from .dashboard.narration import NarrationOverlay, STYLE_COLORS
-from .dashboard.peer_detail import (
-    PeerDetailPanel, PeerDetailState, IdentityInfo, ReputationSnapshot,
+from autonomous_trust.inspector.dashboard.data_streams import DataStreamsPanel
+from autonomous_trust.inspector.dashboard.disaster_response_graph import (
+    build_graph_from_scenario,
 )
-from .dashboard.trust_timeline import TrustTimeline, ReputationSample
+from autonomous_trust.inspector.dashboard.disaster_response_map import (
+    build_map_from_scenario,
+)
+from autonomous_trust.inspector.dashboard.event_log import EventLogPanel
+from autonomous_trust.inspector.dashboard.narration import (
+    NarrationOverlay, STYLE_COLORS,
+)
+from autonomous_trust.inspector.dashboard.peer_detail import (
+    PeerDetailPanel, PeerDetailState, IdentityInfo, ReputationSnapshot,
+    StreamSummary,
+)
+from autonomous_trust.inspector.dashboard.sensor_chart import (
+    SensorComparisonChart,
+)
+from autonomous_trust.inspector.dashboard.trust_timeline import (
+    TrustTimeline, ReputationSample,
+)
+
+import plotly.graph_objects as go
+from collections import deque
 
 
 _TICK_INTERVAL_ID = "demo-tick"
@@ -72,6 +91,8 @@ _PB_SPEED = "demo-pb-speed"       # pattern-matched
 _PB_PHASE = "demo-pb-phase"       # pattern-matched
 _PB_PROGRESS_FILL = "demo-pb-progress-fill"
 _PB_TIME_LABEL = "demo-pb-time"
+_PB_RESET = "demo-pb-reset"
+_PB_KEYBOARD = "demo-pb-keyboard"  # dash_extensions.Keyboard (space → play/pause)
 
 # Stage-2b element IDs.
 _MAP_GRAPH = "demo-map-graph"
@@ -85,64 +106,114 @@ _GRAPH_GRAPH = "demo-trust-graph"
 _STREAMS_IFRAME = "demo-streams-iframe"
 _STREAMS_TICK_SEC = 1.0  # synthesize one reading per stream at 1 Hz
 
+# 3h sensor-comparison chart, embedded inside panel_detail. The chart
+# lives in a sibling html.Details (Sensor Readings) below the iframe so
+# it can be collapsed by the user; the iframe srcDoc cannot host Dash
+# components directly.
+_SENSOR_GRAPH = "demo-sensor-graph"
+_SENSOR_DETAILS = "demo-sensor-details"
+_SENSOR_HISTORY_MAX = 240  # ~4 minutes at 1 Hz; covers the 120s display window
+# kind -> (primary stream data_type, unit) for the comparison chart.
+# Keys match disaster_response peer roles; data types match _STREAM_SPECS.
+_KIND_PRIMARY_DTYPE: dict[str, tuple[str, str]] = {
+    "weather-sensor":      ("temperature", "C"),
+    "seismic-monitor":     ("magnitude",   "Mw"),
+    "air-quality-monitor": ("pm25",        "ug/m3"),
+}
+
 logger = logging.getLogger(__name__)
 
 
-class CivilianDemo:
-    """Dash server + PlaybackEngine wiring for the civilian demo."""
+class MultiAgencyDemo:
+    """Dash server for the multi-agency demo.
 
-    def __init__(self, port: int, playback_file: Optional[str] = None,
-                 host: str = "0.0.0.0", bridge_queue=None):
+    Owns the dashboard layout + Dash callbacks + UI-derived state.
+    The scenario clock, scripted events, live-bridge plumbing, and the
+    optional event recorder all live in the ``PlaybackInterface``
+    instance handed in. Other in-process scenarios can plug into the
+    same machinery by supplying their own ``PlaybackInterface`` (or
+    any ``ScenarioInterface``).
+    """
+
+    def __init__(self, iface: PlaybackInterface, port: int,
+                 host: str = "0.0.0.0"):
+        self._iface = iface
         self._port = port
         self._host = host
-        self._playback_file = playback_file
-        # Stage 3a: if set, drained each tick; live-mode only.
-        self._bridge_queue = bridge_queue
-        self._bridge_seen: set[str] = set()
-
-        self._scenario = DisasterResponseScenario()
-        mode = (PlaybackMode.PLAYBACK
-                if playback_file else PlaybackMode.LIVE)
-        self._engine = PlaybackEngine(self._scenario, mode=mode)
-
-        if playback_file:
-            self._engine.load_recorded(playback_file)
 
         self._narration = NarrationOverlay(script=build_narration_script())
 
+        # Key-stat callouts. Listens to scenario events via the
+        # interface so detection/exclusion latencies tick up live.
+        # EPA onboarding sec is filled in via observe_reputation when
+        # the rep score crosses the threshold — see
+        # _maybe_observe_epa_onboard. The lambda reads
+        # ``self._keystat_tracker`` at call time, so reset can swap
+        # in a fresh tracker without re-registering.
+        self._keystat_tracker = KeyStatTracker(
+            compromised_peer="noaa-3", epa_peer="epa-1")
+        iface.on_engine_event(
+            lambda ev, t: self._keystat_tracker.observe(ev))
+
         # Per-peer reputation history, appended each tick; drives the
-        # trust-timeline panel. Live bridge events (Stage 3b.2) update
-        # _rep_samples directly via _drain_bridge; peers that have
-        # received at least one live observation are tracked in
-        # _live_rep_peers so _sample_reputation skips them and falls
-        # back to peer_state synthesis only for peers we haven't yet
-        # observed (e.g. late joiners not yet in the AT group).
+        # trust-timeline panel. Live bridge events update _rep_samples
+        # via _on_bridge_event; peers that have received at least one
+        # live observation are tracked in _live_rep_peers so
+        # _sample_reputation skips them and falls back to peer_state
+        # synthesis only for peers we haven't yet observed.
         self._rep_samples: dict[str, list[ReputationSample]] = {}
         self._last_sample_t: float = -_TICK_SAMPLE_SEC
         self._live_rep_peers: set[str] = set()
-        # Stage 3b.3(a): bilateral observation matrix. Keys are
-        # canonical (a, b) tuples (sorted) so a's view of b and b's view
-        # of a collapse into one undirected edge weight. Value is the
-        # latest pair-blended trust (currently min — skepticism wins).
+        # Bilateral observation matrix. Keys are canonical (a, b)
+        # tuples (sorted) so a's view of b and b's view of a collapse
+        # into one undirected edge weight. Value is the latest
+        # pair-blended trust (currently min — skepticism wins).
         self._live_trust_matrix: dict[tuple[str, str], float] = {}
         self._live_trust_seen_dir: dict[tuple[str, str], float] = {}
 
         self._peer_detail_panel = PeerDetailPanel()
+        # Last peer rendered into the detail iframe. The iframe
+        # srcDoc is replaced on each render, which resets every
+        # <details> tab to its default_open state — so we only
+        # re-render when the selected peer actually changes (pull on
+        # click). Sentinel value ("<unset>") differs from any real
+        # peer name and from None, so the very first tick always
+        # renders the empty placeholder.
+        self._peer_detail_last_peer: object = "<unset>"
+        self._event_log_panel = EventLogPanel(capacity=200)
         self._streams_panel = DataStreamsPanel(
-            peer_colors=_agency_palette(self._scenario))
+            peer_colors=_agency_palette(iface.scenario))
+
+        # Per-(data_type, peer) ring of recent Reading samples,
+        # populated from both synth (_update_streams) and live (bridge).
+        # Drives the SensorComparisonChart embedded in the peer-detail
+        # drawer when a sensor peer is selected.
+        self._sensor_history: dict[str, dict[str, deque]] = {}
         self._last_streams_t: float = -_STREAMS_TICK_SEC
         # Track which peers have been marked inactive in the streams
         # panel so we only mark once (mark_inactive is idempotent, but
         # avoiding the scan each tick is cheap).
         self._streams_inactive: set[str] = set()
-        # Stage 3b.4: peers whose readings have arrived from real
-        # EnvData* services via the bridge. _update_streams falls back
-        # to synthesis only for peers we haven't yet observed.
+        # Peers whose readings have arrived from real EnvData* services
+        # via the bridge. _update_streams falls back to synthesis only
+        # for peers we haven't yet observed.
         self._live_stream_peers: set[str] = set()
 
+        # Identity facts captured from the bridge's first peer_seen
+        # event for each peer. Tuple: (uuid_str, fingerprint_hex,
+        # joined_at_seconds). Populated only in live mode; playback
+        # peers fall back to '--' in the Peer Detail panel.
+        self._peer_identity: dict[str, tuple[str, str, float]] = {}
+
+        # Subscribe to the interface's event streams.
+        iface.register_bridge_event_handler(self._on_bridge_event)
+        iface.register_event_log_handler(
+            self._event_log_panel.add_from_event_record)
+        iface.register_reset_handler(self._on_reset)
+
         self._dash = DashControl(
-            name="autonomous_trust.inspector.civilian",
-            title=self._scenario.name,
+            name="examples.multi_agency.demo",
+            title=iface.scenario.name,
             host=host,
             port=port,
         )
@@ -152,7 +223,7 @@ class CivilianDemo:
     # --- layout ---------------------------------------------------------
 
     def _build_layout(self) -> html.Div:
-        dashboard = build_dashboard(scenario=self._scenario)
+        dashboard = build_dashboard(scenario=self._iface.scenario)
         # Inject interactive children into the placeholder bodies that
         # build_dashboard() left empty.
         self._replace_child_by_id(
@@ -172,9 +243,63 @@ class CivilianDemo:
                       style={"height": "100%", "width": "100%"}))
         self._replace_child_by_id(
             dashboard, IDS["panel_detail"],
-            html.Iframe(id=_DETAIL_IFRAME, srcDoc="",
-                        style={"width": "100%", "height": "100%",
-                               "border": "0", "background": "transparent"}))
+            html.Div(
+                # Side-by-side: identity/reputation iframe on the left
+                # (1/3), Sensor Readings chart on the right (2/3). The
+                # iframe's body scrolls internally; the chart fills its
+                # column. flex 1:2 splits the row exactly in those
+                # proportions.
+                style={"display": "flex", "flexDirection": "row",
+                       "height": "100%", "gap": "6px"},
+                children=[
+                    html.Iframe(
+                        id=_DETAIL_IFRAME, srcDoc="",
+                        style={"flex": "1 1 0",
+                               "minWidth": "0",
+                               "height": "100%",
+                               "border": "0",
+                               "background": "transparent"}),
+                    # Sensor comparison chart, wrapped in a real
+                    # html.Details so its open/closed state is owned
+                    # by Dash. The wrapper's own display:none hides
+                    # the whole column for non-sensor peers; the
+                    # remaining iframe stretches because flex:1 on it
+                    # absorbs the freed space (the row's flex parent
+                    # treats display:none siblings as absent).
+                    html.Details(
+                        id=_SENSOR_DETAILS,
+                        open=True,
+                        children=[
+                            html.Summary(
+                                "Sensor Readings",
+                                style={
+                                    "padding": "8px 12px",
+                                    "cursor": "pointer",
+                                    "color": "#94a3b8",
+                                    "textTransform": "uppercase",
+                                    "letterSpacing": "0.06em",
+                                    "fontSize": "11px",
+                                    "flex": "0 0 auto",
+                                }),
+                            dcc.Graph(
+                                id=_SENSOR_GRAPH,
+                                figure=go.Figure(),
+                                config={"displayModeBar": False},
+                                responsive=True,
+                                style={"flex": "1 1 auto",
+                                       "minHeight": "0",
+                                       "width": "100%"}),
+                        ],
+                        style={"display": "none",
+                               "flex": "2 1 0",
+                               "minWidth": "0",
+                               "flexDirection": "column",
+                               "border": "1px solid #1f2a44",
+                               "borderRadius": "6px",
+                               "background": "#121a2e",
+                               "overflow": "hidden"}),
+                ],
+            ))
         self._replace_child_by_id(
             dashboard, IDS["panel_graph"],
             dcc.Graph(id=_GRAPH_GRAPH,
@@ -190,6 +315,10 @@ class CivilianDemo:
             dcc.Interval(id=_TICK_INTERVAL_ID,
                          interval=_TICK_MS, n_intervals=0),
             dcc.Store(id=_SELECTED_PEER, data={"name": None}),
+            # Document-level keyboard listener for the spacebar
+            # play/pause shortcut. captureKeys filters at the JS layer
+            # so the callback only fires for ' ' (Space).
+            Keyboard(id=_PB_KEYBOARD, captureKeys=[" "]),
             dashboard,
         ])
 
@@ -214,13 +343,17 @@ class CivilianDemo:
         return False
 
     def _playback_controls_children(self) -> html.Div:
-        scenario = self._scenario
+        scenario = self._iface.scenario
         duration = scenario.duration.total_seconds()
         phases = scenario.phases
         return html.Div(className="demo-pb", children=[
             html.Div(className="demo-pb__row", children=[
                 html.Button("▶", id=_PB_PLAYPAUSE,
-                            n_clicks=0, className="demo-pb__btn"),
+                            n_clicks=0, className="demo-pb__btn",
+                            title="Play / Pause (space)"),
+                html.Button("⟲", id=_PB_RESET,
+                            n_clicks=0, className="demo-pb__btn",
+                            title="Reset to T+0"),
                 html.Div(className="demo-pb__speeds", children=[
                     html.Button(
                         f"{s:g}x",
@@ -255,8 +388,8 @@ class CivilianDemo:
     # --- callbacks ------------------------------------------------------
 
     def _register_callbacks(self):
-        engine = self._engine
-        scenario = self._scenario
+        iface = self._iface
+        scenario = iface.scenario
         narration = self._narration
         demo = self   # for callbacks that need mutable instance state
 
@@ -265,6 +398,7 @@ class CivilianDemo:
             Output(IDS["topbar_phase"], "children"),
             Output(IDS["topbar_status"], "children"),
             Output(IDS["topbar_status"], "className"),
+            Output(IDS["topbar_keystats"], "children"),
             Output(IDS["panel_log"], "children"),
             Output(IDS["narration_overlay"], "children"),
             Output(IDS["narration_overlay"], "style"),
@@ -276,13 +410,14 @@ class CivilianDemo:
             Output(_DETAIL_IFRAME, "srcDoc"),
             Output(_GRAPH_GRAPH, "figure"),
             Output(_STREAMS_IFRAME, "srcDoc"),
+            Output(_SENSOR_GRAPH, "figure"),
+            Output(_SENSOR_DETAILS, "style"),
             Input(_TICK_INTERVAL_ID, "n_intervals"),
             Input(_SELECTED_PEER, "data"),
         )
         def _on_tick(_n, selected):
-            engine.tick()
-            tel = engine.telemetry()
-            demo._drain_bridge(tel.scenario_time)
+            iface.tick()
+            tel = iface.telemetry()
             states = scenario.peer_states
             any_onboarding = any(
                 s == PeerState.PENDING for s in states.values())
@@ -301,7 +436,10 @@ class CivilianDemo:
             phase_str = format_phase(tel.current_phase_idx,
                                      len(scenario.phases),
                                      tel.current_phase_name)
-            log_children = _build_event_log(scenario.event_log)
+            demo._maybe_observe_epa_onboard(tel.scenario_time)
+            keystats_children = _render_keystat_chips(
+                demo._keystat_tracker.stats.callouts())
+            log_children = demo._event_log_panel.to_dash_children()
 
             narration.advance_to(tel.scenario_time)
             nchildren, nstyle = _build_narration(narration.current_block)
@@ -339,7 +477,20 @@ class CivilianDemo:
             timeline_fig.update_layout(uirevision="demo-timeline")
 
             peer_name = (selected or {}).get("name") if selected else None
-            detail_html = demo._build_peer_detail_html(peer_name)
+            # Only rebuild the peer-detail iframe when the selection
+            # changes. The iframe's srcDoc replaces the whole document
+            # on every assignment, which resets every <details> tab to
+            # its default_open state — so a 500ms tick would constantly
+            # snap the tabs back closed. Live data inside the iframe
+            # is therefore a snapshot at click time; the sensor chart
+            # below the iframe and the global Trust Dynamics / Data
+            # Streams panels are the live-updating views.
+            if peer_name != demo._peer_detail_last_peer:
+                detail_html = demo._build_peer_detail_html(peer_name)
+                demo._peer_detail_last_peer = peer_name
+            else:
+                detail_html = no_update
+            sensor_fig, sensor_style = demo._build_sensor_chart(peer_name)
 
             # Stage-2c: trust graph + data streams.
             # Stage 3b.3: live observations cap (and thus discount) any
@@ -359,11 +510,12 @@ class CivilianDemo:
             demo._update_streams(tel.scenario_time, states)
             streams_html = demo._streams_panel.to_html(height="100%")
 
-            return (clock, phase_str, label, css,
+            return (clock, phase_str, label, css, keystats_children,
                     log_children, nchildren, nstyle,
                     play_icon, time_label, progress_style,
                     map_fig, timeline_fig, detail_html,
-                    graph_fig, streams_html)
+                    graph_fig, streams_html,
+                    sensor_fig, sensor_style)
 
         @self._dash.callback(
             Output(_SELECTED_PEER, "data"),
@@ -395,7 +547,21 @@ class CivilianDemo:
             prevent_initial_call=True,
         )
         def _on_playpause(_n):
-            engine.toggle()
+            iface.toggle()
+            return no_update
+
+        @self._dash.callback(
+            Output(_PB_KEYBOARD, "n_keydowns"),  # dummy sink
+            Input(_PB_KEYBOARD, "n_keydowns"),
+            State(_PB_KEYBOARD, "keydown"),
+            prevent_initial_call=True,
+        )
+        def _on_keydown(_n, keydown):
+            # captureKeys=[" "] ensures we only fire on Space, but
+            # double-check the payload defensively (older
+            # dash_extensions versions don't filter as advertised).
+            if keydown and keydown.get("key") == " ":
+                iface.toggle()
             return no_update
 
         @self._dash.callback(
@@ -408,7 +574,7 @@ class CivilianDemo:
             # ctx.triggered_id tells us which one; ids has the speed value.
             tid = ctx.triggered_id
             if isinstance(tid, dict) and "speed" in tid:
-                engine.set_speed(float(tid["speed"]))
+                iface.set_speed(float(tid["speed"]))
             return [no_update] * len(ids)
 
         @self._dash.callback(
@@ -418,12 +584,26 @@ class CivilianDemo:
             prevent_initial_call=True,
         )
         def _on_phase_jump(_clicks, ids):
+            # Pause-and-explain: clicking a phase marker seeks to its
+            # start and pauses, so the narration overlay (driven from
+            # scenario time on the next tick) lingers on that phase's
+            # callout. The presenter resumes with space or the play
+            # button. This is the inverse of the previous "skip-and-
+            # resume" behavior and matches the demo plan §6 spec.
             tid = ctx.triggered_id
             if isinstance(tid, dict) and "t" in tid:
-                engine.seek(float(tid["t"]))
-                if not engine.playing:
-                    engine.play()
+                iface.seek(float(tid["t"]))
+                iface.pause()
             return [no_update] * len(ids)
+
+        @self._dash.callback(
+            Output(_PB_RESET, "n_clicks"),  # dummy sink
+            Input(_PB_RESET, "n_clicks"),
+            prevent_initial_call=True,
+        )
+        def _on_reset(_n):
+            demo._iface.reset()
+            return no_update
 
     # --- Stage 2b data derivation ---------------------------------------
 
@@ -433,13 +613,13 @@ class CivilianDemo:
         every _TICK_SAMPLE_SEC seconds (keeps the timeline lean).
 
         Peers that have received at least one live reputation observation
-        from the bridge are skipped — _drain_bridge writes their samples
-        directly. The synthesis path remains for peers we haven't seen
+        from the bridge are skipped — _on_bridge_event writes their
+        samples directly. The synthesis path remains for peers we haven't seen
         yet (late joiners, peers behind a partition)."""
         if scenario_time - self._last_sample_t < _TICK_SAMPLE_SEC:
             return
         self._last_sample_t = scenario_time
-        for name, state in self._scenario.peer_states.items():
+        for name, state in self._iface.scenario.peer_states.items():
             if name in self._live_rep_peers:
                 continue
             self._rep_samples.setdefault(name, []).append(
@@ -450,12 +630,12 @@ class CivilianDemo:
                 ))
 
     def _build_timeline_figure(self):
-        peer_colors = _agency_palette(self._scenario)
+        peer_colors = _agency_palette(self._iface.scenario)
         tl = TrustTimeline(peer_colors=peer_colors)
         for name, samples in self._rep_samples.items():
             for s in samples:
                 tl.add_sample(s)
-        for phase in self._scenario.phases:
+        for phase in self._iface.scenario.phases:
             tl.add_phase_marker(phase.start.total_seconds(), phase.name)
         return tl.figure(height=None)  # let Dash size it to the panel
 
@@ -485,11 +665,14 @@ class CivilianDemo:
         synth_idx: dict[tuple[str, str], float] = {
             tuple(sorted((a, b))): score for a, b, score in synth
         }
-        # Layer 1: bilateral live overrides the synth weight for those
-        # pairs.
+        # Layer 1: bilateral live overrides synth — and is included
+        # even when synth has no corresponding edge. This is the path
+        # that surfaces real AT-mesh observations on the trust graph
+        # before the scripted scenario has transitioned peers out of
+        # PENDING (e.g. live mode early in the run, or paused before
+        # play).
         for key, score in self._live_trust_matrix.items():
-            if key in synth_idx:
-                synth_idx[key] = score
+            synth_idx[key] = score
         # Layer 2: cap remaining synth edges by single-direction
         # observation. Skip edges already replaced in layer 1.
         if self._live_rep_peers:
@@ -511,10 +694,10 @@ class CivilianDemo:
         return [(a, b, w) for (a, b), w in synth_idx.items()]
 
     def _build_peer_detail_html(self, peer_name: Optional[str]) -> str:
-        if peer_name is None or peer_name not in self._scenario.peers:
+        if peer_name is None or peer_name not in self._iface.scenario.peers:
             return self._peer_detail_panel.to_html(None)
-        role = self._scenario.peers[peer_name]
-        state = self._scenario.peer_states.get(peer_name, PeerState.PENDING)
+        role = self._iface.scenario.peers[peer_name]
+        state = self._iface.scenario.peer_states.get(peer_name, PeerState.PENDING)
         pos = role.position
         lat = (getattr(pos, "lat", None)
                or getattr(pos, "x", 0.0) or 0.0)
@@ -523,6 +706,8 @@ class CivilianDemo:
         latest = None
         if peer_name in self._rep_samples and self._rep_samples[peer_name]:
             latest = self._rep_samples[peer_name][-1].score
+        uuid_str, fingerprint, joined_at = self._peer_identity.get(
+            peer_name, ("", "", 0.0))
         detail = PeerDetailState(
             name=peer_name,
             agency=role.agency,
@@ -530,99 +715,271 @@ class CivilianDemo:
             status=_peer_state_to_status(state),
             lat=float(lat),
             lon=float(lon),
-            identity=IdentityInfo(zta_valid=(state != PeerState.EXCLUDED)),
+            identity=IdentityInfo(
+                uuid=uuid_str,
+                zta_valid=(state != PeerState.EXCLUDED),
+                joined_at=joined_at,
+                key_fingerprint=fingerprint,
+            ),
             reputation=ReputationSnapshot(
                 current_score=latest if latest is not None
                 else _peer_state_to_score(state),
             ),
             capabilities=list(role.capabilities or []),
+            producing=self._build_producing_streams(peer_name),
         )
         return self._peer_detail_panel.to_html(detail)
 
-    def _drain_bridge(self, scenario_time: float) -> None:
-        """Pull bridge observations into the scenario's event log as
-        ANNOTATION events so they appear in the Event Log panel."""
-        if self._bridge_queue is None:
+    def _build_producing_streams(self, peer_name: str) -> list:
+        """Build StreamSummary objects for the selected peer.
+
+        Reads the per-(data_type, peer) ring buffers in _sensor_history
+        — populated from both bridge `reading` events and synth
+        readings — and produces one StreamSummary per data_type the
+        peer has emitted. Pull-style: only the selected peer's data
+        is processed.
+        """
+        out = []
+        for dtype, per_peer in self._sensor_history.items():
+            ring = per_peer.get(peer_name)
+            if not ring:
+                continue
+            recent = list(ring)
+            values = [float(r.value) for r in recent[-32:]]
+            latest = recent[-1]
+            unit = latest.unit or ""
+            quality = float(latest.quality) if latest.quality is not None else 1.0
+            cadence = 1.0
+            if len(recent) >= 2:
+                first_t = recent[0].timestamp.total_seconds()
+                last_t = latest.timestamp.total_seconds()
+                if last_t > first_t:
+                    cadence = (last_t - first_t) / max(1, len(recent) - 1)
+            out.append(StreamSummary(
+                data_type=dtype,
+                unit=unit,
+                cadence_sec=cadence,
+                recent_values=values,
+                direction="producing",
+                quality=quality,
+            ))
+        out.sort(key=lambda s: s.data_type)
+        return out
+
+    def _on_bridge_event(self, ev: tuple) -> None:
+        """Handle one drained bridge tuple (fired by ``PlaybackInterface``).
+
+        Updates the UI-derived state (timeline samples, trust matrix,
+        sensor history, streams panel). The interface itself is
+        responsible for annotating the scenario event log; we only
+        consume the raw tuple.
+        """
+        if not ev:
             return
-        wall = datetime.utcnow().isoformat()
-        while True:
-            try:
-                ev = self._bridge_queue.get_nowait()
-            except _queue.Empty:
-                break
-            except Exception:
-                break
-            if not ev:
+        tag = ev[0]
+        scenario_time = self._iface.current_time
+        if tag == "peer_seen" and len(ev) >= 2:
+            name = str(ev[1])
+            uuid_str = str(ev[2]) if len(ev) >= 3 else ""
+            fingerprint = str(ev[3]) if len(ev) >= 4 else ""
+            # First sighting wins; later peer_seen re-fires shouldn't
+            # overwrite the join time (the bridge dedupes via
+            # self._seen, but be defensive).
+            if name not in self._peer_identity:
+                self._peer_identity[name] = (uuid_str, fingerprint,
+                                             scenario_time)
+                # If this is the currently-selected peer, force a
+                # one-shot re-render of the detail iframe so the new
+                # UUID/fingerprint show up without requiring a re-click.
+                if self._peer_detail_last_peer == name:
+                    self._peer_detail_last_peer = "<unset>"
+        elif tag == "reputation" and len(ev) >= 3:
+            name = str(ev[1])
+            score = float(ev[2])
+            self._rep_samples.setdefault(name, []).append(
+                ReputationSample(
+                    t=scenario_time,
+                    peer_name=name,
+                    score=score,
+                ))
+            self._live_rep_peers.add(name)
+            # Iframe srcDoc is rebuilt only when the selected peer
+            # changes (see comment near the tick callback). Without
+            # this nudge, the Reputation tab shows the score that was
+            # current at click time, which drifts from the live value
+            # surfaced in the Event Log. Forcing a re-render on each
+            # bridge update for the selected peer keeps the two views
+            # in sync; the cost is that any <details> tab the user
+            # had open in the iframe resets — acceptable since the
+            # bridge's 0.05 debounce keeps reputation events sparse.
+            if self._peer_detail_last_peer == name:
+                self._peer_detail_last_peer = "<unset>"
+        elif tag == "rep_pair" and len(ev) >= 4:
+            # Bilateral: observer's view of subject. Cache directional,
+            # then combine into the undirected edge weight via min
+            # (skepticism-wins).
+            observer = str(ev[1])
+            subject = str(ev[2])
+            score = float(ev[3])
+            if observer == subject:
+                return
+            self._live_trust_seen_dir[(observer, subject)] = score
+            key = tuple(sorted((observer, subject)))
+            opposite = self._live_trust_seen_dir.get(
+                (key[1], key[0]) if key[0] == observer
+                else (observer, subject))
+            if opposite is None:
+                self._live_trust_matrix[key] = score
+            else:
+                self._live_trust_matrix[key] = min(score, opposite)
+        elif tag == "reading" and len(ev) >= 3:
+            # envdata reading: forward to the streams panel and mark
+            # the peer as live so _update_streams stops synthesizing.
+            name = str(ev[1])
+            rd = ev[2] if isinstance(ev[2], dict) else {}
+            reading = _reading_from_dict(name, rd)
+            if reading is None:
+                return
+            self._streams_panel.update(reading)
+            self._record_reading(reading)
+            self._live_stream_peers.add(name)
+
+    def _on_reset(self) -> None:
+        """Clear UI-derived state. Fired by ``PlaybackInterface.reset()``
+        after the engine has been rewound and bridge bookkeeping cleared.
+
+        ``KeyStatTracker`` is event-driven: replacing the instance is
+        the cleanest way to clear its accumulated state; the lambda
+        registered via ``iface.on_engine_event`` reads
+        ``self._keystat_tracker`` at call time so it picks up the new
+        instance automatically.
+        """
+        self._keystat_tracker = KeyStatTracker(
+            compromised_peer=self._keystat_tracker._compromised,  # noqa: SLF001
+            epa_peer=self._keystat_tracker._epa)                  # noqa: SLF001
+        self._event_log_panel.clear()
+        self._rep_samples.clear()
+        self._last_sample_t = -_TICK_SAMPLE_SEC
+        self._sensor_history.clear()
+        self._live_rep_peers.clear()
+        self._live_trust_matrix.clear()
+        self._live_trust_seen_dir.clear()
+        self._live_stream_peers.clear()
+        self._peer_identity.clear()
+        # Streams panel has no clear() of its own; rebuilding is the
+        # cheapest way to drop accumulated stream state and inactive
+        # markers.
+        self._streams_panel = DataStreamsPanel(
+            peer_colors=_agency_palette(self._iface.scenario))
+        self._streams_inactive.clear()
+        self._last_streams_t = -_STREAMS_TICK_SEC
+        self._narration.advance_to(0.0)
+        # Force a re-render of the peer detail iframe on the next tick
+        # so the user sees the post-reset state if a peer was selected.
+        self._peer_detail_last_peer = "<unset>"
+
+    def _record_reading(self, reading: Reading) -> None:
+        """Append a reading to the per-(data_type, peer) ring used by
+        the sensor comparison chart. Stores the full Reading so the
+        chart's `add_reading` API can pull `timestamp` and `value`
+        without extra unpacking."""
+        if not reading or not reading.data_type or not reading.peer_name:
+            return
+        per_type = self._sensor_history.setdefault(reading.data_type, {})
+        ring = per_type.get(reading.peer_name)
+        if ring is None:
+            ring = deque(maxlen=_SENSOR_HISTORY_MAX)
+            per_type[reading.peer_name] = ring
+        ring.append(reading)
+
+    def _build_sensor_chart(self, peer_name: Optional[str]
+                            ) -> tuple[go.Figure, dict]:
+        """Build the sensor comparison figure (and its container style)
+        for the panel-detail drawer.
+
+        The returned style applies to the html.Details wrapper, not the
+        Graph itself: the wrapper hides the entire "Sensor Readings"
+        disclosure for non-sensor peers and shows it (preserving the
+        user's open/closed state) for sensors with readings.
+        """
+        # Hidden: wrapper collapses; the iframe sibling absorbs the
+        # full row width. Visible: wrapper is a 2/3-width flex column
+        # (summary + chart); minWidth:0 lets the chart shrink instead
+        # of overflowing the row.
+        hidden_style = {"display": "none", "flex": "2 1 0",
+                        "minWidth": "0",
+                        "flexDirection": "column",
+                        "border": "1px solid #1f2a44",
+                        "borderRadius": "6px",
+                        "background": "#121a2e",
+                        "overflow": "hidden"}
+        visible_style = {"display": "flex", "flex": "2 1 0",
+                         "minWidth": "0",
+                         "flexDirection": "column",
+                         "border": "1px solid #1f2a44",
+                         "borderRadius": "6px",
+                         "background": "#121a2e",
+                         "overflow": "hidden"}
+        if peer_name is None or peer_name not in self._iface.scenario.peers:
+            return (go.Figure(), hidden_style)
+        role = self._iface.scenario.peers[peer_name]
+        spec = _KIND_PRIMARY_DTYPE.get(role.kind)
+        if spec is None:
+            return (go.Figure(), hidden_style)
+        dtype, unit = spec
+        per_peer = self._sensor_history.get(dtype) or {}
+        # Need at least the selected peer's own readings to be useful.
+        if peer_name not in per_peer or not per_peer[peer_name]:
+            return (go.Figure(), hidden_style)
+
+        chart = SensorComparisonChart(
+            data_type=dtype,
+            unit=unit,
+            peer_colors=_agency_palette(self._iface.scenario),
+            window_sec=120.0,
+            title=f"{dtype.replace('_', ' ').title()} — {peer_name} vs corroborators",
+            highlight_peer=peer_name,
+        )
+        # Limit overlay to peers of the same kind (e.g. compare NOAA-3
+        # against the other NOAA weather sensors). Cross-agency peers
+        # producing the same data_type are still useful corroborators
+        # but get noisy quickly; matching by kind keeps the chart clean.
+        for other_name, ring in per_peer.items():
+            other_role = self._iface.scenario.peers.get(other_name)
+            if other_role is None or other_role.kind != role.kind:
                 continue
-            tag = ev[0]
-            if tag == "peer_seen" and len(ev) >= 2:
-                name = str(ev[1])
-                if name in self._bridge_seen:
-                    continue
-                self._bridge_seen.add(name)
-                desc = f"[live] peer observed: {name}"
-            elif tag == "reputation" and len(ev) >= 3:
-                name = str(ev[1])
-                score = float(ev[2])
-                desc = f"[live] {name} reputation = {score:.2f}"
-                # Stage 3b.2: live observations drive the timeline panel
-                # directly. Marking name as live in _live_rep_peers tells
-                # _sample_reputation to stop synthesizing for it.
-                self._rep_samples.setdefault(name, []).append(
-                    ReputationSample(
-                        t=scenario_time,
-                        peer_name=name,
-                        score=score,
-                    ))
-                self._live_rep_peers.add(name)
-            elif tag == "rep_pair" and len(ev) >= 4:
-                # Stage 3b.3(a) bilateral: observer's view of subject.
-                # Cache directional, then combine into the undirected
-                # edge weight via min (skepticism-wins).
-                observer = str(ev[1])
-                subject = str(ev[2])
-                score = float(ev[3])
-                if observer == subject:
-                    continue
-                self._live_trust_seen_dir[(observer, subject)] = score
-                key = tuple(sorted((observer, subject)))
-                opposite = self._live_trust_seen_dir.get(
-                    (key[1], key[0]) if key[0] == observer
-                    else (observer, subject))
-                if opposite is None:
-                    self._live_trust_matrix[key] = score
-                else:
-                    self._live_trust_matrix[key] = min(score, opposite)
-                desc = (f"[live] {observer} ↔ {subject} trust "
-                        f"= {score:.2f}")
-                name = subject
-            elif tag == "ping" and len(ev) >= 3:
-                name = str(ev[1])
-                rtt = float(ev[2])
-                desc = f"[live] {name} rtt = {rtt:.0f}ms"
-            elif tag == "reading" and len(ev) >= 3:
-                # Stage 3b.4: forward an envdata reading into the streams
-                # panel and mark the peer as live so _update_streams
-                # stops synthesizing for it.
-                name = str(ev[1])
-                rd = ev[2] if isinstance(ev[2], dict) else {}
-                reading = _reading_from_dict(name, rd)
-                if reading is None:
-                    continue
-                self._streams_panel.update(reading)
-                self._live_stream_peers.add(name)
-                # Skip event-log emission for streams (they fire ~1 Hz
-                # per peer per data type — would drown the log). Other
-                # tags are far less frequent.
-                continue
-            self._scenario._event_log.append({     # noqa: SLF001
-                "t": scenario_time,
-                "type": "ANNOTATION",
-                "peer": name,
-                "description": desc,
-                "data": {"source": "bridge", "tag": tag},
-                "wall_time": wall,
-            })
+            for reading in ring:
+                chart.add_reading(reading)
+
+        # Mark anomalous traces using the COMPROMISE_DETECT timestamp
+        # from the scenario log so the shading lines up with what the
+        # event log shows.
+        detect_t = _detection_time(self._iface.scenario, peer_name)
+        if detect_t is not None:
+            chart.mark_anomalous(peer_name, t=detect_t)
+
+        fig = chart.figure(width=None, height=None)
+        # Strip the chart's hard-coded width/height so dcc.Graph's
+        # responsive=true sizes the figure to the panel column (now
+        # 2/3 of panel_detail height). Margins tightened so the title
+        # and legend don't crowd the plot at smaller heights.
+        fig.update_layout(width=None, height=None, autosize=True,
+                          margin=dict(l=40, r=12, t=30, b=40))
+        return (fig, visible_style)
+
+    def _maybe_observe_epa_onboard(self, scenario_time: float) -> None:
+        """Forward the most recent EPA reputation reading (live or synth)
+        into KeyStatTracker.observe_reputation so it can fix the
+        epa_onboard_sec timestamp the first time the score crosses
+        the threshold. KeyStatTracker is idempotent past the first
+        crossing, so this is cheap to call every tick."""
+        epa = self._keystat_tracker._epa  # noqa: SLF001
+        samples = self._rep_samples.get(epa)
+        if not samples:
+            return
+        latest = samples[-1]
+        self._keystat_tracker.observe_reputation(
+            peer=epa, score=float(latest.score), t_seconds=scenario_time)
 
     def _update_streams(self, scenario_time: float,
                         peer_states: dict) -> None:
@@ -640,7 +997,7 @@ class CivilianDemo:
             return
         self._last_streams_t = scenario_time
         ts = timedelta(seconds=scenario_time)
-        for name, role in self._scenario.peers.items():
+        for name, role in self._iface.scenario.peers.items():
             state = peer_states.get(name, PeerState.PENDING)
             if state in (PeerState.PENDING, PeerState.EXCLUDED):
                 continue
@@ -653,12 +1010,14 @@ class CivilianDemo:
             for reading in _readings_for_role(name, role, ts, quality,
                                               scenario_time):
                 self._streams_panel.update(reading)
+                self._record_reading(reading)
 
     # --- run ------------------------------------------------------------
 
     def run(self):
-        logger.info("Civilian demo serving on http://%s:%d/ (%s mode)",
-                    self._host, self._port, self._engine.mode)
+        logger.info("Multi-agency demo serving on http://%s:%d/ (%s mode)",
+                    self._host, self._port, self._iface.mode)
+        self._iface.start()
         self._dash.run(self._host, self._port)
 
 
@@ -674,32 +1033,24 @@ def _format_mmss(seconds: float) -> str:
     return f"T+{m:02d}:{s:02d}"
 
 
-_EVENT_SEVERITY_CLASS = {
-    "COMPROMISE_START":  "demo-event demo-event--threat",
-    "COMPROMISE_DETECT": "demo-event demo-event--warning",
-    "PEER_EXCLUDE":      "demo-event demo-event--success",
-    "PEER_JOIN":         "demo-event demo-event--info",
-    "PEER_DEPART":       "demo-event demo-event--warning",
-    "ANNOTATION":        "demo-event demo-event--annot",
-}
+def _render_keystat_chips(callouts: list[tuple[str, str]]) -> list:
+    """Convert KeyStats.callouts() → a list of html.Div chips.
 
-
-def _build_event_log(event_log: list[dict]) -> list:
-    """Render scenario.event_log (newest first) as a list of html.Divs."""
-    if not event_log:
-        return [html.Div("No events yet",
-                         className="demo-placeholder")]
-    items = []
-    for rec in reversed(event_log[-200:]):  # cap at 200 newest
-        t = float(rec.get("t", 0))
-        etype = rec.get("type", "")
-        text = rec.get("description") or etype
-        cls = _EVENT_SEVERITY_CLASS.get(etype, "demo-event")
-        items.append(html.Div(className=cls, children=[
-            html.Span(_format_mmss(t), className="demo-event__time"),
-            html.Span(text, className="demo-event__text"),
-        ]))
-    return items
+    Empty list when the scenario has no callouts yet (fresh start).
+    Each chip is a flex row with a small label + monospace value;
+    styling lives in demo.css under .demo-keystat-chip*."""
+    if not callouts:
+        return []
+    chips = []
+    for label, value in callouts:
+        chips.append(html.Div(
+            className="demo-keystat-chip",
+            children=[
+                html.Span(label, className="demo-keystat-chip__label"),
+                html.Span(value, className="demo-keystat-chip__value"),
+            ],
+        ))
+    return chips
 
 
 def _build_narration(block) -> tuple[list, dict]:
@@ -741,6 +1092,16 @@ def _build_narration(block) -> tuple[list, dict]:
 
 
 # --- Stage 2b helpers --------------------------------------------------
+
+def _detection_time(scenario, peer_name: str) -> Optional[float]:
+    """Return scenario-seconds at which COMPROMISE_DETECT fired for
+    `peer_name`, or None if it hasn't fired yet."""
+    for rec in scenario._event_log:           # noqa: SLF001
+        if (rec.get("type") == "COMPROMISE_DETECT"
+                and rec.get("peer") == peer_name):
+            return float(rec.get("t", 0.0))
+    return None
+
 
 def _peer_state_to_score(state: PeerState) -> float:
     """Synthesize a 0-1 reputation from a scenario PeerState. Replace

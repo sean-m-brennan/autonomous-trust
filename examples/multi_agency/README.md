@@ -1,7 +1,7 @@
 # Multi-Agency Federal Data Sharing Demo
 
 A demonstration of [AutonomousTrust](../../src/autonomous-trust/README.md)
-in a credible civilian disaster-response scenario.
+in a credible multi-agency disaster-response scenario.
 
 ## Scenario
 
@@ -87,7 +87,7 @@ python -m examples.multi_agency.run --playback session.jsonl --speed 5
 examples/
   common/              Shared framework (scenario engine, generators,
                        compromise behaviors, playback, deployment)
-  civilian/
+  multi_agency/
     scenario.py        10-peer disaster response scenario definition
     generators/        NOAA weather, USGS seismic, EPA air quality
     compromise/        Falsified sensor behaviors (drift, abrupt)

@@ -43,17 +43,17 @@ Examples:
     # Where is rep traffic going on the wire? (replaces the ad-hoc python
     # one-liner that sliced outbound_routed by host x function.)
     probe-flow.py --counts outbound_routed --function-substr reputation \\
-                  --dir deploy/civilian/at-probes
+                  --dir deploy/multi_agency/at-probes
 
     # Did the bridge's tasking_tick(3) fire and how many messages did it
     # actually queue? Counter aggregates from the inspector probe file.
     probe-flow.py --counters --layer-prefix bridge.task \\
-                  --host inspector --dir deploy/civilian/at-probes
+                  --host inspector --dir deploy/multi_agency/at-probes
 
     # Pick five inspector-origin rep_req trace_ids to reconstruct.
     probe-flow.py --sample-trace --event new --host inspector \\
                   --function 'request reputation' -n 5 \\
-                  --dir deploy/civilian/at-probes
+                  --dir deploy/multi_agency/at-probes
 """
 import argparse
 import collections

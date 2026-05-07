@@ -9,15 +9,17 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 # ******************
 
-# Civilian-demo inspector image: extends the AT-native peer image with
-# Dash dependencies and the sibling autonomous_trust.* subpackages
+# AT inspector image: extends the AT-native peer image with Dash
+# dependencies and the sibling autonomous_trust.* subpackages
 # (evaluation, inspector, services, simulator). Runs the Dash server
-# AND a CivilianInspectorBridge on the same docker network as the
-# peers so it can actually observe them.
+# AND an InspectorBridge on the same docker network as the peers so
+# it can actually observe them. The default CMD launches the
+# multi-agency example; override CMD/ENTRYPOINT to point at a
+# different demo entry.
 #
 # Build from the repo root (context must include src/):
 #   docker build -t autonomous-trust-inspector:dev \
-#                -f src/autonomous-trust-inspector/Dockerfile-civilian .
+#                -f src/autonomous-trust-inspector/Dockerfile .
 
 ARG BASE_IMAGE=autonomous-trust:dev
 FROM ${BASE_IMAGE}
@@ -34,7 +36,7 @@ WORKDIR /app
 # before opening the logfile.
 RUN mkdir -p /var/at /etc/at && chmod 0777 /var/at /etc/at
 
-# Extra Python deps for the Dash-based civilian dashboard.
+# Extra Python deps for the Dash-based multi-agency dashboard.
 RUN pip install --no-cache-dir \
         "dash>=4.0.0" \
         "dash-bootstrap-components>=2.0.0" \
@@ -64,11 +66,15 @@ COPY src/autonomous-trust-evaluation/autonomous_trust  /opt/at-evaluation/autono
 COPY src/autonomous-trust-services/autonomous_trust    /opt/at-services/autonomous_trust
 COPY src/autonomous-trust-simulator/autonomous_trust   /opt/at-simulator/autonomous_trust
 
-ENV PYTHONPATH=/opt/at-inspector:/opt/at-evaluation:/opt/at-services:/opt/at-simulator:/app
+# Multi-agency demo lives under examples/, not in the inspector package;
+# put it on PYTHONPATH so `python -m examples.multi_agency` resolves.
+COPY examples/multi_agency  /opt/examples/multi_agency
 
-# The base image's entrypoint launches an AT peer daemon; the civilian
+ENV PYTHONPATH=/opt/at-inspector:/opt/at-evaluation:/opt/at-services:/opt/at-simulator:/opt:/app
+
+# The base image's entrypoint launches an AT peer daemon; the multi-agency
 # inspector runs its own process tree, so clear it.
 ENTRYPOINT []
 EXPOSE 8050
-CMD ["python3", "-m", "autonomous_trust.inspector", \
-     "--demo-civilian", "--port", "8050", "--log-level", "info"]
+CMD ["python3", "-m", "examples.multi_agency", \
+     "--port", "8050", "--log-level", "info"]
