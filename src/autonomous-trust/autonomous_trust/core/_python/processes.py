@@ -199,7 +199,7 @@ class Process(metaclass=ProcMeta):
         # queue (e.g. main proc backlogged with rep_resp traffic) would
         # silently block updates from reaching every queue iterated
         # AFTER it — manifested as PeerCapabilities updates landing on
-        # main but never on bridge-data-rcvr in the civilian demo.
+        # main but never on bridge-data-rcvr in the multi-agency demo.
         from queue import Full as _Full
         try:
             from . import _probes

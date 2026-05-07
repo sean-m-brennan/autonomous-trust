@@ -1,5 +1,5 @@
 """
-Cross-source validation task for the civilian disaster response demo.
+Cross-source validation task for the multi-agency disaster response demo.
 
 This is the mechanism by which the network detects the compromised
 NOAA sensor.  FEMA fusion nodes compare temperature readings from
@@ -134,7 +134,7 @@ class CrossSourceValidator:
         )
 
 
-# Default validators for the civilian demo
+# Default validators for the multi-agency demo
 TEMPERATURE_VALIDATOR = CrossSourceValidator(
     data_type="temperature",
     threshold=5.0,      # Flag if >5C from consensus

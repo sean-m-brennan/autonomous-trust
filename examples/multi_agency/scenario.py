@@ -48,7 +48,7 @@ EPA_PURPLE = "#8B5CF6"
 
 
 class DisasterResponseScenario(Scenario):
-    """Multi-agency disaster response scenario for the civilian demo."""
+    """Multi-agency disaster response scenario for the demo."""
 
     @property
     def name(self) -> str:

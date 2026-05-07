@@ -6,7 +6,7 @@
 # Prerequisites (build from repo root):
 #   docker build -t autonomous-trust-devel -f src/autonomous-trust/Dockerfile-devel .
 #   docker build -t autonomous-trust-full-devel -f src/Dockerfile-devel .
-#   docker build -t at-civilian-demo -f examples/multi_agency/deploy/Dockerfile .
+#   docker build -t at-multi-agency-demo -f examples/multi_agency/deploy/Dockerfile .
 #
 # Run:
 #   docker compose -f examples/multi_agency/deploy/docker-compose.yml up
@@ -14,7 +14,7 @@
 # Dashboard: http://localhost:8050
 
 x-common: &common
-  image: at-civilian-demo
+  image: at-multi-agency-demo
   networks:
     - demo-net
   restart: unless-stopped
@@ -33,7 +33,7 @@ services:
   # Simulator — computes network topology and peer connectivity
   simulator:
     <<: *common
-    container_name: civilian-simulator
+    container_name: multi-agency-simulator
     environment:
       <<: *common-env
       AUTONOMOUS_TRUST_EXE: "-m autonomous_trust.simulator"
@@ -50,7 +50,7 @@ services:
   # Coordinator — runs the dashboard and aggregates data
   coordinator:
     <<: *common
-    container_name: civilian-coordinator
+    container_name: multi-agency-coordinator
     environment:
       <<: *common-env
       AUTONOMOUS_TRUST_EXE: "examples/multi_agency/coordinator.py"

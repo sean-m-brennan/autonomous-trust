@@ -1,0 +1,154 @@
+# Tiltfile for AutonomousTrust multi-agency disaster-response demo (k8s)
+# Usage: tilt up -- --variant=multi-agency [--namespace=disaster-demo]
+#                                      [--log-level=info]
+#
+# What this does:
+#   1. Regenerates docker-compose.yaml + kubernetes/ manifests from the
+#      DisasterResponseScenario definition (single source of truth).
+#   2. Builds three images: base (autonomous-trust), peer overlay
+#      (autonomous-trust-disaster), inspector overlay
+#      (autonomous-trust-inspector).
+#   3. Applies all manifests via k8s_yaml.
+#   4. Port-forwards the inspector NodePort to localhost:8050 for the
+#      Tilt UI 'Open Web View' affordance.
+#
+# Live-reload: changes under src/autonomous-trust*/autonomous_trust/
+# trigger image rebuild and rolling-update of affected Deployments.
+
+namespace = os.getenv("_TILT_NAMESPACE", "disaster-demo")
+log_level = os.getenv("_TILT_LOG_LEVEL", "info")
+
+# Run against whatever k8s context the user has selected. minikube,
+# kind, k3d, etc. all work — the manifests are NodePort-based, no
+# cluster-specific networking assumptions beyond a flat pod network.
+allow_k8s_contexts(k8s_context())
+
+repo_root = ".."
+deploy_dir = repo_root + "/deploy/multi_agency"
+
+# --- Manifest regeneration -------------------------------------------------
+# Mirrors `scripts/run-demo-multi-agency.sh` PYTHONPATH and CLI invocation so
+# Tilt produces the same artifacts the launcher script does. Runs once on
+# Tiltfile evaluation; the local_resource below re-runs it whenever the
+# generator or scenario sources change.
+_at_src = ":".join([
+    repo_root + "/src/autonomous-trust",
+    repo_root + "/src/autonomous-trust-evaluation",
+    repo_root + "/src/autonomous-trust-inspector",
+    repo_root + "/src/autonomous-trust-services",
+    repo_root + "/src/autonomous-trust-simulator",
+])
+_gen_cmd = " ".join([
+    "PYTHONPATH=" + _at_src,
+    "python3 -m autonomous_trust.evaluation.scenarios.disaster_response_compose",
+    "--out " + deploy_dir,
+    "--namespace " + namespace,
+    "--image autonomous-trust-disaster",
+    "--image-tag :dev",
+    "--log-level " + log_level,
+])
+local(_gen_cmd, quiet=True, echo_off=True)
+
+# Re-run manifest generation when the generator or scenario definition
+# changes. The deps list is what triggers a re-run; outputs (the YAML
+# files) are not declared because Tilt watches them via the explicit
+# k8s_yaml() paths below.
+local_resource(
+    "multi-agency-manifests",
+    cmd=_gen_cmd,
+    deps=[
+        repo_root + "/src/autonomous-trust-evaluation/autonomous_trust/evaluation/scenarios/disaster_response.py",
+        repo_root + "/src/autonomous-trust-evaluation/autonomous_trust/evaluation/scenarios/disaster_response_compose.py",
+        repo_root + "/src/autonomous-trust-evaluation/autonomous_trust/evaluation/scenarios/scenario.py",
+    ],
+    labels=["scenario"],
+)
+
+# --- Build args (proxy / cert / git version) ------------------------------
+build_args = {}
+for var in ["http_proxy", "https_proxy", "no_proxy"]:
+    val = os.getenv(var, "")
+    if val:
+        build_args[var] = val
+
+cert_content = os.getenv("CERT_CONTENT", "")
+if not cert_content:
+    cert_path = "/usr/local/share/ca-certificates/proxy-ca.crt"
+    result = str(local("cat " + cert_path + " 2>/dev/null || true",
+                       quiet=True, echo_off=True))
+    if result.strip():
+        cert_content = result.strip()
+if cert_content:
+    build_args["CERT_CONTENT"] = cert_content
+
+git_version = str(local("git describe HEAD 2>/dev/null || echo unknown",
+                        quiet=True, echo_off=True)).strip()
+git_version = git_version.removeprefix("v")
+build_args["GIT_VERSION"] = git_version
+
+# --- Image builds ---------------------------------------------------------
+# Three-image chain (mirrors run-demo-multi-agency.sh):
+#   autonomous-trust            base (.core only)
+#   autonomous-trust-disaster   adds .evaluation + .services so peer
+#                               pods can run disaster_response_demo
+#   autonomous-trust-inspector  adds Dash deps + sibling AT subpackages
+# Each manifest references one of these by name; Tilt rewrites tags at
+# apply time, so the YAML's :dev tag is fine.
+
+docker_build(
+    "autonomous-trust",
+    repo_root,
+    dockerfile=repo_root + "/src/autonomous-trust/Dockerfile-native",
+    network="host",
+    build_args=build_args,
+)
+
+docker_build(
+    "autonomous-trust-disaster",
+    repo_root,
+    dockerfile=repo_root + "/src/autonomous-trust-evaluation/Dockerfile-disaster",
+    network="host",
+    build_args=build_args,
+)
+
+docker_build(
+    "autonomous-trust-inspector",
+    repo_root,
+    dockerfile=repo_root + "/src/autonomous-trust-inspector/Dockerfile-multi-agency",
+    network="host",
+    build_args=build_args,
+)
+
+# --- K8s manifests --------------------------------------------------------
+# Order matters for first-time apply: namespace before the rest. Tilt
+# orders by reading the namespace metadata in each doc, but listing
+# namespace.yaml first keeps the kubectl-equivalent ordering obvious.
+k8s_yaml([
+    deploy_dir + "/kubernetes/namespace.yaml",
+    deploy_dir + "/kubernetes/scenario-config.yaml",
+    deploy_dir + "/kubernetes/noaa.yaml",
+    deploy_dir + "/kubernetes/usgs.yaml",
+    deploy_dir + "/kubernetes/fema.yaml",
+    deploy_dir + "/kubernetes/epa.yaml",
+    deploy_dir + "/kubernetes/inspector.yaml",
+])
+
+# Group resources for the Tilt UI. The inspector gets a port-forward so
+# 'Open Web View' lands on http://localhost:8050. NodePort 30850 is
+# still exposed for direct cluster access (e.g. demo presenters using
+# `minikube service`).
+k8s_resource(
+    "multi-agency-inspector",
+    port_forwards=["8050:8050"],
+    labels=["inspector"],
+)
+
+# --- Watch sources --------------------------------------------------------
+watch_file(repo_root + "/src/autonomous-trust/autonomous_trust")
+watch_file(repo_root + "/src/autonomous-trust-evaluation/autonomous_trust")
+watch_file(repo_root + "/src/autonomous-trust-services/autonomous_trust")
+watch_file(repo_root + "/src/autonomous-trust-inspector/autonomous_trust")
+
+# Don't fight ourselves over the generated tree: the local_resource
+# above is the only thing that should write under deploy/multi_agency/.
+watch_settings(ignore=[deploy_dir])

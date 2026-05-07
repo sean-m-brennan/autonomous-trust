@@ -1,5 +1,5 @@
 """
-Civilian demo coordinator / inspector node.
+Multi-agency demo coordinator / inspector node.
 
 Aggregates data from all participants, runs the dashboard with
 demo-specific panels (trust timeline, sensor comparison, event log),
@@ -41,8 +41,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-class CivilianCoordinator(AutonomousTrust):
-    """Coordinator node for the civilian disaster response demo.
+class MultiAgencyCoordinator(AutonomousTrust):
+    """Coordinator node for the multi-agency disaster response demo.
 
     Extends AutonomousTrust with:
     - Peer cohort tracking (for dashboard)
@@ -72,7 +72,7 @@ class CivilianCoordinator(AutonomousTrust):
 
     def init_tasking(self, queues):
         """Called once before the main loop starts."""
-        logger.info("Civilian coordinator starting (compromise_mode=%s)",
+        logger.info("Multi-agency coordinator starting (compromise_mode=%s)",
                     self._compromise_mode)
 
         if self._record_path:
@@ -114,7 +114,7 @@ class CivilianCoordinator(AutonomousTrust):
 
     def cleanup(self):
         """Graceful shutdown."""
-        logger.info("Civilian coordinator shutting down")
+        logger.info("Multi-agency coordinator shutting down")
 
 
 def main():
@@ -148,8 +148,8 @@ def main():
         print("Setup complete for coordinator")
         return
 
-    logger.info("Starting civilian coordinator")
-    coordinator = CivilianCoordinator(
+    logger.info("Starting multi-agency coordinator")
+    coordinator = MultiAgencyCoordinator(
         record_path=record_path,
         compromise_mode=compromise_mode,
         log_level=log_level,

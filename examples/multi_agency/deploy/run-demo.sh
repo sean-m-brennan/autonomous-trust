@@ -4,7 +4,7 @@
 #  Licensed under the Apache License, Version 2.0
 # ******************
 #
-# run-demo.sh — Build and run the civilian disaster response demo.
+# run-demo.sh — Build and run the multi-agency disaster response demo.
 #
 # Usage:
 #   ./run-demo.sh [--skip-build] [--playback FILE] [--speed N]
@@ -20,7 +20,7 @@ COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 # Image names (must be built in order)
 BASE_IMAGE="autonomous-trust-devel"
 FULL_IMAGE="autonomous-trust-full-devel"
-DEMO_IMAGE="at-civilian-demo"
+DEMO_IMAGE="at-multi-agency-demo"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -63,7 +63,7 @@ if [ "$do_build" -eq 1 ]; then
             -f "$REPO_ROOT/src/Dockerfile-devel" "$REPO_ROOT"
     fi
 
-    log "Building civilian demo image: $DEMO_IMAGE ..."
+    log "Building multi-agency demo image: $DEMO_IMAGE ..."
     docker build --network host -t "$DEMO_IMAGE" \
         -f "$SCRIPT_DIR/Dockerfile" "$REPO_ROOT"
 elif ! docker image inspect "$DEMO_IMAGE" >/dev/null 2>&1; then

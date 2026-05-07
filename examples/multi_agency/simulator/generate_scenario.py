@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate the simulator scenario.yaml for the civilian demo.
+Generate the simulator scenario.yaml for the multi-agency demo.
 
 Translates the Python scenario definition into the YAML format that
 the AT simulator expects (PeerInfo objects with positions, paths,
@@ -28,7 +28,7 @@ from examples.multi_agency.scenario import DisasterResponseScenario
 
 
 def generate_scenario_yaml(output_path: str | None = None) -> str:
-    """Generate scenario YAML from the civilian scenario definition."""
+    """Generate scenario YAML from the multi-agency scenario definition."""
     scenario = DisasterResponseScenario()
 
     # Build peer list in simulator format

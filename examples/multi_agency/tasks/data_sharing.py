@@ -1,5 +1,5 @@
 """
-Data-sharing task definitions for the civilian disaster response demo.
+Data-sharing task definitions for the multi-agency disaster response demo.
 
 These define the negotiable tasks that peers advertise and fulfill
 through the AutonomousTrust negotiation protocol.  Each task maps to
@@ -55,7 +55,7 @@ class TaskDefinition:
         }
 
 
-# --- Standard civilian demo tasks ---
+# --- Standard multi-agency demo tasks ---
 
 WEATHER_STREAM = TaskDefinition(
     task_type="weather_stream",

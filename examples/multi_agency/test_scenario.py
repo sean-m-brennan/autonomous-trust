@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Verification tests for the civilian disaster response demo.
+Verification tests for the multi-agency disaster response demo.
 
 Exercises the scenario engine, data generators, compromise detection,
 and playback recording/replay without requiring the full AT stack.
@@ -258,7 +258,7 @@ def test_task_definitions():
 
 
 def main():
-    print("=== Civilian Demo Verification ===\n")
+    print("=== Multi-Agency Demo Verification ===\n")
 
     test_scenario_definition()
     test_scenario_advancement()

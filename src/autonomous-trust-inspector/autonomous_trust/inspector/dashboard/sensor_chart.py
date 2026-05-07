@@ -52,14 +52,28 @@ class SensorComparisonChart:
     def __init__(self, data_type: str, unit: str,
                  peer_colors: dict[str, str],
                  window_sec: float = 120.0,
-                 title: Optional[str] = None):
+                 title: Optional[str] = None,
+                 highlight_peer: Optional[str] = None,
+                 highlight_color: str = "#ffffff"):
         self._data_type = data_type
         self._unit = unit
         self._peer_colors = peer_colors
         self._window_sec = window_sec
         self._title = title or f"{data_type.replace('_', ' ').title()} Comparison"
         self._traces: dict[str, _PeerTrace] = {}
-        self._max_points = int(window_sec / 5) * 2  # generous buffer
+        # Buffer must comfortably cover the visible window even at the
+        # finest expected cadence (~1 Hz in the demo). The old formula
+        # `int(window_sec/5)*2` assumed 5-second cadence and silently
+        # truncated the deque to ~48 samples, which let the rolling
+        # window collapse as old samples were evicted faster than the
+        # window scrolled. 2x window plus a 60-sample floor is cheap
+        # in memory and robust across cadences.
+        self._max_points = max(int(window_sec * 2), 60)
+        # Selected peer gets a contrasting color and thicker stroke so
+        # the user can distinguish it from same-agency corroborators
+        # (which otherwise share one color).
+        self._highlight_peer = highlight_peer
+        self._highlight_color = highlight_color
 
     def add_reading(self, reading: Reading):
         """Add a reading from any peer."""
@@ -95,7 +109,10 @@ class SensorComparisonChart:
             return fig
 
         t_max = max(all_t)
-        t_min = max(0, t_max - self._window_sec)
+        # Ride the rolling window once enough history exists, but
+        # collapse left to the earliest sample before then so lines
+        # span the full plot instead of clustering on the right.
+        t_min = max(0, t_max - self._window_sec, min(all_t))
 
         # Consensus band: fill between min and max of non-anomalous peers
         honest_peers = [
@@ -152,11 +169,16 @@ class SensorComparisonChart:
                 dash = "dash"
                 line_width = 3
 
+            color = trace.color
+            if name == self._highlight_peer:
+                color = self._highlight_color
+                line_width = max(line_width, 3)
+
             fig.add_trace(go.Scatter(
                 x=ts, y=vs,
                 mode="lines",
                 name=name,
-                line=dict(color=trace.color, width=line_width, dash=dash),
+                line=dict(color=color, width=line_width, dash=dash),
             ))
 
         # Anomaly shading

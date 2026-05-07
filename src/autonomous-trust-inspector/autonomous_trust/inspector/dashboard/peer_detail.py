@@ -157,22 +157,20 @@ class PeerDetailPanel:
     # --- body tabs ---------------------------------------------------
 
     def _body(self, s: PeerDetailState) -> str:
-        # Compromised peers get the divergence panel open first.
+        # Compromised peers get the data streams panel open first; the
+        # Sensor Readings chart itself lives outside the iframe (in a
+        # sibling html.Details owned by the Dash callback layer) so the
+        # actual chart can be a dcc.Graph rather than baked-in HTML.
         tabs = [
             self._section("Identity", self._identity(s),
                           default_open=(s.status != "compromised")),
             self._section("Reputation", self._reputation(s),
                           default_open=False),
             self._section("Data Streams", self._streams(s),
+                          default_open=(s.status == "compromised")),
+            self._section("Capabilities", self._capabilities(s),
                           default_open=False),
         ]
-        if s.kind in ("weather-sensor", "seismic-monitor",
-                      "air-quality-monitor"):
-            tabs.append(self._section(
-                "Sensor Readings", self._sensor_readings(s),
-                default_open=(s.status == "compromised")))
-        tabs.append(self._section(
-            "Capabilities", self._capabilities(s), default_open=False))
         return '<div>' + "".join(tabs) + '</div>'
 
     @staticmethod
@@ -279,26 +277,6 @@ class PeerDetailPanel:
             )
 
         return _block("Producing", s.producing) + _block("Consuming", s.consuming)
-
-    def _sensor_readings(self, s: PeerDetailState) -> str:
-        # Placeholder div; the callback layer swaps in a Plotly Graph with
-        # the SensorComparisonChart figure when the peer is a sensor.
-        slot_id = f"peer-detail-sensor-{_esc(s.name)}"
-        hint = ("This peer's readings (red dashed) against corroborating "
-                "sources (solid). Divergence beyond the consensus band "
-                "triggers reputation loss.")
-        if s.status != "compromised":
-            hint = ("Real-time readings from this sensor compared against "
-                    "other peers of the same data type.")
-        return (
-            f'<div id="{slot_id}" style="min-height:180px;'
-            f'background:#0b0f1a;border-radius:4px;padding:6px">'
-            f'<div class="demo-placeholder" style="height:160px">'
-            f'Sensor chart loads when live data arrives'
-            f'</div></div>'
-            f'<div style="color:#64748b;font-size:10px;margin-top:4px">'
-            f'{_esc(hint)}</div>'
-        )
 
     def _capabilities(self, s: PeerDetailState) -> str:
         if not s.capabilities:

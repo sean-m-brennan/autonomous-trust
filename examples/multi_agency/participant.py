@@ -1,5 +1,5 @@
 """
-Civilian demo participant node.
+Multi-agency demo participant node.
 
 Each sensor peer (NOAA, USGS, EPA) runs as an instance of this class.
 It inherits from AutonomousTrust and registers data-source workers
@@ -35,8 +35,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-class CivilianParticipant(AutonomousTrust):
-    """An AT node for the civilian disaster response demo."""
+class MultiAgencyParticipant(AutonomousTrust):
+    """An AT node for the multi-agency disaster response demo."""
 
     def __init__(self, peer_name: str, agency: str, **kwargs):
         self.peer_name = peer_name
@@ -97,8 +97,8 @@ def main():
     else:
         time.sleep(random.uniform(1, 5))
 
-    logger.info("Starting civilian participant: %s (%s)", peer_name, agency)
-    participant = CivilianParticipant(peer_name, agency, log_level=log_level)
+    logger.info("Starting multi-agency participant: %s (%s)", peer_name, agency)
+    participant = MultiAgencyParticipant(peer_name, agency, log_level=log_level)
     participant.run_forever()
 
 

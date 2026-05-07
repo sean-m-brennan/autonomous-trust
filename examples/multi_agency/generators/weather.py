@@ -1,5 +1,5 @@
 """
-NOAA weather data generators for the civilian disaster response demo.
+NOAA weather data generators for the multi-agency disaster response demo.
 
 Produces realistic hurricane-season readings for coastal North Carolina:
   - Temperature (diurnal sinusoid + hurricane warming trend)

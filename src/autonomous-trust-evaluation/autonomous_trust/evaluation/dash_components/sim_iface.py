@@ -18,8 +18,9 @@ import atexit
 import logging
 import threading
 import time
+from datetime import datetime
 from queue import Queue
-from typing import Callable
+from typing import Callable, Optional
 
 from autonomous_trust.inspector.peer.daq import CohortInterface
 from autonomous_trust.inspector.dash_components.core import DashControl
@@ -27,14 +28,31 @@ from autonomous_trust.simulator.sim_client import SimClient
 from autonomous_trust.simulator import default_port
 from autonomous_trust.simulator.sim_data import SimState
 
+from ..scenarios.scenario_iface import ScenarioInterface, ScenarioState
 
-class SimulationInterface(CohortInterface):
+
+class SimulationInterface(CohortInterface, ScenarioInterface):
+    """TCP-simulator-driven scenario source.
+
+    Drains states pushed by an ``autonomous_trust.simulator`` instance
+    over a TCP socket; fans them out to update / end / reset handlers.
+    Used by mission/. The ``ScenarioInterface`` mixin lets this share
+    typing with ``PlaybackInterface`` (the in-process equivalent for
+    multi_agency/), so a Dash app can be written against the ABC.
+    """
+
     cadence = 1
 
     def __init__(self, dash_info: DashControl, sim_host: str = '127.0.0.1', sim_port: int = default_port,
                  sync_objects: list[CohortInterface] = None, log_level: int = logging.INFO, logfile: str = None):
-        super().__init__(log_level=log_level, logfile=logfile)
-        self.tick = 0
+        # Initialize both bases. CohortInterface owns the AT-side
+        # plumbing (peers/time/log); ScenarioInterface owns the
+        # generic handler lists.
+        CohortInterface.__init__(self, log_level=log_level, logfile=logfile)
+        ScenarioInterface.__init__(self)
+        # Frame index from SimClient (was previously named `tick` —
+        # renamed to avoid colliding with ScenarioInterface.tick()).
+        self.frame_idx = 0
         self.ctl = dash_info
         self.app = dash_info.app
         self.client = SimClient(callback=self.state_to_queue(), logger=self.logger, passive=False)
@@ -46,10 +64,68 @@ class SimulationInterface(CohortInterface):
         self.sync_objects = sync_objects
         if sync_objects is None:
             self.sync_objects: list[CohortInterface] = []
-        self.reset_handlers: list[Callable] = []  # additional work to do at reset, set externally
-        self.end_handlers: list[Callable] = []  # work to do upon end (before reset)
-        self.update_handlers: list[Callable[[SimState], None]] = []  # work to do on each update
+        # Most recent SimState received; surfaced via current_time and
+        # used by tick() snapshots.
+        self._latest_state: Optional[SimState] = None
         atexit.register(self.interrupt)
+
+    # --- legacy registration aliases (pre-ScenarioInterface code uses
+    #     these list names; ScenarioInterface stores in
+    #     _update_handlers / _end_handlers / _reset_handlers).
+    @property
+    def update_handlers(self) -> list:
+        return self._update_handlers
+
+    @property
+    def end_handlers(self) -> list:
+        return self._end_handlers
+
+    @property
+    def reset_handlers(self) -> list:
+        return self._reset_handlers
+
+    # --- ScenarioInterface contract ---------------------------------
+
+    @property
+    def current_time(self) -> float:
+        """Latest SimState's time (seconds since epoch); 0 if none yet."""
+        if self._latest_state is None or self._latest_state.time is None:
+            return 0.0
+        t = self._latest_state.time
+        if isinstance(t, datetime):
+            return t.timestamp()
+        return float(t)
+
+    def tick(self) -> ScenarioState:
+        """Snapshot the latest SimState and fan out to update handlers.
+
+        The simulator pushes states asynchronously via ``state_to_queue``,
+        so tick() doesn't itself drive the timeline — it just exposes
+        the most recent push to consumers that prefer pull semantics.
+        """
+        state = ScenarioState(
+            time_seconds=self.current_time,
+            playing=not self.paused,
+            mode="simulator",
+            source_specific={
+                "frame_idx": self.frame_idx,
+                "sim_state": self._latest_state,
+            },
+        )
+        self._fire_update(state)
+        return state
+
+    def reset(self) -> None:
+        """Fire reset handlers; lifecycle is otherwise driven by the
+        simulator's blank-state signal in ``update()``."""
+        self._fire_reset()
+
+    def toggle(self) -> None:
+        self.paused = not self.paused
+        for obj in self.sync_objects:
+            obj.paused = self.paused
+
+    # --- lifecycle --------------------------------------------------
 
     def start(self):
         self.client_thread.start()
@@ -58,15 +134,6 @@ class SimulationInterface(CohortInterface):
     def stop(self):
         self.halt = True
         self.client.halt = True
-
-    def register_update_handler(self, handler: Callable):
-        self.update_handlers.append(handler)
-
-    def register_end_handler(self, handler: Callable):
-        self.end_handlers.append(handler)
-
-    def register_reset_handler(self, handler: Callable):
-        self.reset_handlers.append(handler)
 
     @property
     def resolution(self):
@@ -85,7 +152,8 @@ class SimulationInterface(CohortInterface):
     def state_to_queue(self):
         def cb(state):
             if state is not None:
-                self.tick = self.client.tick
+                self.frame_idx = self.client.tick
+                self._latest_state = state
                 self.queue.put(state, block=True, timeout=None)
         return cb
 
@@ -95,7 +163,7 @@ class SimulationInterface(CohortInterface):
         for obj in self.sync_objects:
             obj.update()
             obj.paused = self.paused
-        for handler in self.update_handlers:
+        for handler in self._update_handlers:
             handler(state)
         if state.blank:
             self.logger.debug('Sim update; reset %s' % state.blank)
@@ -103,12 +171,12 @@ class SimulationInterface(CohortInterface):
             for obj in self.sync_objects:
                 obj.paused = self.paused
             self.can_reset = True
-            for handler in self.end_handlers:
+            for handler in self._end_handlers:
                 handler()
             while self.paused:
                 time.sleep(0.1)
             self.can_reset = False
-            for handler in self.reset_handlers:
+            for handler in self._reset_handlers:
                 handler()
             for obj in self.sync_objects:
                 obj.paused = self.paused

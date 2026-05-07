@@ -91,7 +91,7 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         idx = seed % len(_names)
         fullname = _names[idx]
         nickname = fullname.split('@')[0].rsplit('.', 1)[1]
-        # If the deployment supplies AT_PEER_NAME (e.g. the civilian
+        # If the deployment supplies AT_PEER_NAME (e.g. the multi-agency
         # demo's compose generator labels each container 'noaa-1',
         # 'fema-fusion', ...), honor it as the AT identity nickname so
         # downstream observers — the inspector bridge, dashboards,
