@@ -1,5 +1,5 @@
 """
-Full-screen presentation layout for the civilian demo.
+Full-screen presentation layout for the multi-agency demo.
 
 Arranges all dashboard components into a single-page dark-themed layout
 optimized for projection / screen sharing.  The layout is:
@@ -29,7 +29,7 @@ from typing import Optional
 
 from autonomous_trust.inspector.dashboard.narration import NarrationOverlay
 from autonomous_trust.inspector.dashboard.playback_controls import PlaybackControls, PlaybackState
-from examples.multi_agency.dashboard.narration_script import CIVILIAN_NARRATION
+from examples.multi_agency.dashboard.narration_script import MULTI_AGENCY_NARRATION
 from examples.multi_agency.scenario import (
     DisasterResponseScenario,
     NOAA_BLUE, USGS_GREEN, FEMA_ORANGE, EPA_PURPLE,
@@ -64,7 +64,7 @@ class PresentationLayout:
 
     def __init__(self, scenario: DisasterResponseScenario):
         self._scenario = scenario
-        self._narration = NarrationOverlay(script=CIVILIAN_NARRATION)
+        self._narration = NarrationOverlay(script=MULTI_AGENCY_NARRATION)
         self._playback = PlaybackControls(
             phases=[(p.name, p.start.total_seconds()) for p in scenario.phases],
             duration=scenario.duration.total_seconds(),

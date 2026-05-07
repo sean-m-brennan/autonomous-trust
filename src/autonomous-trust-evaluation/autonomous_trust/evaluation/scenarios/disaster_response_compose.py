@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-"""Docker Compose + Kubernetes manifest generation for the civilian demo.
+"""Docker Compose + Kubernetes manifest generation for the multi-agency demo.
 
 Takes a DisasterResponseScenario (or any Scenario subclass whose peers
 have agency/kind metadata) and emits:
@@ -51,7 +51,8 @@ class ComposeOptions:
     # Peer image must include autonomous_trust.evaluation + .services so
     # the disaster_response_demo entrypoint can import. The bare
     # autonomous-trust image only ships .core; see
-    # src/autonomous-trust-evaluation/Dockerfile-disaster.
+    # src/autonomous-trust-evaluation/Dockerfile for the overlay that
+    # produces this image.
     image: str = "autonomous-trust-disaster"
     registry: str = ""                   # e.g. "ghcr.io/tekfive/"
     image_tag: str = ""                  # e.g. ":demo" or "@sha256:..."
@@ -64,7 +65,7 @@ class ComposeOptions:
     scenario_mount: str = "/app/scenario"  # path where scenario.json is mounted
     metrics_mount: Optional[str] = None    # host path for metrics-collector dir
     extra_env: dict[str, str] = field(default_factory=dict)
-    # Civilian-demo inspector container. Runs the Dash server + bridge
+    # Multi-agency-demo inspector container. Runs the Dash server + bridge
     # on the same demo-net so it can observe peer traffic. Shares the
     # registry/image_tag of the peer image.
     inspector_image: str = "autonomous-trust-inspector"
@@ -75,7 +76,7 @@ class ComposeOptions:
     # true, every container gets AT_PROBES=1 and the host directory
     # `probes_host_dir` is bind-mounted at `probes_container_dir`. Defaults
     # honor host env so callers can flip probes on with
-    # `AT_PROBES=1 ./scripts/run-demo-civilian.sh` without code changes.
+    # `AT_PROBES=1 ./scripts/run-demo-multi-agency.sh` without code changes.
     probes: bool = field(default_factory=lambda: bool(os.environ.get('AT_PROBES')))
     probes_host_dir: str = field(default_factory=lambda: os.environ.get('AT_PROBES_HOST_DIR', './at-probes'))
     probes_container_dir: str = '/var/at-probes'
@@ -167,7 +168,7 @@ def _peer_entry(peer_name: str, role, ip: str, delay_sec: int,
 
 
 def _inspector_entry(opts: ComposeOptions) -> list[str]:
-    """Build the compose service for the civilian inspector container."""
+    """Build the compose service for the multi-agency inspector container."""
     image = f"{opts.registry}{opts.inspector_image}{opts.image_tag}"
     ip = f"{opts.subnet.rsplit('.', 1)[0]}.{opts.inspector_last_octet}"
     env_lines = [
@@ -208,15 +209,14 @@ def _inspector_entry(opts: ComposeOptions) -> list[str]:
     return [
         "  inspector:",
         f"    image: {image}",
-        "    container_name: civilian-inspector",
-        "    hostname: civilian-inspector",
+        "    container_name: multi-agency-inspector",
+        "    hostname: multi-agency-inspector",
         "    environment:",
         *env_lines,
         "    command:",
         '      - "python3"',
         '      - "-m"',
-        '      - "autonomous_trust.inspector"',
-        '      - "--demo-civilian"',
+        '      - "examples.multi_agency"',
         '      - "--port"',
         '      - "8050"',
         '      - "--log-level"',
@@ -327,6 +327,124 @@ def _env_block(env: dict[str, str], indent: str = "            ") -> str:
     return "\n".join(out)
 
 
+# NodePort for the in-cluster inspector. Falls in the standard
+# 30000-32767 range that k8s reserves for NodePort services.
+_INSPECTOR_NODE_PORT = 30850
+
+
+def _inspector_k8s_yaml(opts: ComposeOptions, namespace: str) -> str:
+    """Deployment + NodePort Service for the multi-agency inspector.
+
+    Mirrors `_inspector_entry` (compose) so behavior is identical
+    across backends. The inspector pod sits on the regular cluster
+    network, talks to peers in the same namespace via TCP, and exposes
+    its Dash UI on NodePort 30850 so `minikube service` yields a
+    browser-ready URL."""
+    image = f"{opts.registry}{opts.inspector_image}{opts.image_tag}"
+
+    env: dict[str, str] = {
+        "ROUTER": opts.router,
+        "AUTONOMOUS_TRUST_BACKEND": opts.backend,
+        "AT_TRANSPORT": "autonomous_trust.core.network.TCPNetworkProcess",
+        "AT_PEER_NAME": "inspector",
+        # Same race-margin tuning as the compose bridge — inspector joins
+        # an already-bootstrapping mesh, so the choose_group window and
+        # startup delay are both lengthened.
+        "AT_INIT_TIMEOUT_SEC": "30",
+        "STARTUP_DELAY": "45",
+        "LOG_LEVEL": opts.log_level,
+    }
+    # Forward Mapbox env (host → cluster) when present, identical to the
+    # compose path. Skipped silently when unset.
+    for var in ("MAPBOX", "MAPBOX_STYLE"):
+        val = os.environ.get(var)
+        if val:
+            env[var] = val
+    env.update(opts.extra_env)
+
+    return f"""---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multi-agency-inspector
+  namespace: {namespace}
+  labels:
+    app: multi-agency-inspector
+    role: inspector
+    scenario: disaster-response
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: multi-agency-inspector
+  template:
+    metadata:
+      labels:
+        app: multi-agency-inspector
+        role: inspector
+        scenario: disaster-response
+    spec:
+      containers:
+        - name: inspector
+          image: {image}
+          imagePullPolicy: IfNotPresent
+          command:
+            - "python3"
+            - "-m"
+            - "examples.multi_agency"
+            - "--port"
+            - "8050"
+            - "--namespace"
+            - "{namespace}"
+            - "--log-level"
+            - "{opts.log_level}"
+          ports:
+            - name: http
+              containerPort: 8050
+          env:
+            - name: AT_K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+{_env_block(env)}
+          volumeMounts:
+            - name: scenario-cfg
+              mountPath: {opts.scenario_mount}
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8050
+            initialDelaySeconds: 60
+            periodSeconds: 5
+            failureThreshold: 12
+      volumes:
+        - name: scenario-cfg
+          configMap:
+            name: disaster-response-scenario
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: multi-agency-inspector
+  namespace: {namespace}
+  labels:
+    app: multi-agency-inspector
+    role: inspector
+    scenario: disaster-response
+spec:
+  type: NodePort
+  selector:
+    app: multi-agency-inspector
+  ports:
+    - name: http
+      port: 8050
+      targetPort: 8050
+      nodePort: {_INSPECTOR_NODE_PORT}
+"""
+
+
 def generate_k8s_manifests(scenario, namespace: str = "disaster-demo",
                            opts: Optional[ComposeOptions] = None
                            ) -> dict[str, str]:
@@ -416,6 +534,9 @@ def generate_k8s_manifests(scenario, namespace: str = "disaster-demo",
         f"  name: {namespace}\n"
     )
 
+    if opts.include_inspector:
+        files["inspector.yaml"] = _inspector_k8s_yaml(opts, namespace)
+
     return files
 
 
@@ -433,6 +554,8 @@ def write_all(scenario, out_dir: str, namespace: str = "disaster-demo",
         out_dir/kubernetes/namespace.yaml
         out_dir/kubernetes/scenario-config.yaml
         out_dir/kubernetes/<agency>.yaml
+        out_dir/kubernetes/inspector.yaml   (Deployment + NodePort, when
+                                             include_inspector=True)
     """
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(os.path.join(out_dir, "scenario"), exist_ok=True)
@@ -465,7 +588,7 @@ def write_all(scenario, out_dir: str, namespace: str = "disaster-demo",
 def _main(argv=None):
     p = argparse.ArgumentParser(description=(
         "Generate docker-compose and kubernetes manifests for the "
-        "disaster-response civilian demo."))
+        "disaster-response multi-agency demo."))
     p.add_argument("--out", required=True,
                    help="Output directory (will be created).")
     p.add_argument("--namespace", default="disaster-demo",

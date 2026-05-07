@@ -4,7 +4,7 @@
 #  Licensed under the Apache License, Version 2.0
 # ******************
 
-# Civilian disaster response demo image.
+# Multi-agency disaster response demo image.
 # Layers the demo code on top of the full AT development stack.
 #
 # Prerequisites:
@@ -13,7 +13,7 @@
 #     docker build -t autonomous-trust-full-devel -f src/Dockerfile-devel .
 #
 # Build (from repo root):
-#   docker build -t at-civilian-demo -f examples/multi_agency/deploy/Dockerfile .
+#   docker build -t at-multi-agency-demo -f examples/multi_agency/deploy/Dockerfile .
 
 ARG REGISTRY_URL
 ARG IMAGE_TAG

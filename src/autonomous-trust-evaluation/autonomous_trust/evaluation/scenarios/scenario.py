@@ -12,7 +12,7 @@ The scenario engine is a higher-level orchestrator that drives the
 simulator (for network topology), inspector (for dashboard), and
 custom services (data generators, tasks) together.
 
-Both the civilian and DoD demos inherit from this base.
+Both the multi-agency and DoD demos inherit from this base.
 """
 
 from __future__ import annotations

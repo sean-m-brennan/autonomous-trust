@@ -8,20 +8,26 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 # ******************
 
-"""Stage-3a civilian live-mode bridge.
+"""Generic live-mode bridge between an AT mesh and an external dashboard.
 
-The civilian dashboard runs in the main process as a Dash server.
-To observe real AT peers, we spawn a parallel Inspector in a daemon
-thread that joins the AT network and pushes observations into a
-shared multiprocessing queue. The Dash tick callback drains the queue
-and annotates the scenario with live events.
+The dashboard (e.g. a Dash server in the main process) cannot itself
+participate in the AT protocol — it would block its own UI loop.
+``InspectorBridge`` runs an Inspector in a daemon thread: it joins the
+AT network, observes peers, and pushes events to a multiprocessing
+queue the dashboard drains on each tick.
 
-Intentional limits (Stage 3a):
-    - Peer-id to scenario-name matching is best-effort (nickname),
+Scenario-specific wiring lives in caller modules — pass the capability
+→ peer-process-queue map via ``cap_to_proc`` and the bridge subscribes
+to those streams. Everything else (peer_seen / reputation / rep_pair /
+ping / reading event shapes, the rep_req cadence, the PeerCapabilities
+forwarding) is the same regardless of what data is flowing.
+
+Intentional limits:
+    - Peer-id to display-name matching is best-effort (nickname),
       pending AT_PEER_NAME -> identity propagation.
     - Observations annotate the event log but do NOT yet replace
-      _rep_samples synthesis (timeline keeps synthesized shape).
-    - Exclusion / compromise detection is inferred by Stage 3b.
+      synthesized timeline samples.
+    - Exclusion / compromise detection is inferred downstream.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ import queue
 import threading
 import time
 from queue import Empty, Full
-from typing import Optional
+from typing import Mapping, Optional, Type
 
 from autonomous_trust.core import (
     CfgIds, LogLevel, Process, ProcMeta, from_yaml_string,
@@ -51,40 +57,40 @@ from .inspector import Inspector
 logger = logging.getLogger(__name__)
 
 # Bridge event tuple shapes. First element is the tag.
-#   ("peer_seen",  name:str)
+#   ("peer_seen",  name:str, uuid:str, fingerprint:str)
+#       — fired once on first observation; uuid is the peer's AT
+#         Identity UUID, fingerprint is the leading bytes of the peer's
+#         public signing key (hex, 16 chars). Either string may be
+#         empty if the peer's Identity object is missing those fields.
 #   ("reputation", name:str, score:float, wall_t:float)
 #   ("ping",       name:str, rtt_ms:float, wall_t:float)
 #   ("rep_pair",   observer:str, subject:str, score:float, wall_t:float)
-#       — Stage 3b.3(a) bilateral observation: observer's view of subject.
+#       — bilateral observation: observer's view of subject.
 #   ("reading",    peer:str, reading_dict:dict, wall_t:float)
-#       — Stage 3b.4 envdata stream: a single Reading.to_dict() emitted by
-#         a NOAA / USGS / EPA / FEMA peer's EnvData* worker.
-#   ("peer_gone",  name:str)   # Stage 3b future
+#       — single Reading.to_dict() emitted by a peer's data-stream worker.
+#   ("peer_gone",  name:str)   # future
 BRIDGE_QUEUE_MAX = 1024
 
 # Send a peer-to-peer reputation-query round every PEER_PAIR_QUERY_SEC.
-# O(N²) round-trips per round, but N is small (~10 peers) and the network
-# can absorb 100 messages/min easily.
+# O(N²) round-trips per round, but typical N is small (~10 peers) and
+# the network can absorb 100 messages/min easily.
 PEER_PAIR_QUERY_SEC = 60.0
 
-# Capabilities the bridge subscribes to over the network. Each maps to
-# the remote process's queue name so Message(proc_target, request, ...)
-# lands on the right peer worker.
-_RCVR_CAP_TO_PROC = {
-    'weather_stream':    'weather-stream',
-    'seismic_stream':    'seismic-stream',
-    'airquality_stream': 'airquality-stream',
-    'situation_report':  'situation-report',
-    'data_fusion':       'data-fusion',
-}
+# Minimum score delta that triggers a `reputation` / `rep_pair` push to
+# the bridge queue. The bridge polls latest_reputation every ~5s; with
+# a 0.05 floor, sub-5% drift was being suppressed and the dashboard
+# could appear stuck on a seed value (e.g. 0.49). 0.01 lets the UI see
+# small movement without flooding — at most one event per peer per 5s
+# tick anyway.
+REPUTATION_PUSH_DELTA = 0.01
 
 
 def _peer_name(identity_obj) -> str:
     """Best-effort identity -> display name.
 
-    AT Identity has .nickname, .fullname, .uuid. For the civilian demo
-    we prefer nickname (matches scenario's 'noaa-1' style when AT_PEER_NAME
-    propagation is wired; Stage 3b). Falls back to str() if none set.
+    AT Identity has .nickname, .fullname, .uuid. Prefer nickname so
+    bridge events carry the scenario's short label (e.g. 'noaa-1') when
+    AT_PEER_NAME propagation is wired. Falls back to str() if none set.
     """
     for attr in ("nickname", "fullname"):
         v = getattr(identity_obj, attr, None)
@@ -93,25 +99,51 @@ def _peer_name(identity_obj) -> str:
     return str(identity_obj)
 
 
+def _peer_uuid(identity_obj) -> str:
+    """Stringify the peer's UUID (or '' if absent)."""
+    u = getattr(identity_obj, "uuid", None)
+    return "" if u is None else str(u)
+
+
+def _peer_fingerprint(identity_obj) -> str:
+    """Short hex fingerprint of the peer's public signing key.
+
+    Used as a human-comparable key identity in the dashboard's Peer
+    Detail panel. Returns the first 16 hex chars of
+    `signature.publish()` (the peer's verify key, hex-encoded). Falls
+    back to '' if the Identity carries no signature.
+    """
+    sig = getattr(identity_obj, "signature", None)
+    if sig is None:
+        return ""
+    try:
+        pub = sig.publish()
+    except Exception:
+        return ""
+    if isinstance(pub, bytes):
+        pub = pub.decode("ascii", errors="replace")
+    return str(pub)[:16]
+
+
 class BridgeDataRcvr(Process, metaclass=ProcMeta,
                      proc_name='bridge-data-rcvr',
-                     description='Civilian inspector envdata receiver',
+                     description='Inspector bridge envdata receiver',
                      cfg_name='bridge-data-rcvr'):
-    """Forkserver-child worker that subscribes to peer envdata streams
-    and forwards each Reading dict directly to the inspector bridge
-    queue.
+    """Forkserver-child worker that subscribes to peer data streams and
+    forwards each Reading dict directly to the inspector bridge queue.
 
     Differs from `services.data.client.DataRcvr` in two ways:
 
-      1. It subscribes to the disaster-response capability surface
-         (weather / seismic / airquality / situation_report / data_fusion)
-         rather than the generic 'data' capability.
+      1. It subscribes to a caller-supplied capability surface (passed
+         in via the ``cap_to_proc`` kwarg) rather than the generic
+         'data' capability.
       2. It bypasses Cohort-based routing — there's no Cohort on the
          inspector side, only the Manager-backed `bridge_queue` shared
          with the Dash callback.
 
     Lives in the inspector container; instantiated via
-    `CivilianInspectorBridge.add_worker(BridgeDataRcvr, bridge_queue=...)`.
+    `InspectorBridge.add_worker(BridgeDataRcvr, bridge_queue=...,
+                                cap_to_proc=...)`.
     """
 
     def __init__(self, configurations, subsystems, log_queue, dependencies,
@@ -119,6 +151,9 @@ class BridgeDataRcvr(Process, metaclass=ProcMeta,
         super().__init__(configurations, subsystems, log_queue,
                          dependencies=dependencies)
         self._bridge_queue = kwargs['bridge_queue']
+        # cap_name -> remote process queue name. Snapshot at construction
+        # so the worker doesn't share mutable state with the parent.
+        self._cap_to_proc: dict[str, str] = dict(kwargs['cap_to_proc'])
         # (cap_name, peer_uuid_str) tuples we've already sent a request to.
         self._servicers: set = set()
         self.protocol = DataProtocol(self.name, self.logger, configurations)
@@ -151,7 +186,7 @@ class BridgeDataRcvr(Process, metaclass=ProcMeta,
 
     def _subscribe_to_new_peers(self, queues):
         """Send a DataProtocol.request to any peer advertising one of
-        the disaster envdata capabilities, once per (cap, peer) pair."""
+        the configured capabilities, once per (cap, peer) pair."""
         peer_caps = self.protocol.peer_capabilities
         _probes.counter('bridge.rcvr', 'subscribe_called')
         if not peer_caps:
@@ -163,7 +198,7 @@ class BridgeDataRcvr(Process, metaclass=ProcMeta,
             cap_count = -1
         _probes.counter('bridge.rcvr', 'peer_caps_size', str(cap_count))
         peers_index = self.protocol.peers
-        for cap, proc_target in _RCVR_CAP_TO_PROC.items():
+        for cap, proc_target in self._cap_to_proc.items():
             try:
                 peer_uuids = peer_caps[cap]
             except KeyError:
@@ -209,10 +244,10 @@ class BridgeDataRcvr(Process, metaclass=ProcMeta,
                 continue
             _probes.counter('bridge.rcvr', 'msg_recv',
                             type(message).__name__)
-            # CivilianInspectorBridge.autonomous_tasking forwards the
-            # bridge's peer_capabilities + peers roster onto our queue
-            # (see civilian_bridge.py:241-248). Without these, our
-            # DataProtocol.peer_capabilities stays empty and
+            # InspectorBridge.autonomous_tasking forwards the bridge's
+            # peer_capabilities + peers roster onto our queue (see
+            # bridge.py InspectorBridge.autonomous_tasking). Without
+            # these, our DataProtocol.peer_capabilities stays empty and
             # _subscribe_to_new_peers never finds any cap to subscribe
             # to. Update the protocol's view directly when we recognize
             # the payload; fall through to the generic message handlers
@@ -221,7 +256,7 @@ class BridgeDataRcvr(Process, metaclass=ProcMeta,
                 # Bridge-rcvr receives PeerCapabilities from TWO sources:
                 #   - direct fan-put from idproc via _remember_activity
                 #     (with the framework fix it includes PeerCapabilities)
-                #   - forward from CivilianInspectorBridge.autonomous_tasking,
+                #   - forward from InspectorBridge.autonomous_tasking,
                 #     which reads main proc's view of peer_capabilities.
                 # main proc's view lags behind idproc's because main is
                 # heavily backlogged (102k rep_resp messages, processed
@@ -251,28 +286,31 @@ class BridgeDataRcvr(Process, metaclass=ProcMeta,
             self.protocol.run_message_handlers(queues, message)
 
 
-class CivilianInspectorBridge(Inspector):
+class InspectorBridge(Inspector):
     """Inspector subclass that shadows the stock observer but routes
     reputation / peer-roster events to a bridge queue instead of its
-    own VizServer. The CivilianDemo's Dash callback drains the queue."""
+    own VizServer. The dashboard's tick callback drains the queue."""
 
-    def __init__(self, bridge_queue, **kwargs):
+    def __init__(self, bridge_queue, *, cap_to_proc: Mapping[str, str],
+                 **kwargs):
         super().__init__(**kwargs)
         self._bridge_queue = bridge_queue
+        self._cap_to_proc: dict[str, str] = dict(cap_to_proc)
         self._seen: set[str] = set()
         self._last_rep: dict[str, float] = {}
         # (observer_uuid_str, subject_uuid_str) -> last-pushed score.
         # Used to suppress no-op rep_pair pushes when nothing changed.
         self._last_pair: dict[tuple[str, str], float] = {}
-        # Stage 3b.4: stream readings come in via BridgeDataRcvr.
-        # The Dash side drains the same `bridge_queue` so no separate
-        # plumbing is needed here; we just register the worker.
+        # Stream readings come in via BridgeDataRcvr. The dashboard side
+        # drains the same `bridge_queue` so no separate plumbing is
+        # needed here; we just register the worker.
         self.add_worker(BridgeDataRcvr, self.system_dependencies,
-                        bridge_queue=bridge_queue)
+                        bridge_queue=bridge_queue,
+                        cap_to_proc=self._cap_to_proc)
 
     def init_tasking(self, queues):
-        # No VizServer — the civilian demo runs its own Dash server in
-        # the main process.
+        # No VizServer — the dashboard owns its own server in the main
+        # process.
         pass
 
     def cleanup(self):
@@ -350,13 +388,15 @@ class CivilianInspectorBridge(Inspector):
                 name = _peer_name(peer)
                 if name not in self._seen:
                     self._seen.add(name)
-                    self._push(("peer_seen", name))
+                    self._push(("peer_seen", name,
+                                _peer_uuid(peer),
+                                _peer_fingerprint(peer)))
 
-        # Stage 3b.3(a): peer-to-peer reputation queries. Ask each peer
-        # (observer) for its view of every OTHER peer (subject). Goes
-        # over the network so the remote peer's ReputationProcess is the
-        # one that computes. Responses arrive as rep_resp on the AT main
-        # loop, captured into latest_reputation_pairs by automate.py.
+        # Peer-to-peer reputation queries. Ask each peer (observer) for
+        # its view of every OTHER peer (subject). Goes over the network
+        # so the remote peer's ReputationProcess is the one that
+        # computes. Responses arrive as rep_resp on the AT main loop,
+        # captured into latest_reputation_pairs by automate.py.
         # from_whom MUST be set so the responding peer's
         # forward_reputation can route the rep_resp back over the
         # network (else requestor=None and the response stays local).
@@ -395,7 +435,7 @@ class CivilianInspectorBridge(Inspector):
                     continue
                 name = self._resolve_name(subject_uuid)
                 prev = self._last_rep.get(name)
-                if prev is None or abs(prev - score) >= 0.05:
+                if prev is None or abs(prev - score) >= REPUTATION_PUSH_DELTA:
                     self._last_rep[name] = score
                     self._push(("reputation", name, score, now))
 
@@ -411,7 +451,7 @@ class CivilianInspectorBridge(Inspector):
                     sub_name = self._resolve_name(sub_uuid)
                     key = (obs_uuid, sub_uuid)
                     prev = self._last_pair.get(key)
-                    if prev is None or abs(prev - score) >= 0.05:
+                    if prev is None or abs(prev - score) >= REPUTATION_PUSH_DELTA:
                         self._last_pair[key] = score
                         self._push(("rep_pair", obs_name, sub_name,
                                     score, now))
@@ -440,22 +480,29 @@ class CivilianInspectorBridge(Inspector):
             pass
 
 
-def spawn_bridge(bridge_queue, log_level=LogLevel.WARNING):
-    """Start a CivilianInspectorBridge in a daemon thread.
+def spawn_bridge(bridge_queue, cap_to_proc: Mapping[str, str], *,
+                 bridge_class: Type[InspectorBridge] = InspectorBridge,
+                 thread_name: str = "inspector-bridge",
+                 log_level=LogLevel.WARNING):
+    """Start an InspectorBridge in a daemon thread.
 
     Returns the thread. The bridge calls run_forever() which spawns
     AT worker subprocesses of its own; the thread is the 'parent'
     coordinator, same as a normal Inspector invocation.
+
+    ``bridge_class`` lets callers swap in a subclass with extra
+    behavior; ``thread_name`` is purely cosmetic but useful for tracing.
     """
     def _target():
         try:
-            bridge = CivilianInspectorBridge(
-                bridge_queue=bridge_queue, log_level=log_level)
+            bridge = bridge_class(
+                bridge_queue=bridge_queue,
+                cap_to_proc=cap_to_proc,
+                log_level=log_level)
             bridge.run_forever()
         except Exception:
-            logger.exception("[bridge] CivilianInspectorBridge crashed")
+            logger.exception("[bridge] %s crashed", bridge_class.__name__)
 
-    t = threading.Thread(target=_target, name="civilian-bridge",
-                         daemon=True)
+    t = threading.Thread(target=_target, name=thread_name, daemon=True)
     t.start()
     return t
