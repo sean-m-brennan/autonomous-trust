@@ -27,6 +27,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from dash_extensions.enrich import html
+
 
 # Severity -> CSS class suffix. Plain string to keep this file pure-Python.
 SEVERITY_INFO    = "info"
@@ -131,6 +133,30 @@ class EventLogPanel:
             source="scenario",
         ))
 
+    def add_from_event_record(self, rec: dict) -> None:
+        """Ingest a serialized event from `Scenario.event_log` (dict
+        shape: t, type, peer, description, data). Used by the inspector
+        runtime that drains scenario.event_log incrementally each tick;
+        live ScenarioEvent objects go through add_from_scenario_event."""
+        name = str(rec.get("type", ""))
+        data = rec.get("data") or {}
+        # Bridge-emitted ANNOTATION records carry a "data" severity by
+        # default — they are stream/heartbeat chatter, not phase events.
+        if name == "ANNOTATION" and data.get("source") == "bridge":
+            severity = SEVERITY_DATA
+        else:
+            severity = _SCENARIO_SEVERITY.get(name, SEVERITY_INFO)
+            if data.get("source") == "narration":
+                severity = SEVERITY_INFO
+        desc = rec.get("description") or name
+        self.add(LogEntry(
+            t=float(rec.get("t", 0.0)),
+            text=desc,
+            severity=severity,
+            peer_name=rec.get("peer"),
+            source="scenario",
+        ))
+
     def add_success(self, t: float, text: str,
                     peer_name: Optional[str] = None,
                     source: str = "scenario"):
@@ -155,6 +181,28 @@ class EventLogPanel:
     @property
     def entries(self) -> list[LogEntry]:
         return list(self._entries)
+
+    def to_dash_children(self,
+                         empty_text: str = "No events yet") -> list:
+        """Render entries as a list of Dash html.Div children for direct
+        insertion into the layout's panel_log slot. Newest first.
+
+        Returns a single-element placeholder list when empty so the slot
+        always has a child."""
+        if not self._entries:
+            return [html.Div(empty_text, className="demo-placeholder")]
+        items = []
+        for e in reversed(self._entries):
+            items.append(html.Div(
+                className=e.css_class(),
+                children=[
+                    html.Span(e.time_str(),
+                              className="demo-event__time"),
+                    html.Span(e.text,
+                              className="demo-event__text"),
+                ],
+            ))
+        return items
 
     def to_html(self, height: str = "100%") -> str:
         # Newest first: reverse the stored order in the rendered output.

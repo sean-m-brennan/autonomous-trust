@@ -1,5 +1,5 @@
 """
-USGS seismic data generators for the civilian disaster response demo.
+USGS seismic data generators for the multi-agency disaster response demo.
 
 Produces background micro-seismicity typical of the southeastern US
 (Cape Fear Arch region) with occasional triggered events during

@@ -234,7 +234,7 @@ _ROLE_PROCESS = {
 # ----------------------------------------------------------------------
 
 class DisasterResponseDemoAT(AutonomousTrust):
-    """Agency-aware AutonomousTrust for the civilian demo.
+    """Agency-aware AutonomousTrust for the multi-agency demo.
 
     Honors AT_* env vars set by the compose/k8s generator. If none are
     present, falls back to a fixed peer name ("at-unknown") and no role
@@ -403,7 +403,7 @@ def _main(argv=None):
 
     p = argparse.ArgumentParser(
         prog="python -m autonomous_trust.evaluation.scenarios.disaster_response_demo",
-        description=("Civilian disaster-response peer entrypoint. Mirrors "
+        description=("Multi-agency disaster-response peer entrypoint. Mirrors "
                      "the stock `python -m autonomous_trust` flags and "
                      "additionally injects per-role envdata configuration "
                      "from AT_PEER_NAME / AT_ROLE_KIND."))
