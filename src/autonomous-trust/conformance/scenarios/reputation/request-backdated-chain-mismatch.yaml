@@ -1,0 +1,40 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: request-backdated-chain-mismatch
+byte_pinning: false
+description: |
+    Paxos backdate path. bob's history has been pre-loaded with 3 entries
+    (history_len=3). alice's request specifies id2=1, but bob expects
+    id2 == len(history)+1 == 4. Mismatch -> bob emits `out of date`
+    (backdate). alice would then catch up via the outdated/update flow.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+fixtures:
+  history_len:
+    bob: 3
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: ask permission
+    payload:
+      id1: 9999
+      id2: 1
+      proposer: alice
+
+  - id: 2
+    from: bob
+    to: alice
+    function: out of date
+    in_response_to: 1
+    payload:
+      id1: 9999
+      id2: 1
+      proposer: alice

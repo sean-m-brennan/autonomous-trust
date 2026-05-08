@@ -1,0 +1,27 @@
+schema_version: "1"
+kind: agreement_vector
+protocol: agreement
+name: agreement-pos-tie-rejects
+description: |
+    POS: equal yea and nay stake aggregates. Per AgreementByStake._accumulate_votes
+    (`return self.yea > self.nay`), a tie is treated as rejection — strict
+    majority required.
+impl: stake
+stakes:
+  alice: 5
+  bob: 5
+voters:
+  - id: alice
+  - id: bob
+  - id: carol
+myself: carol
+blob:
+  originator: bob
+  uuid: stake-tie
+votes:
+  - by: alice
+    approval: true
+  - by: bob
+    approval: false
+expected:
+  outcome: false
