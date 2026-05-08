@@ -33,17 +33,21 @@
 #include "autonomous_trust/algorithms/paxos.h"
 
 /****************************
- * Protocol constants (must match Python ReputationProtocol)
+ * Protocol constants — must match the Python ReputationProtocol enum
+ * (src/autonomous-trust/.../reputation/protocol.py) verbatim so a
+ * Python node and a C node can interoperate. The conformance corpus
+ * uses these strings as the `function` field on every reputation
+ * scenario step. Changing any of these is a wire-protocol break.
  ****************************/
 
-#define REP_PROTO_REQUEST  "request permission"
-#define REP_PROTO_GRANT    "grant permission"
-#define REP_PROTO_NACK     "nack"
-#define REP_PROTO_BACKDATE "backdate"
+#define REP_PROTO_REQUEST  "ask permission"
+#define REP_PROTO_GRANT    "permission granted"
+#define REP_PROTO_NACK     "try again"
+#define REP_PROTO_BACKDATE "out of date"
 #define REP_PROTO_TX       "transaction"
-#define REP_PROTO_ACCEPTED "accepted"
-#define REP_PROTO_OUTDATED "outdated"
-#define REP_PROTO_UPDATE   "update"
+#define REP_PROTO_ACCEPTED "tx accepted"
+#define REP_PROTO_OUTDATED "update needed"
+#define REP_PROTO_UPDATE   "latest update"
 #define REP_PROTO_REP_REQ  "reputation request"
 #define REP_PROTO_REP_RESP "reputation response"
 #define REP_PROTO_LOCAL_QUERY  "local_rep_query"    /* Local IPC: query a peer's score */

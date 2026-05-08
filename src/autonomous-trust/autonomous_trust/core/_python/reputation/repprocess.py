@@ -44,6 +44,20 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     backoff_max = 90
     expiration = 300
 
+    # When True, _spawn replaces threading.Thread().start() with a direct,
+    # synchronous call. The conformance harness sets this so scenario steps
+    # are deterministic; production paths leave it False.
+    synchronous_dispatch = False
+
+    def _spawn(self, target, args=(), kwargs=None, daemon=True):
+        kwargs = kwargs or {}
+        if self.synchronous_dispatch:
+            target(*args, **kwargs)
+            return None
+        thread = threading.Thread(target=target, args=args, kwargs=kwargs, daemon=daemon)
+        thread.start()
+        return thread
+
     def __init__(self, configurations, subsystems, log_q, **kwargs):
         super().__init__(configurations, subsystems, log_q,
                          dependencies=[CfgIds.network, CfgIds.identity, CfgIds.negotiation], **kwargs)
@@ -138,7 +152,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if (last_id is not None and last_id >= id1) or last_idx != len(self.history):  # peer is faulty
                 self.peers.demote(message.from_whom)
                 self.logger.debug('Grant from faulty peer')
-                threading.Thread(target=self._paxos_timeout, args=(queues, (id1, id2, peer_id)), daemon=True).start()
+                self._spawn(self._paxos_timeout, args=(queues, (id1, id2, peer_id)))
                 return True
             idx = self._paxos_id_index(id1, id2)
             if idx not in self.my_requests:
@@ -172,12 +186,18 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if message.function == ReputationProtocol.nack:
             id1, id2, _ = from_json_string(message.obj)
             idx = self._paxos_id_index(id1, id2)
+            if idx not in self.my_requests:
+                # Nack for an already-completed (grant succeeded, removed
+                # from my_requests) or never-issued (foreign id) request.
+                # Drop without retrying.
+                self.logger.debug('Nack for unknown or completed request')
+                return True
             if idx not in self.backoff:
                 self.backoff[idx] = 1
             if self.backoff[idx] < self.backoff_max:
                 self.backoff[idx] *= self.backoff_mult
-            threading.Thread(target=self._try_again,
-                             args=(self.backoff[idx], queues, self.requests[idx][0]), daemon=True).start()
+            self._spawn(self._try_again,
+                        args=(self.backoff[idx], queues, self.my_requests[idx].score))
             return True
         return False
 
@@ -383,8 +403,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     _probes.counter('rep.handle_req', 'enter', 'requestor_self')
                 else:
                     _probes.counter('rep.handle_req', 'enter', 'requestor_other')
-            threading.Thread(target=self._compute_reputation,
-                             args=(ident, req_proc, requestor), daemon=True).start()
+            self._spawn(self._compute_reputation,
+                        args=(ident, req_proc, requestor))
             return True
         return False
 

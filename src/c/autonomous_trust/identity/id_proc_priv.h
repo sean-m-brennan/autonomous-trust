@@ -17,6 +17,8 @@
 #ifndef ID_PROC_PRIV_H
 #define ID_PROC_PRIV_H
 
+#include <stdbool.h>
+
 #include "processes/processes.h"
 
 /*@
@@ -26,6 +28,14 @@
   assigns *proc;
 */
 int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
+
+/** Register the identity protocol's message handlers on @p proc.
+ *
+ *  Exposed so the conformance harness (and other test rigs) can drive
+ *  handler dispatch without going through the full identity_run process
+ *  loop, which daemonizes and assumes a real messaging socket. The full
+ *  identity_run path also calls this helper internally. */
+int identity_register_handlers(process_t *proc);
 
 /* Vote-collection critical section, exposed for concurrency regression tests.
  * Both helpers are thread-safe; they internally acquire id_state.lock.
@@ -37,6 +47,18 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
  * hit, -1 on miss or bad arguments. */
 int vote_collection_increment(const char *uuid_key);
 int vote_collection_get(const char *uuid_key, int *out_count);
+
+/** Toggle synchronous-dispatch mode for the conformance harness.
+ *
+ *  When @p enabled is true, handle_welcoming_committee runs the propose +
+ *  self-vote + finalize cascade inline instead of waiting for inbound vote
+ *  messages, and propose_peer / peer_accepted emit as a single broadcast
+ *  (to_whom zeroed) so a bg-only scenario still produces one outbound for
+ *  each. Mirrors Python's `IdentityProcess.synchronous_dispatch` class
+ *  flag. Must be called after the first identity_run invocation (or any
+ *  call that goes through the file-scope state init), as it consults the
+ *  same id_state struct. Production code MUST leave this off. */
+void identity_set_synchronous_dispatch(bool enabled);
 
 #define EID_NOQ 215
 DECLARE_ERROR(EID_NOQ, "Required process queue missing");

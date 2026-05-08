@@ -170,13 +170,31 @@ else()
 endif()
 
 # protobuf
-find_package(Protobuf REQUIRED)  # paths doesn't work
-#find_path(Protobuf_INCLUDE_DIRS message.h PATH_SUFFIXES google/protobuf HINTS ${CONDA_ROOT})
-#find_library(Protobuf_LIBRARY libprotobuf.so HINTS ${CONDA_ROOT})
+#
+# When the conda env provides libprotobuf, pre-seed Protobuf_INCLUDE_DIR /
+# Protobuf_LIBRARY / Protobuf_PROTOC_EXECUTABLE so FindProtobuf reads the
+# *conda* headers for its version-extraction step. Without this, conda's
+# cmake (4.x) lands on /usr/include/google/protobuf/stubs/common.h to
+# extract the version, but its sysroot is the conda toolchain root — the
+# /usr/include path is not readable through that sysroot, so `file
+# STRINGS` fails and the subsequent math(EXPR) calls explode on the empty
+# version string.
+if(DEFINED ENV{CONDA_PREFIX})
+    find_path(_at_protobuf_inc google/protobuf/stubs/common.h
+              HINTS ${CONDA_ROOT} NO_DEFAULT_PATH)
+    find_library(_at_protobuf_lib NAMES protobuf
+                 HINTS ${CONDA_ROOT} NO_DEFAULT_PATH)
+    find_program(_at_protoc_exe protoc HINTS ${CONDA_ROOT} NO_DEFAULT_PATH)
+    if(_at_protobuf_inc AND _at_protobuf_lib)
+        set(Protobuf_INCLUDE_DIR ${_at_protobuf_inc} CACHE PATH "" FORCE)
+        set(Protobuf_LIBRARY ${_at_protobuf_lib} CACHE FILEPATH "" FORCE)
+        if(_at_protoc_exe)
+            set(Protobuf_PROTOC_EXECUTABLE ${_at_protoc_exe} CACHE FILEPATH "" FORCE)
+        endif()
+    endif()
+endif()
+find_package(Protobuf REQUIRED)
 include_directories(${Protobuf_INCLUDE_DIRS})
-#find_program(Protobuf_PROTOC_EXECUTABLE protoc HINTS ${CONDA_ROOT})
-#string(REPLACE "/google/protobuf" "" PROTOBUF_INCLUDE_DIR ${Protobuf_INCLUDE_DIRS})
-#include_directories(${PROTOBUF_INCLUDE_DIR})
 if(Protobuf_LIBRARY)
     message("-- Found libprotobuf at ${Protobuf_LIBRARY}")
 else()
@@ -1233,6 +1251,17 @@ if(AT_NET_DTN)
 endif()
 
 endif() # LIBCHECK_LIBRARY
+
+####################
+# Conformance harness (cross-language test corpus runner)
+#
+# Reads JSON-mirrored corpus produced from src/autonomous-trust/conformance/
+# at build time, runs each case through C-side adapters, emits a results
+# JSON whose shape matches the Python harness output. Optional — only
+# wired when the autonomous-trust Python sources are present alongside.
+if(EXISTS ${CMAKE_SOURCE_DIR}/../autonomous-trust/conformance)
+    add_subdirectory(conformance)
+endif()
 
 ####################
 # Packaging

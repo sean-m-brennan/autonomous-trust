@@ -1,0 +1,20 @@
+schema_version: "1"
+kind: agreement_vector
+protocol: agreement
+name: agreement-poa-originator-shortcircuit
+description: |
+    The myself == blob.originator short-circuit: when the protocol owner
+    is the blob's originator, finalize returns True without consulting
+    votes. Useful for the case where an identity self-proposes during
+    initial group bootstrapping.
+impl: authority
+voters:
+  - id: alice
+    rank: 5
+myself: alice
+blob:
+  originator: alice
+  uuid: self-proposal
+votes: []
+expected:
+  outcome: true
