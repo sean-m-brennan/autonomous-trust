@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://autonomous-trust/conformance/schema/_common.schema.json",
+  "title": "AT Conformance Common Definitions",
+  "description": "Shared sub-schemas referenced from every kind's schema.",
+  "definitions": {
+    "schemaVersion": {
+      "type": "string",
+      "enum": ["1"]
+    },
+    "protocol": {
+      "type": "string",
+      "enum": ["identity", "reputation", "negotiation", "network", "agreement"]
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "hexBytes": {
+      "type": "string",
+      "pattern": "^0x([0-9a-fA-F]{2})*$"
+    },
+    "filePathOrRef": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Either a path under testdata/ relative to the corpus root, or a <ref:fixtures.x.y> token resolved by the loader."
+    }
+  }
+}

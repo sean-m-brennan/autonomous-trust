@@ -1,0 +1,40 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-refuse-low-rep
+byte_pinning: false
+description: |
+    Refusal path: bob is capable, but alice's peer level for him is 0
+    (lowest tier) so bob would normally serve the request — but the
+    handler in negprocess.py applies the level check on the SENDER (the
+    requestor's level as known to the responder). With alice pre-placed
+    at level 0 in bob's peers list, bob refuses.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+  peer_levels:
+    alice: 0
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-low-rep
+
+  - id: 2
+    from: bob
+    to: alice
+    function: nack
+    in_response_to: 1
+    payload:
+      task_id: t-low-rep

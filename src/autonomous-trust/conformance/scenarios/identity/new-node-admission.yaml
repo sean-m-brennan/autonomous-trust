@@ -1,0 +1,70 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: new-node-admission
+byte_pinning: false
+description: |
+    Canonical Identity scenario from CONFORMANCE_PLAN.md Appendix A.
+    A new node announces itself; the border guard (bg) runs welcoming_committee,
+    proposes the candidate to the group, votes (synchronously, because
+    synchronous_dispatch is on), finalizes the agreement, and emits the
+    confirm/accept/history triple to bring the newcomer into the group.
+
+    Because synchronous_dispatch is on and bg's `_history.threshold_rank` is
+    pinned to 0 by the harness, a single-bg group is sufficient to drive the
+    full admission cascade in one delivery.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer broadcasts its identity, package hash, and capabilities.
+        bg receives the announce and runs welcoming_committee.
+
+  - id: 2
+    from: bg
+    to: broadcast
+    function: propose_peer
+    in_response_to: 1
+    description: |
+        bg's welcoming_committee emits a propose_peer to the encrypted group
+        channel so other border guards can vote.
+
+  - id: 3
+    from: bg
+    to: broadcast
+    function: peer_accepted
+    in_response_to: 1
+    description: |
+        After synchronous _vote_collection finalizes, _peer_accepted broadcasts
+        a peer_accepted to the encrypted group channel.
+
+  - id: 4
+    from: bg
+    to: newcomer
+    function: access_granted
+    in_response_to: 1
+    description: |
+        bg sends its own published identity to newcomer in the open so the
+        newcomer can encrypt subsequent traffic to bg.
+
+  - id: 5
+    from: bg
+    to: newcomer
+    function: full_history
+    in_response_to: 1
+    description: |
+        bg sends the group key and identity-history DAG so newcomer can join
+        and decrypt subsequent group-encrypted traffic.
+
+expected_state:
+  bg:
+    phase: 3

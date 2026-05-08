@@ -62,6 +62,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     vote_timeout = 0.5  # seconds to wait for additional votes after own vote cast
     enc = encoding
 
+    # When True, _spawn replaces threading.Thread().start() with a direct,
+    # synchronous call. The conformance harness sets this so scenario steps
+    # are deterministic; production paths should leave it False.
+    synchronous_dispatch = False
+
+    def _spawn(self, target, args=(), kwargs=None, daemon=True):
+        kwargs = kwargs or {}
+        if self.synchronous_dispatch:
+            target(*args, **kwargs)
+            return None
+        thread = threading.Thread(target=target, args=args, kwargs=kwargs, daemon=daemon)
+        thread.start()
+        return thread
+
     def __init__(self, configurations, subsystems, log_q, **kwargs):
         super().__init__(configurations, subsystems, log_q, dependencies=[CfgIds.network], **kwargs)
         # Optional override of the choose_group bootstrap window. The
@@ -331,7 +345,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             with self.lock:
                 self.histories.append(hist_tpl)  # see choose_group
             if not self.choosing:
-                threading.Thread(target=self.choose_group, args=(queues,), daemon=True).start()
+                self._spawn(self.choose_group, args=(queues,))
             return True
         return False
 
@@ -481,8 +495,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.peer_potentials[new_id.uuid] = caps
                 if not self.border_guard_mode:
                     return True  # cache-only path; voting is welcomers' job
-                threading.Thread(target=self._vote_collection,
-                                 args=(queues, id_obj), daemon=True).start()
+                self._spawn(self._vote_collection, args=(queues, id_obj))
                 msg_str = id_obj.to_string()  # to self.handle_vote_on_peer()
                 message = Message(self.name, IdentityProtocol.propose, msg_str, to_whom=self.group)
                 queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -661,7 +674,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             blob = message.obj  # from self.welcoming_committee()
             if isinstance(blob, str):
                 blob = Configuration.from_string(blob)
-            threading.Thread(target=self._process_id, args=(blob,), daemon=True).start()
+            self._spawn(self._process_id, args=(blob,))
             return True
         return False
 
@@ -963,7 +976,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.announce_identity(queues)
         if not self.choosing:
             # initial run, may be called again
-            threading.Thread(target=self.choose_group, args=(queues,), daemon=True).start()
+            self._spawn(self.choose_group, args=(queues,))
         # Drain budget per iter — same shape as repprocess.py /
         # negprocess.py. The 0.5 s cadence-pacing sleep used to cap
         # each subsystem at ~2 msgs/s; welcoming-committee + confirm

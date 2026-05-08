@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://autonomous-trust/conformance/schema/wire_vector.schema.json",
+  "title": "AT Conformance Wire Vector (kind: wire_vector)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "protocol", "name", "input", "expected"],
+  "properties": {
+    "schema_version": {"type": "string", "enum": ["1"]},
+    "kind": {"const": "wire_vector"},
+    "protocol": {"type": "string", "enum": ["identity", "reputation", "negotiation", "network", "agreement"]},
+    "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "description": {"type": "string"},
+    "byte_pinning": {"type": "boolean", "default": false},
+    "wire_format": {
+      "type": "string",
+      "enum": ["json", "binary", "any"],
+      "default": "any",
+      "description": "AT_WIRE_FORMAT to exercise. 'any' iterates all supported formats."
+    },
+    "serialize_mode": {
+      "type": "string",
+      "enum": ["json", "proto", "pjson", "any"],
+      "default": "any"
+    },
+    "constructor": {
+      "type": "string",
+      "description": "Adapter-recognized factory name for building the input object (e.g. 'Message', 'Identity', 'Group', 'AgreementProof')."
+    },
+    "input": {
+      "type": "object",
+      "description": "Either a literal dict of constructor args, or {python_object: <path>} pointing at a JSON-serialized object on disk.",
+      "additionalProperties": true
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Optional pinned bytes/JSON. Only honored when byte_pinning is true. Round-trip semantic equivalence is always checked.",
+      "properties": {
+        "json_wire": {"type": "string"},
+        "protobuf_bin": {"type": "string"}
+      }
+    },
+    "keys": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "nonce": {"type": "string", "pattern": "^0x([0-9a-fA-F]{2})*$"}
+  }
+}

@@ -1,0 +1,490 @@
+/********************
+ *  Copyright 2026 Sean M. Brennan and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
+/** @file Negotiation-protocol adapter (Phase E).
+ *
+ *  Constructs per-participant `process_t` instances with negotiation
+ *  handlers registered, installs a messaging_send test hook, and runs
+ *  the universal scenario engine. Mirrors the identity adapter; the
+ *  protocol-specific bits live in `_build_inbound` (one builder per
+ *  function, wrapping a JSON payload the C handler can decode) and in
+ *  the conformance setters from `neg_proc_priv.h` that pre-populate
+ *  per-participant own-capabilities and peer-level overrides.
+ *
+ *  Task UUIDs are derived as UUIDv5 in namespace
+ *  00000000-0000-0000-0000-000000000aaa with name "task:{slug}", which
+ *  is what the Python adapter does — guarantees the same byte values
+ *  cross-language so a future byte-pinned diff is meaningful.
+ */
+
+#include "negotiation.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include <jansson.h>
+#include <uuid/uuid.h>
+
+#include "identity/identity.h"
+#include "negotiation/negotiation.h"
+#include "negotiation/neg_proc_priv.h"
+#include "processes/processes.h"
+#include "structures/array.h"
+#include "structures/map.h"
+#include "utilities/message.h"
+#include "utilities/msg_types_priv.h"
+
+#include "../scenario_engine.h"
+
+/* ------------------------------------------------------------------------- */
+/* Per-participant impl carries a process_t plus the identity used to        */
+/* build inbound messages (from_whom / to_whom).                             */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    identity_t *full;
+    public_identity_t *pub;
+    process_t *proc;
+} np_impl_t;
+
+static sce_run_ctx_t *g_active_ctx = NULL;
+
+/* Same NS as the Python adapter (uuid5 in this NS for both participant
+ * identities and task uuids), so cross-language diffs are bit-equal. */
+static const uuid_t NEG_NS = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0xaa
+};
+
+static void _uuid5(const char *prefix, const char *name, uuid_t out)
+{
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s%s", prefix, name);
+    uuid_generate_sha1(out, NEG_NS, buf, strlen(buf));
+}
+
+/* Resolve a generic_msg_t.to_whom uuid back to a scenario participant id. */
+static const char *_resolve_to_id(const generic_msg_t *msg)
+{
+    if (msg->type != NET_MESSAGE) return "internal";
+    if (g_active_ctx == NULL) return "unknown";
+    /* Negotiation messages are always direct unicast to a peer (never
+     * group broadcast), so plain uuid match suffices. */
+    for (size_t i = 0; i < g_active_ctx->participant_count; i++)
+    {
+        np_impl_t *impl = (np_impl_t *)g_active_ctx->participants[i].impl;
+        if (impl == NULL || impl->pub == NULL) continue;
+        if (uuid_compare(impl->pub->uuid, msg->info.net_msg.to_whom.uuid) == 0)
+            return g_active_ctx->participants[i].id;
+    }
+    return "unknown";
+}
+
+static int _send_hook(const char *key,
+                      const message_type_t type,
+                      generic_msg_t *msg,
+                      bool blocking)
+{
+    (void)key; (void)blocking;
+    if (g_active_ctx == NULL) return 0;
+    const char *to_id = _resolve_to_id(msg);
+    const char *function = (type == NET_MESSAGE && msg->info.net_msg.function != NULL)
+        ? msg->info.net_msg.function : "__internal__";
+    sce_capture(g_active_ctx, to_id, function);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Participant construction                                                   */
+/* ------------------------------------------------------------------------- */
+
+static int _make_identity(const char *id, size_t idx, identity_t **out)
+{
+    uuid_t uuid;
+    _uuid5("neg:", id, uuid);
+    char addr[ADDR_LEN + 1] = {0};
+    snprintf(addr, sizeof(addr), "10.0.50.%zu", idx + 1);
+    char fullname[NAME_LEN + 1] = {0};
+    snprintf(fullname, sizeof(fullname), "%s.neg", id);
+    return identity_create(&uuid, addr, fullname, id, "me", out);
+}
+
+static np_impl_t *_build_participant_impl(const char *id, size_t idx)
+{
+    np_impl_t *impl = calloc(1, sizeof(np_impl_t));
+    if (impl == NULL) return NULL;
+    if (_make_identity(id, idx, &impl->full) != 0 || impl->full == NULL) goto fail;
+    if (identity_publish(impl->full, &impl->pub) != 0 || impl->pub == NULL) goto fail;
+    impl->proc = smrt_create(sizeof(process_t));
+    if (impl->proc == NULL) goto fail;
+    pthread_rwlock_init(&impl->proc->protocol.peers_rwlock, NULL);
+    strncpy(impl->proc->name, "negotiation", PROC_NAME_LEN);
+    if (map_create(&impl->proc->protocol.handlers) != 0) goto fail;
+    impl->proc->protocol.phase = 1;  /* matches negotiation_run's initial phase */
+    if (negotiation_register_handlers(impl->proc) != 0) goto fail;
+    return impl;
+fail:
+    if (impl != NULL)
+    {
+        if (impl->proc != NULL)
+        {
+            if (impl->proc->protocol.handlers != NULL) map_free(impl->proc->protocol.handlers);
+            pthread_rwlock_destroy(&impl->proc->protocol.peers_rwlock);
+            smrt_deref(impl->proc);
+        }
+        if (impl->pub != NULL) smrt_deref(impl->pub);
+        if (impl->full != NULL) identity_free(impl->full);
+        free(impl);
+    }
+    return NULL;
+}
+
+static void _free_participant_impl(np_impl_t *impl)
+{
+    if (impl == NULL) return;
+    if (impl->proc != NULL)
+    {
+        negotiation_clear_test_state(impl->proc);
+        if (impl->proc->protocol.handlers != NULL) map_free(impl->proc->protocol.handlers);
+        pthread_rwlock_destroy(&impl->proc->protocol.peers_rwlock);
+        smrt_deref(impl->proc);
+    }
+    if (impl->pub != NULL) smrt_deref(impl->pub);
+    if (impl->full != NULL) identity_free(impl->full);
+    free(impl);
+}
+
+/* Apply scenario fixtures: capabilities map + peer_levels map. */
+static void _apply_fixtures(sce_run_ctx_t *ctx)
+{
+    json_t *fixtures = json_object_get(ctx->case_data, "fixtures");
+    if (!json_is_object(fixtures)) return;
+
+    /* Pre-populate every participant's protocol.peers list with every
+     * other participant. handle_invite and handle_haggle don't strictly
+     * need this for the four Phase E scenarios, but mirroring the
+     * Python adapter keeps the harnesses symmetric. */
+    for (size_t i = 0; i < ctx->participant_count; i++)
+    {
+        np_impl_t *impl_i = (np_impl_t *)ctx->participants[i].impl;
+        if (impl_i == NULL || impl_i->proc == NULL) continue;
+        for (size_t j = 0; j < ctx->participant_count; j++)
+        {
+            if (i == j) continue;
+            np_impl_t *impl_j = (np_impl_t *)ctx->participants[j].impl;
+            if (impl_j == NULL || impl_j->pub == NULL) continue;
+            if (impl_i->proc->protocol.num_peers >= DEFAULT_MAX_PEERS) break;
+            memcpy(&impl_i->proc->protocol.peers[impl_i->proc->protocol.num_peers],
+                   impl_j->pub, sizeof(public_identity_t));
+            impl_i->proc->protocol.num_peers++;
+        }
+    }
+
+    /* capabilities: { "<participant>": ["<cap>", ...], ... } — install
+     * each participant's own-capability allowlist on their process_t.
+     * Empty list (e.g. "bob: []") explicitly opts a participant out of
+     * the static capability_table and forces refusal-on-not-capable. */
+    json_t *caps = json_object_get(fixtures, "capabilities");
+    if (json_is_object(caps))
+    {
+        const char *pid;
+        json_t *cap_arr;
+        json_object_foreach(caps, pid, cap_arr) {
+            sce_participant_t *part = sce_find_participant(ctx, pid);
+            if (part == NULL) continue;
+            np_impl_t *impl = (np_impl_t *)part->impl;
+            if (impl == NULL || impl->proc == NULL) continue;
+            if (!json_is_array(cap_arr)) continue;
+
+            size_t n = json_array_size(cap_arr);
+            const char **names = (n > 0) ? calloc(n, sizeof(char *)) : NULL;
+            size_t k = 0;
+            for (size_t i = 0; i < n; i++)
+            {
+                const char *name = json_string_value(json_array_get(cap_arr, i));
+                if (name) names[k++] = name;
+            }
+            negotiation_set_own_capabilities(impl->proc, names, k);
+            free((void *)names);
+        }
+    }
+
+    /* peer_levels: { "<participant>": <int>, ... }. The Python adapter
+     * sets the named participant's level *as seen by every other
+     * participant*. Mirror that. */
+    json_t *plev = json_object_get(fixtures, "peer_levels");
+    if (json_is_object(plev))
+    {
+        const char *pid;
+        json_t *lvl_j;
+        json_object_foreach(plev, pid, lvl_j) {
+            if (!json_is_integer(lvl_j)) continue;
+            int lvl = (int)json_integer_value(lvl_j);
+            sce_participant_t *target = sce_find_participant(ctx, pid);
+            if (target == NULL) continue;
+            np_impl_t *target_impl = (np_impl_t *)target->impl;
+            if (target_impl == NULL || target_impl->pub == NULL) continue;
+            for (size_t i = 0; i < ctx->participant_count; i++)
+            {
+                if (strcmp(ctx->participants[i].id, pid) == 0) continue;
+                np_impl_t *other = (np_impl_t *)ctx->participants[i].impl;
+                if (other == NULL || other->proc == NULL) continue;
+                negotiation_set_peer_level(other->proc, target_impl->pub->uuid, lvl);
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Inbound construction                                                       */
+/* ------------------------------------------------------------------------- */
+
+static json_t *_build_task_json(json_t *payload, const uuid_t task_uuid,
+                                const uuid_t requestor_uuid,
+                                bool include_full)
+{
+    json_t *j = json_object();
+    if (j == NULL) return NULL;
+
+    char uuid_buf[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task_uuid, uuid_buf);
+    json_object_set_new(j, "task_uuid", json_string(uuid_buf));
+    if (!include_full) return j;
+
+    uuid_unparse_lower(requestor_uuid, uuid_buf);
+    json_object_set_new(j, "requestor_uuid", json_string(uuid_buf));
+
+    const char *cap_name = "noop";
+    json_t *cap_j = json_object_get(payload, "capability");
+    if (json_is_string(cap_j)) cap_name = json_string_value(cap_j);
+    json_object_set_new(j, "capability_name", json_string(cap_name));
+
+    bool flexible = true;
+    json_t *flex_j = json_object_get(payload, "flexible");
+    if (json_is_boolean(flex_j)) flexible = json_boolean_value(flex_j);
+    json_object_set_new(j, "flexible", json_boolean(flexible));
+
+    json_object_set_new(j, "timeout", json_integer(0));
+
+    /* when_sec / duration_sec: pin a stable time so handle_invite's
+     * schedule check is deterministic. when=now, duration=60s is plenty
+     * to avoid spurious haggling on a fresh task_stack. */
+    json_object_set_new(j, "when_sec", json_integer((json_int_t)time(NULL)));
+    json_object_set_new(j, "duration_sec", json_integer(60));
+    return j;
+}
+
+static int _build_inbound(sce_run_ctx_t *ctx,
+                          const char *from_id,
+                          const char *to_id,
+                          const char *function,
+                          json_t *payload,
+                          generic_msg_t *out)
+{
+    (void)to_id;
+    sce_participant_t *sender = sce_find_participant(ctx, from_id);
+    sce_participant_t *recipient = sce_find_participant(ctx, to_id);
+    if (sender == NULL)
+    {
+        snprintf(ctx->err, sizeof(ctx->err), "build_inbound: unknown from %s", from_id);
+        return -1;
+    }
+    np_impl_t *sender_impl = (np_impl_t *)sender->impl;
+    np_impl_t *recipient_impl = recipient ? (np_impl_t *)recipient->impl : NULL;
+
+    /* Task uuid: scenarios identify tasks by `task_id` slug; uuid5 the
+     * slug (Python parity). Default slug stops the engine matching
+     * separate steps' tasks together. */
+    const char *slug = "default-task";
+    if (payload && json_is_object(payload))
+    {
+        json_t *tid_j = json_object_get(payload, "task_id");
+        if (json_is_string(tid_j)) slug = json_string_value(tid_j);
+    }
+    uuid_t task_uuid;
+    _uuid5("task:", slug, task_uuid);
+
+    /* Requestor: for `invitation` it's the recipient (the inviter
+     * issuing the request — mirrors the Python adapter where the
+     * recipient is the requestor for the invite path). For every other
+     * function the sender is the requestor. */
+    const uuid_t *requestor_uuid;
+    if (strcmp(function, "invitation") == 0 && recipient_impl)
+        requestor_uuid = (const uuid_t *)&recipient_impl->pub->uuid;
+    else
+        requestor_uuid = (const uuid_t *)&sender_impl->pub->uuid;
+
+    /* Build the JSON payload appropriate to each handler. */
+    json_t *body = NULL;
+    if (strcmp(function, "invitation") == 0
+        || strcmp(function, "haggle") == 0
+        || strcmp(function, "spawn task") == 0)
+    {
+        body = _build_task_json(payload, task_uuid, *requestor_uuid, true);
+    }
+    else if (strcmp(function, "ack") == 0
+             || strcmp(function, "nack") == 0
+             || strcmp(function, "status request") == 0)
+    {
+        body = _build_task_json(payload, task_uuid, *requestor_uuid, false);
+    }
+    else if (strcmp(function, "status response") == 0)
+    {
+        body = _build_task_json(payload, task_uuid, *requestor_uuid, false);
+        if (body)
+        {
+            /* status enum: harness uses 'pending', 'running', etc.; the
+             * C handle_stat_resp reads the integer so map common
+             * strings. NEG_RUNNING == 1 in neg_status_t per neg_proc.c. */
+            const char *st = "running";
+            json_t *st_j = json_object_get(payload, "status");
+            if (json_is_string(st_j)) st = json_string_value(st_j);
+            int status_int = 0; /* unknown */
+            if (strcmp(st, "running") == 0 || strcmp(st, "pending") == 0)
+                status_int = 1;
+            json_object_set_new(body, "status", json_integer(status_int));
+        }
+    }
+    else if (strcmp(function, "report results") == 0)
+    {
+        body = _build_task_json(payload, task_uuid, *requestor_uuid, false);
+    }
+    else
+    {
+        snprintf(ctx->err, sizeof(ctx->err),
+                 "build_inbound: unsupported function %s", function);
+        return -1;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->type = NET_MESSAGE;
+    strncpy(out->info.net_msg.process, "negotiation", PROC_NAME_LEN);
+    out->info.net_msg.function = (char *)function;
+    out->info.net_msg.encrypt = false;
+    memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
+    if (recipient_impl)
+        memcpy(&out->info.net_msg.to_whom, recipient_impl->pub, sizeof(public_identity_t));
+
+    if (body)
+    {
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+    }
+    return 0;
+}
+
+static int _dispatch(sce_run_ctx_t *ctx,
+                     sce_participant_t *target,
+                     generic_msg_t *inbound)
+{
+    (void)ctx;
+    np_impl_t *impl = (np_impl_t *)target->impl;
+    array_t *queues = NULL;
+    array_create(&queues);
+    run_message_handlers(impl->proc, queues, NET_MESSAGE, inbound);
+    array_free(queues);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Adapter entry                                                              */
+/* ------------------------------------------------------------------------- */
+
+void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
+{
+    if (strcmp(c->kind, "scenario") != 0)
+    {
+        char detail[160];
+        snprintf(detail, sizeof(detail),
+                 "C negotiation adapter only handles kind:scenario (got %s)", c->kind);
+        at_case_result_set_skip(out, detail);
+        return;
+    }
+
+    char err[256] = {0};
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    sce_run_ctx_t ctx;
+    sce_init(&ctx);
+    ctx.case_data = c->data;
+    ctx.build_inbound = _build_inbound;
+    ctx.dispatch = _dispatch;
+
+    json_t *parts = json_object_get(c->data, "participants");
+    if (!json_is_array(parts))
+    {
+        snprintf(err, sizeof(err), "scenario: participants array missing");
+        goto fail;
+    }
+    size_t n = json_array_size(parts);
+    if (n > SCE_MAX_PARTICIPANTS)
+    {
+        snprintf(err, sizeof(err), "scenario: too many participants (%zu)", n);
+        goto fail;
+    }
+    for (size_t i = 0; i < n; i++)
+    {
+        json_t *p = json_array_get(parts, i);
+        const char *id = json_string_value(json_object_get(p, "id"));
+        const char *role = json_string_value(json_object_get(p, "role"));
+        if (id == NULL || role == NULL)
+        {
+            snprintf(err, sizeof(err), "participants[%zu] missing id or role", i);
+            goto fail;
+        }
+        snprintf(ctx.participants[i].id, SCE_ID_LEN, "%s", id);
+        snprintf(ctx.participants[i].role, SCE_ID_LEN, "%s", role);
+        ctx.participants[i].impl = _build_participant_impl(id, i);
+        if (ctx.participants[i].impl == NULL)
+        {
+            snprintf(err, sizeof(err),
+                     "participants[%zu] (%s) impl build failed", i, id);
+            goto fail;
+        }
+        ctx.participant_count++;
+    }
+
+    _apply_fixtures(&ctx);
+
+    g_active_ctx = &ctx;
+    messaging_set_test_hook(_send_hook);
+
+    int rc = sce_run(&ctx);
+
+    messaging_set_test_hook(NULL);
+    g_active_ctx = NULL;
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    int duration_ms = (int)((t1.tv_sec - t0.tv_sec) * 1000
+                            + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+    if (rc == 0) at_case_result_set_pass(out, duration_ms);
+    else         at_case_result_set_fail(out, duration_ms, "AssertionError", ctx.err);
+
+    for (size_t i = 0; i < ctx.participant_count; i++)
+        _free_participant_impl((np_impl_t *)ctx.participants[i].impl);
+    return;
+
+fail:
+    g_active_ctx = NULL;
+    messaging_set_test_hook(NULL);
+    for (size_t i = 0; i < ctx.participant_count; i++)
+        _free_participant_impl((np_impl_t *)ctx.participants[i].impl);
+    at_case_result_set_fail(out, 0, "AssertionError", err);
+}

@@ -1,0 +1,27 @@
+schema_version: "1"
+kind: agreement_vector
+protocol: agreement
+name: agreement-pos-nay-by-stake
+description: |
+    POS: nay > yea by stake weight. Inverts the stake distribution from
+    the yea-by-stake case to confirm the outcome flips with the weights.
+    bob (stake 10) rejects; alice (stake 3) approves. Total yea=3, nay=10.
+impl: stake
+stakes:
+  alice: 3
+  bob: 10
+voters:
+  - id: alice
+  - id: bob
+  - id: carol
+myself: carol
+blob:
+  originator: bob
+  uuid: stake-vote-2
+votes:
+  - by: alice
+    approval: true
+  - by: bob
+    approval: false
+expected:
+  outcome: false

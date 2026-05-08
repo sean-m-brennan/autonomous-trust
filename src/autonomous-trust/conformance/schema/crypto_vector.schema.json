@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://autonomous-trust/conformance/schema/crypto_vector.schema.json",
+  "title": "AT Conformance Crypto Vector (kind: crypto_vector)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "protocol", "name", "primitive", "input", "expected"],
+  "properties": {
+    "schema_version": {"type": "string", "enum": ["1"]},
+    "kind": {"const": "crypto_vector"},
+    "protocol": {"type": "string", "enum": ["identity", "reputation", "negotiation", "network", "agreement"]},
+    "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "description": {"type": "string"},
+    "primitive": {
+      "type": "string",
+      "enum": [
+        "ed25519_sign",
+        "ed25519_verify",
+        "nacl_box",
+        "nacl_box_open",
+        "nacl_secretbox",
+        "nacl_secretbox_open"
+      ]
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Primitive-specific inputs. All byte-valued fields are 0x-prefixed lowercase hex."
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Primitive-specific expected outputs. All byte-valued fields are 0x-prefixed lowercase hex."
+    }
+  }
+}

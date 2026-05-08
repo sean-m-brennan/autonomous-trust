@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://autonomous-trust/conformance/schema/negative.schema.json",
+  "title": "AT Conformance Negative Case (kind: negative)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "protocol", "name", "based_on", "mutation", "expected"],
+  "properties": {
+    "schema_version": {"type": "string", "enum": ["1"]},
+    "kind": {"const": "negative"},
+    "protocol": {"type": "string", "enum": ["identity", "reputation", "negotiation", "network", "agreement"]},
+    "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "description": {"type": "string"},
+    "based_on": {
+      "type": "string",
+      "description": "Path to the base scenario or wire_vector YAML, relative to the corpus root."
+    },
+    "mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "target"],
+      "properties": {
+        "step_id": {"type": "integer", "minimum": 1},
+        "op": {
+          "type": "string",
+          "enum": ["flip_byte", "truncate", "append", "replace", "drop_field", "set_field"]
+        },
+        "target": {
+          "type": "string",
+          "description": "What part of the message/step to mutate: signature | wire_bytes | payload.<field> | envelope.<field>"
+        },
+        "index": {"type": "integer"},
+        "value": {"type": ["string", "integer", "boolean", "null"]}
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason_class"],
+      "properties": {
+        "reject_at_step": {"type": "integer", "minimum": 1},
+        "reason_class": {
+          "type": "string",
+          "enum": [
+            "signature_verification_failed",
+            "envelope_malformed",
+            "envelope_truncated",
+            "payload_oversized",
+            "replay_detected",
+            "decryption_failed",
+            "unknown_function",
+            "schema_violation"
+          ]
+        }
+      }
+    }
+  }
+}

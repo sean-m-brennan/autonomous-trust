@@ -1,0 +1,52 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: transaction-accepted
+byte_pinning: false
+description: |
+    Paxos round-2 happy path. alice has already won round-1 (the harness
+    pre-stages bob's `requests` list with the granted (id1, id2) tuple
+    and alice's `my_requests` / `proposals` so her handle_accepted can
+    look up the score by idx). bob verifies the proposal and emits
+    `tx accepted` back to alice; alice's handle_accepted records the
+    acceptance and (with one peer in the group) commits the transaction
+    to history.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+fixtures:
+  requests:
+    bob:
+      - [1000, 1]
+  my_requests:
+    alice:
+      - id1: 1000
+        id2: 1
+        task_id: t-1
+        score: 0.8
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: transaction
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+      task_id: t-1
+      score: 0.8
+
+  - id: 2
+    from: bob
+    to: alice
+    function: tx accepted
+    in_response_to: 1
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice

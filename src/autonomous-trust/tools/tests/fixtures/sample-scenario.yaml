@@ -1,0 +1,36 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: rendering-rules-coverage
+description: |
+    Synthetic scenario authored to exercise every row of the rendering-rules
+    table in SEQUENCE_DIAGRAM_TOOL_SPEC.md. Function names are deliberately
+    not real identity-protocol message names; this fixture tests the renderer,
+    not handler dispatch (the --check fixture covers that separately).
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: responder
+  - id: carol
+    role: observer
+
+steps:
+  - id: 1
+    from: alice
+    to: broadcast
+    function: hello
+    description: |
+        Broadcast step rule: a note over the sender's lane,
+        no arrow.
+
+  - id: 2
+    from: alice
+    to: bob
+    function: ping
+
+  - id: 3
+    from: bob
+    to: alice
+    function: pong
+    in_response_to: 2

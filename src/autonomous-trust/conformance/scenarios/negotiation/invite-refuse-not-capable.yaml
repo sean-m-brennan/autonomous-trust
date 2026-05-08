@@ -1,0 +1,36 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-refuse-not-capable
+byte_pinning: false
+description: |
+    Refusal path: bob does not have the requested capability, so
+    handle_invite emits `nack`. Tests the `task.capability not in
+    self.capabilities` branch.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: []
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-refuse
+
+  - id: 2
+    from: bob
+    to: alice
+    function: nack
+    in_response_to: 1
+    payload:
+      task_id: t-refuse
