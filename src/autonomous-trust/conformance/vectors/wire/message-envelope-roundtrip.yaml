@@ -1,0 +1,18 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: message-envelope-roundtrip
+description: |
+    Message envelope (process|function|data|signature) round-trips through
+    bytes() / Message.parse() with no sender. Plain string payload that
+    must NOT be auto-deserialized as a Configuration.
+byte_pinning: false
+wire_format: json
+serialize_mode: json
+constructor: Message
+input:
+  process: "agreement"
+  function: "propose"
+  obj: "hello world"
+  encrypt: false
+expected: {}

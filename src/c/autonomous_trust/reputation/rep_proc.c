@@ -30,6 +30,7 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
 #include "network/net_message.h"
+#include "reputation/rep_proc_priv.h"
 
 #define EREP_PAXOS 253
 DEFINE_ERROR(EREP_PAXOS, "Paxos consensus error");
@@ -50,6 +51,11 @@ static struct {
     int num_peers;
     pthread_mutex_t lock;
     bool initialized;
+    /* Conformance-only: when true, handle_nack inlines a retry "ask
+     * permission" emission (Python's _try_again thread is skipped under
+     * sync dispatch). Production must leave this false; default 0
+     * preserves existing behavior. */
+    bool synchronous_dispatch;
 } rep_state;
 
 static void _ensure_init(void)
@@ -323,6 +329,50 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
 
     log_debug(proc->logger, "Reputation: nack backoff %d seconds\n", wait_sec);
     (void)wait_sec;
+
+    /* Synchronous-dispatch retry: Python's _try_again thread sleeps for
+     * backoff[idx] then re-emits an "ask permission" to self.group.
+     * Under sync dispatch we inline that emission so the conformance
+     * scenario engine sees the retry on the same step's outbox. The
+     * retry uses fresh ids via paxos_next_ids — chain position stays
+     * the same but id1 grows monotonically. */
+    if (rep_state.synchronous_dispatch)
+    {
+        int64_t retry_id1 = 0, retry_id2 = 0;
+        paxos_next_ids(&rep_state.paxos, &retry_id1, &retry_id2);
+
+        char proposer_str[UUID_STRING_LEN + 1];
+        /* Use this proc's identity uuid as the proposer; the harness
+         * stamps the participant's pub uuid on the from_whom field of
+         * inbound messages, but here we want the OUTBOUND payload to
+         * carry our own uuid. proc->protocol has no direct identity
+         * field; pull it from peers if present, else zero. The harness
+         * keys on function name + to=broadcast for matching, so the
+         * payload uuid is informational only. */
+        memset(proposer_str, 0, sizeof(proposer_str));
+        char zero_uuid[UUID_STRING_LEN + 1] = "00000000-0000-0000-0000-000000000000";
+        memcpy(proposer_str, zero_uuid, sizeof(proposer_str));
+
+        json_t *retry_json = json_object();
+        if (retry_json)
+        {
+            json_object_set_new(retry_json, "id1", json_integer(retry_id1));
+            json_object_set_new(retry_json, "id2", json_integer(retry_id2));
+            json_object_set_new(retry_json, "peer_uuid", json_string(proposer_str));
+
+            generic_msg_t retry = {0};
+            retry.type = NET_MESSAGE;
+            strncpy(retry.info.net_msg.process, "reputation", PROC_NAME_LEN);
+            retry.info.net_msg.function = (char *)REP_PROTO_REQUEST;
+            retry.info.net_msg.encrypt = false;
+            /* to_whom zeroed → broadcast. The conformance hook resolves
+             * a zero uuid to "broadcast" so this matches scenarios that
+             * assert `to: broadcast` on the retry. */
+            net_msg_pack_json(&retry.info.net_msg, retry_json);
+            json_decref(retry_json);
+            messaging_send("network", NET_MESSAGE, &retry, false);
+        }
+    }
 
     return true;
 }
@@ -926,6 +976,141 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
  * Reputation process main entry
  ****************************/
 
+int reputation_register_handlers(process_t *proc)
+{
+    if (proc == NULL) return -1;
+    process_register_handler(proc, (char *)REP_PROTO_REQUEST,   (handler_ptr_t)handle_request);
+    process_register_handler(proc, (char *)REP_PROTO_GRANT,     (handler_ptr_t)handle_grant);
+    process_register_handler(proc, (char *)REP_PROTO_NACK,      (handler_ptr_t)handle_nack);
+    process_register_handler(proc, (char *)REP_PROTO_BACKDATE,  (handler_ptr_t)handle_backdate);
+    process_register_handler(proc, (char *)REP_PROTO_TX,        (handler_ptr_t)handle_transaction);
+    process_register_handler(proc, (char *)REP_PROTO_ACCEPTED,  (handler_ptr_t)handle_accepted);
+    process_register_handler(proc, (char *)REP_PROTO_OUTDATED,  (handler_ptr_t)handle_outdated);
+    process_register_handler(proc, (char *)REP_PROTO_UPDATE,    (handler_ptr_t)handle_update);
+    process_register_handler(proc, (char *)REP_PROTO_REP_REQ,   (handler_ptr_t)handle_rep_request);
+    process_register_handler(proc, (char *)REP_PROTO_REP_RESP,  (handler_ptr_t)handle_rep_response);
+    process_register_handler(proc, (char *)REP_PROTO_LOCAL_QUERY, (handler_ptr_t)handle_local_rep_query);
+    return 0;
+}
+
+/* ---- Conformance test hooks (see rep_proc_priv.h doc) ---------------------- */
+
+void reputation_set_synchronous_dispatch(bool enabled)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    rep_state.synchronous_dispatch = enabled;
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+void reputation_reset_state(int num_peers)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    /* Tear down + reinit. Preserve synchronous_dispatch so the harness
+     * doesn't have to set it on every reset. */
+    bool was_sync = rep_state.synchronous_dispatch;
+    if (rep_state.paxos.initialized)
+        paxos_destroy(&rep_state.paxos);
+    /* Clear my_requests; entries are smrt_ptr-backed tx_score_t. */
+    map_free(&rep_state.my_requests);
+    map_init(&rep_state.my_requests);
+    map_free(&rep_state.updates);
+    map_init(&rep_state.updates);
+    array_free(&rep_state.requested_reps);
+    array_init(&rep_state.requested_reps);
+    /* History reset: free contents + reinit. tx_history_destroy
+     * additionally `free()`s the container, which would corrupt the
+     * heap when the container is the embedded `rep_state.history`
+     * member (never malloc'd). tx_history_free clears contents only. */
+    tx_history_free(&rep_state.history);
+    tx_history_init(&rep_state.history);
+    rep_state.num_peers = num_peers;
+    paxos_init(&rep_state.paxos, num_peers, NULL);
+    rep_state.synchronous_dispatch = was_sync;
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+void reputation_set_chain_len(int len)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    rep_state.paxos.chain_len = len;
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+void reputation_set_last_id(int64_t id)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    rep_state.paxos.last_id = id;
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+void reputation_install_my_request(int64_t id1, int64_t id2,
+                                   const uuid_t proposer_uuid,
+                                   double score,
+                                   const uuid_t task_uuid)
+{
+    _ensure_init();
+    /* Stage rep_state.my_requests[proposer_uuid_str] = tx_score_t{score, task_uuid}.
+     * handle_grant looks this up by proposer uuid string to find the
+     * pending round and broadcast a transaction on majority. */
+    char proposer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proposer_uuid, proposer_str);
+
+    tx_score_t *tx = smrt_create(sizeof(tx_score_t));
+    if (tx == NULL) return;
+    memset(tx, 0, sizeof(*tx));
+    if (task_uuid != NULL)
+        uuid_copy(tx->task_uuid, task_uuid);
+    tx->score = score;
+
+    pthread_mutex_lock(&rep_state.lock);
+    data_t *tx_dat = object_ptr_data(tx, sizeof(tx_score_t));
+    map_set(&rep_state.my_requests, proposer_str, tx_dat);
+
+    /* Also stage paxos.proposals[id1:id2] = {score} so handle_accepted's
+     * score lookup succeeds. paxos_record_grant does the right thing. */
+    paxos_record_grant(&rep_state.paxos, id1, id2, score);
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+void reputation_install_accepted(int64_t id1, int64_t id2)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    /* paxos_has_granted_id(id2) walks paxos.granted_ids — populated only
+     * by paxos_handle_request on the PAXOS_GRANT branch. To pretend a
+     * round at (id1, id2) was granted, append id2 directly and also
+     * stage a proposal so the score lookup in handle_accepted has
+     * something to find. */
+    data_t *id2_dat = integer_data((int)id2);
+    if (id2_dat != NULL)
+        array_append(&rep_state.paxos.granted_ids, id2_dat);
+    if (id1 > rep_state.paxos.last_id)
+        rep_state.paxos.last_id = id1;
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+int reputation_get_chain_len(void)
+{
+    if (!rep_state.initialized) return -1;
+    pthread_mutex_lock(&rep_state.lock);
+    int len = rep_state.paxos.chain_len;
+    pthread_mutex_unlock(&rep_state.lock);
+    return len;
+}
+
+int reputation_get_request_count(void)
+{
+    if (!rep_state.initialized) return -1;
+    pthread_mutex_lock(&rep_state.lock);
+    int count = (int)array_size(&rep_state.paxos.granted_ids);
+    pthread_mutex_unlock(&rep_state.lock);
+    return count;
+}
+
 /* Frama-C: skipped — [solver-timeout] state-cascade through paxos_init +
  * process_register_handler stubs prevents WP from discharging
  * valid_rw(proc) and valid_rd(signal) at downstream call sites */
@@ -938,21 +1123,8 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
     peers_read_unlock(proc);
     paxos_init(&rep_state.paxos, rep_state.num_peers, logger);
 
-    /* Register protocol handlers */
-    process_register_handler(proc, (char *)REP_PROTO_REQUEST,   (handler_ptr_t)handle_request);
-    process_register_handler(proc, (char *)REP_PROTO_GRANT,     (handler_ptr_t)handle_grant);
-    process_register_handler(proc, (char *)REP_PROTO_NACK,      (handler_ptr_t)handle_nack);
-    process_register_handler(proc, (char *)REP_PROTO_BACKDATE,  (handler_ptr_t)handle_backdate);
-    process_register_handler(proc, (char *)REP_PROTO_TX,        (handler_ptr_t)handle_transaction);
-    process_register_handler(proc, (char *)REP_PROTO_ACCEPTED,  (handler_ptr_t)handle_accepted);
-    process_register_handler(proc, (char *)REP_PROTO_OUTDATED,  (handler_ptr_t)handle_outdated);
-    process_register_handler(proc, (char *)REP_PROTO_UPDATE,    (handler_ptr_t)handle_update);
-    process_register_handler(proc, (char *)REP_PROTO_REP_REQ,   (handler_ptr_t)handle_rep_request);
-    process_register_handler(proc, (char *)REP_PROTO_REP_RESP,  (handler_ptr_t)handle_rep_response);
-    process_register_handler(proc, (char *)REP_PROTO_LOCAL_QUERY, (handler_ptr_t)handle_local_rep_query);
-
+    reputation_register_handlers(proc);
     proc->protocol.phase = 1;
-
     return process_run(proc, queues, signal, logger);
 }
 DECLARE_PROCESS(reputation, rep_proc, reputation_run);

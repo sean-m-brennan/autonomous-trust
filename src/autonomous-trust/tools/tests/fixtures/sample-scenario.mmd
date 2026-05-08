@@ -1,0 +1,8 @@
+sequenceDiagram
+    participant alice as requestor
+    participant bob as responder
+    participant carol as observer
+    Note over alice: broadcast: hello
+    Note right of alice: Broadcast step rule: a note over the sender's lane, no arrow.
+    alice->>+bob: ping
+    bob-->>-alice: pong (re: 2)

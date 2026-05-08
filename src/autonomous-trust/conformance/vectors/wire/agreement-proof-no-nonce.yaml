@@ -1,0 +1,15 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: agreement-proof-no-nonce
+description: AgreementProof with approval=false and an absent nonce - lossy nonce restoration.
+byte_pinning: false
+wire_format: any
+serialize_mode: any
+constructor: AgreementProof
+input:
+  uuid: "00000000-1111-2222-3333-444444444444"
+  digest: "0x646967657374313233343536"
+  approval: false
+  nonce: null
+expected: {}

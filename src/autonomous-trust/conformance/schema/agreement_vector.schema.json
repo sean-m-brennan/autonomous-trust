@@ -1,0 +1,94 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://autonomous-trust/conformance/schema/agreement_vector.schema.json",
+  "title": "AT Conformance Agreement Vector (kind: agreement_vector)",
+  "description": "Drives an AgreementProtocol implementation deterministically: builds voters, optionally `prove()`s a blob, submits N pre-signed votes via `verify()`, then asserts the `finalize()` outcome.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "protocol", "name", "impl", "voters", "myself", "blob", "expected"],
+  "properties": {
+    "schema_version": {"type": "string", "enum": ["1"]},
+    "kind": {"const": "agreement_vector"},
+    "protocol": {"const": "agreement"},
+    "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "description": {"type": "string"},
+    "byte_pinning": {"type": "boolean", "default": false},
+    "impl": {
+      "type": "string",
+      "enum": ["authority", "stake"],
+      "description": "Agreement implementation. 'work' (PoW) deferred."
+    },
+    "threshold_rank": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "POA only. Minimum voter rank for a vote to count. Defaults to 0 (any voter counts)."
+    },
+    "stakes": {
+      "type": "object",
+      "description": "POS only. Map of voter_id -> stake (number). Voters not listed have stake 0.",
+      "additionalProperties": {"type": "number"}
+    },
+    "voters": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$"},
+          "rank": {"type": "integer", "minimum": 0, "default": 0},
+          "uuid": {"type": "string", "format": "uuid"}
+        }
+      }
+    },
+    "myself": {
+      "type": "string",
+      "description": "Which voter is the protocol owner (the `myself` parameter). Must match a voters[].id."
+    },
+    "blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["originator", "uuid"],
+      "properties": {
+        "originator": {
+          "type": "string",
+          "description": "Voter id of the blob's originator (drives the myself == originator short-circuit in finalize). Use a voter id; harness resolves to that voter's uuid."
+        },
+        "uuid": {
+          "type": "string",
+          "description": "Stable string identifier for the blob; harness derives a deterministic UUID5 from it. Use any short slug."
+        },
+        "payload": {
+          "type": "string",
+          "description": "Optional UTF-8 string used as the blob's payload (mixed into get_hash). Defaults to the blob.uuid string."
+        }
+      }
+    },
+    "votes": {
+      "type": "array",
+      "default": [],
+      "description": "Each entry produces an AgreementProof signed by `by` and submits it via verify(blob, proof, (msg, sig)). myself's own vote is NOT auto-cast; include it explicitly when wanted (mirrors the production flow where _process_id signs and _vote_collection submits).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["by", "approval"],
+        "properties": {
+          "by": {"type": "string", "description": "Voter id casting this vote."},
+          "approval": {"type": "boolean"}
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome"],
+      "properties": {
+        "outcome": {
+          "type": "boolean",
+          "description": "Required. The expected boolean return value of finalize(blob)."
+        }
+      }
+    }
+  }
+}

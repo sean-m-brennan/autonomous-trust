@@ -1,0 +1,26 @@
+schema_version: "1"
+kind: agreement_vector
+protocol: agreement
+name: agreement-pos-yea-by-stake
+description: |
+    POS: yea > nay by stake weight. alice (stake 10) approves; bob (stake 3)
+    rejects. Aggregate yea=10 > nay=3, finalize True.
+impl: stake
+stakes:
+  alice: 10
+  bob: 3
+voters:
+  - id: alice
+  - id: bob
+  - id: carol
+myself: carol
+blob:
+  originator: bob
+  uuid: stake-vote-1
+votes:
+  - by: alice
+    approval: true
+  - by: bob
+    approval: false
+expected:
+  outcome: true

@@ -1,0 +1,20 @@
+schema_version: "1"
+kind: agreement_vector
+protocol: agreement
+name: agreement-poa-no-votes
+description: |
+    POA: no votes received before finalize. Should return False
+    (per AgreementProtocol.finalize: empty _votes[blob.uuid] => False).
+impl: authority
+voters:
+  - id: alice
+    rank: 0
+  - id: bob
+    rank: 5
+myself: alice
+blob:
+  originator: bob
+  uuid: candidate-empty
+votes: []
+expected:
+  outcome: false

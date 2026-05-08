@@ -1,0 +1,17 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: broken-function-name
+description: |
+    Deliberately malformed: `step.function` is not in IdentityProtocol's
+    handler registry. --check should report it as UNRECOGNIZED.
+participants:
+  - id: alice
+    role: new_node
+  - id: bob
+    role: border_guard
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: definitely_not_a_real_function
