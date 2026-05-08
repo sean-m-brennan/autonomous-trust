@@ -1,0 +1,72 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: request-nacked-stale
+byte_pinning: false
+description: |
+    Paxos round-1 nack path with retry. bob has already approved a higher
+    id1 (last_id=5000), so when alice requests with id1=1000 bob refuses
+    with `try again` (nack). alice's handle_nack now correctly looks up
+    her round in `my_requests`, applies exponential backoff, and emits
+    a fresh `ask permission` to the group as the retry — observable as
+    step 3.
+
+    The harness pre-stages alice's `my_requests` so handle_nack recognizes
+    the inbound nack as belonging to a round she actually started; in
+    production `_start_paxos` would have populated this. backoff_mult is
+    forced to 0 in the adapter so _try_again's wait loop completes
+    immediately under synchronous_dispatch.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+fixtures:
+  last_id:
+    bob: 5000
+  my_requests:
+    alice:
+      - id1: 1000
+        id2: 1
+        task_id: t-retry
+        score: 0.7
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: ask permission
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+
+  - id: 2
+    from: bob
+    to: alice
+    function: try again
+    in_response_to: 1
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+
+  - id: 3
+    from: alice
+    to: broadcast
+    function: ask permission
+    in_response_to: 2
+    no_propagate: true
+    payload:
+      id1: 0
+      id2: 1
+      proposer: alice
+    description: |
+        Alice's retry. The replayed request goes to the group (broadcast),
+        with a fresh id1 derived from the wall clock — the engine matches
+        on (from, to-broadcast, function) so the actual id1 is irrelevant.
+        no_propagate because the bob-receives-retry path needs more state
+        staging than is in scope here (bob would deduplicate or grant
+        again depending on his last_id).

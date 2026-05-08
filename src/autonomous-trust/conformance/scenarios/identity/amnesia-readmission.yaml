@@ -1,0 +1,60 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: amnesia-readmission
+byte_pinning: false
+description: |
+    A peer whose UUID and keys are already known re-announces itself.
+    welcoming_committee detects this as the amnesia branch and calls
+    `_peer_accepted(amnesia=True)` synchronously - no voting thread spawned.
+    Tests the simpler welcoming_committee path and the cascade of
+    confirm + accept + history outbound messages.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: returning
+    role: new_node
+
+fixtures:
+  amnesia_known: true
+
+steps:
+  - id: 1
+    from: returning
+    to: bg
+    function: request_access
+    description: |
+        Returning peer broadcasts an announce. bg already knows this UUID
+        (amnesia_known fixture pre-populates bg's peer list).
+
+  - id: 2
+    from: bg
+    to: broadcast
+    function: peer_accepted
+    in_response_to: 1
+    description: |
+        bg's _peer_accepted emits a confirm to the group on the encrypted
+        broadcast channel.
+
+  - id: 3
+    from: bg
+    to: returning
+    function: access_granted
+    in_response_to: 1
+    description: |
+        bg sends its own identity in the open so the returning peer can
+        encrypt subsequent traffic.
+
+  - id: 4
+    from: bg
+    to: returning
+    function: full_history
+    in_response_to: 1
+    description: |
+        bg sends the group key and history; returning peer can now decrypt
+        group-encrypted messages.
+
+expected_state:
+  bg:
+    phase: 3

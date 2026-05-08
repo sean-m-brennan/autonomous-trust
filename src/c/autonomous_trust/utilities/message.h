@@ -176,6 +176,29 @@ int signal_recv(queue_t *q, long *msg_type, signal_t * sig);
 int messaging_send(const char *key, const message_type_t type, generic_msg_t *msg, bool blocking);
 
 /**
+ * @brief Test-mode hook: callback invoked instead of the real socket write.
+ *
+ * Set via @ref messaging_set_test_hook. While installed, every
+ * @ref messaging_send call invokes the hook with the (key, type, msg)
+ * triple and returns the hook's return value. The real Unix-socket
+ * datagram write is bypassed entirely.
+ *
+ * Used by the conformance harness to capture per-participant outboxes
+ * without a real transport. Set to NULL to restore production behavior.
+ *
+ * Call ordering: messaging_send checks the hook BEFORE generic_msg_to_proto,
+ * so hook implementations see the in-memory @ref generic_msg_t directly.
+ */
+typedef int (*messaging_test_hook_t)(const char *key,
+                                     const message_type_t type,
+                                     generic_msg_t *msg,
+                                     bool blocking);
+
+/** Install a test-mode hook (or pass NULL to clear). Not thread-safe;
+ *  install before starting any harness dispatch and clear after. */
+void messaging_set_test_hook(messaging_test_hook_t hook);
+
+/**
  * @brief Close a specific message queue and remove its socket file.
  *
  * @param queue
