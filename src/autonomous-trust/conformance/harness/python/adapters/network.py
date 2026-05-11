@@ -269,15 +269,209 @@ class NetworkAdapter:
         )
 
     # ------------------------------------------------------------------
-    # Out-of-scope kinds for Phase A
+    # Scenarios
     # ------------------------------------------------------------------
 
-    def run_scenario(self, case: Case) -> None:  # noqa: ARG002
+    def run_scenario(self, case: Case) -> None:
+        if case.name == 'peer-encrypted-roundtrip':
+            self._run_peer_encrypted_roundtrip(case)
+            return
+        if case.name == 'group-encrypted-roundtrip':
+            self._run_group_encrypted_roundtrip(case)
+            return
+        if case.name == 'broadcast-fanout':
+            self._run_broadcast_fanout(case)
+            return
         raise NotImplementedError(
-            'scenario kind not yet implemented for network protocol (Phase A: vectors only)'
+            f'network scenario {case.name!r} not implemented'
         )
 
-    def run_negative(self, case: Case) -> None:  # noqa: ARG002
-        raise NotImplementedError(
-            'negative kind not yet implemented for network protocol (Phase A: vectors only)'
+    def _run_peer_encrypted_roundtrip(self, case: Case) -> None:
+        """Exercise A.encrypt → B.decrypt → Message.parse end-to-end.
+
+        Builds two deterministic Identity instances, runs a Box round-trip
+        with the fixture nonce, and asserts the parsed Message exposes
+        the expected (process, function, verified) tuple.
+        """
+        from autonomous_trust.core.identity import Identity
+        from autonomous_trust.core.identity.encrypt import Encryptor
+        from autonomous_trust.core.identity.sign import Signature
+        from autonomous_trust.core.network.message import Message
+        from autonomous_trust.core.system import CfgIds
+
+        fixtures = case.data.get('fixtures', {}) or {}
+        nonce = hex_to_bytes(fixtures['nonce_hex'])
+        obj_json = fixtures.get('obj_json', '{}')
+
+        a = _make_test_identity('a', addr='10.0.80.1')
+        b = _make_test_identity('b', addr='10.0.80.2')
+
+        # A signs+serializes a Message addressed to B. encrypt=True flags
+        # transport encryption intent but does not encrypt obj inline; the
+        # encryption layer runs on the serialized wire bytes below.
+        msg = Message(CfgIds.identity, 'request_access', obj_json,
+                      from_whom=a, to_whom=b, encrypt=True)
+        plaintext = bytes(msg)
+
+        # A encrypts wire bytes for B with the fixture nonce. PyNaCl's
+        # EncryptedMessage carries (nonce, ciphertext) and B.decrypt
+        # consumes both when handed the EncryptedMessage directly.
+        encrypted = a.encrypt(plaintext, b, nonce=nonce)
+        decrypted = b.decrypt(encrypted, a)
+        if isinstance(decrypted, str):
+            decrypted = decrypted.encode('utf-8')
+
+        # Re-parse via production code. Pass A as sender so signature
+        # verification runs.
+        parsed = Message.parse(decrypted, a)
+        _assert_expected_state_b(case, parsed)
+
+    def _run_group_encrypted_roundtrip(self, case: Case) -> None:
+        """Exercise Group.encrypt → Group.decrypt → Message.parse.
+
+        Builds A and B Identities plus a shared deterministic Group whose
+        keypair seeds the libsodium Box. Both languages must agree on the
+        group keypair bytes for the round-trip to succeed.
+        """
+        import hashlib
+        from uuid import UUID, uuid5
+        from autonomous_trust.core.identity import Group
+        from autonomous_trust.core.identity.encrypt import Encryptor
+        from autonomous_trust.core.network.message import Message
+        from autonomous_trust.core.system import CfgIds
+
+        fixtures = case.data.get('fixtures', {}) or {}
+        nonce = hex_to_bytes(fixtures['nonce_hex'])
+        obj_json = fixtures.get('obj_json', '{}')
+        group_seed_hex = fixtures['group_encryptor_seed_hex']
+
+        a = _make_test_identity('a', addr='10.0.80.1')
+        b = _make_test_identity('b', addr='10.0.80.2')
+
+        # Both group instances share the SAME keypair bytes, mirroring the
+        # production model where every group member holds a copy of the
+        # group's keypair. The Encryptor constructor expects an ASCII-hex
+        # seed (matching Identity's encryptor construction).
+        group_seed = group_seed_hex.encode('ascii')
+        ns = UUID('00000000-0000-0000-0000-000000000bbb')
+        group_uuid = uuid5(ns, 'at-conformance:group:g1')
+        a_group = Group(group_uuid, {}, 'g1',
+                        Encryptor(group_seed, public_only=False),
+                        _public_only=False)
+        b_group = Group(group_uuid, {}, 'g1',
+                        Encryptor(group_seed, public_only=False),
+                        _public_only=False)
+
+        msg = Message(CfgIds.identity, 'request_access', obj_json,
+                      from_whom=a, encrypt=True)
+        plaintext = bytes(msg)
+
+        # Group.encrypt uses the GROUP as `whom`, so the underlying Box
+        # operates over (group_private, group_public) — a shared-secret
+        # encryption among all group members. Same on the decrypt side
+        # because B has the same keypair.
+        encrypted = a_group.encrypt(plaintext, a_group, nonce=nonce)
+        decrypted = b_group.decrypt(encrypted, b_group)
+        if isinstance(decrypted, str):
+            decrypted = decrypted.encode('utf-8')
+
+        parsed = Message.parse(decrypted, a)
+        _assert_expected_state_b(case, parsed)
+
+    def _run_broadcast_fanout(self, case: Case) -> None:
+        """Exercise sign → broadcast wire bytes → parse, fanned out to two
+        independent receivers. Both receivers consume the SAME bytes and
+        must report identical observables.
+        """
+        from autonomous_trust.core.network.message import Message
+        from autonomous_trust.core.system import CfgIds
+
+        fixtures = case.data.get('fixtures', {}) or {}
+        obj_json = fixtures.get('obj_json', '{}')
+
+        a = _make_test_identity('a', addr='10.0.80.1')
+        b = _make_test_identity('b', addr='10.0.80.2')  # noqa: F841 — built for symmetry only
+        c = _make_test_identity('c', addr='10.0.80.3')  # noqa: F841
+
+        msg = Message(CfgIds.identity, 'request_access', obj_json,
+                      from_whom=a, encrypt=False)
+        wire = bytes(msg)
+
+        # Each receiver parses the wire bytes independently with A as the
+        # known sender. The two parses must yield identical observables.
+        parsed_b = Message.parse(wire, a)
+        parsed_c = Message.parse(wire, a)
+        _assert_expected_state(case, 'b', parsed_b)
+        _assert_expected_state(case, 'c', parsed_c)
+
+    # ------------------------------------------------------------------
+    # Negative kind
+    # ------------------------------------------------------------------
+
+    def run_negative(self, case: Case) -> None:
+        from ...common.negative_runner import run_wire_negative
+        expected = case.data['expected']['reason_class']
+        observed = run_wire_negative(self.corpus_root, case)
+        if observed != expected:
+            raise AssertionError(
+                f'reason_class mismatch: expected {expected!r}, '
+                f'observed {observed!r}'
+            )
+
+
+def _assert_expected_state(case: Case, participant_id: str, parsed) -> None:
+    """Compare a parsed Message against `case.expected_state.<participant_id>`.
+
+    Shared by network scenarios so adapters don't redefine the routed_*
+    / verified comparison each time. Caller passes the participant id
+    to support multi-receiver scenarios (e.g. broadcast fan-out).
+    """
+    expected = case.data.get('expected_state', {}).get(participant_id, {}) or {}
+    rp = expected.get('routed_process')
+    rf = expected.get('routed_function')
+    ver = expected.get('verified')
+    if rp is not None and parsed.process != rp:
+        raise AssertionError(
+            f'{participant_id}: routed_process mismatch: '
+            f'expected {rp!r}, got {parsed.process!r}'
         )
+    if rf is not None and parsed.function != rf:
+        raise AssertionError(
+            f'{participant_id}: routed_function mismatch: '
+            f'expected {rf!r}, got {parsed.function!r}'
+        )
+    if ver is not None and bool(parsed.verified) != bool(ver):
+        raise AssertionError(
+            f'{participant_id}: verified mismatch: '
+            f'expected {ver}, got {parsed.verified}'
+        )
+
+
+def _assert_expected_state_b(case: Case, parsed) -> None:
+    """Convenience wrapper for legacy single-receiver scenarios."""
+    _assert_expected_state(case, 'b', parsed)
+
+
+def _make_test_identity(pid: str, addr: str) -> 'Identity':
+    """Build a deterministic Identity for the conformance harness.
+
+    Mirrors the seed-derivation used by the identity adapter so two
+    invocations produce byte-identical keys.
+    """
+    import hashlib
+    from uuid import UUID, uuid5
+    from autonomous_trust.core.algorithms.impl import AgreementImpl
+    from autonomous_trust.core.identity import Identity
+    from autonomous_trust.core.identity.encrypt import Encryptor
+    from autonomous_trust.core.identity.sign import Signature
+
+    sig_seed = hashlib.sha256(b'at-conformance:sig:' + pid.encode()).hexdigest().encode('ascii')
+    enc_seed = hashlib.sha256(b'at-conformance:enc:' + pid.encode()).hexdigest().encode('ascii')
+    ns = UUID('00000000-0000-0000-0000-000000000aaa')
+    uuid = uuid5(ns, f'at-conformance:{pid}')
+    return Identity(
+        uuid, addr, f'{pid}.scenario', pid,
+        Signature(sig_seed, public_only=False),
+        Encryptor(enc_seed, public_only=False),
+        'me', False, 0, AgreementImpl.POA.value,
+    )

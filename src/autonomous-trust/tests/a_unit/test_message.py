@@ -145,3 +145,66 @@ def test_message_bytes_conversion():
 def test_message_parse_sender_not_identity():
     with pytest.raises(RuntimeError, match='Sender must be an Identity'):
         Message.parse('proc|func|data', 'not_identity')
+
+
+def _real_identity(pid):
+    """Build a real Identity (signing capable) for sig-verify tests."""
+    import hashlib
+    from uuid import UUID, uuid5
+    from autonomous_trust.core.algorithms.impl import AgreementImpl
+    from autonomous_trust.core.identity.encrypt import Encryptor
+    from autonomous_trust.core.identity.sign import Signature
+    ns = UUID('00000000-0000-0000-0000-000000000aaa')
+    return Identity(
+        uuid5(ns, f'test:{pid}'),
+        '10.0.0.1', f'{pid}.test', pid,
+        Signature(hashlib.sha256(b'test:sig:' + pid.encode()).hexdigest().encode('ascii'),
+                  public_only=False),
+        Encryptor(hashlib.sha256(b'test:enc:' + pid.encode()).hexdigest().encode('ascii'),
+                  public_only=False),
+        'me', False, 0, AgreementImpl.POA.value,
+    )
+
+
+class TestMessageSignatureRoundtrip:
+    """Regression coverage for BUGS.md P3 (Message.parse / __bytes__ double-hex).
+
+    Before the 2026-05-11 fix, signing a Message with a real Identity and
+    then re-parsing the wire form with that identity as the sender returned
+    a Message with verified=False because __bytes__ double-hex-encoded the
+    signature field and parse() couldn't reconcile the format. The same
+    path affected __str__ + parse. The C side and ReputationProtocol's
+    Paxos handlers both rely on `verified=True` for legitimately signed
+    messages, so the silent failure mis-classified valid traffic.
+    """
+
+    def test_bytes_roundtrip_preserves_verified(self):
+        sender = _real_identity('alice')
+        msg = Message('identity', 'request_access', '{}', from_whom=sender,
+                      encrypt=False)
+        parsed = Message.parse(bytes(msg), sender)
+        assert parsed.verified is True
+
+    def test_str_roundtrip_preserves_verified(self):
+        sender = _real_identity('alice')
+        msg = Message('identity', 'request_access', '{}', from_whom=sender,
+                      encrypt=False)
+        parsed = Message.parse(str(msg), sender)
+        assert parsed.verified is True
+
+    def test_tampered_payload_yields_unverified(self):
+        """Sanity-check the opposite direction: a flipped data byte must
+        leave verified=False after parse. Catches a regression where the
+        fix accidentally short-circuits to verified=True regardless of
+        signature validity."""
+        import json
+        from base64 import b64decode, b64encode
+        sender = _real_identity('alice')
+        msg = Message('identity', 'request_access', '{}', from_whom=sender,
+                      encrypt=False)
+        wire = json.loads(bytes(msg).decode('utf-8'))
+        # Replace the encoded payload while leaving the signature intact.
+        wire['data'] = b64encode(b'{"tampered":1}').decode('ascii')
+        tampered = json.dumps(wire, separators=(',', ':')).encode('utf-8')
+        parsed = Message.parse(tampered, sender)
+        assert parsed.verified is False
