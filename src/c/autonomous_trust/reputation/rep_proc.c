@@ -1111,6 +1111,15 @@ int reputation_get_request_count(void)
     return count;
 }
 
+int64_t reputation_get_last_id(void)
+{
+    if (!rep_state.initialized) return 0;
+    pthread_mutex_lock(&rep_state.lock);
+    int64_t id = rep_state.paxos.last_id;
+    pthread_mutex_unlock(&rep_state.lock);
+    return id;
+}
+
 /* Frama-C: skipped — [solver-timeout] state-cascade through paxos_init +
  * process_register_handler stubs prevents WP from discharging
  * valid_rw(proc) and valid_rd(signal) at downstream call sites */

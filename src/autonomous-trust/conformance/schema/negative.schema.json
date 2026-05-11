@@ -23,7 +23,7 @@
         "step_id": {"type": "integer", "minimum": 1},
         "op": {
           "type": "string",
-          "enum": ["flip_byte", "truncate", "append", "replace", "drop_field", "set_field"]
+          "enum": ["flip_byte", "truncate", "append", "replace", "drop_field", "set_field", "inflate"]
         },
         "target": {
           "type": "string",
@@ -35,6 +35,11 @@
           "type": "string",
           "pattern": "^[0-9a-fA-F]*$",
           "description": "Raw replacement bytes encoded as hex (no 0x prefix). Used by op=replace target=wire_bytes to inject non-JSON garbage."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Target binary size for op=inflate target=payload — the wire `data` field is replaced with base64-of-N-zero-bytes. Honest reason_class is signature_verification_failed (neither parser enforces an explicit size limit today; the test asserts the parser survives a large input and the signature mismatches the inflated payload)."
         }
       }
     },

@@ -267,8 +267,18 @@ class AgreementAdapter:
                 # BUGS.md P5. This scenario shape doesn't pin the digest
                 # bytes across languages; it asserts only the end-to-end
                 # protocol outcome (finalize=true).
+                #
+                # repeat: N mines ONCE and then verifies N times with
+                # the same proof — matches a real wire replay where the
+                # attacker captured a valid POW proof and re-delivered
+                # it. Idempotency is observable through finalize:
+                # Python's `_approved.append(blob)` and C's
+                # `array_append(approved, blob)` both run N times, but
+                # finalize removes only one entry and returns the same
+                # outcome.
                 proof = protocol.prove(blob)
-                protocol.verify(blob, proof, None)
+                for _ in range(int(step.get('repeat', 1))):
+                    protocol.verify(blob, proof, None)
                 continue
 
             if fn != 'vote':

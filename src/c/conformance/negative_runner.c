@@ -195,6 +195,49 @@ int at_neg_apply_mutation(const uint8_t *in_buf, size_t in_len,
         return 0;
     }
 
+    if (strcmp(op, "inflate") == 0 && strcmp(target, "payload") == 0) {
+        /* Replace the wire `data` field with base64 of N zero bytes.
+         * Honest semantic — neither parser enforces a payload size
+         * cap today (transport caps exist at net_transport_tcp.c:173
+         * with NET_MSG_MAX_DATA=1MB, but they fire BEFORE the wire
+         * parse, not inside it). The inflated envelope therefore
+         * decodes cleanly; the signature was over the original
+         * shorter payload, so verification fails. Test guarantees:
+         * parser survives an O(N) larger input, signature verifier
+         * correctly rejects. If a future hardening lands an
+         * envelope-level size limit, this op's classify_op flips to
+         * `payload_oversized` and the YAMLs follow. */
+        json_t *size_node = json_object_get(mutation, "size");
+        if (!json_is_integer(size_node)) return -1;
+        long long sz_signed = (long long)json_integer_value(size_node);
+        if (sz_signed < 1) return -1;
+        size_t bin_len = (size_t)sz_signed;
+
+        json_error_t jerr;
+        json_t *wire = json_loadb((const char *)in_buf, in_len, 0, &jerr);
+        if (wire == NULL) return -2;
+        if (!json_is_object(wire)) { json_decref(wire); return -2; }
+
+        unsigned char *bin = calloc(bin_len, 1);
+        if (bin == NULL) { json_decref(wire); return -1; }
+        size_t b64_buf_len = sodium_base64_encoded_len(bin_len, sodium_base64_VARIANT_ORIGINAL);
+        char *b64 = malloc(b64_buf_len);
+        if (b64 == NULL) { free(bin); json_decref(wire); return -1; }
+        sodium_bin2base64(b64, b64_buf_len, bin, bin_len,
+                          sodium_base64_VARIANT_ORIGINAL);
+        free(bin);
+
+        json_object_set_new(wire, "data", json_string(b64));
+        free(b64);
+
+        char *dumped = json_dumps(wire, JSON_COMPACT);
+        json_decref(wire);
+        if (dumped == NULL) return -1;
+        *out_len = strlen(dumped);
+        *out_buf = (uint8_t *)dumped;
+        return 0;
+    }
+
     if (strcmp(op, "replace") == 0 && strcmp(target, "wire_bytes") == 0) {
         /* Byte-identical to Python's apply_mutation replace/wire_bytes:
          * the entire wire buffer is swapped for a caller-supplied raw
@@ -251,6 +294,15 @@ const char *at_neg_classify_op(json_t *mutation)
     if (op != NULL && strcmp(op, "truncate") == 0) return "envelope_truncated";
     if (op != NULL && target != NULL && strcmp(op, "flip_byte") == 0 &&
         (strcmp(target, "signature") == 0 || strcmp(target, "payload") == 0)) {
+        return "signature_verification_failed";
+    }
+    /* inflate/payload: parsers don't yet enforce a size cap; the
+     * observable failure of a large `data` field is signature mismatch
+     * (the sig was over the pre-inflation short payload). When a
+     * future parser-level size limit lands, this branch flips to
+     * `payload_oversized`. */
+    if (op != NULL && target != NULL && strcmp(op, "inflate") == 0 &&
+        strcmp(target, "payload") == 0) {
         return "signature_verification_failed";
     }
     return "envelope_malformed";
