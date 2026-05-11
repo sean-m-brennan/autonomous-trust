@@ -50,6 +50,7 @@ from autonomous_trust.core.network.network import Network
 from autonomous_trust.core.processes import ProcessTracker
 from autonomous_trust.core.system import CfgIds, PackageHash
 
+from ...common.negative_runner import run_wire_negative
 from ...common.scenario_loader import Case
 from ..scenario_engine import (
     CapturedMessage,
@@ -208,8 +209,14 @@ class IdentityAdapter:
     def run_crypto_vector(self, case: Case) -> None:  # noqa: ARG002
         raise NotImplementedError('identity crypto_vector kind not implemented')
 
-    def run_negative(self, case: Case) -> None:  # noqa: ARG002
-        raise NotImplementedError('identity negative kind not implemented (Phase C: scenarios only)')
+    def run_negative(self, case: Case) -> None:
+        expected = case.data['expected']['reason_class']
+        observed = run_wire_negative(self.corpus_root, case)
+        if observed != expected:
+            raise AssertionError(
+                f'reason_class mismatch: expected {expected!r}, '
+                f'observed {observed!r}'
+            )
 
     # ------------------------------------------------------------------
     # Participant construction

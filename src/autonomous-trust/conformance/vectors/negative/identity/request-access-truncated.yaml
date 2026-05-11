@@ -1,0 +1,22 @@
+schema_version: "1"
+kind: negative
+protocol: identity
+name: request-access-truncated
+description: |
+    Truncate the newcomer's request_access wire buffer mid-JSON. The
+    parser must refuse the input (no half-decoded Message handed to the
+    handlers). Both Python and C parsers must produce a parse failure;
+    the harness classifies the failure category as envelope_truncated
+    based on the mutation intent (the parser exception type alone does
+    not distinguish truncation from generic malformedness).
+
+based_on: scenarios/identity/new-node-admission.yaml
+
+mutation:
+  step_id: 1
+  op: truncate
+  target: wire_bytes
+  index: 64
+
+expected:
+  reason_class: envelope_truncated

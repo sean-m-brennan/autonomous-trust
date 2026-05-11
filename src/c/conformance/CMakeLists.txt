@@ -27,6 +27,7 @@ set(AT_CONFORMANCE_SOURCES
     scenario_loader.c
     scenario_engine.c
     case_result.c
+    negative_runner.c
     adapters/network.c
     adapters/identity.c
     adapters/agreement.c
