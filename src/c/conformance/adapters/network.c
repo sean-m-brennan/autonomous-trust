@@ -1062,15 +1062,19 @@ static int _assert_expected_state(const at_case_t *c, const char *pid,
     const char *rf = json_string_value(json_object_get(p_expected, "routed_function"));
     json_t *ver_j = json_object_get(p_expected, "verified");
     if (rp != NULL && strcmp(parsed->process, rp) != 0) {
+        /* Cap %s widths: the JSON string values are compiler-unbounded
+         * which triggers -Wformat-truncation. Real process / function
+         * names are short by design (PROC_NAME_LEN-sized in the wire
+         * envelope). */
         snprintf(err, err_len,
-                 "%s: routed_process mismatch: expected %s, got %s",
+                 "%.32s: routed_process mismatch: expected %.32s, got %.32s",
                  pid, rp, parsed->process);
         return -1;
     }
     if (rf != NULL &&
         (parsed->function == NULL || strcmp(parsed->function, rf) != 0)) {
         snprintf(err, err_len,
-                 "%s: routed_function mismatch: expected %s, got %s",
+                 "%.32s: routed_function mismatch: expected %.64s, got %.64s",
                  pid, rf, parsed->function ? parsed->function : "(null)");
         return -1;
     }
@@ -1087,6 +1091,13 @@ static int _assert_expected_state(const at_case_t *c, const char *pid,
     return 0;
 }
 
+/* Fan-out broadcast scenario, parameterized by the participants array.
+ * Sender is the first role:sender; every role:receiver gets an
+ * independent parse against the SAME wire bytes. Mirrors the Python
+ * adapter's iterate-participants form. Supports N=2 (broadcast-fanout)
+ * and N=3 (broadcast-fanout-three-receivers) without further code. */
+#define BFAN_MAX_RECEIVERS 8
+
 static int run_broadcast_fanout(const at_case_t *c, char *err, size_t err_len) {
     int rc = -1;
     identity_t *a = NULL;
@@ -1094,15 +1105,49 @@ static int run_broadcast_fanout(const at_case_t *c, char *err, size_t err_len) {
     uint8_t *wire = NULL;
     size_t wire_len = 0;
     net_wire_msg_t msg = {0};
-    net_wire_msg_t parsed_b = {0};
-    net_wire_msg_t parsed_c = {0};
+    net_wire_msg_t parsed[BFAN_MAX_RECEIVERS];
+    memset(parsed, 0, sizeof(parsed));
+    int parsed_count = 0;
+    const char *receiver_ids[BFAN_MAX_RECEIVERS] = {0};
 
     json_t *fixtures = json_object_get(c->data, "fixtures");
     const char *obj_json = fixtures != NULL
         ? json_string_value(json_object_get(fixtures, "obj_json")) : "{}";
     if (obj_json == NULL) obj_json = "{}";
 
-    if (_make_deterministic_identity("a", "10.0.80.1", &a) != 0) {
+    /* Find sender + collect receivers. */
+    const char *sender_id = NULL;
+    int receiver_count = 0;
+    json_t *parts = json_object_get(c->data, "participants");
+    if (!json_is_array(parts)) {
+        snprintf(err, err_len, "scenario: participants array missing");
+        goto cleanup;
+    }
+    size_t n_parts = json_array_size(parts);
+    for (size_t i = 0; i < n_parts; i++) {
+        json_t *p = json_array_get(parts, i);
+        const char *id = json_string_value(json_object_get(p, "id"));
+        const char *role = json_string_value(json_object_get(p, "role"));
+        if (id == NULL || role == NULL) continue;
+        if (strcmp(role, "sender") == 0 && sender_id == NULL) {
+            sender_id = id;
+        } else if (strcmp(role, "receiver") == 0) {
+            if (receiver_count >= BFAN_MAX_RECEIVERS) {
+                snprintf(err, err_len,
+                         "scenario: too many receivers (max %d)",
+                         BFAN_MAX_RECEIVERS);
+                goto cleanup;
+            }
+            receiver_ids[receiver_count++] = id;
+        }
+    }
+    if (sender_id == NULL || receiver_count == 0) {
+        snprintf(err, err_len,
+                 "scenario: broadcast needs one sender and >=1 receiver");
+        goto cleanup;
+    }
+
+    if (_make_deterministic_identity(sender_id, "10.0.80.1", &a) != 0) {
         snprintf(err, err_len, "scenario: identity build failed");
         goto cleanup;
     }
@@ -1129,25 +1174,27 @@ static int run_broadcast_fanout(const at_case_t *c, char *err, size_t err_len) {
         goto cleanup;
     }
 
-    /* Fan-out: parse the SAME bytes twice with A as the known sender.
-     * Each parse must produce identical observables (the engine ships
-     * one bytes copy to multiple receivers in production). */
-    if (net_message_from_wire(wire, wire_len, a_pub, &parsed_b) != 0) {
-        snprintf(err, err_len, "scenario: parse for b failed");
-        goto cleanup;
+    /* Fan-out: parse the SAME bytes once per receiver. Each parse must
+     * produce identical observables — the engine ships one bytes copy
+     * to multiple receivers in production. */
+    for (int i = 0; i < receiver_count; i++) {
+        if (net_message_from_wire(wire, wire_len, a_pub, &parsed[i]) != 0) {
+            /* Cap the %s width to avoid -Wformat-truncation; participant
+             * ids in the corpus schema match `^[a-z0-9][a-z0-9_-]*$`
+             * and are short in practice, but the JSON string value the
+             * compiler sees is unbounded. */
+            snprintf(err, err_len,
+                     "scenario: parse for %.32s failed", receiver_ids[i]);
+            goto cleanup;
+        }
+        parsed_count = i + 1;
+        if (_assert_expected_state(c, receiver_ids[i], &parsed[i],
+                                   err, err_len) != 0) goto cleanup;
     }
-    if (net_message_from_wire(wire, wire_len, a_pub, &parsed_c) != 0) {
-        snprintf(err, err_len, "scenario: parse for c failed");
-        goto cleanup;
-    }
-
-    if (_assert_expected_state(c, "b", &parsed_b, err, err_len) != 0) goto cleanup;
-    if (_assert_expected_state(c, "c", &parsed_c, err, err_len) != 0) goto cleanup;
 
     rc = 0;
 cleanup:
-    net_wire_msg_free(&parsed_b);
-    net_wire_msg_free(&parsed_c);
+    for (int i = 0; i < parsed_count; i++) net_wire_msg_free(&parsed[i]);
     free(wire);
     free(msg.function);
     free(msg.data);
@@ -1159,13 +1206,15 @@ cleanup:
 static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     /* Network scenarios are protocol-specific; each adds a branch here
      * matching by case name. */
-    if (strcmp(c->name, "peer-encrypted-roundtrip") == 0) {
+    if (strcmp(c->name, "peer-encrypted-roundtrip") == 0 ||
+        strcmp(c->name, "peer-encrypted-structured-payload") == 0) {
         return run_peer_encrypted_roundtrip(c, err, err_len);
     }
     if (strcmp(c->name, "group-encrypted-roundtrip") == 0) {
         return run_group_encrypted_roundtrip(c, err, err_len);
     }
-    if (strcmp(c->name, "broadcast-fanout") == 0) {
+    if (strcmp(c->name, "broadcast-fanout") == 0 ||
+        strcmp(c->name, "broadcast-fanout-three-receivers") == 0) {
         return run_broadcast_fanout(c, err, err_len);
     }
     snprintf(err, err_len, "unknown network scenario: %s", c->name);
