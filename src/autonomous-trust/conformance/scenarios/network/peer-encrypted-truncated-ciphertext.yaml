@@ -1,0 +1,54 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: peer-encrypted-truncated-ciphertext
+byte_pinning: false
+description: |
+    Crypto-rejection probe. A encrypts a signed request_access wire
+    envelope for B with the fixture nonce. The harness drops the
+    trailing 16 bytes of the ciphertext (well inside the libsodium
+    Box `MAC || encrypted_data` body) and hands the truncated bytes
+    to B's `decrypt`. Both impls' Box-decrypt must reject:
+      - Python: PyNaCl raises `nacl.exceptions.CryptoError`.
+      - C: `identity_decrypt` returns non-zero.
+
+    Threat model: an on-path attacker may attempt to strip trailing
+    ciphertext bytes (e.g., to drop authenticated tail content while
+    leaving the MAC tag visually intact). libsodium recomputes the
+    poly1305 MAC over the supplied ciphertext on decrypt; truncating
+    the cipher tail changes the recomputed MAC, so the embedded MAC
+    no longer matches and decryption fails.
+
+    Complements `peer-encrypted-tampered-ciphertext` (single-bit
+    flip catches mutation) with a length-mutation cousin (tail-strip
+    catches truncation). Both should reject for the same MAC-based
+    reason, but the threat vectors differ: tamper is mid-stream
+    rewrite, truncate is end-of-stream loss.
+
+    Uses the same `expected_state.<pid>.decrypt_failed: true`
+    assertion enforced by `_assert_decrypt_failed` in both adapters.
+
+participants:
+  - id: a
+    role: sender
+  - id: b
+    role: receiver
+
+fixtures:
+  nonce_hex: "0x000102030405060708090a0b0c0d0e0f1011121314151617"
+  obj_json: "{}"
+
+steps:
+  - id: 1
+    from: a
+    to: b
+    function: request_access
+    description: |
+        A signs+serializes, encrypts to B with the fixture nonce. The
+        harness then drops the trailing 16 bytes of the ciphertext
+        body (preserving the MAC prefix) and hands the shortened
+        bytes to B. B's MAC verification must reject.
+
+expected_state:
+  b:
+    decrypt_failed: true

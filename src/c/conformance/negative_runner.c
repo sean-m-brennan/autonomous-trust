@@ -296,13 +296,22 @@ const char *at_neg_classify_op(json_t *mutation)
         (strcmp(target, "signature") == 0 || strcmp(target, "payload") == 0)) {
         return "signature_verification_failed";
     }
-    /* inflate/payload: parsers don't yet enforce a size cap; the
-     * observable failure of a large `data` field is signature mismatch
-     * (the sig was over the pre-inflation short payload). When a
-     * future parser-level size limit lands, this branch flips to
-     * `payload_oversized`. */
+    /* inflate/payload: two regimes split on the parser-level size cap
+     * (NET_MSG_MAX_DATA, 1 MB):
+     *   - size below the cap: parser accepts, signature mismatches
+     *     pre-inflation payload → signature_verification_failed.
+     *   - size large enough to push the wire over the cap: parser's
+     *     up-front size guard rejects before json_loadb runs →
+     *     payload_oversized.
+     * 768 KB raw * 1.33 (base64) ≈ 1.02 MB wire; tests should pin
+     * sizes well below or well above 768 KB to stay clear of the
+     * boundary. Mirrors the Python classify_op split. */
     if (op != NULL && target != NULL && strcmp(op, "inflate") == 0 &&
         strcmp(target, "payload") == 0) {
+        json_int_t size = 0;
+        json_t *size_j = json_object_get(mutation, "size");
+        if (json_is_integer(size_j)) size = json_integer_value(size_j);
+        if (size >= (json_int_t)(768 * 1024)) return "payload_oversized";
         return "signature_verification_failed";
     }
     return "envelope_malformed";

@@ -1,0 +1,61 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: group-key-rotation-decrypt-fails
+byte_pinning: false
+description: |
+    Group-key rotation probe. A still holds the pre-rotation group
+    key K1 and encrypts a signed envelope for the group with K1. B
+    has been rotated to a NEW group key K2 (different seed,
+    different keypair). B's group-decrypt with K2 cannot recover the
+    plaintext — the MAC over K1's ciphertext doesn't verify against
+    K2's box.
+
+    Operational meaning: when a group rotates its shared key (e.g.
+    after a peer is ejected), members holding the new key MUST NOT
+    be able to read ciphertext encrypted to the old key. This is the
+    forward-secrecy invariant of the rotation flow. If either impl
+    accepted post-rotation decryption of pre-rotation ciphertext,
+    the rotation primitive would be broken — ejected peers (who held
+    K1 before rotation) could still produce ciphertexts the group
+    accepts, defeating the rotation's purpose.
+
+    Distinct from `peer-encrypted-wrong-recipient`: that case uses
+    asymmetric per-peer Box keying (sender knows recipient's pubkey).
+    This case uses symmetric-style group Box keying where the seed
+    differs between sides. Both reject for the same underlying
+    reason (MAC mismatch on derived shared secret), but the
+    operational scenarios are different.
+
+    Both fixtures (K1 and K2) are 64 hex chars / 32 raw bytes;
+    libsodium derives the keypair from the seed identically on both
+    sides, so byte-equal seeds mean byte-equal Box keypairs.
+
+participants:
+  - id: a
+    role: sender
+  - id: b
+    role: receiver
+
+fixtures:
+  nonce_hex: "0x404142434445464748494a4b4c4d4e4f5051525354555657"
+  obj_json: "{}"
+  # K1: A's pre-rotation group key.
+  group_encryptor_seed_hex: "67c6697351ff4aec29cdbaabf2fbe3467cc254f81be8e78d765a2e63339fc99a"
+  # K2: B's post-rotation group key. Bit-flipped from K1 to keep both
+  # seeds well-formed and obviously distinct.
+  group_rotated_seed_hex:   "98399968ce005153d63245540d041cb98c33dab07e417187e9a59ce5fa4d2566"
+
+steps:
+  - id: 1
+    from: a
+    to: b
+    function: request_access
+    description: |
+        A encrypts with K1; B's group key is K2; decryption fails.
+        Validates that rotated peers can't read pre-rotation
+        ciphertext.
+
+expected_state:
+  b:
+    decrypt_failed: true
