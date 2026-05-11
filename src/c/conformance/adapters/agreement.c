@@ -42,6 +42,8 @@
 #include "algorithms/agreement.h"
 #include "structures/merkle.h"
 
+#include "../negative_runner.h"
+
 #define HARNESS_MAX_VOTERS  16
 
 /* ------------------------------------------------------------------------- */
@@ -307,6 +309,10 @@ cleanup:
 /* ------------------------------------------------------------------------- */
 
 void at_agreement_run(const at_case_t *c, at_case_result_t *out) {
+    if (strcmp(c->kind, "negative") == 0) {
+        at_neg_run_wire(c, out);
+        return;
+    }
     if (strcmp(c->kind, "agreement_vector") != 0) {
         char detail[160];
         snprintf(detail, sizeof(detail),
