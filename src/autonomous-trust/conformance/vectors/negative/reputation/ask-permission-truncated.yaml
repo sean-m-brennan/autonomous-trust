@@ -1,0 +1,21 @@
+schema_version: "1"
+kind: negative
+protocol: reputation
+name: ask-permission-truncated
+description: |
+    Truncate alice's reputation `ask permission` wire buffer mid-
+    JSON. The parser must refuse the input — no half-decoded
+    Message ever reaches handle_ask. Companion to
+    identity/request-access-truncated; truncation index also 64
+    bytes, well before the JSON envelope is complete.
+
+based_on: scenarios/reputation/request-granted.yaml
+
+mutation:
+  step_id: 1
+  op: truncate
+  target: wire_bytes
+  index: 64
+
+expected:
+  reason_class: envelope_truncated

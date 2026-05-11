@@ -1,0 +1,20 @@
+schema_version: "1"
+kind: negative
+protocol: agreement
+name: vote-truncated
+description: |
+    Truncate bob's agreement `vote` wire buffer mid-JSON. The parser
+    must refuse the input. Companion to identity/request-access-
+    truncated; truncation index also 64 bytes, well before the JSON
+    envelope is complete.
+
+based_on: scenarios/agreement/poa-leader-abstains.yaml
+
+mutation:
+  step_id: 1
+  op: truncate
+  target: wire_bytes
+  index: 64
+
+expected:
+  reason_class: envelope_truncated

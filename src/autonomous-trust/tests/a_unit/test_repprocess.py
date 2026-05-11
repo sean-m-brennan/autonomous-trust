@@ -148,6 +148,74 @@ class TestHandleRequest:
         result = rp.handle_request(queues, msg)
         assert result is False
 
+    def test_grant_advances_last_id(self):
+        """Regression for BUGS.md P6.
+
+        Prior bug: handle_request granted but never assigned self.last_id,
+        so a duplicate (id1, id2) replay re-passed the `last_id is None or
+        last_id < id1` guard and double-appended to self.requests. C side
+        always advanced (paxos.c:123). After fix, both languages advance
+        last_id to id1 immediately after the grant message is emitted; the
+        ack itself still carries the PRIOR last_id (captured before
+        update), matching paxos.c:114.
+        """
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        rp.protocol.peers.all = [peer]
+
+        net_q = queue.Queue()
+        queues = {CfgIds.network: net_q, CfgIds.reputation: queue.Queue()}
+
+        id1 = 100
+        id2 = 1  # len(history) + 1 == 1
+        msg = Message(CfgIds.reputation, ReputationProtocol.request,
+                      to_yaml_string((id1, id2, peer.uuid)),
+                      from_whom=peer)
+        rp.handle_request(queues, msg)
+        first = net_q.get_nowait()
+        assert first.function == ReputationProtocol.grant
+        assert rp.last_id == id1, (
+            f'last_id must advance to {id1} after grant; '
+            f'got {rp.last_id!r} (P6 regression)'
+        )
+
+    def test_replay_after_grant_is_nacked(self):
+        """Regression for BUGS.md P6: duplicate ask must NACK after grant.
+
+        With last_id correctly pinned by the first grant, the second
+        identical ask hits `last_id < id1` → False and falls through to the
+        nack branch. requests stays length 1 (no double-append). Mirrors
+        C's behavior in paxos_handle_request when id1 is NOT > last_id.
+        """
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        rp.protocol.peers.all = [peer]
+
+        net_q = queue.Queue()
+        queues = {CfgIds.network: net_q, CfgIds.reputation: queue.Queue()}
+
+        id1 = 100
+        id2 = 1
+        msg = Message(CfgIds.reputation, ReputationProtocol.request,
+                      to_yaml_string((id1, id2, peer.uuid)),
+                      from_whom=peer)
+        rp.handle_request(queues, msg)
+        first = net_q.get_nowait()
+        assert first.function == ReputationProtocol.grant
+
+        # Replay the SAME ask. Before P6 fix this re-granted and
+        # doubled requests; after fix it NACKs.
+        rp.handle_request(queues, msg)
+        second = net_q.get_nowait()
+        assert second.function == ReputationProtocol.nack, (
+            f'replayed ask must NACK after first grant, '
+            f'got {second.function!r} (P6 regression)'
+        )
+        assert len(rp.requests) == 1, (
+            'replayed ask must not double-append to requests; '
+            f'got len={len(rp.requests)} (P6 regression)'
+        )
+
 
 class TestHandleGrant:
     def test_wrong_function(self):

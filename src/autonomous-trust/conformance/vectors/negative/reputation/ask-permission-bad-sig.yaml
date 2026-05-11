@@ -1,0 +1,22 @@
+schema_version: "1"
+kind: negative
+protocol: reputation
+name: ask-permission-bad-sig
+description: |
+    Flip one hex character of alice's signature on the reputation
+    `ask permission` request to bob. The receiver's wire-message
+    parser must mark the parsed message as unverified, independent of
+    the Paxos-side logic in handle_ask. First negative for the
+    reputation protocol — confirms the shared `run_wire_negative`
+    framework dispatches correctly on a reputation envelope.
+
+based_on: scenarios/reputation/request-granted.yaml
+
+mutation:
+  step_id: 1
+  op: flip_byte
+  target: signature
+  index: 0
+
+expected:
+  reason_class: signature_verification_failed

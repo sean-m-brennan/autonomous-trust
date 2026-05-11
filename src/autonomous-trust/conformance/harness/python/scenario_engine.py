@@ -112,9 +112,16 @@ def _drive_source(ctx: ScenarioContext, step: dict) -> None:
         payload=step.get('payload', {}),
     )
     targets = _resolve_targets(ctx, step, exclude={step['from']})
-    for target in targets:
-        emitted = target.dispatch(inbound)
-        ctx.outboxes[sid].captured.extend(_tag_emitter(emitted, target.id))
+    # repeat: N delivers the same inbound message N times to the same
+    # targets. Used by replay-handling probes; a correctly-deduping
+    # handler produces the same observable state after N deliveries as
+    # after 1. Built once, dispatched N times — matches what a real
+    # network replay attack would look like (same wire bytes redelivered).
+    repeat = int(step.get('repeat', 1))
+    for _ in range(repeat):
+        for target in targets:
+            emitted = target.dispatch(inbound)
+            ctx.outboxes[sid].captured.extend(_tag_emitter(emitted, target.id))
 
 
 def _drive_assertion(ctx: ScenarioContext, step: dict, in_resp: int) -> None:

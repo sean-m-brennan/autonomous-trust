@@ -1,0 +1,27 @@
+schema_version: "1"
+kind: negative
+protocol: identity
+name: request-access-non-json
+description: |
+    Replace the entire wire buffer of newcomer's request_access with
+    non-JSON ASCII bytes ("not_json_at_all"). Distinct from
+    request-access-truncated (which truncates a real JSON envelope
+    mid-string) and request-access-drop-process (which removes one
+    field but leaves valid JSON). Here the parser sees a buffer that
+    isn't JSON at all; top-level json.loads / json_loadb must fail.
+    Both implementations classify as envelope_malformed.
+
+    This is the first negative case to exercise the new
+    `op: replace target: wire_bytes` mutation. The hex below decodes
+    to the 15 ASCII bytes "not_json_at_all".
+
+based_on: scenarios/identity/new-node-admission.yaml
+
+mutation:
+  step_id: 1
+  op: replace
+  target: wire_bytes
+  content_hex: "6e6f745f6a736f6e5f61745f616c6c"
+
+expected:
+  reason_class: envelope_malformed

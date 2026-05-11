@@ -1,0 +1,20 @@
+schema_version: "1"
+kind: negative
+protocol: agreement
+name: vote-drop-process
+description: |
+    Drop the top-level `process` field from bob's agreement `vote`
+    JSON envelope. Both parsers require process+function; without
+    `process` the JSON path is rejected as envelope_malformed.
+    Companion to identity/request-access-drop-process on an
+    agreement envelope.
+
+based_on: scenarios/agreement/poa-leader-abstains.yaml
+
+mutation:
+  step_id: 1
+  op: drop_field
+  target: envelope.process
+
+expected:
+  reason_class: envelope_malformed

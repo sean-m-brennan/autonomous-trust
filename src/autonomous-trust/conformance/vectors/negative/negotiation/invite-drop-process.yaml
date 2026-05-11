@@ -1,0 +1,20 @@
+schema_version: "1"
+kind: negative
+protocol: negotiation
+name: invite-drop-process
+description: |
+    Drop the top-level `process` field from the JSON wire envelope of
+    alice's negotiation `invitation`. Both parsers require
+    process+function; without `process` the JSON path is rejected.
+    Companion to identity/request-access-drop-process — confirms the
+    same parse-level rejection on a negotiation envelope.
+
+based_on: scenarios/negotiation/invite-accept.yaml
+
+mutation:
+  step_id: 1
+  op: drop_field
+  target: envelope.process
+
+expected:
+  reason_class: envelope_malformed

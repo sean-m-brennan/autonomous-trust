@@ -1,0 +1,20 @@
+schema_version: "1"
+kind: negative
+protocol: reputation
+name: ask-permission-drop-process
+description: |
+    Drop the top-level `process` field from the JSON wire envelope
+    of alice's reputation `ask permission` request. Both parsers
+    require process+function; without `process` the JSON path is
+    rejected as envelope_malformed. Companion to
+    identity/request-access-drop-process on a reputation envelope.
+
+based_on: scenarios/reputation/request-granted.yaml
+
+mutation:
+  step_id: 1
+  op: drop_field
+  target: envelope.process
+
+expected:
+  reason_class: envelope_malformed

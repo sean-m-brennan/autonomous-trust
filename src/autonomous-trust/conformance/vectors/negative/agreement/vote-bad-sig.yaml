@@ -1,0 +1,29 @@
+schema_version: "1"
+kind: negative
+protocol: agreement
+name: vote-bad-sig
+description: |
+    Flip one hex character of bob's signature on the agreement
+    `vote` step from poa-leader-abstains. The wire envelope parser
+    must mark the parsed message as unverified, regardless of any
+    higher-level agreement state-machine behavior. First negative for
+    the agreement protocol — confirms shared `run_wire_negative`
+    dispatches correctly on an agreement envelope.
+
+    Note: the agreement step grammar's `function: vote` is a scenario-
+    driver concept, not a production wire function. For wire-level
+    negatives the value is just an opaque string in the JSON envelope
+    that the parser passes through; signature verification still
+    fires on the (process, function, payload) tuple, so the test
+    discriminates real signature corruption regardless.
+
+based_on: scenarios/agreement/poa-leader-abstains.yaml
+
+mutation:
+  step_id: 1
+  op: flip_byte
+  target: signature
+  index: 0
+
+expected:
+  reason_class: signature_verification_failed

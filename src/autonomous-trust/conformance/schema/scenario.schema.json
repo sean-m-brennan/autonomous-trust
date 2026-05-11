@@ -55,6 +55,12 @@
             "default": false,
             "description": "When true on an assertion step (in_response_to set), the engine verifies the captured outbound exists in the parent step's outbox but does NOT deliver it to the recipient. Useful when the recipient's handler depends on state outside the scenario's control or hits a known production bug."
           },
+          "repeat": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1,
+            "description": "Deliver this source step's message N times. Used to test replay/idempotency: a handler that correctly dedups (by message id, ballot tuple, or natural dict-collapse) produces the same observable state after N deliveries as after 1. Only meaningful on source steps; ignored on steps with in_response_to."
+          },
           "description": {"type": "string"}
         }
       }
