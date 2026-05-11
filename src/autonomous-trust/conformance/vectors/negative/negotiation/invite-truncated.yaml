@@ -1,0 +1,21 @@
+schema_version: "1"
+kind: negative
+protocol: negotiation
+name: invite-truncated
+description: |
+    Truncate alice's negotiation `invitation` wire buffer mid-JSON.
+    The parser must refuse the input — no half-decoded Message handed
+    to the handle_invite path. Companion to
+    identity/request-access-truncated; the truncation index is also
+    64 bytes, well before the JSON envelope is complete.
+
+based_on: scenarios/negotiation/invite-accept.yaml
+
+mutation:
+  step_id: 1
+  op: truncate
+  target: wire_bytes
+  index: 64
+
+expected:
+  reason_class: envelope_truncated

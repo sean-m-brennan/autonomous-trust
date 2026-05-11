@@ -258,6 +258,98 @@ static int _dispatch(sce_run_ctx_t *ctx,
 /* Adapter entry                                                              */
 /* ------------------------------------------------------------------------- */
 
+/* Validate `expected_state` against post-scenario participant state.
+ * Mirrors the Python identity adapter's _Participant._check_expected_state
+ * (src/autonomous-trust/conformance/harness/python/adapters/identity.py:86-111).
+ * Supported keys: phase (int), peer_count (int), has_peer (uuid string).
+ * Unsupported keys produce an error so the corpus and the two adapters
+ * stay aligned — an asymmetry caught at the gate beats a silent skip.
+ *
+ * Returns 0 if all checks pass, -1 with ctx->err on the first mismatch. */
+static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
+    json_t *expected = json_object_get(ctx->case_data, "expected_state");
+    if (!json_is_object(expected)) return 0;
+
+    const char *pid;
+    json_t *checks;
+    json_object_foreach(expected, pid, checks) {
+        if (strcmp(pid, "group") == 0) {
+            /* Engine convention from the Python side: group-state is
+             * adapter-driven; identity has no group-aware checks yet, so
+             * skip silently. */
+            continue;
+        }
+        if (!json_is_object(checks)) continue;
+        sce_participant_t *p = sce_find_participant(ctx, pid);
+        if (p == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "expected_state references unknown participant %s", pid);
+            return -1;
+        }
+        ic_impl_t *impl = (ic_impl_t *)p->impl;
+        process_t *proc = impl->proc;
+
+        const char *key;
+        json_t *val;
+        json_object_foreach(checks, key, val) {
+            if (strcmp(key, "phase") == 0) {
+                int want = (int)json_integer_value(val);
+                int got = (int)proc->protocol.phase;
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: phase=%d, expected %d", pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "peer_count") == 0) {
+                int want = (int)json_integer_value(val);
+                /* protocol.num_peers is the same field the production
+                 * peer-add path advances; mirrors Python's
+                 * `sum(len(level) for level in self.process.peers.hierarchy)`
+                 * (which collapses all hierarchy levels to a flat count). */
+                int got = (int)proc->protocol.num_peers;
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: peer_count=%d, expected %d", pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "has_peer") == 0) {
+                const char *uuid_str = json_string_value(val);
+                if (uuid_str == NULL) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: has_peer expects a uuid string", pid);
+                    return -1;
+                }
+                uuid_t want_uuid;
+                if (uuid_parse(uuid_str, want_uuid) != 0) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: has_peer uuid %s not parseable",
+                             pid, uuid_str);
+                    return -1;
+                }
+                bool found = false;
+                for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+                    if (memcmp(proc->protocol.peers[i].uuid, want_uuid,
+                               sizeof(uuid_t)) == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: has_peer %s not present (have %d peers)",
+                             pid, uuid_str, (int)proc->protocol.num_peers);
+                    return -1;
+                }
+            } else {
+                snprintf(ctx->err, sizeof(ctx->err),
+                         "%s: unsupported expected_state key %s", pid, key);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 void at_identity_run(const at_case_t *c, at_case_result_t *out) {
     if (strcmp(c->kind, "negative") == 0) {
         at_neg_run_wire(c, out);
@@ -322,6 +414,10 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
     messaging_set_test_hook(_send_hook);
 
     int rc = sce_run(&ctx);
+    /* The engine's stub _check_expected_state is a no-op; per-protocol
+     * enforcement lives here so a scenario's bg.peer_count: 1 (and
+     * friends) is checked symmetrically with the Python adapter. */
+    if (rc == 0) rc = _identity_check_expected_state(&ctx);
 
     messaging_set_test_hook(NULL);
     g_active_ctx = NULL;
