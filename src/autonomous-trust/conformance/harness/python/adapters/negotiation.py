@@ -99,11 +99,19 @@ class _Participant:
     def _check_expected_state(self, asserts: dict[str, Any]) -> None:
         for key, expected in asserts.items():
             if key == 'has_my_task':
-                actual = expected in {str(uid) for uid in self.process.my_tasks}
-                if not actual:
+                # `expected` is a slug; derive the same task uuid the
+                # adapter mints in `_build_inbound`
+                # (`uuid5(_NS, f'task:{slug}')`) and look it up in
+                # process.my_tasks. The prior literal-string comparison
+                # never matched a slug against uuid strings — fixed
+                # alongside the symmetric C-side `has_my_task` accessor
+                # so the two adapters agree on what this key means.
+                want_uuid = uuid5(_NS, f'task:{expected}')
+                if want_uuid not in self.process.my_tasks:
                     raise AssertionError(
-                        f'{self.id}: my_tasks does not contain task uuid for slug {expected!r} '
-                        f'(have {sorted(str(u) for u in self.process.my_tasks)})'
+                        f'{self.id}: my_tasks does not contain task uuid '
+                        f'{want_uuid} (slug {expected!r}); have '
+                        f'{sorted(str(u) for u in self.process.my_tasks)}'
                     )
             elif key == 'confirmed':
                 if not self.process.confirmed:

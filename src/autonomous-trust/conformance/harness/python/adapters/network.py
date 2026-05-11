@@ -273,13 +273,18 @@ class NetworkAdapter:
     # ------------------------------------------------------------------
 
     def run_scenario(self, case: Case) -> None:
-        if case.name == 'peer-encrypted-roundtrip':
+        # Peer-encrypted runners all parameterize on fixtures (nonce_hex,
+        # obj_json); additional scenarios that exercise the same Box
+        # round-trip with different inputs route to the same method.
+        if case.name in ('peer-encrypted-roundtrip',
+                         'peer-encrypted-structured-payload'):
             self._run_peer_encrypted_roundtrip(case)
             return
         if case.name == 'group-encrypted-roundtrip':
             self._run_group_encrypted_roundtrip(case)
             return
-        if case.name == 'broadcast-fanout':
+        if case.name in ('broadcast-fanout',
+                         'broadcast-fanout-three-receivers'):
             self._run_broadcast_fanout(case)
             return
         raise NotImplementedError(
@@ -379,9 +384,15 @@ class NetworkAdapter:
         _assert_expected_state_b(case, parsed)
 
     def _run_broadcast_fanout(self, case: Case) -> None:
-        """Exercise sign → broadcast wire bytes → parse, fanned out to two
-        independent receivers. Both receivers consume the SAME bytes and
+        """Exercise sign → broadcast wire bytes → parse, fanned out to N
+        independent receivers. All receivers consume the SAME bytes and
         must report identical observables.
+
+        Sender is the first participant with role 'sender'; every other
+        participant is a receiver. Supports two receivers
+        (broadcast-fanout) and three (broadcast-fanout-three-receivers)
+        symmetrically — the only difference is participant count + the
+        per-receiver expected_state blocks.
         """
         from autonomous_trust.core.network.message import Message
         from autonomous_trust.core.system import CfgIds
@@ -389,20 +400,39 @@ class NetworkAdapter:
         fixtures = case.data.get('fixtures', {}) or {}
         obj_json = fixtures.get('obj_json', '{}')
 
-        a = _make_test_identity('a', addr='10.0.80.1')
-        b = _make_test_identity('b', addr='10.0.80.2')  # noqa: F841 — built for symmetry only
-        c = _make_test_identity('c', addr='10.0.80.3')  # noqa: F841
+        participants = case.data.get('participants', [])
+        sender_spec = next((p for p in participants if p['role'] == 'sender'),
+                           None)
+        if sender_spec is None:
+            raise AssertionError('broadcast scenario requires a sender role')
+        sender_id = sender_spec['id']
+
+        receivers = [p['id'] for p in participants if p['role'] == 'receiver']
+        if not receivers:
+            raise AssertionError(
+                'broadcast scenario requires at least one receiver role'
+            )
+
+        # Each receiver gets a deterministic addr 10.0.80.<index+2>;
+        # receiver identities are built only for symmetry with the C
+        # adapter (which materializes them); the Python parser uses
+        # only the sender identity to verify the signature, so receivers
+        # are spectators here.
+        sender = _make_test_identity(sender_id, addr='10.0.80.1')
+        for idx, rid in enumerate(receivers):
+            _make_test_identity(rid, addr=f'10.0.80.{idx + 2}')
 
         msg = Message(CfgIds.identity, 'request_access', obj_json,
-                      from_whom=a, encrypt=False)
+                      from_whom=sender, encrypt=False)
         wire = bytes(msg)
 
-        # Each receiver parses the wire bytes independently with A as the
-        # known sender. The two parses must yield identical observables.
-        parsed_b = Message.parse(wire, a)
-        parsed_c = Message.parse(wire, a)
-        _assert_expected_state(case, 'b', parsed_b)
-        _assert_expected_state(case, 'c', parsed_c)
+        # Each receiver parses the wire bytes independently with sender
+        # as the known signer. All parses must yield identical
+        # observables; the per-receiver expected_state block enforces
+        # that pin.
+        for rid in receivers:
+            parsed = Message.parse(wire, sender)
+            _assert_expected_state(case, rid, parsed)
 
     # ------------------------------------------------------------------
     # Negative kind

@@ -84,6 +84,13 @@ int reputation_get_chain_len(void);
  *  `requests_count` expected_state assertion. */
 int reputation_get_request_count(void);
 
+/** Read the current Paxos `last_id` for the `last_id_set`
+ *  expected_state assertion. Returns 0 if state is uninitialized OR
+ *  if last_id has never been advanced — Python's `self.last_id is
+ *  not None` maps to `> 0` here (paxos_handle_request only ever
+ *  sets last_id to id1, which scenarios pin > 0). */
+int64_t reputation_get_last_id(void);
+
 #define EREP_PAXOS 253
 DECLARE_ERROR(EREP_PAXOS, "Paxos consensus error");
 

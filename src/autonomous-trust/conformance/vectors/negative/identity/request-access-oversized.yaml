@@ -1,0 +1,39 @@
+schema_version: "1"
+kind: negative
+protocol: identity
+name: request-access-oversized
+description: |
+    Replace the `data` field on newcomer's request_access with base64
+    of 65535 zero bytes (well above the typical envelope size of a few
+    hundred bytes, well below the C transport's 1 MB NET_MSG_MAX_DATA
+    so the test exercises parse, not transport rejection).
+
+    Honest semantic — neither Python's `Message.parse` nor C's
+    `net_message_from_wire` enforces a payload size cap inside the
+    parser today. The inflated envelope decodes cleanly; the
+    signature was over the original short payload, so verification
+    fails. Reason_class: signature_verification_failed.
+
+    What this scenario DOES validate:
+      - Both parsers survive an O(N) larger input without crashing
+        or memory exhaustion.
+      - The signature verifier rejects the tampered envelope even
+        when the payload-size delta is large.
+
+    What it does NOT validate:
+      - Parser-level size limits — neither implementation has one
+        yet. If a future hardening adds a wire-envelope size cap,
+        this scenario's expected.reason_class flips to
+        `payload_oversized` and the cap kicks in before signature
+        verify.
+
+based_on: scenarios/identity/new-node-admission.yaml
+
+mutation:
+  step_id: 1
+  op: inflate
+  target: payload
+  size: 65535
+
+expected:
+  reason_class: signature_verification_failed

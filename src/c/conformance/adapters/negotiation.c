@@ -414,11 +414,12 @@ static int _dispatch(sce_run_ctx_t *ctx,
  *                             has any entries.
  *   - confirmed:     bool   → asserts whether neg_state.confirmed map
  *                             has any entries.
- * has_my_task is intentionally not supported here yet: it requires
- * cross-language uuid derivation from a string slug, which Python and
- * C currently do differently. Authoring a scenario that needs it
- * would need to thread a uuid-string fixture through both adapters
- * first.
+ *   - has_my_task:   slug   → asserts that neg_state.my_tasks has an
+ *                             entry keyed by uuid5(NEG_NS, "task:<slug>")
+ *                             (same derivation the adapter uses when
+ *                             building task inbounds in _build_inbound,
+ *                             so the C side compares bit-equal keys to
+ *                             Python's `uuid5(_NS, f'task:{slug}')`).
  *
  * Per-participant `pid` is honored for the iteration form, but the C
  * neg_state is global (one negotiation instance per binary), so any
@@ -462,6 +463,28 @@ static int _negotiation_check_expected_state(sce_run_ctx_t *ctx)
                              "%s: confirmed=%s, expected %s",
                              pid, got ? "true" : "false",
                              want ? "true" : "false");
+                    return -1;
+                }
+            } else if (strcmp(key, "has_my_task") == 0) {
+                const char *slug = json_string_value(val);
+                if (slug == NULL) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: has_my_task expects a slug string", pid);
+                    return -1;
+                }
+                /* Same derivation the adapter uses when building task
+                 * inbounds (see `_build_inbound` / `_uuid5`): the key
+                 * stored in production my_tasks is the stringified
+                 * uuid5 of NEG_NS + "task:<slug>". Python's adapter
+                 * derives identically with uuid5(_NS, f'task:{slug}'). */
+                uuid_t want_uuid;
+                _uuid5("task:", slug, want_uuid);
+                if (!negotiation_has_my_task_uuid(want_uuid)) {
+                    char uuid_str[UUID_STRING_LEN + 1] = {0};
+                    uuid_unparse_lower(want_uuid, uuid_str);
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: has_my_task slug=%s (uuid=%s) not present",
+                             pid, slug, uuid_str);
                     return -1;
                 }
             } else {

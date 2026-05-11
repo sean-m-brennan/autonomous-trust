@@ -1,0 +1,82 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pow-prove-replay-idempotent
+byte_pinning: false
+description: |
+    POW replay-handling probe. bob mines a valid proof for blob-x
+    once, then the SAME mined proof is delivered to agreement_verify
+    twice (repeat: 2 on the prove step — the adapter mines once and
+    re-verifies N times, matching a real wire replay where an
+    attacker captured a valid POW proof and re-sent it). The
+    finalize outcome stays true regardless of how many times the
+    same proof is replayed.
+
+    Why outcome is invariant despite no internal dedup:
+      - Python `AgreementByWork.verify` appends `blob` to
+        `self._approved` on each valid call
+        (`autonomous_trust/.../algorithms/work.py:58-62`). Replay →
+        _approved has N copies of blob.
+      - Python finalize (`agreement.py`) calls
+        `if blob in self._approved: self._approved.remove(blob); return True`.
+        First call finds + removes ONE entry; returns True. The
+        scenario's expected_state runs finalize once per blob, so
+        the user-visible outcome is True. _approved retains N-1
+        extra entries (a benign minor leak under replay).
+      - C `agreement_verify` (`src/c/autonomous_trust/algorithms/
+        agreement.c:432-437`) likewise `array_append`s on each
+        valid call; `agreement_finalize` scans, finds the first
+        match, removes one entry, returns true. Symmetric to Python.
+
+    What this scenario DOES prove:
+      - POW finalize outcome is invariant under prove-replay on
+        both impls.
+      - The `repeat: N` grammar wired into the agreement adapter's
+        `function: prove` step works in both languages.
+
+    What it does NOT prove:
+      - That POW dedup the approved set. They DO NOT.
+      - Per-language byte-identical digests (still tracked as
+        BUGS.md P5; this scenario inherits the per-language-mining
+        compromise from `pow-mined-proof-finalizes-true`).
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: work
+  difficulty: 2
+  myself: bob
+  blobs:
+    blob-x:
+      originator: alice
+      payload: "replay-mineable-payload"
+
+steps:
+  - id: 1
+    from: bob
+    to: agreement
+    function: prove
+    payload:
+      blob: blob-x
+    repeat: 2
+    description: |
+        bob mines a valid POW proof for blob-x (once per impl, at
+        its own DIFFICULTY semantics) and replays it via
+        protocol.verify twice. _approved / approved-array grows to
+        2 entries; finalize still returns true after consuming one.
+
+  - id: 2
+    from: bob
+    to: agreement
+    function: finalize
+    payload:
+      blob: blob-x
+      expected_outcome: true
+    description: |
+        finalize finds the (first) approved entry and returns true.
+        Compared cross-language only on outcome, not on the post-
+        finalize size of _approved (which differs by impl details).

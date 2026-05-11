@@ -1,0 +1,24 @@
+schema_version: "1"
+kind: negative
+protocol: reputation
+name: ask-permission-oversized
+description: |
+    Replace the `data` field on alice's reputation `ask permission`
+    request with base64 of 65535 zero bytes. Companion to
+    identity/request-access-oversized on a reputation envelope.
+
+    Same honest semantic: parsers decode cleanly, signature
+    verification fails because the inflated payload doesn't match
+    what alice signed. Reason_class:
+    signature_verification_failed.
+
+based_on: scenarios/reputation/request-granted.yaml
+
+mutation:
+  step_id: 1
+  op: inflate
+  target: payload
+  size: 65535
+
+expected:
+  reason_class: signature_verification_failed

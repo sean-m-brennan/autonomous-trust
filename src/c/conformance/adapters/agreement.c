@@ -523,7 +523,14 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
              * for the blob (per the protocol's own difficulty rule),
              * then agreement_verify admits the proof. Per-language
              * semantics — see BUGS.md P5 for the cross-language
-             * digest-format and DIFFICULTY interpretation drift. */
+             * digest-format and DIFFICULTY interpretation drift.
+             *
+             * repeat: N mines once, then verifies N times with the
+             * same proof — replay-attack semantics. agreement_verify
+             * appends to proto->state.work.approved each time;
+             * agreement_finalize removes ONE entry and returns true,
+             * so the outcome is idempotent under replay. Mirrors the
+             * Python adapter's `for _ in range(repeat)` loop. */
             agreement_proof_t *mined = NULL;
             if (agreement_prove(proto, &be->blob, &mined) != 0 || mined == NULL) {
                 snprintf(err, err_len,
@@ -536,7 +543,15 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
                 goto cleanup;
             }
             proofs[proof_count++] = mined;
-            agreement_verify(proto, &be->blob, mined, NULL, 0);
+            int repeat = 1;
+            json_t *rep_j = json_object_get(step, "repeat");
+            if (json_is_integer(rep_j)) {
+                int rv = (int)json_integer_value(rep_j);
+                if (rv >= 1) repeat = rv;
+            }
+            for (int rep = 0; rep < repeat; rep++) {
+                agreement_verify(proto, &be->blob, mined, NULL, 0);
+            }
             continue;
         }
 

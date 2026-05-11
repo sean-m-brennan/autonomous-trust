@@ -76,6 +76,8 @@ def apply_mutation(wire_bytes: bytes, mutation: dict[str, Any]) -> bytes:
             raise NotImplementedError(
                 f'replace wire_bytes content_hex is not valid hex: {exc}'
             ) from exc
+    if op == 'inflate' and target == 'payload':
+        return _inflate_payload(wire_bytes, mutation.get('size'))
 
     raise NotImplementedError(f'mutation op={op!r} target={target!r} not implemented')
 
@@ -159,6 +161,40 @@ def _flip_payload_byte(wire_bytes: bytes, index: int) -> bytes:
     return json.dumps(wire, separators=(',', ':')).encode('utf-8')
 
 
+def _inflate_payload(wire_bytes: bytes, size: int | None) -> bytes:
+    """Replace the wire `data` field with base64 of N zero bytes.
+
+    Honest semantic: neither Python's `Message.parse` nor C's
+    `net_message_from_wire` enforces a payload size limit today
+    (transport-layer limits exist; see `net_transport_tcp.c:173` for
+    `NET_MSG_MAX_DATA = 1MB`, but they fire after parse). The inflated
+    envelope therefore decodes cleanly, the signature was computed for
+    the original short payload, and verification fails — reason_class
+    `signature_verification_failed`. What the test does validate:
+    parsers survive an order-of-magnitude-larger payload without
+    crashing or memory exhaustion. If a future hardening adds a size
+    cap inside the parser, the affected scenarios switch to
+    `payload_oversized`.
+    """
+    import base64
+    if not isinstance(size, int) or size < 1:
+        raise NotImplementedError(
+            'inflate payload requires a positive integer size'
+        )
+    try:
+        wire = json.loads(wire_bytes.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise NotImplementedError(
+            f'cannot inflate payload: wire buffer is not JSON ({exc})'
+        ) from exc
+    if not isinstance(wire, dict):
+        raise NotImplementedError(
+            'inflate payload requires a JSON-object wire envelope'
+        )
+    wire['data'] = base64.b64encode(bytes(size)).decode('ascii')
+    return json.dumps(wire, separators=(',', ':')).encode('utf-8')
+
+
 def _drop_envelope_field(wire_bytes: bytes, field: str) -> bytes:
     """Remove a top-level field from the JSON wire envelope.
 
@@ -195,6 +231,13 @@ def classify_op(mutation: dict[str, Any]) -> str:
     if op == 'truncate':
         return 'envelope_truncated'
     if op == 'flip_byte' and target in ('signature', 'payload'):
+        return 'signature_verification_failed'
+    if op == 'inflate' and target == 'payload':
+        # Parsers don't enforce a size cap today; the inflated payload
+        # decodes cleanly but the signature was for the original short
+        # `data`. The observable failure is signature mismatch. If a
+        # future hardening adds parser-level size limits, the affected
+        # scenarios update to expect `payload_oversized`.
         return 'signature_verification_failed'
     # drop_field, replace, and any other structural mutation all fall under
     # envelope_malformed — the buffer reaches the parser but fails JSON
