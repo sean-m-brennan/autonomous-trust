@@ -1,0 +1,22 @@
+schema_version: "1"
+kind: negative
+protocol: agreement
+name: vote-tampered-payload
+description: |
+    Flip one byte of the base64 `data` field on bob's agreement
+    `vote` step from poa-leader-abstains. The envelope still
+    decodes (base64 alphabet preserved) but the decoded payload
+    differs from what bob signed, so signature verification must
+    fail. Companion to vote-bad-sig; corrupts the payload while
+    leaving the signature intact.
+
+based_on: scenarios/agreement/poa-leader-abstains.yaml
+
+mutation:
+  step_id: 1
+  op: flip_byte
+  target: payload
+  index: 0
+
+expected:
+  reason_class: signature_verification_failed

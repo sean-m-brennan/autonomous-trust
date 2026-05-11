@@ -64,6 +64,18 @@ def apply_mutation(wire_bytes: bytes, mutation: dict[str, Any]) -> bytes:
         return wire_bytes[:n]
     if op == 'drop_field' and target.startswith('envelope.'):
         return _drop_envelope_field(wire_bytes, target[len('envelope.'):])
+    if op == 'replace' and target == 'wire_bytes':
+        content_hex = mutation.get('content_hex')
+        if not isinstance(content_hex, str):
+            raise NotImplementedError(
+                'replace wire_bytes requires a content_hex string in the mutation'
+            )
+        try:
+            return bytes.fromhex(content_hex)
+        except ValueError as exc:
+            raise NotImplementedError(
+                f'replace wire_bytes content_hex is not valid hex: {exc}'
+            ) from exc
 
     raise NotImplementedError(f'mutation op={op!r} target={target!r} not implemented')
 
@@ -184,6 +196,9 @@ def classify_op(mutation: dict[str, Any]) -> str:
         return 'envelope_truncated'
     if op == 'flip_byte' and target in ('signature', 'payload'):
         return 'signature_verification_failed'
+    # drop_field, replace, and any other structural mutation all fall under
+    # envelope_malformed — the buffer reaches the parser but fails JSON
+    # validation (missing required field, non-JSON bytes, wrong structure).
     return 'envelope_malformed'
 
 

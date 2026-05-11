@@ -569,7 +569,20 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
             goto cleanup;
         }
         proofs[proof_count++] = p;
-        agreement_verify(proto, &be->blob, p, NULL, 0);
+        /* repeat: N replays the same agreement_verify call N times. The
+         * proto's votes list ends up with N references to the same
+         * proof; for POA accumulate-by-rank (max-rank wins, dict
+         * collapses by key) the outcome is identical to a single-vote
+         * run. Mirrors Python adapter's `for _ in range(repeat)` loop. */
+        int repeat = 1;
+        json_t *rep_j = json_object_get(step, "repeat");
+        if (json_is_integer(rep_j)) {
+            int rv = (int)json_integer_value(rep_j);
+            if (rv >= 1) repeat = rv;
+        }
+        for (int rep = 0; rep < repeat; rep++) {
+            agreement_verify(proto, &be->blob, p, NULL, 0);
+        }
     }
 
     /* Walk expected_state.agreement; finalize each blob and assert outcome. */
