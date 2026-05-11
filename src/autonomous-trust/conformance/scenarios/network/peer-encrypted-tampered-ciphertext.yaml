@@ -1,0 +1,49 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: peer-encrypted-tampered-ciphertext
+byte_pinning: false
+description: |
+    Crypto-rejection probe. A encrypts a signed request_access wire
+    envelope for B with the fixture nonce. The harness flips one byte
+    of the ciphertext (well past the 24-byte nonce, deep inside the
+    poly1305-MAC-protected region) and hands the tampered bytes to
+    B's `decrypt`. Both impls' Box-decrypt must reject:
+      - Python: PyNaCl raises `nacl.exceptions.CryptoError`.
+      - C: `identity_decrypt` returns non-zero.
+
+    Threat model: an on-path attacker can flip bits in cipher bytes
+    between peers; libsodium's Curve25519-XSalsa20-Poly1305 catches
+    the modification via the MAC tag. This scenario pins that
+    invariant at the conformance gate — if either impl ever switched
+    to a non-AE cipher, accepted truncated ciphertext, or short-
+    circuited MAC verification, the conformance run flips to
+    "decrypt unexpectedly succeeded" on the affected side.
+
+    First scenario in the corpus to use the new
+    `expected_state.<pid>.decrypt_failed: true` assertion (mirrored
+    in `_assert_decrypt_failed` helpers in both adapters).
+
+participants:
+  - id: a
+    role: sender
+  - id: b
+    role: receiver
+
+fixtures:
+  nonce_hex: "0x000102030405060708090a0b0c0d0e0f1011121314151617"
+  obj_json: "{}"
+
+steps:
+  - id: 1
+    from: a
+    to: b
+    function: request_access
+    description: |
+        A signs+serializes, encrypts to B with the fixture nonce. The
+        harness then flips one cipher byte and hands the corrupted
+        bytes to B. B's MAC check must reject.
+
+expected_state:
+  b:
+    decrypt_failed: true

@@ -86,6 +86,17 @@ bool negotiation_has_confirmed_any(void);
  *  the two adapters compare against bit-equal keys. */
 bool negotiation_has_my_task_uuid(const uuid_t uuid);
 
+/** Read the per-task flood counter the negotiation handler updates on
+ *  every observed invite (see `handle_invite` flood-detection block).
+ *  Stored on the shared `proposed_tasks` map keyed by
+ *  "flood:<task-uuid>" — Python's equivalent is
+ *  `proposed_tasks[uuid].count`. Returns 0 if the task has no flood
+ *  record yet (i.e., the handler has not been called with this
+ *  task uuid), or if neg_state is uninitialized. For the
+ *  `flood_count: {task:<slug>, count:<int>}` expected_state
+ *  assertion exercised by the flood-probe scenario. */
+int negotiation_get_task_flood_count(const uuid_t uuid);
+
 #define ENEG_NOPEERS 243
 DECLARE_ERROR(ENEG_NOPEERS, "No capable peers available");
 

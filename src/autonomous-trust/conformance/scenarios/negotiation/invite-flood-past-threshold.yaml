@@ -1,0 +1,75 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-flood-past-threshold
+byte_pinning: false
+description: |
+    Flood-counter probe at the threshold boundary. alice's
+    `invitation` for a single task is delivered to bob 6 times
+    via the universal scenario engine's `repeat: N` grammar — one
+    over the `max_task_duplicates = 5` ceiling both implementations
+    track:
+      - Python: `proposed_tasks[uuid].count` in
+        `negotiation/negprocess.py:122-125`
+      - C: `flood:<uuid>` key on the same `proposed_tasks` map in
+        `negotiation/neg_proc.c:529-540`
+
+    What this scenario IS valid for: confirming the universal
+    `repeat: N` engine path drives 6 negotiation envelopes through
+    `handle_invite` in both impls without aborting, and that bob's
+    `task_stack` is non-empty after the run (the engine handled
+    every delivery). Pairs with `invite-replay-survives` (N=2;
+    proves the engine path) by exercising the same path one over
+    the documented `max_task_duplicates = 5` ceiling.
+
+    Cross-language behavioral asymmetries past the threshold —
+    NOT pinned by this scenario, tracked in BUGS.md §P7:
+      1. Python's `proposed_tasks[uuid].count` is DELETED by
+         `_add_task` whenever the task is admitted to task_stack
+         (negprocess.py:75-76). With concurrency slots available
+         the counter resets every iteration, so the flood
+         threshold is never reached in normal operation.
+      2. C's `flood:<uuid>` counter on the same `proposed_tasks`
+         map is separate from task storage and persists across
+         admissions (neg_proc.c:529-540). It correctly
+         accumulates and fires the refuse path on iteration 6.
+      3. Past-threshold action differs too — Python demotes the
+         sender via `peers.demote` then continues normal
+         capability/level dispatch; C sends an immediate refuse
+         and returns.
+    The `flood_count` expected_state key supported by both
+    adapters (`negotiation.py::_check_expected_state` /
+    `_negotiation_check_expected_state` in adapters/negotiation.c)
+    is unused by this scenario pending the P7 fix. Once Python's
+    flood counter is moved to a non-auto-deleting map, this
+    scenario can pin `flood_count: {task: t-flood, count: 6}`
+    symmetrically.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-flood
+    repeat: 6
+    description: |
+        alice invites bob to perform data_fetch — the same
+        invitation envelope is delivered 6 times, one past the
+        `max_task_duplicates = 5` threshold. Both impls' flood
+        counter is expected to read 6 after the run.
+
+expected_state:
+  bob:
+    task_in_stack: true

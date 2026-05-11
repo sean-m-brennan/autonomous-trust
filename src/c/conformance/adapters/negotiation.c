@@ -420,6 +420,13 @@ static int _dispatch(sce_run_ctx_t *ctx,
  *                             building task inbounds in _build_inbound,
  *                             so the C side compares bit-equal keys to
  *                             Python's `uuid5(_NS, f'task:{slug}')`).
+ *   - flood_count:   {task:<slug>, count:<int>}
+ *                           → asserts that the per-task flood counter
+ *                             handle_invite maintains equals `count`.
+ *                             Reads via negotiation_get_task_flood_count
+ *                             (production-side accessor over the
+ *                             "flood:<uuid>" key); Python reads
+ *                             `proposed_tasks[uuid].count` directly.
  *
  * Per-participant `pid` is honored for the iteration form, but the C
  * neg_state is global (one negotiation instance per binary), so any
@@ -485,6 +492,37 @@ static int _negotiation_check_expected_state(sce_run_ctx_t *ctx)
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: has_my_task slug=%s (uuid=%s) not present",
                              pid, slug, uuid_str);
+                    return -1;
+                }
+            } else if (strcmp(key, "flood_count") == 0) {
+                /* {task: <slug>, count: <int>} — derive uuid from slug
+                 * (same _uuid5 used elsewhere), read the per-task flood
+                 * counter via the production-side accessor. Mirrors
+                 * the Python adapter's read on
+                 * `proposed_tasks[uuid].count`. */
+                if (!json_is_object(val)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: flood_count expects {task:<slug>, count:<int>}", pid);
+                    return -1;
+                }
+                const char *slug = json_string_value(
+                    json_object_get(val, "task"));
+                json_t *count_j = json_object_get(val, "count");
+                if (slug == NULL || !json_is_integer(count_j)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: flood_count requires task=<slug> and count=<int>", pid);
+                    return -1;
+                }
+                int want = (int)json_integer_value(count_j);
+                uuid_t want_uuid;
+                _uuid5("task:", slug, want_uuid);
+                int got = negotiation_get_task_flood_count(want_uuid);
+                if (got != want) {
+                    char uuid_str[UUID_STRING_LEN + 1] = {0};
+                    uuid_unparse_lower(want_uuid, uuid_str);
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: flood_count for slug=%s (uuid=%s) = %d, expected %d",
+                             pid, slug, uuid_str, got, want);
                     return -1;
                 }
             } else {
