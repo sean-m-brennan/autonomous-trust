@@ -1,0 +1,73 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: peer-encrypted-wrong-signer
+byte_pinning: false
+description: |
+    Signature-impersonation probe. Z (a third party) signs a wire
+    envelope and encrypts it to B with its own Box keypair. B
+    decrypts the outer envelope successfully (it trusts the Box-
+    layer sender Z), then parses the inner Message claiming the
+    sender is A. Because the inner signature was made with Z's
+    Ed25519 signing key but verification is attempted against A's
+    public signing key, verification must fail and `parsed.verified`
+    must be false.
+
+    Threat model: an authorized peer Z (or a leaked-keypair peer)
+    crafts a message and attempts to impersonate A at the next
+    protocol layer — e.g., to issue a reputation update or vote
+    using A's identity. The network layer's signature verification
+    binds the inner content to a specific public key; verifying
+    against the claimed-sender's pubkey (A) rejects this
+    impersonation regardless of whether the Box-layer encryption
+    succeeded.
+
+    Complements `peer-encrypted-tampered-ciphertext` and the
+    wire-negative `flip_byte`/signature mutations:
+      - tampered-ciphertext: an on-path attacker mutates bits in
+        ciphertext after a legitimate sender signed. MAC catches it.
+      - flip_byte/signature: random corruption of the signature
+        bytes. Ed25519 verify catches it.
+      - wrong-signer (THIS): a VALID Ed25519 signature by a real
+        key, presented to a verifier expecting a different
+        signing pubkey. Tests that verify rejects "valid-but-from-
+        wrong-key" — the property that protects against
+        impersonation by authorized peers, not just bit-rot.
+
+    Both languages use `Message.parse(plain, sender=A)` /
+    `net_message_from_wire(plain, len, peer=a_pub, ...)`. Python's
+    parse uses sender.signature.public for verification (ignoring
+    the wire's embedded from_sig_hex); C's parse, when peer is non-
+    NULL, uses peer.signature.public (same behavior). Both should
+    yield verified=false.
+
+participants:
+  - id: a
+    role: claimed_sender
+  - id: b
+    role: receiver
+  - id: z
+    role: actual_signer
+
+fixtures:
+  nonce_hex: "0x000102030405060708090a0b0c0d0e0f1011121314151617"
+  obj_json: "{}"
+
+steps:
+  - id: 1
+    from: z
+    to: b
+    function: request_access
+    description: |
+        Z signs+serializes a request_access wire envelope and Box-
+        encrypts to B with the fixture nonce. B decrypts using Z's
+        pubkey (Box-layer sender), succeeds, then parses the inner
+        Message with the CLAIMED sender = A. The Ed25519 verifier
+        on B's side checks Z's signature against A's pubkey —
+        mismatch, verified=false.
+
+expected_state:
+  b:
+    routed_process: identity
+    routed_function: request_access
+    verified: false

@@ -33,6 +33,15 @@ class Network(InitializableConfig):
     ping = 'ping'
     stats_req = 'stats_req'
     stats_resp = 'stats_resp'
+    # Parser-level wire-bytes size cap. Matches the C transport's
+    # NET_MSG_MAX_DATA (net_message.h:31). Enforced at envelope-parse
+    # time as defense-in-depth: the TCP transport already caps inbound
+    # bytes, but Message.parse may be called on in-process or
+    # alternate-transport bytes, so the parser carries the same
+    # guarantee. Used by Message.parse to reject oversized envelopes
+    # before json.loads consumes them. Any change here must match
+    # NET_MSG_MAX_DATA in src/c/autonomous_trust/network/net_message.h.
+    max_wire_bytes = 1024 * 1024
 
     def __init__(self, _ip4_cidr, _ip6_cidr, _mac_address, _mcast4_addr, _mcast6_addr, _port=None):
         #super().__init__(network_pb2.Network)

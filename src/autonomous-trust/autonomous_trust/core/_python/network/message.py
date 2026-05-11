@@ -183,6 +183,24 @@ class Message(object):
         from ..identity import Identity
         if validate and sender is not None and not isinstance(sender, Identity):
             raise RuntimeError('Sender must be an Identity')
+        # Envelope-level size cap (parser-side defense-in-depth). The TCP
+        # transport already caps inbound bytes at NET_MSG_MAX_DATA, but
+        # parse() is also called on in-process / alternate-transport
+        # bytes; mirroring the cap here means oversized envelopes never
+        # reach json.loads regardless of how they arrived. Matches C's
+        # net_message_from_wire size check (net_message.c). Measured in
+        # bytes — for str inputs we use len(str) which equals byte
+        # length for ASCII/UTF-8 envelopes (the only wire shape AT
+        # produces). Reject reason surfaces as ValueError so the
+        # conformance negative_runner classifies it as
+        # payload_oversized.
+        wire_len = (len(raw_msg) if isinstance(raw_msg, (bytes, bytearray))
+                    else len(raw_msg.encode(Network.encoding)))
+        if wire_len > Network.max_wire_bytes:
+            raise ValueError(
+                f'wire envelope exceeds size cap '
+                f'({wire_len} > {Network.max_wire_bytes} bytes)'
+            )
         if isinstance(raw_msg, bytes):
             raw_msg = raw_msg.decode(Network.encoding)
 
