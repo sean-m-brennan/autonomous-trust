@@ -1,0 +1,73 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: multi-blob-originator-shortcircuit
+byte_pinning: false
+description: |
+    Third agreement state-machine scenario. Exercises the
+    `myself.uuid == blob.originator → return True` short-circuit in
+    finalize alongside a normal-flow blob in the same protocol instance.
+
+    alice is the running participant (myself) AND the leader (rank 5).
+    blob-self is originated by alice (finalize must short-circuit to true
+    regardless of votes). blob-other is originated by bob and follows
+    standard POA: alice's vote decides because she's the leader.
+
+    What this catches that single-blob vectors do not:
+      - The short-circuit path doesn't accidentally consume or affect
+        the vote tally for OTHER blobs in the same protocol instance.
+      - Both branches (short-circuit + normal finalize) coexist correctly.
+
+    The hostile vote (bob rejecting blob-self) is deliberately included:
+    if a future change ever moved the short-circuit AFTER vote counting,
+    bob's reject would change the observed outcome to False and this
+    test would catch it.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: authority
+  threshold_rank: 0
+  ranks:
+    alice: 5
+    bob: 0
+  myself: alice
+  blobs:
+    blob-self:
+      originator: alice
+      payload: "self-originated"
+    blob-other:
+      originator: bob
+      payload: "bob-originated"
+
+steps:
+  - id: 1
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-self
+      approval: false
+    description: |
+        Hostile vote on alice's own blob — should be silently ignored
+        because the short-circuit in finalize fires before votes are
+        consulted.
+  - id: 2
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-other
+      approval: true
+    description: leader alice approves blob-other → decisive.
+
+expected_state:
+  agreement:
+    blob-self:
+      outcome: true
+    blob-other:
+      outcome: true

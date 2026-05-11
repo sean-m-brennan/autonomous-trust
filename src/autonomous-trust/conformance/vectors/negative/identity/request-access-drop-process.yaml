@@ -1,0 +1,22 @@
+schema_version: "1"
+kind: negative
+protocol: identity
+name: request-access-drop-process
+description: |
+    Drop the top-level `process` field from the JSON wire envelope. Both
+    parsers require process+function to be present; without process the
+    JSON path is rejected (Python's parse falls through to the pipe-
+    legacy format and raises ValueError; C's net_message_from_wire
+    returns non-zero). Either way the harness categorizes the failure as
+    envelope_malformed — the first negative case in the corpus to
+    exercise that reason_class.
+
+based_on: scenarios/identity/new-node-admission.yaml
+
+mutation:
+  step_id: 1
+  op: drop_field
+  target: envelope.process
+
+expected:
+  reason_class: envelope_malformed

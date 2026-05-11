@@ -1,0 +1,98 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: multi-blob-poa-leader-decides
+byte_pinning: false
+description: |
+    First state-machine scenario for the agreement protocol. Three voters
+    (alice = rank 5 = POA leader; bob, charlie = rank 0) interleave votes
+    across two concurrent blobs. POA semantics: only the leader's verdict
+    decides each blob; lower-rank votes are tracked but ignored by
+    finalize. Verifies that an `AgreementProtocol` instance correctly
+    isolates per-blob vote tallies (no cross-contamination between
+    blob-x and blob-y) and applies the per-blob leader verdict.
+
+    Distinct from `kind: agreement_vector`: the existing vectors specify
+    all votes up-front against a single blob. This scenario interleaves
+    votes for two blobs and asserts that finalize on each blob returns
+    the correct outcome.
+
+    Adapter contract: walks steps[] directly (does NOT use the universal
+    scenario_engine, because agreement protocol calls are local method
+    invocations, not message exchanges with inboxes/outboxes). Each step
+    declares `from: <voter>`, `function: vote`, `payload: {blob,
+    approval}`. Adapter signs an AgreementProof with the named voter's
+    Identity and calls protocol.verify(); after the last step, walks
+    expected_state.agreement.<blob_id>.outcome and asserts each
+    protocol.finalize(blob) match.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+  - id: charlie
+    role: voter
+
+fixtures:
+  impl: authority
+  threshold_rank: 0
+  # Ranks define who's the POA leader (highest rank decides under POA).
+  ranks:
+    alice: 5
+    bob: 0
+    charlie: 0
+  # `myself` is the voter whose AgreementProtocol instance the scenario
+  # exercises. Must be one of the participants.
+  myself: alice
+  # Blobs the protocol will collect votes on. `originator` references a
+  # voter id; finalize() short-circuits to true if myself originates the
+  # blob, so neither blob is originated by alice here.
+  blobs:
+    blob-x:
+      originator: bob
+      payload: "x-payload"
+    blob-y:
+      originator: charlie
+      payload: "y-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: leader approves blob-x — should be decisive.
+  - id: 2
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-y
+      approval: true
+    description: bob (rank 0) approves blob-y — not decisive under POA.
+  - id: 3
+    from: charlie
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: charlie (rank 0) approves blob-x — redundant under POA.
+  - id: 4
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-y
+      approval: false
+    description: leader rejects blob-y — should be decisive.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: true
+    blob-y:
+      outcome: false

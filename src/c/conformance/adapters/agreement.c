@@ -305,12 +305,304 @@ cleanup:
 }
 
 /* ------------------------------------------------------------------------- */
+/* kind:scenario — multi-blob vote accumulation                                */
+/* ------------------------------------------------------------------------- */
+
+#define HARNESS_MAX_BLOBS  8
+
+static int _build_voters_from_participants(json_t *parts, json_t *ranks,
+                                           agreement_voter_t *out_voters,
+                                           size_t *out_count,
+                                           char *err, size_t err_len) {
+    if (!json_is_array(parts)) {
+        snprintf(err, err_len, "scenario: participants array missing");
+        return -1;
+    }
+    size_t n = json_array_size(parts);
+    if (n == 0 || n > HARNESS_MAX_VOTERS) {
+        snprintf(err, err_len, "scenario: participant count out of range (%zu)", n);
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        json_t *p = json_array_get(parts, i);
+        const char *id = json_string_value(json_object_get(p, "id"));
+        if (id == NULL) {
+            snprintf(err, err_len, "scenario: participants[%zu] missing id", i);
+            return -1;
+        }
+        if (_put_uuid(out_voters[i].uuid, id) != 0) {
+            snprintf(err, err_len, "scenario: participants[%zu] id too long", i);
+            return -1;
+        }
+        int rank = 0;
+        if (json_is_object(ranks)) {
+            json_t *r = json_object_get(ranks, id);
+            if (json_is_integer(r)) rank = (int)json_integer_value(r);
+        }
+        out_voters[i].rank = rank;
+    }
+    *out_count = n;
+    return 0;
+}
+
+static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
+    int rc = -1;
+    agreement_protocol_t *proto = NULL;
+    agreement_voter_t voters[HARNESS_MAX_VOTERS] = {{{0}, 0}};
+    size_t voter_count = 0;
+    /* Pre-built blobs, keyed by their scenario id. */
+    struct blob_entry {
+        char id[MERKLE_UUID_LEN];
+        merkle_blob_t blob;
+    } blobs[HARNESS_MAX_BLOBS] = {{{0}, {{0}}}};
+    size_t blob_count = 0;
+    agreement_proof_t *proofs[HARNESS_MAX_VOTERS * HARNESS_MAX_BLOBS] = {0};
+    size_t proof_count = 0;
+
+    json_t *parts_j = json_object_get(c->data, "participants");
+    json_t *steps_j = json_object_get(c->data, "steps");
+    json_t *fixtures_j = json_object_get(c->data, "fixtures");
+    json_t *expected_state_j = json_object_get(c->data, "expected_state");
+    if (!json_is_array(steps_j) || !json_is_object(fixtures_j)) {
+        snprintf(err, err_len, "scenario: steps[] or fixtures missing");
+        return -1;
+    }
+
+    const char *impl = json_string_value(json_object_get(fixtures_j, "impl"));
+    const char *myself_id = json_string_value(json_object_get(fixtures_j, "myself"));
+    if (impl == NULL || myself_id == NULL) {
+        snprintf(err, err_len, "scenario: fixtures.impl/myself missing");
+        return -1;
+    }
+    json_t *ranks_j = json_object_get(fixtures_j, "ranks");
+
+    if (_build_voters_from_participants(parts_j, ranks_j,
+                                        voters, &voter_count,
+                                        err, err_len) != 0) {
+        return -1;
+    }
+
+    /* Stakes (POS only) — same scheme as run_agreement_vector but keyed
+     * on fixtures.stakes for the scenario form. */
+    g_stakes_count = 0;
+    if (strcmp(impl, "stake") == 0) {
+        json_t *stakes_j = json_object_get(fixtures_j, "stakes");
+        if (json_is_object(stakes_j)) {
+            const char *key;
+            json_t *value;
+            json_object_foreach(stakes_j, key, value) {
+                if (g_stakes_count >= HARNESS_MAX_VOTERS) break;
+                if (_put_uuid(g_stakes[g_stakes_count].uuid, key) != 0) continue;
+                g_stakes[g_stakes_count].stake = json_is_number(value)
+                    ? json_number_value(value) : 0.0;
+                g_stakes_count++;
+            }
+        }
+    }
+
+    agreement_voter_t *me = _find_voter_by_id(voters, voter_count, myself_id);
+    if (me == NULL) {
+        snprintf(err, err_len, "scenario: myself %s not in participants", myself_id);
+        return -1;
+    }
+    agreement_voter_t others[HARNESS_MAX_VOTERS];
+    int other_count = 0;
+    for (size_t i = 0; i < voter_count; i++) {
+        if (&voters[i] == me) continue;
+        others[other_count++] = voters[i];
+    }
+
+    if (strcmp(impl, "authority") == 0) {
+        json_t *thr_j = json_object_get(fixtures_j, "threshold_rank");
+        int threshold = json_is_integer(thr_j) ? (int)json_integer_value(thr_j) : 0;
+        if (agreement_by_authority_create(me, others, other_count, threshold, &proto) != 0
+            || proto == NULL) {
+            snprintf(err, err_len, "scenario: authority_create failed");
+            goto cleanup;
+        }
+    } else if (strcmp(impl, "stake") == 0) {
+        if (agreement_by_stake_create(me, others, other_count, _harness_get_stake, &proto) != 0
+            || proto == NULL) {
+            snprintf(err, err_len, "scenario: stake_create failed");
+            goto cleanup;
+        }
+    } else {
+        snprintf(err, err_len, "scenario: unsupported impl %s", impl);
+        goto cleanup;
+    }
+
+    /* Pre-build all blobs declared in fixtures.blobs. */
+    json_t *blobs_j = json_object_get(fixtures_j, "blobs");
+    if (json_is_object(blobs_j)) {
+        const char *key;
+        json_t *value;
+        json_object_foreach(blobs_j, key, value) {
+            if (blob_count >= HARNESS_MAX_BLOBS) {
+                snprintf(err, err_len, "scenario: too many blobs (>%d)", HARNESS_MAX_BLOBS);
+                goto cleanup;
+            }
+            if (strlen(key) >= MERKLE_UUID_LEN) {
+                snprintf(err, err_len, "scenario: blob id %s too long", key);
+                goto cleanup;
+            }
+            strncpy(blobs[blob_count].id, key, MERKLE_UUID_LEN - 1);
+            const char *origin = json_string_value(json_object_get(value, "originator"));
+            if (origin == NULL || strlen(origin) >= MERKLE_UUID_LEN) {
+                snprintf(err, err_len, "scenario: blob %s: missing/long originator", key);
+                goto cleanup;
+            }
+            strncpy(blobs[blob_count].blob.uuid, key, MERKLE_UUID_LEN - 1);
+            strncpy(blobs[blob_count].blob.originator, origin, MERKLE_UUID_LEN - 1);
+            blobs[blob_count].blob.get_hash = _harness_blob_hash;
+            blob_count++;
+        }
+    }
+    if (blob_count == 0) {
+        snprintf(err, err_len, "scenario: fixtures.blobs is empty");
+        goto cleanup;
+    }
+
+    /* Walk steps. Two step kinds: function=vote (submit a vote) and
+     * function=finalize (inline finalize call with payload.expected_outcome
+     * asserted before continuing). */
+    size_t nsteps = json_array_size(steps_j);
+    for (size_t i = 0; i < nsteps; i++) {
+        json_t *step = json_array_get(steps_j, i);
+        const char *func = json_string_value(json_object_get(step, "function"));
+        json_t *payload = json_object_get(step, "payload");
+        const char *blob_id = json_string_value(json_object_get(payload, "blob"));
+        if (func == NULL || blob_id == NULL) {
+            snprintf(err, err_len,
+                     "scenario: steps[%zu] missing function or payload.blob", i);
+            goto cleanup;
+        }
+        struct blob_entry *be = NULL;
+        for (size_t j = 0; j < blob_count; j++) {
+            if (strcmp(blobs[j].id, blob_id) == 0) { be = &blobs[j]; break; }
+        }
+        if (be == NULL) {
+            snprintf(err, err_len, "scenario: steps[%zu] unknown blob %s", i, blob_id);
+            goto cleanup;
+        }
+
+        if (strcmp(func, "finalize") == 0) {
+            json_t *exp_j = json_object_get(payload, "expected_outcome");
+            if (!json_is_boolean(exp_j)) {
+                snprintf(err, err_len,
+                         "scenario: steps[%zu] finalize step must declare "
+                         "payload.expected_outcome", i);
+                goto cleanup;
+            }
+            bool want = json_is_true(exp_j);
+            bool got = agreement_finalize(proto, &be->blob);
+            if (got != want) {
+                snprintf(err, err_len,
+                         "steps[%zu] finalize(%s) expected %s, got %s",
+                         i, blob_id,
+                         want ? "true" : "false",
+                         got ? "true" : "false");
+                goto cleanup;
+            }
+            continue;
+        }
+
+        if (strcmp(func, "vote") != 0) {
+            snprintf(err, err_len,
+                     "scenario: steps[%zu] function must be vote|finalize (got %s)",
+                     i, func);
+            goto cleanup;
+        }
+
+        const char *from_id = json_string_value(json_object_get(step, "from"));
+        json_t *appr_j = json_object_get(payload, "approval");
+        if (from_id == NULL || !json_is_boolean(appr_j)) {
+            snprintf(err, err_len, "scenario: steps[%zu] vote payload malformed", i);
+            goto cleanup;
+        }
+        agreement_voter_t *voter = _find_voter_by_id(voters, voter_count, from_id);
+        if (voter == NULL) {
+            snprintf(err, err_len, "scenario: steps[%zu] unknown voter %s", i, from_id);
+            goto cleanup;
+        }
+        uint8_t digest[MERKLE_DIGEST_LEN];
+        _harness_blob_hash(&be->blob, NULL, 0, digest);
+
+        agreement_proof_t *p = NULL;
+        if (agreement_proof_create(voter->uuid, digest, MERKLE_DIGEST_LEN,
+                                   json_is_true(appr_j), NULL, 0, &p) != 0
+            || p == NULL) {
+            snprintf(err, err_len, "scenario: steps[%zu] proof_create failed", i);
+            goto cleanup;
+        }
+        proofs[proof_count++] = p;
+        agreement_verify(proto, &be->blob, p, NULL, 0);
+    }
+
+    /* Walk expected_state.agreement; finalize each blob and assert outcome. */
+    json_t *agreement_expected = json_is_object(expected_state_j)
+        ? json_object_get(expected_state_j, "agreement") : NULL;
+    if (json_is_object(agreement_expected)) {
+        const char *key;
+        json_t *value;
+        json_object_foreach(agreement_expected, key, value) {
+            struct blob_entry *be = NULL;
+            for (size_t j = 0; j < blob_count; j++) {
+                if (strcmp(blobs[j].id, key) == 0) { be = &blobs[j]; break; }
+            }
+            if (be == NULL) {
+                snprintf(err, err_len,
+                         "scenario: expected_state.agreement.%s: unknown blob", key);
+                goto cleanup;
+            }
+            json_t *outcome_j = json_object_get(value, "outcome");
+            if (!json_is_boolean(outcome_j)) {
+                snprintf(err, err_len,
+                         "scenario: expected_state.agreement.%s.outcome must be boolean",
+                         key);
+                goto cleanup;
+            }
+            bool want = json_is_true(outcome_j);
+            bool got = agreement_finalize(proto, &be->blob);
+            if (got != want) {
+                snprintf(err, err_len,
+                         "finalize(%s): expected %s, got %s",
+                         key, want ? "true" : "false", got ? "true" : "false");
+                goto cleanup;
+            }
+        }
+    }
+
+    rc = 0;
+cleanup:
+    for (size_t i = 0; i < proof_count; i++) {
+        agreement_proof_free(proofs[i]);
+    }
+    if (proto != NULL) agreement_protocol_free(proto);
+    return rc;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Dispatch                                                                    */
 /* ------------------------------------------------------------------------- */
 
 void at_agreement_run(const at_case_t *c, at_case_result_t *out) {
     if (strcmp(c->kind, "negative") == 0) {
         at_neg_run_wire(c, out);
+        return;
+    }
+    if (strcmp(c->kind, "scenario") == 0) {
+        char err[256] = {0};
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int rc = run_scenario(c, err, sizeof(err));
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        int duration_ms = (int)((t1.tv_sec - t0.tv_sec) * 1000
+                                + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+        if (rc == 0) {
+            at_case_result_set_pass(out, duration_ms);
+        } else {
+            at_case_result_set_fail(out, duration_ms, "AssertionError", err);
+        }
         return;
     }
     if (strcmp(c->kind, "agreement_vector") != 0) {

@@ -1,0 +1,96 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pos-vote-order-invariance
+byte_pinning: false
+description: |
+    Fourth agreement state-machine scenario: vote-arrival-order invariance
+    under POS stake-weighted tallying.
+
+    Same voters/stakes/blobs as `multi-blob-pos-stake-weighted`; same
+    final per-blob vote sets; the only difference is that the steps
+    fire in the OPPOSITE order. POS finalize sums yea-stake / nay-stake
+    over the per-blob _votes[] list — the sum is commutative, so
+    arrival order must not affect the outcome. This case + the
+    forward-order case together prove order-invariance: if either
+    implementation introduced an order-sensitive bug (e.g. early-exit
+    on first vote, or last-write-wins semantics), one of the two would
+    diverge.
+
+    Per-blob terminal vote totals (must match `multi-blob-pos-stake-weighted`):
+      blob-p: yea = alice(10),                       nay = bob(3)   → true
+      blob-q: yea = bob(3) + charlie(5) = 8,         nay = alice(10) → false
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+  - id: charlie
+    role: voter
+
+fixtures:
+  impl: stake
+  stakes:
+    alice: 10
+    bob: 3
+    charlie: 5
+  myself: alice
+  blobs:
+    blob-p:
+      originator: bob
+      payload: "p-payload"
+    blob-q:
+      originator: charlie
+      payload: "q-payload"
+
+steps:
+  # Forward-order case fires votes 1..5 in id order. Reverse here:
+  # step ids 1..5 in this file correspond to the reversed order.
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-q
+      approval: false
+    description: alice (stake 10) rejects blob-q FIRST this time.
+  - id: 2
+    from: charlie
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-q
+      approval: true
+    description: charlie (stake 5) approves blob-q.
+  - id: 3
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-q
+      approval: true
+    description: bob (stake 3) approves blob-q.
+  - id: 4
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-p
+      approval: false
+    description: bob (stake 3) rejects blob-p.
+  - id: 5
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-p
+      approval: true
+    description: alice (stake 10) approves blob-p LAST this time.
+
+expected_state:
+  agreement:
+    blob-p:
+      outcome: true
+    blob-q:
+      outcome: false

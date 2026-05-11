@@ -1,0 +1,86 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: late-vote-after-finalize
+byte_pinning: false
+description: |
+    Seventh agreement state-machine scenario. Tests that an inline
+    `finalize` step captures the outcome at that moment and a vote
+    arriving AFTER finalize does not retroactively flip the asserted
+    outcome.
+
+    Introduces a new step kind: `function: finalize`. Both adapters now
+    accept either `function: vote` (submits a vote) or `function:
+    finalize` (calls protocol.finalize and asserts payload.expected_outcome
+    inline). Vote steps stay unchanged.
+
+    Step trace:
+      1. alice (leader, rank 5) approves blob-x.
+      2. bob (rank 0) approves blob-x.
+      3. finalize blob-x → expect True (leader approved). Production
+         agreement.finalize() also consumes & deletes self._votes[blob.uuid]
+         here; subsequent verify() calls on this blob start a fresh tally.
+      4. bob casts a LATE vote (rejecting) on blob-x. verify() accepts it
+         silently (no exception). The result captured at step 3 is the
+         canonical outcome — this late vote can't change it, and any
+         subsequent finalize would only see this one vote (without the
+         leader's, which would now be a degenerate case anyway).
+
+    No final expected_state is required: the assertion lives inline at
+    step 3. The trailing vote at step 4 is a behavior probe — its only
+    purpose is to confirm the protocol accepts post-finalize votes
+    without crashing.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: authority
+  threshold_rank: 0
+  ranks:
+    alice: 5
+    bob: 0
+  myself: alice
+  blobs:
+    blob-x:
+      originator: bob
+      payload: "x-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: leader approves.
+  - id: 2
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: bob also approves.
+  - id: 3
+    from: alice
+    to: agreement
+    function: finalize
+    payload:
+      blob: blob-x
+      expected_outcome: true
+    description: inline finalize — must return True; votes are consumed.
+  - id: 4
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: false
+    description: |
+        Late vote after finalize. Both impls must accept this without
+        raising; the previously-asserted outcome stays True regardless.

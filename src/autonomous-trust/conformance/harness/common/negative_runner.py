@@ -147,6 +147,28 @@ def _flip_payload_byte(wire_bytes: bytes, index: int) -> bytes:
     return json.dumps(wire, separators=(',', ':')).encode('utf-8')
 
 
+def _drop_envelope_field(wire_bytes: bytes, field: str) -> bytes:
+    """Remove a top-level field from the JSON wire envelope.
+
+    Dropping a required field (e.g. `process`, `function`) makes the
+    consumer's parser reject the buffer as malformed. Dropping the
+    `signature` field is also useful: parsing still succeeds, but the
+    parser leaves verified=False.
+    """
+    try:
+        wire = json.loads(wire_bytes.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise NotImplementedError(
+            f'cannot drop field: wire buffer is not JSON ({exc})'
+        ) from exc
+    if not isinstance(wire, dict) or field not in wire:
+        raise NotImplementedError(
+            f'envelope has no field {field!r}; cannot drop'
+        )
+    del wire[field]
+    return json.dumps(wire, separators=(',', ':')).encode('utf-8')
+
+
 def classify_op(mutation: dict[str, Any]) -> str:
     """Return the observable reason_class implied by a mutation op.
 

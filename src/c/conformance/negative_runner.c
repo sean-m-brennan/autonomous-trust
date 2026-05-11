@@ -195,6 +195,26 @@ int at_neg_apply_mutation(const uint8_t *in_buf, size_t in_len,
         return 0;
     }
 
+    if (strcmp(op, "drop_field") == 0 &&
+        strncmp(target, "envelope.", 9) == 0) {
+        const char *field = target + 9;
+        json_error_t jerr;
+        json_t *wire = json_loadb((const char *)in_buf, in_len, 0, &jerr);
+        if (wire == NULL) return -2;
+        if (!json_is_object(wire) ||
+            json_object_get(wire, field) == NULL) {
+            json_decref(wire);
+            return -2;
+        }
+        json_object_del(wire, field);
+        char *dumped = json_dumps(wire, JSON_COMPACT);
+        json_decref(wire);
+        if (dumped == NULL) return -1;
+        *out_len = strlen(dumped);
+        *out_buf = (uint8_t *)dumped;
+        return 0;
+    }
+
     return -2; /* unsupported op in v1 */
 }
 
