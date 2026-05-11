@@ -78,6 +78,14 @@ int negotiation_get_task_stack_size(void);
  *  Python adapter's `if not self.process.confirmed` check. */
 bool negotiation_has_confirmed_any(void);
 
+/** Returns true iff the shared `my_tasks` map has an entry keyed by
+ *  the given uuid (its string form, as the production code stores).
+ *  For the `has_my_task: <slug>` expected_state assertion in the
+ *  conformance corpus — the adapter derives the uuid from the slug
+ *  using the same uuid5 namespace+format Python's adapter uses, so
+ *  the two adapters compare against bit-equal keys. */
+bool negotiation_has_my_task_uuid(const uuid_t uuid);
+
 #define ENEG_NOPEERS 243
 DECLARE_ERROR(ENEG_NOPEERS, "No capable peers available");
 

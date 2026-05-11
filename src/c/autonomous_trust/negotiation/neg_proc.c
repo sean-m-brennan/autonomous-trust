@@ -1182,6 +1182,18 @@ bool negotiation_has_confirmed_any(void)
     return any;
 }
 
+bool negotiation_has_my_task_uuid(const uuid_t uuid)
+{
+    if (!neg_state.initialized) return false;
+    char key[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(uuid, key);
+    pthread_mutex_lock(&neg_state.lock);
+    data_t *dat = NULL;
+    bool found = (map_get(&neg_state.my_tasks, key, &dat) == 0 && dat != NULL);
+    pthread_mutex_unlock(&neg_state.lock);
+    return found;
+}
+
 int negotiation_register_handlers(process_t *proc)
 {
     if (proc == NULL) return -1;
