@@ -1,0 +1,65 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: poa-threshold-rank-filter
+byte_pinning: false
+description: |
+    Sixth agreement state-machine scenario. Exercises POA's
+    `threshold_rank` filter: voters whose rank is below threshold have
+    their vote forced to False in finalize regardless of what they cast.
+
+    Setup: alice (rank 2) is the highest-ranked voter (the "leader"
+    under POA), bob (rank 1) is a peer, threshold_rank is 3. Alice
+    votes approve. Under unfiltered POA leader-decides this would
+    yield True; with threshold_rank=3, alice's rank-2 vote is below
+    threshold → forced to False → finalize returns False.
+
+    Catches future changes that:
+      - drop the threshold check entirely (would flip this case to True);
+      - apply the threshold to votes but not to the leader-rank lookup
+        (so a below-threshold "leader" still gets to decide).
+
+    Note: only ONE blob in this scenario — the threshold rule is
+    protocol-instance scoped, not per-blob, so a companion clear-win
+    blob in the same instance would need a voter above threshold to be
+    illustrative, complicating the shape. The single-blob form keeps
+    the threshold semantics crisp.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: authority
+  threshold_rank: 3
+  ranks:
+    alice: 2
+    bob: 1
+  # myself must not equal blob.originator, or finalize short-circuits
+  # to True before the threshold check even runs.
+  myself: bob
+  blobs:
+    blob-x:
+      originator: alice
+      payload: "below-threshold-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        alice (rank 2, the highest-ranked voter so "leader" under POA)
+        approves blob-x. With threshold_rank=3 her vote is below
+        threshold and _count_vote forces it to False; _accumulate_votes
+        looks up the leader's vote at rank=2 and gets False.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: false
