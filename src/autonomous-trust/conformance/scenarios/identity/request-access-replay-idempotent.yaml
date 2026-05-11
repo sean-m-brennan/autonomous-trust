@@ -1,0 +1,53 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: request-access-replay-idempotent
+byte_pinning: false
+description: |
+    Identity replay-handling probe — confirms that newcomer's
+    `request_access` announce, when delivered twice to a border guard,
+    does NOT double-add newcomer to bg's peers list.
+
+    Background: bg's `welcoming_committee` in
+    `autonomous_trust/.../identity/idprocess.py` checks
+    `existing = self.peers.find_by_uuid(new_id.uuid)` and takes an
+    "amnesia" branch when the peer is already known (line 452-483). On
+    the amnesia path it re-registers missing capabilities (per-cap
+    dedup) and re-emits an admission broadcast if border_guard_mode is
+    on, but does NOT re-run the vote-collection or peer-add path.
+    Result: bg's peer count stays at 1 regardless of how many times
+    request_access is replayed.
+
+    Scenario structure: one source step with `repeat: 2`. No
+    in_response_to follow-ups — the engine just dispatches twice and
+    snapshots bg's state. The Python adapter's _check_expected_state
+    enforces peer_count: 1; the C adapter has no expected_state check
+    today (its scenario_engine stub is a no-op), so it validates only
+    that the second delivery doesn't crash.
+
+    First identity scenario to exercise the universal scenario engine's
+    `repeat: N` field (the agreement adapter pioneered the grammar; the
+    reputation `ask-permission-replay-rejected` was the first universal
+    case).
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    repeat: 2
+    description: |
+        newcomer broadcasts request_access twice. The first delivery
+        triggers bg's welcoming_committee → vote → peer_accepted →
+        peer-add cascade. The second delivery sees newcomer already
+        in bg.peers and takes the amnesia branch — no double-add.
+
+expected_state:
+  bg:
+    peer_count: 1

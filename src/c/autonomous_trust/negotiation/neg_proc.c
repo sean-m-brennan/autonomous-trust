@@ -1164,6 +1164,24 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
  * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
  * cascades.
  */
+int negotiation_get_task_stack_size(void)
+{
+    if (!neg_state.initialized) return -1;
+    pthread_mutex_lock(&neg_state.lock);
+    int n = job_queue_count(&neg_state.task_stack);
+    pthread_mutex_unlock(&neg_state.lock);
+    return n;
+}
+
+bool negotiation_has_confirmed_any(void)
+{
+    if (!neg_state.initialized) return false;
+    pthread_mutex_lock(&neg_state.lock);
+    bool any = map_size(&neg_state.confirmed) > 0;
+    pthread_mutex_unlock(&neg_state.lock);
+    return any;
+}
+
 int negotiation_register_handlers(process_t *proc)
 {
     if (proc == NULL) return -1;

@@ -30,7 +30,12 @@
           "description": "What part of the message/step to mutate: signature | wire_bytes | payload.<field> | envelope.<field>"
         },
         "index": {"type": "integer"},
-        "value": {"type": ["string", "integer", "boolean", "null"]}
+        "value": {"type": ["string", "integer", "boolean", "null"]},
+        "content_hex": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]*$",
+          "description": "Raw replacement bytes encoded as hex (no 0x prefix). Used by op=replace target=wire_bytes to inject non-JSON garbage."
+        }
       }
     },
     "expected": {

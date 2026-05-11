@@ -67,6 +67,17 @@ void negotiation_set_peer_level(const process_t *proc,
  *  Idempotent. The harness calls this between scenarios. */
 void negotiation_clear_test_state(const process_t *proc);
 
+/** Read the current size of the shared task_stack for
+ *  `task_in_stack` expected_state assertions. Returns -1 if neg_state
+ *  is uninitialized. Mirrors the Python adapter's check on
+ *  `process.task_stack._heap` non-emptiness. */
+int negotiation_get_task_stack_size(void);
+
+/** Returns true iff the shared `confirmed` map has at least one
+ *  entry, for the `confirmed` expected_state assertion. Mirrors the
+ *  Python adapter's `if not self.process.confirmed` check. */
+bool negotiation_has_confirmed_any(void);
+
 #define ENEG_NOPEERS 243
 DECLARE_ERROR(ENEG_NOPEERS, "No capable peers available");
 
