@@ -1,0 +1,70 @@
+#!/bin/bash
+# Validate-and-retry compiler launcher.
+#
+# Works around a virtiofs page-cache reconciliation bug observed when this
+# tree is built from a sandboxed VM where the source mount is virtiofs:
+# gcc occasionally writes a relocatable .o whose section header table has
+# zero-filled byte ranges (typically inside the section-header string-table
+# entry). The on-disk file is shorter than ar/ranlib expect, and
+# `bfd plugin: ELF section name out of range` warnings fire when the
+# static archive is built. Symbols from the affected .o are then absent
+# from the archive's TOC, breaking the link with undefined references.
+#
+# The .o file is corrupt-on-disk — re-running ar/ranlib does not recover
+# it. The fix is to re-invoke the compiler and overwrite the bad output.
+# This launcher does exactly that: after each compile, sniff the .o for
+# a readable .shstrtab section; if it's not present, delete the output
+# and re-run the compiler. Bounded retry so a real compile error does
+# not loop forever.
+#
+# Wired up via CMAKE_C_COMPILER_LAUNCHER in src/c/CMakeLists.txt. Skipped
+# for non-.o outputs (preprocessing, assembly, link). No-op on non-virtiofs
+# filesystems where the corruption never appears in the first place.
+
+set -u
+
+# Walk argv to find the -o <path> output. Returns "" if not found.
+extract_output() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o) printf '%s' "${2:-}"; return 0 ;;
+        esac
+        shift
+    done
+    printf ''
+}
+
+is_corrupt_object() {
+    local f="$1"
+    [ -f "$f" ] || return 1
+    case "$f" in *.o) ;; *) return 1 ;; esac
+    # readelf cannot dump .shstrtab on a corrupt-section-header file. The
+    # exact warning it emits is "Section '.shstrtab' was not dumped because
+    # it does not exist" — we grep for that precise string, then return
+    # truthy (=corrupt) when the warning is present.
+    /usr/bin/readelf --string-dump=.shstrtab "$f" 2>&1 \
+        | grep -q "was not dumped" && return 0
+    return 1
+}
+
+attempt=0
+max=3
+out=""
+while [ $attempt -lt $max ]; do
+    "$@"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        exit $rc
+    fi
+    if [ -z "$out" ]; then
+        out=$(extract_output "$@")
+    fi
+    if [ -z "$out" ] || ! is_corrupt_object "$out"; then
+        exit 0
+    fi
+    attempt=$((attempt + 1))
+    echo "cc-validate-output: $out has corrupt sections (attempt $attempt); retrying" >&2
+    rm -f "$out"
+done
+echo "cc-validate-output: gave up after $max attempts on $out" >&2
+exit 1

@@ -41,6 +41,12 @@
 #include "adapters/negotiation.h"
 #include "adapters/reputation.h"
 
+/* Adapters that handle kind:negative need the JSON corpus root to resolve
+ * `based_on` references; one runner invocation processes one root, so a
+ * process-global is the simplest plumbing. */
+static const char *g_corpus_json_root = NULL;
+const char *at_runner_corpus_json_root(void) { return g_corpus_json_root; }
+
 /* Adapter dispatch keyed on protocol. Every adapter knows what kinds it
  * handles and emits skip for anything else. */
 static void dispatch(const at_case_t *c, at_case_result_t *out) {
@@ -106,6 +112,7 @@ int main(int argc, char **argv) {
 
     const char *corpus = argv[1];
     const char *results_path = argv[2];
+    g_corpus_json_root = corpus;
 
     at_case_t *cases = NULL;
     size_t n = 0;

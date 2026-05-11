@@ -101,10 +101,18 @@ run_c_harness() {
     return 2
   fi
 
-  rm -rf "$build_dir"
-  echo "Initializing C build dir at $build_dir ..." >&2
-  mkdir -p "$build_dir"
-  (cd "$build_dir" && cmake ..)
+  if [[ ! -d "$build_dir" ]]; then
+    echo "Initializing C build dir at $build_dir ..." >&2
+    mkdir -p "$build_dir"
+    (cd "$build_dir" && cmake ..)
+  else
+    # Reuse existing build dir for incremental builds. The compiler launcher
+    # set up by AT_CC_VALIDATE_OUTPUT (see src/c/CMakeLists.txt) handles the
+    # virtiofs page-cache reconciliation hazard that previously forced us
+    # to wipe build/ on every run; refresh the cmake config in case CMake
+    # files changed since last run.
+    (cd "$build_dir" && cmake ..) >/dev/null
+  fi
 
   echo "Building + running C conformance harness ..."
   (cd "$build_dir" && make conformance_c)

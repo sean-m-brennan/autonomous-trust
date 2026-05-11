@@ -48,6 +48,41 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 set(CMAKE_C_FLAGS_DEBUG "-g -O0")
 
+# virtiofs page-cache reconciliation hazard (sandbox builds): when the
+# source/build trees live on virtiofs, gcc occasionally writes a .o with
+# a corrupt section header table. The on-disk file is short of what
+# ar/ranlib expect, so the bfd LTO plugin emits "ELF section name out
+# of range" and the symbol is silently dropped from the static archive's
+# TOC, breaking the eventual link. Detect virtiofs and install a
+# validate-and-retry compiler launcher that re-invokes gcc on bad
+# output. Off by default outside virtiofs (no false positives), and
+# always overridable via -DAT_CC_VALIDATE_OUTPUT={ON,OFF}.
+execute_process(
+    COMMAND stat -f --format=%T ${CMAKE_BINARY_DIR}
+    OUTPUT_VARIABLE _at_build_fs_type
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(_at_build_fs_type STREQUAL "fuseblk" OR
+   _at_build_fs_type STREQUAL "virtiofs" OR
+   _at_build_fs_type MATCHES "^9p")
+    set(_at_validate_default ON)
+else()
+    set(_at_validate_default OFF)
+endif()
+option(AT_CC_VALIDATE_OUTPUT
+    "Re-invoke the compiler when it emits a .o with a corrupt section header (virtiofs workaround)"
+    ${_at_validate_default})
+if(AT_CC_VALIDATE_OUTPUT)
+    set(_at_cc_launcher ${CMAKE_CURRENT_SOURCE_DIR}/cmake/cc-validate-output)
+    if(NOT EXISTS ${_at_cc_launcher})
+        message(FATAL_ERROR "AT_CC_VALIDATE_OUTPUT=ON but ${_at_cc_launcher} is missing")
+    endif()
+    set(CMAKE_C_COMPILER_LAUNCHER ${_at_cc_launcher})
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${_at_cc_launcher})
+    message("-- AT_CC_VALIDATE_OUTPUT enabled (build FS: ${_at_build_fs_type}); using ${_at_cc_launcher}")
+endif()
+
 set(warning_as_error -Werror)
 set(useful_warnings
     -Wshadow 

@@ -155,8 +155,15 @@ class AgreementAdapter:
             'agreement uses kind: agreement_vector, not kind: scenario'
         )
 
-    def run_negative(self, case: Case) -> None:  # noqa: ARG002
-        raise NotImplementedError('agreement negative kind not implemented')
+    def run_negative(self, case: Case) -> None:
+        from ...common.negative_runner import run_wire_negative
+        expected = case.data['expected']['reason_class']
+        observed = run_wire_negative(self.corpus_root, case)
+        if observed != expected:
+            raise AssertionError(
+                f'reason_class mismatch: expected {expected!r}, '
+                f'observed {observed!r}'
+            )
 
     # ------------------------------------------------------------------
     # Builders

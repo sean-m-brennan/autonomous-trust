@@ -48,6 +48,8 @@
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 
+#include "../negative_runner.h"
+
 #include "../scenario_engine.h"
 
 typedef struct {
@@ -540,11 +542,16 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
 
 void at_reputation_run(const at_case_t *c, at_case_result_t *out)
 {
+    if (strcmp(c->kind, "negative") == 0)
+    {
+        at_neg_run_wire(c, out);
+        return;
+    }
     if (strcmp(c->kind, "scenario") != 0)
     {
         char detail[160];
         snprintf(detail, sizeof(detail),
-                 "C reputation adapter only handles kind:scenario (got %s)", c->kind);
+                 "C reputation adapter only handles kind:scenario|negative (got %s)", c->kind);
         at_case_result_set_skip(out, detail);
         return;
     }

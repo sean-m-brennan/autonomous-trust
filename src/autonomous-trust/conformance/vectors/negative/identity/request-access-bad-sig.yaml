@@ -1,0 +1,21 @@
+schema_version: "1"
+kind: negative
+protocol: identity
+name: request-access-bad-sig
+description: |
+    Mutate one byte of the newcomer's signature on the request_access
+    announce. The receiver's wire-message parser must mark the parsed
+    message as unverified, regardless of whether higher-level identity
+    logic later acts on it. Both Python (Message.parse) and C
+    (net_message_from_wire) must independently arrive at the same verdict.
+
+based_on: scenarios/identity/new-node-admission.yaml
+
+mutation:
+  step_id: 1
+  op: flip_byte
+  target: signature
+  index: 0
+
+expected:
+  reason_class: signature_verification_failed

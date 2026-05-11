@@ -1,0 +1,26 @@
+schema_version: "1"
+kind: negative
+protocol: identity
+name: request-access-tampered-payload
+description: |
+    Flip one byte of the base64 `data` field on the newcomer's
+    request_access announce. The wire envelope still decodes — the
+    base64 alphabet is preserved — but the decoded payload differs from
+    what the sender signed, so signature verification must fail. Both
+    Python (Message.parse) and C (net_message_from_wire) must
+    independently mark the parsed message as unverified.
+
+    Complement to `request-access-bad-sig`: that case corrupts the
+    signature hex, this one corrupts the payload while leaving the
+    signature intact. Both should land at the same reason_class.
+
+based_on: scenarios/identity/new-node-admission.yaml
+
+mutation:
+  step_id: 1
+  op: flip_byte
+  target: payload
+  index: 0
+
+expected:
+  reason_class: signature_verification_failed

@@ -42,12 +42,18 @@
 
 #include "identity/identity.h"
 #include "identity/id_proc_priv.h"
+#include "network/net_message.h"
 #include "processes/processes.h"
 #include "structures/array.h"
 #include "structures/map.h"
 #include "utilities/message.h"
 
+#include "../negative_runner.h"
 #include "../scenario_engine.h"
+
+/* Provided by runner.c; needed for kind:negative case dispatch to resolve
+ * based_on references inside the JSON corpus mirror. */
+extern const char *at_runner_corpus_json_root(void);
 
 /* ------------------------------------------------------------------------- */
 /* Per-participant impl carries a process_t plus a public_identity_t copy    */
@@ -253,10 +259,14 @@ static int _dispatch(sce_run_ctx_t *ctx,
 /* ------------------------------------------------------------------------- */
 
 void at_identity_run(const at_case_t *c, at_case_result_t *out) {
+    if (strcmp(c->kind, "negative") == 0) {
+        at_neg_run_wire(c, out);
+        return;
+    }
     if (strcmp(c->kind, "scenario") != 0) {
         char detail[160];
         snprintf(detail, sizeof(detail),
-                 "C identity adapter only handles kind:scenario (got %s)", c->kind);
+                 "C identity adapter only handles kind:scenario|negative (got %s)", c->kind);
         at_case_result_set_skip(out, detail);
         return;
     }
