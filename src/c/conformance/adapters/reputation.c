@@ -68,6 +68,7 @@ typedef struct {
     bool valid;
     int chain_len;
     int request_count;
+    int64_t last_id;
 } rp_snap_t;
 static rp_snap_t g_snaps[SCE_MAX_PARTICIPANTS];
 
@@ -470,6 +471,7 @@ static int _dispatch(sce_run_ctx_t *ctx,
     {
         s->chain_len     = reputation_get_chain_len();
         s->request_count = reputation_get_request_count();
+        s->last_id       = reputation_get_last_id();
     }
     return 0;
 }
@@ -527,9 +529,36 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                     return -1;
                 }
             }
+            else if (strcmp(key, "last_id_set") == 0)
+            {
+                /* Python's check is `self.process.last_id is not None`;
+                 * the C side uses int64_t initialized to 0 and only
+                 * advances on a granted ballot (paxos.c:123). > 0
+                 * therefore means "set". Scenarios pin ballot ids > 0
+                 * so this maps cleanly to Python's None semantics. */
+                bool want = json_is_true(val);
+                bool got = (snap->last_id > 0);
+                if (got != want)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: last_id_set=%s (value=%lld), expected %s",
+                             pid, got ? "true" : "false",
+                             (long long)snap->last_id,
+                             want ? "true" : "false");
+                    return -1;
+                }
+            }
             else
             {
-                /* Unknown keys are advisory; skip silently. */
+                /* Unknown key: error rather than silently skip. The
+                 * Python adapter does the same (`raise
+                 * AssertionError(f'{self.id}: unsupported expected_state
+                 * key {key!r}')`); without this, a scenario could pin
+                 * a key that Python enforces but C ignores, hiding a
+                 * real asymmetry behind a green C result. */
+                snprintf(ctx->err, sizeof(ctx->err),
+                         "%s: unsupported expected_state key %s", pid, key);
+                return -1;
             }
         }
     }

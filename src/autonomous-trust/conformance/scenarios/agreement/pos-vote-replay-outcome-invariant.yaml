@@ -1,0 +1,100 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pos-vote-replay-outcome-invariant
+byte_pinning: false
+description: |
+    POS replay-handling probe. Bob (stake 3) votes NO on blob-x with
+    repeat: 2, sandwiched between yes-votes from alice (stake 10) and
+    carol (stake 5). The clear yes-majority (yea=15) is far enough
+    ahead of nay (3 single, or 6 doubled) that bob's replayed nay
+    cannot flip the outcome.
+
+    Important honest caveat — what this scenario DOES and DOES NOT
+    prove:
+
+      - DOES prove: the user-visible finalize outcome is invariant
+        under replay of one voter, on BOTH Python and C, for this
+        margin. If either impl introduced a hard crash or an order-
+        sensitive bug on duplicate vote delivery, this scenario
+        would surface it.
+
+      - Does NOT prove: that POS implementations dedup votes
+        internally. They DO NOT. AgreementByStake._count_vote in
+        `autonomous_trust/.../algorithms/stake.py:35-40` adds the
+        voter's stake to yea/nay unconditionally; C's
+        `_stake_count_vote` (`src/c/autonomous_trust/algorithms/
+        agreement.c:208-222`) does the same. Bob's second nay-vote
+        adds another 3 to nay (Python: nay=6 after replay; C: same).
+        The outcome stays true only because the yes-majority is
+        large enough to absorb the extra nay.
+
+      - Implication: a scenario with a tight stake margin (e.g.
+        yea=6 vs nay=3 with a no-voter of stake 3 replayed) WOULD
+        flip from true to false under replay, and the conformance
+        gate would catch that. Such a scenario is a follow-up if
+        the project decides to fix POS to dedup; for now both impls
+        accept the non-dedup behavior symmetrically.
+
+    Setup mirrors the existing pos-* scenarios:
+      voters: alice (stake 10), bob (stake 3), carol (stake 5)
+      myself: alice
+      blob.originator: charlie-equivalent (bob, so myself != originator)
+      Votes: alice YES, bob NO (repeat 2), carol YES.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+  - id: carol
+    role: voter
+
+fixtures:
+  impl: stake
+  stakes:
+    alice: 10
+    bob: 3
+    carol: 5
+  myself: alice
+  blobs:
+    blob-x:
+      originator: bob
+      payload: "stake-replay-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: alice (stake 10) approves blob-x.
+
+  - id: 2
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: false
+    repeat: 2
+    description: |
+        bob (stake 3) rejects blob-x. Delivered TWICE — neither
+        impl dedups by voter uuid, so nay accumulates 3+3=6.
+        Outcome still hinges on yea (10+5=15) > nay (6) → true.
+
+  - id: 3
+    from: carol
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: carol (stake 5) approves blob-x.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: true

@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: peer-encrypted-structured-payload
+byte_pinning: false
+description: |
+    Variant of `peer-encrypted-roundtrip` with a non-trivial obj_json.
+    Confirms the full Box(encrypt) → wire(serialize) → Box(decrypt) →
+    Message.parse path is invariant under realistic payload shape and
+    size, not just the degenerate empty `{}` case.
+
+    Concretely the payload here is ~260 bytes of structured JSON with
+    nested keys and unicode-safe strings. Both Python's
+    `Message.__bytes__` (which b64-encodes the obj string) and C's
+    `net_message_to_wire` (sodium_bin2base64 over msg->data) must
+    survive a non-empty payload without truncation, alignment, or
+    encoding drift. The `expected_state.b` assertions are the same
+    as the empty-payload roundtrip — the test is that nothing in the
+    parser exposes obj-shape-dependent behavior.
+
+    Uses the same dispatch as peer-encrypted-roundtrip (adapter
+    routes by case.name to `_run_peer_encrypted_roundtrip`). The
+    runner already parameterizes `obj_json` from the fixture, so no
+    new adapter code is needed beyond a one-line dispatch entry.
+
+participants:
+  - id: a
+    role: sender
+  - id: b
+    role: receiver
+
+fixtures:
+  nonce_hex: "0x303132333435363738393a3b3c3d3e3f4041424344454647"
+  # Structured JSON payload, ~260 bytes. Mixes nested objects, arrays,
+  # numeric types, and a deliberately diverse character mix (still
+  # ASCII to avoid Python/C string-encoding nuance interfering with the
+  # round-trip — this scenario isolates payload-shape, not encoding).
+  obj_json: '{"task":"data_fetch","priority":7,"params":{"endpoint":"https://api.example.com/v1/items","timeout_ms":15000,"retries":3,"backoff":[100,250,500]},"caps":["compute","storage"],"meta":{"trace_id":"01HF8K9M5Q","spawned_by":"alice","tags":["regression","conformance","payload-shape"]}}'
+
+steps:
+  - id: 1
+    from: a
+    to: b
+    function: request_access
+    description: |
+        A signs+serializes the request_access Message with a non-empty
+        structured payload, encrypts to B with the fixture nonce, B
+        decrypts and re-parses. The parsed Message must carry the same
+        (process, function, verified) tuple as the empty-payload case.
+
+expected_state:
+  b:
+    routed_process: identity
+    routed_function: request_access
+    verified: true

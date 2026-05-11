@@ -1,0 +1,62 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: broadcast-fanout-three-receivers
+byte_pinning: false
+description: |
+    Variant of `broadcast-fanout` with three receivers instead of two.
+    Confirms fan-out determinism is invariant in N: parsing the same
+    signed wire bytes against the same sender identity yields identical
+    (process, function, verified) tuples for every receiver, regardless
+    of how many receivers fan-out spans.
+
+    The adapter (both Python and C) was refactored 2026-05-11 to iterate
+    participants from `case.data['participants']` rather than hard-
+    coding 'b' and 'c'. This scenario is the first that exercises N=3;
+    the existing `broadcast-fanout` continues to validate the N=2 case
+    using the same code path. If a future regression introduced
+    receiver-index-dependent state (e.g. a parser shared mutable buffer
+    keyed by receiver), the discrepancy between N=2 and N=3 would
+    surface here.
+
+    Production-code analogue is unchanged from `broadcast-fanout`: the
+    broadcast layer ships ONE bytes copy per receiver, each receiver
+    independently runs the parse + signature-verify path.
+
+participants:
+  - id: a
+    role: sender
+  - id: b
+    role: receiver
+  - id: c
+    role: receiver
+  - id: d
+    role: receiver
+
+fixtures:
+  obj_json: "{}"
+
+steps:
+  - id: 1
+    from: a
+    to: broadcast
+    function: request_access
+    description: |
+        A signs+serializes the broadcast Message once. The adapter
+        delivers the same wire bytes to B, C, and D; each independently
+        re-parses with A as the known sender. All three parses must
+        yield identical observables.
+
+expected_state:
+  b:
+    routed_process: identity
+    routed_function: request_access
+    verified: true
+  c:
+    routed_process: identity
+    routed_function: request_access
+    verified: true
+  d:
+    routed_process: identity
+    routed_function: request_access
+    verified: true

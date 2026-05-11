@@ -1,0 +1,29 @@
+schema_version: "1"
+kind: negative
+protocol: negotiation
+name: invite-oversized
+description: |
+    Replace the `data` field on alice's negotiation invitation with
+    base64 of 65535 zero bytes. Companion to
+    identity/request-access-oversized on a negotiation envelope.
+
+    Both parsers decode the inflated envelope cleanly (no parser-
+    level size cap today); signature was over the original payload,
+    so verification fails. Reason_class:
+    signature_verification_failed.
+
+    Test guarantees: parser survives the larger input; signature
+    verifier still rejects when data-size delta is order-of-
+    magnitude larger than the original. Does NOT test size
+    enforcement — there isn't any in the parser.
+
+based_on: scenarios/negotiation/invite-accept.yaml
+
+mutation:
+  step_id: 1
+  op: inflate
+  target: payload
+  size: 65535
+
+expected:
+  reason_class: signature_verification_failed
