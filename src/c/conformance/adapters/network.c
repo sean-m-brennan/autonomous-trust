@@ -1203,6 +1203,606 @@ cleanup:
     return rc;
 }
 
+/* For crypto-rejection scenarios: assert the YAML pins
+ * `expected_state.<pid>.decrypt_failed: true`. The caller observed the
+ * expected decrypt failure before invoking this; if the YAML didn't
+ * declare the expectation, the scenario is misconfigured. Mirrors the
+ * Python adapter's `_assert_decrypt_failed`. */
+static int _assert_decrypt_failed(const at_case_t *c, const char *pid,
+                                  char *err, size_t err_len) {
+    json_t *expected_state = json_object_get(c->data, "expected_state");
+    json_t *pid_obj = json_object_get(expected_state, pid);
+    if (!json_is_object(pid_obj)
+        || !json_is_true(json_object_get(pid_obj, "decrypt_failed"))) {
+        snprintf(err, err_len,
+                 "%.32s: scenario observed decrypt failure but "
+                 "expected_state did not declare decrypt_failed: true", pid);
+        return -1;
+    }
+    return 0;
+}
+
+static int run_peer_encrypted_tampered_ciphertext(const at_case_t *c,
+                                                  char *err, size_t err_len) {
+    /* Flip one byte of the Box ciphertext after A encrypts; B's
+     * identity_decrypt must return non-zero (poly1305 MAC catches the
+     * tamper). Mirrors the Python runner of the same name. */
+    int rc = -1;
+    identity_t *a = NULL, *b = NULL;
+    public_identity_t *a_pub = NULL, *b_pub = NULL;
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    unsigned char *cipher = NULL, *plain = NULL;
+    uint8_t *nonce = NULL;
+    size_t nonce_len = 0;
+    net_wire_msg_t msg = {0};
+
+    json_t *fixtures = json_object_get(c->data, "fixtures");
+    if (!json_is_object(fixtures)) {
+        snprintf(err, err_len, "scenario: fixtures missing");
+        return -1;
+    }
+    const char *nonce_hex = json_string_value(json_object_get(fixtures, "nonce_hex"));
+    const char *obj_json = json_string_value(json_object_get(fixtures, "obj_json"));
+    if (nonce_hex == NULL || obj_json == NULL) {
+        snprintf(err, err_len, "scenario: nonce_hex or obj_json missing");
+        return -1;
+    }
+    if (hex_to_bytes(nonce_hex, &nonce, &nonce_len) != 0 ||
+        nonce_len != crypto_box_NONCEBYTES) {
+        snprintf(err, err_len, "scenario: bad nonce");
+        goto cleanup;
+    }
+    if (_make_deterministic_identity("a", "10.0.80.1", &a) != 0 ||
+        _make_deterministic_identity("b", "10.0.80.2", &b) != 0 ||
+        identity_publish(a, &a_pub) != 0 || identity_publish(b, &b_pub) != 0) {
+        snprintf(err, err_len, "scenario: identity setup failed");
+        goto cleanup;
+    }
+
+    strncpy(msg.process, "identity", PROC_NAME_LEN);
+    msg.function = strdup("request_access");
+    if (msg.function == NULL) goto cleanup;
+    size_t obj_len = strlen(obj_json);
+    msg.data = malloc(obj_len > 0 ? obj_len : 1);
+    if (msg.data == NULL) goto cleanup;
+    memcpy(msg.data, obj_json, obj_len);
+    msg.data_len = obj_len;
+    msg.to_whom.type = RECIPIENT_PEER;
+    memcpy(&msg.to_whom.target.peer, b_pub, sizeof(public_identity_t));
+    memcpy(&msg.from_whom, a_pub, sizeof(public_identity_t));
+    msg.encrypt = true;
+
+    if (net_message_to_wire(&msg, a, &wire, &wire_len) != 0) {
+        snprintf(err, err_len, "scenario: net_message_to_wire failed");
+        goto cleanup;
+    }
+
+    size_t cipher_len = wire_len + crypto_box_MACBYTES;
+    cipher = malloc(cipher_len);
+    if (cipher == NULL) goto cleanup;
+    msg_str_t in = { .msg = wire, .len = wire_len };
+    if (identity_encrypt(a, &in, b_pub, nonce, cipher) != 0) {
+        snprintf(err, err_len, "scenario: identity_encrypt failed");
+        goto cleanup;
+    }
+
+    /* Flip one byte of the ciphertext. Position 16 is well inside the
+     * MAC-protected region (Python flips position 30 of the nonce-
+     * prefixed buffer; subtracting the 24-byte nonce gives 6 — still
+     * inside the ciphertext, MAC catches either way). */
+    if (cipher_len < 17) {
+        snprintf(err, err_len, "scenario: cipher buffer too short to tamper");
+        goto cleanup;
+    }
+    cipher[16] ^= 0x01;
+
+    plain = malloc(wire_len > 0 ? wire_len : 1);
+    if (plain == NULL) goto cleanup;
+    msg_str_t cipher_ms = { .msg = cipher, .len = cipher_len };
+    int drc = identity_decrypt(b, &cipher_ms, a_pub, nonce, plain);
+    if (drc == 0) {
+        snprintf(err, err_len,
+                 "b: decrypt of tampered ciphertext unexpectedly succeeded");
+        goto cleanup;
+    }
+    if (_assert_decrypt_failed(c, "b", err, err_len) != 0) goto cleanup;
+
+    rc = 0;
+cleanup:
+    free(plain);
+    free(cipher);
+    free(wire);
+    free(msg.function);
+    free(msg.data);
+    free(nonce);
+    if (a_pub != NULL) smrt_deref(a_pub);
+    if (b_pub != NULL) smrt_deref(b_pub);
+    if (a != NULL) identity_free(a);
+    if (b != NULL) identity_free(b);
+    return rc;
+}
+
+static int run_peer_encrypted_truncated_ciphertext(const at_case_t *c,
+                                                   char *err, size_t err_len) {
+    /* Drop the trailing 16 bytes of the libsodium Box ciphertext after
+     * A encrypts; B's identity_decrypt must return non-zero. Mirrors
+     * the Python runner of the same name. Pairs with the tampered-
+     * ciphertext scenario: both surface as MAC verification failure
+     * but exercise different mutations (mid-stream flip vs tail
+     * truncation). */
+    int rc = -1;
+    identity_t *a = NULL, *b = NULL;
+    public_identity_t *a_pub = NULL, *b_pub = NULL;
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    unsigned char *cipher = NULL, *plain = NULL;
+    uint8_t *nonce = NULL;
+    size_t nonce_len = 0;
+    net_wire_msg_t msg = {0};
+
+    json_t *fixtures = json_object_get(c->data, "fixtures");
+    if (!json_is_object(fixtures)) {
+        snprintf(err, err_len, "scenario: fixtures missing");
+        return -1;
+    }
+    const char *nonce_hex = json_string_value(json_object_get(fixtures, "nonce_hex"));
+    const char *obj_json = json_string_value(json_object_get(fixtures, "obj_json"));
+    if (nonce_hex == NULL || obj_json == NULL) {
+        snprintf(err, err_len, "scenario: nonce_hex or obj_json missing");
+        return -1;
+    }
+    if (hex_to_bytes(nonce_hex, &nonce, &nonce_len) != 0 ||
+        nonce_len != crypto_box_NONCEBYTES) {
+        snprintf(err, err_len, "scenario: bad nonce");
+        goto cleanup;
+    }
+    if (_make_deterministic_identity("a", "10.0.80.1", &a) != 0 ||
+        _make_deterministic_identity("b", "10.0.80.2", &b) != 0 ||
+        identity_publish(a, &a_pub) != 0 || identity_publish(b, &b_pub) != 0) {
+        snprintf(err, err_len, "scenario: identity setup failed");
+        goto cleanup;
+    }
+
+    strncpy(msg.process, "identity", PROC_NAME_LEN);
+    msg.function = strdup("request_access");
+    if (msg.function == NULL) goto cleanup;
+    size_t obj_len = strlen(obj_json);
+    msg.data = malloc(obj_len > 0 ? obj_len : 1);
+    if (msg.data == NULL) goto cleanup;
+    memcpy(msg.data, obj_json, obj_len);
+    msg.data_len = obj_len;
+    msg.to_whom.type = RECIPIENT_PEER;
+    memcpy(&msg.to_whom.target.peer, b_pub, sizeof(public_identity_t));
+    memcpy(&msg.from_whom, a_pub, sizeof(public_identity_t));
+    msg.encrypt = true;
+
+    if (net_message_to_wire(&msg, a, &wire, &wire_len) != 0) {
+        snprintf(err, err_len, "scenario: net_message_to_wire failed");
+        goto cleanup;
+    }
+
+    size_t cipher_len = wire_len + crypto_box_MACBYTES;
+    cipher = malloc(cipher_len);
+    if (cipher == NULL) goto cleanup;
+    msg_str_t in = { .msg = wire, .len = wire_len };
+    if (identity_encrypt(a, &in, b_pub, nonce, cipher) != 0) {
+        snprintf(err, err_len, "scenario: identity_encrypt failed");
+        goto cleanup;
+    }
+
+    /* C's cipher buffer is `MAC(16) || cipher_data(wire_len)` — no
+     * nonce prefix (nonce is passed separately to libsodium). Drop
+     * the trailing 16 bytes; MAC remains intact but cipher body
+     * shrinks. libsodium recomputes MAC over the shortened body,
+     * which no longer matches the embedded tag → reject.
+     *
+     * Need cipher_len > 16 + 16 (MAC + minimum truncate + at least
+     * one byte of cipher remaining); request_access wire is well
+     * above this. */
+    if (cipher_len < crypto_box_MACBYTES + 16 + 1) {
+        snprintf(err, err_len,
+                 "scenario: cipher buffer too short to truncate (%zu bytes)",
+                 cipher_len);
+        goto cleanup;
+    }
+    size_t truncated_len = cipher_len - 16;
+
+    plain = malloc(wire_len > 0 ? wire_len : 1);
+    if (plain == NULL) goto cleanup;
+    msg_str_t cipher_ms = { .msg = cipher, .len = truncated_len };
+    int drc = identity_decrypt(b, &cipher_ms, a_pub, nonce, plain);
+    if (drc == 0) {
+        snprintf(err, err_len,
+                 "b: decrypt of truncated ciphertext unexpectedly succeeded");
+        goto cleanup;
+    }
+    if (_assert_decrypt_failed(c, "b", err, err_len) != 0) goto cleanup;
+
+    rc = 0;
+cleanup:
+    free(plain);
+    free(cipher);
+    free(wire);
+    free(msg.function);
+    free(msg.data);
+    free(nonce);
+    if (a_pub != NULL) smrt_deref(a_pub);
+    if (b_pub != NULL) smrt_deref(b_pub);
+    if (a != NULL) identity_free(a);
+    if (b != NULL) identity_free(b);
+    return rc;
+}
+
+static int run_peer_encrypted_wrong_recipient(const at_case_t *c,
+                                              char *err, size_t err_len) {
+    /* A encrypts for B's pubkey; C tries to decrypt with C's privkey
+     * against A's pubkey. The Box(C_priv, A_pub) shared secret differs
+     * from Box(A_priv, B_pub), so identity_decrypt returns non-zero. */
+    int rc = -1;
+    identity_t *a = NULL, *b = NULL, *cident = NULL;
+    public_identity_t *a_pub = NULL, *b_pub = NULL, *c_pub = NULL;
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    unsigned char *cipher = NULL, *plain = NULL;
+    uint8_t *nonce = NULL;
+    size_t nonce_len = 0;
+    net_wire_msg_t msg = {0};
+
+    json_t *fixtures = json_object_get(c->data, "fixtures");
+    const char *nonce_hex = fixtures
+        ? json_string_value(json_object_get(fixtures, "nonce_hex")) : NULL;
+    const char *obj_json = fixtures
+        ? json_string_value(json_object_get(fixtures, "obj_json")) : NULL;
+    if (nonce_hex == NULL || obj_json == NULL) {
+        snprintf(err, err_len, "scenario: nonce_hex or obj_json missing");
+        return -1;
+    }
+    if (hex_to_bytes(nonce_hex, &nonce, &nonce_len) != 0 ||
+        nonce_len != crypto_box_NONCEBYTES) {
+        snprintf(err, err_len, "scenario: bad nonce");
+        goto cleanup;
+    }
+    if (_make_deterministic_identity("a", "10.0.80.1", &a) != 0 ||
+        _make_deterministic_identity("b", "10.0.80.2", &b) != 0 ||
+        _make_deterministic_identity("c", "10.0.80.3", &cident) != 0 ||
+        identity_publish(a, &a_pub) != 0 ||
+        identity_publish(b, &b_pub) != 0 ||
+        identity_publish(cident, &c_pub) != 0) {
+        snprintf(err, err_len, "scenario: identity setup failed");
+        goto cleanup;
+    }
+
+    strncpy(msg.process, "identity", PROC_NAME_LEN);
+    msg.function = strdup("request_access");
+    if (msg.function == NULL) goto cleanup;
+    size_t obj_len = strlen(obj_json);
+    msg.data = malloc(obj_len > 0 ? obj_len : 1);
+    if (msg.data == NULL) goto cleanup;
+    memcpy(msg.data, obj_json, obj_len);
+    msg.data_len = obj_len;
+    msg.to_whom.type = RECIPIENT_PEER;
+    memcpy(&msg.to_whom.target.peer, b_pub, sizeof(public_identity_t));
+    memcpy(&msg.from_whom, a_pub, sizeof(public_identity_t));
+    msg.encrypt = true;
+
+    if (net_message_to_wire(&msg, a, &wire, &wire_len) != 0) {
+        snprintf(err, err_len, "scenario: net_message_to_wire failed");
+        goto cleanup;
+    }
+
+    size_t cipher_len = wire_len + crypto_box_MACBYTES;
+    cipher = malloc(cipher_len);
+    if (cipher == NULL) goto cleanup;
+    msg_str_t in = { .msg = wire, .len = wire_len };
+    if (identity_encrypt(a, &in, b_pub, nonce, cipher) != 0) {
+        snprintf(err, err_len, "scenario: identity_encrypt failed");
+        goto cleanup;
+    }
+
+    plain = malloc(wire_len > 0 ? wire_len : 1);
+    if (plain == NULL) goto cleanup;
+    msg_str_t cipher_ms = { .msg = cipher, .len = cipher_len };
+    /* C is the WRONG recipient — has its own keypair, not B's. */
+    int drc = identity_decrypt(cident, &cipher_ms, a_pub, nonce, plain);
+    if (drc == 0) {
+        snprintf(err, err_len,
+                 "c: decrypt with wrong recipient key unexpectedly succeeded");
+        goto cleanup;
+    }
+    if (_assert_decrypt_failed(c, "c", err, err_len) != 0) goto cleanup;
+
+    rc = 0;
+cleanup:
+    free(plain);
+    free(cipher);
+    free(wire);
+    free(msg.function);
+    free(msg.data);
+    free(nonce);
+    if (a_pub != NULL) smrt_deref(a_pub);
+    if (b_pub != NULL) smrt_deref(b_pub);
+    if (c_pub != NULL) smrt_deref(c_pub);
+    if (a != NULL) identity_free(a);
+    if (b != NULL) identity_free(b);
+    if (cident != NULL) identity_free(cident);
+    return rc;
+}
+
+static int run_peer_encrypted_wrong_signer(const at_case_t *c,
+                                           char *err, size_t err_len) {
+    /* Z signs+encrypts to B; B parses with peer=a_pub (the claimed
+     * sender). Box-layer decrypt SUCCEEDS (B holds Z's pubkey for
+     * the Box channel); the signature verify at the next layer
+     * uses A's pubkey against Z's signature → mismatch →
+     * restored.verified = false. Mirrors the Python runner. */
+    int rc = -1;
+    identity_t *a = NULL, *b = NULL, *z = NULL;
+    public_identity_t *a_pub = NULL, *b_pub = NULL, *z_pub = NULL;
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    unsigned char *cipher = NULL, *plain = NULL;
+    uint8_t *nonce = NULL;
+    size_t nonce_len = 0;
+    net_wire_msg_t msg = {0};
+    net_wire_msg_t restored = {0};
+
+    json_t *fixtures = json_object_get(c->data, "fixtures");
+    const char *nonce_hex = fixtures
+        ? json_string_value(json_object_get(fixtures, "nonce_hex")) : NULL;
+    const char *obj_json = fixtures
+        ? json_string_value(json_object_get(fixtures, "obj_json")) : NULL;
+    if (nonce_hex == NULL || obj_json == NULL) {
+        snprintf(err, err_len, "scenario: nonce_hex or obj_json missing");
+        return -1;
+    }
+    if (hex_to_bytes(nonce_hex, &nonce, &nonce_len) != 0 ||
+        nonce_len != crypto_box_NONCEBYTES) {
+        snprintf(err, err_len, "scenario: bad nonce");
+        goto cleanup;
+    }
+    if (_make_deterministic_identity("a", "10.0.80.1", &a) != 0 ||
+        _make_deterministic_identity("b", "10.0.80.2", &b) != 0 ||
+        _make_deterministic_identity("z", "10.0.80.3", &z) != 0 ||
+        identity_publish(a, &a_pub) != 0 ||
+        identity_publish(b, &b_pub) != 0 ||
+        identity_publish(z, &z_pub) != 0) {
+        snprintf(err, err_len, "scenario: identity setup failed");
+        goto cleanup;
+    }
+
+    /* Wire metadata identifies Z as the from_whom (truthful at the
+     * Box-encryption layer); the impersonation lives at the parse-
+     * side `peer` arg. The choice of msg.from_whom here doesn't
+     * affect parse outcome because net_message_from_wire prefers
+     * the non-NULL peer arg over the wire's embedded from_sig_hex
+     * (see net_message.c:198-219). Setting from_whom=z keeps the
+     * wire honest about its Box-layer sender. */
+    strncpy(msg.process, "identity", PROC_NAME_LEN);
+    msg.function = strdup("request_access");
+    if (msg.function == NULL) goto cleanup;
+    size_t obj_len = strlen(obj_json);
+    msg.data = malloc(obj_len > 0 ? obj_len : 1);
+    if (msg.data == NULL) goto cleanup;
+    memcpy(msg.data, obj_json, obj_len);
+    msg.data_len = obj_len;
+    msg.to_whom.type = RECIPIENT_PEER;
+    memcpy(&msg.to_whom.target.peer, b_pub, sizeof(public_identity_t));
+    memcpy(&msg.from_whom, z_pub, sizeof(public_identity_t));
+    msg.encrypt = true;
+
+    /* Sign with Z. */
+    if (net_message_to_wire(&msg, z, &wire, &wire_len) != 0) {
+        snprintf(err, err_len, "scenario: net_message_to_wire failed");
+        goto cleanup;
+    }
+
+    /* Z encrypts to B with Z's box keys. */
+    size_t cipher_len = wire_len + crypto_box_MACBYTES;
+    cipher = malloc(cipher_len);
+    if (cipher == NULL) goto cleanup;
+    msg_str_t in = { .msg = wire, .len = wire_len };
+    if (identity_encrypt(z, &in, b_pub, nonce, cipher) != 0) {
+        snprintf(err, err_len, "scenario: identity_encrypt failed");
+        goto cleanup;
+    }
+
+    /* B decrypts using Z's pubkey — must succeed. */
+    plain = malloc(wire_len > 0 ? wire_len : 1);
+    if (plain == NULL) goto cleanup;
+    msg_str_t cipher_ms = { .msg = cipher, .len = cipher_len };
+    if (identity_decrypt(b, &cipher_ms, z_pub, nonce, plain) != 0) {
+        snprintf(err, err_len,
+                 "scenario: identity_decrypt failed (Box should succeed; "
+                 "wrong-signer pins the SIGNATURE layer, not Box)");
+        goto cleanup;
+    }
+
+    /* B parses with peer=a_pub (CLAIMED sender). Signature was made
+     * with Z's key; verify against A's pubkey → fail; verified=false. */
+    if (net_message_from_wire(plain, wire_len, a_pub, &restored) != 0) {
+        snprintf(err, err_len, "scenario: net_message_from_wire failed");
+        goto cleanup;
+    }
+    if (restored.verified) {
+        snprintf(err, err_len,
+                 "b: verify of Z-signed wire against A succeeded "
+                 "(impersonation NOT rejected)");
+        goto cleanup;
+    }
+
+    /* Validate expected_state.b.{routed_process, routed_function,
+     * verified}. */
+    json_t *expected_state = json_object_get(c->data, "expected_state");
+    json_t *b_expected = json_object_get(expected_state, "b");
+    if (json_is_object(b_expected)) {
+        const char *rp = json_string_value(json_object_get(b_expected, "routed_process"));
+        const char *rf = json_string_value(json_object_get(b_expected, "routed_function"));
+        json_t *ver_j = json_object_get(b_expected, "verified");
+        if (rp != NULL && strcmp(restored.process, rp) != 0) {
+            snprintf(err, err_len,
+                     "routed_process mismatch: expected %s, got %s",
+                     rp, restored.process);
+            goto cleanup;
+        }
+        if (rf != NULL &&
+            (restored.function == NULL || strcmp(restored.function, rf) != 0)) {
+            snprintf(err, err_len,
+                     "routed_function mismatch: expected %s, got %s",
+                     rf, restored.function ? restored.function : "(null)");
+            goto cleanup;
+        }
+        if (ver_j != NULL) {
+            bool want = json_is_true(ver_j);
+            if (restored.verified != want) {
+                snprintf(err, err_len,
+                         "verified mismatch: expected %s, got %s",
+                         want ? "true" : "false",
+                         restored.verified ? "true" : "false");
+                goto cleanup;
+            }
+        }
+    }
+
+    rc = 0;
+cleanup:
+    net_wire_msg_free(&restored);
+    free(plain);
+    free(cipher);
+    free(wire);
+    free(msg.function);
+    free(msg.data);
+    free(nonce);
+    if (a_pub != NULL) smrt_deref(a_pub);
+    if (b_pub != NULL) smrt_deref(b_pub);
+    if (z_pub != NULL) smrt_deref(z_pub);
+    if (a != NULL) identity_free(a);
+    if (b != NULL) identity_free(b);
+    if (z != NULL) identity_free(z);
+    return rc;
+}
+
+static int run_group_key_rotation_decrypt_fails(const at_case_t *c,
+                                                char *err, size_t err_len) {
+    /* A's group instance keyed with K1, B's with K2 — different
+     * seeds, different keypairs. Group.encrypt with K1 then
+     * Group.decrypt with K2 → MAC fails. Mirrors the Python runner. */
+    int rc = -1;
+    identity_t *a = NULL;
+    public_identity_t *a_pub = NULL;
+    group_t *a_group = NULL, *b_group = NULL;
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    unsigned char *cipher = NULL, *plain = NULL;
+    uint8_t *nonce = NULL;
+    size_t nonce_len = 0;
+    net_wire_msg_t msg = {0};
+
+    json_t *fixtures = json_object_get(c->data, "fixtures");
+    const char *nonce_hex = fixtures
+        ? json_string_value(json_object_get(fixtures, "nonce_hex")) : NULL;
+    const char *obj_json = fixtures
+        ? json_string_value(json_object_get(fixtures, "obj_json")) : NULL;
+    const char *k1 = fixtures
+        ? json_string_value(json_object_get(fixtures, "group_encryptor_seed_hex")) : NULL;
+    const char *k2 = fixtures
+        ? json_string_value(json_object_get(fixtures, "group_rotated_seed_hex")) : NULL;
+    if (nonce_hex == NULL || obj_json == NULL || k1 == NULL || k2 == NULL) {
+        snprintf(err, err_len,
+                 "scenario: fixtures need nonce_hex/obj_json/"
+                 "group_encryptor_seed_hex/group_rotated_seed_hex");
+        return -1;
+    }
+    if (strlen(k1) != crypto_box_SEEDBYTES * 2 ||
+        strlen(k2) != crypto_box_SEEDBYTES * 2) {
+        snprintf(err, err_len,
+                 "scenario: group seeds must be %u hex chars",
+                 (unsigned)(crypto_box_SEEDBYTES * 2));
+        return -1;
+    }
+    if (hex_to_bytes(nonce_hex, &nonce, &nonce_len) != 0 ||
+        nonce_len != crypto_box_NONCEBYTES) {
+        snprintf(err, err_len, "scenario: bad nonce");
+        goto cleanup;
+    }
+
+    if (_make_deterministic_identity("a", "10.0.80.1", &a) != 0 ||
+        identity_publish(a, &a_pub) != 0) {
+        snprintf(err, err_len, "scenario: identity setup failed");
+        goto cleanup;
+    }
+
+    uuid_t group_uuid;
+    {
+        const char *label = "at-conformance:group:rotate";
+        unsigned char sha[32];
+        crypto_hash_sha256(sha, (const unsigned char *)label, strlen(label));
+        memcpy(group_uuid, sha, 16);
+        group_uuid[6] = (group_uuid[6] & 0x0F) | 0x40;
+        group_uuid[8] = (group_uuid[8] & 0x3F) | 0x80;
+    }
+    char group_addr[] = "10.0.80.10";
+    if (group_create(&group_uuid, group_addr, &a_group) != 0 ||
+        group_create(&group_uuid, group_addr, &b_group) != 0) {
+        snprintf(err, err_len, "scenario: group_create failed");
+        goto cleanup;
+    }
+    encryptor_init(&a_group->encryptor, (const unsigned char *)k1);
+    encryptor_init(&b_group->encryptor, (const unsigned char *)k2);
+
+    strncpy(msg.process, "identity", PROC_NAME_LEN);
+    msg.function = strdup("request_access");
+    if (msg.function == NULL) goto cleanup;
+    size_t obj_len = strlen(obj_json);
+    msg.data = malloc(obj_len > 0 ? obj_len : 1);
+    if (msg.data == NULL) goto cleanup;
+    memcpy(msg.data, obj_json, obj_len);
+    msg.data_len = obj_len;
+    msg.to_whom.type = RECIPIENT_BROADCAST;
+    memcpy(&msg.from_whom, a_pub, sizeof(public_identity_t));
+    msg.encrypt = true;
+
+    if (net_message_to_wire(&msg, a, &wire, &wire_len) != 0) {
+        snprintf(err, err_len, "scenario: net_message_to_wire failed");
+        goto cleanup;
+    }
+
+    size_t cipher_len = wire_len + crypto_box_MACBYTES;
+    cipher = malloc(cipher_len);
+    if (cipher == NULL) goto cleanup;
+    msg_str_t in = { .msg = wire, .len = wire_len };
+    if (group_encrypt(a_group, &in, a_group, nonce, cipher) != 0) {
+        snprintf(err, err_len, "scenario: group_encrypt failed");
+        goto cleanup;
+    }
+
+    plain = malloc(wire_len > 0 ? wire_len : 1);
+    if (plain == NULL) goto cleanup;
+    msg_str_t cipher_ms = { .msg = cipher, .len = cipher_len };
+    int drc = group_decrypt(b_group, &cipher_ms, b_group, nonce, plain);
+    if (drc == 0) {
+        snprintf(err, err_len,
+                 "b: post-rotation decrypt of pre-rotation ciphertext "
+                 "unexpectedly succeeded");
+        goto cleanup;
+    }
+    if (_assert_decrypt_failed(c, "b", err, err_len) != 0) goto cleanup;
+
+    rc = 0;
+cleanup:
+    free(plain);
+    free(cipher);
+    free(wire);
+    free(msg.function);
+    free(msg.data);
+    free(nonce);
+    if (a_group != NULL) smrt_deref(a_group);
+    if (b_group != NULL) smrt_deref(b_group);
+    if (a_pub != NULL) smrt_deref(a_pub);
+    if (a != NULL) identity_free(a);
+    return rc;
+}
+
 static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     /* Network scenarios are protocol-specific; each adds a branch here
      * matching by case name. */
@@ -1216,6 +1816,21 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     if (strcmp(c->name, "broadcast-fanout") == 0 ||
         strcmp(c->name, "broadcast-fanout-three-receivers") == 0) {
         return run_broadcast_fanout(c, err, err_len);
+    }
+    if (strcmp(c->name, "peer-encrypted-tampered-ciphertext") == 0) {
+        return run_peer_encrypted_tampered_ciphertext(c, err, err_len);
+    }
+    if (strcmp(c->name, "peer-encrypted-truncated-ciphertext") == 0) {
+        return run_peer_encrypted_truncated_ciphertext(c, err, err_len);
+    }
+    if (strcmp(c->name, "peer-encrypted-wrong-recipient") == 0) {
+        return run_peer_encrypted_wrong_recipient(c, err, err_len);
+    }
+    if (strcmp(c->name, "peer-encrypted-wrong-signer") == 0) {
+        return run_peer_encrypted_wrong_signer(c, err, err_len);
+    }
+    if (strcmp(c->name, "group-key-rotation-decrypt-fails") == 0) {
+        return run_group_key_rotation_decrypt_fails(c, err, err_len);
     }
     snprintf(err, err_len, "unknown network scenario: %s", c->name);
     return 1; /* skip */

@@ -122,6 +122,34 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: task_in_stack={actual}, expected {expected}'
                     )
+            elif key == 'flood_count':
+                # `expected` is {task: <slug>, count: <int>}. Derive the
+                # same task uuid `_build_inbound` mints from the slug and
+                # read `proposed_tasks[uuid].count` — the per-task flood
+                # counter `handle_invite` increments on each observed
+                # invite. Mirrors the C accessor
+                # `negotiation_get_task_flood_count` which reads the
+                # symmetric "flood:<uuid>" key from `proposed_tasks`.
+                if not isinstance(expected, dict):
+                    raise AssertionError(
+                        f'{self.id}: flood_count expects '
+                        f'{{task: <slug>, count: <int>}}, got {expected!r}'
+                    )
+                slug = expected.get('task')
+                want = expected.get('count')
+                if not isinstance(slug, str) or not isinstance(want, int):
+                    raise AssertionError(
+                        f'{self.id}: flood_count requires task=<slug> and '
+                        f'count=<int>, got {expected!r}'
+                    )
+                want_uuid = uuid5(_NS, f'task:{slug}')
+                counter = self.process.proposed_tasks.get(want_uuid)
+                got = counter.count if counter is not None else 0
+                if got != want:
+                    raise AssertionError(
+                        f'{self.id}: flood_count for slug {slug!r} '
+                        f'(uuid={want_uuid}) = {got}, expected {want}'
+                    )
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
 

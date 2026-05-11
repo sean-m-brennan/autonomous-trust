@@ -39,7 +39,7 @@
         "size": {
           "type": "integer",
           "minimum": 1,
-          "description": "Target binary size for op=inflate target=payload — the wire `data` field is replaced with base64-of-N-zero-bytes. Honest reason_class is signature_verification_failed (neither parser enforces an explicit size limit today; the test asserts the parser survives a large input and the signature mismatches the inflated payload)."
+          "description": "Target binary size for op=inflate target=payload — the wire `data` field is replaced with base64-of-N-zero-bytes. Two reason_class regimes split at 768 KB raw (≈1 MB wire after base64): sizes below 768 KB → signature_verification_failed (parser accepts, sig mismatches); sizes at or above 768 KB → payload_oversized (parser's envelope size cap, Network.max_wire_bytes / NET_MSG_MAX_DATA = 1 MB, rejects before json.loads)."
         }
       }
     },

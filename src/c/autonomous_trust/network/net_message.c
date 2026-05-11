@@ -147,6 +147,17 @@ int net_message_from_wire(const uint8_t *data, size_t len,
 
     memset(msg_out, 0, sizeof(net_wire_msg_t));
 
+    /* Envelope-level size cap (parser-side defense-in-depth). The TCP
+     * transport already enforces NET_MSG_MAX_DATA on inbound bytes
+     * (net_transport_tcp.c:173), but this function is also called on
+     * in-process or alternate-transport bytes; mirroring the cap here
+     * means oversized envelopes never reach json_loadb regardless of
+     * arrival path. Python's Message.parse carries the same cap on
+     * its side (network.py: Network.max_wire_bytes). Change both
+     * together. */
+    if (len > NET_MSG_MAX_DATA)
+        return EXCEPTION(ENET_WIRE);
+
     json_error_t err;
     json_t *root = json_loadb((const char *)data, len, 0, &err);
     if (root == NULL)

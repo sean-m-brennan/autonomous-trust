@@ -287,6 +287,21 @@ class NetworkAdapter:
                          'broadcast-fanout-three-receivers'):
             self._run_broadcast_fanout(case)
             return
+        if case.name == 'peer-encrypted-tampered-ciphertext':
+            self._run_peer_encrypted_tampered_ciphertext(case)
+            return
+        if case.name == 'peer-encrypted-truncated-ciphertext':
+            self._run_peer_encrypted_truncated_ciphertext(case)
+            return
+        if case.name == 'peer-encrypted-wrong-recipient':
+            self._run_peer_encrypted_wrong_recipient(case)
+            return
+        if case.name == 'peer-encrypted-wrong-signer':
+            self._run_peer_encrypted_wrong_signer(case)
+            return
+        if case.name == 'group-key-rotation-decrypt-fails':
+            self._run_group_key_rotation_decrypt_fails(case)
+            return
         raise NotImplementedError(
             f'network scenario {case.name!r} not implemented'
         )
@@ -435,6 +450,252 @@ class NetworkAdapter:
             _assert_expected_state(case, rid, parsed)
 
     # ------------------------------------------------------------------
+    # Crypto-rejection scenarios (failure paths)
+    # ------------------------------------------------------------------
+    # The roundtrip / fanout runners above test happy paths: parse,
+    # signature-verify, expected_state. These runners cover the
+    # crypto-rejection corner of the matrix — a properly-formed wire
+    # envelope whose ciphertext or key context is wrong, so decryption
+    # must fail. Each runner attempts the decryption and asserts that
+    # the receiver's box raised CryptoError (Python) / returned non-
+    # zero (C). The shared `_assert_decrypt_failed` helper enforces the
+    # YAML expected_state.<receiver>.decrypt_failed: true pin.
+
+    def _run_peer_encrypted_tampered_ciphertext(self, case: Case) -> None:
+        """Flip one byte of the Box ciphertext; B's decrypt must fail.
+
+        Validates that libsodium's poly1305 MAC catches ciphertext
+        tampering — a "wire bytes survived transit but were modified"
+        threat. Same as production: PyNaCl raises CryptoError on MAC
+        mismatch; C `identity_decrypt` returns non-zero.
+        """
+        from nacl.exceptions import CryptoError
+        from autonomous_trust.core.network.message import Message
+        from autonomous_trust.core.system import CfgIds
+
+        fixtures = case.data.get('fixtures', {}) or {}
+        nonce = hex_to_bytes(fixtures['nonce_hex'])
+        obj_json = fixtures.get('obj_json', '{}')
+
+        a = _make_test_identity('a', addr='10.0.80.1')
+        b = _make_test_identity('b', addr='10.0.80.2')
+
+        msg = Message(CfgIds.identity, 'request_access', obj_json,
+                      from_whom=a, to_whom=b, encrypt=True)
+        plaintext = bytes(msg)
+
+        encrypted = a.encrypt(plaintext, b, nonce=nonce)
+        # EncryptedMessage is `nonce || ciphertext`; pick a byte well
+        # past the 24-byte nonce so we deterministically corrupt the
+        # ciphertext, not the nonce. Flipping the nonce would also
+        # cause decrypt to fail but for a different reason — the test
+        # intent is "MAC catches ciphertext mutation."
+        tampered = bytearray(bytes(encrypted))
+        if len(tampered) < 30:
+            raise AssertionError(
+                f'tampered: encrypted buffer too short ({len(tampered)} bytes)'
+            )
+        tampered[30] ^= 0x01
+
+        try:
+            b.decrypt(bytes(tampered), a)
+        except CryptoError:
+            _assert_decrypt_failed(case, 'b')
+            return
+        raise AssertionError(
+            'b: decrypt of tampered ciphertext unexpectedly succeeded'
+        )
+
+    def _run_peer_encrypted_truncated_ciphertext(self, case: Case) -> None:
+        """Drop the trailing 16 bytes of the Box ciphertext; B's decrypt
+        must fail.
+
+        Pairs with `_run_peer_encrypted_tampered_ciphertext`: tamper
+        catches single-byte mutation, truncate catches end-of-stream
+        loss. Both surface as MAC mismatch from libsodium's poly1305
+        verification — recomputed MAC over the shortened ciphertext
+        no longer matches the embedded MAC tag.
+        """
+        from nacl.exceptions import CryptoError
+        from autonomous_trust.core.network.message import Message
+        from autonomous_trust.core.system import CfgIds
+
+        fixtures = case.data.get('fixtures', {}) or {}
+        nonce = hex_to_bytes(fixtures['nonce_hex'])
+        obj_json = fixtures.get('obj_json', '{}')
+
+        a = _make_test_identity('a', addr='10.0.80.1')
+        b = _make_test_identity('b', addr='10.0.80.2')
+
+        msg = Message(CfgIds.identity, 'request_access', obj_json,
+                      from_whom=a, to_whom=b, encrypt=True)
+        plaintext = bytes(msg)
+
+        encrypted = a.encrypt(plaintext, b, nonce=nonce)
+        # PyNaCl's EncryptedMessage bytes form is `nonce(24) || MAC(16)
+        # || cipher(N)`. Drop the trailing 16 bytes — leaves nonce and
+        # MAC intact but truncates the cipher body. crypto_box_open_easy
+        # recomputes MAC over the supplied ciphertext, so the MAC tag
+        # no longer matches and decrypt rejects.
+        full = bytes(encrypted)
+        # 24 nonce + 16 MAC + at least 1 cipher byte after truncation.
+        if len(full) < 24 + 16 + 16 + 1:
+            raise AssertionError(
+                f'truncated: encrypted buffer too short ({len(full)} bytes)'
+            )
+        truncated = full[:-16]
+
+        try:
+            b.decrypt(truncated, a)
+        except CryptoError:
+            _assert_decrypt_failed(case, 'b')
+            return
+        raise AssertionError(
+            'b: decrypt of truncated ciphertext unexpectedly succeeded'
+        )
+
+    def _run_peer_encrypted_wrong_recipient(self, case: Case) -> None:
+        """A encrypts for B's public key; C tries to decrypt with C's
+        own private key against A's public key. Must fail — wrong
+        recipient identity.
+
+        Threat model: an eavesdropper captures the per-peer-encrypted
+        envelope but lacks B's private key. Even with A's public key
+        (which is fine for verifying signatures, but Box needs B's
+        secret to derive the shared secret), decryption rejects.
+        """
+        from nacl.exceptions import CryptoError
+        from autonomous_trust.core.network.message import Message
+        from autonomous_trust.core.system import CfgIds
+
+        fixtures = case.data.get('fixtures', {}) or {}
+        nonce = hex_to_bytes(fixtures['nonce_hex'])
+        obj_json = fixtures.get('obj_json', '{}')
+
+        a = _make_test_identity('a', addr='10.0.80.1')
+        b = _make_test_identity('b', addr='10.0.80.2')
+        c = _make_test_identity('c', addr='10.0.80.3')
+
+        msg = Message(CfgIds.identity, 'request_access', obj_json,
+                      from_whom=a, to_whom=b, encrypt=True)
+        plaintext = bytes(msg)
+        encrypted = a.encrypt(plaintext, b, nonce=nonce)
+
+        try:
+            # Box(c.private, a.public) doesn't share a secret with
+            # Box(a.private, b.public). Decrypt must fail.
+            c.decrypt(encrypted, a)
+        except CryptoError:
+            _assert_decrypt_failed(case, 'c')
+            return
+        raise AssertionError(
+            'c: decrypt with wrong recipient key unexpectedly succeeded'
+        )
+
+    def _run_peer_encrypted_wrong_signer(self, case: Case) -> None:
+        """Z signs+encrypts to B; B parses with claimed sender = A.
+
+        Sig was made with Z's key; verify uses A's key → fails. Pins
+        that the network signature check rejects impersonation by
+        authorized-but-different peers, not just signature bit-rot.
+
+        Note that decryption SUCCEEDS in this scenario — Z is a legit
+        Box-layer sender (B has Z's pubkey). The rejection happens at
+        the signature layer inside `Message.parse`, surfaced as
+        `parsed.verified = False`.
+        """
+        from autonomous_trust.core.network.message import Message
+        from autonomous_trust.core.system import CfgIds
+
+        fixtures = case.data.get('fixtures', {}) or {}
+        nonce = hex_to_bytes(fixtures['nonce_hex'])
+        obj_json = fixtures.get('obj_json', '{}')
+
+        a = _make_test_identity('a', addr='10.0.80.1')
+        b = _make_test_identity('b', addr='10.0.80.2')
+        z = _make_test_identity('z', addr='10.0.80.3')
+
+        # Z constructs+signs the Message. from_whom=z drives the
+        # Message ctor's self-signing path (signs with Z's private
+        # signing key). The wire envelope embeds Z's from_uuid /
+        # from_sig_hex but `Message.parse` uses the externally
+        # supplied `sender` arg for verification — so the wire's
+        # embedded metadata doesn't affect the verify outcome.
+        msg = Message(CfgIds.identity, 'request_access', obj_json,
+                      from_whom=z, to_whom=b, encrypt=True)
+        plaintext = bytes(msg)
+
+        # Z encrypts to B via Z's box keys. B decrypts using Z's
+        # pubkey (the actual Box sender) — this succeeds; the
+        # impersonation lives at the inner-signature layer.
+        encrypted = z.encrypt(plaintext, b, nonce=nonce)
+        decrypted = b.decrypt(encrypted, z)
+        if isinstance(decrypted, str):
+            decrypted = decrypted.encode('utf-8')
+
+        # B parses with claimed sender = A. The Ed25519 verifier
+        # checks Z's signature against A's pubkey → mismatch.
+        parsed = Message.parse(decrypted, a)
+        if parsed.verified:
+            raise AssertionError(
+                'b: verify of Z-signed wire against A succeeded '
+                '(impersonation NOT rejected)'
+            )
+        _assert_expected_state_b(case, parsed)
+
+    def _run_group_key_rotation_decrypt_fails(self, case: Case) -> None:
+        """A and B were in the same group, but B has rotated to a new
+        group key. A still has K1; A's send encrypts with K1; B has
+        only K2 → decryption fails. Validates that rotated peers can't
+        read pre-rotation ciphertext (a forward-secrecy property of
+        the rotation flow).
+
+        Fixture format: two group seeds, `group_encryptor_seed_hex`
+        (A's pre-rotation K1) and `group_rotated_seed_hex` (B's new
+        K2). Both are 64 hex chars / 32 raw bytes.
+        """
+        from uuid import UUID, uuid5
+        from nacl.exceptions import CryptoError
+        from autonomous_trust.core.identity import Group
+        from autonomous_trust.core.identity.encrypt import Encryptor
+        from autonomous_trust.core.network.message import Message
+        from autonomous_trust.core.system import CfgIds
+
+        fixtures = case.data.get('fixtures', {}) or {}
+        nonce = hex_to_bytes(fixtures['nonce_hex'])
+        obj_json = fixtures.get('obj_json', '{}')
+        k1_seed = fixtures['group_encryptor_seed_hex'].encode('ascii')
+        k2_seed = fixtures['group_rotated_seed_hex'].encode('ascii')
+
+        a = _make_test_identity('a', addr='10.0.80.1')
+        b = _make_test_identity('b', addr='10.0.80.2')
+
+        ns = UUID('00000000-0000-0000-0000-000000000bbb')
+        group_uuid = uuid5(ns, 'at-conformance:group:rotate')
+        a_group = Group(group_uuid, {}, 'g1',
+                        Encryptor(k1_seed, public_only=False),
+                        _public_only=False)
+        # B's view of the group has rotated to K2 — different keypair.
+        b_group = Group(group_uuid, {}, 'g1',
+                        Encryptor(k2_seed, public_only=False),
+                        _public_only=False)
+
+        msg = Message(CfgIds.identity, 'request_access', obj_json,
+                      from_whom=a, encrypt=True)
+        plaintext = bytes(msg)
+
+        encrypted = a_group.encrypt(plaintext, a_group, nonce=nonce)
+        try:
+            b_group.decrypt(encrypted, b_group)
+        except CryptoError:
+            _assert_decrypt_failed(case, 'b')
+            return
+        raise AssertionError(
+            'b: post-rotation decrypt of pre-rotation ciphertext '
+            'unexpectedly succeeded'
+        )
+
+    # ------------------------------------------------------------------
     # Negative kind
     # ------------------------------------------------------------------
 
@@ -480,6 +741,21 @@ def _assert_expected_state(case: Case, participant_id: str, parsed) -> None:
 def _assert_expected_state_b(case: Case, parsed) -> None:
     """Convenience wrapper for legacy single-receiver scenarios."""
     _assert_expected_state(case, 'b', parsed)
+
+
+def _assert_decrypt_failed(case: Case, participant_id: str) -> None:
+    """For crypto-rejection scenarios: assert the YAML pins
+    `expected_state.<pid>.decrypt_failed: true`. The runner caught the
+    expected CryptoError before calling this; if the YAML didn't
+    declare the expectation, the scenario is misconfigured.
+    Symmetric helper exists in the C network adapter.
+    """
+    expected = case.data.get('expected_state', {}).get(participant_id, {}) or {}
+    if not expected.get('decrypt_failed', False):
+        raise AssertionError(
+            f'{participant_id}: scenario observed decrypt failure but '
+            f'expected_state did not declare decrypt_failed: true'
+        )
 
 
 def _make_test_identity(pid: str, addr: str) -> 'Identity':

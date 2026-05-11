@@ -233,11 +233,23 @@ def classify_op(mutation: dict[str, Any]) -> str:
     if op == 'flip_byte' and target in ('signature', 'payload'):
         return 'signature_verification_failed'
     if op == 'inflate' and target == 'payload':
-        # Parsers don't enforce a size cap today; the inflated payload
-        # decodes cleanly but the signature was for the original short
-        # `data`. The observable failure is signature mismatch. If a
-        # future hardening adds parser-level size limits, the affected
-        # scenarios update to expect `payload_oversized`.
+        # Two regimes, split on the parser-level size cap
+        # (Network.max_wire_bytes / NET_MSG_MAX_DATA, both 1 MB):
+        #  - Moderate inflation (size below cap): parser accepts the
+        #    bytes; the inflated `data` mismatches the pre-inflation
+        #    signature → signature_verification_failed.
+        #  - Inflation that pushes the wire over the cap: parser
+        #    rejects up-front via the size guard, before json.loads
+        #    runs → payload_oversized.
+        # Wire bytes = JSON envelope (~few hundred B) + base64 of the
+        # inflated payload (~1.33 * size). The 768K threshold is a
+        # conservative under-approximation of "wire crosses 1 MB":
+        # 768K raw * 1.33 ≈ 1.02 MB wire ≥ 1 MB cap. Tests should pin
+        # sizes well below 768K (sig-fail regime) or well above (cap
+        # regime) to stay clear of the boundary.
+        size = mutation.get('size', 0)
+        if size >= 768 * 1024:
+            return 'payload_oversized'
         return 'signature_verification_failed'
     # drop_field, replace, and any other structural mutation all fall under
     # envelope_malformed — the buffer reaches the parser but fails JSON

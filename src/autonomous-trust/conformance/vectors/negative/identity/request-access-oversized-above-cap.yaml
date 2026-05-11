@@ -1,0 +1,39 @@
+schema_version: "1"
+kind: negative
+protocol: identity
+name: request-access-oversized-above-cap
+description: |
+    Companion to identity/request-access-oversized at the opposite
+    end of the inflate size range. Replaces alice's `data` field
+    with base64 of 1,048,576 zero bytes (1 MiB raw). After base64
+    expansion (~1.4 MiB) plus envelope overhead, the wire bytes
+    exceed the parser-level cap (Network.max_wire_bytes /
+    NET_MSG_MAX_DATA, both 1 MiB).
+
+    Both parsers reject the envelope at the size guard BEFORE
+    json.loads / json_loadb runs. Observable reason_class:
+    payload_oversized.
+
+    Pairs with request-access-oversized (size=65535 →
+    signature_verification_failed) to exercise both halves of the
+    inflate-payload classification:
+      - Below 768 KB raw: parser accepts, signature mismatches
+        pre-inflation payload → sig_failed.
+      - At/above 768 KB raw: parser's envelope size cap fires
+        first → payload_oversized.
+
+    Defense-in-depth: the TCP transport already enforces the same
+    cap before parser entry (net_transport_tcp.c:173); hoisting it
+    into the parser means non-TCP delivery paths (in-process,
+    test harness, alternate transports) carry the same guarantee.
+
+based_on: scenarios/identity/new-node-admission.yaml
+
+mutation:
+  step_id: 1
+  op: inflate
+  target: payload
+  size: 1048576
+
+expected:
+  reason_class: payload_oversized

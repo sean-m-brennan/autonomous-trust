@@ -1194,6 +1194,24 @@ bool negotiation_has_my_task_uuid(const uuid_t uuid)
     return found;
 }
 
+int negotiation_get_task_flood_count(const uuid_t uuid)
+{
+    if (!neg_state.initialized) return 0;
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(uuid, task_uuid_str);
+    /* Mirror the key construction in handle_invite (neg_proc.c:529-530):
+     * "flood:<task-uuid>" stored on proposed_tasks. */
+    char flood_key[UUID_STRING_LEN + 8];
+    snprintf(flood_key, sizeof(flood_key), "flood:%s", task_uuid_str);
+    pthread_mutex_lock(&neg_state.lock);
+    data_t *flood_dat = NULL;
+    int count = 0;
+    if (map_get(&neg_state.proposed_tasks, flood_key, &flood_dat) == 0 && flood_dat)
+        data_integer(flood_dat, &count);
+    pthread_mutex_unlock(&neg_state.lock);
+    return count;
+}
+
 int negotiation_register_handlers(process_t *proc)
 {
     if (proc == NULL) return -1;
