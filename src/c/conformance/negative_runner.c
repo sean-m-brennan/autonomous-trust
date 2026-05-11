@@ -195,6 +195,32 @@ int at_neg_apply_mutation(const uint8_t *in_buf, size_t in_len,
         return 0;
     }
 
+    if (strcmp(op, "replace") == 0 && strcmp(target, "wire_bytes") == 0) {
+        /* Byte-identical to Python's apply_mutation replace/wire_bytes:
+         * the entire wire buffer is swapped for a caller-supplied raw
+         * byte sequence (hex-encoded in the YAML). Used to inject non-
+         * JSON garbage; parser must reject as envelope_malformed. */
+        const char *content_hex = json_string_value(
+            json_object_get(mutation, "content_hex"));
+        if (content_hex == NULL) return -1;
+        size_t hlen = strlen(content_hex);
+        if (hlen % 2 != 0) return -1;
+        size_t n = hlen / 2;
+        uint8_t *p = malloc(n + 1); /* +1 keeps allocation non-NULL when n=0 */
+        if (p == NULL) return -1;
+        for (size_t i = 0; i < n; i++) {
+            unsigned int v;
+            if (sscanf(content_hex + 2 * i, "%2x", &v) != 1) {
+                free(p);
+                return -1;
+            }
+            p[i] = (uint8_t)v;
+        }
+        *out_buf = p;
+        *out_len = n;
+        return 0;
+    }
+
     if (strcmp(op, "drop_field") == 0 &&
         strncmp(target, "envelope.", 9) == 0) {
         const char *field = target + 9;

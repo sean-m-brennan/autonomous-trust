@@ -288,7 +288,13 @@ class AgreementAdapter:
                                    nonce=None)
             signed = voter.sign(bytes(proof))
             sig_pair = (signed.message, signed.signature)
-            protocol.verify(blob, proof, sig_pair)
+            # repeat: N replays the same verify(blob, proof, sig) call N
+            # times. Implementations that dedup at the count-vote layer
+            # (POA collapses by rank, POS collapses by voter uuid) must
+            # produce the same finalize outcome regardless of N. Used by
+            # the replay-idempotency scenarios.
+            for _ in range(int(step.get('repeat', 1))):
+                protocol.verify(blob, proof, sig_pair)
 
         # Drive finalize per blob and assert against expected_state.
         agreement_expected = spec.get('expected_state', {}).get('agreement', {}) or {}

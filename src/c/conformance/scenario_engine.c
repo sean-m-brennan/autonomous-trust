@@ -51,10 +51,16 @@ void sce_capture(sce_run_ctx_t *ctx, const char *to_id, const char *function) {
 /* ------------------------------------------------------------------------- */
 
 /* Build & dispatch an inbound to all matching targets. Records outbox bounds
- * for `step_id`. Returns 0 on success, -1 with ctx->err on dispatch failure. */
+ * for `step_id`. `repeat` controls how many times the same inbound is
+ * dispatched — 1 for normal source steps, N for replay-idempotency probes.
+ * The inbound is built once and dispatched N times (matches Python's
+ * scenario_engine and a real network replay's "same wire bytes redelivered"
+ * semantic). Outbox bounds wrap all N deliveries' captured emissions.
+ * Returns 0 on success, -1 with ctx->err on dispatch failure. */
 static int _build_and_deliver(sce_run_ctx_t *ctx, int step_id,
                               const char *from, const char *to,
-                              const char *function, json_t *payload) {
+                              const char *function, json_t *payload,
+                              int repeat) {
     generic_msg_t inbound;
     if (ctx->build_inbound(ctx, from, to, function, payload, &inbound) != 0) {
         snprintf(ctx->err, sizeof(ctx->err),
@@ -65,24 +71,30 @@ static int _build_and_deliver(sce_run_ctx_t *ctx, int step_id,
     ctx->outbox_start[step_id] = (int)ctx->captured_count;
     ctx->current_step_id = step_id;
 
-    if (strcmp(to, "broadcast") == 0) {
-        /* Deliver to every participant except `from`. */
-        for (size_t i = 0; i < ctx->participant_count; i++) {
-            if (strcmp(ctx->participants[i].id, from) == 0) continue;
-            snprintf(ctx->current_dispatcher, sizeof(ctx->current_dispatcher),
-                     "%s", ctx->participants[i].id);
-            ctx->dispatch(ctx, &ctx->participants[i], &inbound);
-        }
-    } else {
-        sce_participant_t *target = sce_find_participant(ctx, to);
-        if (target == NULL) {
+    sce_participant_t *unicast_target = NULL;
+    if (strcmp(to, "broadcast") != 0) {
+        unicast_target = sce_find_participant(ctx, to);
+        if (unicast_target == NULL) {
             snprintf(ctx->err, sizeof(ctx->err),
                      "step %d: unknown participant to:%s", step_id, to);
             return -1;
         }
-        snprintf(ctx->current_dispatcher, sizeof(ctx->current_dispatcher),
-                 "%s", target->id);
-        ctx->dispatch(ctx, target, &inbound);
+    }
+
+    for (int rep = 0; rep < repeat; rep++) {
+        if (unicast_target == NULL) {
+            /* Deliver to every participant except `from`. */
+            for (size_t i = 0; i < ctx->participant_count; i++) {
+                if (strcmp(ctx->participants[i].id, from) == 0) continue;
+                snprintf(ctx->current_dispatcher, sizeof(ctx->current_dispatcher),
+                         "%s", ctx->participants[i].id);
+                ctx->dispatch(ctx, &ctx->participants[i], &inbound);
+            }
+        } else {
+            snprintf(ctx->current_dispatcher, sizeof(ctx->current_dispatcher),
+                     "%s", unicast_target->id);
+            ctx->dispatch(ctx, unicast_target, &inbound);
+        }
     }
     ctx->outbox_end[step_id] = (int)ctx->captured_count;
     return 0;
@@ -98,7 +110,13 @@ static int _drive_source(sce_run_ctx_t *ctx, json_t *step) {
         snprintf(ctx->err, sizeof(ctx->err), "source step missing required field");
         return -1;
     }
-    return _build_and_deliver(ctx, sid, from, to, function, payload);
+    int repeat = 1;
+    json_t *rep_j = json_object_get(step, "repeat");
+    if (json_is_integer(rep_j)) {
+        int rv = (int)json_integer_value(rep_j);
+        if (rv >= 1) repeat = rv;
+    }
+    return _build_and_deliver(ctx, sid, from, to, function, payload, repeat);
 }
 
 static int _drive_assertion(sce_run_ctx_t *ctx, json_t *step, int in_resp) {
@@ -163,9 +181,11 @@ static int _drive_assertion(sce_run_ctx_t *ctx, json_t *step, int in_resp) {
     /* Propagate: deliver this step's message to its `to`. The payload comes
      * from the step's own payload field (mirroring Python engine, where
      * the captured raw message is delivered; here we re-build via the
-     * adapter callback for type-safety). */
+     * adapter callback for type-safety). `repeat` is meaningless on an
+     * assertion step (the inbound message is whatever the source emitted,
+     * once), so pin to 1. */
     return _build_and_deliver(ctx, sid, from, to, function,
-                              json_object_get(step, "payload"));
+                              json_object_get(step, "payload"), 1);
 }
 
 static int _check_expected_state(sce_run_ctx_t *ctx) {

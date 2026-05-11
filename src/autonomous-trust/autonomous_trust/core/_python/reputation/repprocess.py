@@ -105,11 +105,24 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     if self.last_id is None or self.last_id < id1:
                         if len(self.history) + 1 == id2:
                             self.requests.append(self._paxos_id_index(id1, id2))
+                            # Ack carries the PRIOR last_id so the proposer
+                            # sees the state-before-this-grant; matches C's
+                            # `*out_last_id = inst->last_id;` capture in
+                            # paxos.c:114 (before the update at :123).
                             ack = ((id1, id2, peer_id), (self.last_id, len(self.history)), self.last_value)
                             msg = Message(self.name, ReputationProtocol.grant,
                                           to_json_string(ack), message.from_whom)
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                             self.logger.debug('Request granted')
+                            # Pin the ballot — second-grant guard. Without
+                            # this, a duplicate (id1, id2) ask would re-pass
+                            # the `last_id is None or last_id < id1` check
+                            # and grant again, double-appending to
+                            # self.requests. C's paxos_handle_request sets
+                            # `inst->last_id = id1` here (paxos.c:123); the
+                            # missing update was the cross-language
+                            # asymmetry tracked as BUGS.md P6.
+                            self.last_id = id1
                         else:
                             msg = Message(self.name, ReputationProtocol.backdate, message.obj, message.from_whom)
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)

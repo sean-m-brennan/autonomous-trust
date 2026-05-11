@@ -407,6 +407,75 @@ static int _dispatch(sce_run_ctx_t *ctx,
 /* Adapter entry                                                              */
 /* ------------------------------------------------------------------------- */
 
+/* Validate `expected_state` against post-scenario negotiation state.
+ * Mirrors the Python negotiation adapter (`harness/python/adapters/
+ * negotiation.py::_check_expected_state`) — supported keys:
+ *   - task_in_stack: bool   → asserts whether the shared task_stack
+ *                             has any entries.
+ *   - confirmed:     bool   → asserts whether neg_state.confirmed map
+ *                             has any entries.
+ * has_my_task is intentionally not supported here yet: it requires
+ * cross-language uuid derivation from a string slug, which Python and
+ * C currently do differently. Authoring a scenario that needs it
+ * would need to thread a uuid-string fixture through both adapters
+ * first.
+ *
+ * Per-participant `pid` is honored for the iteration form, but the C
+ * neg_state is global (one negotiation instance per binary), so any
+ * pid's check reads the same shared state. Single-acceptor scenarios
+ * are unambiguous; multi-acceptor scenarios would need the production
+ * code itself to split per-process state — out of scope here. */
+static int _negotiation_check_expected_state(sce_run_ctx_t *ctx)
+{
+    json_t *expected = json_object_get(ctx->case_data, "expected_state");
+    if (!json_is_object(expected)) return 0;
+
+    const char *pid;
+    json_t *checks;
+    json_object_foreach(expected, pid, checks) {
+        if (!json_is_object(checks)) continue;
+        if (sce_find_participant(ctx, pid) == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "expected_state references unknown participant %s", pid);
+            return -1;
+        }
+
+        const char *key;
+        json_t *val;
+        json_object_foreach(checks, key, val) {
+            if (strcmp(key, "task_in_stack") == 0) {
+                bool want = json_is_true(val);
+                int sz = negotiation_get_task_stack_size();
+                bool got = (sz > 0);
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: task_in_stack=%s (stack size=%d), expected %s",
+                             pid, got ? "true" : "false", sz,
+                             want ? "true" : "false");
+                    return -1;
+                }
+            } else if (strcmp(key, "confirmed") == 0) {
+                bool want = json_is_true(val);
+                bool got = negotiation_has_confirmed_any();
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: confirmed=%s, expected %s",
+                             pid, got ? "true" : "false",
+                             want ? "true" : "false");
+                    return -1;
+                }
+            } else {
+                /* Unknown key: surface so a scenario can't silently
+                 * skip C-side enforcement of something Python checks. */
+                snprintf(ctx->err, sizeof(ctx->err),
+                         "%s: unsupported expected_state key %s", pid, key);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
 {
     if (strcmp(c->kind, "negative") == 0)
@@ -473,6 +542,7 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
     messaging_set_test_hook(_send_hook);
 
     int rc = sce_run(&ctx);
+    if (rc == 0) rc = _negotiation_check_expected_state(&ctx);
 
     messaging_set_test_hook(NULL);
     g_active_ctx = NULL;
