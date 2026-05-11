@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pow-no-proof-finalizes-false
+byte_pinning: false
+description: |
+    Ninth agreement state-machine scenario; first POW (Proof-of-Work)
+    case. Tests the no-proof-submitted code path: with `impl: work` and
+    no preceding verify() call, finalize must return false. Both Python
+    (AgreementByWork.finalize checks `blob in self._approved`) and C
+    (`agreement_finalize` walks `proto->state.work.approved`) should
+    agree.
+
+    Why this is the v1 POW scenario: a "valid proof" cross-language
+    case requires mining a nonce that produces a digest with N leading
+    zeros, and the digest must be byte-identical in both languages (so
+    both impls hash blobs the same way before the test even starts).
+    The cross-language hash-format question is its own piece of
+    plumbing; for now the no-proof case proves the POW dispatch path
+    works end-to-end and adds POW to the conformance corpus.
+
+    Scenario uses one finalize step (no preceding votes). Step grammar
+    extension from `late-vote-after-finalize` makes the inline finalize
+    + expected_outcome assertion natural.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: work
+  myself: bob
+  blobs:
+    blob-x:
+      originator: alice
+      payload: "no-proof-here"
+
+steps:
+  - id: 1
+    from: bob
+    to: agreement
+    function: finalize
+    payload:
+      blob: blob-x
+      expected_outcome: false
+    description: |
+        Finalize without prior verify. Both impls must return false
+        ("no proof submitted, blob not in approved list").

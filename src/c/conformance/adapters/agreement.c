@@ -426,6 +426,18 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
             snprintf(err, err_len, "scenario: stake_create failed");
             goto cleanup;
         }
+    } else if (strcmp(impl, "work") == 0) {
+        /* Mirror Python's AgreementByWork.DIFFICULTY = 2 so any future
+         * "mine + verify" POW scenario produces byte-identical proofs
+         * across languages. The fixture may override via
+         * `difficulty: N`. */
+        json_t *diff_j = json_object_get(fixtures_j, "difficulty");
+        int difficulty = json_is_integer(diff_j) ? (int)json_integer_value(diff_j) : 2;
+        if (agreement_by_work_create(me, others, other_count, difficulty, &proto) != 0
+            || proto == NULL) {
+            snprintf(err, err_len, "scenario: work_create failed");
+            goto cleanup;
+        }
     } else {
         snprintf(err, err_len, "scenario: unsupported impl %s", impl);
         goto cleanup;
@@ -506,9 +518,31 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
             continue;
         }
 
+        if (strcmp(func, "prove") == 0) {
+            /* POW-flavored step: agreement_prove mines a valid nonce
+             * for the blob (per the protocol's own difficulty rule),
+             * then agreement_verify admits the proof. Per-language
+             * semantics — see BUGS.md P5 for the cross-language
+             * digest-format and DIFFICULTY interpretation drift. */
+            agreement_proof_t *mined = NULL;
+            if (agreement_prove(proto, &be->blob, &mined) != 0 || mined == NULL) {
+                snprintf(err, err_len,
+                         "scenario: steps[%zu] agreement_prove failed", i);
+                goto cleanup;
+            }
+            if (proof_count >= (sizeof(proofs) / sizeof(proofs[0]))) {
+                agreement_proof_free(mined);
+                snprintf(err, err_len, "scenario: too many proofs");
+                goto cleanup;
+            }
+            proofs[proof_count++] = mined;
+            agreement_verify(proto, &be->blob, mined, NULL, 0);
+            continue;
+        }
+
         if (strcmp(func, "vote") != 0) {
             snprintf(err, err_len,
-                     "scenario: steps[%zu] function must be vote|finalize (got %s)",
+                     "scenario: steps[%zu] function must be vote|finalize|prove (got %s)",
                      i, func);
             goto cleanup;
         }
