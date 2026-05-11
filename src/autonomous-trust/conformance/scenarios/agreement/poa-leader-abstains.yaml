@@ -1,0 +1,62 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: poa-leader-abstains
+byte_pinning: false
+description: |
+    Eighth agreement state-machine scenario. Probes the case where the
+    highest-ranked voter (the POA "leader") abstains while lower-rank
+    voters do cast votes.
+
+    The C side's `_authority_accumulate` in
+    `src/c/autonomous_trust/algorithms/agreement.c` explicitly handles
+    this case: "count == 0 case falls through here — a deliberate 'no
+    leader vote yet, so not approved'", returning false. The expected
+    cross-language outcome is therefore false.
+
+    Setup:
+      voters: alice (rank 5, leader), bob (rank 0)
+      myself: bob (so myself != originator, no short-circuit to True)
+      blob.originator: alice
+      Only bob votes (approve).
+
+    Expected finalize behavior: leader (alice) didn't vote, so no
+    entry exists for rank 5 in the accumulated votes; finalize returns
+    false. If either implementation raises an exception or returns
+    true, that's a real bug — the conformance gate is the right place
+    to surface it.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: authority
+  threshold_rank: 0
+  ranks:
+    alice: 5
+    bob: 0
+  myself: bob
+  blobs:
+    blob-x:
+      originator: alice
+      payload: "leader-abstains-payload"
+
+steps:
+  - id: 1
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        Bob (rank 0, non-leader) approves. Alice (rank 5, leader)
+        never votes on this blob.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: false

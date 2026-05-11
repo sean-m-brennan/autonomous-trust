@@ -41,6 +41,7 @@ from uuid import UUID, uuid5
 from autonomous_trust.core.algorithms.agreement import AgreementProof, AgreementVoter
 from autonomous_trust.core.algorithms.authority import AgreementByAuthority
 from autonomous_trust.core.algorithms.stake import AgreementByStake
+from autonomous_trust.core.algorithms.work import AgreementByWork
 from autonomous_trust.core.identity import Identity
 from autonomous_trust.core.identity.encrypt import Encryptor
 from autonomous_trust.core.identity.sign import Signature
@@ -89,6 +90,21 @@ class _AuthorityImpl(AgreementByAuthority):
 
     def _pre_verify(self, blob, proof, sig) -> bool:  # noqa: ARG002
         return True
+
+
+class _WorkImpl(AgreementByWork):
+    """Concrete AgreementByWork for the harness. POW's verify/finalize
+    bypass the abstract _count_vote / _accumulate_votes chain, but the
+    base class still declares them abstract — provide stubs."""
+
+    def _pre_verify(self, blob, proof, sig) -> bool:  # noqa: ARG002
+        return True
+
+    def _count_vote(self, blob, proof, voter):  # noqa: ARG002
+        return None
+
+    def _accumulate_votes(self, votes):  # noqa: ARG002
+        return False
 
 
 class AgreementAdapter:
@@ -200,6 +216,8 @@ class AgreementAdapter:
         elif impl_name == 'stake':
             stakes = self._resolve_stakes(fixtures.get('stakes', {}) or {}, identities)
             protocol = _StakeImpl(myself, peers, stakes)
+        elif impl_name == 'work':
+            protocol = _WorkImpl(myself, peers)
         else:
             raise AssertionError(f'unsupported impl {impl_name!r}')
 
@@ -240,10 +258,23 @@ class AgreementAdapter:
                     )
                 continue
 
+            if fn == 'prove':
+                # POW-flavored step: protocol.prove() mines a valid
+                # nonce for `blob`, then protocol.verify() admits the
+                # proof. Per-language mining — both impls have their
+                # own DIFFICULTY interpretation (Python: leading hex
+                # nibbles; C: leading raw zero bytes), tracked as
+                # BUGS.md P5. This scenario shape doesn't pin the digest
+                # bytes across languages; it asserts only the end-to-end
+                # protocol outcome (finalize=true).
+                proof = protocol.prove(blob)
+                protocol.verify(blob, proof, None)
+                continue
+
             if fn != 'vote':
                 raise AssertionError(
                     f'step {step["id"]}: agreement scenarios only support '
-                    f'function=vote|finalize (got {fn!r})'
+                    f'function=vote|finalize|prove (got {fn!r})'
                 )
 
             voter_id = step['from']

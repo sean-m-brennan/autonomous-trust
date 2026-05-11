@@ -240,3 +240,60 @@ class TestAgreementImplEnum:
         from autonomous_trust.core.algorithms.impl import AgreementImpl
         members = list(AgreementImpl)
         assert len(members) == 3
+
+
+class TestAuthorityAccumulateLeaderAbstains:
+    """Regression coverage for BUGS.md P4 (POA finalize with absent leader).
+
+    Before the 2026-05-11 fix, AgreementByAuthority._accumulate_votes called
+    dict(votes)[leader] unconditionally — when the highest-ranked voter
+    had not actually cast a vote (network drop, slow peer, etc.), Python
+    raised KeyError. The C side handled the same case by falling through
+    to return False ("no leader vote → not approved"). The asymmetry was
+    surfaced by the agreement/poa-leader-abstains conformance scenario.
+    """
+
+    def _build_protocol(self, voter_ranks):
+        """Construct a minimal AgreementByAuthority-style protocol via
+        ConcreteAgreementProtocol-style subclassing of authority.
+
+        Avoids the full Identity/PyNaCl stack — just enough plumbing to
+        invoke _accumulate_votes directly.
+        """
+        from autonomous_trust.core.algorithms.authority import AgreementByAuthority
+
+        class _Probe(AgreementByAuthority):
+            def _pre_verify(self, blob, proof, sig):
+                return True
+
+        voters = []
+        for idx, rank in enumerate(voter_ranks):
+            voters.append(ConcreteVoter(uuid4(), rank))
+        if not voters:
+            raise ValueError("need at least one voter")
+        return _Probe(voters[0], voters[1:], threshold_rank=0)
+
+    def test_leader_abstain_returns_false(self):
+        # voters: ranks 5 (leader, absent) and 0 (present).
+        proto = self._build_protocol([5, 0])
+        # _accumulate_votes receives the list returned by _count_vote
+        # across all (proof, voter) pairs. authority's _count_vote
+        # returns (rank, approval). Only rank=0 voted here:
+        result = proto._accumulate_votes([(0, True)])
+        assert result is False, (
+            "leader (rank 5) didn't vote → finalize must return False, "
+            "not raise KeyError"
+        )
+
+    def test_no_votes_returns_false(self):
+        # Pathological: no voter cast anything. Same expectation.
+        proto = self._build_protocol([5, 0])
+        assert proto._accumulate_votes([]) is False
+
+    def test_leader_present_decides(self):
+        # Sanity: when the leader DID vote, their verdict still drives
+        # the outcome (the fix mustn't have weakened the leader-decides
+        # semantics).
+        proto = self._build_protocol([5, 0])
+        assert proto._accumulate_votes([(5, True), (0, False)]) is True
+        assert proto._accumulate_votes([(5, False), (0, True)]) is False
