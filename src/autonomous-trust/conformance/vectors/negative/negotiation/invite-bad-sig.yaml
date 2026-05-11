@@ -1,0 +1,22 @@
+schema_version: "1"
+kind: negative
+protocol: negotiation
+name: invite-bad-sig
+description: |
+    First cross-protocol negative case: flip one byte of the signature
+    field on alice's negotiation `invitation` message. Confirms that the
+    shared `run_wire_negative` framework correctly dispatches when the
+    base scenario lives outside the identity protocol — the wire envelope
+    format is the same across protocols, so the same mutation engine
+    applies.
+
+based_on: scenarios/negotiation/invite-accept.yaml
+
+mutation:
+  step_id: 1
+  op: flip_byte
+  target: signature
+  index: 0
+
+expected:
+  reason_class: signature_verification_failed

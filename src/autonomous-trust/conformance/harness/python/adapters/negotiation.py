@@ -176,8 +176,15 @@ class NegotiationAdapter:
     def run_crypto_vector(self, case: Case) -> None:  # noqa: ARG002
         raise NotImplementedError('negotiation does not own crypto vectors')
 
-    def run_negative(self, case: Case) -> None:  # noqa: ARG002
-        raise NotImplementedError('negotiation negative kind not implemented')
+    def run_negative(self, case: Case) -> None:
+        from ...common.negative_runner import run_wire_negative
+        expected = case.data['expected']['reason_class']
+        observed = run_wire_negative(self.corpus_root, case)
+        if observed != expected:
+            raise AssertionError(
+                f'reason_class mismatch: expected {expected!r}, '
+                f'observed {observed!r}'
+            )
 
     # ------------------------------------------------------------------
     # Participant construction

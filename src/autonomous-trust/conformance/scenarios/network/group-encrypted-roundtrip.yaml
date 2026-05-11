@@ -1,0 +1,58 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: group-encrypted-roundtrip
+byte_pinning: false
+description: |
+    Group-encrypted broadcast round-trip. Two participants share a single
+    group keypair (deterministic seed). A signs and serializes a Message,
+    encrypts the wire bytes with the group's `Box(group_private,
+    group_public)` shared-secret form, and B decrypts with its own copy of
+    the group keypair. The scenario asserts that the parsed Message
+    carries the expected (process, function, verified) tuple.
+
+    Production-code path exercised:
+      Python: Group.encrypt(bytes(msg), self.group) → group_member.decrypt(...)
+              + Message.parse with sender=A (verify against A's pub).
+      C:      group_encrypt(g, &in, g, nonce, cipher) → group_decrypt(...)
+              + net_message_from_wire(plain, plain_len, A_pub).
+
+    Distinct from `peer-encrypted-roundtrip`: that case uses per-peer
+    Box(A_priv, B_pub) keying; this case uses shared-group keying where
+    every group member has the same private/public pair. Box framing
+    still differs between Python (PyNaCl prefixes the nonce) and C
+    (libsodium accepts a separate nonce arg), so byte_pinning stays off.
+
+participants:
+  - id: a
+    role: sender
+  - id: b
+    role: receiver
+
+fixtures:
+  # Caller-supplied per-message nonce (24 bytes). Same nonce on encrypt and
+  # decrypt — Group encryption uses crypto_box semantics.
+  nonce_hex: "0x101112131415161718191a1b1c1d1e1f2021222324252627"
+  # Group keypair seed (64 hex chars = 32 raw bytes), used on both sides so
+  # the keypair is byte-identical across A's and B's local Group instances.
+  group_encryptor_seed_hex: "67c6697351ff4aec29cdbaabf2fbe3467cc254f81be8e78d765a2e63339fc99a"
+  # Same payload shape as peer-encrypted-roundtrip; testing the envelope,
+  # not the body contents.
+  obj_json: "{}"
+
+steps:
+  - id: 1
+    from: a
+    to: b
+    function: request_access
+    description: |
+        A signs the request_access Message with its own identity key,
+        wraps the wire bytes in group-encryption, B decrypts with its
+        copy of the group keypair, re-parses, and the adapter captures
+        the parsed-Message observables for expected_state.
+
+expected_state:
+  b:
+    routed_process: identity
+    routed_function: request_access
+    verified: true
