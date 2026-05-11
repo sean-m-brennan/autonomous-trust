@@ -173,3 +173,62 @@ def test_verify_digest_starts_with_prefix_but_wrong_hash():
     result = ew.verify(blob, proof, b'sig')
     assert result is True
     assert blob not in ew._approved
+
+
+class TestProveStoresNonce:
+    """Regression coverage for BUGS.md P5 (AgreementByWork.prove dropped the nonce).
+
+    Before the 2026-05-11 fix, `prove()` returned `AgreementProof(...,
+    nonce=None)` even when its inner loop incremented the nonce to find
+    a valid hash. `verify()` then re-hashed against the no-nonce form
+    and rejected the freshly-mined proof in every loop case — POW
+    end-to-end (prove → verify → finalize) silently failed unless the
+    no-nonce hash already met DIFFICULTY (~1/256 of blobs at
+    DIFFICULTY=2). C's `agreement_prove` had always stored the nonce
+    correctly. Asymmetry surfaced by
+    `agreement/pow-mined-proof-finalizes-true`.
+    """
+
+    def _force_loop_blob(self):
+        # Build a blob whose no-nonce hash deliberately does NOT start
+        # with b'00', so prove() must enter the increment loop. Uses
+        # SimpleBlob and a fixed uuid until we find one that requires
+        # mining (deterministic).
+        from uuid import UUID
+        # The exact UUID doesn't matter as long as the no-nonce hash
+        # doesn't start with b'00'. Iterate counter-style UUIDs.
+        for i in range(256):
+            b = SimpleBlob()
+            b.uuid = UUID(int=i + 1)
+            if not b.get_hash().startswith(b'00'):
+                return b
+        raise AssertionError(
+            "couldn't find a SimpleBlob whose no-nonce hash needs mining"
+        )
+
+    def test_prove_loop_path_produces_verifiable_proof(self):
+        me = _mock_voter()
+        ew = EasyWork(me, [])
+        ew.DIFFICULTY = 2
+        blob = self._force_loop_blob()
+        proof = ew.prove(blob)
+        # The proof carries a non-None nonce because prove looped.
+        assert proof.nonce is not None, (
+            "prove() must record the nonce when mining iterates "
+            "beyond the no-nonce baseline"
+        )
+        # And verify must accept it — this is the regression.
+        ew.verify(blob, proof, b'sig')
+        assert blob in ew._approved
+
+    def test_prove_no_loop_path_keeps_nonce_none(self):
+        # DIFFICULTY=0 means the no-nonce hash matches trivially.
+        # In that case prove() returns nonce=None, and verify recomputes
+        # blob.get_hash(None) → match → approved.
+        me = _mock_voter()
+        ew = EasyWork(me, [])  # DIFFICULTY = 0
+        blob = SimpleBlob()
+        proof = ew.prove(blob)
+        assert proof.nonce is None
+        ew.verify(blob, proof, b'sig')
+        assert blob in ew._approved

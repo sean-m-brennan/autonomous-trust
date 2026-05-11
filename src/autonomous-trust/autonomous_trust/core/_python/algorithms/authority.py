@@ -44,5 +44,14 @@ class AgreementByAuthority(AgreementProtocol, ABC):
         return voter.rank, False
 
     def _accumulate_votes(self, votes):
-        leader = max([voter.rank for voter in self.voters])
-        return dict(votes)[leader]
+        # POA semantics: the highest-ranked voter's verdict decides. If the
+        # leader didn't actually cast a vote, there's no entry for their
+        # rank in the tally — treat that as "consensus not reached, not
+        # approved". The C side's _authority_accumulate has the same
+        # behavior; previously this path raised KeyError, which surfaced
+        # as a cross-language asymmetry in the
+        # agreement/poa-leader-abstains conformance scenario.
+        if not self.voters:
+            return False
+        leader = max(voter.rank for voter in self.voters)
+        return dict(votes).get(leader, False)

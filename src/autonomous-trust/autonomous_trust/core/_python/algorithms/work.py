@@ -31,16 +31,29 @@ class AgreementByWork(AgreementProtocol, ABC):
         self._approved = []
 
     def prove(self, blob):
-        nonce = 0
-        computed_hash = blob.get_hash()
         # WARNING: this is *designed* to take some time
+        nonce_used = None
+        computed_hash = blob.get_hash()
         try:
-            while not computed_hash.startswith(b'0' * self.DIFFICULTY):
-                nonce += 1
-                computed_hash = blob.get_hash(str(nonce).encode(encoding))
+            if not computed_hash.startswith(b'0' * self.DIFFICULTY):
+                nonce = 0
+                while True:
+                    nonce += 1
+                    nonce_bytes = str(nonce).encode(encoding)
+                    computed_hash = blob.get_hash(nonce_bytes)
+                    if computed_hash.startswith(b'0' * self.DIFFICULTY):
+                        nonce_used = nonce_bytes
+                        break
         except MemoryError:
             pass
-        return AgreementProof(self.myself.uuid, computed_hash, True)
+        # Store the nonce in the proof so verify() can recompute the same
+        # hash. Without this, any mined proof that needed >0 iterations
+        # would re-hash against the no-nonce form in verify and be
+        # rejected — see BUGS.md P5 (FIXED 2026-05-11). When the no-nonce
+        # hash already met the difficulty, nonce_used stays None and
+        # verify naturally re-hashes with no nonce, matching.
+        return AgreementProof(self.myself.uuid, computed_hash, True,
+                              nonce=nonce_used)
 
     def verify(self, blob, proof, sig):
         self._pre_verify(blob, proof, sig)
