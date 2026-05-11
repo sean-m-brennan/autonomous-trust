@@ -1,0 +1,77 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pos-tie-breaker-edge
+byte_pinning: false
+description: |
+    Fifth agreement state-machine scenario: POS stake-weighted decision
+    boundary. When the aggregate yea-stake exactly equals the aggregate
+    nay-stake, finalize must return false (the rule is strict `yea >
+    nay`, not `>=`). Pair the tied blob with a non-tied blob in the same
+    protocol instance to confirm the boundary check doesn't bleed into
+    other blobs' tallies.
+
+    Distinct from `agreement-pos-tie-rejects` (the single-blob vector):
+    this scenario interleaves a clear-win blob with a tied blob and
+    asserts both finalize outcomes from the same AgreementProtocol
+    instance.
+
+    Per-blob terminal vote totals:
+      blob-tie:   yea = alice(5),  nay = bob(5)   →  5 == 5  → false (strict >)
+      blob-clear: yea = alice(5),  nay = (none)   →  5 >  0  → true
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+  - id: carol
+    role: voter
+
+fixtures:
+  impl: stake
+  stakes:
+    alice: 5
+    bob: 5
+    carol: 0
+  myself: carol
+  blobs:
+    blob-tie:
+      originator: alice
+      payload: "tie-payload"
+    blob-clear:
+      originator: bob
+      payload: "clear-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-tie
+      approval: true
+    description: alice (stake 5) approves blob-tie.
+  - id: 2
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-tie
+      approval: false
+    description: bob (stake 5) rejects blob-tie → ties at 5/5.
+  - id: 3
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-clear
+      approval: true
+    description: alice (stake 5) approves blob-clear. No opposing vote → 5 > 0.
+
+expected_state:
+  agreement:
+    blob-tie:
+      outcome: false
+    blob-clear:
+      outcome: true
