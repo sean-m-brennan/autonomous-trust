@@ -1,0 +1,39 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: chain-outdated-notification
+byte_pinning: false
+description: |
+    Exercises the `update needed` (ReputationProtocol.outdated)
+    handler — the path a peer takes when notified that its
+    reputation history is shorter than a peer's. handle_outdated
+    reads the requested length, slices `self.history.era(index)`,
+    and emits a `latest update` (ReputationProtocol.update)
+    message carrying the chain slice back to the sender.
+
+    Cross-language note: Python's adapter builds the inbound as
+    `str(length)` (raw decimal string); C's adapter builds an
+    empty JSON object `{}`. Both handlers may treat a missing/zero
+    length similarly (return empty chain) — the conformance value
+    here is no-crash equivalence on the handler entry point. A
+    deeper assertion (e.g. observable chain forwarded to sender)
+    would require expected_state coverage that neither adapter
+    currently exposes.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: holder
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: update needed
+    payload:
+      length: 0
+    description: |
+        alice notifies bob its history is short (length=0). bob's
+        handle_outdated slices history.era(0) and emits a `latest
+        update` back to alice with the chain.

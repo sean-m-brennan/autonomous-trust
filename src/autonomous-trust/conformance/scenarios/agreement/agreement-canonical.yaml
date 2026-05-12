@@ -1,0 +1,59 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: agreement-canonical
+byte_pinning: false
+description: |
+    Documentation canonical for the Agreement protocol — picked up
+    by `scripts/build-docs.sh` via the `<protocol>-canonical.yaml`
+    convention and rendered into `doc/architecture/_generated/`.
+    Distinct from the existing agreement happy paths
+    (`multi-blob-poa-leader-decides` is multi-blob; `poa-leader-
+    abstains` is an edge case) — this is the simplest possible
+    single-blob POA flow.
+
+    Flow: alice is the POA leader (rank 5, above threshold). She
+    votes approve on blob-x (originated by bob, so finalize does
+    not short-circuit on `myself == originator`). With POA semantics
+    the leader's verdict decides — finalize returns true.
+
+    Adapter contract is identical to other agreement scenarios:
+    walks `steps[]` directly (no scenario_engine inbox/outbox),
+    signs an AgreementProof with the named voter's Identity and
+    calls protocol.verify() per step, then asserts
+    expected_state.agreement.<blob>.outcome after the last vote.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: authority
+  threshold_rank: 0
+  ranks:
+    alice: 5
+    bob: 0
+  myself: alice
+  blobs:
+    blob-x:
+      originator: bob
+      payload: "canonical-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        Leader (alice, rank 5) approves blob-x originated by bob.
+        Under POA the leader's verdict decides → outcome true.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: true

@@ -277,7 +277,8 @@ class NetworkAdapter:
         # obj_json); additional scenarios that exercise the same Box
         # round-trip with different inputs route to the same method.
         if case.name in ('peer-encrypted-roundtrip',
-                         'peer-encrypted-structured-payload'):
+                         'peer-encrypted-structured-payload',
+                         'network-canonical'):
             self._run_peer_encrypted_roundtrip(case)
             return
         if case.name == 'group-encrypted-roundtrip':

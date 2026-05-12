@@ -107,6 +107,21 @@ class _Participant:
                         f'{self.id}: expected peer uuid {expected} in peer list, '
                         f'got {sorted(actual_uuids)}'
                     )
+            elif key == 'peer_caps_count':
+                # Number of caps registered in self.peer_capabilities for
+                # any OTHER participant's uuid. With per-cap dedup in
+                # handle_caps_response, the count reflects unique caps
+                # registered across all responders. C's accessor sums
+                # over all non-self uuids in id_state.peer_caps_map, so
+                # the assertion is symmetric.
+                pcap = self.process.peer_capabilities
+                count = 0
+                for cap_name, uuid_list in pcap.items():
+                    count += len(uuid_list)
+                if count != expected:
+                    raise AssertionError(
+                        f'{self.id}: peer_caps_count={count}, expected {expected}'
+                    )
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
 
@@ -278,6 +293,15 @@ class IdentityAdapter:
             if amnesia_known and pid in existing_pids and newcomer_pid is not None:
                 peers.add(identities[newcomer_pid])
             participant = self._build_one(pid, role, identity, peers, group)
+            # Install own-capability allowlist from fixtures.capabilities;
+            # mirrors the C adapter's `identity_set_own_capabilities`
+            # plumbing. handle_caps_query reads
+            # `self.capabilities.to_list()` and emits it as a JSON-array
+            # caps_response payload.
+            cap_fix: dict[str, list[str]] = fixtures.get('capabilities', {}) or {}
+            for cap_name in cap_fix.get(pid, []):
+                participant.process.protocol.capabilities.register_ability(
+                    cap_name, None, [], {})
             handles[pid] = ParticipantHandle(
                 id=pid, role=role, impl=participant,
                 dispatch=lambda msg, p=participant: self._dispatch(p, msg),
@@ -428,6 +452,29 @@ class IdentityAdapter:
             grp = sender.process.group
             steps = sender.process._history.recite() if grp else []
             obj = to_json_string((grp, steps))
+        elif function == IdentityProtocol.vote:
+            # `count_vote` expects `(blob, proof, (msg, sig))`. The
+            # production wire flow is consistent — `Identity.sign`
+            # and `Identity.verify` both use HexEncoder, and the
+            # JSON encoder round-trips bytes via base64 — so the
+            # on-wire path works correctly. Here we deliver the tuple
+            # in-memory; `Identity.verify` calls NaCl with HexEncoder
+            # which decodes the bytes as hex, so the SignedMessage
+            # input must be hex-ASCII. 128 '0' chars decodes to 64
+            # zero bytes (correct NaCl sig length, corrupt content),
+            # so `verify` raises BadSignatureError, caught by
+            # count_vote.
+            obj = ({}, '', (b'', b'0' * 128))
+        elif function == IdentityProtocol.caps_query:
+            # Python's handle_caps_query reads no payload — it just emits
+            # a caps_response back. Send an empty string so message.obj
+            # is something parseable but unused.
+            obj = ''
+        elif function == IdentityProtocol.caps_response:
+            # handle_caps_response parses `from_json_string(message.obj)`
+            # as a list of capability names. Build that native form.
+            caps_list = payload.get('caps', []) if isinstance(payload, dict) else []
+            obj = to_json_string(caps_list)
         else:
             obj = to_json_string(payload)
 

@@ -41,3 +41,7 @@ dependencies:
   - testcontainers
   - jsonschema
   - ruamel.yaml
+  - playwright
+  - pyee
+  - pip:
+      - mermaid-cli
