@@ -396,10 +396,23 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_reputation_request(self, _, message):
         if message.function == ReputationProtocol.rep_req:
+            # Accept both wire forms (BUGS.md §P9B):
+            #   object: {peer_uuid, requesting_process}  — canonical, matches C
+            #   tuple : (peer_uuid_str, req_proc_str)    — legacy
             if isinstance(message.obj, str):
-                ident, req_proc = from_json_string(message.obj)
+                parsed = from_json_string(message.obj)
             else:
-                ident, req_proc = message.obj
+                parsed = message.obj
+            if isinstance(parsed, dict):
+                ident = parsed.get('peer_uuid')
+                req_proc = parsed.get('requesting_process')
+            elif isinstance(parsed, (list, tuple)) and len(parsed) >= 2:
+                ident, req_proc = parsed[0], parsed[1]
+            else:
+                self.logger.error(
+                    'handle_reputation_request: unsupported payload shape %r'
+                    % type(parsed).__name__)
+                return True
             requestor = message.from_whom
             # Tag the requestor type so we can correlate
             # rep.handle_req with rep.compute and rep.forward.

@@ -1,0 +1,47 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-key-update
+byte_pinning: false
+description: |
+    Exercises the `group_key_update` (IdentityProtocol.update)
+    handler — the path a peer takes when a co-member of its
+    group broadcasts a new group object (typically a key
+    rotation or membership change). handle_group_update
+    compares the incoming group's uuid + addresses-length
+    against the local group and adopts the larger membership;
+    same-uuid + smaller-or-equal is a quiet no-op; different
+    uuids are tie-broken deterministically by uuid string
+    ordering.
+
+    Pins the BUGS.md §P11 fix: handle_group_update now parses
+    string-form payloads via Configuration.from_string (mirrors
+    handle_confirm_peer's pattern) so a serialized group on the
+    wire decodes cleanly. Without the fix, accessing
+    `theirs.uuid` raised AttributeError.
+
+    Cross-language value: both Python and C must accept the
+    serialized group from the sender's process.group, parse it,
+    and adopt/reject deterministically. The adapter fixtures
+    pre-populate both participants with a Group; the sender's
+    group is what flows over the wire to the receiver. With
+    same-uuid + same-addresses on both sides, the receiver
+    no-ops (deterministic across languages).
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: peer_a
+    role: group_member
+
+steps:
+  - id: 1
+    from: bg
+    to: peer_a
+    function: group_key_update
+    payload: {}
+    description: |
+        bg broadcasts its current group to peer_a.
+        peer_a's handle_group_update parses the serialized
+        payload, compares against its own group (same uuid in
+        the adapter's shared-group fixture), and no-ops.

@@ -423,6 +423,34 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     {
         body = json_object();  /* empty payload */
     }
+    else if (strcmp(function, REP_PROTO_REP_REQ) == 0)
+    {
+        /* C's `handle_rep_request` expects a `{peer_uuid,
+         * requesting_process}` object; Python's `handle_reputation_request`
+         * expects a `(ident, req_proc)` JSON list. See BUGS.md §P9 for
+         * the wire-format divergence. Each adapter builds its language's
+         * native form here so both handlers exercise without crashing. */
+        const char *target_pid = from_id;
+        const char *req_proc = "negotiation";
+        if (payload && json_is_object(payload))
+        {
+            json_t *t = json_object_get(payload, "target");
+            if (json_is_string(t)) target_pid = json_string_value(t);
+            json_t *p = json_object_get(payload, "proc");
+            if (json_is_string(p)) req_proc = json_string_value(p);
+        }
+        char target_uuid[UUID_STRING_LEN + 1] = {0};
+        sce_participant_t *target = sce_find_participant(ctx, target_pid);
+        if (target != NULL)
+        {
+            rp_impl_t *t_impl = (rp_impl_t *)target->impl;
+            if (t_impl && t_impl->pub)
+                uuid_unparse_lower(t_impl->pub->uuid, target_uuid);
+        }
+        body = json_object();
+        json_object_set_new(body, "peer_uuid", json_string(target_uuid));
+        json_object_set_new(body, "requesting_process", json_string(req_proc));
+    }
     else
     {
         snprintf(ctx->err, sizeof(ctx->err),

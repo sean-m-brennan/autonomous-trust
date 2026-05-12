@@ -1,0 +1,65 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: vote-on-peer-multi-bg
+byte_pinning: false
+description: |
+    Exercises the `vote_on_peer` (IdentityProtocol.vote) handler
+    — the path a border guard takes when receiving a vote from
+    another border guard about a candidate peer's admission.
+    handle_count_vote (Python) / handle_count_vote (C) tally
+    the votes and, on majority, trigger _peer_accepted.
+
+    Multi-BG topology required: a single-BG scenario can't
+    deliver `vote_on_peer` because it would have to vote on
+    itself. This scenario uses two BGs (alice, bob) plus a
+    newcomer candidate. alice sends a vote to bob; bob's
+    handle_count_vote runs.
+
+    Cross-language payload-shape divergence (by design, not a
+    bug):
+      - Python: `(blob, proof, (msg_bytes, sig_bytes))` tuple,
+        in-memory in the adapter. `Identity.sign` and
+        `Identity.verify` both use HexEncoder, and the JSON
+        encoder round-trips bytes via base64, so the on-wire
+        path works correctly in production. For dispatch
+        coverage we deliver a 128-char hex sig that decodes to
+        64 zero bytes — proper NaCl sig length, corrupt
+        content — so `from_whom.verify` raises BadSignatureError
+        (caught by count_vote).
+      - C: `{uuid, approved}` JSON object keyed off the
+        candidate's uuid. handle_count_vote calls
+        `vote_collection_increment(uuid_key)` and (because
+        bob's num_peers is 0 in this fixture, MAJORITY(0) == 1)
+        crosses majority on this single vote, triggering
+        _peer_accepted in C synchronous_dispatch.
+
+    Cross-language conformance value: dispatch-path coverage on
+    both languages. Each side runs handle_count_vote without
+    exception. The state changes diverge (Python no-ops at the
+    verify step; C may proceed to _peer_accepted) — orthogonal
+    to drift closure.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: vote_on_peer
+    payload:
+      candidate: newcomer
+      approved: true
+    description: |
+        alice (BG) emits a vote for newcomer's admission to bob
+        (BG). Python's count_vote unpacks the in-memory
+        `(blob, proof, (msg, sig))` tuple and runs through the
+        BadSignatureError-catch path. C's handle_count_vote
+        parses `{uuid, approved}` and increments the vote
+        collection for newcomer.
