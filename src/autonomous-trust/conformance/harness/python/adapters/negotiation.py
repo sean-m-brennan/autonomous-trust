@@ -125,10 +125,10 @@ class _Participant:
             elif key == 'flood_count':
                 # `expected` is {task: <slug>, count: <int>}. Derive the
                 # same task uuid `_build_inbound` mints from the slug and
-                # read `proposed_tasks[uuid].count` — the per-task flood
-                # counter `handle_invite` increments on each observed
-                # invite. Mirrors the C accessor
-                # `negotiation_get_task_flood_count` which reads the
+                # read `flood_counts[uuid]` — the per-task flood counter
+                # `handle_invite` increments on each observed invite.
+                # Mirrors the C accessor
+                # `negotiation_get_task_flood_count`, which reads the
                 # symmetric "flood:<uuid>" key from `proposed_tasks`.
                 if not isinstance(expected, dict):
                     raise AssertionError(
@@ -143,8 +143,7 @@ class _Participant:
                         f'count=<int>, got {expected!r}'
                     )
                 want_uuid = uuid5(_NS, f'task:{slug}')
-                counter = self.process.proposed_tasks.get(want_uuid)
-                got = counter.count if counter is not None else 0
+                got = self.process.flood_counts.get(want_uuid, 0)
                 if got != want:
                     raise AssertionError(
                         f'{self.id}: flood_count for slug {slug!r} '
