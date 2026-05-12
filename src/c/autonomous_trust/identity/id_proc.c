@@ -53,6 +53,8 @@ static char ID_PROPOSE[]     = "propose_peer";
 static char ID_VOTE[]        = "vote_on_peer";
 static char ID_CONFIRM[]     = "peer_accepted";
 static char ID_UPDATE[]      = "group_key_update";
+static char ID_CAPS_QUERY[]  = "peer_caps_query";
+static char ID_CAPS_RESPONSE[] = "peer_caps_response";
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -73,6 +75,16 @@ static struct {
      * as a single broadcast (zero-to_whom) instead of per-peer fanout
      * so that bg-only scenarios still see one outbound for each. */
     bool synchronous_dispatch;
+    /* Test-installed per-process own-capability allowlist used by
+     * handle_caps_query to populate its outgoing caps_response payload.
+     * Keyed by process_t* (formatted "%p"); values are array_t* of
+     * heap-dup'd capability-name strings. Mirrors neg_state.own_caps_by_proc.
+     * Production code MUST NOT touch this. */
+    map_t own_caps_by_proc;
+    /* Peer capabilities recorded by handle_caps_response. Keyed by
+     * lowercased uuid string; values are array_t* of cap-name strings.
+     * Conformance assertion surface via identity_get_peer_caps_count. */
+    map_t peer_caps_map;
 } id_state;
 
 static void _ensure_id_init(void)
@@ -82,10 +94,86 @@ static void _ensure_id_init(void)
         array_init(&id_state.histories);
         map_init(&id_state.peer_potentials);
         map_init(&id_state.vote_collection);
+        map_init(&id_state.own_caps_by_proc);
+        map_init(&id_state.peer_caps_map);
         id_state.choosing_group = false;
         pthread_mutex_init(&id_state.lock, NULL);
         id_state.initialized = true;
     }
+}
+
+static void _id_proc_key(const process_t *proc, char *out, size_t n)
+{
+    snprintf(out, n, "%p", (const void *)proc);
+}
+
+/* Look up the test-installed own-caps array for a process. Returns the
+ * array_t* of heap-dup'd cap-name strings, or NULL if no override is
+ * installed. Caller does NOT hold id_state.lock; this function acquires
+ * it for the lookup and releases before returning the pointer. The
+ * array contents are stable for the lifetime of the install (the test
+ * harness owns lifecycle). */
+static array_t *_id_own_caps_for(const process_t *proc)
+{
+    if (proc == NULL) return NULL;
+    char key[32]; _id_proc_key(proc, key, sizeof(key));
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    array_t *arr = NULL;
+    if (map_get(&id_state.own_caps_by_proc, key, &dat) == 0 && dat != NULL)
+        data_object_ptr(dat, (ptr_t *)&arr);
+    pthread_mutex_unlock(&id_state.lock);
+    return arr;
+}
+
+void identity_set_own_capabilities(const process_t *proc,
+                                   const char *const *cap_names,
+                                   size_t n_caps)
+{
+    _ensure_id_init();
+    char key[32]; _id_proc_key(proc, key, sizeof(key));
+    pthread_mutex_lock(&id_state.lock);
+    if (cap_names == NULL || n_caps == 0)
+    {
+        map_remove(&id_state.own_caps_by_proc, key);
+        pthread_mutex_unlock(&id_state.lock);
+        return;
+    }
+    array_t *arr = NULL;
+    if (array_create(&arr) != 0 || arr == NULL)
+    {
+        pthread_mutex_unlock(&id_state.lock);
+        return;
+    }
+    for (size_t i = 0; i < n_caps; i++)
+    {
+        if (cap_names[i] == NULL) continue;
+        size_t len = strlen(cap_names[i]);
+        char *dup = smrt_create(len + 1);
+        if (dup == NULL) continue;
+        memcpy(dup, cap_names[i], len + 1);
+        data_t *str_dat = string_data(dup, len + 1);
+        if (str_dat == NULL) { smrt_deref(dup); continue; }
+        array_append(arr, str_dat);
+    }
+    data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
+    map_set(&id_state.own_caps_by_proc, key, arr_dat);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+int identity_get_peer_caps_count(const uuid_t uuid)
+{
+    if (!id_state.initialized) return 0;
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(uuid, uuid_str);
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    array_t *arr = NULL;
+    if (map_get(&id_state.peer_caps_map, uuid_str, &dat) == 0 && dat != NULL)
+        data_object_ptr(dat, (ptr_t *)&arr);
+    int n = (arr != NULL) ? (int)array_size(arr) : 0;
+    pthread_mutex_unlock(&id_state.lock);
+    return n;
 }
 
 /****************************
@@ -914,6 +1002,127 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
 }
 
 /****************************
+ * Handler: handle_caps_query (peer_caps_query)
+ *
+ * Look up the test-installed own-capability allowlist for this
+ * process and emit it as a JSON array in a caps_response back to
+ * the sender. Mirrors Python's handle_caps_query (idprocess.py:798
+ * — reads `self.capabilities.to_list()`, emits as JSON-array
+ * payload). When no allowlist is installed, emits an empty array;
+ * the receiver's handle_caps_response treats that as a no-op.
+ ****************************/
+
+/* Frama-C: skipped — JSON + messaging stubs. */
+static bool handle_caps_query(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    log_debug(proc->logger, "Identity: caps_query from %s\n",
+              nmsg->from_whom.fullname);
+
+    /* Build a JSON array of own capability names from the test-installed
+     * allowlist for this process (NULL → empty array). */
+    json_t *caps_arr = json_array();
+    array_t *own = _id_own_caps_for(proc);
+    if (own != NULL)
+    {
+        pthread_mutex_lock(&id_state.lock);
+        for (size_t i = 0; i < array_size(own); i++)
+        {
+            data_t *str_dat = NULL;
+            if (array_get(own, i, &str_dat) != 0 || str_dat == NULL) continue;
+            char *cap_name = NULL;
+            if (data_string_ptr(str_dat, &cap_name) != 0 || cap_name == NULL)
+                continue;
+            json_array_append_new(caps_arr, json_string(cap_name));
+        }
+        pthread_mutex_unlock(&id_state.lock);
+    }
+
+    generic_msg_t response = {0};
+    response.type = NET_MESSAGE;
+    strncpy(response.info.net_msg.process, "identity", PROC_NAME_LEN);
+    response.info.net_msg.function = ID_CAPS_RESPONSE;
+    response.info.net_msg.encrypt = true;
+    memcpy(&response.info.net_msg.to_whom, &nmsg->from_whom,
+           sizeof(public_identity_t));
+    strncpy(response.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    net_msg_pack_json(&response.info.net_msg, caps_arr);
+    json_decref(caps_arr);
+    messaging_send("network", NET_MESSAGE, &response, false);
+    return true;
+}
+
+/****************************
+ * Handler: handle_caps_response (peer_caps_response)
+ *
+ * Parse a JSON array of capability names and store under the sender's
+ * uuid in id_state.peer_caps_map. Mirrors Python's
+ * handle_caps_response (idprocess.py:832 — registers received caps
+ * under sender.uuid in self.peer_capabilities, with per-cap dedup;
+ * this C analog stores the full set verbatim, dedup with subsequent
+ * responses by replacement). Conformance scenarios observe via
+ * identity_get_peer_caps_count.
+ ****************************/
+
+/* Frama-C: skipped — JSON parsing + map mutation. */
+static bool handle_caps_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    log_debug(proc->logger, "Identity: caps_response from %s\n",
+              nmsg->from_whom.fullname);
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_warn(proc->logger,
+                 "Identity: handle_caps_response: no JSON payload\n");
+        return true;
+    }
+    if (!json_is_array(payload))
+    {
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Identity: handle_caps_response: payload not a JSON array\n");
+        return true;
+    }
+
+    array_t *arr = NULL;
+    if (array_create(&arr) != 0 || arr == NULL)
+    {
+        json_decref(payload);
+        return true;
+    }
+    size_t n = json_array_size(payload);
+    for (size_t i = 0; i < n; i++)
+    {
+        const char *name = json_string_value(json_array_get(payload, i));
+        if (name == NULL) continue;
+        size_t len = strlen(name);
+        char *dup = smrt_create(len + 1);
+        if (dup == NULL) continue;
+        memcpy(dup, name, len + 1);
+        data_t *str_dat = string_data(dup, len + 1);
+        if (str_dat == NULL) { smrt_deref(dup); continue; }
+        array_append(arr, str_dat);
+    }
+    json_decref(payload);
+
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, uuid_str);
+    data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.peer_caps_map, uuid_str, arr_dat);
+    pthread_mutex_unlock(&id_state.lock);
+
+    log_debug(proc->logger,
+              "Identity: registered %zu cap(s) for peer %s\n",
+              array_size(arr), uuid_str);
+    return true;
+}
+
+/****************************
  * Pre-loop: acquire capabilities and announce
  ****************************/
 
@@ -1021,6 +1230,8 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_VOTE,     (handler_ptr_t)handle_count_vote);
     process_register_handler(proc, ID_CONFIRM,  (handler_ptr_t)handle_confirm_peer);
     process_register_handler(proc, ID_UPDATE,   (handler_ptr_t)handle_group_update);
+    process_register_handler(proc, ID_CAPS_QUERY,    (handler_ptr_t)handle_caps_query);
+    process_register_handler(proc, ID_CAPS_RESPONSE, (handler_ptr_t)handle_caps_response);
     return 0;
 }
 

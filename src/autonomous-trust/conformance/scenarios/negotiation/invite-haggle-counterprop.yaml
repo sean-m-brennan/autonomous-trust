@@ -1,0 +1,58 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-haggle-counterprop
+byte_pinning: false
+description: |
+    Exercises the `haggle` (NegotiationProtocol.response) handler.
+    handle_haggle is invoked when a peer counter-proposes against
+    a previously announced invitation: with `flexible: true` the
+    handler re-emits an `invitation` (announce) carrying the
+    counter-proposed parameters back to the original sender.
+
+    Scenario shape: alice delivers a haggle to bob directly (no
+    prior invitation step — bob's my_tasks is empty). With
+    flexible=true (the adapter default) bob's handle_haggle falls
+    through the `if task.uuid in self.my_tasks` branch and just
+    re-emits an announce to alice. The C handle_haggle takes the
+    same fall-through path (no my_tasks entry → emit announce).
+    Both sides survive without exception, exercising the handler
+    end-to-end.
+
+    Observable: handler runs without exception in both Python and
+    C. A negative observable (e.g. `task_in_stack: false`) is NOT
+    pinned here because C's neg_state is a file-static singleton
+    shared across all scenarios — state from earlier scenarios
+    (notably `invite-flood-past-threshold`, which admits 6 tasks)
+    pollutes a fresh assertion. Python doesn't have this issue
+    because each scenario builds fresh NegotiationProcess
+    instances. Fixing the C side properly requires a per-scenario
+    state reset hook; orthogonal to validating handle_haggle.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: haggle
+    payload:
+      capability: data_fetch
+      task_id: t-haggle
+      flexible: true
+    description: |
+        alice's response (haggle) to a prior invitation carries
+        a counter-proposed `when`. bob's handle_haggle re-emits
+        an invitation (announce) to alice with the same task.
+
+# No expected_state — see description above. The conformance value is
+# cross-language no-crash equivalence (Python + C both run handle_haggle
+# without exception on the same inputs).

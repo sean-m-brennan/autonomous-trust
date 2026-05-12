@@ -907,6 +907,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if message.function == IdentityProtocol.diff:
             self.logger.debug('Received history diff')
             steps = from_json_string(message.obj)  # from self.choose_group()
+            # Empty-diff guard: `_history.ingest_branch` does `steps[-1]`
+            # without a length check (BUGS.md §P10). Production code path
+            # is from `choose_group()` which never sends empty diffs, but
+            # an empty payload on the wire reaches here too. Treat empty
+            # as a no-op rather than crashing.
+            if not steps:
+                return True
             self._record_group(queues)
             name = message.from_whom.nickname
             if name in self._history.heads:
@@ -931,7 +938,18 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if message.function == IdentityProtocol.update:
             self.logger.debug('Received group update')
             group = message.obj  # from self._update_group()
+            # Wire form arrives as a serialized string; parse it back to a
+            # Group object. handle_confirm_peer (idprocess.py:742-743) does
+            # the same — handle_group_update was missing it (BUGS.md §P11).
+            # Without this guard, accessing `theirs.uuid` below raises
+            # AttributeError on any over-the-wire delivery.
+            if isinstance(group, str):
+                if not group:
+                    return True  # empty payload — no-op
+                group = Configuration.from_string(group)
             mine, theirs = self.group, group
+            if mine is None or theirs is None:
+                return True
             if mine.uuid == theirs.uuid:
                 # Same group: adopt strictly larger membership, otherwise no-op.
                 if len(theirs.addresses) > len(mine.addresses):

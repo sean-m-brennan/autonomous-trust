@@ -298,14 +298,55 @@ _PROTOCOL_CLASSES = {
     # agreement and network do not have a class-attribute message vocabulary.
 }
 
+# Process modules that register handlers against the protocol classes above.
+# Used to filter "orphan" enum entries — Protocol class attributes that have
+# no `register_handler` call pointing at them.
+_PROCESS_SOURCES = {
+    'identity': 'autonomous_trust.core._python.identity.idprocess',
+    'reputation': 'autonomous_trust.core._python.reputation.repprocess',
+    'negotiation': 'autonomous_trust.core._python.negotiation.negprocess',
+}
+
+
+def _handler_keyed_attrs(protocol: str, attr_names: set[str]) -> set[str]:
+    """Return the subset of `attr_names` actually used as `register_handler` keys.
+
+    Reads the corresponding `*process.py` source and looks for
+    `register_handler(<ProtocolClass>.<attr>, ...)` calls. Class attributes
+    that the production code never registers a handler for are orphans
+    (e.g. constants reserved for future use, or message names registered
+    on the wire but ignored by the receiver), and should not count as
+    "registered functions" for drift-check purposes.
+    """
+    qual = _PROCESS_SOURCES.get(protocol)
+    if qual is None:
+        # No process module mapped → fall back to "everything is wired".
+        return set(attr_names)
+    try:
+        module = importlib.import_module(qual)
+    except ImportError:
+        return set(attr_names)
+    source_path = Path(getattr(module, '__file__', '') or '')
+    if not source_path.is_file():
+        return set(attr_names)
+    text = source_path.read_text(encoding='utf-8')
+    proto_cls = _PROTOCOL_CLASSES[protocol].rsplit('.', 1)[1]
+    pat = re.compile(
+        rf'\bregister_handler\s*\(\s*{re.escape(proto_cls)}\.(\w+)\b'
+    )
+    used = {m.group(1) for m in pat.finditer(text)}
+    return attr_names & used
+
 
 def _registered_functions(protocol: str) -> set[str]:
     """Return the set of function-name strings the protocol class defines.
 
     Reads the class attributes of the matching `<Protocol>` subclass. Each
     public, all-lowercase, string-valued class attribute is treated as a
-    registered message function (matching the convention used by every
-    `Protocol` in the project).
+    candidate message function, then filtered to only those whose attribute
+    name appears as a `register_handler(<ProtocolClass>.<attr>, ...)` key in
+    the production process module. Orphan enum entries (no handler wired)
+    are excluded so the drift report tracks real coverage gaps only.
     """
     qual = _PROTOCOL_CLASSES.get(protocol)
     if qual is None:
@@ -313,13 +354,14 @@ def _registered_functions(protocol: str) -> set[str]:
     module_name, class_name = qual.rsplit('.', 1)
     module = importlib.import_module(module_name)
     cls = getattr(module, class_name)
-    out: set[str] = set()
+    candidate_attrs: dict[str, str] = {}
     for name, value in vars(cls).items():
         if name.startswith('_'):
             continue
         if isinstance(value, str):
-            out.add(value)
-    return out
+            candidate_attrs[name] = value
+    wired_attrs = _handler_keyed_attrs(protocol, set(candidate_attrs))
+    return {candidate_attrs[a] for a in wired_attrs}
 
 
 def _scenarios_for_protocol(protocol: str) -> list[Path]:
@@ -378,8 +420,18 @@ def _convert_with_mmdc(mermaid: str, fmt: str) -> bytes:
         src = td_path / 'in.mmd'
         dst = td_path / f'out.{fmt}'
         src.write_text(mermaid, encoding='utf-8')
-        subprocess.run(['mmdc', '-i', str(src), '-o', str(dst)],
-                       check=True, capture_output=True)
+        proc = subprocess.run(['mmdc', '-i', str(src), '-o', str(dst)],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            # Surface mmdc's actual diagnostic; the swallowed stderr is the
+            # most common reason build-docs.sh users can't tell why a render
+            # failed (sandbox issues under containerized Chromium, mermaid
+            # syntax incompatibilities, missing puppeteer config, etc.).
+            details = '\n'.join(part for part in (proc.stdout, proc.stderr) if part).strip()
+            raise RuntimeError(
+                f'mmdc exited {proc.returncode} for {fmt} render. '
+                f'Mermaid source:\n{mermaid}\nmmdc output:\n{details or "(empty)"}'
+            )
         return dst.read_bytes()
 
 

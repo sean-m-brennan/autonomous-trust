@@ -1,0 +1,37 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: chain-replay-update
+byte_pinning: false
+description: |
+    Exercises the `latest update` (ReputationProtocol.update)
+    handler — the path a peer takes when receiving a chain replay
+    from another peer. handle_update records the update under
+    `self.updates[from_whom.uuid]`; if `num_updates` peers have
+    reported, it computes the grouping of consistent chains.
+
+    Cross-language note: Python's adapter builds the inbound as
+    `to_json_string([])` (empty chain); C's adapter builds an
+    empty JSON object `{}`. Both handlers treat a missing chain
+    as the empty case — the conformance value here is no-crash
+    equivalence on the handler entry point. A deeper assertion
+    (e.g. updates dict size, grouping outcome) would require
+    expected_state coverage that neither adapter currently
+    exposes.
+
+participants:
+  - id: alice
+    role: provider
+  - id: bob
+    role: consumer
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: latest update
+    payload: {}
+    description: |
+        alice sends bob a chain replay (empty here). bob's
+        handle_update appends to self.updates and (with
+        num_updates=1 default) processes the grouping.

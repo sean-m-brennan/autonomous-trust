@@ -48,6 +48,29 @@ int identity_register_handlers(process_t *proc);
 int vote_collection_increment(const char *uuid_key);
 int vote_collection_get(const char *uuid_key, int *out_count);
 
+/** Install a per-process own-capability allowlist for the conformance
+ *  harness. `cap_names` is an array of `n_caps` C-string capability
+ *  names (e.g. "sensor_validation"). The list is dup'd and owned by
+ *  the identity state; pass cap_names=NULL or n_caps=0 to clear.
+ *
+ *  Production code MUST NOT call this — capabilities normally flow in
+ *  through the autonomous_ability fan-put. Mirrors
+ *  `negotiation_set_own_capabilities` in neg_proc_priv.h.
+ *
+ *  Consumed by handle_caps_query, which emits the list as a JSON array
+ *  in the caps_response payload (BUGS.md note 2026-05-12: was a stub;
+ *  now reads the test-installed list verbatim). */
+void identity_set_own_capabilities(const process_t *proc,
+                                   const char *const *cap_names,
+                                   size_t n_caps);
+
+/** Return the number of capabilities recorded for @p uuid in the
+ *  shared peer_capabilities map, or 0 if no entry exists. The map is
+ *  populated by handle_caps_response on inbound `peer_caps_response`
+ *  messages; conformance scenarios assert against this via the
+ *  `peer_caps_count` expected_state key. */
+int identity_get_peer_caps_count(const uuid_t uuid);
+
 /** Toggle synchronous-dispatch mode for the conformance harness.
  *
  *  When @p enabled is true, handle_welcoming_committee runs the propose +

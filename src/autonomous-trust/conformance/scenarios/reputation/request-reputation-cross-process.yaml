@@ -1,0 +1,44 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: request-reputation-cross-process
+byte_pinning: false
+description: |
+    Exercises the `request reputation` (ReputationProtocol.rep_req)
+    handler — a peer asks another peer about a third peer's
+    computed reputation. handle_reputation_request reads
+    (ident, req_proc), computes reputation for ident, and emits
+    a `reputation response` back to the requestor (Python side;
+    `rep_resp` is registered in C but unregistered on Python →
+    orphan on Python side per --check's orphan filter).
+
+    Wire format: object form, `{peer_uuid, requesting_process}`,
+    matching C's `handle_rep_request` natively (BUGS.md §P9B fix
+    landed 2026-05-12 — Python's `handle_reputation_request` now
+    accepts both the canonical object form and the legacy tuple
+    form, so both languages parse identical bytes). Both adapters
+    build the same payload here; cross-language wire interop is
+    pinned.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: charlie
+    role: subject
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: charlie
+      proc: negotiation
+    description: |
+        alice asks bob for charlie's reputation in the
+        negotiation process scope. bob's handler computes a
+        score (whatever the local history supports — zero
+        history → zero score is fine) and emits a rep_resp
+        back to alice.

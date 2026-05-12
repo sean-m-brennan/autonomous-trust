@@ -48,7 +48,12 @@
 #define REP_PROTO_ACCEPTED "tx accepted"
 #define REP_PROTO_OUTDATED "update needed"
 #define REP_PROTO_UPDATE   "latest update"
-#define REP_PROTO_REP_REQ  "reputation request"
+#define REP_PROTO_REP_REQ  "request reputation"  /* matches Python's
+                                                   * ReputationProtocol.rep_req
+                                                   * verbatim; do NOT tidy back to
+                                                   * "reputation request" — breaks
+                                                   * Python<->C interop. See
+                                                   * BUGS.md §P9. */
 #define REP_PROTO_REP_RESP "reputation response"
 #define REP_PROTO_LOCAL_QUERY  "local_rep_query"    /* Local IPC: query a peer's score */
 #define REP_PROTO_LOCAL_RESP   "local_rep_response"  /* Local IPC: reply with score */

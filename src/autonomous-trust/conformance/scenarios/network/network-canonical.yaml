@@ -1,0 +1,51 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: network-canonical
+byte_pinning: false
+description: |
+    Documentation canonical for the Network protocol — picked up
+    by `scripts/build-docs.sh` via the `<protocol>-canonical.yaml`
+    convention and rendered into `doc/architecture/_generated/`.
+    Mirrors `peer-encrypted-roundtrip` step-for-step and dispatches
+    to the same adapter runner; the duplication is intentional so
+    the docs example has a stable filename (`network-canonical`)
+    that won't move when `peer-encrypted-roundtrip` is updated.
+
+    Flow: A builds a signed identity `request_access` Message
+    addressed to B, JSON-serializes it, and encrypts the wire bytes
+    via per-peer NaCl Box against B's encryption public key. B
+    decrypts, re-parses via the production parser, and the scenario
+    asserts the parsed Message carries the correct (process,
+    function, verified) tuple. Box framing differs between Python
+    (PyNaCl prefixes the nonce to the ciphertext) and C (libsodium
+    expects a caller-supplied nonce alongside the bare ciphertext),
+    so byte_pinning is off; semantic equivalence at the parsed-
+    Message boundary is what the conformance gate checks.
+
+participants:
+  - id: a
+    role: sender
+  - id: b
+    role: receiver
+
+fixtures:
+  nonce_hex: "0x000102030405060708090a0b0c0d0e0f1011121314151617"
+  obj_json: "{}"
+
+steps:
+  - id: 1
+    from: a
+    to: b
+    function: request_access
+    description: |
+        A signs/serializes a request_access Message, encrypts the bytes
+        with the fixed nonce to B, B decrypts and re-parses. Adapter
+        captures the parsed-Message observables (process, function,
+        verified) for expected_state.
+
+expected_state:
+  b:
+    routed_process: identity
+    routed_function: request_access
+    verified: true

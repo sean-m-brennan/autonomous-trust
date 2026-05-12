@@ -1807,7 +1807,8 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     /* Network scenarios are protocol-specific; each adds a branch here
      * matching by case name. */
     if (strcmp(c->name, "peer-encrypted-roundtrip") == 0 ||
-        strcmp(c->name, "peer-encrypted-structured-payload") == 0) {
+        strcmp(c->name, "peer-encrypted-structured-payload") == 0 ||
+        strcmp(c->name, "network-canonical") == 0) {
         return run_peer_encrypted_roundtrip(c, err, err_len);
     }
     if (strcmp(c->name, "group-encrypted-roundtrip") == 0) {
