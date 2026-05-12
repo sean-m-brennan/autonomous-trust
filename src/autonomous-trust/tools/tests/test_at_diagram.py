@@ -205,18 +205,21 @@ class TestCheck:
         assert 'definitely_not_a_real_function' in report.unrecognized_functions
         assert not report.is_clean
 
-    def test_unexercised_functions_for_negotiation(self):
-        # NegotiationProtocol defines `start` ('spawn task'), 'haggle',
-        # 'report results' — the corpus's invite/status scenarios don't
-        # exercise all of them. --check should surface that.
-        path = (
-            at_diagram.CORPUS_ROOT / 'scenarios' / 'negotiation'
-            / 'invite-accept.yaml'
-        )
-        report = at_diagram.check(path)
-        # Don't pin the exact unexercised list — additions over time would
-        # break it. Just verify there is at least one entry.
-        assert len(report.unexercised_functions) >= 1
+    def test_orphan_enum_entries_excluded(self):
+        # NegotiationProtocol.task ('task info') and ReputationProtocol.rep_resp
+        # ('reputation response') are class attributes with NO
+        # register_handler call in the corresponding *process.py. The
+        # orphan-filter inside _registered_functions must exclude them so
+        # they don't surface as drift — `_handler_keyed_attrs` parses the
+        # production source for `register_handler(<Class>.<attr>, ...)`
+        # and intersects.
+        neg_funcs = at_diagram._registered_functions('negotiation')
+        rep_funcs = at_diagram._registered_functions('reputation')
+        assert 'task info' not in neg_funcs
+        assert 'reputation response' not in rep_funcs
+        # Sanity: real handlers ARE in the set.
+        assert 'spawn task' in neg_funcs
+        assert 'request reputation' in rep_funcs
 
 
 # ---------------------------------------------------------------------------

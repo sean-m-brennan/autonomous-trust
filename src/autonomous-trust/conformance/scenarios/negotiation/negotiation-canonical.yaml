@@ -1,0 +1,49 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: negotiation-canonical
+byte_pinning: false
+description: |
+    Documentation canonical for the Negotiation protocol — picked
+    up by `scripts/build-docs.sh` via the `<protocol>-canonical.yaml`
+    convention and rendered into `doc/architecture/_generated/`.
+    Mirrors `invite-accept` step-for-step; the duplication is
+    intentional so the docs example has a stable filename
+    (`negotiation-canonical`) that won't move when `invite-accept`
+    is updated, while still running through the same conformance
+    code path so the diagram cannot drift from executable behavior.
+
+    Flow: alice (requestor) invites bob (worker) to perform a
+    `data_fetch` task. bob has the capability, peer level is mid-tier,
+    and the default TaskParameters are acceptable, so `handle_invite`
+    emits an `ack` back to alice.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t1
+    description: alice asks bob to do a data_fetch.
+  - id: 2
+    from: bob
+    to: alice
+    function: ack
+    in_response_to: 1
+    payload:
+      task_id: t1
+    description: |
+        bob's handle_invite finds data_fetch in own capabilities, peer level
+        is non-zero, parameters acceptable -> ack.
