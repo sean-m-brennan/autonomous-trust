@@ -708,7 +708,32 @@ class TestHandleInviteNewTask:
         assert np.proposed_tasks[task.uuid].count == 1
 
 
-class TestHandleHaggleFullException:
+class TestHandleInviteFloodCounter:
+    """Regression for BUGS.md §P7: per-task flood counter must persist
+    across `_add_task` admissions so the `max_task_duplicates` threshold
+    is reachable. Mirrors C's structurally-separate
+    "flood:<uuid>" map entry in negotiation/neg_proc.c."""
+
+    def test_flood_counter_persists_past_threshold(self):
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        cap = Capability('video')
+        np.protocol.capabilities.register_ability('video', lambda: None)
+
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
+        task = Task(tp, peer)
+        task.to_json_string = MagicMock(return_value='yaml')
+        msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
+                      task, from_whom=peer)
+        net_q = queue.Queue()
+
+        for _ in range(np.max_task_duplicates + 1):
+            assert np.handle_invite({CfgIds.network: net_q}, msg) is True
+
+        # Counter advanced once per invite and was NOT cleared by _add_task.
+        assert np.flood_counts[task.uuid] == np.max_task_duplicates + 1
+        # Only iteration 6 trips the > threshold branch.
+        assert np.peers.demote.call_count == 1
     """Cover Full exception paths in handle_haggle (lines 167-168, 172-173)."""
 
     def test_flexible_task_full_queue(self):
