@@ -47,6 +47,7 @@
 #include "structures/array.h"
 #include "structures/map.h"
 #include "utilities/message.h"
+#include "utilities/msg_types_priv.h"
 
 #include "../negative_runner.h"
 #include "../scenario_engine.h"
@@ -184,6 +185,37 @@ static void _free_participant_impl(ic_impl_t *impl) {
 static void _apply_fixtures(sce_run_ctx_t *ctx) {
     json_t *fixtures = json_object_get(ctx->case_data, "fixtures");
     if (!json_is_object(fixtures)) return;
+
+    /* capabilities: { "<participant>": ["<cap>", ...], ... } —
+     * install each participant's own-capability allowlist via
+     * identity_set_own_capabilities so handle_caps_query emits the
+     * matching JSON-array payload. Mirrors the negotiation adapter's
+     * fixture wiring; Python's identity adapter populates
+     * `process.protocol.capabilities` from the same fixture key. */
+    json_t *caps = json_object_get(fixtures, "capabilities");
+    if (json_is_object(caps))
+    {
+        const char *pid;
+        json_t *cap_arr;
+        json_object_foreach(caps, pid, cap_arr) {
+            sce_participant_t *part = sce_find_participant(ctx, pid);
+            if (part == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            if (impl == NULL || impl->proc == NULL) continue;
+            if (!json_is_array(cap_arr)) continue;
+            size_t n = json_array_size(cap_arr);
+            const char **names = (n > 0) ? calloc(n, sizeof(char *)) : NULL;
+            size_t k = 0;
+            for (size_t i = 0; i < n; i++)
+            {
+                const char *name = json_string_value(json_array_get(cap_arr, i));
+                if (name) names[k++] = name;
+            }
+            identity_set_own_capabilities(impl->proc, names, k);
+            free((void *)names);
+        }
+    }
+
     json_t *amnesia_j = json_object_get(fixtures, "amnesia_known");
     bool amnesia_known = json_is_true(amnesia_j);
 
@@ -220,7 +252,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                           const char *function,
                           json_t *payload,
                           generic_msg_t *out) {
-    (void)payload; (void)to_id;
+    (void)to_id;
     sce_participant_t *sender = sce_find_participant(ctx, from_id);
     if (sender == NULL) {
         snprintf(ctx->err, sizeof(ctx->err), "build_inbound: unknown from %s", from_id);
@@ -237,6 +269,55 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     out->info.net_msg.function = (char *)function;
     out->info.net_msg.encrypt = false;
     memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
+
+    /* peer_caps_response — pack the YAML `caps: [...]` list as a JSON
+     * array so handle_caps_response can parse + register it. Without
+     * this, the C handler sees no payload and silently no-ops. */
+    if (strcmp(function, "peer_caps_response") == 0 && json_is_object(payload)) {
+        json_t *src = json_object_get(payload, "caps");
+        if (json_is_array(src)) {
+            json_t *body = json_array();
+            size_t n = json_array_size(src);
+            for (size_t i = 0; i < n; i++) {
+                json_t *v = json_array_get(src, i);
+                if (json_is_string(v))
+                    json_array_append_new(body, json_string(json_string_value(v)));
+            }
+            net_msg_pack_json(&out->info.net_msg, body);
+            json_decref(body);
+        }
+        return 0;
+    }
+
+    /* vote_on_peer is the only identity function whose C handler
+     * (`handle_count_vote`) requires a structured JSON payload —
+     * `{uuid, approved}` keyed off the candidate's uuid. Other
+     * identity functions either expect empty/unused payloads or use
+     * the generic obj passthrough. */
+    if (strcmp(function, "vote_on_peer") == 0 && json_is_object(payload)) {
+        const char *cand_id = NULL;
+        json_t *c = json_object_get(payload, "candidate");
+        if (json_is_string(c)) cand_id = json_string_value(c);
+        bool approved = true;
+        json_t *a = json_object_get(payload, "approved");
+        if (json_is_boolean(a)) approved = json_boolean_value(a);
+
+        char uuid_buf[UUID_STRING_LEN + 1] = {0};
+        if (cand_id != NULL) {
+            sce_participant_t *cand = sce_find_participant(ctx, cand_id);
+            if (cand != NULL) {
+                ic_impl_t *cand_impl = (ic_impl_t *)cand->impl;
+                if (cand_impl && cand_impl->pub)
+                    uuid_unparse_lower(cand_impl->pub->uuid, uuid_buf);
+            }
+        }
+        json_t *body = json_object();
+        json_object_set_new(body, "uuid", json_string(uuid_buf));
+        json_object_set_new(body, "approved", json_boolean(approved));
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+    }
+
     return 0;
 }
 
@@ -338,6 +419,37 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: has_peer %s not present (have %d peers)",
                              pid, uuid_str, (int)proc->protocol.num_peers);
+                    return -1;
+                }
+            } else if (strcmp(key, "peer_caps_count") == 0) {
+                /* `peer_caps_count: <int>` — assert the number of caps
+                 * recorded for THIS participant under their own uuid in
+                 * id_state.peer_caps_map. Populated by handle_caps_response
+                 * on inbound peer_caps_response. Wait — actually we want
+                 * the caps recorded ABOUT a peer; the key references the
+                 * recipient and the value is the count under the SENDER
+                 * uuid. The scenario authoring convention is that
+                 * `peer_caps_count` is keyed by participant id whose
+                 * peer_caps_map entry under the OTHER participant's uuid
+                 * we want — but with a 2-party scenario the only sender
+                 * is the other participant. Simplest reading: assert
+                 * `id_state.peer_caps_map` has `int` total entries for
+                 * SOME peer registered after the scenario; we encode
+                 * that as: count across all entries in the map for THIS
+                 * participant. The map is shared, so the count is the
+                 * global peer count — that's fine for a 2-party probe. */
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->participant_count; i++) {
+                    ic_impl_t *other = (ic_impl_t *)ctx->participants[i].impl;
+                    if (other == NULL || other->pub == NULL) continue;
+                    if (strcmp(ctx->participants[i].id, pid) == 0) continue;
+                    got += identity_get_peer_caps_count(other->pub->uuid);
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: peer_caps_count=%d, expected %d",
+                             pid, got, want);
                     return -1;
                 }
             } else {

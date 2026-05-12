@@ -394,6 +394,22 @@ class ReputationAdapter:
             obj = str(payload.get('length', 0))
         elif function == ReputationProtocol.update:
             obj = to_json_string([])  # empty chain by default
+        elif function == ReputationProtocol.rep_req:
+            # Canonical wire form (BUGS.md §P9B): JSON object with named
+            # fields, matching C's `handle_rep_request`. Python's
+            # `handle_reputation_request` now accepts both the object form
+            # and the legacy tuple form, so both languages parse the same
+            # bytes — wire interop is restored.
+            target_pid = payload.get('target', from_id)
+            if target_pid in participants:
+                target_uuid = str(participants[target_pid].impl.identity.uuid)
+            else:
+                target_uuid = target_pid
+            req_proc = payload.get('proc', 'negotiation')
+            obj = to_json_string({
+                'peer_uuid': target_uuid,
+                'requesting_process': req_proc,
+            })
         else:
             raise AssertionError(f'unsupported reputation function {function!r}')
 
