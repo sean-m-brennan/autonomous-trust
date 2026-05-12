@@ -39,6 +39,13 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                          dependencies=[CfgIds.network, CfgIds.identity], **kwargs)
         self.task_stack = JobQueue()
         self.proposed_tasks = {}  # TaskCounters for local tasks remotely requested
+        # Persistent per-task flood counter. Kept separate from
+        # `proposed_tasks` because `_add_task` clears the latter on every
+        # successful admission, which would make the flood threshold
+        # unreachable in normal operation. Mirrors C's structurally
+        # separate "flood:<uuid>" key on `proposed_tasks` in
+        # negotiation/neg_proc.c — see BUGS.md §P7.
+        self.flood_counts = {}
         self.my_tasks = {}  # TaskTrackers for remote tasks I've requested
         self.confirmed = {}
         self.status_pending = []
@@ -121,7 +128,8 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             if task.uuid not in self.proposed_tasks:
                 self.proposed_tasks[task.uuid] = TaskCounter(task)
             self.proposed_tasks[task.uuid].count += 1
-            if self.proposed_tasks[task.uuid].count > self.max_task_duplicates:
+            self.flood_counts[task.uuid] = self.flood_counts.get(task.uuid, 0) + 1
+            if self.flood_counts[task.uuid] > self.max_task_duplicates:
                 self.peers.demote(message.from_whom)
             try:
                 if task.capability not in self.capabilities:

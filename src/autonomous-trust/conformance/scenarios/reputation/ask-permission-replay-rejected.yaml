@@ -60,3 +60,4 @@ steps:
 expected_state:
   bob:
     requests_count: 1
+    last_id_set: true
