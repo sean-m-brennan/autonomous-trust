@@ -15,25 +15,25 @@ source:
 
 build:
 {% if rust_ext %}
-  script: maturin build && python -m pip install ./dist/{{ name }}-{{ version }}.tar.gz --no-deps --ignore-installed -vv
+  script: maturin build && $PYTHON -m pip install ./dist/{{ name }}-{{ version }}.tar.gz --no-deps --ignore-installed -vv
 {% else %}
   noarch: python
-  script: poetry build -f wheel && python -m pip install ./dist/{{ name }}-{{ version }}-py3-none-any.whl --no-deps --ignore-installed -vv
+  script: poetry build -f wheel && $PYTHON -m pip install ./dist/{{ name }}-{{ version }}-py3-none-any.whl --no-deps --ignore-installed -vv
 {% endif %}
 
 requirements:
   build:
-    - python==3.10
+    - python==3.13
     - pip
     - poetry
     - maturin
   host:
-    - python==3.10
+    - python==3.13
     - pip
     - poetry
     - maturin
   run:
-    - python>=3.10
+    - python>=3.13
     - icontract
     - psutil
     - pynacl

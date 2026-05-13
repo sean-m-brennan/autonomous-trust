@@ -172,8 +172,128 @@ build_builder() {
     push_to_registry "package-builder" 2>/dev/null || true
 }
 
+# Run the package-builder image against each source package that has a
+# meta.yaml, producing conda artifacts under src/dist/conda-repo. The
+# Dockerfile's WORKDIR is /build and its CMD builds `.` — so we override
+# the working directory to /build/src (where the recipe is mounted). The
+# release/full/lite Docker images bind-mount the output of this step at
+# /app/dist during their builds.
+run_builder() {
+    local conda_repo="$SRC_DIR/dist/conda-repo"
+    if $FORCE && [[ -d "$conda_repo" ]]; then
+        info "--force: wiping $conda_repo"
+        rm -rf "$conda_repo"
+    fi
+    if [[ -d "$conda_repo" ]] && [[ -n "$(ls -A "$conda_repo" 2>/dev/null)" ]]; then
+        info "package-builder output exists at $conda_repo (skip); pass --force to rebuild"
+        return 0
+    fi
+    if ! docker image inspect package-builder >/dev/null 2>&1; then
+        info "package-builder image missing; building it first"
+        build_builder
+    fi
+    mkdir -p "$conda_repo"
+
+    # Source packages with a top-level meta.yaml. Discover dynamically.
+    # Then pin `autonomous-trust` to the front of the list: the other
+    # subpackages list it in their `run:` requirements, so it must exist
+    # in the local conda channel before they build (otherwise conda-build's
+    # test-env solver fails with "autonomous-trust does not exist").
+    local subpkgs=()
+    local mypath
+    for mypath in "$SRC_DIR"/*/meta.yaml; do
+        [[ -f "$mypath" ]] || continue
+        subpkgs+=("$(basename "$(dirname "$mypath")")")
+    done
+    if [[ ${#subpkgs[@]} -eq 0 ]]; then
+        warn "no meta.yaml files under $SRC_DIR; nothing to build"
+        return 0
+    fi
+    # Reorder: autonomous-trust first, everything else after.
+    local ordered=()
+    local sp
+    for sp in "${subpkgs[@]}"; do
+        [[ "$sp" == "autonomous-trust" ]] && ordered=("$sp" "${ordered[@]}") || ordered+=("$sp")
+    done
+    subpkgs=("${ordered[@]}")
+
+    # Each build sees the in-progress local channel so dependent packages
+    # find already-built siblings. Harmless for the first (autonomous-trust)
+    # since it has no AT-internal deps. Conda-build auto-indexes the
+    # output-folder after each successful build.
+    #
+    # `--no-test` skips conda-build's post-build test phase, including
+    # the test-env resolution that otherwise tries to install `run`
+    # requirements (including `autonomous-trust`) from the channel list.
+    # The test-env solver does NOT inherit the `-c file:///build/dist`
+    # channel reliably across conda-build versions, which makes
+    # `autonomous-trust` look unavailable from `-inspector`/`-services`/
+    # `-simulator` even when the package is already built and present.
+    # None of our recipes define test commands, so `--no-test` only
+    # skips env-resolution (which we don't need). Drop this flag if a
+    # recipe gains real test commands and the channel issue is fixed.
+    local extra_args='-c file:///build/dist --no-test'
+    for sp in "${subpkgs[@]}"; do
+        local src_pkg="$SRC_DIR/$sp"
+        # Sweep stale conda-build artifacts from previous (possibly failed)
+        # runs. `.conda/` is conda's per-user state dir created by `conda
+        # build` when it can't write to its base cache; if left in the
+        # mounted source dir, conda re-discovers it next run and tries to
+        # re-apply patches from packages whose extracted recipe dirs are
+        # gone — producing "no such patch:" errors. `.condarc` is the
+        # accompanying conda config that pointed at it.
+        rm -rf "$src_pkg/.conda" "$src_pkg/.condarc"
+        # Also wipe the recipe's poetry output (./dist) so re-runs don't
+        # confuse already-extracted wheels with newly-built ones.
+        rm -rf "$src_pkg/dist"
+        # Temporarily move heavy/problematic subtrees OUTSIDE the source
+        # dir entirely. node_modules has tens of thousands of files plus
+        # broken symlinks that crash `cp -a` during conda-build's
+        # _copy_top_level_recipe step. Stash must be outside the bind-
+        # mounted source — a sibling location inside the same dir still
+        # gets walked by conda-build's recipe-copy. Production runtime
+        # needs only the built wheel; node_modules is dev-time only.
+        local stash="/tmp/at-builder-stash-$$-${sp//\//_}"
+        local stashed=0
+        if [[ -d "$src_pkg/reactjs/node_modules" ]]; then
+            mv "$src_pkg/reactjs/node_modules" "$stash"
+            stashed=1
+            # Restore on any exit path (success/failure/Ctrl-C) so a stray
+            # build crash doesn't leave the user with a missing
+            # node_modules dir.
+            # shellcheck disable=SC2064
+            trap "[[ -d '$stash' && ! -e '$src_pkg/reactjs/node_modules' ]] && mv '$stash' '$src_pkg/reactjs/node_modules'" EXIT INT TERM
+        fi
+        info "running package-builder for $sp ..."
+        docker run --rm -u "$(id -u):$(id -g)" \
+            -e "EXTRA_ARGS=$extra_args" \
+            -e "HOME=/tmp" \
+            -v "$src_pkg:/build/src" \
+            -v "$conda_repo:/build/dist" \
+            -w /build/src \
+            package-builder
+        if (( stashed )); then
+            mv "$stash" "$src_pkg/reactjs/node_modules"
+            trap - EXIT INT TERM
+        fi
+        # Surface what got produced; if zero matching artifacts landed,
+        # downstream builds will fail with confusing "channel doesn't
+        # have this package" errors, so flag it early.
+        local pkg_name="${sp//-/_}"
+        local found
+        found=$(find "$conda_repo" -name "${pkg_name}-*.conda" -o -name "${pkg_name}-*.tar.bz2" 2>/dev/null | head -1)
+        if [[ -z "$found" ]]; then
+            error "package-builder for $sp produced no ${pkg_name}-* artifact under $conda_repo"
+            error "  inspect the conda-build output above for the real failure"
+            return 1
+        fi
+        info "  → produced $(basename "$found")"
+    done
+}
+
 build_release() {
     info "Building ${IMAGE_NAME} (release) ..."
+    run_builder
     local args
     read -ra args <<< "$(common_build_args)"
     docker build "${args[@]}" \
@@ -185,6 +305,7 @@ build_release() {
 
 build_full() {
     info "Building ${IMAGE_NAME}-full ..."
+    run_builder
     local args
     read -ra args <<< "$(common_build_args)"
     docker build "${args[@]}" \
@@ -196,6 +317,7 @@ build_full() {
 
 build_lite() {
     info "Building ${IMAGE_NAME}-lite ..."
+    run_builder
     local args
     read -ra args <<< "$(common_build_args)"
     docker build "${args[@]}" \
