@@ -40,7 +40,8 @@ from nacl.public import Box, PrivateKey, PublicKey
 from nacl.secret import SecretBox
 from nacl.signing import SigningKey, VerifyKey
 
-from ...common.scenario_loader import Case, hex_to_bytes
+from ...common.canonical import canonicalize
+from ...common.scenario_loader import Case, hex_to_bytes, load_testdata_bytes
 
 
 class NetworkAdapter:
@@ -66,7 +67,30 @@ class NetworkAdapter:
         # the impl handles each cell without coupling any of them.
         for mode in modes:
             for fmt in formats:
-                self._round_trip(constructor, input_args, mode=mode, wire_format=fmt)
+                self._round_trip(constructor, input_args, mode=mode,
+                                 wire_format=fmt, spec=spec)
+
+    def _assert_byte_pin(self, spec: dict[str, Any], actual: bytes, label: str) -> None:
+        """Compare implementation-emitted bytes to a JCS-canonical fixture.
+
+        Only fires when the scenario opts in via `byte_pinning: true` AND
+        provides `expected.json_wire`. Both inputs are canonicalised before
+        comparison so an implementation emitting semantically-equal-but-not-
+        byte-equal JSON (different key order, integer vs `.0`, etc.) still
+        passes — the contract is canonical-form equality, not lexical.
+        """
+        if not spec.get('byte_pinning'):
+            return
+        expected_path = (spec.get('expected') or {}).get('json_wire')
+        if not expected_path:
+            return
+        expected = canonicalize(load_testdata_bytes(self.corpus_root, expected_path))
+        actual_canonical = canonicalize(actual)
+        if actual_canonical != expected:
+            raise AssertionError(
+                f'{label}: wire bytes diverge from pinned fixture '
+                f'{expected_path!r}\n  expected: {expected!r}\n  actual:   {actual_canonical!r}'
+            )
 
     @staticmethod
     def _iter_formats(spec: str) -> list[str]:
@@ -91,7 +115,8 @@ class NetworkAdapter:
         return dict(raw)
 
     def _round_trip(self, constructor: str, args: dict[str, Any],
-                    mode: str, wire_format: str) -> None:
+                    mode: str, wire_format: str,
+                    spec: dict[str, Any] | None = None) -> None:
         from autonomous_trust.core.config.configuration import (
             Configuration, SerializeMode, WireFormat,
         )
@@ -100,11 +125,13 @@ class NetworkAdapter:
         Configuration.mode = SerializeMode[mode.upper()]
         Configuration.wire_format = WireFormat[wire_format.upper()]
         try:
-            self._round_trip_unguarded(constructor, args)
+            self._round_trip_unguarded(constructor, args, spec=spec or {})
         finally:
             Configuration.mode, Configuration.wire_format = old_mode, old_fmt
 
-    def _round_trip_unguarded(self, constructor: str, args: dict[str, Any]) -> None:
+    def _round_trip_unguarded(self, constructor: str, args: dict[str, Any],
+                              spec: dict[str, Any] | None = None) -> None:
+        spec = spec or {}
         if constructor == 'AgreementProof':
             from autonomous_trust.core.algorithms.agreement import AgreementProof
             uid = UUID(args['uuid'])
@@ -118,6 +145,8 @@ class NetworkAdapter:
             assert restored.digest == obj.digest, 'AgreementProof digest drift'
             assert restored.approval == obj.approval, 'AgreementProof approval drift'
             assert restored.nonce == obj.nonce, 'AgreementProof nonce drift'
+            self._assert_byte_pin(spec, data.encode('utf-8') if isinstance(data, str) else data,
+                                  'AgreementProof')
             return
 
         if constructor == 'Signature':
@@ -128,25 +157,30 @@ class NetworkAdapter:
             restored = Signature.from_string(data)
             assert restored.publish() == pub, 'Signature pub-key drift'
             assert restored.public_only is True
+            # Signature carries a generated keypair; byte-pinning is only
+            # meaningful when the test supplies a deterministic seed. Skip
+            # the pin assertion here unless the scenario explicitly wires
+            # one up — see vectors/wire/signature-roundtrip.yaml.
             return
 
         if constructor == 'Message':
             # Message is not a Configuration subclass; it has its own
             # JSON envelope (process|function|data|signature). The vector
             # round-trips that envelope without exercising mode/wire-format.
-            self._message_round_trip(args)
+            self._message_round_trip(args, spec)
             return
 
         raise AssertionError(f'unsupported wire_vector constructor: {constructor!r}')
 
-    def _message_round_trip(self, args: dict[str, Any]) -> None:
+    def _message_round_trip(self, args: dict[str, Any], spec: dict[str, Any]) -> None:
         from autonomous_trust.core.network.message import Message
 
         process = args['process']
         function = args['function']
         obj = args.get('obj', '')
         encrypt = bool(args.get('encrypt', False))
-        msg = Message(process, function, obj, encrypt=encrypt)
+        trace_id = args.get('trace_id')
+        msg = Message(process, function, obj, encrypt=encrypt, trace_id=trace_id)
         wire = bytes(msg)
         restored = Message.parse(wire, sender=None, validate=False)
         assert restored.process == msg.process, 'Message.process drift'
@@ -157,6 +191,7 @@ class NetworkAdapter:
         assert str(restored.obj) == str(msg.obj), \
             f'Message.obj drift: {restored.obj!r} != {msg.obj!r}'
         assert restored.encrypt == msg.encrypt, 'Message.encrypt drift'
+        self._assert_byte_pin(spec, wire, 'Message')
 
     @staticmethod
     def _coerce_bytes(value: Any) -> bytes:

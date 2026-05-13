@@ -6,13 +6,14 @@ description: |
     AgreementProof round-trips equivalently across all (mode, wire-format)
     cells. Adapted from src/autonomous-trust/tests/a_unit/test_wire_serialization.py
     TestAgreementProofWire::test_round_trip.
-byte_pinning: false
-wire_format: any
-serialize_mode: any
+byte_pinning: true
+wire_format: json
+serialize_mode: proto
 constructor: AgreementProof
 input:
   uuid: "11111111-2222-3333-4444-555555555555"
   digest: "0x6469676573743132333435360000000000000000"
   approval: true
   nonce: "0x6e6f6e63655f76616c7565"
-expected: {}
+expected:
+  json_wire: testdata/wire/agreement-proof-roundtrip/expected.json
