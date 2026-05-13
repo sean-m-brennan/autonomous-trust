@@ -33,6 +33,8 @@
 
 #include "../negative_runner.h"
 #include "../jcs.h"
+#include "../scenario_loader.h"
+#include "utilities/b64.h"
 
 /* ------------------------------------------------------------------------- */
 /* Hex helpers                                                                */
@@ -417,10 +419,126 @@ static int run_crypto_vector(const at_case_t *c,
 }
 
 /* ------------------------------------------------------------------------- */
-/* Wire vectors — round-trip equivalence (no byte-pinning per Phase A).      */
+/* Byte-pinning helper                                                       */
 /* ------------------------------------------------------------------------- */
 
-static int run_wv_agreement_proof(json_t *input, json_t *expected,
+/* Compare implementation-emitted JSON to the pinned `expected.json_wire`
+ * fixture from the scenario.  Both sides are passed through
+ * jcs_canonicalize first so a difference in key order, integer-vs-float
+ * lexical form, etc. does not register as a divergence — only canonical
+ * differences do.  Returns 0 on match (or when the case isn't byte-pinned),
+ * non-zero on mismatch (with a populated err buffer). */
+static int assert_byte_pin_json(json_t *case_data, const char *emitted_json,
+                                const char *label, char *err, size_t err_len) {
+    json_t *bp = json_object_get(case_data, "byte_pinning");
+    if (!json_is_true(bp)) return 0;
+
+    json_t *expected = json_object_get(case_data, "expected");
+    json_t *jwire = expected ? json_object_get(expected, "json_wire") : NULL;
+    if (!json_is_string(jwire)) {
+        snprintf(err, err_len, "%s: byte_pinning=true but expected.json_wire missing",
+                 label);
+        return -1;
+    }
+
+    char *expected_bytes = NULL;
+    size_t expected_len = 0;
+    if (at_load_testdata_bytes(json_string_value(jwire),
+                               &expected_bytes, &expected_len) != 0) {
+        snprintf(err, err_len, "%s: cannot load fixture %s",
+                 label, json_string_value(jwire));
+        return -1;
+    }
+
+    char *emit_canon = NULL, *exp_canon = NULL;
+    size_t emit_canon_len = 0, exp_canon_len = 0;
+    int rc = -1;
+    if (jcs_canonicalize(emitted_json, strlen(emitted_json),
+                         &emit_canon, &emit_canon_len) != 0) {
+        snprintf(err, err_len, "%s: canonicalize(emitted) failed", label);
+        goto out;
+    }
+    if (jcs_canonicalize(expected_bytes, expected_len,
+                         &exp_canon, &exp_canon_len) != 0) {
+        snprintf(err, err_len, "%s: canonicalize(expected) failed", label);
+        goto out;
+    }
+    if (emit_canon_len != exp_canon_len ||
+        memcmp(emit_canon, exp_canon, emit_canon_len) != 0) {
+        snprintf(err, err_len,
+                 "%s: wire bytes diverge from pinned fixture %s\n"
+                 "  expected: %.*s\n  actual:   %.*s",
+                 label, json_string_value(jwire),
+                 (int)exp_canon_len, exp_canon,
+                 (int)emit_canon_len, emit_canon);
+        goto out;
+    }
+    rc = 0;
+out:
+    free(emit_canon);
+    free(exp_canon);
+    free(expected_bytes);
+    return rc;
+}
+
+/* Build the JSON form the Python adapter emits for an AgreementProof
+ * under SerializeMode.PROTO + WireFormat.JSON: protobuf-JSON mapping with
+ * bytes-fields base64-encoded and default-valued fields omitted.  The
+ * UUID is stored as `bytes` in the proto schema, so Python base64-encodes
+ * its ASCII string form (36 bytes) — we do the same here.
+ *
+ * Returns a newly-malloc'd compact JSON string; caller frees. */
+static char *agreement_proof_to_json(const agreement_proof_t *proof) {
+    json_t *root = json_object();
+    if (root == NULL) return NULL;
+
+    /* uuid: base64(uuid_ascii_string) — the proto field is bytes. */
+    size_t uuid_strlen = strlen(proof->uuid);
+    char uuid_b64[128];  /* 36-byte UUID string base64-encodes to 48 + NUL */
+    base64_encode((const unsigned char *)proof->uuid, uuid_strlen,
+                  uuid_b64, sizeof(uuid_b64));
+    json_object_set_new(root, "uuid", json_string(uuid_b64));
+
+    /* digest: base64(bytes). */
+    if (proof->digest != NULL && proof->digest_len > 0) {
+        size_t need = b64_encoded_len(proof->digest_len);
+        char *dst = malloc(need);
+        if (dst != NULL) {
+            base64_encode(proof->digest, proof->digest_len, dst, need);
+            json_object_set_new(root, "digest", json_string(dst));
+            free(dst);
+        }
+    } else {
+        /* Default-valued bytes field: omit per proto3 JSON mapping. */
+    }
+
+    /* approval: omit when false (proto3 default). */
+    if (proof->approval) {
+        json_object_set_new(root, "approval", json_true());
+    }
+
+    /* nonce: base64(bytes); omit when empty. */
+    if (proof->nonce != NULL && proof->nonce_len > 0) {
+        size_t need = b64_encoded_len(proof->nonce_len);
+        char *dst = malloc(need);
+        if (dst != NULL) {
+            base64_encode(proof->nonce, proof->nonce_len, dst, need);
+            json_object_set_new(root, "nonce", json_string(dst));
+            free(dst);
+        }
+    }
+
+    char *out = json_dumps(root, JSON_COMPACT);
+    json_decref(root);
+    return out;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Wire vectors — round-trip equivalence + optional byte-pinning             */
+/* ------------------------------------------------------------------------- */
+
+static int run_wv_agreement_proof(json_t *case_data, json_t *input,
+                                  json_t *expected,
                                   char *err, size_t err_len) {
     (void)expected;  /* expected is empty for round-trip-only vectors. */
 
@@ -521,6 +639,20 @@ static int run_wv_agreement_proof(json_t *input, json_t *expected,
             goto cleanup_restored;
         }
     }
+
+    /* Byte-pin assertion (no-op unless the scenario sets byte_pinning=true).
+     * Emits the proof in Python's PROTO+JSON shape, then defers to the
+     * shared JCS-canonical comparator. */
+    char *emitted = agreement_proof_to_json(proof);
+    if (emitted == NULL) {
+        snprintf(err, err_len, "wv/agreement_proof: json emit failed");
+        goto cleanup_restored;
+    }
+    int bp_rc = assert_byte_pin_json(case_data, emitted, "wv/agreement_proof",
+                                     err, err_len);
+    free(emitted);
+    if (bp_rc != 0) goto cleanup_restored;
+
     rc = 0;
 cleanup_restored:
     free(restored.digest);
@@ -586,7 +718,8 @@ cleanup:
     return rc;
 }
 
-static int run_wv_message_envelope(json_t *input, json_t *expected,
+static int run_wv_message_envelope(json_t *case_data, json_t *input,
+                                   json_t *expected,
                                    char *err, size_t err_len) {
     (void)expected;
 
@@ -629,6 +762,18 @@ static int run_wv_message_envelope(json_t *input, json_t *expected,
      * for the from_uuid field, which round-trips through net_message_from_wire
      * without error. */
 
+    /* Scenario-supplied trace_id pins the wire bytes deterministically.
+     * Absent → net_message_to_wire mints a fresh one (which is fine for
+     * round-trip cases but NOT for byte-pinned ones). */
+    json_t *trace_j = json_object_get(input, "trace_id");
+    if (json_is_string(trace_j)) {
+        const char *t = json_string_value(trace_j);
+        size_t tlen = strlen(t);
+        if (tlen > NET_TRACE_ID_LEN) tlen = NET_TRACE_ID_LEN;
+        memcpy(msg.trace_id, t, tlen);
+        msg.trace_id[tlen] = '\0';
+    }
+
     if (net_message_to_wire(&msg, NULL, &wire, &wire_len) != 0) {
         snprintf(err, err_len, "wv/message: to_wire failed");
         goto cleanup;
@@ -653,6 +798,13 @@ static int run_wv_message_envelope(json_t *input, json_t *expected,
         snprintf(err, err_len, "wv/message: encrypt flag drift");
         goto cleanup;
     }
+
+    /* Byte-pin assertion: the emitted wire is already JSON, so feed it
+     * straight to the shared comparator. */
+    int bp_rc = assert_byte_pin_json(case_data, (const char *)wire,
+                                     "wv/message", err, err_len);
+    if (bp_rc != 0) goto cleanup;
+
     rc = 0;
 cleanup:
     free(msg.function);
@@ -660,24 +812,6 @@ cleanup:
     free(wire);
     net_wire_msg_free(&restored);
     return rc;
-}
-
-/* Skip-sentinel return for byte-pinned wire vectors that the C adapter
- * cannot currently honour.  Python wire-pin scenarios exercise
- * `SerializeMode.PROTO + WireFormat.JSON`, which emits the proto fields as
- * JSON (with bytes-as-base64 and defaults omitted).  The C adapter at
- * present only round-trips proto-binary; adding the proto→JSON emission
- * path is tracked separately so this skip is intentional rather than a
- * regression.  See CONFORMANCE_PLAN.md "Open Questions" for the gap. */
-static int wv_skip_if_byte_pinned(const at_case_t *c, char *err, size_t err_len) {
-    json_t *bp = json_object_get(c->data, "byte_pinning");
-    if (json_is_true(bp)) {
-        snprintf(err, err_len,
-                 "C adapter: byte-pinned wire vectors await proto-to-JSON "
-                 "emission path (parity exercised by jcs_test instead)");
-        return 1;  /* skip */
-    }
-    return 0;
 }
 
 static int run_wire_vector(const at_case_t *c,
@@ -695,17 +829,16 @@ static int run_wire_vector(const at_case_t *c,
         return -1;
     }
 
-    int skip_rc = wv_skip_if_byte_pinned(c, err, err_len);
-    if (skip_rc != 0) return skip_rc;
-
-    /* expected is empty for round-trip-only vectors; handlers tolerate NULL. */
+    /* expected is empty for round-trip-only vectors; handlers tolerate NULL.
+     * `case_data` is the full data block — handlers that support byte-
+     * pinning need it to find expected.json_wire and the byte_pinning flag. */
     int rc;
     if (strcmp(ctor, "AgreementProof") == 0) {
-        rc = run_wv_agreement_proof(input, expected, err, err_len);
+        rc = run_wv_agreement_proof(c->data, input, expected, err, err_len);
     } else if (strcmp(ctor, "Signature") == 0) {
         rc = run_wv_signature(input, expected, err, err_len);
     } else if (strcmp(ctor, "Message") == 0) {
-        rc = run_wv_message_envelope(input, expected, err, err_len);
+        rc = run_wv_message_envelope(c->data, input, expected, err, err_len);
     } else {
         snprintf(err, err_len, "unsupported constructor: %s", ctor);
         rc = 1;  /* skip sentinel */

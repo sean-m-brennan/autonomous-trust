@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -82,6 +83,17 @@ def convert(corpus_root: Path, out_dir: Path) -> int:
                 encoding='utf-8',
             )
             count += 1
+
+    # Mirror the testdata/ tree verbatim so the C harness can resolve
+    # paths like `expected.json_wire: testdata/wire/foo/expected.json`
+    # relative to its own corpus root, without needing to know where the
+    # original YAML lives.
+    testdata_src = corpus_root / 'testdata'
+    if testdata_src.is_dir():
+        testdata_dst = out_dir / 'testdata'
+        if testdata_dst.exists():
+            shutil.rmtree(testdata_dst)
+        shutil.copytree(testdata_src, testdata_dst)
 
     # Top-level index so the C runner can discover cases without a
     # filesystem walk. Order matches Python loader's stable alphabetical.

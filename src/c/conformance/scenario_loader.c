@@ -29,6 +29,44 @@ static char *xstrdup(const char *s) {
     return r;
 }
 
+/* Process-global corpus root.  Lifetime is bounded by the next
+ * at_load_corpus() call; ownership stays here. */
+static char *g_corpus_root = NULL;
+
+const char *at_corpus_root(void) {
+    return g_corpus_root;
+}
+
+int at_load_testdata_bytes(const char *rel_path, char **out, size_t *out_len) {
+    if (rel_path == NULL || out == NULL || out_len == NULL) return -1;
+    if (g_corpus_root == NULL) return -1;
+    /* Reject traversal: `..` anywhere in the relative path. */
+    if (strstr(rel_path, "..") != NULL) return -1;
+    if (rel_path[0] == '/') return -1;  /* must be relative */
+
+    char path[2048];
+    int wr = snprintf(path, sizeof(path), "%s/%s", g_corpus_root, rel_path);
+    if (wr < 0 || (size_t)wr >= sizeof(path)) return -1;
+
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return -1; }
+    rewind(f);
+
+    char *buf = malloc((size_t)sz + 1);
+    if (buf == NULL) { fclose(f); return -1; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (got != (size_t)sz) { free(buf); return -1; }
+    buf[sz] = '\0';
+
+    *out = buf;
+    *out_len = (size_t)sz;
+    return 0;
+}
+
 static int load_one_case(const char *json_root, const char *rel_path, at_case_t *out) {
     char path[2048];
     snprintf(path, sizeof(path), "%s/%s", json_root, rel_path);
@@ -71,6 +109,10 @@ static int load_one_case(const char *json_root, const char *rel_path, at_case_t 
 int at_load_corpus(const char *json_root, at_case_t **cases, size_t *n) {
     *cases = NULL;
     *n = 0;
+
+    /* Remember the root for later testdata lookups. */
+    free(g_corpus_root);
+    g_corpus_root = xstrdup(json_root);
 
     char index_path[2048];
     snprintf(index_path, sizeof(index_path), "%s/index.json", json_root);
