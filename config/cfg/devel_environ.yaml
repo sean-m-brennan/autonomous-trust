@@ -43,5 +43,6 @@ dependencies:
   - ruamel.yaml
   - playwright
   - pyee
+  - jcs
   - pip:
       - mermaid-cli

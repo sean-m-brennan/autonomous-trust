@@ -21,13 +21,18 @@
 # protocol-specific adapter, and emits a results JSON whose shape matches
 # the Python harness's so the cross-language diff tool can compare them.
 
-# Source paths
+# Source paths.  `jcs.c` is also reused by `jcs_test`; both targets pull it
+# in via source rather than a separate library, since at this scale a tiny
+# duplicated compile keeps the CMake graph simpler than yet another lib.
+# (`at_ryu` is defined at the top-level CMakeLists so both the conformance
+# runner and the JCS parity test can link against it.)
 set(AT_CONFORMANCE_SOURCES
     runner.c
     scenario_loader.c
     scenario_engine.c
     case_result.c
     negative_runner.c
+    jcs.c
     adapters/network.c
     adapters/identity.c
     adapters/agreement.c
@@ -96,6 +101,7 @@ target_include_directories(conformance_runner
 # libprotobuf-c, because libsymbols are resolved single-pass.
 set(AT_CONFORMANCE_LIBS
     -Wl,--start-group autonomous_trust_static ${TEST_DEPENDENCIES} -Wl,--end-group
+    at_ryu
 )
 target_link_libraries(conformance_runner PRIVATE ${AT_CONFORMANCE_LIBS})
 

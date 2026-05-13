@@ -422,13 +422,13 @@ if(AT_NET_DTN)
         list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_stub.c)
     elseif(AT_NET_DTN_BACKEND STREQUAL "ion")
         # NASA ION bp_* API. Two modes:
-        #   (a) Submodule present at ./ION-DTN — we build it via
-        #       autotools into a build-local prefix. No sudo required.
+        #   (a) Submodule present at ./third_party/ION-DTN — we build it
+        #       via autotools into a build-local prefix. No sudo required.
         #   (b) Submodule absent — fall back to system-installed ION (or
         #       paths supplied explicitly via -DION_* cache vars).
         # The node's local EID must be pre-provisioned via bpadmin before
         # the transport is used at runtime.
-        set(ION_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/ION-DTN)
+        set(ION_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ION-DTN)
         set(ION_PREFIX    ${CMAKE_BINARY_DIR}/ion-install)
 
         if(EXISTS ${ION_SUBMODULE}/configure.ac)
@@ -454,7 +454,7 @@ if(AT_NET_DTN)
 
             # BUILD_IN_SOURCE because ION's autotools setup does not cleanly
             # support out-of-tree builds. Artifacts land inside the submodule
-            # checkout (ION-DTN's own .gitignore covers them).
+            # checkout under third_party/ION-DTN (its own .gitignore covers them).
             ExternalProject_Add(ion_external
                 SOURCE_DIR        ${ION_SUBMODULE}
                 BUILD_IN_SOURCE   1
@@ -490,7 +490,7 @@ if(AT_NET_DTN)
                 message(FATAL_ERROR
                     "AT_NET_DTN_BACKEND=ion selected but the ION-DTN submodule is missing "
                     "AND no system install was found. Fix one of:\n"
-                    "  git submodule update --init src/c/autonomous_trust/network/dtn/ION-DTN\n"
+                    "  git submodule update --init src/c/third_party/ION-DTN\n"
                     "  sudo make install (in a cloned ION-DTN)\n"
                     "  cmake ... -DION_INCLUDE_DIR=... -DION_BP_LIB=... -DION_ICI_LIB=...")
             endif()
@@ -511,7 +511,7 @@ if(AT_NET_DTN)
         # uD3TN AAP 2.0: protobuf-delimited framing. Schema lives at
         # autonomous_trust/network/dtn/proto/aap2.proto, vendored verbatim
         # from https://gitlab.com/d3tn/ud3tn/-/raw/master/components/aap2/aap2.proto
-        # Currently symlinked to submodule location in ./ud3tn/
+        # Currently symlinked to submodule location in ./third_party/ud3tn/
         #
         # Codegen is a standalone protoc-c run — we don't reuse the main
         # `protos` list because aap2.proto lives under the DTN tree, not the
@@ -737,6 +737,24 @@ if(AT_ZTA)
     include_directories(${OPENSSL_INCLUDE_DIR})
 endif()
 
+# Ryu (shortest-decimal d2s) for JCS number formatting.  Pulled in as a
+# git submodule under third_party/ryu/; the upstream repo's C sources live
+# in its `ryu/` subdir, so source paths read `third_party/ryu/ryu/...`.
+# Includes go via `ryu/ryu.h` — the include-dir at `third_party/ryu/`
+# lets that resolve to `third_party/ryu/ryu/ryu.h`.
+#
+# Build target defined here at top level so both the conformance runner
+# and the jcs_test target can link against it.
+add_library(at_ryu STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu/ryu/d2s.c
+)
+target_include_directories(at_ryu PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu
+)
+# Ryu emits a few unused-variable warnings on some compilers; suppress
+# rather than patch the submodule.
+target_compile_options(at_ryu PRIVATE -O2 -Wno-error -Wno-unused-function)
+
 add_library(autonomous_trust SHARED ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
 set_target_properties(autonomous_trust PROPERTIES COMPILE_FLAGS "${lib_compile_flags}")
 target_sources(autonomous_trust PUBLIC ${libsrc}
@@ -892,6 +910,26 @@ add_executable(negotiation2_test test/negotiation2_test.c)
 set_source_files_properties(test/negotiation2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(negotiation2_test PRIVATE ${AT_TEST_LIBS})
 
+# Cross-language parity test for the C JCS canonicalizer.  Pulls in
+# conformance/jcs.c directly so the test is independent of whether the
+# conformance harness build is enabled.  Doesn't need the full AT static
+# archive — only jansson, Ryu, libcheck (+ subunit when libcheck is
+# statically linked) and libm for isnan/isinf.
+add_executable(jcs_test
+    test/jcs_test.c
+    conformance/jcs.c
+)
+set_source_files_properties(test/jcs_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(jcs_test PRIVATE
+    at_ryu
+    ${LIBJANSSON_LIBRARY}
+    ${LIBCHECK_LIBRARY}
+    subunit
+    m
+    pthread
+    rt
+)
+
 enable_testing()
 
 add_test(NAME array_test COMMAND $<TARGET_FILE:array_test>)
@@ -922,6 +960,7 @@ add_test(NAME reputation2_test COMMAND $<TARGET_FILE:reputation2_test>)
 add_test(NAME map_json_test COMMAND $<TARGET_FILE:map_json_test>)
 add_test(NAME array2_test COMMAND $<TARGET_FILE:array2_test>)
 add_test(NAME negotiation2_test COMMAND $<TARGET_FILE:negotiation2_test>)
+add_test(NAME jcs_test COMMAND $<TARGET_FILE:jcs_test>)
 
 add_executable(msg_types_test test/msg_types_test.c)
 set_source_files_properties(test/msg_types_test.c PROPERTIES COMPILE_FLAGS "-Wall")
