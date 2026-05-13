@@ -59,7 +59,7 @@ RUN echo "ALL            ALL = (ALL) NOPASSWD: ALL" >>/etc/sudoers
 
 RUN conda config --add channels conda-forge
 RUN conda update -y -n base conda
-RUN conda create -n autonomous_trust python=3.10 && conda clean -afy
+RUN conda create -n autonomous_trust python=3.13 && conda clean -afy
 
 SHELL ["conda", "run", "--live-stream", "-n", "autonomous_trust", "/bin/bash", "-c"]
 RUN pip install pydevd-pycharm
