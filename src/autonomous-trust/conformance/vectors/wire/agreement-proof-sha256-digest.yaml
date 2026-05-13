@@ -1,0 +1,20 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: agreement-proof-sha256-digest
+description: |
+    Realistic production shape: 32-byte digest (SHA-256 of "hello world"),
+    approval=true, no nonce. Pins both implementations against the size
+    most blobs actually use, catching any base64 length math regression
+    that boundary cases (1-byte, no-nonce) wouldn't hit.
+byte_pinning: true
+wire_format: json
+serialize_mode: proto
+constructor: AgreementProof
+input:
+  uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+  digest: "0xa591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e"
+  approval: true
+  nonce: null
+expected:
+  json_wire: testdata/wire/agreement-proof-sha256-digest/expected.json

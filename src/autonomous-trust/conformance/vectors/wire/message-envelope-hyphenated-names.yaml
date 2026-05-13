@@ -1,0 +1,21 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: message-envelope-hyphenated-names
+description: |
+    Message envelope with hyphenated process/function names ("fleet-update",
+    "propose-artifact"). Some routing layers historically restricted these
+    to identifier-like strings; this pin catches any side adding silent
+    validation that would reject hyphens.
+byte_pinning: true
+wire_format: json
+serialize_mode: json
+constructor: Message
+input:
+  process: "fleet-update"
+  function: "propose-artifact"
+  obj: "manifest_v1"
+  encrypt: false
+  trace_id: "cafebabedeadbeef0011223344556677"
+expected:
+  json_wire: testdata/wire/message-envelope-hyphenated-names/expected.json
