@@ -1,0 +1,19 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: agreement-proof-approval-only
+description: |
+    AgreementProof with approval=true and no nonce. Exercises the proto-JSON
+    case where one non-default field is present and one is absent, catching
+    drift in either implementation's default-omission rules.
+byte_pinning: true
+wire_format: json
+serialize_mode: proto
+constructor: AgreementProof
+input:
+  uuid: "22222222-3333-4444-5555-666666666666"
+  digest: "0x6469676573745f617070726f76616c"
+  approval: true
+  nonce: null
+expected:
+  json_wire: testdata/wire/agreement-proof-approval-only/expected.json

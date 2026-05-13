@@ -1,0 +1,21 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: agreement-proof-zero-uuid
+description: |
+    AgreementProof with the canonical nil UUID (00000000-...-000000000000)
+    as a real wire value. Catches any side that special-cases the nil UUID
+    as "absent" — the proto bytes field carries the 36-byte ASCII string
+    "00000000-0000-0000-0000-000000000000" base64-encoded, and both impls
+    must emit that, not omit the field.
+byte_pinning: true
+wire_format: json
+serialize_mode: proto
+constructor: AgreementProof
+input:
+  uuid: "00000000-0000-0000-0000-000000000000"
+  digest: "0x01"
+  approval: false
+  nonce: null
+expected:
+  json_wire: testdata/wire/agreement-proof-zero-uuid/expected.json

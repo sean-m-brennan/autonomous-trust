@@ -1,0 +1,20 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: agreement-proof-max-nonce
+description: |
+    Realistic full-record shape: SHA-256-sized digest plus a 32-byte
+    nonce (the upper edge of what an NaCl-derived correlation nonce
+    would carry).  Pairs sha256-digest's data scale with a substantive
+    nonce so the largest realistic record byte-pins end to end.
+byte_pinning: true
+wire_format: json
+serialize_mode: proto
+constructor: AgreementProof
+input:
+  uuid: "55555555-6666-7777-8888-999999999999"
+  digest: "0xa591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e"
+  approval: true
+  nonce: "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+expected:
+  json_wire: testdata/wire/agreement-proof-max-nonce/expected.json
