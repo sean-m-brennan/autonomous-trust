@@ -18,10 +18,28 @@
 #include <stdlib.h>
 #include <jansson.h>
 #include <sodium.h>
+#include <uuid/uuid.h>
 
 #include "network/net_message.h"
 #include "identity/identity_priv.h"
 #include "utilities/exception.h"
+
+/* Fill `out` (33 bytes) with a fresh 32-char hex uuid4 + NUL, matching
+ * Python's `uuid.uuid4().hex` shape (no hyphens, lowercase). */
+static void generate_trace_id(char out[NET_TRACE_ID_LEN + 1])
+{
+    uuid_t u;
+    uuid_generate(u);
+    /* uuid_unparse_lower writes 36 bytes + NUL; rebuild without hyphens. */
+    char tmp[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(u, tmp);
+    size_t oi = 0;
+    for (size_t i = 0; i < UUID_STRING_LEN && oi < NET_TRACE_ID_LEN; ++i) {
+        if (tmp[i] == '-') continue;
+        out[oi++] = tmp[i];
+    }
+    out[NET_TRACE_ID_LEN] = '\0';
+}
 
 #define ENET_WIRE 232
 DEFINE_ERROR(ENET_WIRE, "Wire message serialization error");
@@ -115,8 +133,29 @@ int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
     if (data_b64 != NULL)
         free(data_b64);
 
+    /* trace_id: preserve the caller's choice if set, else mint a fresh one.
+     * Must match Python's `uuid.uuid4().hex` shape (32 lowercase hex chars,
+     * no hyphens) so byte-for-byte conformance vectors round-trip. */
+    char trace_buf[NET_TRACE_ID_LEN + 1];
+    if (msg->trace_id[0] != '\0') {
+        memcpy(trace_buf, msg->trace_id, NET_TRACE_ID_LEN);
+        trace_buf[NET_TRACE_ID_LEN] = '\0';
+    } else {
+        generate_trace_id(trace_buf);
+    }
+    json_object_set_new(root, "trace_id", json_string(trace_buf));
+
+    /* from_uuid: emit empty string when from_whom is unset (all-zero uuid),
+     * matching Python's `from_whom is None` branch which writes "".  Without
+     * this check the C side would emit the canonical nil-UUID string
+     * ("00000000-...") and diverge byte-for-byte from Python on every
+     * unsigned wire vector. */
     char uuid_str[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
+    if (uuid_is_null(msg->from_whom.uuid)) {
+        uuid_str[0] = '\0';
+    } else {
+        uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
+    }
     json_object_set_new(root, "from_uuid", json_string(uuid_str));
     json_object_set_new(root, "from_name", json_string(msg->from_whom.fullname));
     json_object_set_new(root, "from_address", json_string(msg->from_whom.address));
@@ -178,6 +217,16 @@ int net_message_from_wire(const uint8_t *data, size_t len,
     msg_out->process[PROC_NAME_LEN] = '\0';
     msg_out->function = strdup(function);
     msg_out->encrypt = encrypt_val ? json_boolean_value(encrypt_val) : false;
+
+    /* trace_id: preserved verbatim across the hop when the peer sent one;
+     * minted fresh when absent (backward-compat with pre-trace_id peers). */
+    const char *trace_str = json_string_value(json_object_get(root, "trace_id"));
+    if (trace_str != NULL && strlen(trace_str) == NET_TRACE_ID_LEN) {
+        memcpy(msg_out->trace_id, trace_str, NET_TRACE_ID_LEN);
+        msg_out->trace_id[NET_TRACE_ID_LEN] = '\0';
+    } else {
+        generate_trace_id(msg_out->trace_id);
+    }
 
     if (data_b64 != NULL && strlen(data_b64) > 0)
     {

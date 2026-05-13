@@ -214,6 +214,13 @@ endif()
 # /usr/include path is not readable through that sysroot, so `file
 # STRINGS` fails and the subsequent math(EXPR) calls explode on the empty
 # version string.
+#
+# If conda is active but lacks protobuf, fall through to a system search
+# that bypasses find_package(Protobuf) entirely — we emulate the small
+# subset of vars our build needs (INCLUDE_DIR/LIBRARY/PROTOC) using bare
+# find_*, dodging the broken file STRINGS read.  Recommend `conda install
+# protobuf libprotobuf` to stay inside the env.
+set(_at_protobuf_resolved FALSE)
 if(DEFINED ENV{CONDA_PREFIX})
     find_path(_at_protobuf_inc google/protobuf/stubs/common.h
               HINTS ${CONDA_ROOT} NO_DEFAULT_PATH)
@@ -226,14 +233,48 @@ if(DEFINED ENV{CONDA_PREFIX})
         if(_at_protoc_exe)
             set(Protobuf_PROTOC_EXECUTABLE ${_at_protoc_exe} CACHE FILEPATH "" FORCE)
         endif()
+        find_package(Protobuf REQUIRED)
+        set(_at_protobuf_resolved TRUE)
+    else()
+        # Conda has no protobuf — fall back to a bare-find of the system
+        # copy.  Do NOT call find_package(Protobuf) here: conda's cmake
+        # cannot read the system header through its sysroot and would
+        # error out with `file STRINGS ... cannot be read`.
+        find_path(_at_sys_protobuf_inc google/protobuf/stubs/common.h)
+        find_library(_at_sys_protobuf_lib NAMES protobuf)
+        find_program(_at_sys_protoc_exe protoc)
+        if(_at_sys_protobuf_inc AND _at_sys_protobuf_lib)
+            set(Protobuf_INCLUDE_DIR  ${_at_sys_protobuf_inc} CACHE PATH "" FORCE)
+            set(Protobuf_INCLUDE_DIRS ${_at_sys_protobuf_inc})
+            set(Protobuf_LIBRARY      ${_at_sys_protobuf_lib} CACHE FILEPATH "" FORCE)
+            set(Protobuf_LIBRARIES    ${_at_sys_protobuf_lib})
+            if(_at_sys_protoc_exe)
+                set(Protobuf_PROTOC_EXECUTABLE ${_at_sys_protoc_exe} CACHE FILEPATH "" FORCE)
+            endif()
+            message(STATUS "Conda has no protobuf; using system at ${_at_sys_protobuf_lib} "
+                           "(install `protobuf libprotobuf` into the conda env to silence this)")
+            set(_at_protobuf_resolved TRUE)
+        endif()
     endif()
 endif()
-find_package(Protobuf REQUIRED)
+if(NOT _at_protobuf_resolved)
+    find_package(Protobuf REQUIRED)
+endif()
 include_directories(${Protobuf_INCLUDE_DIRS})
 if(Protobuf_LIBRARY)
     message("-- Found libprotobuf at ${Protobuf_LIBRARY}")
 else()
     message(FATAL_ERROR "Required dependency libprotobuf not found.")
+endif()
+
+# Legacy uppercase alias.  The system cmake 3.31 FindProtobuf still
+# back-fills PROTOBUF_INCLUDE_DIR from Protobuf_INCLUDE_DIR, but conda's
+# cmake 4.x dropped that fallback.  Three sites in this file (the protoc
+# `-I` flag plus the google/protobuf/*.proto source paths around line
+# 750) still reference the uppercase form, so set it explicitly here so
+# the build is portable across cmake versions.
+if(NOT DEFINED PROTOBUF_INCLUDE_DIR OR "${PROTOBUF_INCLUDE_DIR}" STREQUAL "")
+    set(PROTOBUF_INCLUDE_DIR ${Protobuf_INCLUDE_DIR})
 endif()
 
 # protobuf-c
