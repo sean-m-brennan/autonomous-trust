@@ -21,10 +21,10 @@
 # Adds optional C-harness build+run plus a cross-language diff.
 #
 # Usage:
-#   scripts/test-conformance.sh                         # Python only
-#   scripts/test-conformance.sh --c                     # Python + C + diff
-#   scripts/test-conformance.sh --c-only                # C only (skip Python)
-#   scripts/test-conformance.sh --c --strict-coverage   # also fail on coverage gaps
+#   scripts/test-conformance.sh                         # Python + C + diff
+#   scripts/test-conformance.sh --python                # Python only (skip C)
+#   scripts/test-conformance.sh --c                     # C only (skip Python)
+#   scripts/test-conformance.sh --strict-coverage       # also fail on coverage gaps
 #   scripts/test-conformance.sh -k secretbox            # forward args to pytest
 #
 # All non-flag arguments are forwarded to pytest. Flags consumed by this
@@ -34,7 +34,7 @@ set -euo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
-run_c=0
+run_c=1
 c_only=0
 strict_coverage=0
 pytest_args=()
@@ -43,11 +43,12 @@ while (("$#")); do
   case "$1" in
     --c)
       run_c=1
+      c_only=1
       shift
       ;;
-    --c-only)
-      run_c=1
-      c_only=1
+    --python)
+      run_c=0
+      c_only=0
       shift
       ;;
     --strict-coverage)
@@ -99,6 +100,29 @@ run_c_harness() {
   if ! command -v cmake >/dev/null 2>&1; then
     echo "ERROR: cmake not found; --c requires cmake on PATH." >&2
     return 2
+  fi
+
+  # Cache-staleness guard: if any FILEPATH the cache thinks it knows is
+  # missing on disk now (e.g. a system lib was uninstalled, or a conda
+  # env activation since last build moved the library to a new prefix),
+  # cmake will keep using the stale path and `make` will fail with a
+  # cryptic "No rule to make target /old/path/libfoo.so".  Wipe the
+  # build dir in that case so cmake re-resolves from scratch.
+  if [[ -f "$build_dir/CMakeCache.txt" ]]; then
+    local stale=""
+    while IFS= read -r p; do
+      if [[ -n "$p" && ! -e "$p" ]]; then
+        stale="$p"
+        break
+      fi
+    done < <(grep -E "^[A-Za-z_]+_(LIBRARY|EXECUTABLE|INCLUDE_DIR):(FILEPATH|PATH)=/" \
+                "$build_dir/CMakeCache.txt" \
+             | sed -E 's/^[^=]+=//' | grep -v NOTFOUND)
+    if [[ -n "$stale" ]]; then
+      echo "Cache references missing path: $stale" >&2
+      echo "Wiping $build_dir to force a clean reconfigure ..." >&2
+      rm -rf "$build_dir"
+    fi
   fi
 
   if [[ ! -d "$build_dir" ]]; then

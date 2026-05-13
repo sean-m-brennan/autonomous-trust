@@ -54,4 +54,16 @@ int at_load_corpus(const char *json_root, at_case_t **cases, size_t *n);
 /** Release heap fields and the underlying JSON root. */
 void at_case_free(at_case_t *c);
 
+/** Return the corpus root passed to the last successful at_load_corpus()
+ *  call, or NULL if no corpus has been loaded.  Lifetime is bounded by
+ *  the next at_load_corpus() call (the returned pointer is owned by the
+ *  loader and stays valid until then). */
+const char *at_corpus_root(void);
+
+/** Load a testdata file by its corpus-relative path.  On success returns
+ *  0, sets *out to a newly-malloc'd buffer holding @p out_len bytes, and
+ *  the caller must free(*out).  Refuses paths that escape the corpus
+ *  root via `..` segments. */
+int at_load_testdata_bytes(const char *rel_path, char **out, size_t *out_len);
+
 #endif /* AT_CONFORMANCE_LOADER_H */
