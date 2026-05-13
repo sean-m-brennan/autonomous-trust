@@ -1,0 +1,23 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: message-envelope-max-process-name
+description: |
+    Process name at exactly PROC_NAME_LEN (64 chars).  C declares
+    char process[PROC_NAME_LEN + 1] and uses strncpy(... sizeof - 1)
+    which copies 64 chars + NUL — 64 chars fits exactly.  Python has
+    no equivalent limit; pinning here proves the boundary value
+    round-trips byte-identical on both sides, with no truncation or
+    NUL-loss on the C path.
+byte_pinning: true
+wire_format: json
+serialize_mode: json
+constructor: Message
+input:
+  process: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  function: "do_thing"
+  obj: "payload"
+  encrypt: false
+  trace_id: "ffffeeeeddddccccbbbbaaaa99998888"
+expected:
+  json_wire: testdata/wire/message-envelope-max-process-name/expected.json

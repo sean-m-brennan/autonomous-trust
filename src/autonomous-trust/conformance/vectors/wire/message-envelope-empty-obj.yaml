@@ -1,0 +1,21 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: message-envelope-empty-obj
+description: |
+    Message envelope boundary: obj="". Both implementations have a separate
+    branch for empty payloads (no base64 to compute, empty string emitted).
+    Pinning ensures both sides emit "" rather than e.g. null or omitting
+    the data field entirely.
+byte_pinning: true
+wire_format: json
+serialize_mode: json
+constructor: Message
+input:
+  process: "identity"
+  function: "noop"
+  obj: ""
+  encrypt: false
+  trace_id: "0000000000000000ffffffffffffffff"
+expected:
+  json_wire: testdata/wire/message-envelope-empty-obj/expected.json
