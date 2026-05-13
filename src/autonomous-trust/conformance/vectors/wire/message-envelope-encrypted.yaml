@@ -1,0 +1,21 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: message-envelope-encrypted
+description: |
+    Message envelope with encrypt=true. The encrypt flag goes on the wire
+    as a JSON boolean; this case pins the byte form, catching any drift in
+    how either side serialises booleans or orders the flag relative to
+    sibling fields after JCS canonicalization.
+byte_pinning: true
+wire_format: json
+serialize_mode: json
+constructor: Message
+input:
+  process: "reputation"
+  function: "broadcast_score"
+  obj: "payload_str"
+  encrypt: true
+  trace_id: "aaaabbbbccccdddd1111222233334444"
+expected:
+  json_wire: testdata/wire/message-envelope-encrypted/expected.json

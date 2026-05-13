@@ -667,10 +667,77 @@ cleanup:
     return rc;
 }
 
-static int run_wv_signature(json_t *input, json_t *expected,
+/* Byte-pin path for `constructor: Signature` when the scenario supplies a
+ * deterministic seed_hex.  Mirrors Python's Signature.to_string() output
+ * under PROTO+JSON: a single-field JSON envelope {"hexSeed": "<base64>"}
+ * where the value is base64 of the 64-character ASCII hex form of the
+ * 32-byte Ed25519 public key derived from the seed.  Returns 0 on
+ * (match | not byte-pinned), non-zero with `err` set on divergence. */
+static int run_wv_signature_byte_pin(json_t *case_data, json_t *input,
+                                     char *err, size_t err_len) {
+    json_t *bp = json_object_get(case_data, "byte_pinning");
+    if (!json_is_true(bp)) return 0;
+
+    json_t *seed_j = json_object_get(input, "seed_hex");
+    if (!json_is_string(seed_j)) {
+        snprintf(err, err_len,
+                 "wv/signature: byte_pinning=true requires `seed_hex` in input");
+        return -1;
+    }
+    const char *seed_hex = json_string_value(seed_j);
+    if (strlen(seed_hex) != 64) {
+        snprintf(err, err_len,
+                 "wv/signature: seed_hex must be 64 hex chars (got %zu)",
+                 strlen(seed_hex));
+        return -1;
+    }
+
+    /* hex -> 32 raw seed bytes -> Ed25519 keypair. */
+    unsigned char seed[crypto_sign_SEEDBYTES];
+    if (sodium_hex2bin(seed, sizeof(seed), seed_hex, 64, NULL, NULL, NULL) != 0) {
+        snprintf(err, err_len, "wv/signature: bad seed hex");
+        return -1;
+    }
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES];
+    unsigned char sk[crypto_sign_SECRETKEYBYTES];
+    if (crypto_sign_seed_keypair(pk, sk, seed) != 0) {
+        snprintf(err, err_len, "wv/signature: seed_keypair failed");
+        return -1;
+    }
+
+    /* Python encodes the public key as ASCII hex (64 chars), then
+     * base64-encodes that ASCII string (NOT the raw 32 bytes). */
+    char pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+    sodium_bin2hex(pk_hex, sizeof(pk_hex), pk, sizeof(pk));
+
+    char pk_b64[256];
+    base64_encode((const unsigned char *)pk_hex, crypto_sign_PUBLICKEYBYTES * 2,
+                  pk_b64, sizeof(pk_b64));
+
+    json_t *root = json_object();
+    json_object_set_new(root, "hexSeed", json_string(pk_b64));
+    char *emitted = json_dumps(root, JSON_COMPACT);
+    json_decref(root);
+    if (emitted == NULL) {
+        snprintf(err, err_len, "wv/signature: json_dumps failed");
+        return -1;
+    }
+    int bp_rc = assert_byte_pin_json(case_data, emitted, "wv/signature",
+                                     err, err_len);
+    free(emitted);
+    return bp_rc;
+}
+
+static int run_wv_signature(json_t *case_data, json_t *input, json_t *expected,
                             char *err, size_t err_len) {
-    (void)input;
     (void)expected;
+
+    /* If the scenario carries a seed_hex, the deterministic byte-pin path
+     * is sole proof of conformance — skip the random identity round-trip
+     * (which has independent purpose but doesn't share bytes with Python). */
+    if (json_object_get(input, "seed_hex") != NULL) {
+        return run_wv_signature_byte_pin(case_data, input, err, err_len);
+    }
 
     /* The C side has no standalone signature_t serializer — the Python
      * Signature.to_string/from_string contract maps to public_identity_t
@@ -836,7 +903,7 @@ static int run_wire_vector(const at_case_t *c,
     if (strcmp(ctor, "AgreementProof") == 0) {
         rc = run_wv_agreement_proof(c->data, input, expected, err, err_len);
     } else if (strcmp(ctor, "Signature") == 0) {
-        rc = run_wv_signature(input, expected, err, err_len);
+        rc = run_wv_signature(c->data, input, expected, err, err_len);
     } else if (strcmp(ctor, "Message") == 0) {
         rc = run_wv_message_envelope(c->data, input, expected, err, err_len);
     } else {

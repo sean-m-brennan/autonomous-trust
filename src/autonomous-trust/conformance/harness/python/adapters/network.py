@@ -151,16 +151,23 @@ class NetworkAdapter:
 
         if constructor == 'Signature':
             from autonomous_trust.core.identity.sign import Signature
-            sig = Signature.generate()
+            # When the scenario supplies `seed_hex` (32-byte seed as a
+            # 64-char ASCII hex string), build the Signature from it for
+            # byte-pinned determinism.  Without a seed we fall back to
+            # Signature.generate() — round-trip equivalence is still
+            # checked but byte-pin will refuse without a fixture.
+            seed_hex = args.get('seed_hex')
+            if seed_hex is not None:
+                sig = Signature(seed_hex.encode('ascii'), public_only=False)
+            else:
+                sig = Signature.generate()
             pub = sig.publish()
             data = sig.to_string()
             restored = Signature.from_string(data)
             assert restored.publish() == pub, 'Signature pub-key drift'
             assert restored.public_only is True
-            # Signature carries a generated keypair; byte-pinning is only
-            # meaningful when the test supplies a deterministic seed. Skip
-            # the pin assertion here unless the scenario explicitly wires
-            # one up — see vectors/wire/signature-roundtrip.yaml.
+            self._assert_byte_pin(spec, data.encode('utf-8') if isinstance(data, str) else data,
+                                  'Signature')
             return
 
         if constructor == 'Message':

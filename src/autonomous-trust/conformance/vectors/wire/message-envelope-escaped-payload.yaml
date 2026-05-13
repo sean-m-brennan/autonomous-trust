@@ -1,0 +1,22 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: message-envelope-escaped-payload
+description: |
+    Message envelope where obj contains JSON-special characters: double
+    quote, backslash, and newline.  The wire format base64-encodes the
+    payload bytes — JSON escaping should NOT be applied to obj before
+    base64.  This pin catches the regression where either side escapes
+    the obj string first and double-encodes the specials.
+byte_pinning: true
+wire_format: json
+serialize_mode: json
+constructor: Message
+input:
+  process: "logger"
+  function: "log_event"
+  obj: "line1\"q\\b\nline2"
+  encrypt: false
+  trace_id: "1234567890abcdef1234567890abcdef"
+expected:
+  json_wire: testdata/wire/message-envelope-escaped-payload/expected.json

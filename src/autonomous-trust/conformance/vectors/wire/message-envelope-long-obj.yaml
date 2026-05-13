@@ -1,0 +1,22 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: message-envelope-long-obj
+description: |
+    Message obj is 256 bytes of 'x'.  Crosses multiple base64 chunk
+    boundaries (each chunk is 3 bytes in, 4 chars out) and ends on a
+    boundary requiring double-'=' padding (256 mod 3 == 1).  Catches
+    chunk-boundary or length-rounding bugs in either side's base64
+    encoder.
+byte_pinning: true
+wire_format: json
+serialize_mode: json
+constructor: Message
+input:
+  process: "storage"
+  function: "append_blob"
+  obj: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  encrypt: false
+  trace_id: "1111222233334444aaaabbbbccccdddd"
+expected:
+  json_wire: testdata/wire/message-envelope-long-obj/expected.json
