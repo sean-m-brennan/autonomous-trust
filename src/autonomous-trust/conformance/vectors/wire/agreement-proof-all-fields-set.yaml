@@ -1,0 +1,20 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: agreement-proof-all-fields-set
+description: |
+    Every AgreementProof field is populated and non-default: non-nil UUID,
+    non-empty digest, approval=true, non-empty nonce.  Covers the dense-
+    record path that the default-omission scenarios skip — every field has
+    to make it onto the wire in the right canonical position.
+byte_pinning: true
+wire_format: json
+serialize_mode: proto
+constructor: AgreementProof
+input:
+  uuid: "44444444-5555-6666-7777-888888888888"
+  digest: "0xcafef00d"
+  approval: true
+  nonce: "0xaaaaaaaaaaaaaaaaaaaaaaaa"
+expected:
+  json_wire: testdata/wire/agreement-proof-all-fields-set/expected.json
