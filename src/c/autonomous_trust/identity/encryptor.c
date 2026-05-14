@@ -22,20 +22,30 @@
 #include "identity_priv.h"
 #include "utilities/exception.h"
 
-void public_encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
+int public_encryptor_init(encryptor_t *encr, const unsigned char *hex_seed, size_t hex_len)
 {
+    if (encr == NULL || hex_seed == NULL
+        || hex_len != crypto_box_PUBLICKEYBYTES * 2)
+        return -1;
     sodium_memzero(encr->private, sizeof(encr->private));
-    unhexlify(hex_seed, crypto_box_PUBLICKEYBYTES * 2, (unsigned char *)encr->public);
+    if (unhexlify(hex_seed, hex_len, (unsigned char *)encr->public) != 0)
+        return -1;
     hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char *)encr->public_hex);
+    return 0;
 }
 
-void encryptor_init(encryptor_t *encr, const unsigned char *hex_seed)
+int encryptor_init(encryptor_t *encr, const unsigned char *hex_seed, size_t hex_len)
 {
+    if (encr == NULL || hex_seed == NULL
+        || hex_len != crypto_box_SEEDBYTES * 2)
+        return -1;
     unsigned char seed[crypto_box_SEEDBYTES];
-    unhexlify(hex_seed, crypto_box_SEEDBYTES * 2, seed);
+    if (unhexlify(hex_seed, hex_len, seed) != 0)
+        return -1;
     crypto_box_seed_keypair((unsigned char *)encr->public, (unsigned char *)encr->private, seed);
     sodium_memzero(seed, sizeof(seed));
     hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char *)encr->public_hex);
+    return 0;
 }
 
 /* Frama-C: skipped — [solver-timeout] libsodium stub preconditions */

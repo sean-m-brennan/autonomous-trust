@@ -354,13 +354,17 @@ static int _make_signer_identity(const char *pid, identity_t **out) {
     crypto_hash_sha256(digest, (const unsigned char *)label, strlen(label));
     hexlify(digest, crypto_sign_SEEDBYTES, hex_seed);
     hex_seed[crypto_sign_SEEDBYTES * 2] = '\0';
-    signature_init(&(*out)->signature, hex_seed);
+    if (signature_init(&(*out)->signature, hex_seed,
+                       crypto_sign_SEEDBYTES * 2) != 0)
+        return -1;
 
     snprintf(label, sizeof(label), "at-conformance:neg:enc:%s", pid);
     crypto_hash_sha256(digest, (const unsigned char *)label, strlen(label));
     hexlify(digest, crypto_box_SEEDBYTES, hex_seed);
     hex_seed[crypto_box_SEEDBYTES * 2] = '\0';
-    encryptor_init(&(*out)->encryptor, hex_seed);
+    if (encryptor_init(&(*out)->encryptor, hex_seed,
+                       crypto_box_SEEDBYTES * 2) != 0)
+        return -1;
     return 0;
 }
 

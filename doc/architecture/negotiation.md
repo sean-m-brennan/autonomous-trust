@@ -20,71 +20,45 @@ The negotiation subsystem handles distributed task assignment, parameter hagglin
 
 ## Task Lifecycle
 
+The diagram below is generated from `conformance/scenarios/negotiation/negotiation-canonical.yaml` by `scripts/build-docs.sh` — it cannot drift from the executable corpus. The canonical pins the invite → ack → poll happy path; the rest of the protocol (refuse, haggle, result reporting) is documented as separate scenarios linked below.
+
+<!-- at_diagram:start protocol=negotiation scenario=negotiation-canonical -->
 ```mermaid
 sequenceDiagram
-    participant Main as Main Orchestrator
-    participant NegL as Local Negotiation
-    participant Net as Network
-    participant NegR as Remote Negotiation
-    participant MainR as Remote Main
-
-    Main->>NegL: start (Task)
-    NegL->>NegL: Create TaskTracker<br/>Find capable peers via<br/>PeerCapabilities
-
-    loop For each capable peer
-        NegL->>Net: announce (Task)<br/>[encrypted peer-to-peer]
-        Net->>NegR: invitation
-    end
-
-    alt Peer accepts parameters
-        NegR->>NegR: Add to JobQueue
-        NegR->>Net: acceptance (Task)
-        Net->>NegL: ack
-        NegL->>NegL: Record confirmation
-
-    else Peer haggles (timing or content)
-        NegR->>Net: response (modified Task)
-        Net->>NegL: haggle
-
-        alt Parameters flexible
-            NegL->>Net: announce (adjusted Task)
-            Net->>NegR: re-invitation
-        else Not flexible
-            NegL->>NegL: Cancel participant
-        end
-
-    else Peer not capable
-        NegR->>Net: refusal (Task)
-        Net->>NegL: nack
-        NegL->>NegL: Cancel participant
-    end
-
-    note over NegR: JobQueue scheduled time arrives
-
-    NegR->>MainR: Task (for execution)
-    MainR->>MainR: Execute capability
-    MainR->>NegR: TaskResult (with ZKP)
-    NegR->>Net: result (TaskResult)
-    Net->>NegL: report results
-    NegL->>Main: TaskResult
-
-    note over Main: Verify ZKP, submit<br/>TransactionScore to Reputation
-
-    opt Long-running task monitoring
-        NegL->>Net: status_req
-        Net->>NegR: status request
-        NegR->>MainR: TaskStatus
-        MainR->>NegR: TaskStatus (with psutil status)
-        NegR->>Net: status_resp
-        Net->>NegL: status response
-
-        alt Task still running
-            NegL->>NegL: Extend timeout
-        else Task dead/stopped
-            NegL->>NegL: Cancel participant
-        end
-    end
+    participant alice as requestor
+    participant bob as worker
+    alice->>+bob: invitation
+    Note right of alice: alice invites bob to perform a data_fetch task on the encrypted peer-to-peer channel.
+    bob-->>-alice: ack (re: 1)
+    Note right of bob: bob's handle_invite finds data_fetch in own capabilities, peer level non-zero, parameters acceptable → emits an ack and pushes the task onto its task_stack.
+    alice->>+bob: status request
+    Note right of alice: Some time later alice polls the running task. handle_stat_req looks up the task in bob's task_stack to read execution state.
+    bob-->>-alice: status response (re: 3)
+    Note right of bob: bob reports the task as still pending (queued, not yet executing). alice will re-poll until the task completes or the timeout elapses.
 ```
+<!-- at_diagram:end -->
+
+**Channel semantics.** `invitation`, `ack`, `nack`, `haggle`, `status request`, `status response`, and `report results` all travel on the **encrypted peer-to-peer channel** between the requester and each worker. The local `spawn task` hop (Main Orchestrator → NegotiationProcess) is in-process via the IPC queue, not on the wire.
+
+**Refuse branches** (not in the canonical, pinned by separate scenarios):
+
+- **Not capable.** If the worker doesn't have the requested capability registered, `handle_invite` short-circuits and emits `nack`. Trace: [`invite-refuse-not-capable.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-refuse-not-capable.yaml).
+- **Low reputation.** If the sender's peer-level reads as 0 (lowest reputation tier), the invite is refused regardless of capability. Trace: [`invite-refuse-low-rep.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-refuse-low-rep.yaml).
+- **Flood threshold.** Past `max_task_duplicates = 5` invites of the same task uuid, `handle_invite` emits `nack` and short-circuits (refuse-and-return). The flood counter persists across admissions (BUGS.md §P7) and is canonical AT v1 behavior on both Python and C. Trace: [`invite-flood-past-threshold.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-flood-past-threshold.yaml).
+
+**Haggle branch.** When the worker's parameters disagree with the requester's (timing window or content), `handle_invite` emits `haggle` carrying a counter-proposed `Task`. The requester's `handle_haggle` either re-announces with the adjusted parameters (if `flexible: true`) or cancels the participant. Trace: [`invite-haggle-counterprop.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-haggle-counterprop.yaml).
+
+**Result reporting.** When the worker completes the task, it emits `report results` carrying the `TaskResult` (and ZKP where applicable). The requester's `handle_results` records the per-peer result, forwards to the main queue when all participants have reported, then deletes the `my_tasks` entry so further results are rejected. Trace: [`report-results-forwarded.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/report-results-forwarded.yaml).
+
+**Spawn fan-out.** A locally-spawned task hits the negotiation process via the main → negotiation queue with `function: spawn task`. The handler registers the task in `my_tasks` and fan-outs `invitation` messages to every peer whose capabilities include the task's capability. Trace: [`spawn-task-fanout.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/spawn-task-fanout.yaml).
+
+**Internal steps not on the wire** (omitted from the diagram, but part of the protocol):
+
+- After receiving `invitation` and emitting `ack`, the worker's `_add_task` pushes the task onto its `JobQueue` priority queue, ordered by scheduled execution time.
+- When `now() >= job.when`, the worker pops the task and hands it to its Main Orchestrator for capability execution. The result (with ZKP) flows back into the negotiation process before being emitted as `report results`.
+- The requester's Main Orchestrator submits a `TransactionScore` to the Reputation process after verifying the ZKP — that's where the Negotiation and Reputation protocols compose end-to-end.
+
+**Replay idempotency.** Re-delivering the same `invitation` is canonical and survives: the flood counter advances but the task admission is unchanged. Trace: [`invite-replay-survives.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-replay-survives.yaml).
 
 ## Key Components
 
@@ -102,6 +76,6 @@ Tracks outstanding remote tasks by UUID, storing expected results per peer. A ta
 
 ### Spam Protection
 
-If a peer sends duplicate task invitations beyond `max_task_duplicates`, the peer is demoted in the hierarchy.
+Once a peer sends more than `max_task_duplicates` (5) duplicate invitations for the same task uuid, `handle_invite` emits `nack` and short-circuits further processing for that invite. The per-task flood counter persists across admissions (BUGS.md §P7) and is canonical AT v1 behavior on both Python and C (refuse-and-return).
 
 [Reputation Consensus >](reputation.md)
