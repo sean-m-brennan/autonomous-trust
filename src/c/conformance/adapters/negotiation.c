@@ -473,25 +473,39 @@ static int _negotiation_check_expected_state(sce_run_ctx_t *ctx)
                     return -1;
                 }
             } else if (strcmp(key, "has_my_task") == 0) {
-                const char *slug = json_string_value(val);
-                if (slug == NULL) {
-                    snprintf(ctx->err, sizeof(ctx->err),
-                             "%s: has_my_task expects a slug string", pid);
-                    return -1;
-                }
-                /* Same derivation the adapter uses when building task
+                /* Accepts either a slug string (positive presence) or a
+                 * dict {slug, present: bool} for either direction.
+                 * Same derivation the adapter uses when building task
                  * inbounds (see `_build_inbound` / `_uuid5`): the key
                  * stored in production my_tasks is the stringified
                  * uuid5 of NEG_NS + "task:<slug>". Python's adapter
                  * derives identically with uuid5(_NS, f'task:{slug}'). */
+                const char *slug = NULL;
+                bool want_present = true;
+                if (json_is_string(val)) {
+                    slug = json_string_value(val);
+                } else if (json_is_object(val)) {
+                    slug = json_string_value(json_object_get(val, "slug"));
+                    json_t *p_j = json_object_get(val, "present");
+                    if (p_j != NULL) want_present = json_is_true(p_j);
+                }
+                if (slug == NULL) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: has_my_task expects slug-string or "
+                             "{slug, present} dict", pid);
+                    return -1;
+                }
                 uuid_t want_uuid;
                 _uuid5("task:", slug, want_uuid);
-                if (!negotiation_has_my_task_uuid(want_uuid)) {
+                bool got = negotiation_has_my_task_uuid(want_uuid);
+                if (got != want_present) {
                     char uuid_str[UUID_STRING_LEN + 1] = {0};
                     uuid_unparse_lower(want_uuid, uuid_str);
                     snprintf(ctx->err, sizeof(ctx->err),
-                             "%s: has_my_task slug=%s (uuid=%s) not present",
-                             pid, slug, uuid_str);
+                             "%s: has_my_task slug=%s (uuid=%s) present=%s, expected %s",
+                             pid, slug, uuid_str,
+                             got ? "true" : "false",
+                             want_present ? "true" : "false");
                     return -1;
                 }
             } else if (strcmp(key, "flood_count") == 0) {
@@ -562,6 +576,10 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
     ctx.case_data = c->data;
     ctx.build_inbound = _build_inbound;
     ctx.dispatch = _dispatch;
+
+    /* Wipe singleton neg_state so observables like task_in_stack:false /
+     * has_my_task:false are not polluted by prior scenarios. */
+    negotiation_reset_state();
 
     json_t *parts = json_object_get(c->data, "participants");
     if (!json_is_array(parts))
