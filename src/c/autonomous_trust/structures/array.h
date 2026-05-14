@@ -209,22 +209,44 @@ size_t array_size(array_t *a);
 
 /**
  * @brief For-each macro
- * @details requires array_t *array, int index, and data_t value to be defined.
- * Be careful not to mutate (e.g. array_remove) inside the iteration.
+ * @details Requires @c array_t *array, @c int index, and @c data_t value
+ * to be defined in the caller's scope.
  *
+ * **Shrinkage-aware** (added 2026-05-14, BUGS.md recurring theme §3):
+ * if the body mutates the array such that @c array_size shrinks, the
+ * macro decrements @p index by the shrinkage amount on the next step
+ * expression — modeling "every element shifted left by N". This handles
+ * the common "iterate-and-remove-current-element" pattern correctly
+ * (the element that used to be at @p index + 1 is now at @p index and
+ * gets visited on the next iteration instead of being skipped). When
+ * @c index would underflow, it is clamped to 0. Growth is unaffected;
+ * elements appended during iteration are visited in order.
+ *
+ * Caller should still avoid removing elements *after* the current index
+ * — the macro will re-visit elements you've already processed in that
+ * case. The previous macro would silently skip.
  */
-#define array_for_each(array, index, value)                      \
-    for (index = 0; (size_t)index < array_size(array); index++) \
-    {                                                   \
-        int __attribute__((unused)) a_errors[1] = {0};  \
-        int _a_err = array_get(array, index, &value);   \
-        if (_a_err != 0)                                \
-        {                                               \
-            a_errors[0] = _a_err;                       \
-            continue;                                   \
-        }
+#define array_for_each(array, index, value)                                 \
+    {                                                                       \
+        size_t _afe_prev = array_size(array);                               \
+        for (index = 0;                                                     \
+             (size_t)index < array_size(array);                             \
+             ((array_size(array) < _afe_prev)                               \
+                  ? (index = ((size_t)index >= (_afe_prev - array_size(array))) \
+                              ? (int)((size_t)index - (_afe_prev - array_size(array))) \
+                              : 0,                                          \
+                     _afe_prev = array_size(array))                         \
+                  : (index++, _afe_prev = array_size(array))))              \
+        {                                                                   \
+            int __attribute__((unused)) a_errors[1] = {0};                  \
+            int _a_err = array_get(array, index, &value);                   \
+            if (_a_err != 0)                                                \
+            {                                                               \
+                a_errors[0] = _a_err;                                       \
+                continue;                                                   \
+            }
 
-#define array_end_for_each }
+#define array_end_for_each } }
 
 /**
  * @brief

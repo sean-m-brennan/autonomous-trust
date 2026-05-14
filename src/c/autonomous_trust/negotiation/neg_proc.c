@@ -30,6 +30,18 @@
 
 DEFINE_ERROR(ENEG_NOPEERS, "No capable peers available");
 
+/* Protocol-string definitions (declared `extern char[]` in
+ * negotiation.h). Writable arrays for direct assignment to `char *`. */
+char NEG_PROTO_START[]    = "spawn task";
+char NEG_PROTO_ANNOUNCE[] = "invitation";
+char NEG_PROTO_RESPONSE[] = "haggle";
+char NEG_PROTO_ACCEPT[]   = "ack";
+char NEG_PROTO_REFUSE[]   = "nack";
+char NEG_PROTO_STAT_REQ[] = "status request";
+char NEG_PROTO_STAT_RSP[] = "status response";
+char NEG_PROTO_RESULT[]   = "report results";
+char NEG_PROTO_CANCEL[]   = "cancel";
+
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
  ****************************/
@@ -468,7 +480,7 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
         generic_msg_t invite = {0};
         invite.type = NET_MESSAGE;
         strncpy(invite.info.net_msg.process, "negotiation", PROC_NAME_LEN);
-        invite.info.net_msg.function = (char *)NEG_PROTO_ANNOUNCE;
+        invite.info.net_msg.function = NEG_PROTO_ANNOUNCE;
         invite.info.net_msg.encrypt = true;
         memcpy(&invite.info.net_msg.to_whom, &proc->protocol.peers[i],
                sizeof(public_identity_t));
@@ -1235,14 +1247,14 @@ int negotiation_get_task_flood_count(const uuid_t uuid)
 int negotiation_register_handlers(process_t *proc)
 {
     if (proc == NULL) return -1;
-    process_register_handler(proc, (char *)NEG_PROTO_START,    (handler_ptr_t)handle_start_task);
-    process_register_handler(proc, (char *)NEG_PROTO_ANNOUNCE, (handler_ptr_t)handle_invite);
-    process_register_handler(proc, (char *)NEG_PROTO_RESPONSE, (handler_ptr_t)handle_haggle);
-    process_register_handler(proc, (char *)NEG_PROTO_ACCEPT,   (handler_ptr_t)handle_accept);
-    process_register_handler(proc, (char *)NEG_PROTO_REFUSE,   (handler_ptr_t)handle_refuse);
-    process_register_handler(proc, (char *)NEG_PROTO_STAT_REQ, (handler_ptr_t)handle_stat_req);
-    process_register_handler(proc, (char *)NEG_PROTO_STAT_RSP, (handler_ptr_t)handle_stat_resp);
-    process_register_handler(proc, (char *)NEG_PROTO_RESULT,   (handler_ptr_t)handle_results);
+    process_register_handler(proc, NEG_PROTO_START,    (handler_ptr_t)handle_start_task);
+    process_register_handler(proc, NEG_PROTO_ANNOUNCE, (handler_ptr_t)handle_invite);
+    process_register_handler(proc, NEG_PROTO_RESPONSE, (handler_ptr_t)handle_haggle);
+    process_register_handler(proc, NEG_PROTO_ACCEPT,   (handler_ptr_t)handle_accept);
+    process_register_handler(proc, NEG_PROTO_REFUSE,   (handler_ptr_t)handle_refuse);
+    process_register_handler(proc, NEG_PROTO_STAT_REQ, (handler_ptr_t)handle_stat_req);
+    process_register_handler(proc, NEG_PROTO_STAT_RSP, (handler_ptr_t)handle_stat_resp);
+    process_register_handler(proc, NEG_PROTO_RESULT,   (handler_ptr_t)handle_results);
     return 0;
 }
 

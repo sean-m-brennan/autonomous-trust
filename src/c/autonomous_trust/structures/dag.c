@@ -24,6 +24,7 @@
 
 #include "dag.h"
 #include "../utilities/allocation.h"
+#include "../utilities/util.h"
 
 DEFINE_ERROR(EDAG_INVALID_BRANCH, "Invalid branch name in DAG");
 DEFINE_ERROR(EDAG_BRANCH_EXISTS, "Branch already exists in DAG");
@@ -338,7 +339,7 @@ int dag_ingest_branch(step_dag_t *dag, linked_step_t **steps, size_t count,
     }
 
     if (name_out != NULL && name_out_len > 0)
-        strncpy(name_out, name, name_out_len - 1);
+        at_strlcpy(name_out, name, name_out_len);
 
     /* first step starts from genesis */
     int err = dag_branch(dag, name, steps[count - 1], "genesis");

@@ -36,6 +36,15 @@
 #define EFLEET_PAXOS 260
 DEFINE_ERROR(EFLEET_PAXOS, "Fleet Paxos consensus error");
 
+/* Protocol-string definitions (declared `extern char[]` in
+ * fleet_proc.h). Writable arrays for direct `char *` assignment. */
+char FLEET_PROTO_PROPOSE[]    = "update proposal";
+char FLEET_PROTO_VOTE_REQ[]   = "update vote request";
+char FLEET_PROTO_VOTE_GRANT[] = "update vote grant";
+char FLEET_PROTO_VOTE_NACK[]  = "update vote nack";
+char FLEET_PROTO_ACCEPTED[]   = "update accepted";
+char FLEET_PROTO_REJECTED[]   = "update rejected";
+
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -146,7 +155,7 @@ static bool handle_update_proposal(const process_t *proc, directory_t *queues, g
         generic_msg_t req = {0};
         req.type = NET_MESSAGE;
         strncpy(req.info.net_msg.process, "fleet", PROC_NAME_LEN);
-        req.info.net_msg.function = (char *)FLEET_PROTO_VOTE_REQ;
+        req.info.net_msg.function = FLEET_PROTO_VOTE_REQ;
         req.info.net_msg.encrypt = true;
         memcpy(&req.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
         strncpy(req.info.net_msg.return_to, "fleet", PROC_NAME_LEN);
@@ -225,7 +234,7 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
         generic_msg_t grant = {0};
         grant.type = NET_MESSAGE;
         strncpy(grant.info.net_msg.process, "fleet", PROC_NAME_LEN);
-        grant.info.net_msg.function = (char *)FLEET_PROTO_VOTE_GRANT;
+        grant.info.net_msg.function = FLEET_PROTO_VOTE_GRANT;
         grant.info.net_msg.encrypt = true;
         memcpy(&grant.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
         strncpy(grant.info.net_msg.return_to, "fleet", PROC_NAME_LEN);
@@ -251,7 +260,7 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
         generic_msg_t nack = {0};
         nack.type = NET_MESSAGE;
         strncpy(nack.info.net_msg.process, "fleet", PROC_NAME_LEN);
-        nack.info.net_msg.function = (char *)FLEET_PROTO_VOTE_NACK;
+        nack.info.net_msg.function = FLEET_PROTO_VOTE_NACK;
         nack.info.net_msg.encrypt = true;
         memcpy(&nack.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
         strncpy(nack.info.net_msg.return_to, "fleet", PROC_NAME_LEN);
@@ -348,7 +357,7 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
             generic_msg_t acc_msg = {0};
             acc_msg.type = NET_MESSAGE;
             strncpy(acc_msg.info.net_msg.process, "fleet", PROC_NAME_LEN);
-            acc_msg.info.net_msg.function = (char *)FLEET_PROTO_ACCEPTED;
+            acc_msg.info.net_msg.function = FLEET_PROTO_ACCEPTED;
             acc_msg.info.net_msg.encrypt = true;
             memcpy(&acc_msg.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
             strncpy(acc_msg.info.net_msg.return_to, "fleet", PROC_NAME_LEN);
@@ -364,7 +373,7 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
         generic_msg_t self_acc = {0};
         self_acc.type = NET_MESSAGE;
         strncpy(self_acc.info.net_msg.process, "fleet", PROC_NAME_LEN);
-        self_acc.info.net_msg.function = (char *)FLEET_PROTO_ACCEPTED;
+        self_acc.info.net_msg.function = FLEET_PROTO_ACCEPTED;
         json_t *self_json = json_object();
         if (!self_json)
         {
@@ -513,7 +522,7 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
             artifact_msg.type = NET_MESSAGE;
             net_msg_t *anmsg = &artifact_msg.info.net_msg;
             strncpy(anmsg->process, "artifact", PROC_NAME_LEN);
-            anmsg->function = (char *)ARTIFACT_PROTO_REQUEST;
+            anmsg->function = ARTIFACT_PROTO_REQUEST;
             memcpy(&anmsg->to_whom, &nmsg->from_whom, sizeof(public_identity_t));
             anmsg->encrypt = true;
             strncpy(anmsg->return_to, "artifact", PROC_NAME_LEN);
@@ -547,11 +556,11 @@ int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t 
     paxos_init(&fleet_state.vote_paxos, fleet_state.num_peers, logger);
 
     /* Register protocol handlers */
-    process_register_handler(proc, (char *)FLEET_PROTO_PROPOSE,    (handler_ptr_t)handle_update_proposal);
-    process_register_handler(proc, (char *)FLEET_PROTO_VOTE_REQ,   (handler_ptr_t)handle_vote_request);
-    process_register_handler(proc, (char *)FLEET_PROTO_VOTE_GRANT, (handler_ptr_t)handle_vote_grant);
-    process_register_handler(proc, (char *)FLEET_PROTO_VOTE_NACK,  (handler_ptr_t)handle_vote_nack);
-    process_register_handler(proc, (char *)FLEET_PROTO_ACCEPTED,   (handler_ptr_t)handle_update_accepted);
+    process_register_handler(proc, FLEET_PROTO_PROPOSE,    (handler_ptr_t)handle_update_proposal);
+    process_register_handler(proc, FLEET_PROTO_VOTE_REQ,   (handler_ptr_t)handle_vote_request);
+    process_register_handler(proc, FLEET_PROTO_VOTE_GRANT, (handler_ptr_t)handle_vote_grant);
+    process_register_handler(proc, FLEET_PROTO_VOTE_NACK,  (handler_ptr_t)handle_vote_nack);
+    process_register_handler(proc, FLEET_PROTO_ACCEPTED,   (handler_ptr_t)handle_update_accepted);
 
     proc->protocol.phase = 1;
 

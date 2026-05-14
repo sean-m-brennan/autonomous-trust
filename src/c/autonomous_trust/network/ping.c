@@ -29,6 +29,7 @@
 
 #include "network/ping.h"
 #include "utilities/exception.h"
+#include "utilities/socket_helpers.h"
 
 DEFINE_ERROR(EPING_TIMEOUT, "Ping timed out");
 
@@ -71,11 +72,7 @@ int ping(const char *host, int count, ping_stats_t *stats)
         return SYS_EXCEPTION();
     }
 
-    /* Set receive timeout */
-    struct timeval tv;
-    tv.tv_sec  = PING_TIMEOUT_MS / 1000;
-    tv.tv_usec = (PING_TIMEOUT_MS % 1000) * 1000;
-    setsockopt(rcv_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)at_set_rcvtimeo(rcv_sock, PING_TIMEOUT_MS, NULL);
 
     /* Bind receiver to PING_RCV_PORT */
     struct sockaddr_in rcv_addr;
@@ -115,8 +112,8 @@ int ping(const char *host, int count, ping_stats_t *stats)
         struct timespec t_send, t_recv;
         clock_gettime(CLOCK_MONOTONIC, &t_send);
 
-        ssize_t sent = sendto(snd_sock, &net_seq, sizeof(net_seq), 0,
-                              (struct sockaddr *)&dst, sizeof(dst));
+        ssize_t sent = at_sendto_eintr(snd_sock, &net_seq, sizeof(net_seq), 0,
+                                       (struct sockaddr *)&dst, sizeof(dst));
         if (sent < 0)
         {
             timed_out++;
@@ -128,8 +125,8 @@ int ping(const char *host, int count, ping_stats_t *stats)
         uint32_t resp = 0;
         struct sockaddr_in from;
         socklen_t from_len = sizeof(from);
-        ssize_t rcvd = recvfrom(rcv_sock, &resp, sizeof(resp), 0,
-                                (struct sockaddr *)&from, &from_len);
+        ssize_t rcvd = at_recvfrom_eintr(rcv_sock, &resp, sizeof(resp), 0,
+                                         (struct sockaddr *)&from, &from_len);
 
         clock_gettime(CLOCK_MONOTONIC, &t_recv);
 
@@ -192,10 +189,7 @@ static void *ping_server_loop(void *arg)
         return NULL;
 
     /* Set receive timeout so we can check ping_server_running */
-    struct timeval tv;
-    tv.tv_sec  = 1;
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)at_set_rcvtimeo(sock, 1000, NULL);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -215,8 +209,8 @@ static void *ping_server_loop(void *arg)
         struct sockaddr_in from;
         socklen_t from_len = sizeof(from);
 
-        ssize_t n = recvfrom(sock, &pkt, sizeof(pkt), 0,
-                             (struct sockaddr *)&from, &from_len);
+        ssize_t n = at_recvfrom_eintr(sock, &pkt, sizeof(pkt), 0,
+                                      (struct sockaddr *)&from, &from_len);
         if (n < 0)
         {
             /* Timeout or error — check running flag and loop */
@@ -225,8 +219,8 @@ static void *ping_server_loop(void *arg)
 
         /* Echo back seq + 1 */
         uint32_t reply = htonl(ntohl(pkt) + 1);
-        sendto(sock, &reply, sizeof(reply), 0,
-               (struct sockaddr *)&from, from_len);
+        (void)at_sendto_eintr(sock, &reply, sizeof(reply), 0,
+                              (struct sockaddr *)&from, from_len);
     }
 
     close(sock);

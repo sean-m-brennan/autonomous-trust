@@ -27,6 +27,22 @@ inline long min(long a, long b) { return ((a) < (b) ? a : b); }
 
 inline long max(long a, long b) { return ((a) > (b) ? a : b); }
 
+size_t at_strlcpy(char *dst, const char *src, size_t dst_len)
+{
+    if (src == NULL) {
+        if (dst != NULL && dst_len > 0)
+            dst[0] = '\0';
+        return 0;
+    }
+    size_t src_len = strlen(src);
+    if (dst == NULL || dst_len == 0)
+        return src_len;
+    size_t copy_len = (src_len < dst_len - 1) ? src_len : dst_len - 1;
+    memcpy(dst, src, copy_len);
+    dst[copy_len] = '\0';
+    return src_len;
+}
+
 /* Frama-C: skipped — [string-loop] nested strstr + memmove loop */
 char *strremove(char *str, const char *sub)
 {

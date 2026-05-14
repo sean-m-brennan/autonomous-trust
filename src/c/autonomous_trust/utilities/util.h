@@ -60,6 +60,22 @@ long min(long a, long b);
 long max(long a, long b);
 
 /**
+ * @brief BSD-style strlcpy: bounded copy that always NUL-terminates.
+ *
+ * Copies up to @p dst_len - 1 bytes from @p src into @p dst followed
+ * by '\0'. If @p src is NULL the destination is set to "". If @p dst
+ * is NULL or @p dst_len is 0 the function returns the source length
+ * without touching @p dst (mirrors the BSD behavior for sizing
+ * queries).
+ *
+ * @return Length of @p src (excluding NUL). The caller can detect
+ *         truncation with @c (return >= dst_len). Always safe to use
+ *         in place of strncpy: the destination is unconditionally
+ *         NUL-terminated when @p dst_len > 0.
+ */
+size_t at_strlcpy(char *dst, const char *src, size_t dst_len);
+
+/**
  * @brief Remove every occurrence of @p sub from @p str in place.
  *
  * @param[in,out] str  NUL-terminated string; modified in place.

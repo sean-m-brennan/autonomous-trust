@@ -22,6 +22,7 @@
 #include <jansson.h>
 
 #include "network.h"
+#include "utilities/at_jansson.h"
 #include "utilities/exception.h"
 #include "config/configuration.h"
 #include "utilities/util.h"
@@ -149,17 +150,11 @@ int network_from_json(const json_t *obj, void *data_struct)
 {
     network_config_t *net = data_struct;
     net->port = json_integer_value(json_object_get(obj, "port"));
-    const char *val;
-    val = json_string_value(json_object_get(obj, "ip4_cidr"));
-    if (val != NULL) strncpy(net->ip4_cidr, val, CIDR4_LEN);
-    val = json_string_value(json_object_get(obj, "ip6_cidr"));
-    if (val != NULL) strncpy(net->ip6_cidr, val, CIDR6_LEN);
-    val = json_string_value(json_object_get(obj, "mcast4_addr"));
-    if (val != NULL) strncpy(net->mcast4_addr, val, IPV4_ADDR_LEN);
-    val = json_string_value(json_object_get(obj, "mcast6_addr"));
-    if (val != NULL) strncpy(net->mcast6_addr, val, IPV6_ADDR_LEN);
-    val = json_string_value(json_object_get(obj, "mac_addr"));
-    if (val != NULL) strncpy(net->mac_address, val, MAC_ADDR_LEN);
+    AT_JSON_STRING(obj, "ip4_cidr",    net->ip4_cidr);
+    AT_JSON_STRING(obj, "ip6_cidr",    net->ip6_cidr);
+    AT_JSON_STRING(obj, "mcast4_addr", net->mcast4_addr);
+    AT_JSON_STRING(obj, "mcast6_addr", net->mcast6_addr);
+    AT_JSON_STRING(obj, "mac_addr",    net->mac_address);
     return 0;
 }
 

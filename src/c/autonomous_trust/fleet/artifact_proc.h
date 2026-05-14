@@ -31,13 +31,14 @@
 extern "C" {
 #endif
 
-/* Protocol message function names */
-#define ARTIFACT_PROTO_REQUEST   "artifact request"
-#define ARTIFACT_PROTO_MANIFEST  "artifact manifest"
-#define ARTIFACT_PROTO_CHUNK_REQ "artifact chunk request"
-#define ARTIFACT_PROTO_CHUNK     "artifact chunk"
-#define ARTIFACT_PROTO_COMPLETE  "artifact complete"
-#define ARTIFACT_PROTO_READY     "artifact ready"
+/* Protocol message function names — writable char arrays (definitions
+ * in `artifact_proc.c`). */
+extern char ARTIFACT_PROTO_REQUEST[];
+extern char ARTIFACT_PROTO_MANIFEST[];
+extern char ARTIFACT_PROTO_CHUNK_REQ[];
+extern char ARTIFACT_PROTO_CHUNK[];
+extern char ARTIFACT_PROTO_COMPLETE[];
+extern char ARTIFACT_PROTO_READY[];
 
 /* Chunk payload size: MAX_MSG_SIZE(1024) - 64 bytes for JSON header overhead */
 #define ARTIFACT_CHUNK_SIZE 960

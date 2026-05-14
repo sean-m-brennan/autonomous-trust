@@ -33,8 +33,9 @@
 extern "C" {
 #endif
 
-/* Protocol message function name for broadcasting update status */
-#define UPDATE_PROTO_STATUS  "update status"
+/* Protocol message function name for broadcasting update status.
+ * Writable char array — definition in `update_proc.c`. */
+extern char UPDATE_PROTO_STATUS[];
 
 /* Default timeout for peer handshake self-test (seconds) */
 #define UPDATE_HANDSHAKE_TIMEOUT_SEC 15

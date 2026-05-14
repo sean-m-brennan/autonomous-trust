@@ -36,6 +36,26 @@
 DEFINE_ERROR(EREP_PAXOS, "Paxos consensus error");
 
 /****************************
+ * Protocol-string definitions (declared `extern char[]` in
+ * reputation.h). Writable arrays so `net_msg.function` (typed
+ * `char *`) accepts them without a `(char *)` cast under
+ * `-Wwrite-strings`.
+ ****************************/
+
+char REP_PROTO_REQUEST[]     = "ask permission";
+char REP_PROTO_GRANT[]       = "permission granted";
+char REP_PROTO_NACK[]        = "try again";
+char REP_PROTO_BACKDATE[]    = "out of date";
+char REP_PROTO_TX[]          = "transaction";
+char REP_PROTO_ACCEPTED[]    = "tx accepted";
+char REP_PROTO_OUTDATED[]    = "update needed";
+char REP_PROTO_UPDATE[]      = "latest update";
+char REP_PROTO_REP_REQ[]     = "request reputation";
+char REP_PROTO_REP_RESP[]    = "reputation response";
+char REP_PROTO_LOCAL_QUERY[] = "local_rep_query";
+char REP_PROTO_LOCAL_RESP[]  = "local_rep_response";
+
+/****************************
  * Process state (file-scope static, thread-safe via mutex)
  ****************************/
 
@@ -124,6 +144,10 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     {
         /* Build grant payload: (id1, id2, peer_uuid, last_id, chain_len) */
         json_t *grant_json = json_object();
+        if (grant_json == NULL) {
+            log_error(proc->logger, "Reputation: json_object OOM (grant)\n");
+            return true;
+        }
         json_object_set_new(grant_json, "id1", json_integer(id1));
         json_object_set_new(grant_json, "id2", json_integer(id2));
         json_object_set_new(grant_json, "peer_uuid", json_string(peer_uuid_str));
@@ -133,7 +157,7 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
         generic_msg_t grant = {0};
         grant.type = NET_MESSAGE;
         strncpy(grant.info.net_msg.process, "reputation", PROC_NAME_LEN);
-        grant.info.net_msg.function = (char *)REP_PROTO_GRANT;
+        grant.info.net_msg.function = REP_PROTO_GRANT;
         grant.info.net_msg.encrypt = true;
         memcpy(&grant.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
         strncpy(grant.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
@@ -147,13 +171,17 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     {
         /* BACKDATE: chain index mismatch */
         json_t *bd_json = json_object();
+        if (bd_json == NULL) {
+            log_error(proc->logger, "Reputation: json_object OOM (backdate)\n");
+            return true;
+        }
         json_object_set_new(bd_json, "id1", json_integer(id1));
         json_object_set_new(bd_json, "id2", json_integer(id2));
 
         generic_msg_t backdate = {0};
         backdate.type = NET_MESSAGE;
         strncpy(backdate.info.net_msg.process, "reputation", PROC_NAME_LEN);
-        backdate.info.net_msg.function = (char *)REP_PROTO_BACKDATE;
+        backdate.info.net_msg.function = REP_PROTO_BACKDATE;
         backdate.info.net_msg.encrypt = true;
         memcpy(&backdate.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
         strncpy(backdate.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
@@ -167,13 +195,17 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     {
         /* NACK: id1 <= last_id */
         json_t *nack_json = json_object();
+        if (nack_json == NULL) {
+            log_error(proc->logger, "Reputation: json_object OOM (nack)\n");
+            return true;
+        }
         json_object_set_new(nack_json, "id1", json_integer(id1));
         json_object_set_new(nack_json, "id2", json_integer(id2));
 
         generic_msg_t nack = {0};
         nack.type = NET_MESSAGE;
         strncpy(nack.info.net_msg.process, "reputation", PROC_NAME_LEN);
-        nack.info.net_msg.function = (char *)REP_PROTO_NACK;
+        nack.info.net_msg.function = REP_PROTO_NACK;
         nack.info.net_msg.encrypt = true;
         memcpy(&nack.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
         strncpy(nack.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
@@ -267,6 +299,11 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
     {
         /* Broadcast REP_PROTO_TX to all peers */
         json_t *tx_json = json_object();
+        if (tx_json == NULL) {
+            log_error(proc->logger, "Reputation: json_object OOM (tx)\n");
+            json_decref(payload);
+            return true;
+        }
         json_object_set_new(tx_json, "id1", json_integer(id1));
         json_object_set_new(tx_json, "id2", json_integer(id2));
         json_object_set_new(tx_json, "peer_uuid", json_string(peer_uuid_str));
@@ -282,7 +319,7 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
             generic_msg_t tx_msg = {0};
             tx_msg.type = NET_MESSAGE;
             strncpy(tx_msg.info.net_msg.process, "reputation", PROC_NAME_LEN);
-            tx_msg.info.net_msg.function = (char *)REP_PROTO_TX;
+            tx_msg.info.net_msg.function = REP_PROTO_TX;
             tx_msg.info.net_msg.encrypt = true;
             memcpy(&tx_msg.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
             strncpy(tx_msg.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
@@ -363,7 +400,7 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
             generic_msg_t retry = {0};
             retry.type = NET_MESSAGE;
             strncpy(retry.info.net_msg.process, "reputation", PROC_NAME_LEN);
-            retry.info.net_msg.function = (char *)REP_PROTO_REQUEST;
+            retry.info.net_msg.function = REP_PROTO_REQUEST;
             retry.info.net_msg.encrypt = false;
             /* to_whom zeroed → broadcast. The conformance hook resolves
              * a zero uuid to "broadcast" so this matches scenarios that
@@ -399,7 +436,7 @@ static bool handle_backdate(const process_t *proc, directory_t *queues, generic_
     generic_msg_t update_req = {0};
     update_req.type = NET_MESSAGE;
     strncpy(update_req.info.net_msg.process, "reputation", PROC_NAME_LEN);
-    update_req.info.net_msg.function = (char *)REP_PROTO_OUTDATED;
+    update_req.info.net_msg.function = REP_PROTO_OUTDATED;
     update_req.info.net_msg.encrypt = true;
     memcpy(&update_req.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
     strncpy(update_req.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
@@ -464,6 +501,10 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
 
     /* Send ACCEPTED back */
     json_t *acc_json = json_object();
+    if (acc_json == NULL) {
+        log_error(proc->logger, "Reputation: json_object OOM (accepted)\n");
+        return true;
+    }
     json_object_set_new(acc_json, "id1", json_integer(id1));
     json_object_set_new(acc_json, "id2", json_integer(id2));
     json_object_set_new(acc_json, "peer_uuid", json_string(peer_uuid_str));
@@ -473,7 +514,7 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     generic_msg_t accepted = {0};
     accepted.type = NET_MESSAGE;
     strncpy(accepted.info.net_msg.process, "reputation", PROC_NAME_LEN);
-    accepted.info.net_msg.function = (char *)REP_PROTO_ACCEPTED;
+    accepted.info.net_msg.function = REP_PROTO_ACCEPTED;
     accepted.info.net_msg.encrypt = true;
     memcpy(&accepted.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
     strncpy(accepted.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
@@ -600,7 +641,7 @@ static bool handle_outdated(const process_t *proc, directory_t *queues, generic_
     generic_msg_t update = {0};
     update.type = NET_MESSAGE;
     strncpy(update.info.net_msg.process, "reputation", PROC_NAME_LEN);
-    update.info.net_msg.function = (char *)REP_PROTO_UPDATE;
+    update.info.net_msg.function = REP_PROTO_UPDATE;
     update.info.net_msg.encrypt = true;
     memcpy(&update.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
     strncpy(update.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
@@ -783,6 +824,11 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
 
     /* Pack response (peer_uuid, score, requesting_process) */
     json_t *resp_json = json_object();
+    if (resp_json == NULL) {
+        log_error(proc->logger, "Reputation: json_object OOM (rep_resp)\n");
+        json_decref(payload);
+        return true;
+    }
     json_object_set_new(resp_json, "peer_uuid", json_string(peer_uuid_str));
     json_object_set_new(resp_json, "score", json_real(score));
     json_object_set_new(resp_json, "requesting_process", json_string(req_proc_str));
@@ -792,7 +838,7 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
     generic_msg_t resp = {0};
     resp.type = NET_MESSAGE;
     strncpy(resp.info.net_msg.process, "reputation", PROC_NAME_LEN);
-    resp.info.net_msg.function = (char *)REP_PROTO_REP_RESP;
+    resp.info.net_msg.function = REP_PROTO_REP_RESP;
     resp.info.net_msg.encrypt = true;
     memcpy(&resp.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
     strncpy(resp.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
@@ -887,6 +933,11 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
 
     /* Build response */
     json_t *resp_json = json_object();
+    if (resp_json == NULL) {
+        log_error(proc->logger, "Reputation: json_object OOM (local_resp)\n");
+        json_decref(payload);
+        return true;
+    }
     json_object_set_new(resp_json, "peer_uuid", json_string(peer_uuid_str));
     json_object_set_new(resp_json, "score", json_real(score));
     json_object_set_new(resp_json, "found", json_boolean(found));
@@ -896,7 +947,7 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
     generic_msg_t resp = {0};
     resp.type = NET_MESSAGE;
     strncpy(resp.info.net_msg.process, return_proc, PROC_NAME_LEN);
-    resp.info.net_msg.function = (char *)REP_PROTO_LOCAL_RESP;
+    resp.info.net_msg.function = REP_PROTO_LOCAL_RESP;
     net_msg_pack_json(&resp.info.net_msg, resp_json);
     json_decref(resp_json);
 
@@ -953,13 +1004,17 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
         generic_msg_t req = {0};
         req.type = NET_MESSAGE;
         strncpy(req.info.net_msg.process, "reputation", PROC_NAME_LEN);
-        req.info.net_msg.function = (char *)REP_PROTO_REQUEST;
+        req.info.net_msg.function = REP_PROTO_REQUEST;
         req.info.net_msg.encrypt = true;
         memcpy(&req.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
         strncpy(req.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
 
         /* Pack (id1, id2, identity_uuid) as JSON into the request */
         json_t *req_json = json_object();
+        if (req_json == NULL) {
+            log_error(proc->logger, "Reputation: json_object OOM (start_paxos)\n");
+            continue;
+        }
         json_object_set_new(req_json, "id1", json_integer(id1));
         json_object_set_new(req_json, "id2", json_integer(id2));
         json_object_set_new(req_json, "peer_uuid", json_string(identity_uuid));
@@ -979,17 +1034,17 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
 int reputation_register_handlers(process_t *proc)
 {
     if (proc == NULL) return -1;
-    process_register_handler(proc, (char *)REP_PROTO_REQUEST,   (handler_ptr_t)handle_request);
-    process_register_handler(proc, (char *)REP_PROTO_GRANT,     (handler_ptr_t)handle_grant);
-    process_register_handler(proc, (char *)REP_PROTO_NACK,      (handler_ptr_t)handle_nack);
-    process_register_handler(proc, (char *)REP_PROTO_BACKDATE,  (handler_ptr_t)handle_backdate);
-    process_register_handler(proc, (char *)REP_PROTO_TX,        (handler_ptr_t)handle_transaction);
-    process_register_handler(proc, (char *)REP_PROTO_ACCEPTED,  (handler_ptr_t)handle_accepted);
-    process_register_handler(proc, (char *)REP_PROTO_OUTDATED,  (handler_ptr_t)handle_outdated);
-    process_register_handler(proc, (char *)REP_PROTO_UPDATE,    (handler_ptr_t)handle_update);
-    process_register_handler(proc, (char *)REP_PROTO_REP_REQ,   (handler_ptr_t)handle_rep_request);
-    process_register_handler(proc, (char *)REP_PROTO_REP_RESP,  (handler_ptr_t)handle_rep_response);
-    process_register_handler(proc, (char *)REP_PROTO_LOCAL_QUERY, (handler_ptr_t)handle_local_rep_query);
+    process_register_handler(proc, REP_PROTO_REQUEST,   (handler_ptr_t)handle_request);
+    process_register_handler(proc, REP_PROTO_GRANT,     (handler_ptr_t)handle_grant);
+    process_register_handler(proc, REP_PROTO_NACK,      (handler_ptr_t)handle_nack);
+    process_register_handler(proc, REP_PROTO_BACKDATE,  (handler_ptr_t)handle_backdate);
+    process_register_handler(proc, REP_PROTO_TX,        (handler_ptr_t)handle_transaction);
+    process_register_handler(proc, REP_PROTO_ACCEPTED,  (handler_ptr_t)handle_accepted);
+    process_register_handler(proc, REP_PROTO_OUTDATED,  (handler_ptr_t)handle_outdated);
+    process_register_handler(proc, REP_PROTO_UPDATE,    (handler_ptr_t)handle_update);
+    process_register_handler(proc, REP_PROTO_REP_REQ,   (handler_ptr_t)handle_rep_request);
+    process_register_handler(proc, REP_PROTO_REP_RESP,  (handler_ptr_t)handle_rep_response);
+    process_register_handler(proc, REP_PROTO_LOCAL_QUERY, (handler_ptr_t)handle_local_rep_query);
     return 0;
 }
 
