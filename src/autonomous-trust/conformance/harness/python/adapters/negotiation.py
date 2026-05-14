@@ -99,23 +99,39 @@ class _Participant:
     def _check_expected_state(self, asserts: dict[str, Any]) -> None:
         for key, expected in asserts.items():
             if key == 'has_my_task':
-                # `expected` is a slug; derive the same task uuid the
-                # adapter mints in `_build_inbound`
-                # (`uuid5(_NS, f'task:{slug}')`) and look it up in
-                # process.my_tasks. The prior literal-string comparison
-                # never matched a slug against uuid strings — fixed
-                # alongside the symmetric C-side `has_my_task` accessor
-                # so the two adapters agree on what this key means.
-                want_uuid = uuid5(_NS, f'task:{expected}')
-                if want_uuid not in self.process.my_tasks:
+                # Accepts either a slug string (positive presence check)
+                # or a dict {slug, present: bool} for either direction.
+                # Mirrors C's _negotiation_check_expected_state branch.
+                if isinstance(expected, str):
+                    slug, want_present = expected, True
+                elif isinstance(expected, dict):
+                    slug = expected.get('slug')
+                    want_present = bool(expected.get('present', True))
+                    if not isinstance(slug, str):
+                        raise AssertionError(
+                            f'{self.id}: has_my_task dict requires slug=<str>, '
+                            f'got {expected!r}'
+                        )
+                else:
                     raise AssertionError(
-                        f'{self.id}: my_tasks does not contain task uuid '
-                        f'{want_uuid} (slug {expected!r}); have '
+                        f'{self.id}: has_my_task expects str or '
+                        f'{{slug, present}}, got {expected!r}'
+                    )
+                want_uuid = uuid5(_NS, f'task:{slug}')
+                got = want_uuid in self.process.my_tasks
+                if got != want_present:
+                    raise AssertionError(
+                        f'{self.id}: has_my_task slug={slug!r} (uuid={want_uuid}) '
+                        f'present={got}, expected {want_present}; have '
                         f'{sorted(str(u) for u in self.process.my_tasks)}'
                     )
             elif key == 'confirmed':
-                if not self.process.confirmed:
-                    raise AssertionError(f'{self.id}: confirmed map is empty')
+                want = bool(expected)
+                got = bool(self.process.confirmed)
+                if got != want:
+                    raise AssertionError(
+                        f'{self.id}: confirmed={got}, expected {want}'
+                    )
             elif key == 'task_in_stack':
                 actual = any(True for _ in self.process.task_stack._heap)
                 if actual != bool(expected):

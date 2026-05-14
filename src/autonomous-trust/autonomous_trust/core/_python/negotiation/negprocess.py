@@ -129,8 +129,21 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                 self.proposed_tasks[task.uuid] = TaskCounter(task)
             self.proposed_tasks[task.uuid].count += 1
             self.flood_counts[task.uuid] = self.flood_counts.get(task.uuid, 0) + 1
+            # Flood threshold: refuse the invite and short-circuit further
+            # processing. Mirrors C's neg_proc.c handle_invite — see BUGS.md
+            # §P7 for counter persistence and the past-threshold action
+            # alignment rationale.
             if self.flood_counts[task.uuid] > self.max_task_duplicates:
-                self.peers.demote(message.from_whom)
+                self.logger.warning(
+                    'Negotiation: flood detected for task %s (count=%d), refusing'
+                    % (task.uuid, self.flood_counts[task.uuid]))
+                try:
+                    msg = Message(self.name, NegotiationProtocol.refusal,
+                                  task.to_json_string(), message.from_whom)
+                    queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+                except Full:
+                    self.logger.error('handle_invite: Network queue full (flood-refuse)')
+                return True
             try:
                 if task.capability not in self.capabilities:
                     msg = Message(self.name, NegotiationProtocol.refusal, task.to_json_string(), message.from_whom)

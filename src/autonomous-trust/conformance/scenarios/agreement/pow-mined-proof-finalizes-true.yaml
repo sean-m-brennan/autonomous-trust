@@ -9,25 +9,14 @@ description: |
     `protocol.prove()` implementation, then runs verify and asserts
     finalize=true.
 
-    PER-LANGUAGE MINING (this is the design, not a test gap): Python's
-    `nacl.hash.blake2b` returns ASCII-hex bytes; C's
-    `crypto_generichash` returns raw bytes. The `DIFFICULTY=2` setting
-    consequently means different things in each impl — Python checks 2
-    leading hex `'0'` chars (1 zero byte), C checks 2 leading raw zero
-    bytes. Both impls still produce mineable proofs at their own
-    difficulty; the conformance gate compares only the *outcome* of
-    `finalize` (true on both sides), not the digest bytes. The
-    cross-language digest-format and DIFFICULTY-interpretation drift
-    is tracked as BUGS.md P5 and deferred for production alignment.
-
-    Why this scenario still adds value despite per-language semantics:
-      - Exercises the full prove/verify/finalize POW state machine in
-        both languages end-to-end.
-      - Confirms `agreement_prove` and `protocol.prove` produce proofs
-        their own verifier accepts (a regression would surface as
-        outcome=false on one or both sides).
-      - Gives a structural template for a future cross-language POW
-        scenario after the canonical-hash plumbing lands.
+    Cross-language semantics are now aligned (BUGS.md §P5 CLOSED
+    2026-05-14): both Python and C use raw 32-byte blake2b digests
+    and check `DIFFICULTY` leading zero BYTES. The digest bytes for
+    the same input are byte-identical; see
+    `pow-cross-language-byte-pin.yaml` for the explicit assertion.
+    This scenario stays focused on the end-to-end outcome
+    (finalize=true) so a regression in the prove→verify→finalize
+    state machine surfaces independently of the digest format.
 
 participants:
   - id: alice
@@ -62,6 +51,7 @@ steps:
       blob: blob-x
       expected_outcome: true
     description: |
-        finalize sees the approved blob and returns true. The exact
-        digest bytes differ across languages (see P5); only the
-        outcome is cross-language asserted.
+        finalize sees the approved blob and returns true. After §P5
+        alignment the digest bytes are also cross-language identical;
+        this scenario asserts only the protocol outcome — see
+        `pow-cross-language-byte-pin.yaml` for the digest byte-pin.

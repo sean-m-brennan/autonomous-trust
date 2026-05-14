@@ -76,8 +76,11 @@ def test_verify_matching_hash():
     me = _mock_voter()
     ew = EasyWork(me, [])
     blob = SimpleBlob()
-    real_hash = blob.get_hash()
-    proof = AgreementProof(me.uuid, real_hash, True, nonce=None)
+    # POW now uses raw blake2b bytes (BUGS.md §P5 cross-language note,
+    # CLOSED 2026-05-14); construct the proof digest with the same
+    # helper verify() will use to recompute it.
+    from autonomous_trust.core._python.algorithms.work import _raw_hash
+    proof = AgreementProof(me.uuid, _raw_hash(blob), True, nonce=None)
     result = ew.verify(blob, proof, b'sig')
     assert result is True
     assert blob in ew._approved

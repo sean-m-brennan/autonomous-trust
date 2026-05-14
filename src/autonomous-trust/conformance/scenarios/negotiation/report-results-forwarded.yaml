@@ -15,17 +15,14 @@ description: |
     Setup: step 1 has alice spawn a local task (populating
     alice.my_tasks via start_task and fan-outing an invitation to
     bob); step 2 has bob report results back to alice. After
-    step 2, alice.my_tasks no longer contains the task — that's
-    the cross-language no-crash assertion this scenario pins.
+    step 2, alice.my_tasks no longer contains the task and
+    alice.task_stack is empty — both pinned via expected_state.
 
-    Why we can't directly assert "task absent from my_tasks":
-    the negotiation adapter's `has_my_task` expected_state key
-    only supports a positive presence check (raises if absent).
-    The conformance value here is therefore cross-language
-    equivalence at the no-crash level — both Python and C must
-    walk the same two-step path without exception. An inverse
-    assertion lands later if `has_my_task: false` becomes a
-    supported observable.
+    The negative-form `has_my_task: {slug, present:false}` and the
+    `task_in_stack: false` assertion rely on per-scenario state
+    reset in the C adapter (negotiation_reset_state) — without it,
+    file-static neg_state would carry residue from alphabetically
+    earlier scenarios.
 
 participants:
   - id: alice
@@ -61,9 +58,7 @@ steps:
         defaulting to 1) forwards the TaskResult to the main
         queue, then deletes my_tasks[uuid].
 
-# No expected_state — handle_results clears my_tasks[uuid], which the
-# adapter's `has_my_task` key can't assert in the negative. C's
-# neg_state is a file-static singleton so other negative observables
-# (e.g. task_in_stack: false) are polluted by prior scenarios. The
-# conformance value here is cross-language no-crash equivalence: both
-# Python and C walk the same two-step path without exception.
+expected_state:
+  alice:
+    has_my_task: {slug: t-results, present: false}
+    task_in_stack: false

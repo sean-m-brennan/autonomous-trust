@@ -67,6 +67,15 @@ void negotiation_set_peer_level(const process_t *proc,
  *  Idempotent. The harness calls this between scenarios. */
 void negotiation_clear_test_state(const process_t *proc);
 
+/** Wipe the entire negotiation singleton state (task_stack,
+ *  proposed_tasks, my_tasks, confirmed, status_pending, and all
+ *  conformance-only override maps) and re-init each container.
+ *  Conformance-only. The harness calls this at the start of every
+ *  scenario so negative observables (`task_in_stack: false`,
+ *  `has_my_task: false` for a slug-derived uuid, etc.) are not
+ *  polluted by prior scenarios run in alphabetical order. */
+void negotiation_reset_state(void);
+
 /** Read the current size of the shared task_stack for
  *  `task_in_stack` expected_state assertions. Returns -1 if neg_state
  *  is uninitialized. Mirrors the Python adapter's check on

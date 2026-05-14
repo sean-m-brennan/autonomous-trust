@@ -207,6 +207,26 @@ void negotiation_clear_test_state(const process_t *proc)
     pthread_mutex_unlock(&neg_state.lock);
 }
 
+void negotiation_reset_state(void)
+{
+    _ensure_init();
+    pthread_mutex_lock(&neg_state.lock);
+    job_queue_clear(&neg_state.task_stack);
+    map_free(&neg_state.proposed_tasks);
+    map_init(&neg_state.proposed_tasks);
+    map_free(&neg_state.my_tasks);
+    map_init(&neg_state.my_tasks);
+    map_free(&neg_state.confirmed);
+    map_init(&neg_state.confirmed);
+    array_free(&neg_state.status_pending);
+    array_init(&neg_state.status_pending);
+    map_free(&neg_state.own_caps_by_proc);
+    map_init(&neg_state.own_caps_by_proc);
+    map_free(&neg_state.peer_levels);
+    map_init(&neg_state.peer_levels);
+    pthread_mutex_unlock(&neg_state.lock);
+}
+
 /****************************
  * Helper: build a reply net_msg_t directed back to sender
  ****************************/
