@@ -7,20 +7,25 @@ description: |
     Documentation canonical for the Identity protocol — picked up by
     `scripts/build-docs.sh` via the `<protocol>-canonical.yaml`
     convention and rendered into `doc/architecture/_generated/`.
-    Mirrors `new-node-admission` step-for-step; the duplication is
-    intentional so the docs example has a stable filename
-    (`identity-canonical`) that won't move when `new-node-admission`
-    is updated, while still running through the same conformance
-    code path so the diagram cannot drift from executable behavior.
+    Drives the same code path as `new-node-admission` plus a
+    second border guard (peer_a) casting an explicit vote, so the
+    generated diagram conveys the multi-BG voting pattern the
+    hand-authored Identity sequence diagram in
+    `doc/architecture/identity-protocol.md` is built around.
 
-    Flow: a new node broadcasts `request_access`; the border guard
-    (bg) runs welcoming_committee, proposes the candidate to the
-    group, votes (synchronously under `synchronous_dispatch`),
-    finalizes the agreement, and emits the confirm/accept/history
-    triple to bring the newcomer into the group.
+    Flow: a new node broadcasts `request_access`; bg's
+    welcoming_committee proposes the candidate to the encrypted
+    group channel; peer_a (another BG) votes to admit; bg's
+    handle_count_vote tallies and emits `peer_accepted` to the
+    group; bg sends `access_granted` and `full_history` directly
+    to the newcomer to complete admission. v1 schema can't render
+    `alt`/`else` branches, so the amnesia path
+    (`amnesia-readmission.yaml`) is documented separately.
 
 participants:
   - id: bg
+    role: border_guard
+  - id: peer_a
     role: border_guard
   - id: newcomer
     role: new_node
@@ -41,18 +46,29 @@ steps:
     in_response_to: 1
     description: |
         bg's welcoming_committee emits a propose_peer to the encrypted group
-        channel so other border guards can vote.
+        channel so other border guards (peer_a here) can vote.
 
   - id: 3
+    from: peer_a
+    to: bg
+    function: vote_on_peer
+    payload:
+      candidate: newcomer
+      approved: true
+    description: |
+        peer_a (another BG) votes to admit newcomer. bg's
+        handle_count_vote tallies via vote_collection_increment.
+
+  - id: 4
     from: bg
     to: broadcast
     function: peer_accepted
     in_response_to: 1
     description: |
-        After synchronous _vote_collection finalizes, _peer_accepted broadcasts
-        a peer_accepted to the encrypted group channel.
+        After synchronous _vote_collection finalizes, _peer_accepted
+        broadcasts a peer_accepted to the encrypted group channel.
 
-  - id: 4
+  - id: 5
     from: bg
     to: newcomer
     function: access_granted
@@ -61,7 +77,7 @@ steps:
         bg sends its own published identity to newcomer in the open so the
         newcomer can encrypt subsequent traffic to bg.
 
-  - id: 5
+  - id: 6
     from: bg
     to: newcomer
     function: full_history
