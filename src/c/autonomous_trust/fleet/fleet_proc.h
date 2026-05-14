@@ -27,12 +27,15 @@
 #include "autonomous_trust/processes/processes.h"
 #include "autonomous_trust/fleet/update_proposal.h"
 
-#define FLEET_PROTO_PROPOSE      "update proposal"
-#define FLEET_PROTO_VOTE_REQ     "update vote request"
-#define FLEET_PROTO_VOTE_GRANT   "update vote grant"
-#define FLEET_PROTO_VOTE_NACK    "update vote nack"
-#define FLEET_PROTO_ACCEPTED     "update accepted"
-#define FLEET_PROTO_REJECTED     "update rejected"
+/* Writable char arrays — definitions in `fleet_proc.c`. Avoids the
+ * `(char *)` const-cast at every assignment to `net_msg.function`
+ * under `-Wwrite-strings`. */
+extern char FLEET_PROTO_PROPOSE[];
+extern char FLEET_PROTO_VOTE_REQ[];
+extern char FLEET_PROTO_VOTE_GRANT[];
+extern char FLEET_PROTO_VOTE_NACK[];
+extern char FLEET_PROTO_ACCEPTED[];
+extern char FLEET_PROTO_REJECTED[];
 
 #define FLEET_DEFAULT_MIN_REPUTATION 0.7
 

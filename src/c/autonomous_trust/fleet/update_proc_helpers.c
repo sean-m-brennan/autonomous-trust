@@ -30,6 +30,7 @@
 #include <jansson.h>
 
 #include "fleet/update_proc.h"
+#include "utilities/at_jansson.h"
 #include "utilities/util.h"
 
 /* ------------------------------------------------------------------ */
@@ -87,34 +88,16 @@ int update_state_read(const char *data_dir, update_state_t *state)
     if (!root)
         return -1;
 
-    const char *s;
-
-    s = json_string_value(json_object_get(root, "state"));
-    if (s) strncpy(state->state, s, sizeof(state->state) - 1);
-    state->state[sizeof(state->state) - 1] = '\0';
-
-    s = json_string_value(json_object_get(root, "version"));
-    if (s) strncpy(state->version, s, sizeof(state->version) - 1);
-    state->version[sizeof(state->version) - 1] = '\0';
-
-    s = json_string_value(json_object_get(root, "hash_hex"));
-    if (s) strncpy(state->hash_hex, s, sizeof(state->hash_hex) - 1);
-    state->hash_hex[sizeof(state->hash_hex) - 1] = '\0';
-
-    s = json_string_value(json_object_get(root, "backup_path"));
-    if (s) strncpy(state->backup_path, s, sizeof(state->backup_path) - 1);
-    state->backup_path[sizeof(state->backup_path) - 1] = '\0';
-
-    s = json_string_value(json_object_get(root, "binary_path"));
-    if (s) strncpy(state->binary_path, s, sizeof(state->binary_path) - 1);
-    state->binary_path[sizeof(state->binary_path) - 1] = '\0';
+    AT_JSON_STRING(root, "state",       state->state);
+    AT_JSON_STRING(root, "version",     state->version);
+    AT_JSON_STRING(root, "hash_hex",    state->hash_hex);
+    AT_JSON_STRING(root, "backup_path", state->backup_path);
+    AT_JSON_STRING(root, "binary_path", state->binary_path);
 
     state->timestamp = (long)json_integer_value(json_object_get(root, "timestamp"));
     state->attempt   = (int)json_integer_value(json_object_get(root, "attempt"));
 
-    s = json_string_value(json_object_get(root, "type"));
-    if (s) strncpy(state->type, s, sizeof(state->type) - 1);
-    state->type[sizeof(state->type) - 1] = '\0';
+    AT_JSON_STRING(root, "type",        state->type);
 
     json_decref(root);
     return 0;

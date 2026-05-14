@@ -193,12 +193,16 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr)
     json_object_set_new(obj, "petname", json_string(ident->petname));
 
     json_t *sig = json_object();
+    if (sig == NULL)
+        return EXCEPTION(ENOMEM);
     unsigned char *hex = signature_publish(&ident->signature); // encoded
     json_object_set_new(sig, "hex_seed", json_string((char *)hex));
     free(hex);
     json_object_set_new(obj, "signature", sig);
 
     json_t *encr = json_object();
+    if (encr == NULL)
+        return EXCEPTION(ENOMEM);
     hex = encryptor_publish(&ident->encryptor); // encoded
     json_object_set_new(encr, "hex_seed", json_string((char *)hex));
     free(hex);
