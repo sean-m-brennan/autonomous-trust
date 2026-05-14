@@ -28,12 +28,14 @@ extern "C" {
 /**
  * @brief ZTA protocol message function names
  *
- * These are used in the network message 'function' field to identify
- * ZTA-specific protocol messages exchanged between peers.
+ * Used in the network message 'function' field to identify ZTA-specific
+ * protocol messages exchanged between peers. Declared as writable
+ * char arrays (definitions in zta_process.c) so they're assignable to
+ * `char *` fields without a const-cast under `-Wwrite-strings`.
  */
-#define ZTA_PROTO_REVOCATION_ALERT  "zta_revoked"     /* Alert group about a revocation */
-#define ZTA_PROTO_VERIFICATION      "zta_verified"    /* Share verification result */
-#define ZTA_PROTO_REVERIFY_REQ      "zta_reverify"    /* Request peers to re-verify a peer */
+extern char ZTA_PROTO_REVOCATION_ALERT[];  /* Alert group about a revocation */
+extern char ZTA_PROTO_VERIFICATION[];      /* Share verification result */
+extern char ZTA_PROTO_REVERIFY_REQ[];      /* Request peers to re-verify a peer */
 
 #ifdef __cplusplus
 } /* extern "C" */

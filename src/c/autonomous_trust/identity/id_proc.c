@@ -201,8 +201,79 @@ static int _remember_activity(const process_t *proc, directory_t *queues, generi
 }
 
 /****************************
+ * Helper: _update_group
+ * Phase-3 group churn — broadcast the current group state to all peers so
+ * they converge on our address_map / group key. Mirrors Python's
+ * `_update_group` (idprocess.py:598).
+ *
+ * Two emit modes (same shape as _peer_accepted's ID_CONFIRM fanout):
+ *   - production: per-peer encrypted unicast.
+ *   - synchronous_dispatch: a single broadcast (to_whom zeroed) so a
+ *     bg-only conformance scenario sees one outbound regardless of
+ *     peer count.
+ *
+ * The receive-side (handle_group_update) MUST apply the uuid tiebreaker
+ * on equal-size address lists to prevent an ID_UPDATE ping-pong flood —
+ * see the constraint block above handle_group_update and memory entry
+ * `feedback_group_update_flood.md`.
+ ****************************/
+
+/* Frama-C: skipped — [solver-timeout] identity/peers/JSON preconditions */
+static int _update_group(const process_t *proc, directory_t *queues)
+{
+    (void)queues; /* network emission uses messaging_send by queue name */
+
+    if (id_state.synchronous_dispatch)
+    {
+        generic_msg_t update = {0};
+        update.type = NET_MESSAGE;
+        strncpy(update.info.net_msg.process, "identity", PROC_NAME_LEN);
+        update.info.net_msg.function = ID_UPDATE;
+        update.info.net_msg.encrypt = false;
+        /* to_whom left zeroed → network layer broadcast */
+        json_t *grp_json = NULL;
+        if (group_to_json(&proc->protocol.group, &grp_json) != 0 || grp_json == NULL)
+        {
+            log_error(proc->logger, "Identity: group_to_json failed (update broadcast)\n");
+            if (grp_json != NULL) json_decref(grp_json);
+            return EXCEPTION(ENOMEM);
+        }
+        net_msg_pack_json(&update.info.net_msg, grp_json);
+        json_decref(grp_json);
+        messaging_send("network", NET_MESSAGE, &update, false);
+        return 0;
+    }
+
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        generic_msg_t update = {0};
+        update.type = NET_MESSAGE;
+        strncpy(update.info.net_msg.process, "identity", PROC_NAME_LEN);
+        update.info.net_msg.function = ID_UPDATE;
+        update.info.net_msg.encrypt = true;
+        memcpy(&update.info.net_msg.to_whom, &proc->protocol.peers[i],
+               sizeof(public_identity_t));
+        json_t *grp_json = NULL;
+        if (group_to_json(&proc->protocol.group, &grp_json) != 0 || grp_json == NULL)
+        {
+            log_error(proc->logger, "Identity: group_to_json failed (update fanout)\n");
+            if (grp_json != NULL) json_decref(grp_json);
+            continue;
+        }
+        net_msg_pack_json(&update.info.net_msg, grp_json);
+        json_decref(grp_json);
+        messaging_send("network", NET_MESSAGE, &update, false);
+    }
+    peers_read_unlock(proc);
+    return 0;
+}
+
+/****************************
  * Helper: _add_peer
  * Adds a new peer to the process's peer list and broadcasts to local processes.
+ * Then mirrors Python's `_add_peer` (idprocess.py:701) by recording the new
+ * peer's address in the group map and emitting ID_UPDATE to existing peers.
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] logging/identity/peers preconditions */
@@ -232,13 +303,74 @@ static int _add_peer(process_t *proc, directory_t *queues, const public_identity
     peer_msg.type = PEER;
     memcpy(&peer_msg.info.peer, new_peer, sizeof(public_identity_t));
     _remember_activity(proc, queues, &peer_msg);
+
+    /* Phase-3 group churn — parity with Python's _add_peer (idprocess.py:705).
+     * Record the new peer's address in our group's address_map, then broadcast
+     * the updated group to existing peers via _update_group. The receive-side
+     * tiebreaker prevents an ID_UPDATE ping-pong flood. */
+    if (proc->protocol.group.address_map.items == NULL)
+        map_init(&proc->protocol.group.address_map);
+    char new_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(new_peer->uuid, new_uuid_str);
+    if (group_add_address(&proc->protocol.group, new_uuid_str, (char *)new_peer->address) == 0)
+    {
+        /* Local-process broadcast of the updated group (Python: _record_group). */
+        generic_msg_t group_msg = {0};
+        group_msg.type = GROUP;
+        memcpy(&group_msg.info.group, &proc->protocol.group, sizeof(group_t));
+        _remember_activity(proc, queues, &group_msg);
+        /* Push the updated group to our peers. */
+        _update_group(proc, queues);
+    }
+    return 0;
+}
+
+/****************************
+ * Helper: _send_caps_query
+ * Directed UDP-loss recovery — sends ID_CAPS_QUERY to a specific peer over
+ * the network. Mirrors Python's `_send_caps_query` (idprocess.py:870).
+ *
+ * Used by `handle_confirm_peer` when the incoming peer's UUID is missing
+ * from `id_state.peer_potentials` — i.e. their `announce` (UDP broadcast)
+ * was lost, so we never populated their cap potentials, but the confirm
+ * (group/TCP) arrived and we're about to admit them. Without this query,
+ * the late joiner ends up in `peers[]` but absent from `peer_capabilities`,
+ * invisible to cap-driven discovery (see memory feedback_late_joiner_caps).
+ *
+ * Encrypt=false: when the announce is lost we typically lack the peer's
+ * crypto material, so we can't authenticated-encrypt to them. The peer's
+ * `handle_caps_query` doesn't gate on encryption; the response back to us
+ * (which has the encryptor key needed) is the encrypted leg. The caller
+ * must populate `peer->address` for routing.
+ ****************************/
+
+/* Frama-C: skipped — [solver-timeout] identity/messaging preconditions */
+static int _send_caps_query(const process_t *proc, const public_identity_t *peer)
+{
+    generic_msg_t query = {0};
+    query.type = NET_MESSAGE;
+    strncpy(query.info.net_msg.process, "identity", PROC_NAME_LEN);
+    query.info.net_msg.function = ID_CAPS_QUERY;
+    query.info.net_msg.encrypt = false;
+    memcpy(&query.info.net_msg.to_whom, peer, sizeof(public_identity_t));
+    strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    messaging_send("network", NET_MESSAGE, &query, false);
+    log_info(proc->logger,
+             "Identity: sent caps_query to %s (UDP-loss recovery)\n",
+             peer->fullname);
     return 0;
 }
 
 /****************************
  * Helper: _peer_accepted
  * Sends ID_CONFIRM to existing group members and ID_ACCEPT to the new peer,
- * then adds the peer to our list.
+ * then adds the peer to our list (which also triggers Phase-3 group churn
+ * inside `_add_peer` — see the constraint block above `handle_group_update`
+ * for the tiebreaker rule that prevents an ID_UPDATE flood).
+ *
+ * Confirm payload carries `{uuid, fullname, address}` so the receiver can
+ * route a directed `caps_query` back to the new peer if its announce was
+ * lost (UDP-loss recovery — see _send_caps_query).
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] identity/peers preconditions */
@@ -262,10 +394,15 @@ static int _peer_accepted(process_t *proc, directory_t *queues, const public_ide
         confirm.info.net_msg.encrypt = false;
         /* to_whom left zeroed → network layer broadcast */
         json_t *peer_json = json_object();
+        if (peer_json == NULL) {
+            log_error(proc->logger, "Identity: json_object OOM (confirm broadcast)\n");
+            return EXCEPTION(ENOMEM);
+        }
         char uuid_str[UUID_STRING_LEN + 1];
         uuid_unparse_lower(new_peer->uuid, uuid_str);
         json_object_set_new(peer_json, "uuid", json_string(uuid_str));
         json_object_set_new(peer_json, "fullname", json_string(new_peer->fullname));
+        json_object_set_new(peer_json, "address", json_string(new_peer->address));
         net_msg_pack_json(&confirm.info.net_msg, peer_json);
         json_decref(peer_json);
         messaging_send("network", NET_MESSAGE, &confirm, false);
@@ -282,10 +419,15 @@ static int _peer_accepted(process_t *proc, directory_t *queues, const public_ide
             confirm.info.net_msg.encrypt = true;
             memcpy(&confirm.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
             json_t *peer_json = json_object();
+            if (peer_json == NULL) {
+                log_error(proc->logger, "Identity: json_object OOM (confirm fanout)\n");
+                continue;
+            }
             char uuid_str[UUID_STRING_LEN + 1];
             uuid_unparse_lower(new_peer->uuid, uuid_str);
             json_object_set_new(peer_json, "uuid", json_string(uuid_str));
             json_object_set_new(peer_json, "fullname", json_string(new_peer->fullname));
+            json_object_set_new(peer_json, "address", json_string(new_peer->address));
             net_msg_pack_json(&confirm.info.net_msg, peer_json);
             json_decref(peer_json);
             messaging_send("network", NET_MESSAGE, &confirm, false);
@@ -468,6 +610,10 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
      * harness sees a single propose_peer outbound regardless of peer
      * count. Production fans out one encrypted unicast per peer. */
     json_t *proposal_json = json_object();
+    if (proposal_json == NULL) {
+        log_error(proc->logger, "Identity: json_object OOM (propose_peer)\n");
+        return true;
+    }
     json_object_set_new(proposal_json, "uuid", json_string(uuid_str));
     json_object_set_new(proposal_json, "fullname", json_string(nmsg->from_whom.fullname));
     json_object_set_new(proposal_json, "address", json_string(nmsg->from_whom.address));
@@ -672,6 +818,10 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
 
     /* Pack approval vote */
     json_t *vote_json = json_object();
+    if (vote_json == NULL) {
+        log_error(proc->logger, "Identity: json_object OOM (vote)\n");
+        return true;
+    }
     json_object_set_new(vote_json, "uuid", json_string(proposed_uuid));
     json_object_set_new(vote_json, "approved", json_true());
 
@@ -893,6 +1043,7 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
 
     json_t *j_uuid     = json_object_get(payload, "uuid");
     json_t *j_fullname = json_object_get(payload, "fullname");
+    json_t *j_address  = json_object_get(payload, "address");
 
     if (!j_uuid || !j_fullname)
     {
@@ -903,6 +1054,7 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
 
     const char *uuid_str  = json_string_value(j_uuid);
     const char *fullname  = json_string_value(j_fullname);
+    const char *address   = j_address ? json_string_value(j_address) : NULL;
 
     /* Reconstruct public_identity_t from JSON fields */
     public_identity_t new_peer;
@@ -911,10 +1063,38 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
         uuid_parse(uuid_str, new_peer.uuid);
     if (fullname != NULL)
         strncpy(new_peer.fullname, fullname, NAME_LEN);
+    if (address != NULL)
+        strncpy(new_peer.address, address, ADDR_LEN);
 
     json_decref(payload);
 
     log_info(proc->logger, "Identity: confirmed peer %s (%s)\n", fullname, uuid_str);
+
+    /* UDP-loss recovery: if the new peer's announce never reached us, their
+     * UUID is absent from id_state.peer_potentials. The confirm broadcast is
+     * still reliable (group/TCP), so the peer is in `peers[]` but has no
+     * registered capabilities — invisible to cap-driven discovery. Mirrors
+     * Python's handle_confirm_peer (idprocess.py:847). Requires `address`
+     * from the confirm payload to route the query. See memory entry
+     * feedback_late_joiner_caps.md. */
+    if (uuid_str != NULL && address != NULL && address[0] != '\0')
+    {
+        pthread_mutex_lock(&id_state.lock);
+        data_t *pot_dat = NULL;
+        bool has_potential = (map_get(&id_state.peer_potentials,
+                                      (map_key_t)uuid_str, &pot_dat) == 0
+                              && pot_dat != NULL);
+        pthread_mutex_unlock(&id_state.lock);
+        if (!has_potential)
+        {
+            log_info(proc->logger,
+                     "Identity: no prior caps potential for %s (%s) — "
+                     "querying directly (announce likely lost)\n",
+                     fullname, uuid_str);
+            _send_caps_query(proc, &new_peer);
+        }
+    }
+
     _add_peer(proc, queues, &new_peer);
 
     return true;
@@ -966,7 +1146,32 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
 
 /****************************
  * Handler: handle_group_update (group_key_update)
- * Phase 3 only. Receives group address list updates.
+ * Phase 3 only. Receives group address list updates and either adopts the
+ * incoming group or, when we are the canonical winner, pushes our group to
+ * peers via `_update_group` so the network converges.
+ *
+ * !!! TIEBREAKER CONSTRAINT — DO NOT REMOVE !!!
+ *
+ * Mirrors Python's idprocess.py::handle_group_update. Equal-size address
+ * lists with differing uuids MUST be broken deterministically by uuid (the
+ * smaller-uuid peer wins). The loser silently adopts; only the winner
+ * re-broadcasts. Symmetric reflection on equality is the predicate that
+ * produces a network-wide ID_UPDATE flood (~10k msgs/sec) — observed in a
+ * civilian-demo run; see memory entry `feedback_group_update_flood.md`.
+ *
+ * Decision matrix:
+ *   same uuid:
+ *     theirs > mine  → adopt (replace map)
+ *     theirs <= mine → silent no-op (NEVER echo)
+ *   different uuid:
+ *     theirs > mine  → adopt
+ *     theirs < mine  → push our group (we are larger; canonical winner)
+ *     equal size     → adopt iff strcmp(theirs.uuid, mine.uuid) < 0;
+ *                      otherwise push our group (we are uuid-tiebreak winner)
+ *
+ * The emit-side is in _update_group; the natural call site is _add_peer
+ * (via _peer_accepted) on every new admission. That path also exercises
+ * this tiebreaker on the receive side.
  ****************************/
 
 /* Frama-C: skipped —
@@ -990,37 +1195,109 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
     log_info(proc->logger, "Identity: received group update from %s\n",
              nmsg->from_whom.fullname);
 
-    /* Unpack group JSON from payload */
     json_t *payload = NULL;
-    bool updated = false;
-    if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL)
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true; /* malformed payload — discard, do not echo */
+
+    /* Incoming group uuid + address_map size. */
+    json_t *j_uuid = json_object_get(payload, "uuid");
+    const char *theirs_uuid_str = j_uuid ? json_string_value(j_uuid) : NULL;
+    uuid_t theirs_uuid = {0};
+    bool theirs_uuid_valid = (theirs_uuid_str != NULL
+                              && uuid_parse(theirs_uuid_str, theirs_uuid) == 0);
+
+    json_t *j_addr_map = json_object_get(payload, "address_map");
+    size_t theirs_size = (j_addr_map != NULL && json_is_object(j_addr_map))
+                         ? json_object_size(j_addr_map) : 0;
+
+    /* Mine: snapshot uuid + address_map size. */
+    size_t mine_size = map_size(&((process_t *)proc)->protocol.group.address_map);
+    char mine_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proc->protocol.group.uuid, mine_uuid_str);
+
+    bool same_group = theirs_uuid_valid
+                      && uuid_compare(theirs_uuid, proc->protocol.group.uuid) == 0;
+
+    bool adopt = false;
+    if (same_group)
     {
-        /* Extract address count from incoming payload to compare with current group */
-        json_t *j_address = json_object_get(payload, "address");
-        const char *incoming_addr = j_address ? json_string_value(j_address) : NULL;
-
-        /* Compare: if incoming has a non-empty address and current group address differs,
-         * treat as newer/replacement and update */
-        if (incoming_addr != NULL && incoming_addr[0] != '\0' &&
-            strcmp(incoming_addr, proc->protocol.group.address) != 0)
+        /* Same group: adopt strictly larger membership, else silent no-op. */
+        if (theirs_size > mine_size)
+            adopt = true;
+        else
         {
-            /* Update group address from incoming payload */
-            strncpy(((process_t *)proc)->protocol.group.address, incoming_addr, ADDR_LEN);
-            updated = true;
-            log_info(proc->logger, "Identity: group address updated to %s\n", incoming_addr);
+            json_decref(payload);
+            return true; /* never echo on equal/smaller */
         }
-
-        json_decref(payload);
+    }
+    else
+    {
+        /* Different groups: adopt strictly larger; tiebreak on uuid (smaller
+         * wins). Symmetric reflection on equal size + different uuid is the
+         * predicate that produces the ID_UPDATE flood — see constraint block
+         * above and memory entry feedback_group_update_flood.md. */
+        if (theirs_size > mine_size)
+            adopt = true;
+        else if (theirs_size < mine_size)
+            adopt = false;
+        else if (theirs_uuid_valid)
+            adopt = (strcmp(theirs_uuid_str, mine_uuid_str) < 0);
+        else
+        {
+            /* No comparable uuid — cannot tiebreak deterministically. Treat
+             * as no-op rather than risk a flood. */
+            json_decref(payload);
+            return true;
+        }
     }
 
-    if (!updated)
-        log_debug(proc->logger, "Identity: group update: no change needed\n");
+    if (adopt)
+    {
+        log_info(proc->logger,
+                 "Identity: adopting incoming group (uuid %s, addresses %zu)\n",
+                 theirs_uuid_str ? theirs_uuid_str : "?", theirs_size);
+        if (theirs_uuid_valid)
+            memcpy(((process_t *)proc)->protocol.group.uuid,
+                   theirs_uuid, sizeof(uuid_t));
+        json_t *j_address = json_object_get(payload, "address");
+        const char *incoming_addr = j_address ? json_string_value(j_address) : NULL;
+        if (incoming_addr != NULL && incoming_addr[0] != '\0')
+        {
+            strncpy(((process_t *)proc)->protocol.group.address,
+                    incoming_addr, ADDR_LEN);
+            ((process_t *)proc)->protocol.group.address[ADDR_LEN] = '\0';
+        }
+        /* Replace address_map: free any existing entries, then ingest theirs
+         * by walking the JSON object so we never need map_priv.h here. */
+        if (((process_t *)proc)->protocol.group.address_map.items != NULL)
+            map_free(&((process_t *)proc)->protocol.group.address_map);
+        map_init(&((process_t *)proc)->protocol.group.address_map);
+        if (j_addr_map != NULL && json_is_object(j_addr_map))
+        {
+            const char *k;
+            json_t *v;
+            json_object_foreach(j_addr_map, k, v)
+            {
+                const char *addr = json_string_value(v);
+                if (k != NULL && addr != NULL)
+                    group_add_address(&((process_t *)proc)->protocol.group,
+                                      k, addr);
+            }
+        }
+        /* Mirror Python's _record_group: push GROUP state to local processes. */
+        generic_msg_t group_msg = {0};
+        group_msg.type = GROUP;
+        memcpy(&group_msg.info.group, &proc->protocol.group, sizeof(group_t));
+        _remember_activity(proc, queues, &group_msg);
+        json_decref(payload);
+        return true;
+    }
 
-    generic_msg_t group_msg = {0};
-    group_msg.type = GROUP;
-    memcpy(&group_msg.info.group, &proc->protocol.group, sizeof(group_t));
-    _remember_activity(proc, queues, &group_msg);
-
+    /* We are the canonical winner — push our group to peers so they converge.
+     * Never reached on same-uuid equal-size (returned silent no-op above), so
+     * cannot participate in the flood. */
+    json_decref(payload);
+    _update_group(proc, queues);
     return true;
 }
 
@@ -1278,8 +1555,98 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
     _announce_identity(proc, queues);
     proc->protocol.phase = 2;
 
-    /* Phase 2→3 transition happens in choose_group (async) */
-    /* For now, set to phase 3 after announcement */
+    /* Phase 2→3: choose_group — wait adaptively for histories from existing
+     * peers, then either adopt one or self-bootstrap a fresh group. Mirrors
+     * Python's choose_group (idprocess.py:248). Runs inline here and pumps
+     * inbound messages during the wait so handle_receive_history can deposit
+     * histories into id_state.histories. The conformance harness uses
+     * at_identity_run (not this entry point), so blocking in the wait does
+     * not affect synchronous_dispatch tests. */
+    {
+        const long INIT_TIMEOUT_US = 5L * 1000000L;  /* Python init_timeout=5s */
+        const long GRACE_US        = 1L * 1000000L;  /* Python grace=1s */
+        struct timeval start_tv, now_tv;
+        gettimeofday(&start_tv, NULL);
+        long first_seen_us = -1;
+
+        pthread_mutex_lock(&id_state.lock);
+        id_state.choosing_group = true;
+        pthread_mutex_unlock(&id_state.lock);
+
+        while (keep_running(proc, &pctx.sig_q, logger))
+        {
+            gettimeofday(&now_tv, NULL);
+            long elapsed_us = (now_tv.tv_sec - start_tv.tv_sec) * 1000000L
+                            + (now_tv.tv_usec - start_tv.tv_usec);
+            if (elapsed_us > INIT_TIMEOUT_US)
+                break;
+
+            pthread_mutex_lock(&id_state.lock);
+            size_t hcount = array_size(&id_state.histories);
+            pthread_mutex_unlock(&id_state.lock);
+            if (hcount > 0)
+            {
+                if (first_seen_us < 0)
+                    first_seen_us = elapsed_us;
+                else if (elapsed_us - first_seen_us >= GRACE_US)
+                    break;
+            }
+
+            /* Pump inbound messages so handle_receive_history can run. */
+            generic_msg_t pump = {0};
+            int rc = messaging_recv(&pump);
+            if (rc == 0)
+                run_message_handlers(proc, queues, pump.type, &pump);
+            else
+                sleep_until(proc, cadence);
+        }
+
+        /* Selection / self-bootstrap. The C history wire form is still a stub
+         * (see _peer_accepted), so full history-parse + peer-union selection
+         * isn't wired up here yet — when histories arrived we just log and
+         * transition; the group address_map converges through subsequent
+         * ID_UPDATE traffic. The self-bootstrap path matches Python's
+         * Group.initialize({self.identity.uuid: self.identity.address}, ...). */
+        pthread_mutex_lock(&id_state.lock);
+        size_t final_hcount = array_size(&id_state.histories);
+        pthread_mutex_unlock(&id_state.lock);
+
+        if (final_hcount > 0)
+        {
+            log_info(logger, "Identity: choose_group: %zu histor%s received; "
+                     "transitioning to phase 3 (selection pending full history parse)\n",
+                     final_hcount, final_hcount == 1 ? "y" : "ies");
+        }
+        else
+        {
+            log_info(logger, "Identity: choose_group: no histories received; "
+                     "self-bootstrapping a fresh group\n");
+            public_identity_t *pub = NULL;
+            data_t *id_dat = NULL;
+            char id_key[] = "identity";
+            if (map_get(proc->configs, id_key, &id_dat) == 0)
+            {
+                config_t *id_cfg = NULL;
+                if (data_object_ptr(id_dat, (void **)&id_cfg) == 0
+                    && id_cfg->data_struct != NULL)
+                    identity_publish((const identity_t *)id_cfg->data_struct, &pub);
+            }
+            char empty_addr[1] = {0};
+            char *seed_addr = (pub != NULL) ? pub->address : empty_addr;
+            if (group_init(NULL, seed_addr, &proc->protocol.group) == 0 && pub != NULL)
+            {
+                char uuid_str[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(pub->uuid, uuid_str);
+                group_add_address(&proc->protocol.group, uuid_str, pub->address);
+            }
+            if (pub != NULL)
+                smrt_deref(pub);
+        }
+
+        pthread_mutex_lock(&id_state.lock);
+        id_state.choosing_group = false;
+        pthread_mutex_unlock(&id_state.lock);
+    }
     proc->protocol.phase = 3;
 
     /* Identity-specific loop: re-announce periodically until peers found */

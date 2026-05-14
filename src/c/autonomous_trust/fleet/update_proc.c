@@ -39,6 +39,10 @@
 #define EUPDATE 280
 DEFINE_ERROR(EUPDATE, "Update process error");
 
+/* Protocol-string definition (declared `extern char[]` in
+ * update_proc.h). */
+char UPDATE_PROTO_STATUS[] = "update status";
+
 
 /* ------------------------------------------------------------------ */
 /* Module state                                                        */
@@ -160,6 +164,10 @@ static void broadcast_status(const process_t *proc,
                              const char *detail)
 {
     json_t *base = json_object();
+    if (base == NULL) {
+        log_error(proc->logger, "Update: json_object OOM (broadcast_status)\n");
+        return;
+    }
     json_object_set_new(base, "hash", json_string(hash_hex));
     json_object_set_new(base, "version", json_string(version));
     json_object_set_new(base, "status", json_string(status));
@@ -174,7 +182,7 @@ static void broadcast_status(const process_t *proc,
         out.type = NET_MESSAGE;
         net_msg_t *nmsg = &out.info.net_msg;
         strncpy(nmsg->process, "update", PROC_NAME_LEN);
-        nmsg->function = (char *)UPDATE_PROTO_STATUS;
+        nmsg->function = UPDATE_PROTO_STATUS;
         nmsg->encrypt = true;
         memcpy(&nmsg->to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
         strncpy(nmsg->return_to, "update", PROC_NAME_LEN);
@@ -353,13 +361,17 @@ static void run_health_check(const process_t *proc, update_state_t *state)
         for (size_t i = 0; i < max; i++)
         {
             json_t *ping = json_object();
+            if (ping == NULL) {
+                log_error(proc->logger, "Update: json_object OOM (handshake)\n");
+                continue;
+            }
             json_object_set_new(ping, "type", json_string("health_check"));
 
             generic_msg_t out = {0};
             out.type = NET_MESSAGE;
             net_msg_t *nmsg = &out.info.net_msg;
             strncpy(nmsg->process, "update", PROC_NAME_LEN);
-            nmsg->function = (char *)UPDATE_PROTO_STATUS;
+            nmsg->function = UPDATE_PROTO_STATUS;
             nmsg->encrypt = true;
             memcpy(&nmsg->to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
             strncpy(nmsg->return_to, "update", PROC_NAME_LEN);
@@ -614,11 +626,11 @@ int update_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
     }
 
     /* Register handlers */
-    process_register_handler(proc, (char *)ARTIFACT_PROTO_READY,
+    process_register_handler(proc, ARTIFACT_PROTO_READY,
                              (handler_ptr_t)handle_artifact_ready);
-    process_register_handler(proc, (char *)UPDATE_PROTO_STATUS,
+    process_register_handler(proc, UPDATE_PROTO_STATUS,
                              (handler_ptr_t)handle_update_status);
-    process_register_handler(proc, (char *)CONFIG_PROTO_READY,
+    process_register_handler(proc, CONFIG_PROTO_READY,
                              (handler_ptr_t)handle_config_ready);
 
     proc->protocol.phase = 1;
