@@ -51,56 +51,41 @@ Peers are organized into 3 levels with a 10-level valuation scale. New peers ent
 
 ## Identity Protocol Sequence
 
+The diagram below is generated from `conformance/scenarios/identity/identity-canonical.yaml` by `scripts/build-docs.sh` — it cannot drift from the executable corpus.
+
+<!-- at_diagram:start protocol=identity scenario=identity-canonical -->
 ```mermaid
 sequenceDiagram
-    participant New as New Node
-    participant Leader as Border Guard<br/>(existing peer)
-    participant Others as Other Group<br/>Members
-
-    note over New,Others: Phase 1 - Announce (open broadcast channel)
-
-    New->>+Leader: announce<br/>(identity, pkg_hash, capabilities)
-    New->>Others: announce<br/>(identity, pkg_hash, capabilities)
-
-    note over Leader,Others: Phase 3 - Border guard evaluates
-
-    alt Amnesiac peer (already known UUID)
-        Leader->>Others: confirm (IdentityObj)<br/>[encrypted group]
-        Leader->>New: accept (leader identity, pkg_hash, caps)<br/>[unencrypted peer-to-peer]
-        Leader->>New: full_history (steps, group key)<br/>[encrypted peer-to-peer]
-    else New peer
-        Leader->>Others: propose (IdentityObj)<br/>[encrypted group]
-
-        note over Leader,Others: Voting round (encrypted group channel)
-
-        Others->>Others: _process_id()<br/>verify no UUID/key collision
-        Leader->>Leader: _process_id()<br/>verify no UUID/key collision
-        Others->>Leader: vote (IdentityObj, proof, signature)<br/>[encrypted group]
-        Leader->>Leader: count_vote()<br/>verify signatures
-
-        note over Leader: Vote collection timeout expires
-
-        alt Votes sufficient (finalize succeeds)
-            Leader->>Others: confirm (IdentityObj)<br/>[encrypted group]
-            Leader->>New: accept (leader identity, pkg_hash, caps)<br/>[unencrypted peer-to-peer]
-            Leader->>New: full_history (steps, group key)<br/>[encrypted peer-to-peer]
-        end
-    end
-
-    note over New: Phase 2 - New node processes acceptance
-
-    New->>New: handle_acceptance()<br/>add leader as peer
-    New->>New: receive_history()<br/>adopt group key
-
-    note over New: choose_group() selects longest history
-
-    New->>Others: history_diff (new steps)<br/>[encrypted group]
-    Others->>Others: handle_history_diff()<br/>merge branch
-
-    note over Leader,Others: Group update (encrypted peer-to-peer)
-
-    Leader->>Others: group_key_update (updated Group)<br/>[encrypted peer-to-peer]
+    participant bg as border_guard
+    participant peer_a as border_guard
+    participant newcomer as new_node
+    Note over newcomer: broadcast: request_access
+    Note right of newcomer: newcomer broadcasts its identity, package hash, and capabilities. bg receives the announce and runs welcoming_committee.
+    Note over bg: broadcast: propose_peer
+    Note right of bg: bg's welcoming_committee emits a propose_peer to the encrypted group channel so other border guards (peer_a here) can vote.
+    peer_a->>bg: vote_on_peer
+    Note right of peer_a: peer_a (another BG) votes to admit newcomer. bg's handle_count_vote tallies via vote_collection_increment.
+    Note over bg: broadcast: peer_accepted
+    Note right of bg: After synchronous _vote_collection finalizes, _peer_accepted broadcasts a peer_accepted to the encrypted group channel.
+    bg-->>newcomer: access_granted (re: 1)
+    Note right of bg: bg sends its own published identity to newcomer in the open so the newcomer can encrypt subsequent traffic to bg.
+    bg-->>newcomer: full_history (re: 1)
+    Note right of bg: bg sends the group key and identity-history DAG so newcomer can join and decrypt subsequent group-encrypted traffic.
 ```
+<!-- at_diagram:end -->
+
+**Channel semantics:** `request_access` travels on the **open broadcast channel** (unencrypted UDP). `propose_peer`, `vote_on_peer`, and `peer_accepted` travel on the **encrypted group channel**. `access_granted` is sent peer-to-peer in the open (the newcomer has no group key yet), and `full_history` is peer-to-peer encrypted with the leader's box key once `access_granted` has been processed.
+
+**Internal steps not on the wire** (omitted from the diagram, but part of the protocol):
+
+- After receiving `propose_peer`, each receiver runs `_process_id()` to verify the candidate's UUID and keys don't collide with existing peers; rejection short-circuits the vote.
+- After receiving each `vote_on_peer`, the leader runs `count_vote()` to verify the signature and increment the vote tally.
+- After receiving `access_granted`, the newcomer runs `handle_acceptance()` to add the leader as a peer, then `receive_history()` on the subsequent `full_history` to adopt the group key.
+- The newcomer's `choose_group()` selects the longest history if multiple groups responded, and sends a `history_diff` back to the group with any steps the group is missing.
+
+**Alternate path — amnesia readmission.** If the leader recognizes the newcomer's UUID from history (a previously-known peer rejoining), it skips the voting round and emits `peer_accepted` / `access_granted` / `full_history` directly. The amnesia trace is pinned by `conformance/scenarios/identity/amnesia-readmission.yaml`. v1 of the diagram tool does not render `alt`/`else` branches; the two paths are documented as separate scenarios.
+
+**Group key rotation.** When the group composition changes, the leader broadcasts `group_key_update` (encrypted peer-to-peer) so existing members rotate to the new key. Covered by `conformance/scenarios/identity/group-key-update.yaml`.
 
 ## Agreement Implementations
 

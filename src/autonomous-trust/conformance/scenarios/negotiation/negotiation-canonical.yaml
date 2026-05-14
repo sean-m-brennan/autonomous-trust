@@ -7,16 +7,23 @@ description: |
     Documentation canonical for the Negotiation protocol — picked
     up by `scripts/build-docs.sh` via the `<protocol>-canonical.yaml`
     convention and rendered into `doc/architecture/_generated/`.
-    Mirrors `invite-accept` step-for-step; the duplication is
-    intentional so the docs example has a stable filename
-    (`negotiation-canonical`) that won't move when `invite-accept`
-    is updated, while still running through the same conformance
-    code path so the diagram cannot drift from executable behavior.
+    Drives the same code paths as `invite-accept` (Phase 1) +
+    `status-poll` (Phase 2), composed end-to-end so the generated
+    diagram conveys the invite-accept-then-poll lifecycle the
+    hand-authored Negotiation diagram in
+    `doc/architecture/negotiation.md` is built around.
 
     Flow: alice (requestor) invites bob (worker) to perform a
-    `data_fetch` task. bob has the capability, peer level is mid-tier,
-    and the default TaskParameters are acceptable, so `handle_invite`
-    emits an `ack` back to alice.
+    `data_fetch` task. bob has the capability, peer level is
+    mid-tier, and the default TaskParameters are acceptable, so
+    `handle_invite` emits an `ack` back to alice. Later alice
+    polls the task's status; bob's `handle_stat_req` finds the
+    task in `task_stack` and replies with `status response`
+    carrying `status: pending`.
+
+    v1 schema cannot render `alt`/`else`, so the refuse-not-capable,
+    refuse-low-rep, haggle, and report-results paths are documented
+    as separate scenarios (linked from negotiation.md prose).
 
 participants:
   - id: alice
@@ -35,15 +42,43 @@ steps:
     function: invitation
     payload:
       capability: data_fetch
-      task_id: t1
-    description: alice asks bob to do a data_fetch.
+      task_id: t-canonical
+    description: |
+        alice invites bob to perform a data_fetch task on the encrypted
+        peer-to-peer channel.
+
   - id: 2
     from: bob
     to: alice
     function: ack
     in_response_to: 1
     payload:
-      task_id: t1
+      task_id: t-canonical
     description: |
-        bob's handle_invite finds data_fetch in own capabilities, peer level
-        is non-zero, parameters acceptable -> ack.
+        bob's handle_invite finds data_fetch in own capabilities, peer
+        level non-zero, parameters acceptable → emits an ack and pushes
+        the task onto its task_stack.
+
+  - id: 3
+    from: alice
+    to: bob
+    function: status request
+    payload:
+      capability: data_fetch
+      task_id: t-canonical
+    description: |
+        Some time later alice polls the running task. handle_stat_req
+        looks up the task in bob's task_stack to read execution state.
+
+  - id: 4
+    from: bob
+    to: alice
+    function: status response
+    in_response_to: 3
+    payload:
+      task_id: t-canonical
+      status: pending
+    description: |
+        bob reports the task as still pending (queued, not yet
+        executing). alice will re-poll until the task completes or
+        the timeout elapses.

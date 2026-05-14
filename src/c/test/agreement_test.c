@@ -176,8 +176,10 @@ DEFINE_TEST(test_work_voting)
     ck_assert_ptr_nonnull(proof);
     ck_assert(proof->approval);
 
-    /* first byte should be ASCII '0' (0x30) matching Python PoW convention */
-    ck_assert_int_eq(proof->digest[0], '0');
+    /* first DIFFICULTY raw bytes should be 0x00 — canonical AT v1 POW
+     * digest format on both Python (raw blake2b via _raw_hash) and C
+     * (crypto_generichash_blake2b). See BUGS.md §P5 closure. */
+    ck_assert_int_eq(proof->digest[0], 0);
 
     /* verify checks PoW */
     ck_assert(agreement_verify(proto, blob, proof, NULL, 0));

@@ -18,6 +18,13 @@ description: |
     empty, bob's last_id is None, so the strict-inequality guard
     passes and bob emits a `permission granted` ack back to alice.
 
+    Phase 1 only — v1 schema + the C harness's per-step state reset
+    make composing Phase 1 + Phase 2 in one scenario require
+    step-specific fixtures (not supported by the adapter). The
+    Phase 2 trace is pinned by `transaction-accepted.yaml`; nack
+    / backdate / sync variants by `request-nacked-stale`,
+    `request-backdated-chain-mismatch`, `chain-outdated-notification`.
+
 participants:
   - id: alice
     role: proposer
@@ -33,6 +40,11 @@ steps:
       id1: 1000
       id2: 1
       proposer: alice
+    description: |
+        Phase 1 — alice broadcasts an ask-permission ballot on the
+        encrypted group channel. (id1, id2, proposer) uniquely tags
+        the round; id1 is a millisecond timestamp, id2 is the
+        proposer's chain index.
   - id: 2
     from: bob
     to: alice
@@ -42,6 +54,11 @@ steps:
       id1: 1000
       id2: 1
       proposer: alice
+    description: |
+        Phase 1 — bob's last_id is None and chain is empty, so the
+        strict-inequality guard passes; handle_request emits a grant
+        ack back to alice. (Out-of-band nack / backdate / sync
+        branches are documented in separate scenarios.)
 
 expected_state:
   bob:

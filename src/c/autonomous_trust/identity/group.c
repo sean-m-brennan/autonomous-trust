@@ -41,8 +41,10 @@ int group_init(uuid_t *uuid, char *address, group_t *group)
     unsigned char *eseed = encryptor_generate();
     if (eseed == NULL)
         return -1;
-    encryptor_init(&group->encryptor, eseed);
+    int rc = encryptor_init(&group->encryptor, eseed, crypto_box_SEEDBYTES * 2);
     free(eseed);
+    if (rc != 0)
+        return -1;
     return 0;
 }
 
@@ -158,8 +160,15 @@ int group_from_json(const json_t *obj, void *data_struct)
     else
         map_init(&group->address_map);
 
-    uint8_t *seed = (uint8_t *)json_object_get(json_object_get(obj, "encryptor"), "hex_seed");
-    encryptor_init(&group->encryptor, seed); // decoded
+    /* Extract the hex_seed STRING (not the jansson value pointer — prior
+     * cast of `json_object_get` to `uint8_t *` was a latent bug, reading
+     * jansson struct bytes as if they were hex). */
+    const char *seed_hex = json_string_value(
+        json_object_get(json_object_get(obj, "encryptor"), "hex_seed"));
+    if (seed_hex == NULL
+        || encryptor_init(&group->encryptor,
+                          (const unsigned char *)seed_hex, strlen(seed_hex)) != 0)
+        return -1;
     return 0;
 }
 
@@ -184,6 +193,7 @@ int group_sync_in(AutonomousTrust__Core__Protobuf__Identity__Group *proto, group
 {
     memcpy(group->uuid, proto->uuid.data, sizeof(uuid_t));
     strncpy(group->address, proto->address, ADDR_LEN);
+    group->address[ADDR_LEN] = '\0';  /* strncpy does not terminate when src is >= ADDR_LEN */
     memcpy(group->encryptor.public_hex, proto->encryptor->hex_seed.data, crypto_box_PUBLICKEYBYTES * 2);
     return 0;
 }

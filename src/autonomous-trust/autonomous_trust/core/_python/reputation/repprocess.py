@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from ..network import Message
 from ..processes import Process, ProcMeta
 from ..config import Configuration, from_json_string, to_json_string
+from ..identity.protocol import IdentityProtocol
 from .protocol import ReputationProtocol
 from .reputation import TransactionHistory, Reputation, Reputations, TransactionScore
 from ..system import CfgIds, now, encoding
@@ -43,6 +44,16 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     backoff_mult = 1.5
     backoff_max = 90
     expiration = 300
+    # Reputation-tied rank elevation (BUGS.md §P2). Each tier is
+    # (score_floor, rank); scores below the lowest floor map to rank 0.
+    # Sorted ascending so _rank_tier can iterate and pick the highest
+    # matching tier. Tunable, but keep monotonically increasing.
+    RANK_TIERS = (
+        (0.50, 1),
+        (0.65, 2),
+        (0.80, 3),
+        (0.90, 4),
+    )
 
     # When True, _spawn replaces threading.Thread().start() with a direct,
     # synchronous call. The conformance harness sets this so scenario steps
@@ -84,6 +95,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.requested_reps = []
         self.updates = {}
         self.num_updates = 3
+        # Last published rank per peer uuid-string. Suppresses redundant
+        # rank_update IPC when the tier hasn't changed (BUGS.md §P2).
+        self.peer_ranks: dict[str, int] = {}
+        # (peer_uuid, score) pairs produced by _compute_reputation in
+        # spawned threads, drained by the main `process` loop where
+        # `queues` is in scope. Same pattern as `requested_reps`.
+        self.pending_ranks: list = []
 
     @property
     def peers(self):
@@ -369,6 +387,44 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     # TODO can we use the transaction memory to do better than CTFT before reputation kicks in?
 
+    @classmethod
+    def _rank_tier(cls, score: float) -> int:
+        """Map a reputation score to its rank tier.
+
+        Walks RANK_TIERS top-down, returning the highest tier whose
+        floor is met. Scores below the lowest floor map to 0.
+        """
+        for floor, rank in reversed(cls.RANK_TIERS):
+            if score >= floor:
+                return rank
+        return 0
+
+    def _publish_rank_change(self, queues, peer_uuid, score):
+        """Notify IdentityProcess of a tier crossing (BUGS.md §P2).
+
+        Suppressed if the tier hasn't changed from the last publication
+        for this peer. Local IPC only — message goes on the identity
+        queue with `IdentityProtocol.rank_update`.
+        """
+        try:
+            new_rank = self._rank_tier(score)
+            key = str(peer_uuid)
+            if self.peer_ranks.get(key) == new_rank:
+                return
+            self.peer_ranks[key] = new_rank
+            payload = to_json_string((key, new_rank))
+            # Local IPC: no to_whom (the consumer is the local
+            # IdentityProcess reading its own queue; no network egress).
+            msg = Message(CfgIds.identity, IdentityProtocol.rank_update,
+                          payload, to_whom=None, from_whom=self.identity)
+            queues[CfgIds.identity].put(msg, block=True, timeout=self.q_cadence)
+            self.logger.debug('Published rank_update for %s: %d (score=%.3f)' %
+                              (key, new_rank, score))
+        except Full:
+            self.logger.error('_publish_rank_change: identity queue full')
+        except Exception as err:
+            self.logger.warning('_publish_rank_change failed: %s' % err)
+
     def _compute_reputation(self, peer, req_proc, requestor):
         _probes.counter('rep.compute', 'enter')
         try:
@@ -388,6 +444,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                                                       CfgIds.reputation + Configuration.file_ext))
             except (OSError, IOError) as e:
                 self.logger.warning('Could not persist reputations: %s' % e)
+            # Queue a rank-update for IdentityProcess; drained by the
+            # process loop alongside forward_reputation. The spawned
+            # _compute_reputation thread doesn't have access to queues
+            # so it can't put directly.
+            self.pending_ranks.append((peer_uuid, rep_score))
             self.requested_reps.append((Reputation(peer_uuid, rep_score), req_proc, requestor))
             _probes.counter('rep.compute', 'queued')
         except Exception as e:
@@ -513,6 +574,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                                 self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
                 _probes.counter('proc.reputation', 'iter_drained', str(drained))
                 self.forward_reputation(queues)
+                # Drain rank updates queued by _compute_reputation.
+                while self.pending_ranks:
+                    peer_uuid, rep_score = self.pending_ranks.pop(0)
+                    self._publish_rank_change(queues, peer_uuid, rep_score)
 
                 present = now().timestamp()
                 for req in list(self.requests):

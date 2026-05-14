@@ -523,9 +523,18 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         json_object_set_new(comp, "verified", json_boolean(verify_ok));
         send_to_peer(proc, ARTIFACT_PROTO_COMPLETE, comp, &nmsg->from_whom);
 
-        /* Send ARTIFACT_PROTO_READY to fleet process internally */
+        /* Send ARTIFACT_PROTO_READY to fleet process internally. The
+         * path is pure string formatting — the eventual recipient must
+         * still open() and handle ENOENT (TOCTOU window = message
+         * latency). */
         char path_buf[256];
-        artifact_store_get_path(hash_hex, path_buf, sizeof(path_buf));
+        if (artifact_store_get_path(hash_hex, path_buf, sizeof(path_buf)) != 0)
+        {
+            log_error(proc->logger,
+                      "Artifact: get_path failed for %s, skipping ready notice\n",
+                      hash_hex);
+            return false;
+        }
 
         json_t *ready = json_object();
         if (!ready)

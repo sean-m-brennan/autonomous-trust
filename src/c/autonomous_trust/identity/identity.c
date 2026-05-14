@@ -60,14 +60,18 @@ int identity_init(uuid_t *uuid, const char *address, const char *fullname,
     unsigned char *sseed = signature_generate();
     if (sseed == NULL)
         return -1;
-    signature_init(&(identity->signature), sseed);
+    int rc = signature_init(&(identity->signature), sseed, crypto_sign_SEEDBYTES * 2);
     free(sseed);
+    if (rc != 0)
+        return -1;
 
     unsigned char *eseed = encryptor_generate();
     if (eseed == NULL)
         return -1;
-    encryptor_init(&identity->encryptor, eseed);
+    rc = encryptor_init(&identity->encryptor, eseed, crypto_box_SEEDBYTES * 2);
     free(eseed);
+    if (rc != 0)
+        return -1;
 
     return 0;
 }
@@ -128,13 +132,19 @@ int identity_publish(const identity_t *ident, public_identity_t **pub_copy)
     unsigned char *sseed = signature_publish(&ident->signature);
     if (sseed == NULL)
         return -1;
-    public_signature_init(&newIdent->signature, sseed);
+    int rc = public_signature_init(&newIdent->signature, sseed,
+                                    crypto_sign_PUBLICKEYBYTES * 2);
     free(sseed);
+    if (rc != 0)
+        return -1;
     unsigned char *eseed = encryptor_publish(&ident->encryptor);
     if (eseed == NULL)
         return -1;
-    public_encryptor_init(&newIdent->encryptor, eseed);
+    rc = public_encryptor_init(&newIdent->encryptor, eseed,
+                                crypto_box_PUBLICKEYBYTES * 2);
     free(eseed);
+    if (rc != 0)
+        return -1;
 
     return 0;
 }
@@ -219,11 +229,15 @@ int identity_from_json(const json_t *obj, void *data_struct)
     if (petname_str != NULL)
         strncpy(ident->petname, petname_str, sizeof(ident->petname)-1);
     const char *sig_hex = json_string_value(json_object_get(json_object_get(obj, "signature"), "hex_seed"));
-    if (sig_hex != NULL)
-        signature_init(&ident->signature, (const unsigned char *)sig_hex);
+    if (sig_hex != NULL
+        && signature_init(&ident->signature,
+                          (const unsigned char *)sig_hex, strlen(sig_hex)) != 0)
+        return -1;
     const char *enc_hex = json_string_value(json_object_get(json_object_get(obj, "encryptor"), "hex_seed"));
-    if (enc_hex != NULL)
-        encryptor_init(&ident->encryptor, (const unsigned char *)enc_hex);
+    if (enc_hex != NULL
+        && encryptor_init(&ident->encryptor,
+                          (const unsigned char *)enc_hex, strlen(enc_hex)) != 0)
+        return -1;
     return 0;
 }
 
@@ -276,8 +290,12 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
         strncpy(identity->nickname, proto->nickname, NAME_LEN);
     if (proto->petname != NULL)
         strncpy(identity->petname, proto->petname, NAME_LEN);
-    public_signature_init(&identity->signature, proto->signature->hex_seed.data);
-    public_encryptor_init(&identity->encryptor, proto->encryptor->hex_seed.data);
+    if (public_signature_init(&identity->signature, proto->signature->hex_seed.data,
+                              proto->signature->hex_seed.len) != 0)
+        return -1;
+    if (public_encryptor_init(&identity->encryptor, proto->encryptor->hex_seed.data,
+                              proto->encryptor->hex_seed.len) != 0)
+        return -1;
 
 #ifdef AT_ZTA_ENABLED
     memset(identity->zta_credential_hash, 0, sizeof(identity->zta_credential_hash));

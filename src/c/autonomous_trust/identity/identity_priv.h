@@ -67,18 +67,22 @@ int unhexlify(const unsigned char *buf, size_t len, unsigned char *result);
 
 /*@
   requires \valid(sig);
-  requires \valid_read(hex_seed + (0 .. crypto_sign_PUBLICKEYBYTES * 2 - 1));
+  requires hex_seed == \null ||
+           \valid_read(hex_seed + (0 .. hex_len - 1));
+  ensures \result == 0 || \result == -1;
 */
-void public_signature_init(signature_t *sig, const unsigned char *hex_seed);
+int public_signature_init(signature_t *sig, const unsigned char *hex_seed, size_t hex_len);
 
 /*@
   requires \valid(sig);
-  requires \valid_read(hex_seed + (0 .. crypto_sign_SEEDBYTES * 2 - 1));
+  requires hex_seed == \null ||
+           \valid_read(hex_seed + (0 .. hex_len - 1));
   assigns sig->private[0 .. crypto_sign_SECRETKEYBYTES - 1],
           sig->public[0 .. crypto_sign_PUBLICKEYBYTES - 1],
           sig->public_hex[0 .. crypto_sign_PUBLICKEYBYTES * 2];
+  ensures \result == 0 || \result == -1;
 */
-void signature_init(signature_t *sig, const unsigned char *hex_seed);
+int signature_init(signature_t *sig, const unsigned char *hex_seed, size_t hex_len);
 
 /*@
   requires \valid(sig);
@@ -99,21 +103,25 @@ unsigned char *signature_generate(void);
 
 /*@
   requires \valid(encr);
-  requires \valid_read(hex_seed + (0 .. crypto_box_PUBLICKEYBYTES * 2 - 1));
+  requires hex_seed == \null ||
+           \valid_read(hex_seed + (0 .. hex_len - 1));
   assigns encr->private[0 .. crypto_box_SECRETKEYBYTES - 1],
           encr->public[0 .. crypto_box_PUBLICKEYBYTES - 1],
           encr->public_hex[0 .. crypto_box_PUBLICKEYBYTES * 2];
+  ensures \result == 0 || \result == -1;
 */
-void public_encryptor_init(encryptor_t *encr, const unsigned char *hex_seed);
+int public_encryptor_init(encryptor_t *encr, const unsigned char *hex_seed, size_t hex_len);
 
 /*@
   requires \valid(encr);
-  requires \valid_read(hex_seed + (0 .. crypto_box_SEEDBYTES * 2 - 1));
+  requires hex_seed == \null ||
+           \valid_read(hex_seed + (0 .. hex_len - 1));
   assigns encr->private[0 .. crypto_box_SECRETKEYBYTES - 1],
           encr->public[0 .. crypto_box_PUBLICKEYBYTES - 1],
           encr->public_hex[0 .. crypto_box_PUBLICKEYBYTES * 2];
+  ensures \result == 0 || \result == -1;
 */
-void encryptor_init(encryptor_t *encr, const unsigned char *hex_seed);
+int encryptor_init(encryptor_t *encr, const unsigned char *hex_seed, size_t hex_len);
 
 /*@
   requires \valid(encr);

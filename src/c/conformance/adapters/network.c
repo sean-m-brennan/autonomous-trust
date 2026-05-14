@@ -963,13 +963,17 @@ static int _make_deterministic_identity(const char *pid, const char *addr,
     crypto_hash_sha256(digest, (const unsigned char *)label, strlen(label));
     hexlify(digest, crypto_sign_SEEDBYTES, hex_seed);
     hex_seed[crypto_sign_SEEDBYTES * 2] = '\0';
-    signature_init(&(*out)->signature, hex_seed);
+    if (signature_init(&(*out)->signature, hex_seed,
+                       crypto_sign_SEEDBYTES * 2) != 0)
+        return -1;
 
     snprintf(label, sizeof(label), "at-conformance:enc:%s", pid);
     crypto_hash_sha256(digest, (const unsigned char *)label, strlen(label));
     hexlify(digest, crypto_box_SEEDBYTES, hex_seed);
     hex_seed[crypto_box_SEEDBYTES * 2] = '\0';
-    encryptor_init(&(*out)->encryptor, hex_seed);
+    if (encryptor_init(&(*out)->encryptor, hex_seed,
+                       crypto_box_SEEDBYTES * 2) != 0)
+        return -1;
     return 0;
 }
 
@@ -1177,8 +1181,15 @@ static int run_group_encrypted_roundtrip(const at_case_t *c,
         snprintf(err, err_len, "scenario: group_create failed");
         goto cleanup;
     }
-    encryptor_init(&a_group->encryptor, (const unsigned char *)group_seed_hex);
-    encryptor_init(&b_group->encryptor, (const unsigned char *)group_seed_hex);
+    if (encryptor_init(&a_group->encryptor,
+                       (const unsigned char *)group_seed_hex,
+                       crypto_box_SEEDBYTES * 2) != 0
+        || encryptor_init(&b_group->encryptor,
+                          (const unsigned char *)group_seed_hex,
+                          crypto_box_SEEDBYTES * 2) != 0) {
+        snprintf(err, err_len, "scenario: group encryptor_init failed");
+        goto cleanup;
+    }
 
     /* Build A's signed wire message. */
     strncpy(msg.process, "identity", PROC_NAME_LEN);
@@ -1970,8 +1981,13 @@ static int run_group_key_rotation_decrypt_fails(const at_case_t *c,
         snprintf(err, err_len, "scenario: group_create failed");
         goto cleanup;
     }
-    encryptor_init(&a_group->encryptor, (const unsigned char *)k1);
-    encryptor_init(&b_group->encryptor, (const unsigned char *)k2);
+    if (encryptor_init(&a_group->encryptor, (const unsigned char *)k1,
+                       crypto_box_SEEDBYTES * 2) != 0
+        || encryptor_init(&b_group->encryptor, (const unsigned char *)k2,
+                          crypto_box_SEEDBYTES * 2) != 0) {
+        snprintf(err, err_len, "scenario: group encryptor_init failed");
+        goto cleanup;
+    }
 
     strncpy(msg.process, "identity", PROC_NAME_LEN);
     msg.function = strdup("request_access");
