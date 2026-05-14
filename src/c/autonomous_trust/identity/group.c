@@ -126,6 +126,8 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
     json_object_set_new(obj, "address_map", addr_map);
 
     json_t *encr = json_object();
+    if (encr == NULL)
+        return EXCEPTION(ENOMEM);
     unsigned char *hex = encryptor_publish(&ident->encryptor); // encoded
     json_object_set(encr, "hex_seed", json_string((char *)hex));
     free(hex);

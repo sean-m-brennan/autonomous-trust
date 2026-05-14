@@ -61,6 +61,8 @@ static int write_entry_jsonl(FILE *fp, const zta_audit_entry_t *entry)
     hash_to_hex(entry->result.credential_hash, ZTA_HASH_LEN, hash_buf, sizeof(hash_buf));
 
     json_t *obj = json_object();
+    if (obj == NULL)
+        return -1;
     json_object_set_new(obj, "timestamp", json_string(ts_buf));
     json_object_set_new(obj, "peer_uuid", json_string(uuid_buf));
     json_object_set_new(obj, "action", json_string(entry->action));

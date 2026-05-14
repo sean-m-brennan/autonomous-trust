@@ -25,6 +25,7 @@
 
 #include "map_priv.h"
 #include "array_priv.h"
+#include "utilities/at_jansson.h"
 #include "utilities/exception.h"
 
 const size_t GAP = 128; // approximate prime gap
@@ -522,11 +523,17 @@ int map_to_json(const void *data_struct, json_t **obj_ptr)
         else
         {
             elt = json_object();
-            json_object_set_new(elt, "key", json_string(map->items[i].key));
-            json_t *val;
-            data_to_json(map->items[i].value, &val);
-            json_object_set_new(elt, "value", val);
-            json_object_set_new(elt, "hash", json_integer(map->items[i].hash));
+            if (elt == NULL) {
+                /* Fall back to null on allocator failure rather than
+                 * propagating an inconsistent partially-built array. */
+                elt = json_null();
+            } else {
+                json_object_set_new(elt, "key", json_string(map->items[i].key));
+                json_t *val;
+                data_to_json(map->items[i].value, &val);
+                json_object_set_new(elt, "value", val);
+                json_object_set_new(elt, "hash", json_integer(map->items[i].hash));
+            }
         }
         json_array_append_new(j_arr, elt);
     }
@@ -569,9 +576,13 @@ int map_from_json(const json_t *obj, void *data_struct)
         if (!json_is_null(elt))
         {
             map->items[i].hash = json_integer_value(json_object_get(elt, "hash"));
-            const char *key = json_string_value(json_object_get(elt, "key"));
-            map->items[i].key = malloc(strlen(key) + 1);
-            strcpy(map->items[i].key, key);
+            /* Guard against malformed input: a missing or non-string
+             * "key" used to crash via strlen(NULL). Treat such an entry
+             * as an empty slot and continue. */
+            if (at_json_string_dup(elt, "key", &map->items[i].key) != 0) {
+                map->items[i].key = NULL;
+                continue;
+            }
             map->items[i].value = calloc(1, sizeof(data_t));
             data_from_json(json_object_get(elt, "value"), map->items[i].value);
         }
