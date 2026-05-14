@@ -48,7 +48,13 @@ is_corrupt_object() {
 }
 
 attempt=0
-max=3
+# Retry cap. Observed in practice: a single bad write per object is the
+# norm, but cascades of 3-5 corrupt writes happen under heavy parallel
+# build (-j N), and on one occasion 6+ retries were needed before a clean
+# write landed. Cap at 10 to keep a real (non-virtiofs) compile error
+# from looping unboundedly while leaving comfortable headroom for the
+# observed worst case.
+max=10
 out=""
 while [ $attempt -lt $max ]; do
     "$@"
