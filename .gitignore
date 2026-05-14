@@ -78,6 +78,17 @@ deploy
 
 # C build
 /src/c/build
+# Defense against accidental in-place cmake/make under src/c (use src/c/build)
+/src/c/CMakeCache.txt
+/src/c/CMakeFiles/
+/src/c/cmake_install.cmake
+/src/c/CTestTestfile.cmake
+/src/c/Makefile
+/src/c/conformance/CMakeCache.txt
+/src/c/conformance/CMakeFiles/
+/src/c/conformance/cmake_install.cmake
+/src/c/conformance/CTestTestfile.cmake
+/src/c/conformance/Makefile
 /src/c/proto/c
 **/*.pb-c.c
 **/*.pb-c.h
@@ -134,3 +145,4 @@ embedded/signing.pub
 /doc/tekfive/Figure_2.png
 /doc/tekfive/Figure_3.png
 /src/c/doc/
+/src/c/autonomous_trust/version.h

@@ -414,6 +414,7 @@ set(libsrc
     autonomous_trust/structures/merkle.c
     autonomous_trust/structures/redblack.c
     autonomous_trust/utilities/allocation.c
+    autonomous_trust/utilities/at_jansson.c
     autonomous_trust/utilities/b64.c
     autonomous_trust/utilities/err_str.c
     autonomous_trust/utilities/exception.c
@@ -423,6 +424,7 @@ set(libsrc
     autonomous_trust/utilities/protobuf_shutdown.cpp
     autonomous_trust/utilities/queue_pool.c
     autonomous_trust/utilities/sighandler.c
+    autonomous_trust/utilities/socket_helpers.c
     autonomous_trust/utilities/timeout.c
     autonomous_trust/utilities/util.c
     autonomous_trust/fleet/update_proposal.c
@@ -883,6 +885,14 @@ add_executable(net_message_test test/net_message_test.c)
 set_source_files_properties(test/net_message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_message_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(socket_helpers_test test/socket_helpers_test.c)
+set_source_files_properties(test/socket_helpers_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(socket_helpers_test PRIVATE ${AT_TEST_LIBS} pthread)
+
+add_executable(at_jansson_test test/at_jansson_test.c)
+set_source_files_properties(test/at_jansson_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(at_jansson_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(negotiation_test test/negotiation_test.c)
 set_source_files_properties(test/negotiation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(negotiation_test PRIVATE ${AT_TEST_LIBS} m)
@@ -984,6 +994,8 @@ add_test(NAME merkle_test COMMAND $<TARGET_FILE:merkle_test>)
 add_test(NAME dag_test COMMAND $<TARGET_FILE:dag_test>)
 add_test(NAME agreement_test COMMAND $<TARGET_FILE:agreement_test>)
 add_test(NAME net_message_test COMMAND $<TARGET_FILE:net_message_test>)
+add_test(NAME socket_helpers_test COMMAND $<TARGET_FILE:socket_helpers_test>)
+add_test(NAME at_jansson_test COMMAND $<TARGET_FILE:at_jansson_test>)
 add_test(NAME negotiation_test COMMAND $<TARGET_FILE:negotiation_test>)
 add_test(NAME reputation_test COMMAND $<TARGET_FILE:reputation_test>)
 add_test(NAME history_test COMMAND $<TARGET_FILE:history_test>)
@@ -1152,6 +1164,7 @@ add_executable(update_proc_test
     test/update_proc_test.c
     autonomous_trust/fleet/update_proc_helpers.c
     autonomous_trust/fleet/update_selftest.c
+    autonomous_trust/utilities/at_jansson.c
     ${fleet_test_util_srcs})
 set_source_files_properties(test/update_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(update_proc_test PRIVATE ${TEST_DEPENDENCIES})
@@ -1163,6 +1176,7 @@ add_executable(config_proc_test
     test/config_proc_test.c
     autonomous_trust/fleet/config_proc_helpers.c
     autonomous_trust/fleet/update_proc_helpers.c
+    autonomous_trust/utilities/at_jansson.c
     ${fleet_test_util_srcs})
 set_source_files_properties(test/config_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(config_proc_test PRIVATE ${TEST_DEPENDENCIES})

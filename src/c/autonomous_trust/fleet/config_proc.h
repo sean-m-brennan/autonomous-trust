@@ -35,12 +35,13 @@
 extern "C" {
 #endif
 
-#define CONFIG_PROTO_PROPOSE    "config proposal"
-#define CONFIG_PROTO_VOTE_REQ   "config vote request"
-#define CONFIG_PROTO_VOTE_GRANT "config vote grant"
-#define CONFIG_PROTO_VOTE_NACK  "config vote nack"
-#define CONFIG_PROTO_ACCEPTED   "config accepted"
-#define CONFIG_PROTO_READY      "config ready"
+/* Writable char arrays — definitions in `config_proc.c`. */
+extern char CONFIG_PROTO_PROPOSE[];
+extern char CONFIG_PROTO_VOTE_REQ[];
+extern char CONFIG_PROTO_VOTE_GRANT[];
+extern char CONFIG_PROTO_VOTE_NACK[];
+extern char CONFIG_PROTO_ACCEPTED[];
+extern char CONFIG_PROTO_READY[];
 
 #define CONFIG_IDENTITY_PENALTY -1.0
 

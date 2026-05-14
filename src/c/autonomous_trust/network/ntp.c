@@ -28,6 +28,7 @@
 
 #include "network/ntp.h"
 #include "utilities/exception.h"
+#include "utilities/socket_helpers.h"
 
 DEFINE_ERROR(ENTP_TIMEOUT, "NTP request timed out");
 DEFINE_ERROR(ENTP_STRATUM, "NTP stratum too high");
@@ -150,11 +151,10 @@ int ntp_client_request(const char *server_addr, ntp_result_t *result)
     if (sock < 0)
         return SYS_EXCEPTION();
 
-    /* Set receive timeout */
-    struct timeval tv;
-    tv.tv_sec  = NTP_TIMEOUT_MS / 1000;
-    tv.tv_usec = (NTP_TIMEOUT_MS % 1000) * 1000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    /* Set receive timeout (warn-only — falling through with no timeout
+     * would risk an unbounded wait, but the server can also legitimately
+     * be slow). */
+    (void)at_set_rcvtimeo(sock, NTP_TIMEOUT_MS, NULL);
 
     struct sockaddr_in srv;
     memset(&srv, 0, sizeof(srv));
@@ -180,29 +180,37 @@ int ntp_client_request(const char *server_addr, ntp_result_t *result)
     pkt.tx_ts_sec  = htonl(sec);
     pkt.tx_ts_frac = htonl(frac);
 
-    if (sendto(sock, &pkt, sizeof(pkt), 0,
-               (struct sockaddr *)&srv, sizeof(srv)) < 0)
+    if (at_sendto_eintr(sock, &pkt, sizeof(pkt), 0,
+                        (struct sockaddr *)&srv, sizeof(srv)) < 0)
     {
         close(sock);
         return SYS_EXCEPTION();
     }
 
-    /* Receive response */
+    /* Receive response. Drop short / non-NTP datagrams and keep
+     * recv-ing — a stray UDP packet on this ephemeral port (or a
+     * truncated reply from a misconfigured peer) should not abort
+     * the whole request. The SO_RCVTIMEO above gates total wait. */
     struct sockaddr_in from;
     socklen_t from_len = sizeof(from);
-    ssize_t n = recvfrom(sock, &pkt, sizeof(pkt), 0,
-                         (struct sockaddr *)&from, &from_len);
-    close(sock);
-
-    if (n < 0)
+    ssize_t n;
+    for (;;)
     {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return EXCEPTION(ENTP_TIMEOUT);
-        return SYS_EXCEPTION();
+        from_len = sizeof(from);
+        n = at_recvfrom_eintr(sock, &pkt, sizeof(pkt), 0,
+                              (struct sockaddr *)&from, &from_len);
+        if (n < 0)
+        {
+            close(sock);
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return EXCEPTION(ENTP_TIMEOUT);
+            return SYS_EXCEPTION();
+        }
+        if (n >= (ssize_t)sizeof(ntp_packet_t))
+            break;
+        /* Short datagram — discard and keep listening. */
     }
-
-    if (n < (ssize_t)sizeof(ntp_packet_t))
-        return EXCEPTION(ENTP_SHORT);
+    close(sock);
 
     /* Record receive time (t4) */
     struct timespec t4;
@@ -234,10 +242,7 @@ static void *ntp_server_loop(void *arg)
     if (sock < 0)
         return NULL;
 
-    struct timeval tv;
-    tv.tv_sec  = 1;
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)at_set_rcvtimeo(sock, 1000, NULL);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -257,8 +262,8 @@ static void *ntp_server_loop(void *arg)
         struct sockaddr_in from;
         socklen_t from_len = sizeof(from);
 
-        ssize_t n = recvfrom(sock, &req, sizeof(req), 0,
-                             (struct sockaddr *)&from, &from_len);
+        ssize_t n = at_recvfrom_eintr(sock, &req, sizeof(req), 0,
+                                      (struct sockaddr *)&from, &from_len);
         if (n < 0)
             continue;
 
@@ -294,8 +299,8 @@ static void *ntp_server_loop(void *arg)
         resp.tx_ts_sec  = htonl(tx_sec);
         resp.tx_ts_frac = htonl(tx_frac);
 
-        sendto(sock, &resp, sizeof(resp), 0,
-               (struct sockaddr *)&from, from_len);
+        (void)at_sendto_eintr(sock, &resp, sizeof(resp), 0,
+                              (struct sockaddr *)&from, from_len);
     }
 
     close(sock);

@@ -34,6 +34,13 @@
 #include "zta_audit.h"
 #include "zta_protocol.h"
 
+/* Protocol-string definitions (declared `extern char[]` in
+ * zta_protocol.h). Writable arrays so they're directly assignable to
+ * `char *` fields. */
+char ZTA_PROTO_REVOCATION_ALERT[] = "zta_revoked";
+char ZTA_PROTO_VERIFICATION[]     = "zta_verified";
+char ZTA_PROTO_REVERIFY_REQ[]     = "zta_reverify";
+
 /****************************
  * Process state
  ****************************/
@@ -298,13 +305,17 @@ static void _request_reputation(process_t *proc, const uuid_t peer_uuid,
     uuid_unparse_lower(peer_uuid, uuid_str);
 
     json_t *query = json_object();
+    if (query == NULL) {
+        log_error(logger, "ZTA: json_object OOM (rep query)\n");
+        return;
+    }
     json_object_set_new(query, "peer_uuid", json_string(uuid_str));
     json_object_set_new(query, "return_process", json_string(proc->name));
 
     generic_msg_t msg = {0};
     msg.type = NET_MESSAGE;
     strncpy(msg.info.net_msg.process, "reputation", PROC_NAME_LEN);
-    msg.info.net_msg.function = (char *)REP_PROTO_LOCAL_QUERY;
+    msg.info.net_msg.function = REP_PROTO_LOCAL_QUERY;
     net_msg_pack_json(&msg.info.net_msg, query);
     json_decref(query);
 
@@ -774,7 +785,7 @@ int zta_process_run(process_t *proc, directory_t *queues,
              zta_state.policy->reverify_interval_sec);
 
     /* Register handler for reputation responses from the reputation process */
-    process_register_handler(proc, (char *)REP_PROTO_LOCAL_RESP,
+    process_register_handler(proc, REP_PROTO_LOCAL_RESP,
                              (handler_ptr_t)_handle_rep_response);
 
     /* Standard process setup */

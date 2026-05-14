@@ -248,7 +248,91 @@ DEFINE_TEST(test_array_get_rejects_index_equal_size)
 }
 END_TEST_DEFINITION()
 
+/* Shrink-aware array_for_each (BUGS.md recurring theme §3). The
+ * iterate-and-remove-current-element pattern must visit every original
+ * element exactly once — the old macro silently skipped the element
+ * that shifted into the just-removed slot. */
+DEFINE_TEST(test_array_for_each_handles_remove_during_iteration)
+{
+    array_t arr;
+    ck_assert_ret_ok(array_init(&arr));
+    ck_assert_ret_ok(array_append(&arr, integer_data(1)));
+    ck_assert_ret_ok(array_append(&arr, integer_data(2)));
+    ck_assert_ret_ok(array_append(&arr, integer_data(3)));
+    ck_assert_ret_ok(array_append(&arr, integer_data(4)));
+    ck_assert_uint_eq(array_size(&arr), 4);
+
+    /* Visit every element exactly once and remove each as we go. */
+    int seen[4] = {0};
+    int seen_count = 0;
+    int idx;
+    data_t *v;
+    array_for_each(&arr, idx, v)
+        int n = 0;
+        ck_assert_ret_ok(data_integer(v, &n));
+        ck_assert(n >= 1 && n <= 4);
+        seen[n - 1]++;
+        seen_count++;
+        ck_assert_ret_ok(array_remove(&arr, v));
+    array_end_for_each
+
+    ck_assert_int_eq(seen_count, 4);
+    for (int i = 0; i < 4; i++)
+        ck_assert_int_eq(seen[i], 1);  /* each element exactly once */
+    ck_assert_uint_eq(array_size(&arr), 0);
+
+    /* Empty array: zero iterations. */
+    int touched = 0;
+    array_for_each(&arr, idx, v)
+        (void)v;
+        touched++;
+    array_end_for_each
+    ck_assert_int_eq(touched, 0);
+}
+END_TEST_DEFINITION()
+
+/* Filter-style: keep evens, remove odds. Even after non-contiguous
+ * removals the surviving elements must all be visited and the kept
+ * ones must remain in the array. */
+DEFINE_TEST(test_array_for_each_handles_filter_during_iteration)
+{
+    array_t arr;
+    ck_assert_ret_ok(array_init(&arr));
+    for (int i = 1; i <= 6; i++)
+        ck_assert_ret_ok(array_append(&arr, integer_data(i)));
+    ck_assert_uint_eq(array_size(&arr), 6);
+
+    int seen_values_or = 0; /* bitmask of visited values */
+    int idx;
+    data_t *v;
+    array_for_each(&arr, idx, v)
+        int n = 0;
+        ck_assert_ret_ok(data_integer(v, &n));
+        seen_values_or |= (1 << n);
+        if (n % 2 == 1)
+            ck_assert_ret_ok(array_remove(&arr, v));
+    array_end_for_each
+
+    /* Every value 1..6 must have been observed at least once. */
+    for (int n = 1; n <= 6; n++)
+        ck_assert((seen_values_or & (1 << n)) != 0);
+
+    /* Surviving evens, in order. */
+    ck_assert_uint_eq(array_size(&arr), 3);
+    int expected[3] = {2, 4, 6};
+    for (int i = 0; i < 3; i++) {
+        data_t *out = NULL;
+        ck_assert_ret_ok(array_get(&arr, i, &out));
+        int n = 0;
+        ck_assert_ret_ok(data_integer(out, &n));
+        ck_assert_int_eq(n, expected[i]);
+    }
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Array, test_array_data, test_array_create_heap,
           test_array_find_contains, test_array_set_overwrite,
           test_array_remove, test_array_oob_errors,
-          test_array_get_rejects_index_equal_size)
+          test_array_get_rejects_index_equal_size,
+          test_array_for_each_handles_remove_during_iteration,
+          test_array_for_each_handles_filter_during_iteration)
