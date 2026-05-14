@@ -746,6 +746,29 @@ void identity_set_synchronous_dispatch(bool enabled)
     pthread_mutex_unlock(&id_state.lock);
 }
 
+void identity_reset_state(void)
+{
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    /* Preserve synchronous_dispatch across reset so the harness can set
+     * it once at adapter init rather than on every scenario. Matches
+     * reputation_reset_state's preservation semantics. */
+    bool was_sync = id_state.synchronous_dispatch;
+    array_free(&id_state.histories);
+    array_init(&id_state.histories);
+    map_free(&id_state.peer_potentials);
+    map_init(&id_state.peer_potentials);
+    map_free(&id_state.vote_collection);
+    map_init(&id_state.vote_collection);
+    map_free(&id_state.own_caps_by_proc);
+    map_init(&id_state.own_caps_by_proc);
+    map_free(&id_state.peer_caps_map);
+    map_init(&id_state.peer_caps_map);
+    id_state.choosing_group = false;
+    id_state.synchronous_dispatch = was_sync;
+    pthread_mutex_unlock(&id_state.lock);
+}
+
 /****************************
  * Handler: count_vote (vote_on_peer)
  * Phase 3 only. Receives and counts votes on proposed peers.
