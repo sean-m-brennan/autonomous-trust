@@ -32,6 +32,7 @@
 
 #include "agreement.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -543,6 +544,38 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
                 goto cleanup;
             }
             proofs[proof_count++] = mined;
+            /* Optional cross-language byte-pin assertion. */
+            const char *exp_hex = json_string_value(
+                json_object_get(payload, "expected_digest_hex"));
+            if (exp_hex != NULL) {
+                size_t want_len = strlen(exp_hex);
+                if (want_len != mined->digest_len * 2) {
+                    snprintf(err, err_len,
+                             "scenario: steps[%zu] expected_digest_hex length %zu "
+                             "does not match digest %zu hex chars",
+                             i, want_len, mined->digest_len * 2);
+                    goto cleanup;
+                }
+                char got_hex[MERKLE_DIGEST_LEN * 2 + 1] = {0};
+                for (size_t b = 0; b < mined->digest_len; b++) {
+                    snprintf(got_hex + b * 2, 3, "%02x", mined->digest[b]);
+                }
+                /* Compare lowercase-insensitively to allow YAML authors to
+                 * write either case without re-mining. */
+                bool match = true;
+                for (size_t k = 0; k < want_len; k++) {
+                    char a = (char)tolower((unsigned char)got_hex[k]);
+                    char b = (char)tolower((unsigned char)exp_hex[k]);
+                    if (a != b) { match = false; break; }
+                }
+                if (!match) {
+                    snprintf(err, err_len,
+                             "scenario: steps[%zu] prove(%s) digest_hex %s "
+                             "does not match expected %s",
+                             i, blob_id, got_hex, exp_hex);
+                    goto cleanup;
+                }
+            }
             int repeat = 1;
             json_t *rep_j = json_object_get(step, "repeat");
             if (json_is_integer(rep_j)) {

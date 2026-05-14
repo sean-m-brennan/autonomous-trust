@@ -23,13 +23,11 @@ description: |
     engine path under the threshold) by exercising the same path
     one over the documented `max_task_duplicates = 5` ceiling.
 
-    Remaining cross-language asymmetry past the threshold — NOT
-    pinned by this scenario, tracked separately: Python demotes
-    the sender via `peers.demote` and continues normal
-    capability/level dispatch; C sends an immediate refuse and
-    returns. That's a policy difference orthogonal to the
-    counter-persistence fix and is left for a follow-on
-    alignment decision.
+    Past-threshold action: refuse-and-return on both sides
+    (canonical AT v1 behavior). Python and C both emit a
+    `refusal` and short-circuit further dispatch when
+    `flood_counts[uuid] > max_task_duplicates`. Step 2 asserts
+    that at least one refusal appears in step 1's outbox.
 
 participants:
   - id: alice
@@ -54,7 +52,20 @@ steps:
         alice invites bob to perform data_fetch — the same
         invitation envelope is delivered 6 times, one past the
         `max_task_duplicates = 5` threshold. Both impls' flood
-        counter is expected to read 6 after the run.
+        counter is expected to read 6 after the run; iteration 6
+        emits a refusal back to alice (refuse-and-return).
+  - id: 2
+    from: bob
+    to: alice
+    function: nack
+    in_response_to: 1
+    no_propagate: true
+    description: |
+        Assertion-only: at least one `nack` (NegotiationProtocol.refusal)
+        appears in step 1's captured outbox (iteration 6 trips the flood
+        threshold on both Python and C). `no_propagate: true` keeps this
+        an observation step — the engine does not deliver this message
+        back to alice.
 
 expected_state:
   bob:

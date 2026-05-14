@@ -1,0 +1,92 @@
+name: Conformance Corpus
+
+# Runs the dual-language conformance harness on push/PR. The
+# autonomous_trust repo ships two parallel impls (Python and C) of the
+# same protocols and the conformance corpus pins their behavior
+# bit-for-bit (within v1's byte_pinning: false semantic-equality
+# scope). This workflow gates merges by:
+#   1. Building + running the C harness over the full corpus.
+#   2. Running the Python harness over the same corpus.
+#   3. Diffing the two JSON result files via
+#      `conformance.harness.common.diff_results` — fails the run if
+#      any case has an asymmetric outcome between the two impls
+#      (e.g. one passes, one fails) or if --strict-coverage flags a
+#      corpus case neither side recorded.
+#
+# Local equivalent: `bash scripts/test-conformance.sh --c --strict-coverage`.
+#
+# When the parent (`sustainable_space/`) CI pipeline materializes,
+# the meta-step referenced in CONFORMANCE_PLAN.md §CI Integration
+# can call this workflow via `workflow_run` or duplicate the
+# `diff_results` invocation against the artifacts uploaded here.
+
+on:
+  push:
+    branches: [master, main, 'feature/**']
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system build deps for the C harness
+        # libuuid / libsodium / libjansson / protobuf are the four
+        # find_package() dependencies in src/c/CMakeLists.txt
+        # (libuuid:182, libsodium:192, libjansson:198, protobuf:231).
+        # OpenSSL is conditional but cheap to include. pkg-config is
+        # required by some find_path() lookups.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            uuid-dev libsodium-dev libjansson-dev \
+            libprotobuf-dev protobuf-compiler \
+            libssl-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install Python deps for the conformance env
+        # Mirrors tox -e conformance's deps (src/autonomous-trust/tox.ini)
+        # so the fallback `python -m pytest` path in
+        # scripts/test-conformance.sh works without tox.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r src/autonomous-trust/requirements.txt \
+                      -r src/autonomous-trust/tests_require.txt \
+                      jsonschema protobuf tox
+
+      - name: Build + run the C conformance harness, then diff
+        # --c builds and runs the C harness, then invokes
+        # `diff_results` against the Python JSON output.
+        # --strict-coverage fails the run if any corpus case is
+        # missing from either side (a stronger guarantee than the
+        # default per-case-symmetric mode).
+        run: bash scripts/test-conformance.sh --c --strict-coverage
+
+      - name: Upload Python conformance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-python-results
+          path: src/autonomous-trust/conformance/results/python-*.json
+          if-no-files-found: warn
+
+      - name: Upload C conformance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-c-results
+          path: src/c/build/conformance/results/c-latest.json
+          if-no-files-found: warn

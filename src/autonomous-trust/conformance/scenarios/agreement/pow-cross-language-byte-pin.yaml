@@ -1,0 +1,63 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pow-cross-language-byte-pin
+byte_pinning: true
+description: |
+    Cross-language byte-pinned POW digest. After the canonical
+    alignment (BUGS.md §P5 CLOSED 2026-05-14), Python and C both:
+      - Compute raw 32-byte blake2b digests over `blob.designation + nonce`.
+      - Check `DIFFICULTY` *leading zero bytes* (not leading hex '0' chars).
+      - Iterate the nonce as ASCII-decimal starting at 1.
+
+    With DIFFICULTY=2 (the AgreementByWork default) and a fixed
+    designation (`b'byte-pin-blob'`), both impls must converge on the
+    same minimum nonce (28943) and produce the same digest. The
+    `payload.expected_digest_hex` assertion is enforced symmetrically
+    by the prove-step handler in
+    `harness/python/adapters/agreement.py` and
+    `src/c/conformance/adapters/agreement.c`.
+
+    Pairs with `pow-mined-proof-finalizes-true.yaml` (same DIFFICULTY=2,
+    end-to-end outcome only) by adding a tighter byte-level pin that
+    catches digest-format or hash-input divergence in either language.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: work
+  difficulty: 2
+  myself: bob
+  blobs:
+    byte-pin-blob:
+      originator: alice
+
+steps:
+  - id: 1
+    from: bob
+    to: agreement
+    function: prove
+    payload:
+      blob: byte-pin-blob
+      expected_digest_hex: "00004eb0279bc9d63eefbab8c645d61b777c180f99b48a4f78b82a43abeec1a3"
+    description: |
+        bob mines a POW proof for byte-pin-blob at DIFFICULTY=2. Both
+        impls find nonce=28943 (smallest integer whose ASCII-decimal
+        bytes appended to the designation produce a >=2-leading-zero-
+        byte digest) and the byte-pin assertion verifies the digest
+        matches.
+  - id: 2
+    from: bob
+    to: agreement
+    function: finalize
+    payload:
+      blob: byte-pin-blob
+      expected_outcome: true
+    description: |
+        finalize sees the approved blob (verify ran in step 1) and
+        returns true. Combined with the byte-pin from step 1, this
+        pins both the digest format and the protocol outcome.
