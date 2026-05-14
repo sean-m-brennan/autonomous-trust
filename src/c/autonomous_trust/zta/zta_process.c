@@ -140,7 +140,7 @@ static void _broadcast_revocation_alert(process_t *proc, const uuid_t peer_uuid,
 
     memcpy(msg.info.zta_event.peer_uuid, peer_uuid, sizeof(uuid_t));
     memcpy(msg.info.zta_event.voucher_uuid, zta_state.self_uuid, sizeof(uuid_t));
-    memcpy(msg.info.zta_event.credential_hash, cred_hash, 32);
+    memcpy(msg.info.zta_event.credential_hash, cred_hash, ZTA_HASH_LEN);
     msg.info.zta_event.status = (int)ZTA_REVOKED;
     snprintf(msg.info.zta_event.reason, sizeof(msg.info.zta_event.reason),
              "credential revoked");

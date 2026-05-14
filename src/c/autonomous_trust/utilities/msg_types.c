@@ -493,10 +493,12 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
         strncpy(net_msg->from_whom.address, from_addr, ADDR_LEN);
     const char *from_sig = json_string_value(json_object_get(root, "from_sig_hex"));
     if (from_sig && from_sig[0] != '\0')
-        public_signature_init(&net_msg->from_whom.signature, (const unsigned char *)from_sig);
+        (void)public_signature_init(&net_msg->from_whom.signature,
+                                    (const unsigned char *)from_sig, strlen(from_sig));
     const char *from_enc = json_string_value(json_object_get(root, "from_enc_hex"));
     if (from_enc && from_enc[0] != '\0')
-        public_encryptor_init(&net_msg->from_whom.encryptor, (const unsigned char *)from_enc);
+        (void)public_encryptor_init(&net_msg->from_whom.encryptor,
+                                    (const unsigned char *)from_enc, strlen(from_enc));
 
     const char *to_uuid = json_string_value(json_object_get(root, "to_uuid"));
     if (to_uuid)
@@ -509,10 +511,12 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
         strncpy(net_msg->to_whom.address, to_addr, ADDR_LEN);
     const char *to_sig = json_string_value(json_object_get(root, "to_sig_hex"));
     if (to_sig && to_sig[0] != '\0')
-        public_signature_init(&net_msg->to_whom.signature, (const unsigned char *)to_sig);
+        (void)public_signature_init(&net_msg->to_whom.signature,
+                                    (const unsigned char *)to_sig, strlen(to_sig));
     const char *to_enc = json_string_value(json_object_get(root, "to_enc_hex"));
     if (to_enc && to_enc[0] != '\0')
-        public_encryptor_init(&net_msg->to_whom.encryptor, (const unsigned char *)to_enc);
+        (void)public_encryptor_init(&net_msg->to_whom.encryptor,
+                                    (const unsigned char *)to_enc, strlen(to_enc));
 
     const char *obj_str = json_string_value(json_object_get(root, "obj"));
     json_int_t obj_len = json_integer_value(json_object_get(root, "obj_len"));

@@ -272,10 +272,12 @@ int net_message_from_wire(const uint8_t *data, size_t len,
             strncpy(msg_out->from_whom.address, from_addr, ADDR_LEN);
         const char *from_sig = json_string_value(json_object_get(root, "from_sig_hex"));
         if (from_sig != NULL && from_sig[0] != '\0')
-            public_signature_init(&msg_out->from_whom.signature, (const unsigned char *)from_sig);
+            (void)public_signature_init(&msg_out->from_whom.signature,
+                                        (const unsigned char *)from_sig, strlen(from_sig));
         const char *from_enc = json_string_value(json_object_get(root, "from_enc_hex"));
         if (from_enc != NULL && from_enc[0] != '\0')
-            public_encryptor_init(&msg_out->from_whom.encryptor, (const unsigned char *)from_enc);
+            (void)public_encryptor_init(&msg_out->from_whom.encryptor,
+                                        (const unsigned char *)from_enc, strlen(from_enc));
     }
 
     /* extract and verify signature if present */

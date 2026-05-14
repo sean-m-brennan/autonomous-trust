@@ -22,20 +22,30 @@
 #include "identity_priv.h"
 #include "utilities/exception.h"
 
-void public_signature_init(signature_t *sig, const unsigned char *hex_seed)
+int public_signature_init(signature_t *sig, const unsigned char *hex_seed, size_t hex_len)
 {
+    if (sig == NULL || hex_seed == NULL
+        || hex_len != crypto_sign_PUBLICKEYBYTES * 2)
+        return -1;
     sodium_memzero(sig->private, sizeof(sig->private));
-    unhexlify(hex_seed, crypto_sign_PUBLICKEYBYTES * 2, (unsigned char *)sig->public);
+    if (unhexlify(hex_seed, hex_len, (unsigned char *)sig->public) != 0)
+        return -1;
     hexlify(sig->public, crypto_sign_PUBLICKEYBYTES, (unsigned char *)sig->public_hex);
+    return 0;
 }
 
-void signature_init(signature_t *sig, const unsigned char *hex_seed)
+int signature_init(signature_t *sig, const unsigned char *hex_seed, size_t hex_len)
 {
+    if (sig == NULL || hex_seed == NULL
+        || hex_len != crypto_sign_SEEDBYTES * 2)
+        return -1;
     unsigned char seed[crypto_sign_SEEDBYTES];
-    unhexlify(hex_seed, crypto_sign_SEEDBYTES * 2, seed);
+    if (unhexlify(hex_seed, hex_len, seed) != 0)
+        return -1;
     crypto_sign_seed_keypair((unsigned char *)sig->public, (unsigned char *)sig->private, seed);
     sodium_memzero(seed, sizeof(seed));
     hexlify(sig->public, crypto_sign_PUBLICKEYBYTES, (unsigned char *)sig->public_hex);
+    return 0;
 }
 
 /* Frama-C: skipped — [solver-timeout] libsodium stub preconditions */
