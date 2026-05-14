@@ -54,15 +54,19 @@ _NS = UUID('00000000-0000-0000-0000-000000000aaa')
 
 
 class _ScenarioBlob(SimplestBlob):
-    """Minimal SimplestBlob with a stable designation derived from a payload."""
+    """Minimal SimplestBlob with a stable designation matching the C
+    harness's `_harness_blob_hash` input. The designation is the
+    blob's scenario id (the YAML key) — same bytes the C side feeds
+    to blake2b. This keeps cross-language POW byte-identical so a
+    scenario can pin a `digest_hex` assertion on a mined proof."""
 
-    def __init__(self, originator: UUID, uuid: UUID, payload: bytes) -> None:
+    def __init__(self, originator: UUID, uuid: UUID, blob_id: str) -> None:
         super().__init__(originator, uuid)
-        self._payload = payload
+        self._blob_id = blob_id
 
     @property
     def designation(self) -> bytes:
-        return (str(self.originator) + str(self.uuid)).encode('utf-8') + self._payload
+        return self._blob_id.encode('utf-8')
 
 
 class _StakeImpl(AgreementByStake):
@@ -261,12 +265,10 @@ class AgreementAdapter:
             if fn == 'prove':
                 # POW-flavored step: protocol.prove() mines a valid
                 # nonce for `blob`, then protocol.verify() admits the
-                # proof. Per-language mining — both impls have their
-                # own DIFFICULTY interpretation (Python: leading hex
-                # nibbles; C: leading raw zero bytes), tracked as
-                # BUGS.md P5. This scenario shape doesn't pin the digest
-                # bytes across languages; it asserts only the end-to-end
-                # protocol outcome (finalize=true).
+                # proof. After canonical alignment (BUGS.md §P5 closed),
+                # both impls produce raw blake2b digests and the same
+                # nonce iteration order, so a scenario MAY pin the
+                # exact digest via payload.expected_digest_hex.
                 #
                 # repeat: N mines ONCE and then verifies N times with
                 # the same proof — matches a real wire replay where the
@@ -277,6 +279,14 @@ class AgreementAdapter:
                 # finalize removes only one entry and returns the same
                 # outcome.
                 proof = protocol.prove(blob)
+                expected_hex = payload.get('expected_digest_hex')
+                if expected_hex is not None:
+                    got_hex = proof.digest.hex()
+                    if got_hex.lower() != str(expected_hex).lower():
+                        raise AssertionError(
+                            f'step {step["id"]}: prove({blob_id}) digest_hex '
+                            f'{got_hex} does not match expected {expected_hex}'
+                        )
                 for _ in range(int(step.get('repeat', 1))):
                     protocol.verify(blob, proof, None)
                 continue
@@ -329,8 +339,7 @@ class AgreementAdapter:
             )
         originator_uuid = identities[originator_id].uuid
         blob_uuid = uuid5(_NS, f'blob:{blob_id}')
-        payload = spec.get('payload', blob_id).encode('utf-8')
-        return _ScenarioBlob(originator_uuid, blob_uuid, payload)
+        return _ScenarioBlob(originator_uuid, blob_uuid, blob_id)
 
     def run_negative(self, case: Case) -> None:
         from ...common.negative_runner import run_wire_negative
@@ -381,8 +390,7 @@ class AgreementAdapter:
             raise AssertionError(f'blob.originator references unknown voter {originator_id!r}')
         originator_uuid = identities[originator_id].uuid
         blob_uuid = uuid5(_NS, f'blob:{spec["uuid"]}')
-        payload = spec.get('payload', spec['uuid']).encode('utf-8')
-        return _ScenarioBlob(originator_uuid, blob_uuid, payload)
+        return _ScenarioBlob(originator_uuid, blob_uuid, spec['uuid'])
 
 
 def _stretch(pid: str, role: bytes) -> bytes:

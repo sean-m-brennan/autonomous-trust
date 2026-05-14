@@ -490,6 +490,10 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
     ctx.build_inbound = _build_inbound;
     ctx.dispatch = _dispatch;
 
+    /* Wipe singleton id_state so observables (peer_caps_count etc.) are
+     * not polluted by prior scenarios. Preserves synchronous_dispatch. */
+    identity_reset_state();
+
     /* Build participants. */
     json_t *parts = json_object_get(c->data, "participants");
     if (!json_is_array(parts)) {

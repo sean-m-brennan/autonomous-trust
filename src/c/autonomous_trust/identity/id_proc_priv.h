@@ -83,6 +83,13 @@ int identity_get_peer_caps_count(const uuid_t uuid);
  *  same id_state struct. Production code MUST leave this off. */
 void identity_set_synchronous_dispatch(bool enabled);
 
+/** Wipe the entire identity singleton state (histories, peer_potentials,
+ *  vote_collection, peer_caps_map, and conformance-only override maps),
+ *  resetting choosing_group to false. Preserves synchronous_dispatch so
+ *  callers can set it once at adapter init. The harness calls this at
+ *  the start of every scenario; production must not call it. */
+void identity_reset_state(void);
+
 #define EID_NOQ 215
 DECLARE_ERROR(EID_NOQ, "Required process queue missing");
 
