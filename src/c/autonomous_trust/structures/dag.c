@@ -108,6 +108,26 @@ void linked_step_free(linked_step_t *step)
         free(step);
 }
 
+int linked_step_recompute_length(linked_step_t *step)
+{
+    if (step == NULL)
+        return -1;
+    /* Walk parents up to (but not including) the genesis sentinel and
+     * count edges traversed. Mirrors Python LinkedStep._length —
+     * "length is depth from genesis" (dag.py:74-76). A reparent that
+     * leaves the cached value stale is the audit's M9 finding. */
+    int len = 0;
+    const linked_step_t *cur = step;
+    while (cur != NULL && !_is_genesis(cur)) {
+        len++;
+        cur = cur->parent;
+        if (len > 1000000)  /* defensive cap; acyclic invariant should hold */
+            break;
+    }
+    step->length = len;
+    return len;
+}
+
 /*@
   requires valid_dag(dag);
   requires \valid_read(branch);
@@ -212,6 +232,8 @@ int dag_init(step_dag_t *dag)
     if (dag == NULL)
         return EINVAL;
     int err;
+    dag->validate_fn = NULL;
+    dag->validate_ctx = NULL;
     err = map_create(&dag->heads);
     if (err != 0)
         return err;
@@ -556,6 +578,73 @@ int dag_recite(step_dag_t *dag, const char *branch, linked_step_t *root,
     }
 
     *steps_out = list;
+    return 0;
+}
+
+void dag_set_validator(step_dag_t *dag, dag_validate_fn fn, void *ctx)
+{
+    if (dag == NULL)
+        return;
+    dag->validate_fn = fn;
+    dag->validate_ctx = ctx;
+}
+
+/* Frama-C: skipped — [recursive-ds] composite ingest/diff/recite/merge */
+int dag_catch_up(step_dag_t *dag, linked_step_t **steps, size_t count,
+                 array_t **diff_out)
+{
+    if (dag == NULL || steps == NULL || count == 0)
+        return EINVAL;
+
+    char branch_name[32] = {0};
+    int err = dag_ingest_branch(dag, steps, count, NULL,
+                                branch_name, sizeof(branch_name));
+    if (err != 0)
+        return err;
+
+    /* Locate divergence from main. The common_root may be &dag_genesis,
+     * in which case dag_recite walks the full branch. */
+    int idx = 0;
+    linked_step_t *common_root = NULL;
+    err = dag_diff(dag, branch_name, NULL, &idx, &common_root);
+    if (err != 0)
+        return err;
+
+    /* Mirror Python: recite from common_root (exclusive of genesis),
+     * head-first. The caller takes ownership of the array. */
+    array_t *branch_diff = NULL;
+    err = dag_recite(dag, branch_name, common_root, &branch_diff);
+    if (err != 0)
+        return err;
+
+    /* Run the installed validator (Python's `_validate(branch)`). A
+     * NULL hook is treated as always-valid, matching the abstract-
+     * base default behavior. */
+    bool ok = true;
+    if (dag->validate_fn != NULL)
+        ok = dag->validate_fn(dag, branch_name, dag->validate_ctx);
+
+    if (ok)
+    {
+        int merr = dag_merge(dag, branch_name, NULL, false);
+        if (merr != 0)
+        {
+            if (diff_out != NULL)
+                *diff_out = branch_diff;
+            else if (branch_diff != NULL)
+                array_free(branch_diff);
+            return merr;
+        }
+    }
+    /* On validation failure: the temp branch stays in the DAG
+     * unmerged. The caller can inspect the diff and decide what to
+     * do — same contract as Python's catch_up returning the diff
+     * even when validation rejected the merge. */
+
+    if (diff_out != NULL)
+        *diff_out = branch_diff;
+    else if (branch_diff != NULL)
+        array_free(branch_diff);
     return 0;
 }
 

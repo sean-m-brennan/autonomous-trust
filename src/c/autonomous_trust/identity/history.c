@@ -22,9 +22,12 @@
 #include <uuid/uuid.h>
 #include <jansson.h>
 
+#include <time.h>
+
 #include "history.h"
 #include "identity_priv.h"
 #include "../utilities/allocation.h"
+#include "../utilities/logger.h"
 
 /* IdentityObj blob interface implementations */
 
@@ -144,6 +147,68 @@ void identity_obj_free(identity_obj_t *obj)
         free(obj);
 }
 
+/* C13: branch validator for IdentityHistory — parity with Python
+ * IdentityHistory._validate (history/history.py:155-168). Walks the
+ * branch and rejects backdating: a child step must have a strictly
+ * later timestamp than its parent. dag_recite returns the branch
+ * head-first, so when iterating index i we are looking at a
+ * progressively older step, and the immediately-prior index i-1 is
+ * the newer (child) entry. Backdating is therefore
+ *   prev->timestamp <= cur->timestamp
+ * (the newer node has a non-strictly-greater timestamp). Mirrors
+ * the Python `steps[i-1].timestamp >= steps[i].timestamp` test
+ * over the root-first branch_list.
+ *
+ * NB: Python's check skips entries with `timestamp is None`; the C
+ * representation never carries a NULL timestamp (datetime_t is
+ * value-typed), so the gate degenerates to an unconditional
+ * comparison. */
+static bool _identity_history_validate_branch(step_dag_t *dag,
+                                              const char *branch,
+                                              void *ctx)
+{
+    identity_history_t *h = (identity_history_t *)ctx;
+    array_t *steps = NULL;
+    if (dag_recite(dag, branch, NULL, &steps) != 0 || steps == NULL)
+    {
+        if (h != NULL)
+            log_error(h->logger, "IdentityHistory: branch %s not found\n",
+                      branch);
+        return false;
+    }
+
+    size_t n = array_size(steps);
+    bool ok = true;
+    for (size_t i = 1; i < n; i++)
+    {
+        data_t *prev_d = NULL;
+        data_t *cur_d = NULL;
+        if (array_get(steps, (int)(i - 1), &prev_d) != 0 || prev_d == NULL ||
+            array_get(steps, (int)i,       &cur_d)  != 0 || cur_d  == NULL)
+            continue;
+        ptr_t prev_p = NULL;
+        ptr_t cur_p  = NULL;
+        if (data_object_ptr(prev_d, &prev_p) != 0 ||
+            data_object_ptr(cur_d,  &cur_p)  != 0)
+            continue;
+        const linked_step_t *prev = (const linked_step_t *)prev_p;
+        const linked_step_t *cur  = (const linked_step_t *)cur_p;
+        time_t prev_t = mktime((struct tm *)&prev->timestamp);
+        time_t cur_t  = mktime((struct tm *)&cur->timestamp);
+        if (prev_t <= cur_t)
+        {
+            if (h != NULL)
+                log_error(h->logger,
+                          "IdentityHistory: backdating at step %zu of branch %s\n",
+                          i, branch);
+            ok = false;
+            break;
+        }
+    }
+    array_free(steps);
+    return ok;
+}
+
 /* Frama-C: skipped —
  * [solver-timeout] identity_history_create: dag_init + success ensures (smrt_ptr
  * allocation cascade).
@@ -168,6 +233,10 @@ int identity_history_create(agreement_voter_t *myself,
         free(h);
         return err;
     }
+    /* Install the IdentityHistory-specific branch validator (C13).
+     * The ctx is the owning history struct so the validator can log
+     * via the same logger as the rest of identity_history_*. */
+    dag_set_validator(&h->dag, _identity_history_validate_branch, h);
 
     err = merkle_tree_create(&h->merkle);
     if (err != 0)
@@ -250,10 +319,13 @@ bool identity_history_verify_existence(identity_history_t *history,
     return merkle_audit(history->merkle, item, proof, proof_len);
 }
 
-/* JSON serialization helpers for wire-compatible history exchange */
+/* JSON serialization helpers for wire-compatible history exchange.
+ * Exported so id_proc.c can build/parse the 3-tuple history payload
+ * (`[group, [steps], [peers]]`) that mirrors Python idprocess.py:498-513.
+ * Declared in history.h. */
 
 /* Frama-C: skipped — linked_step_to_json / linked_step_from_json: jansson + hexlify cascades. */
-static json_t *linked_step_to_json(const linked_step_t *step)
+json_t *linked_step_to_json(const linked_step_t *step)
 {
     if (step == NULL)
         return NULL;
@@ -282,7 +354,7 @@ static json_t *linked_step_to_json(const linked_step_t *step)
 }
 
 /* Frama-C: skipped — linked_step_to_json / linked_step_from_json: jansson + hexlify cascades. */
-static int linked_step_from_json(const json_t *obj, linked_step_t **step_out)
+int linked_step_from_json(const json_t *obj, linked_step_t **step_out)
 {
     if (obj == NULL || step_out == NULL)
         return EINVAL;
@@ -445,15 +517,16 @@ int identity_history_hear(identity_history_t *history,
     for (size_t i = 0; i + 1 < count; i++)
         steps[i]->parent = steps[i + 1];
 
-    char name_out[32];
-    int err = dag_ingest_branch(&history->dag, steps, count, NULL,
-                                name_out, sizeof(name_out));
+    /* C12: dag_catch_up performs ingest + diff + recite + validate
+     * + merge in one shot, matching Python StepDAG.catch_up
+     * (dag.py:287-297). The validator installed at create time
+     * (_identity_history_validate_branch) decides whether the merge
+     * actually happens; on rejection the branch stays in the DAG
+     * unmerged. We discard the branch_diff here — the wire layer
+     * does not surface it to the caller. */
+    int err = dag_catch_up(&history->dag, steps, count, NULL);
     free(steps);
-    if (err != 0)
-        return err;
-
-    /* merge into main */
-    return dag_merge(&history->dag, name_out, NULL, false);
+    return err;
 }
 
 /* Frama-C: skipped —
@@ -530,4 +603,191 @@ int identity_history_by_work_create(public_identity_t *myself,
 
     err = agreement_by_work_create(&voter, NULL, 0, difficulty, &(*history)->agreement);
     return err;
+}
+
+/****************************
+ * Blacklist + identity-aware prove/verify wrappers
+ *
+ * Mirrors Python's PoA/PoS prove() overrides (poa.py:37-42,
+ * pos.py:35-40) and IdentityHistory.verify_object (history.py:170-213).
+ * These sit on top of the protocol-generic agreement_* primitives,
+ * which intentionally remain blacklist- and identity-blind.
+ ****************************/
+
+int identity_history_blacklist_add(identity_history_t *history,
+                                   const uuid_t uuid,
+                                   const char *address)
+{
+    if (history == NULL || history->blacklist == NULL)
+        return EINVAL;
+    if (uuid == NULL && (address == NULL || address[0] == '\0'))
+        return EINVAL;
+
+    identity_blacklist_entry_t *entry = calloc(1, sizeof(*entry));
+    if (entry == NULL)
+        return ENOMEM;
+    if (uuid != NULL) {
+        uuid_copy(entry->uuid, uuid);
+        entry->uuid_set = true;
+    }
+    if (address != NULL) {
+        strncpy(entry->address, address, ADDR_LEN);
+        entry->address[ADDR_LEN] = '\0';
+    }
+    data_t *dat = object_ptr_data(entry, sizeof(*entry));
+    if (dat == NULL) {
+        free(entry);
+        return ENOMEM;
+    }
+    return array_append(history->blacklist, dat);
+}
+
+bool identity_history_is_blacklisted(const identity_history_t *history,
+                                     const uuid_t uuid,
+                                     const char *address)
+{
+    if (history == NULL || history->blacklist == NULL)
+        return false;
+    size_t n = array_size(history->blacklist);
+    for (size_t i = 0; i < n; i++) {
+        data_t *dat = NULL;
+        if (array_get(history->blacklist, (int)i, &dat) != 0 || dat == NULL)
+            continue;
+        ptr_t ptr = NULL;
+        if (data_object_ptr(dat, &ptr) != 0 || ptr == NULL)
+            continue;
+        const identity_blacklist_entry_t *e =
+            (const identity_blacklist_entry_t *)ptr;
+        if (uuid != NULL && e->uuid_set &&
+            uuid_compare((unsigned char *)e->uuid, (unsigned char *)uuid) == 0)
+            return true;
+        if (address != NULL && address[0] != '\0' &&
+            e->address[0] != '\0' &&
+            strncmp(e->address, address, ADDR_LEN) == 0)
+            return true;
+    }
+    return false;
+}
+
+int identity_history_prove(identity_history_t *history,
+                           merkle_blob_t *blob,
+                           agreement_proof_t **proof_out)
+{
+    if (history == NULL || blob == NULL || proof_out == NULL)
+        return EINVAL;
+    *proof_out = NULL;
+
+    /* The blob carries an identity_obj_t whose `.identity` field is the
+     * subject of the proof. Skip the blacklist check if the blob is not
+     * an identity_obj_t (no .identity present) — defensive, matches
+     * Python's failure-to-find-attrs path. */
+    const identity_obj_t *idobj = (const identity_obj_t *)blob;
+    if (idobj != NULL && idobj->identity != NULL) {
+        if (identity_history_is_blacklisted(history,
+                                            idobj->identity->uuid,
+                                            idobj->identity->address)) {
+            if (history->logger != NULL)
+                log_debug(history->logger,
+                          "identity_history_prove: rejecting blacklisted "
+                          "identity %s\n", idobj->identity->nickname);
+            return EACCES;
+        }
+    }
+    return agreement_prove(history->agreement, blob, proof_out);
+}
+
+bool identity_history_verify_object(identity_history_t *history,
+                                    merkle_blob_t *blob,
+                                    agreement_proof_t *proof,
+                                    const uint8_t *sig, size_t sig_len)
+{
+    if (history == NULL || blob == NULL)
+        return false;
+
+    /* Shape check: blob must carry a non-null identity with at least
+     * uuid + fullname + signature populated. Mirrors Python's
+     * IdentityObj.validate() (history.py:55-69). The C identity_obj_t
+     * stores `identity` as a pointer; null or zero-fullname rejects. */
+    const identity_obj_t *idobj = (const identity_obj_t *)blob;
+    if (idobj->identity == NULL) {
+        if (history->logger != NULL)
+            log_debug(history->logger, "verify_object: no identity\n");
+        return false;
+    }
+    if (idobj->identity->fullname[0] == '\0') {
+        if (history->logger != NULL)
+            log_debug(history->logger, "verify_object: identity has no fullname\n");
+        return false;
+    }
+    /* Signature key presence: the ed25519 public key is a fixed-size
+     * array, but a freshly-zeroed identity would have an all-zero key.
+     * Reject that as the C analog of Python's `identity.signature is None`. */
+    bool key_nonzero = false;
+    for (size_t i = 0; i < crypto_sign_PUBLICKEYBYTES; i++) {
+        if (idobj->identity->signature.public[i] != 0) {
+            key_nonzero = true;
+            break;
+        }
+    }
+    if (!key_nonzero) {
+        if (history->logger != NULL)
+            log_debug(history->logger, "verify_object: identity has no signature key\n");
+        return false;
+    }
+
+    /* Signature check is optional — Python skips it when sig/proof are
+     * None. The sig buffer here is the libsodium combined form
+     * (signature || message), matching how identity_sign produces it. */
+    if (sig != NULL && sig_len > 0 && proof != NULL) {
+        if (history->peers == NULL) {
+            if (history->logger != NULL)
+                log_warn(history->logger,
+                         "verify_object: no peers list, cannot locate voter\n");
+            return false;
+        }
+        uuid_t voter_uuid;
+        if (uuid_parse(proof->uuid, voter_uuid) != 0) {
+            if (history->logger != NULL)
+                log_warn(history->logger,
+                         "verify_object: bad voter uuid %s\n", proof->uuid);
+            return false;
+        }
+        const public_identity_t *voter =
+            peers_find_by_uuid(history->peers, voter_uuid);
+        if (voter == NULL) {
+            if (history->logger != NULL)
+                log_warn(history->logger,
+                         "verify_object: unknown voter %s\n", proof->uuid);
+            return false;
+        }
+        /* crypto_sign_open recovers the message from the combined buffer
+         * and validates the signature in one shot; non-zero return means
+         * the signature failed verification (Python's BadSignatureError). */
+        unsigned char *recovered = malloc(sig_len);
+        if (recovered == NULL)
+            return false;
+        unsigned long long recovered_len = 0;
+        int rc = crypto_sign_open(recovered, &recovered_len,
+                                  sig, sig_len, voter->signature.public);
+        free(recovered);
+        if (rc != 0) {
+            if (history->logger != NULL)
+                log_warn(history->logger,
+                         "verify_object: signature verification failed\n");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool identity_history_verify(identity_history_t *history,
+                             merkle_blob_t *blob,
+                             agreement_proof_t *proof,
+                             const uint8_t *sig, size_t sig_len)
+{
+    if (history == NULL || history->agreement == NULL)
+        return false;
+    if (!identity_history_verify_object(history, blob, proof, sig, sig_len))
+        return false;
+    return agreement_verify(history->agreement, blob, proof, sig, sig_len);
 }

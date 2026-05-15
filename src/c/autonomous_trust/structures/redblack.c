@@ -480,6 +480,26 @@ int tree_size(tree_t *tree)
     return tree->size;
 }
 
+int tree_first(tree_t *tree)
+{
+    if (tree == NULL || tree->root == NULL || tree->size == 0)
+        return -1;
+    struct rbNode *n = tree->root;
+    while (n->left != NULL)
+        n = n->left;
+    return n->key;
+}
+
+int tree_last(tree_t *tree)
+{
+    if (tree == NULL || tree->root == NULL || tree->size == 0)
+        return -1;
+    struct rbNode *n = tree->root;
+    while (n->right != NULL)
+        n = n->right;
+    return n->key;
+}
+
 /*@
   requires node == \null || \valid(node);
   assigns \nothing;
