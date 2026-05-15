@@ -179,6 +179,77 @@ DEFINE_TEST(test_dag_branch_exists_error)
 }
 END_TEST_DEFINITION()
 
+/* Validator that always rejects — used to exercise the rejection
+ * branch of dag_catch_up. Counts invocations via ctx so the test can
+ * confirm the hook actually ran. */
+static bool _always_reject_validator(step_dag_t *dag, const char *branch, void *ctx)
+{
+    (void)dag;
+    (void)branch;
+    if (ctx != NULL)
+        (*(int *)ctx)++;
+    return false;
+}
+
+DEFINE_TEST(test_dag_catch_up_success)
+{
+    step_dag_t dag;
+    ck_assert_ret_ok(dag_init(&dag));
+
+    /* NULL validator => always-valid, branch merged into main */
+    linked_step_t *ext[3];
+    ck_assert_ret_ok(linked_step_create("c-3", NULL, &ext[0]));  /* head */
+    ck_assert_ret_ok(linked_step_create("c-2", NULL, &ext[1]));
+    ck_assert_ret_ok(linked_step_create("c-1", NULL, &ext[2]));  /* root-side */
+
+    array_t *diff = NULL;
+    ck_assert_ret_ok(dag_catch_up(&dag, ext, 3, &diff));
+    ck_assert_ptr_nonnull(diff);
+    /* All three steps diverge from genesis, so the recited diff is the
+     * full inbound chain. */
+    ck_assert_int_eq(array_size(diff), 3);
+
+    /* After merge, main's head equals the inbound head. */
+    linked_step_t *main_head = NULL;
+    ck_assert_ret_ok(dag_fork(&dag, NULL, &main_head));
+    ck_assert_ptr_eq(main_head, ext[0]);
+
+    array_free(diff);
+    dag_free(&dag);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_dag_catch_up_validation_rejected)
+{
+    step_dag_t dag;
+    ck_assert_ret_ok(dag_init(&dag));
+
+    int validator_calls = 0;
+    dag_set_validator(&dag, _always_reject_validator, &validator_calls);
+
+    linked_step_t *ext[2];
+    ck_assert_ret_ok(linked_step_create("r-2", NULL, &ext[0]));  /* head */
+    ck_assert_ret_ok(linked_step_create("r-1", NULL, &ext[1]));  /* root-side */
+
+    array_t *diff = NULL;
+    ck_assert_ret_ok(dag_catch_up(&dag, ext, 2, &diff));
+    ck_assert_int_eq(validator_calls, 1);
+    /* diff is still populated even though the merge was vetoed —
+     * mirrors Python catch_up's "return branch_diff" regardless. */
+    ck_assert_ptr_nonnull(diff);
+    ck_assert_int_eq(array_size(diff), 2);
+
+    /* Main's head must still be genesis since the merge was rejected. */
+    linked_step_t *main_head = NULL;
+    ck_assert_ret_ok(dag_fork(&dag, NULL, &main_head));
+    ck_assert(main_head != ext[0]);
+
+    array_free(diff);
+    dag_free(&dag);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(DAG, test_dag_create_and_add, test_dag_branch_and_merge,
           test_dag_diff, test_dag_recite, test_dag_ingest_branch,
-          test_dag_branch_exists_error)
+          test_dag_branch_exists_error,
+          test_dag_catch_up_success, test_dag_catch_up_validation_rejected)

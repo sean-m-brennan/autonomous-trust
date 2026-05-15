@@ -458,11 +458,18 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
 }
 
 /**
- * Contrite tit-for-tat:
- * - No history → 0.49 (slightly defect)
- * - Check last interaction with this peer
- * - If peer cooperated last time (score > 0.5), cooperate
- * - Else defect
+ * Contrite tit-for-tat — ports repprocess.py:363-386.
+ *
+ * Collects ALL direct peer↔self interactions, computes the peer's running
+ * standing (mean of their scores) and our own standing (mean of our scores
+ * in those same transactions), then blends them. The result is continuous
+ * in [0.0, 1.0], not the binary 0.0/1.0 the previous implementation
+ * returned from the last direct tx alone.
+ *
+ *   - No direct history → 0.49 (slightly defect, lets reputation kick in)
+ *   - peer defected last AND my standing is poor → max(0.51, peer_standing)
+ *   - peer defected last AND my standing is good  → min(0.49, peer_standing)
+ *   - cooperative case                            → max(0.51, peer_standing)
  */
 double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *reps,
                                const uuid_t self_uuid, const uuid_t peer_uuid)
@@ -472,11 +479,12 @@ double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *re
     int count = 0;
     tx_history_by_peer(hist, peer_uuid, txns, &count, MAX_CHAIN_LEN);
 
-    if (count == 0)
-        return 0.49;
+    double peer_sum = 0.0;
+    double my_sum   = 0.0;
+    int    n        = 0;
+    double peer_last = 0.0;
 
-    /* Find last transaction involving both self and peer */
-    for (int i = count - 1; i >= 0; i--)
+    for (int i = 0; i < count; i++)
     {
         const transaction_t *tx = &txns[i];
         if (!tx->p1_set || !tx->p2_set)
@@ -487,47 +495,38 @@ double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *re
         bool peer_is_p1 = (uuid_compare(tx->p1_uuid, peer_uuid) == 0);
         bool peer_is_p2 = (uuid_compare(tx->p2_uuid, peer_uuid) == 0);
 
-        if ((self_is_p1 && peer_is_p2) || (self_is_p2 && peer_is_p1))
-        {
-            /* Found a direct interaction */
-            double peer_last_score;
-            if (peer_is_p1)
-                peer_last_score = tx->p1_score;
-            else
-                peer_last_score = tx->p2_score;
-
-            /* Contrite: if peer cooperated (> 0.5), cooperate back */
-            if (peer_last_score > 0.5)
-                return 1.0;
-
-            /* Check own standing - if we defected last and peer retaliated, forgive */
-            double self_last_score;
-            if (self_is_p1)
-                self_last_score = tx->p1_score;
-            else
-                self_last_score = tx->p2_score;
-
-            if (self_last_score <= 0.5)
-                return 1.0;  /* Contrite: we defected, accept retaliation */
-
-            return 0.0;  /* Defect */
+        double peer_score, my_score;
+        if (peer_is_p1 && self_is_p2) {
+            peer_score = tx->p1_score;
+            my_score   = tx->p2_score;
+        } else if (peer_is_p2 && self_is_p1) {
+            peer_score = tx->p2_score;
+            my_score   = tx->p1_score;
+        } else {
+            continue;
         }
+        peer_sum += peer_score;
+        my_sum   += my_score;
+        peer_last = peer_score;  /* iteration is forward, so this ends as the most-recent */
+        n++;
     }
 
-    /* No direct interaction found, check general peer history */
-    if (count > 0)
-    {
-        const transaction_t *last = &txns[count - 1];
-        double last_score;
-        if (uuid_compare(last->p1_uuid, peer_uuid) == 0)
-            last_score = last->p1_score;
-        else
-            last_score = last->p2_score;
+    if (n < 1)
+        return 0.49;
 
-        return (last_score > 0.5) ? 1.0 : 0.0;
+    double peer_standing = peer_sum / (double)n;
+    double my_standing   = my_sum   / (double)n;
+
+    if (peer_last < 0.5 && my_standing < 0.5) {
+        /* Peer defected, but my standing is poor — be contrite. */
+        return (peer_standing > 0.51) ? peer_standing : 0.51;
+    } else if (peer_last < 0.5 && my_standing >= 0.5) {
+        /* Peer defected, my standing is fine — retaliate. */
+        return (peer_standing < 0.49) ? peer_standing : 0.49;
+    } else {
+        /* Cooperate/cooperate, possibly digging out of a hole. */
+        return (peer_standing > 0.51) ? peer_standing : 0.51;
     }
-
-    return 0.49;
 }
 
 /**

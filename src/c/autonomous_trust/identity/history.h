@@ -252,6 +252,74 @@ int identity_history_by_work_create(public_identity_t *myself,
                                     int difficulty,
                                     identity_history_t **history);
 
+/* Blacklist entry — minimal {uuid, address} record. Either field may be
+ * zeroed to mean "match anything"; at least one must be set. Stored in
+ * history->blacklist as data-wrapped pointers; freed with the history. */
+typedef struct {
+    uuid_t uuid;
+    bool   uuid_set;
+    char   address[ADDR_LEN + 1];
+} identity_blacklist_entry_t;
+
+/** Add an entry to the history's blacklist. Either @p uuid or @p address
+ *  may be NULL/zero to leave that field unmatched; at least one must be
+ *  set. Mirrors the per-entry attributes Python checks in
+ *  poa.py:38-41 and pos.py:36-39. */
+int identity_history_blacklist_add(identity_history_t *history,
+                                   const uuid_t uuid,
+                                   const char *address);
+
+/** Return true iff a blacklist entry matches by uuid or address.
+ *  Consulted by identity_history_prove() to short-circuit proof
+ *  generation; callers verifying inbound traffic may use it directly. */
+bool identity_history_is_blacklisted(const identity_history_t *history,
+                                     const uuid_t uuid,
+                                     const char *address);
+
+/** Identity-aware wrapper around agreement_prove(). Returns EACCES
+ *  (without allocating *proof_out) if the blob's wrapped identity is
+ *  blacklisted by uuid or address; otherwise delegates to
+ *  agreement_prove. Mirrors the Python PoA/PoS prove() overrides
+ *  (poa.py:37-42, pos.py:35-40) which return None for blacklisted
+ *  blobs. PoW uses the same wrapper for consistency even though Python
+ *  PoW inherits the no-op base prove(). */
+int identity_history_prove(identity_history_t *history,
+                           merkle_blob_t *blob,
+                           agreement_proof_t **proof_out);
+
+/** Structural + signature verification on an identity blob before its
+ *  vote is counted. Mirrors Python's IdentityHistory.verify_object
+ *  (history.py:170-213): rejects bad blob shape, missing identity
+ *  fields, unknown voters, and bad signatures. The agreement layer's
+ *  pre_verify hooks remain protocol-generic; this check sits on top.
+ *  Use identity_history_verify() to combine both checks.
+ *
+ *  @p sig / @p sig_len may be (NULL, 0) to skip the signature step (the
+ *  Python equivalent of `sig is None`). */
+bool identity_history_verify_object(identity_history_t *history,
+                                    merkle_blob_t *blob,
+                                    agreement_proof_t *proof,
+                                    const uint8_t *sig, size_t sig_len);
+
+/** Identity-aware wrapper around agreement_verify(). Returns false if
+ *  identity_history_verify_object() rejects the blob; otherwise
+ *  delegates to agreement_verify. */
+bool identity_history_verify(identity_history_t *history,
+                             merkle_blob_t *blob,
+                             agreement_proof_t *proof,
+                             const uint8_t *sig, size_t sig_len);
+
+/** Serialize a single DAG step (uuid + ISO timestamp + hex'd payload)
+ *  to a fresh JSON object. Caller owns the returned ref and must
+ *  json_decref. Returns NULL on allocation failure or NULL @p step. */
+json_t *linked_step_to_json(const linked_step_t *step);
+
+/** Inverse of @ref linked_step_to_json — allocate a fresh
+ *  @ref linked_step_t and populate it. The payload, if present, is
+ *  unhex'd into a freshly-malloc'd MERKLE_DIGEST_LEN buffer owned by
+ *  the step. Returns 0 on success. */
+int linked_step_from_json(const json_t *obj, linked_step_t **step_out);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -114,8 +114,11 @@ DEFINE_TEST(test_reputation_contrite_tft)
     ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.8));
 
     score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    /* Peer cooperated (0.8 > 0.5), should cooperate back = 1.0 */
-    ck_assert_double_eq_tol(score, 1.0, 0.001);
+    /* One cooperative direct interaction: peer_standing = 0.8,
+     * my_standing = 0.9, peer_last = 0.8 (not < 0.5). Falls into the
+     * cooperate/cooperate branch which returns max(0.51, peer_standing).
+     * Mirrors Python repprocess.py:384-385. */
+    ck_assert_double_eq_tol(score, 0.8, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);

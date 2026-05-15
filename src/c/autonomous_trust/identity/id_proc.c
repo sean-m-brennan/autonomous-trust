@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -25,10 +26,13 @@
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
+#include "utilities/probes.h"
 #include "utilities/timeout.h"
 #include "structures/data.h"
 #include "network/net_message.h"
 #include "peers.h"
+#include "history.h"
+#include "identity_priv.h"
 #include "id_proc_priv.h"
 
 #ifdef AT_ZTA_ENABLED
@@ -55,6 +59,10 @@ static char ID_CONFIRM[]     = "peer_accepted";
 static char ID_UPDATE[]      = "group_key_update";
 static char ID_CAPS_QUERY[]  = "peer_caps_query";
 static char ID_CAPS_RESPONSE[] = "peer_caps_response";
+/* Local-only IPC from ReputationProcess (no wire egress). Payload is a
+ * 2-element JSON array `[peer_uuid_str, new_rank_int]`. Mirrors
+ * Python IdentityProtocol.rank_update (idprocess.py:139 / protocol.py:78). */
+static char ID_RANK[]        = "rank_update";
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -65,6 +73,13 @@ static struct {
     map_t peer_potentials;
     map_t vote_collection;
     bool choosing_group;
+    /* Group-merge tracking — mirrors Python's self.self_bootstrapped
+     * and self.merging in idprocess.py:126-127. Set when choose_group's
+     * self-bootstrap fallback fires (no histories arrived in time);
+     * cleared after _merge_to_mesh adopts a real mesh. `merging` is
+     * the re-entry guard for the merge helper. See BUGS.md §P1. */
+    bool self_bootstrapped;
+    bool merging;
     pthread_mutex_t lock;
     bool initialized;
     /* Test-only: when true, paths that would normally defer work to
@@ -85,6 +100,26 @@ static struct {
      * lowercased uuid string; values are array_t* of cap-name strings.
      * Conformance assertion surface via identity_get_peer_caps_count. */
     map_t peer_caps_map;
+    /* Reputation-derived per-peer rank tier. Keyed by lowercased uuid
+     * string; values are int data. Written by handle_rank_update on
+     * local IPC from ReputationProcess. Mirrors Python's per-peer
+     * `peer._rank` mutation in idprocess.py:1052. Future history-
+     * construction code should consult this map (via
+     * `identity_get_peer_rank`) instead of defaulting voter.rank to 0
+     * in history.c:487,506,525. */
+    map_t peer_ranks;
+    /* Self-rank mirror updated when handle_rank_update's payload
+     * targets the local identity uuid. Default 0; reads are unlocked
+     * since the field is a single int and writes are mutex-guarded. */
+    int self_rank;
+    /* Per-process identity history (Python's `self._history`). Lazy-
+     * initialized by _ensure_history(proc) the first time a path needs
+     * the local DAG — _peer_accepted's `steps` slot in the wire
+     * payload, _merge_to_mesh's ingest of inbound steps, etc. Selection
+     * mirrors Python's idprocess.py:100-110: read `identity.block` and
+     * call the matching `identity_history_by_*_create`. NULL until
+     * first use. */
+    identity_history_t *history;
 } id_state;
 
 static void _ensure_id_init(void)
@@ -96,10 +131,78 @@ static void _ensure_id_init(void)
         map_init(&id_state.vote_collection);
         map_init(&id_state.own_caps_by_proc);
         map_init(&id_state.peer_caps_map);
+        map_init(&id_state.peer_ranks);
+        id_state.self_rank = 0;
         id_state.choosing_group = false;
+        id_state.self_bootstrapped = false;
+        id_state.merging = false;
         pthread_mutex_init(&id_state.lock, NULL);
         id_state.initialized = true;
     }
+}
+
+/* Resolve the configured identity from proc->configs and call the
+ * matching identity_history_by_*_create. Caller must hold id_state.lock.
+ * Returns the cached history if already built, NULL on failure to
+ * resolve config or construct. Mirrors Python's idprocess.py:100-110
+ * (the `_history` field selection in IdentityProcess.__init__).
+ *
+ * peers_t* is passed as NULL — the local process peer list lives in
+ * proc->protocol.peers (a flat array), and identity_history_t's peers
+ * field is only consulted by verify_object's voter lookup; the wire-
+ * payload paths (recite, ingest, merge) don't touch it. */
+static identity_history_t *_ensure_history_locked(const process_t *proc)
+{
+    if (id_state.history != NULL)
+        return id_state.history;
+    if (proc == NULL || proc->configs == NULL)
+        return NULL;
+
+    data_t *id_dat = NULL;
+    char id_key[] = "identity";
+    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
+        return NULL;
+    config_t *id_cfg = NULL;
+    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 ||
+        id_cfg == NULL || id_cfg->data_struct == NULL)
+        return NULL;
+    identity_t *self_id = (identity_t *)id_cfg->data_struct;
+    public_identity_t *self_pub = NULL;
+    if (identity_publish(self_id, &self_pub) != 0 || self_pub == NULL)
+        return NULL;
+
+    /* Construct history matching self_id->block. The threshold/
+     * difficulty arguments use the cross-impl defaults — POA threshold
+     * derives at vote-time (sentinel -1), POW uses POW_DEFAULT_DIFFICULTY.
+     * Stake doesn't get a reputation_fn here; the C identity_history
+     * stake path doesn't yet read one. */
+    identity_history_t *h = NULL;
+    int err = -1;
+    switch (self_id->block) {
+        case POA:
+            err = identity_history_by_authority_create(self_pub, NULL,
+                                                       proc->logger, 0,
+                                                       AUTHORITY_THRESHOLD_DERIVE,
+                                                       &h);
+            break;
+        case POS:
+            err = identity_history_by_stake_create(self_pub, NULL,
+                                                   proc->logger, 0,
+                                                   NULL, &h);
+            break;
+        case POW:
+        default:
+            err = identity_history_by_work_create(self_pub, NULL,
+                                                  proc->logger, 0,
+                                                  POW_DEFAULT_DIFFICULTY, &h);
+            break;
+    }
+    smrt_deref(self_pub);
+
+    if (err != 0 || h == NULL)
+        return NULL;
+    id_state.history = h;
+    return h;
 }
 
 static void _id_proc_key(const process_t *proc, char *out, size_t n)
@@ -371,10 +474,18 @@ static int _send_caps_query(const process_t *proc, const public_identity_t *peer
  * Confirm payload carries `{uuid, fullname, address}` so the receiver can
  * route a directed `caps_query` back to the new peer if its announce was
  * lost (UDP-loss recovery — see _send_caps_query).
+ *
+ * @p amnesia mirrors Python's `_peer_accepted(amnesia=True)` flag
+ * (idprocess.py:488,515-522): when true, the peer is already in our
+ * peers list (returned-peer / confirm-before-announce recovery case),
+ * so we re-emit the confirm + accept + history broadcasts to refresh
+ * the peer's view but skip the _add_peer call to avoid no-op churn
+ * (and, more importantly, to avoid emitting a duplicate group update).
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] identity/peers preconditions */
-static int _peer_accepted(process_t *proc, directory_t *queues, const public_identity_t *new_peer)
+static int _peer_accepted(process_t *proc, directory_t *queues,
+                          const public_identity_t *new_peer, bool amnesia)
 {
     /* Send ID_CONFIRM to existing group members with new_peer identity in JSON payload.
      *
@@ -444,21 +555,105 @@ static int _peer_accepted(process_t *proc, directory_t *queues, const public_ide
     messaging_send("network", NET_MESSAGE, &accept, false);
 
     /* Send ID_HISTORY to the new peer so they can decrypt subsequent
-     * group-encrypted traffic. Matches Python's _peer_accepted, which
-     * emits to_json_string((self.group, self._history.recite())) here.
-     * The C side's history serialization isn't yet wired into this
-     * helper; the harness only checks the function name (per Phase A
-     * byte_pinning: false), so an empty payload is acceptable. Until
-     * a real history payload is added, peers receiving this message
-     * will see an empty obj — handle_receive_history tolerates this. */
+     * group-encrypted traffic AND populate their peer list with our
+     * existing admissions. The payload is a 3-element JSON array
+     * [group_obj, [steps...], [peer_idents...]] matching Python's
+     * `to_json_string((self.group, self._history.recite(),
+     * [p.publish() for p in self.peers.all]))` (idprocess.py:507-510).
+     *
+     * The C identity process doesn't yet hold a per-process
+     * identity_history_t (Python's `self._history` field), so the
+     * `steps` slot ships as an empty array for now. The receive-side
+     * (handle_receive_history → choose_group → _populate_peers_from_history)
+     * tolerates that — the peers slot is what late-joiner sync
+     * actually needs to work. When per-process identity_history_t
+     * gets wired up, call dag_recite + linked_step_to_json here and
+     * replace the empty array. */
+    json_t *hist_arr = json_array();
+    if (hist_arr != NULL)
+    {
+        /* Slot 0: group. */
+        json_t *group_json = NULL;
+        if (group_to_json(&proc->protocol.group, &group_json) == 0 &&
+            group_json != NULL) {
+            json_array_append_new(hist_arr, group_json);
+        } else {
+            json_array_append_new(hist_arr, json_null());
+        }
+        /* Slot 1: steps from the per-process identity history DAG.
+         * dag_recite walks from the head of the main branch back to
+         * root and yields the steps in insert order; each one becomes
+         * a `{uuid, timestamp, payload(hex)}` JSON object via
+         * linked_step_to_json. Mirrors Python's `self._history.recite()`
+         * in idprocess.py:508. */
+        json_t *steps_json = json_array();
+        if (steps_json != NULL)
+        {
+            pthread_mutex_lock(&id_state.lock);
+            identity_history_t *h = _ensure_history_locked(proc);
+            if (h != NULL) {
+                array_t *steps_arr = NULL;
+                if (dag_recite(&h->dag, NULL, NULL, &steps_arr) == 0 &&
+                    steps_arr != NULL) {
+                    size_t n = array_size(steps_arr);
+                    for (size_t i = 0; i < n; i++) {
+                        data_t *s_dat = NULL;
+                        if (array_get(steps_arr, (int)i, &s_dat) != 0 ||
+                            s_dat == NULL)
+                            continue;
+                        ptr_t sptr = NULL;
+                        if (data_object_ptr(s_dat, &sptr) != 0 || sptr == NULL)
+                            continue;
+                        json_t *step_json =
+                            linked_step_to_json((const linked_step_t *)sptr);
+                        if (step_json != NULL)
+                            json_array_append_new(steps_json, step_json);
+                    }
+                    array_free(steps_arr);
+                }
+            }
+            pthread_mutex_unlock(&id_state.lock);
+            json_array_append_new(hist_arr, steps_json);
+        } else {
+            json_array_append_new(hist_arr, json_array());
+        }
+        /* Slot 2: peer-bundle. Iterate proc->protocol.peers[] and
+         * publish each as a public-identity JSON object. */
+        json_t *peers_json = json_array();
+        if (peers_json != NULL)
+        {
+            peers_read_lock(proc);
+            for (size_t i = 0; i < proc->protocol.num_peers; i++)
+            {
+                json_t *p_json = NULL;
+                if (public_identity_to_json(&proc->protocol.peers[i], &p_json) == 0 &&
+                    p_json != NULL)
+                    json_array_append_new(peers_json, p_json);
+            }
+            peers_read_unlock(proc);
+            json_array_append_new(hist_arr, peers_json);
+        } else {
+            json_array_append_new(hist_arr, json_array());
+        }
+    }
+
     generic_msg_t hist = {0};
     hist.type = NET_MESSAGE;
     strncpy(hist.info.net_msg.process, "identity", PROC_NAME_LEN);
     hist.info.net_msg.function = ID_HISTORY;
     hist.info.net_msg.encrypt = true;
     memcpy(&hist.info.net_msg.to_whom, new_peer, sizeof(public_identity_t));
+    if (hist_arr != NULL)
+    {
+        net_msg_pack_json(&hist.info.net_msg, hist_arr);
+        json_decref(hist_arr);
+    }
     messaging_send("network", NET_MESSAGE, &hist, false);
 
+    /* Skip _add_peer in the amnesia case — the peer is already in our
+     * list and re-adding would emit a redundant group update. */
+    if (amnesia)
+        return 0;
     return _add_peer(proc, queues, new_peer);
 }
 
@@ -518,7 +713,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         log_info(proc->logger,
                  "Identity: peer %s already known (amnesia path)\n",
                  nmsg->from_whom.fullname);
-        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom);
+        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom, true);
         return true;
     }
 
@@ -581,7 +776,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     {
         log_info(proc->logger, "Identity: bootstrap — auto-accepting first peer %s\n",
                  nmsg->from_whom.fullname);
-        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom);
+        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom, false);
         return true;
     }
 
@@ -663,7 +858,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         log_info(proc->logger,
                  "Identity: synchronous_dispatch — self-vote majority for %s\n",
                  nmsg->from_whom.fullname);
-        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom);
+        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom, false);
     }
     return true;
 }
@@ -731,6 +926,405 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
     return true;
 }
 
+/* Forward declaration — definition is in the pre-loop block lower in
+ * this file. _merge_to_mesh / _announce_self_to_bundled_peers reuse the
+ * same announcement build + retry-on-network-busy logic. */
+static int _announce_identity(const process_t *proc, directory_t *queues);
+
+/****************************
+ * Helper: _announce_self_to_bundled_peers
+ *
+ * Mirrors Python's `_announce_self_to_bundled_peers` (idprocess.py:659-699).
+ * Sends an ID_ACCEPT (carrying self identity, package_hash, capabilities)
+ * to each peer in the bundle so the receivers' `handle_acceptance` adds
+ * us to their peer list. Without this, only welcomers (the few peers
+ * that voted on us at announce time) ever add us; everyone else stays
+ * in the unknown-sender path for our encrypted traffic and silently
+ * defers/drops it via the mystery-handler.
+ *
+ * The bundle list is the union of peer identities pulled out of inbound
+ * full_history payloads (Python's choose_group / _merge_to_mesh stash
+ * those into a `unioned_peers` dict before calling). The C history
+ * wire-format currently ships an empty payload (see _peer_accepted
+ * note above), so this helper is wired but quiescent until the wire
+ * format catches up. Once it does, no further wiring will be needed
+ * here.
+ ****************************/
+static int _announce_self_to_bundled_peers(const process_t *proc,
+                                           directory_t *queues,
+                                           const public_identity_t *peers,
+                                           size_t n_peers)
+{
+    (void)queues;
+    if (proc == NULL || peers == NULL || n_peers == 0)
+        return 0;
+
+    /* Build the accept payload once — same shape as the welcomer's
+     * ID_ACCEPT in _peer_accepted: identity in `from_whom`, no body. */
+    generic_msg_t accept_template = {0};
+    accept_template.type = NET_MESSAGE;
+    strncpy(accept_template.info.net_msg.process, "identity", PROC_NAME_LEN);
+    accept_template.info.net_msg.function = ID_ACCEPT;
+    accept_template.info.net_msg.encrypt = false;
+    strncpy(accept_template.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+
+    /* Populate from_whom with our published identity, same way as
+     * _build_announcement does it. */
+    data_t *id_dat = NULL;
+    char id_key[] = "identity";
+    if (map_get(proc->configs, id_key, &id_dat) == 0 && id_dat != NULL)
+    {
+        config_t *id_cfg = NULL;
+        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 &&
+            id_cfg != NULL && id_cfg->data_struct != NULL)
+        {
+            public_identity_t *pub = NULL;
+            identity_publish((const identity_t *)id_cfg->data_struct, &pub);
+            if (pub != NULL) {
+                memcpy(&accept_template.info.net_msg.from_whom, pub,
+                       sizeof(public_identity_t));
+                smrt_deref(pub);
+            }
+        }
+    }
+
+    size_t sent = 0;
+    for (size_t i = 0; i < n_peers; i++)
+    {
+        generic_msg_t accept = accept_template;
+        memcpy(&accept.info.net_msg.to_whom, &peers[i],
+               sizeof(public_identity_t));
+        if (messaging_send("network", NET_MESSAGE, &accept, false) == 0) {
+            sent++;
+            probes_counter("peer.set", "self_announce", "sent");
+        } else {
+            probes_counter("peer.set", "self_announce", "queue_full");
+        }
+    }
+    if (sent > 0)
+        log_debug(proc->logger,
+                  "Identity: announced self to %zu bundled peer(s)\n", sent);
+    return 0;
+}
+
+/****************************
+ * Helper: _populate_peers_from_history
+ *
+ * Mirrors Python's `_populate_peers_from_history` (idprocess.py:605-657).
+ * Seeds proc->protocol.peers from a welcomer's bundled peer list. Late
+ * joiners never receive the confirm broadcasts for peers admitted
+ * before they joined — admit-time `_peer_accepted` targets the
+ * welcomer's group at that moment.
+ *
+ * We deliberately do NOT call _add_peer here because the history bundle
+ * we just adopted already contains an admission step for each of these
+ * peers; _add_peer would double-emit group churn. We append directly to
+ * proc->protocol.peers (skipping self / already-known entries) and
+ * follow up with _announce_self_to_bundled_peers so the bundled peers
+ * learn about us — without that, the symmetry breaks and encrypted
+ * traffic to them fails the unknown-sender decrypt path.
+ ****************************/
+static int _populate_peers_from_history(process_t *proc,
+                                        directory_t *queues,
+                                        const public_identity_t *peer_idents,
+                                        size_t n)
+{
+    if (proc == NULL || peer_idents == NULL || n == 0)
+        return 0;
+
+    /* Resolve self uuid for the dedup check. */
+    uuid_t self_uuid;
+    uuid_clear(self_uuid);
+    data_t *id_dat = NULL;
+    char id_key[] = "identity";
+    if (map_get(proc->configs, id_key, &id_dat) == 0 && id_dat != NULL) {
+        config_t *id_cfg = NULL;
+        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 &&
+            id_cfg != NULL && id_cfg->data_struct != NULL) {
+            const public_identity_t *me =
+                (const public_identity_t *)id_cfg->data_struct;
+            uuid_copy(self_uuid, (unsigned char *)me->uuid);
+        }
+    }
+
+    /* Append new peers. peers_write_lock guards the array; the
+     * uniqueness check is similar to _add_peer's idempotent guard. */
+    size_t added = 0;
+    peers_write_lock(proc);
+    for (size_t i = 0; i < n; i++) {
+        const public_identity_t *p = &peer_idents[i];
+        if (uuid_compare((unsigned char *)p->uuid, self_uuid) == 0)
+            continue;
+        bool dup = false;
+        for (size_t k = 0; k < proc->protocol.num_peers; k++) {
+            if (uuid_compare(proc->protocol.peers[k].uuid,
+                             (unsigned char *)p->uuid) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+        if (proc->protocol.num_peers >= MAX_PEERS)
+            break;
+        memcpy(&proc->protocol.peers[proc->protocol.num_peers],
+               p, sizeof(public_identity_t));
+        proc->protocol.num_peers++;
+        added++;
+    }
+    peers_write_unlock(proc);
+
+    if (added > 0) {
+        log_debug(proc->logger,
+                  "Identity: history bundle added %zu previously unknown peer(s)\n",
+                  added);
+        /* Bundled peers don't know about us yet — fix the asymmetry. */
+        _announce_self_to_bundled_peers(proc, queues, peer_idents, n);
+    }
+    return 0;
+}
+
+/****************************
+ * Helper: _union_peers_from_histories
+ *
+ * Walk every stashed history JSON in @p id_state.histories, pull the
+ * `peers` slot (index 2 of the 3-tuple) out of each, parse entries
+ * into public_identity_t records, and dedup by uuid. Mirrors Python's
+ * choose_group / _merge_to_mesh `unioned_peers` collection
+ * (idprocess.py:278-296, 397-409). The caller owns the returned heap
+ * array and must free() it; @p *out_count receives the entry count.
+ *
+ * Returns 0 on success (even if zero peers found); non-zero on
+ * allocation failure.
+ ****************************/
+static int _union_peers_from_histories(public_identity_t **out, size_t *out_count)
+{
+    if (out == NULL || out_count == NULL)
+        return EINVAL;
+    *out = NULL;
+    *out_count = 0;
+
+    /* First pass: count entries to bound the alloc; cap at MAX_PEERS to
+     * keep the working set small. */
+    size_t cap = 0;
+    size_t n_hist = array_size(&id_state.histories);
+    for (size_t i = 0; i < n_hist; i++) {
+        data_t *h_dat = NULL;
+        if (array_get(&id_state.histories, (int)i, &h_dat) != 0 || h_dat == NULL)
+            continue;
+        ptr_t ptr = NULL;
+        if (data_object_ptr(h_dat, &ptr) != 0 || ptr == NULL)
+            continue;
+        const json_t *root = (const json_t *)ptr;
+        if (!json_is_array(root) || json_array_size(root) < 3)
+            continue;
+        const json_t *peers_arr = json_array_get(root, 2);
+        if (peers_arr && json_is_array(peers_arr))
+            cap += json_array_size(peers_arr);
+    }
+    if (cap == 0)
+        return 0;
+    if (cap > MAX_PEERS)
+        cap = MAX_PEERS;
+
+    public_identity_t *buf = calloc(cap, sizeof(public_identity_t));
+    if (buf == NULL)
+        return ENOMEM;
+
+    size_t n = 0;
+    for (size_t i = 0; i < n_hist && n < cap; i++) {
+        data_t *h_dat = NULL;
+        if (array_get(&id_state.histories, (int)i, &h_dat) != 0 || h_dat == NULL)
+            continue;
+        ptr_t ptr = NULL;
+        if (data_object_ptr(h_dat, &ptr) != 0 || ptr == NULL)
+            continue;
+        const json_t *root = (const json_t *)ptr;
+        if (!json_is_array(root) || json_array_size(root) < 3)
+            continue;
+        const json_t *peers_arr = json_array_get(root, 2);
+        if (!peers_arr || !json_is_array(peers_arr))
+            continue;
+        size_t m = json_array_size(peers_arr);
+        for (size_t k = 0; k < m && n < cap; k++) {
+            const json_t *p_obj = json_array_get(peers_arr, k);
+            if (!p_obj || !json_is_object(p_obj))
+                continue;
+            public_identity_t parsed = {0};
+            if (public_identity_from_json(p_obj, &parsed) != 0)
+                continue;
+            /* Dedup by uuid against entries already in buf. */
+            bool dup = false;
+            for (size_t j = 0; j < n; j++) {
+                if (uuid_compare((unsigned char *)buf[j].uuid,
+                                 (unsigned char *)parsed.uuid) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                buf[n] = parsed;
+                n++;
+            }
+        }
+    }
+
+    if (n == 0) {
+        free(buf);
+        return 0;
+    }
+    *out = buf;
+    *out_count = n;
+    return 0;
+}
+
+/****************************
+ * Helper: _merge_to_mesh
+ *
+ * Mirrors Python's `_merge_to_mesh` (idprocess.py:383-441). Called when
+ * a full_history arrives AFTER choose_group's self-bootstrap fallback
+ * already ran. Adopts the mesh's group + history, then re-broadcasts
+ * request_access on the open channel so a BG admits us through the
+ * normal welcoming-committee flow. The eventual access_granted +
+ * full_history round-trip routes back through handle_receive_history
+ * with self_bootstrapped now clear — no re-entry.
+ *
+ * The merging flag is the re-entry guard; caller is responsible for
+ * setting it and this helper clears it on exit (success or failure).
+ ****************************/
+static int _merge_to_mesh(process_t *proc, directory_t *queues)
+{
+    if (proc == NULL)
+        return EINVAL;
+
+    log_info(proc->logger,
+             "Identity: merging self-bootstrap into mesh (re-announcing)\n");
+
+    /* Walk the stashed histories under the id_state lock to pull
+     * three things out: (1) the bundled peer list, (2) the group from
+     * the longest-history welcomer, (3) that same welcomer's steps
+     * array. Mirrors Python choose_group / _merge_to_mesh which sort
+     * `accepted` by `len(steps) > len(accepted[1])` so the most
+     * complete view wins (idprocess.py:305-306, 412). Releasing the
+     * lock before calling _populate_peers_from_history (which takes
+     * its own locks). */
+    public_identity_t *peer_bundle = NULL;
+    size_t bundle_n = 0;
+    group_t adopted_group = {0};
+    bool have_group = false;
+    json_t *steps_ref = NULL;     /* borrowed; alive while histories holds it */
+    size_t best_steps_len = 0;    /* highest json_array_size(steps) seen */
+
+    pthread_mutex_lock(&id_state.lock);
+    _union_peers_from_histories(&peer_bundle, &bundle_n);
+
+    size_t n_hist = array_size(&id_state.histories);
+    for (size_t i = 0; i < n_hist; i++) {
+        data_t *h_dat = NULL;
+        if (array_get(&id_state.histories, (int)i, &h_dat) != 0 || h_dat == NULL)
+            continue;
+        ptr_t hptr = NULL;
+        if (data_object_ptr(h_dat, &hptr) != 0 || hptr == NULL)
+            continue;
+        json_t *root = (json_t *)hptr;
+        if (!json_is_array(root) || json_array_size(root) < 2)
+            continue;
+        json_t *s_json = json_array_get(root, 1);
+        size_t this_steps_len =
+            (s_json && json_is_array(s_json)) ? json_array_size(s_json) : 0;
+
+        /* Pick this entry only if it has strictly more steps than the
+         * best seen so far. The first entry always replaces the
+         * zero-initialized baseline (`have_group=false` ensures
+         * even an empty-steps entry can seed adoption when no other
+         * choice exists). Strict > on ties matches Python's behavior:
+         * the first welcomer at a given length wins, later ties keep
+         * the earlier pick. */
+        bool pick = false;
+        if (!have_group && this_steps_len == 0) {
+            pick = true;
+        } else if (this_steps_len > best_steps_len) {
+            pick = true;
+        }
+        if (!pick)
+            continue;
+
+        json_t *g_json = json_array_get(root, 0);
+        if (g_json && json_is_object(g_json)) {
+            group_t parsed = {0};
+            if (group_from_json(g_json, &parsed) == 0) {
+                adopted_group = parsed;
+                have_group = true;
+            }
+        }
+        steps_ref = (this_steps_len > 0) ? s_json : NULL;
+        best_steps_len = this_steps_len;
+    }
+
+    /* Ingest the inbound steps into our DAG before releasing the lock —
+     * _ensure_history_locked requires it. */
+    if (steps_ref != NULL) {
+        identity_history_t *h = _ensure_history_locked(proc);
+        if (h != NULL) {
+            size_t m = json_array_size(steps_ref);
+            linked_step_t **steps = calloc(m, sizeof(linked_step_t *));
+            size_t parsed_n = 0;
+            if (steps != NULL) {
+                for (size_t k = 0; k < m; k++) {
+                    json_t *sj = json_array_get(steps_ref, k);
+                    if (sj == NULL || !json_is_object(sj))
+                        continue;
+                    linked_step_t *step = NULL;
+                    if (linked_step_from_json(sj, &step) == 0 && step != NULL)
+                        steps[parsed_n++] = step;
+                }
+                if (parsed_n > 0) {
+                    /* C12 parity: dag_catch_up does the full ingest +
+                     * diff + recite + validate + merge sequence that
+                     * mirrors Python StepDAG.catch_up
+                     * (dag.py:287-297). The validator installed by
+                     * identity_history_create vetoes the merge on
+                     * timestamp backdating; on rejection the branch
+                     * remains in the DAG but unmerged. We discard the
+                     * branch_diff — id_proc has no consumer for it. */
+                    dag_catch_up(&h->dag, steps, parsed_n, NULL);
+                }
+                /* dag_ingest_branch retains owning refs on success; on
+                 * failure we leak the unowned ones intentionally rather
+                 * than guess at the ownership boundary mid-stream. */
+                free(steps);
+            }
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+
+    /* Adopt the mesh's group key under peers_write_lock (the
+     * proc->protocol.group field is covered by the same lock as
+     * proc->protocol.peers in the existing code). Mirrors Python's
+     * `self.group = accepted_group` in idprocess.py:420. */
+    if (have_group) {
+        char gid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(adopted_group.uuid, gid_str);
+        peers_write_lock(proc);
+        memcpy(&proc->protocol.group, &adopted_group, sizeof(group_t));
+        peers_write_unlock(proc);
+        log_info(proc->logger,
+                 "Identity: adopted mesh group %s during merge\n", gid_str);
+    }
+
+    _populate_peers_from_history(proc, queues, peer_bundle, bundle_n);
+    free(peer_bundle);
+
+    int rc = _announce_identity(proc, queues);
+
+    pthread_mutex_lock(&id_state.lock);
+    id_state.self_bootstrapped = false;
+    id_state.merging = false;
+    pthread_mutex_unlock(&id_state.lock);
+
+    return rc;
+}
+
 /****************************
  * Handler: receive_history (full_history)
  * Receives full history + group from established peer.
@@ -761,9 +1355,22 @@ static bool handle_receive_history(const process_t *proc, directory_t *queues, g
     /* Store the history JSON blob in the histories array for later processing */
     data_t *hist_dat = object_ptr_data(payload, sizeof(json_t));
     array_append(&id_state.histories, hist_dat);
+    /* Late-history merge trigger — mirrors Python's idprocess.py:367-377.
+     * If choose_group's self-bootstrap fallback already fired and a real
+     * mesh's history just arrived, fan out to _merge_to_mesh so we can
+     * re-broadcast request_access and be admitted normally. The merging
+     * flag guards against re-entry while the helper is running. */
+    bool should_merge = (id_state.self_bootstrapped
+                         && !id_state.merging
+                         && !id_state.choosing_group);
+    if (should_merge)
+        id_state.merging = true;
     pthread_mutex_unlock(&id_state.lock);
 
     log_debug(proc->logger, "Identity: stored history from %s\n", nmsg->from_whom.fullname);
+
+    if (should_merge)
+        _merge_to_mesh((process_t *)proc, queues);
     return true;
 }
 
@@ -914,7 +1521,12 @@ void identity_reset_state(void)
     map_init(&id_state.own_caps_by_proc);
     map_free(&id_state.peer_caps_map);
     map_init(&id_state.peer_caps_map);
+    map_free(&id_state.peer_ranks);
+    map_init(&id_state.peer_ranks);
+    id_state.self_rank = 0;
     id_state.choosing_group = false;
+    id_state.self_bootstrapped = false;
+    id_state.merging = false;
     id_state.synchronous_dispatch = was_sync;
     pthread_mutex_unlock(&id_state.lock);
 }
@@ -1001,7 +1613,7 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
         {
             log_info(proc->logger, "Identity: majority vote reached for %s, accepting peer\n",
                      uuid_key);
-            _peer_accepted(proc, queues, new_peer);
+            _peer_accepted(proc, queues, new_peer, false);
         }
         else
         {
@@ -1423,6 +2035,114 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
 }
 
 /****************************
+ * Handler: rank_update (rank_update)
+ * Local-only IPC from ReputationProcess (BUGS.md §P2). Payload is a
+ * 2-element JSON array `[peer_uuid_str, new_rank_int]`. Mirrors
+ * Python's handle_rank_update (idprocess.py:1020-1058). Updates the
+ * peer_ranks map (or self_rank if the payload targets us); the next
+ * history-construction call should consult these for voter rank.
+ ****************************/
+
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
+static bool handle_rank_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_warn(proc->logger, "Identity: handle_rank_update: no JSON payload\n");
+        return true;
+    }
+    if (!json_is_array(payload) || json_array_size(payload) < 2)
+    {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: handle_rank_update: bad payload shape\n");
+        return true;
+    }
+    const char *peer_uuid_str = json_string_value(json_array_get(payload, 0));
+    json_t *j_rank = json_array_get(payload, 1);
+    if (peer_uuid_str == NULL || !json_is_integer(j_rank))
+    {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: handle_rank_update: bad field types\n");
+        return true;
+    }
+    int new_rank = (int)json_integer_value(j_rank);
+
+    /* Detect self-target by comparing against our own identity uuid from
+     * proc->configs["identity"]. Mirrors Python idprocess.py:1039. */
+    bool is_self = false;
+    char self_str[UUID_STRING_LEN + 1] = {0};
+    data_t *id_dat = NULL;
+    char id_key[] = "identity";
+    if (map_get(proc->configs, id_key, &id_dat) == 0 && id_dat != NULL)
+    {
+        config_t *id_cfg = NULL;
+        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 &&
+            id_cfg != NULL && id_cfg->data_struct != NULL)
+        {
+            const public_identity_t *me =
+                (const public_identity_t *)id_cfg->data_struct;
+            uuid_unparse_lower(me->uuid, self_str);
+            if (strncmp(self_str, peer_uuid_str, UUID_STRING_LEN) == 0)
+                is_self = true;
+        }
+    }
+
+    /* map_set takes `char *const` for the key; copy into a writable
+     * local before insertion. The map dups the key internally so the
+     * stack-local is safe to drop afterward. */
+    char key_buf[UUID_STRING_LEN + 1];
+    strncpy(key_buf, peer_uuid_str, UUID_STRING_LEN);
+    key_buf[UUID_STRING_LEN] = '\0';
+
+    pthread_mutex_lock(&id_state.lock);
+    if (is_self) {
+        id_state.self_rank = new_rank;
+    } else {
+        data_t *rank_dat = integer_data(new_rank);
+        if (rank_dat != NULL)
+            map_set(&id_state.peer_ranks, key_buf, rank_dat);
+    }
+    pthread_mutex_unlock(&id_state.lock);
+
+    log_debug(proc->logger, "Identity: rank update for %s -> %d%s\n",
+              key_buf, new_rank, is_self ? " (self)" : "");
+    json_decref(payload);
+    return true;
+}
+
+int identity_get_peer_rank(const uuid_t uuid)
+{
+    if (!id_state.initialized) return 0;
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(uuid, uuid_str);
+    pthread_mutex_lock(&id_state.lock);
+    int rank = 0;
+    data_t *dat = NULL;
+    if (map_get(&id_state.peer_ranks, uuid_str, &dat) == 0 && dat != NULL)
+        data_integer(dat, &rank);
+    pthread_mutex_unlock(&id_state.lock);
+    return rank;
+}
+
+int identity_get_self_rank(void)
+{
+    if (!id_state.initialized) return 0;
+    pthread_mutex_lock(&id_state.lock);
+    int r = id_state.self_rank;
+    pthread_mutex_unlock(&id_state.lock);
+    return r;
+}
+
+/****************************
  * Pre-loop: acquire capabilities and announce
  ****************************/
 
@@ -1479,6 +2199,11 @@ static int _build_announcement(const process_t *proc, generic_msg_t *buf)
     return 0;
 }
 
+/* Parity wrapper for Python's `_broadcast_request_access`
+ * (idprocess.py:219-227). Builds and emits the request_access envelope
+ * on the open channel — used both by the Phase 1→2 initial announce
+ * AND by the group-merge recovery path in `_merge_to_mesh` to
+ * re-broadcast without a phase change. */
 /* Frama-C: skipped — [solver-timeout] logging/snprintf/json preconditions */
 static int _announce_identity(const process_t *proc, directory_t *queues)
 {
@@ -1532,6 +2257,7 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_UPDATE,   (handler_ptr_t)handle_group_update);
     process_register_handler(proc, ID_CAPS_QUERY,    (handler_ptr_t)handle_caps_query);
     process_register_handler(proc, ID_CAPS_RESPONSE, (handler_ptr_t)handle_caps_response);
+    process_register_handler(proc, ID_RANK,          (handler_ptr_t)handle_rank_update);
     return 0;
 }
 
@@ -1563,7 +2289,20 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
      * at_identity_run (not this entry point), so blocking in the wait does
      * not affect synchronous_dispatch tests. */
     {
-        const long INIT_TIMEOUT_US = 5L * 1000000L;  /* Python init_timeout=5s */
+        /* AT_INIT_TIMEOUT_SEC env-var override — mirrors Python's
+         * idprocess.py:87-92. The default 5 s is fine for a bootstrap
+         * node, but late joiners that need an existing mesh's history
+         * to arrive over UDP broadcast (e.g. an observer container
+         * coming up beside an already-running peer mesh) routinely
+         * lose the race and self-bootstrap. Set this env var on those
+         * containers to extend the wait. */
+        long INIT_TIMEOUT_US = 5L * 1000000L;  /* Python init_timeout=5s */
+        const char *init_override = getenv("AT_INIT_TIMEOUT_SEC");
+        if (init_override != NULL && init_override[0] != '\0') {
+            double secs = strtod(init_override, NULL);
+            if (secs > 0)
+                INIT_TIMEOUT_US = (long)(secs * 1000000.0);
+        }
         const long GRACE_US        = 1L * 1000000L;  /* Python grace=1s */
         struct timeval start_tv, now_tv;
         gettimeofday(&start_tv, NULL);
@@ -1641,6 +2380,13 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
             }
             if (pub != NULL)
                 smrt_deref(pub);
+            /* Mark self-bootstrap so a late-arriving full_history triggers
+             * the merge path in handle_receive_history → _merge_to_mesh.
+             * Cleared once the merge completes. Mirrors Python's
+             * `self.self_bootstrapped = True` (idprocess.py:342). */
+            pthread_mutex_lock(&id_state.lock);
+            id_state.self_bootstrapped = true;
+            pthread_mutex_unlock(&id_state.lock);
         }
 
         pthread_mutex_lock(&id_state.lock);

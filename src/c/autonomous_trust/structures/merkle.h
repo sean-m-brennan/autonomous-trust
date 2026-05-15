@@ -285,8 +285,79 @@ bool merkle_audit(merkle_tree_t *tree, merkle_blob_t *blob,
     ensures \result == false;
   disjoint behaviors;
 */
+/** Membership predicate — true iff @p blob (matched by uuid) is in
+ *  @p tree's blob list. Mirrors Python's MerkleTree.__contains__
+ *  (merkle.py:249-258). Does NOT recompute or verify hashes; for
+ *  cryptographic verification, build an inclusion proof and call
+ *  merkle_audit instead. */
+bool merkle_contains(const merkle_tree_t *tree, const merkle_blob_t *blob);
+
 bool merkle_consistent(merkle_tree_t *tree, int other_size,
                        const uint8_t *other_root_digest);
+
+/**
+ * @brief H11 — locate subtrees with duplicate hashes (parity with Python
+ *        `MerkleTree.subtree_duplications`, merkle.py:269-274).
+ *
+ * Scans every node in @p tree and returns the indices of nodes whose
+ * digest matches at least one other node's digest. Both leaves and
+ * internal nodes are considered: an internal-node collision implies
+ * the two subtrees rooted at those nodes encode the same data
+ * sequence (collision-resistance of BLAKE2b makes accidental
+ * collisions cryptographically negligible).
+ *
+ * The Python implementation tracks duplicates via a `unique`
+ * defaultdict populated during `_rehash`; the C representation has
+ * no such bookkeeping, so this performs an O(n²) pairwise digest
+ * scan on demand. Acceptable for typical Merkle tree sizes.
+ *
+ * NB: the Python source keys `self.unique` by `leaf.uuid` rather
+ * than `leaf.digest`, which would mean the defaultdict only finds
+ * collisions when two nodes share a UUID — never under auto-UUID
+ * generation. We port the documented intent (digest collisions)
+ * rather than the literal bug.
+ *
+ * @param tree       merkle tree to scan.
+ * @param idx_out    out param; receives a malloc'd `int*` array
+ *                   of indices into `tree->nodes` for colliding
+ *                   nodes. NULL if no duplicates. Caller frees.
+ * @param count_out  out param; receives the length of @p idx_out.
+ * @return 0 on success, EINVAL on bad args, ENOMEM on alloc failure.
+ */
+int merkle_subtree_duplications(merkle_tree_t *tree,
+                                int **idx_out, size_t *count_out);
+
+/**
+ * @brief H12 — verify a blob's membership using a possibly-extended
+ *        proof chain (parity with Python `MerkleTree.audit(blob, chain)`,
+ *        merkle.py:226-247).
+ *
+ * Walks the proof from leaf to root, optionally continuing through
+ * @p extra_chain to a super-tree root, and compares the final digest
+ * against @p super_hash. When @p extra_chain is NULL and @p super_hash
+ * equals `tree->root_digest`, behavior matches `merkle_audit`.
+ *
+ * The extra chain extends the local inclusion proof above this tree's
+ * root, e.g. when @p tree is itself a sub-tree of a larger forest and
+ * the caller has the additional sibling digests up to the forest root.
+ *
+ * @param tree         merkle tree the blob lives in.
+ * @param blob         the blob whose membership is being verified.
+ * @param proof        inclusion proof from blob to local root (typically
+ *                     produced by `merkle_inclusion_proof`).
+ * @param proof_n      length of @p proof.
+ * @param extra_chain  optional extension above the local root, ordered
+ *                     from local root upward to super-root. May be NULL
+ *                     when @p extra_n is 0.
+ * @param extra_n      length of @p extra_chain (0 == no extension).
+ * @param super_hash   target digest to compare against; must be
+ *                     `MERKLE_DIGEST_LEN` bytes.
+ * @return true if the recomputed root digest equals @p super_hash.
+ */
+bool merkle_audit_chain(merkle_tree_t *tree, merkle_blob_t *blob,
+                        merkle_proof_step_t *proof, int proof_n,
+                        merkle_proof_step_t *extra_chain, int extra_n,
+                        const uint8_t *super_hash);
 
 /**
  * @brief Free all tree resources (nodes array, blobs array, tree struct).

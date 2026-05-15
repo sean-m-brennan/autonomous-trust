@@ -339,6 +339,18 @@ static int decrypt_message(const identity_t *myself, const public_identity_t *pe
  ****************************/
 
 /* Frama-C: skipped — [alloc-pattern] route_to_process: at_memcpy + strdup + messaging_send. */
+/* Known gaps vs Python netprocess.py (audit refs divergence.md):
+ *   H7  stats_req: Python intercepts `function == "stats_req"` here and
+ *       returns a `stats_resp` with the local net_stats dict. C does
+ *       not — Python peers querying a C peer's stats hang.
+ *   H8  ping: Python intercepts `function == "ping"` and dispatches an
+ *       async worker through netprocess. C routes to the destination
+ *       process queue, so a generic-ping message goes unanswered.
+ * Both would land as `if (strcmp(wmsg->process, "network") == 0 &&
+ * strcmp(wmsg->function, "stats_req"|"ping") == 0) { ... return 0; }`
+ * branches before the generic route below. The stats body lookup
+ * needs a net_stats accessor that doesn't exist yet; the ping side
+ * needs to plumb through the async ping API in network/ping.c. */
 static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
                             directory_t *queues, logger_t *logger)
 {

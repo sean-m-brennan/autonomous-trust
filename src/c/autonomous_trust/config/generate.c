@@ -16,6 +16,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -382,13 +383,24 @@ int random_config(const char *cfg_dir)
     struct stat st;
     if (stat(id_path, &st) != 0)
     {
-        uuid_t name_uuid;
-        uuid_generate(name_uuid);
-        char name_str[UUID_STRING_LEN + 1];
-        uuid_unparse_lower(name_uuid, name_str);
-
         char fullname[NAME_LEN + 1];
-        snprintf(fullname, NAME_LEN, "agent-%.*s", 8, name_str);
+        /* AT_PEER_NAME override — mirrors Python generate.py:87-107
+         * (uses an env var on the identity nickname so multi-agent
+         * compose runs label their peers by container role). Falls
+         * back to a UUID-derived `agent-XXXXXXXX` when unset. The full
+         * `_names` list / seed-modulo indexing (Python's randomize=True
+         * path) isn't ported yet — see divergence.md H5. */
+        const char *peer_name = getenv("AT_PEER_NAME");
+        if (peer_name != NULL && peer_name[0] != '\0') {
+            strncpy(fullname, peer_name, NAME_LEN);
+            fullname[NAME_LEN] = '\0';
+        } else {
+            uuid_t name_uuid;
+            uuid_generate(name_uuid);
+            char name_str[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(name_uuid, name_str);
+            snprintf(fullname, NAME_LEN, "agent-%.*s", 8, name_str);
+        }
 
         int err = generate_identity(fullname, cfg_dir);
         if (err != 0)
