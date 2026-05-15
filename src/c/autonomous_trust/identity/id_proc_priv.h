@@ -71,6 +71,16 @@ void identity_set_own_capabilities(const process_t *proc,
  *  `peer_caps_count` expected_state key. */
 int identity_get_peer_caps_count(const uuid_t uuid);
 
+/** Return the reputation-derived rank tier last published for @p uuid via
+ *  the ID_RANK local-IPC handler (handle_rank_update). Returns 0 if no
+ *  entry exists. The map is populated by ReputationProcess crossing a
+ *  RANK_TIERS boundary. Mirrors Python's per-peer `peer._rank` field
+ *  consulted by AgreementByAuthority voter weighting (BUGS.md §P2). */
+int identity_get_peer_rank(const uuid_t uuid);
+
+/** Return the rank last applied to the local identity via ID_RANK. */
+int identity_get_self_rank(void);
+
 /** Toggle synchronous-dispatch mode for the conformance harness.
  *
  *  When @p enabled is true, handle_welcoming_committee runs the propose +

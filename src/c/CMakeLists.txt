@@ -81,6 +81,27 @@ if(AT_CC_VALIDATE_OUTPUT)
     set(CMAKE_C_COMPILER_LAUNCHER ${_at_cc_launcher})
     set(CMAKE_CXX_COMPILER_LAUNCHER ${_at_cc_launcher})
     message("-- AT_CC_VALIDATE_OUTPUT enabled (build FS: ${_at_build_fs_type}); using ${_at_cc_launcher}")
+
+    # Same virtiofs page-cache hazard, different victim: when ar/ranlib writes
+    # libautonomous_trust.a through virtiofs, the on-disk file is occasionally
+    # truncated at a page boundary (observed exactly 65536 bytes, leaving 5 of
+    # 81 expected members). Downstream links then fail with undefined refs on
+    # symbols whose .o was never persisted. Wrap ar+ranlib with a validate-
+    # and-retry launcher analogous to cc-validate-output. Tied to the same
+    # AT_CC_VALIDATE_OUTPUT switch since the trigger is identical (virtiofs).
+    set(_at_ar_launcher ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ar-validate-output)
+    if(NOT EXISTS ${_at_ar_launcher})
+        message(FATAL_ERROR "AT_CC_VALIDATE_OUTPUT=ON but ${_at_ar_launcher} is missing")
+    endif()
+    set(CMAKE_C_ARCHIVE_CREATE
+        "${_at_ar_launcher} ar <CMAKE_AR> qc <TARGET> <LINK_FLAGS> <OBJECTS>")
+    set(CMAKE_C_ARCHIVE_FINISH
+        "${_at_ar_launcher} ranlib <CMAKE_RANLIB> <TARGET>")
+    set(CMAKE_CXX_ARCHIVE_CREATE
+        "${_at_ar_launcher} ar <CMAKE_AR> qc <TARGET> <LINK_FLAGS> <OBJECTS>")
+    set(CMAKE_CXX_ARCHIVE_FINISH
+        "${_at_ar_launcher} ranlib <CMAKE_RANLIB> <TARGET>")
+    message("-- AT_CC_VALIDATE_OUTPUT: wrapping ar/ranlib via ${_at_ar_launcher}")
 endif()
 
 set(warning_as_error -Werror)
@@ -421,6 +442,7 @@ set(libsrc
     autonomous_trust/utilities/logger.c
     autonomous_trust/utilities/message.c
     autonomous_trust/utilities/msg_types.c
+    autonomous_trust/utilities/probes.c
     autonomous_trust/utilities/protobuf_shutdown.cpp
     autonomous_trust/utilities/queue_pool.c
     autonomous_trust/utilities/sighandler.c

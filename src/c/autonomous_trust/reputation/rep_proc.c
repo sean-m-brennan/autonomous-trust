@@ -29,11 +29,47 @@
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
+#include "utilities/probes.h"
 #include "network/net_message.h"
 #include "reputation/rep_proc_priv.h"
 
 #define EREP_PAXOS 253
 DEFINE_ERROR(EREP_PAXOS, "Paxos consensus error");
+
+/****************************
+ * Reputation-tied rank elevation — mirrors Python ReputationProcess
+ * RANK_TIERS / _rank_tier / _publish_rank_change (repprocess.py:51-56,
+ * 391-426). Each tier is (score_floor, rank). Walks top-down so the
+ * highest matching floor wins; scores below the lowest map to 0.
+ *
+ * Keep monotonically increasing in floor and rank to preserve the
+ * walk-from-top invariant. Any change here must land in Python's
+ * RANK_TIERS at the same time.
+ ****************************/
+
+typedef struct { double floor; int rank; } rank_tier_t;
+static const rank_tier_t RANK_TIERS[] = {
+    {0.50, 1},
+    {0.65, 2},
+    {0.80, 3},
+    {0.90, 4},
+};
+#define NUM_RANK_TIERS (sizeof(RANK_TIERS) / sizeof(RANK_TIERS[0]))
+
+static int _rank_tier(double score)
+{
+    for (int i = (int)NUM_RANK_TIERS - 1; i >= 0; i--) {
+        if (score >= RANK_TIERS[i].floor)
+            return RANK_TIERS[i].rank;
+    }
+    return 0;
+}
+
+/* Forward declaration — definition follows _ensure_init/state struct.
+ * Emits a local-IPC rank_update to the identity process queue iff the
+ * peer's tier has changed since the last publication. Mirrors Python's
+ * `_publish_rank_change` in repprocess.py:402-426. */
+static void _publish_rank_change(const uuid_t peer_uuid, double score);
 
 /****************************
  * Protocol-string definitions (declared `extern char[]` in
@@ -54,6 +90,12 @@ char REP_PROTO_REP_REQ[]     = "request reputation";
 char REP_PROTO_REP_RESP[]    = "reputation response";
 char REP_PROTO_LOCAL_QUERY[] = "local_rep_query";
 char REP_PROTO_LOCAL_RESP[]  = "local_rep_response";
+
+/* Local-IPC `function` field for the rank_update message reputation
+ * emits to identity (BUGS.md §P2). Writable buffer so the assignment
+ * to `nmsg->function` (typed `char *`) compiles under -Wwrite-strings.
+ * Value must match Python IdentityProtocol.rank_update verbatim. */
+static char ID_RANK_FUNC[] = "rank_update";
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -76,6 +118,10 @@ static struct {
      * sync dispatch). Production must leave this false; default 0
      * preserves existing behavior. */
     bool synchronous_dispatch;
+    /* Last published rank per peer uuid-string. Suppresses redundant
+     * rank_update IPC when the tier hasn't changed. Mirrors Python's
+     * self.peer_ranks in repprocess.py:100. */
+    map_t peer_ranks;
 } rep_state;
 
 static void _ensure_init(void)
@@ -87,11 +133,59 @@ static void _ensure_init(void)
         map_init(&rep_state.my_requests);
         map_init(&rep_state.updates);
         array_init(&rep_state.requested_reps);
+        map_init(&rep_state.peer_ranks);
         /* paxos_init is called in reputation_run after num_peers is known */
         rep_state.num_peers = 0;
         pthread_mutex_init(&rep_state.lock, NULL);
         rep_state.initialized = true;
     }
+}
+
+static void _publish_rank_change(const uuid_t peer_uuid, double score)
+{
+    int new_rank = _rank_tier(score);
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, uuid_str);
+
+    /* Dedup: skip if the tier hasn't changed from the last publication
+     * for this peer. Mirrors Python's `self.peer_ranks.get(key) == new_rank`
+     * guard in repprocess.py:412. */
+    pthread_mutex_lock(&rep_state.lock);
+    int prior = -1;
+    data_t *prior_dat = NULL;
+    if (map_get(&rep_state.peer_ranks, uuid_str, &prior_dat) == 0 &&
+        prior_dat != NULL) {
+        data_integer(prior_dat, &prior);
+    }
+    if (prior == new_rank) {
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    data_t *rank_dat = integer_data(new_rank);
+    if (rank_dat != NULL)
+        map_set(&rep_state.peer_ranks, uuid_str, rank_dat);
+    pthread_mutex_unlock(&rep_state.lock);
+
+    /* Build the rank_update payload — a 2-element JSON array
+     * [uuid_str, rank_int] matching Python's
+     * `to_json_string((key, new_rank))` in repprocess.py:415. */
+    json_t *arr = json_array();
+    if (arr == NULL) return;
+    json_array_append_new(arr, json_string(uuid_str));
+    json_array_append_new(arr, json_integer(new_rank));
+
+    generic_msg_t ipc = {0};
+    ipc.type = NET_MESSAGE;
+    strncpy(ipc.info.net_msg.process, "identity", PROC_NAME_LEN);
+    ipc.info.net_msg.function = ID_RANK_FUNC;
+    ipc.info.net_msg.encrypt = false;  /* local IPC, no wire egress */
+    strncpy(ipc.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    net_msg_pack_json(&ipc.info.net_msg, arr);
+    json_decref(arr);
+
+    /* messaging_send keys by process name; "identity" routes to the
+     * IdentityProcess queue directly, bypassing the network process. */
+    messaging_send("identity", NET_MESSAGE, &ipc, false);
 }
 
 /****************************
@@ -785,12 +879,17 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
 {
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Reputation: rep request from %s\n", nmsg->from_whom.fullname);
+    /* Mirrors Python's `_probes.counter('rep.compute', 'enter')` at
+     * repprocess.py:429; the rep.compute layer correlates handle_req
+     * → compute → forward across the reputation pipeline. */
+    probes_counter("rep.compute", "enter", NULL);
 
     /* Unpack (peer_uuid, requesting_process) */
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
     {
         log_error(proc->logger, "Reputation: handle_rep_request: failed to unpack JSON\n");
+        probes_counter("rep.compute", "exception", "unpack_failed");
         return false;
     }
 
@@ -810,8 +909,10 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
     /* Parse UUID and compute reputation */
     uuid_t peer_uuid;
     double score = 0.0;
+    bool have_uuid = false;
     if (uuid_parse(peer_uuid_str, peer_uuid) == 0)
     {
+        have_uuid = true;
         pthread_mutex_lock(&rep_state.lock);
         /* Use a dummy self uuid (zero) for now — process doesn't carry self identity */
         uuid_t self_uuid;
@@ -820,6 +921,16 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
                                    self_uuid, peer_uuid);
         reputations_update(&rep_state.reputations, peer_uuid, score);
         pthread_mutex_unlock(&rep_state.lock);
+    }
+
+    /* Publish a rank_update IPC to identity if the score crossed a tier.
+     * Mirrors Python's _publish_rank_change drain in repprocess.py:577-580.
+     * Done inline here (rather than queued) because handle_rep_request
+     * already holds the send context; Python uses a queue because its
+     * _compute_reputation runs in a spawned thread without queue access. */
+    if (have_uuid) {
+        _publish_rank_change(peer_uuid, score);
+        probes_counter("rep.compute", "queued", NULL);
     }
 
     /* Pack response (peer_uuid, score, requesting_process) */
@@ -1080,6 +1191,8 @@ void reputation_reset_state(int num_peers)
      * member (never malloc'd). tx_history_free clears contents only. */
     tx_history_free(&rep_state.history);
     tx_history_init(&rep_state.history);
+    map_free(&rep_state.peer_ranks);
+    map_init(&rep_state.peer_ranks);
     rep_state.num_peers = num_peers;
     paxos_init(&rep_state.paxos, num_peers, NULL);
     rep_state.synchronous_dispatch = was_sync;

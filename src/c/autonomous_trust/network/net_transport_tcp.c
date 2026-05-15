@@ -18,9 +18,12 @@
  * @file net_transport_tcp.c
  * @brief TCP (IPv4 + IPv6) implementations of the net_transport_t vtable.
  *
- * Wire frame is ASCII-size-prefixed: "<N>|<N bytes of payload>". Each send
- * opens a short-lived connection to the target; each recv accept()s once
- * per invocation and reads a single framed message.
+ * Wire frame is a 4-byte network-byte-order (big-endian) unsigned length
+ * prefix followed by exactly that many bytes of payload. This matches the
+ * Python reference's `struct.pack('!I', len(msg))` framing so the two
+ * implementations can interoperate over TCP. Each send opens a short-lived
+ * connection to the target; each recv accept()s once per invocation and
+ * reads a single framed message.
  *
  * Broadcast/group semantics are limited over TCP (no native broadcast).
  * `send_broadcast` returns -1 for these channels; the orchestrator in
@@ -97,10 +100,11 @@ static int tcp_send_to(const uint8_t *msg, size_t msg_len,
         return EXCEPTION(ENET_SEND);
     }
 
-    /* Size-prefix frame: "<N>|..." */
-    char size_hdr[32];
-    int hdr_len = snprintf(size_hdr, sizeof(size_hdr), "%zu|", msg_len);
-    if (send_all(sock, size_hdr, (size_t)hdr_len) != 0) {
+    /* 4-byte network-byte-order length prefix (matches Python tcp.py:106:
+     * `sock.send(struct.pack('!I', len(msg)))`). NET_MSG_MAX_DATA on this
+     * side is 1 MB, well under UINT32_MAX, so the cast is safe. */
+    uint32_t hdr_be = htonl((uint32_t)msg_len);
+    if (send_all(sock, &hdr_be, sizeof(hdr_be)) != 0) {
         close(sock);
         return EXCEPTION(ENET_SEND);
     }
@@ -150,21 +154,23 @@ static int tcp_accept_and_read(int listen_sock, uint8_t **buf_out, size_t *buf_l
         return SYS_EXCEPTION();
     }
 
-    /* Read "<N>|" length prefix — bounded by 31 chars so it cannot overrun. */
-    char size_buf[32] = {0};
-    int si = 0;
-    while (si < 31) {
-        char c;
-        ssize_t n = at_recv_eintr(client, &c, 1, 0);
+    /* Read 4-byte big-endian length prefix (matches Python tcp.py:131-146:
+     * `struct.unpack('!I', size_data)[0]`). Loop until 4 bytes are in hand
+     * because a single recv() may return short. */
+    uint8_t hdr_buf[4];
+    size_t hdr_got = 0;
+    while (hdr_got < sizeof(hdr_buf)) {
+        ssize_t n = at_recv_eintr(client, hdr_buf + hdr_got,
+                                  sizeof(hdr_buf) - hdr_got, 0);
         if (n <= 0) {
             close(client);
             return EXCEPTION(ENET_RECV);
         }
-        if (c == '|')
-            break;
-        size_buf[si++] = c;
+        hdr_got += (size_t)n;
     }
-    size_t data_size = (size_t)atol(size_buf);
+    uint32_t hdr_be;
+    memcpy(&hdr_be, hdr_buf, sizeof(hdr_be));
+    size_t data_size = (size_t)ntohl(hdr_be);
     if (data_size == 0 || data_size > NET_MSG_MAX_DATA) {
         close(client);
         return EXCEPTION(ENET_RECV);
