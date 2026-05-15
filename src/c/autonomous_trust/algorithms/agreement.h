@@ -56,6 +56,22 @@ typedef enum {
     AGREEMENT_WORK
 } agreement_type_t;
 
+/* PoW canonical difficulty — leading zero BYTES required on the digest
+ * prefix. Mirrors Python's `AgreementByWork.DIFFICULTY = 2` class
+ * constant (work.py:41). Callers of agreement_by_work_create may still
+ * pass a different value for tests, but production runs and any
+ * cross-impl interop MUST use this constant so a C-mined proof
+ * validates against a Python verifier and vice versa. Change here
+ * MUST land in Python at the same time. */
+#define POW_DEFAULT_DIFFICULTY 2
+
+/* Pass to agreement_by_authority_create's @c threshold_rank arg to
+ * select dynamic top-1/3 derivation from the current voter set, the
+ * same rule Python AgreementByAuthority.threshold_rank applies when
+ * the explicit override is None (authority.py:30-39). Any negative
+ * value works; this name reads cleaner at call sites. */
+#define AUTHORITY_THRESHOLD_DERIVE (-1)
+
 typedef struct agreement_protocol_s agreement_protocol_t;
 
 /* vtable function pointer types */
@@ -165,6 +181,18 @@ int agreement_protocol_create(agreement_voter_t *myself,
     ensures \result != 0;
   disjoint behaviors;
 */
+/**
+ * Construct an AGREEMENT_AUTHORITY protocol.
+ *
+ * Pass a non-negative @p threshold_rank to pin the cutoff explicitly,
+ * or pass a negative value (e.g. -1) to let the protocol derive the
+ * threshold dynamically from the current voter set as the top-1/3 cutoff
+ * — the same rule Python's `AgreementByAuthority.threshold_rank`
+ * applies (authority.py:30-39). The derived form lets reputation-tied
+ * elevation raise the authority bar as peers earn rank, while still
+ * staying safe during bootstrap (all-zero ranks → threshold 0, every
+ * vote counts).
+ */
 int agreement_by_authority_create(agreement_voter_t *myself,
                                   agreement_voter_t *others, int other_count,
                                   int threshold_rank,
@@ -199,6 +227,15 @@ int agreement_by_stake_create(agreement_voter_t *myself,
     ensures \result != 0;
   disjoint behaviors;
 */
+/**
+ * Construct an AGREEMENT_WORK protocol.
+ *
+ * Production callers SHOULD pass @ref POW_DEFAULT_DIFFICULTY for
+ * @p difficulty so a C-mined proof validates against a Python verifier
+ * (and vice versa). Tests may pass any non-negative value. The value
+ * is in leading-zero BYTES of the digest, not bits — matching Python
+ * AgreementByWork.DIFFICULTY (work.py:41).
+ */
 int agreement_by_work_create(agreement_voter_t *myself,
                              agreement_voter_t *others, int other_count,
                              int difficulty,

@@ -38,6 +38,16 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr);
 
 int identity_from_json(const json_t *obj, void *data_struct);
 
+/** Serialize a published-form identity (no private key material) to a
+ *  fresh JSON object. Caller takes ownership of @p *obj_ptr. Used by
+ *  id_proc.c when building the peer-bundle inside the ID_HISTORY wire
+ *  payload (matches Python `p.publish()` in idprocess.py:507). */
+int public_identity_to_json(const public_identity_t *p, json_t **obj_ptr);
+
+/** Inverse of @ref public_identity_to_json. Writes into the
+ *  caller-owned @p p (which is zeroed first). Returns 0 on success. */
+int public_identity_from_json(const json_t *obj, public_identity_t *p);
+
 int group_to_json(const void *data_struct, json_t **obj_ptr);
 
 int group_from_json(const json_t *obj, void *data_struct);

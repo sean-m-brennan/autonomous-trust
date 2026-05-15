@@ -171,6 +171,80 @@ int identity_decrypt(const identity_t *ident, const msg_str_t *cipher, const pub
 }
 
 /* Frama-C: skipped — [serialization] jansson JSON serialization */
+/* Public-only identity serializer for wire payloads. Matches the
+ * subset of identity_to_json that's safe to publish — same field shape
+ * minus the locally-meaningful `rank` (which lives on `identity_t` past
+ * the public_identity_t prefix). Used by id_proc.c when building the
+ * peer-bundle inside the ID_HISTORY wire payload. */
+int public_identity_to_json(const public_identity_t *p, json_t **obj_ptr)
+{
+    if (p == NULL || obj_ptr == NULL)
+        return EINVAL;
+    *obj_ptr = json_object();
+    json_t *obj = *obj_ptr;
+    if (obj == NULL)
+        return ENOMEM;
+
+    json_object_set_new(obj, "typename", json_string("identity"));
+    char uuid_str[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse(p->uuid, uuid_str);
+    json_object_set_new(obj, "uuid", json_string(uuid_str));
+    json_object_set_new(obj, "address", json_string((const char *)p->address));
+    json_object_set_new(obj, "fullname", json_string(p->fullname));
+    json_object_set_new(obj, "nickname", json_string(p->nickname));
+    json_object_set_new(obj, "petname", json_string(p->petname));
+
+    json_t *sig = json_object();
+    if (sig == NULL) return ENOMEM;
+    unsigned char *hex = signature_publish(&p->signature);
+    json_object_set_new(sig, "hex_seed", json_string((char *)hex));
+    free(hex);
+    json_object_set_new(obj, "signature", sig);
+
+    json_t *encr = json_object();
+    if (encr == NULL) return ENOMEM;
+    hex = encryptor_publish(&p->encryptor);
+    json_object_set_new(encr, "hex_seed", json_string((char *)hex));
+    free(hex);
+    json_object_set_new(obj, "encryptor", encr);
+    return 0;
+}
+
+int public_identity_from_json(const json_t *obj, public_identity_t *p)
+{
+    if (obj == NULL || p == NULL)
+        return EINVAL;
+    memset(p, 0, sizeof(*p));
+    const char *uuid_str = json_string_value(json_object_get(obj, "uuid"));
+    if (uuid_str == NULL || uuid_parse(uuid_str, p->uuid) < 0)
+        return -1;
+    const char *s;
+    if ((s = json_string_value(json_object_get(obj, "address"))) != NULL)
+        strncpy(p->address, s, ADDR_LEN);
+    if ((s = json_string_value(json_object_get(obj, "fullname"))) != NULL)
+        strncpy(p->fullname, s, NAME_LEN);
+    if ((s = json_string_value(json_object_get(obj, "nickname"))) != NULL)
+        strncpy(p->nickname, s, NAME_LEN);
+    if ((s = json_string_value(json_object_get(obj, "petname"))) != NULL)
+        strncpy(p->petname, s, NAME_LEN);
+
+    const char *sig_hex = json_string_value(
+        json_object_get(json_object_get(obj, "signature"), "hex_seed"));
+    if (sig_hex != NULL &&
+        public_signature_init(&p->signature,
+                              (const unsigned char *)sig_hex,
+                              strlen(sig_hex)) != 0)
+        return -1;
+    const char *enc_hex = json_string_value(
+        json_object_get(json_object_get(obj, "encryptor"), "hex_seed"));
+    if (enc_hex != NULL &&
+        public_encryptor_init(&p->encryptor,
+                              (const unsigned char *)enc_hex,
+                              strlen(enc_hex)) != 0)
+        return -1;
+    return 0;
+}
+
 int identity_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const identity_t *ident = data_struct;

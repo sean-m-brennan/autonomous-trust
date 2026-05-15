@@ -39,9 +39,9 @@
 
 static const char *required_configs[] = {
     "subsystems", "network", "identity",
-    //"negotitation, "reputation"
+    "negotiation", "reputation",
 };
-static const int num_req_cfgs = 3;
+static const int num_req_cfgs = 5;
 
 const char ROOT_ENV_VAR[] = "AUTONOMOUS_TRUST_ROOT";
 
@@ -319,8 +319,15 @@ int load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger)
             num_err++;
         }
     }
+    /* Python `load_configs` (discover.py:35-44) is lenient — it loads
+     * whatever is present in the cfg dir without asserting required
+     * names. Downgrade from error to warning so a minimal setup that
+     * omits one of the standard configs doesn't surface as a hard
+     * failure in C while passing on the Python side. Hard failures
+     * still come from `num_err` (file-parse errors). Mirrors the
+     * divergence.md M11 audit note. */
     if (required > 0)
-        log_error(logger, "%d required configurations not found\n", required);
+        log_warn(logger, "%d required configurations not found\n", required);
     return num_err;
 }
 

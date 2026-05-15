@@ -145,6 +145,16 @@ tree_t *tree_copy(tree_t *tree);*/
 */
 int tree_size(tree_t *tree);
 
+/** Smallest key in @p tree, or -1 if empty. O(h) — walks the left
+ *  spine. Mirrors Python Tree.first (redblack.py — `_first` walks left
+ *  from the root). For sequential range scans, callers may pair this
+ *  with @ref tree_last to bound the iteration cheaply. */
+int tree_first(tree_t *tree);
+
+/** Largest key in @p tree, or -1 if empty. O(h). Mirrors Python's
+ *  Tree.last. */
+int tree_last(tree_t *tree);
+
 /**
 * @brief Depth of the tree.
 *
