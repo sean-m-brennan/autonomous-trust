@@ -473,6 +473,134 @@ bool merkle_audit(merkle_tree_t *tree, merkle_blob_t *blob,
     return memcmp(digest, tree->root_digest, MERKLE_DIGEST_LEN) == 0;
 }
 
+/* Membership check by uuid match. Walks the blob list — small in
+ * practice. Mirrors Python's MerkleTree.__contains__ (merkle.py:249).
+ * Hash-correctness is *not* verified here; for that, build an inclusion
+ * proof and audit it. */
+bool merkle_contains(const merkle_tree_t *tree, const merkle_blob_t *blob)
+{
+    if (tree == NULL || blob == NULL || tree->blobs == NULL)
+        return false;
+    size_t n = array_size(tree->blobs);
+    for (size_t i = 0; i < n; i++) {
+        data_t *dat = NULL;
+        if (array_get(tree->blobs, (int)i, &dat) != 0 || dat == NULL)
+            continue;
+        ptr_t ptr = NULL;
+        if (data_object_ptr(dat, &ptr) != 0 || ptr == NULL)
+            continue;
+        const merkle_blob_t *b = (const merkle_blob_t *)ptr;
+        if (strncmp(b->uuid, blob->uuid, MERKLE_UUID_LEN) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Internal helper shared by merkle_audit and merkle_audit_chain. Walks
+ * a single proof segment, accumulating @p digest in place. */
+static void _merkle_walk_proof(uint8_t *digest,
+                               const merkle_proof_step_t *proof, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (!proof[i].has_left && !proof[i].has_right)
+        {
+            /* single-child: just rehash (matches merkle_audit) */
+            merkle_hash(digest, MERKLE_DIGEST_LEN, digest);
+        }
+        else if (!proof[i].has_left)
+        {
+            /* we are the left child */
+            uint8_t combined[MERKLE_DIGEST_LEN * 2];
+            memcpy(combined, digest, MERKLE_DIGEST_LEN);
+            memcpy(combined + MERKLE_DIGEST_LEN, proof[i].right,
+                   MERKLE_DIGEST_LEN);
+            merkle_hash(combined, MERKLE_DIGEST_LEN * 2, digest);
+        }
+        else
+        {
+            /* we are the right child */
+            uint8_t combined[MERKLE_DIGEST_LEN * 2];
+            memcpy(combined, proof[i].left, MERKLE_DIGEST_LEN);
+            memcpy(combined + MERKLE_DIGEST_LEN, digest,
+                   MERKLE_DIGEST_LEN);
+            merkle_hash(combined, MERKLE_DIGEST_LEN * 2, digest);
+        }
+    }
+}
+
+/* H12: chain-extended audit. */
+bool merkle_audit_chain(merkle_tree_t *tree, merkle_blob_t *blob,
+                        merkle_proof_step_t *proof, int proof_n,
+                        merkle_proof_step_t *extra_chain, int extra_n,
+                        const uint8_t *super_hash)
+{
+    if (tree == NULL || blob == NULL || super_hash == NULL)
+        return false;
+    if (proof == NULL && proof_n != 0)
+        return false;
+    if (extra_chain == NULL && extra_n != 0)
+        return false;
+    if (blob->get_hash == NULL)
+        return false;
+
+    uint8_t digest[MERKLE_DIGEST_LEN];
+    blob->get_hash(blob, NULL, 0, digest);
+
+    if (proof_n > 0)
+        _merkle_walk_proof(digest, proof, proof_n);
+    if (extra_n > 0)
+        _merkle_walk_proof(digest, extra_chain, extra_n);
+
+    return memcmp(digest, super_hash, MERKLE_DIGEST_LEN) == 0;
+}
+
+/* H11: find subtrees with duplicate digests. O(n²) pairwise scan. */
+int merkle_subtree_duplications(merkle_tree_t *tree,
+                                int **idx_out, size_t *count_out)
+{
+    if (tree == NULL || idx_out == NULL || count_out == NULL)
+        return EINVAL;
+
+    *idx_out = NULL;
+    *count_out = 0;
+
+    if (tree->node_count <= 1)
+        return 0;
+
+    int *out = malloc(sizeof(int) * (size_t)tree->node_count);
+    if (out == NULL)
+        return ENOMEM;
+    size_t out_n = 0;
+
+    for (int i = 0; i < tree->node_count; i++)
+    {
+        bool dup = false;
+        for (int j = 0; j < tree->node_count; j++)
+        {
+            if (i == j)
+                continue;
+            if (memcmp(tree->nodes[i].digest, tree->nodes[j].digest,
+                       MERKLE_DIGEST_LEN) == 0)
+            {
+                dup = true;
+                break;
+            }
+        }
+        if (dup)
+            out[out_n++] = i;
+    }
+
+    if (out_n == 0)
+    {
+        free(out);
+        return 0;
+    }
+    *idx_out = out;
+    *count_out = out_n;
+    return 0;
+}
+
 /* Frama-C: skipped — [solver-timeout] memcmp danglingness preconditions */
 bool merkle_consistent(merkle_tree_t *tree, int other_size,
                        const uint8_t *other_root_digest)

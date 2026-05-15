@@ -36,8 +36,22 @@
 #define CIDR6_LEN (IPV6_ADDR_LEN + 4)
 #define MAC_ADDR_LEN 17
 
-#define DEFAULT_MCAST4_ADDR "239.0.0.1"
-#define DEFAULT_MCAST6_ADDR "ff02::1"
+/* Per-peer duplicate-broadcast threshold before demotion. Mirrors
+ * Python NetworkProcess.annoy_limit (netprocess.py:90). The pest-
+ * tracking map itself isn't yet wired into the C receive path —
+ * defining the constant here so it's discoverable at the matching
+ * call sites and so a future implementer has one knob to tune.
+ * See divergence.md M13. */
+#define NET_ANNOY_LIMIT 5
+
+/* Multicast group addresses for peer discovery. These must match the
+ * Python reference (network.py:31-32) so the two implementations join the
+ * same groups by default; otherwise C and Python peers cannot see each
+ * other's multicast traffic. The v4 address sits in the admin-scoped
+ * 239/8 block; the v6 address is a randomly generated organization-local
+ * address. Operators can still override via configuration. */
+#define DEFAULT_MCAST4_ADDR "239.0.0.65"
+#define DEFAULT_MCAST6_ADDR "ff00::41e9:dddc:e4c7:e7e7"
 
 typedef struct
 {

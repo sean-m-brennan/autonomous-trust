@@ -31,6 +31,7 @@
 #include "config/configuration.h"
 #include "structures/map.h"
 #include "utilities/msg_types_priv.h"
+#include "utilities/probes.h"
 #include "utilities/util.h"
 
 const char *sig_quit = "quit";
@@ -357,6 +358,15 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
             continue;
         if (!run_message_handlers(proc, queues, buf.type, &buf))
         {
+            /* Probe parity with Python's automate.py:517-521 unhandled-
+             * message instrumentation. Layer is the proc name so the
+             * tail tool can pivot per-process; reason is the message
+             * type as a small int. */
+            char type_buf[32];
+            snprintf(type_buf, sizeof(type_buf), "type:%ld", buf.type);
+            char layer[PROC_NAME_LEN + 16];
+            snprintf(layer, sizeof(layer), "proc.%s", proc->name);
+            probes_counter(layer, "unhandled", type_buf);
             size_t size = message_size(buf.type);
             void *msg = smrt_create(size);
             if (msg == NULL)
@@ -387,4 +397,42 @@ int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_
     if (err != 0)
         return err;
     return process_loop(proc, queues, logger, &ctx);
+}
+
+/* Mirrors Python's Process.update queue-broadcast (processes.py:195-218).
+ * Iterates the queue directory, skips the caller's own slot, and
+ * messaging_send's @p msg to each. Per-queue failures are logged and
+ * recorded as a `proc.update` / `queue_full` counter increment so the
+ * scattered-drop pattern shows up in probe output. The Python version
+ * uses `queue.put(block=True, timeout=q_cadence)` and catches Full;
+ * the C `messaging_send(..., false)` is non-blocking and surfaces a
+ * non-zero return on failure, which is the equivalent signal. */
+int process_update(const process_t *proc, directory_t *queues,
+                   generic_msg_t *msg)
+{
+    if (proc == NULL || queues == NULL || msg == NULL)
+        return -1;
+    size_t qsize = array_size(queues);
+    int sent = 0;
+    for (size_t i = 0; i < qsize; i++) {
+        data_t *name_val = NULL;
+        if (array_get(queues, (int)i, &name_val) != 0)
+            continue;
+        char *qname = NULL;
+        if (data_string_ptr(name_val, &qname) != 0 || qname == NULL)
+            continue;
+        if (strcmp(qname, proc->name) == 0)
+            continue;
+        int rc = messaging_send(qname, msg->type, msg, false);
+        if (rc != 0) {
+            if (proc->logger != NULL)
+                log_warn(proc->logger,
+                         "process_update: send to %s failed (rc=%d)\n",
+                         qname, rc);
+            probes_counter("proc.update", "queue_full", qname);
+            continue;
+        }
+        sent++;
+    }
+    return sent;
 }
