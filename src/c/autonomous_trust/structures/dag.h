@@ -35,6 +35,7 @@ extern "C" {
 
 #define DAG_UUID_LEN 37
 #define DAG_MAIN_BRANCH "main"
+#define DAG_ALL_BRANCHES "all"
 
 typedef struct linked_step_s linked_step_t;
 
@@ -324,6 +325,23 @@ int dag_fork(step_dag_t *dag, const char *branch, linked_step_t **head_out);
   disjoint behaviors;
 */
 int dag_recite(step_dag_t *dag, const char *branch, linked_step_t *root, array_t **steps_out);
+
+/**
+ * @brief M8 — snapshot all branch heads (parity with Python
+ *        `StepDAG.fork(head=all_branches)`, dag.py:254-261).
+ *
+ * Allocates a map of branch_name → linked_step_t* covering every
+ * branch currently in the DAG. The step pointers refer to the DAG's
+ * live nodes — they are NOT deep-copied, so the caller must not
+ * outlive the DAG. (Python's deepcopy semantics aren't preserved
+ * because no current call site needs them and a deep clone would
+ * require walking the parent chain of every head.)
+ *
+ * Caller owns @p heads_out and frees it via `map_free`.
+ *
+ * @return 0 on success, EINVAL on bad args, ENOMEM on alloc failure.
+ */
+int dag_fork_all(step_dag_t *dag, map_t **heads_out);
 
 /**
  * @brief Install a per-DAG validation hook (C13).

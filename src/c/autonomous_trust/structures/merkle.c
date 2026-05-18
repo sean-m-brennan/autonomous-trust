@@ -350,6 +350,38 @@ int merkle_root_digest(merkle_tree_t *tree, uint8_t *digest_out)
     return 0;
 }
 
+/* TODO (divergence.md L4 follow-up): this is a status snapshot, NOT a
+ * round-trip serializer — there is no `merkle_from_json` counterpart.
+ * Python's `Merkle.to_dict()` round-trips because the blob payloads are
+ * self-typed Python objects (`json.dumps` falls back to their `__repr__`
+ * / dict). On the C side, blob content is opaque to the tree (the
+ * application supplies `blob_designation_fn` to hash payload bytes), so
+ * reconstructing a tree from a JSON dump would need a caller-typed blob
+ * deserializer. The supported checkpoint pattern is "save the blob list,
+ * reinsert on restore"; add `merkle_from_json` only if a generic
+ * blob-payload encoding becomes available. */
+/* Frama-C: skipped — [alloc-pattern] jansson allocations */
+json_t *merkle_to_json(const merkle_tree_t *tree)
+{
+    if (tree == NULL) return NULL;
+    json_t *out = json_object();
+    if (out == NULL) return NULL;
+
+    if (tree->has_root_digest) {
+        char hex[MERKLE_DIGEST_LEN * 2 + 1];
+        for (int i = 0; i < MERKLE_DIGEST_LEN; i++)
+            snprintf(&hex[i * 2], 3, "%02x", tree->root_digest[i]);
+        hex[MERKLE_DIGEST_LEN * 2] = '\0';
+        json_object_set_new(out, "root_digest", json_string(hex));
+    } else {
+        json_object_set_new(out, "root_digest", json_null());
+    }
+    size_t blob_count = (tree->blobs != NULL) ? array_size(tree->blobs) : 0;
+    json_object_set_new(out, "blob_count", json_integer((json_int_t)blob_count));
+    json_object_set_new(out, "node_count", json_integer((json_int_t)tree->node_count));
+    return out;
+}
+
 /* Frama-C: skipped — [recursive-ds] unbounded tree traversal */
 int merkle_inclusion_proof(merkle_tree_t *tree, merkle_blob_t *blob,
                            merkle_proof_step_t **proof_out, int *proof_len)
@@ -430,6 +462,11 @@ int merkle_inclusion_proof(merkle_tree_t *tree, merkle_blob_t *blob,
     return 0;
 }
 
+/* Forward declaration; definition lives after merkle_audit since it
+ * is also used by merkle_audit_chain. */
+static void _merkle_walk_proof(uint8_t *digest,
+                               const merkle_proof_step_t *proof, int n);
+
 /* Frama-C: skipped — [recursive-ds] unbounded tree traversal */
 bool merkle_audit(merkle_tree_t *tree, merkle_blob_t *blob,
                   merkle_proof_step_t *proof, int proof_len)
@@ -438,37 +475,12 @@ bool merkle_audit(merkle_tree_t *tree, merkle_blob_t *blob,
         return false;
     if (!tree->has_root_digest)
         return false;
-
-    uint8_t digest[MERKLE_DIGEST_LEN];
-    if (blob->get_hash != NULL)
-        blob->get_hash(blob, NULL, 0, digest);
-    else
+    if (blob->get_hash == NULL)
         return false;
 
-    for (int i = 0; i < proof_len; i++)
-    {
-        if (!proof[i].has_left && !proof[i].has_right)
-        {
-            /* single-child: just rehash */
-            merkle_hash(digest, MERKLE_DIGEST_LEN, digest);
-        }
-        else if (!proof[i].has_left)
-        {
-            /* we are the left child */
-            uint8_t combined[MERKLE_DIGEST_LEN * 2];
-            memcpy(combined, digest, MERKLE_DIGEST_LEN);
-            memcpy(combined + MERKLE_DIGEST_LEN, proof[i].right, MERKLE_DIGEST_LEN);
-            merkle_hash(combined, MERKLE_DIGEST_LEN * 2, digest);
-        }
-        else
-        {
-            /* we are the right child */
-            uint8_t combined[MERKLE_DIGEST_LEN * 2];
-            memcpy(combined, proof[i].left, MERKLE_DIGEST_LEN);
-            memcpy(combined + MERKLE_DIGEST_LEN, digest, MERKLE_DIGEST_LEN);
-            merkle_hash(combined, MERKLE_DIGEST_LEN * 2, digest);
-        }
-    }
+    uint8_t digest[MERKLE_DIGEST_LEN];
+    blob->get_hash(blob, NULL, 0, digest);
+    _merkle_walk_proof(digest, proof, proof_len);
 
     return memcmp(digest, tree->root_digest, MERKLE_DIGEST_LEN) == 0;
 }
@@ -555,7 +567,36 @@ bool merkle_audit_chain(merkle_tree_t *tree, merkle_blob_t *blob,
     return memcmp(digest, super_hash, MERKLE_DIGEST_LEN) == 0;
 }
 
-/* H11: find subtrees with duplicate digests. O(n²) pairwise scan. */
+/* Helper: a "CVE-protection lift" is when a single-child parent inherits
+ * its lone child's digest verbatim (merkle.c:223-226). The parent-child
+ * pair will share a digest but does not represent a duplicate subtree
+ * in the data-collision sense. Distinguishing this from a genuine
+ * duplicate keeps merkle_subtree_duplications useful — without the
+ * filter, every tree built from an odd-leaf-count level emits spurious
+ * dup-pairs. */
+static bool _is_lone_child_lift(const merkle_tree_t *tree, int a, int b)
+{
+    /* Treat "a" as candidate parent of "b" first. */
+    if (tree->nodes[b].parent == a)
+    {
+        const merkle_node_t *p = &tree->nodes[a];
+        if ((p->left == b && p->right == -1) ||
+            (p->right == b && p->left == -1))
+            return true;
+    }
+    if (tree->nodes[a].parent == b)
+    {
+        const merkle_node_t *p = &tree->nodes[b];
+        if ((p->left == a && p->right == -1) ||
+            (p->right == a && p->left == -1))
+            return true;
+    }
+    return false;
+}
+
+/* H11: find subtrees with genuine duplicate digests. O(n²) pairwise
+ * scan, excluding parent-child digest lifts inherent to CVE-2012-2459
+ * protection. */
 int merkle_subtree_duplications(merkle_tree_t *tree,
                                 int **idx_out, size_t *count_out)
 {
@@ -581,11 +622,12 @@ int merkle_subtree_duplications(merkle_tree_t *tree,
             if (i == j)
                 continue;
             if (memcmp(tree->nodes[i].digest, tree->nodes[j].digest,
-                       MERKLE_DIGEST_LEN) == 0)
-            {
-                dup = true;
-                break;
-            }
+                       MERKLE_DIGEST_LEN) != 0)
+                continue;
+            if (_is_lone_child_lift(tree, i, j))
+                continue;
+            dup = true;
+            break;
         }
         if (dup)
             out[out_n++] = i;

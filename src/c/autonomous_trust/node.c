@@ -77,7 +77,8 @@ int at_node_init(at_node_t *node, const at_node_config_t *cfg)
     if (cfg->generate_config)
     {
         log_info(&node->log, "Generating configs in %s\n", cfg_dir);
-        int err = random_config(cfg_dir);
+        /* seed_str=NULL → random_config falls back to AT_PEER_SEED env. */
+        int err = random_config(cfg_dir, NULL);
         if (err != 0)
         {
             log_error(&node->log, "Config generation failed: %s\n",

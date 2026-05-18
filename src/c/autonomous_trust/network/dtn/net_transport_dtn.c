@@ -421,6 +421,12 @@ static int dtn_link_class_ms(const net_transport_ctx_t *ctx, const char *target)
 
 const net_transport_t dtn_bp_transport = {
     .name           = "dtn_bp",
+    /* DTN bundle protocol carries IPv6-shaped addresses inside the EID
+     * (ipn:<node>.<service> or dtn://<host>/...) but the AT identity
+     * layer treats the endpoint as opaque. Use NETPROTO_NONE so the
+     * generator falls back to the legacy IPv4 detection path; explicit
+     * DTN-aware identity generation is a separate work item. */
+    .net_proto      = NETPROTO_NONE,
     .open           = dtn_open,
     .send_unicast   = dtn_send_unicast,
     .send_broadcast = dtn_send_broadcast,
