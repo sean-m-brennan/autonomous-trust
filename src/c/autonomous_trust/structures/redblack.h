@@ -23,6 +23,7 @@
 
 #include "utilities/exception.h"
 #include "utilities/allocation.h"
+#include "array.h"
 
 typedef void* tree_data_ptr_t;
 
@@ -236,6 +237,54 @@ int tree_insert(tree_t *tree, tree_data_ptr_t data, int key);
   disjoint behaviors;
 */
 int tree_delete(tree_t *tree, int key);
+
+/**
+ * @brief H14 — collect leaf nodes reachable from @p node (parity with
+ *        Python `Node.leaves`, redblack.py:101-114).
+ *
+ * Walks the subtree rooted at @p node and appends pointers to every
+ * leaf (node with no `rbNode` children) into @p leaves_out. The output
+ * array is allocated by this function; caller frees with `array_free`.
+ * The contained node pointers are aliases into @p node's subtree and
+ * remain valid while the tree is not mutated.
+ *
+ * @return 0 on success, EINVAL on bad args, ENOMEM on alloc failure.
+ */
+int tree_node_leaves(struct rbNode *node, array_t **leaves_out);
+
+/**
+ * @brief H14 — serialize the tree structure (keys only) to a nested
+ *        JSON array (parity with Python `Tree.to_tuple`,
+ *        redblack.py:405-413).
+ *
+ * Encoding: empty tree => `[]`. Node => `[key, left_json, right_json]`
+ * where each child slot is `[]` when absent. Mirrors Python's nested
+ * tuple shape. Data payloads are NOT included; only the structural
+ * skeleton (which keys live at which positions). Caller `json_decref`s
+ * the result.
+ *
+ * The signature accepts `void *` rather than `json_t *` so this
+ * header does not have to drag in `<jansson.h>` for every TU that
+ * includes red-black. Callers cast the returned value back to
+ * `json_t *` themselves.
+ *
+ * @return non-NULL `json_t *` on success (cast as `void *`), NULL on
+ *         allocation failure.
+ */
+void *tree_to_json(tree_t *tree);
+
+/**
+ * @brief H14 — reconstruct a tree from the JSON form produced by
+ *        `tree_to_json` (parity with Python `Tree.from_tuple`,
+ *        redblack.py:415-431). Keys are inserted via `tree_insert`
+ *        with NULL data pointers; the input encodes structure only.
+ *
+ * @param j         JSON array as produced by `tree_to_json` (passed
+ *                  as `void *` so this header stays jansson-free).
+ * @param tree_out  out parameter; receives a freshly allocated tree.
+ * @return 0 on success, EINVAL on bad input, ENOMEM on alloc failure.
+ */
+int tree_from_json(void *j, tree_t **tree_out);
 
 /**
 * @brief Free all tree structures (not data though).

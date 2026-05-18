@@ -367,6 +367,16 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
             char layer[PROC_NAME_LEN + 16];
             snprintf(layer, sizeof(layer), "proc.%s", proc->name);
             probes_counter(layer, "unhandled", type_buf);
+            /* Network messages carry a trace_id; emit a correlation
+             * record so downstream tooling can follow the message
+             * end-to-end. Mirrors Python automate.py:518 / repprocess.py:570 /
+             * negprocess.py:348. */
+            if (buf.type == NET_MESSAGE) {
+                probes_trace_msg(buf.info.net_msg.trace_id,
+                                 buf.info.net_msg.process,
+                                 buf.info.net_msg.function,
+                                 "unhandled", "proc", proc->name, NULL);
+            }
             size_t size = message_size(buf.type);
             void *msg = smrt_create(size);
             if (msg == NULL)

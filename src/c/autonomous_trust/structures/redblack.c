@@ -18,6 +18,8 @@
 #include <stdbool.h>
 #include <errno.h>
 
+#include <jansson.h>
+
 #include "redblack_priv.h"
 #include "array_priv.h"
 
@@ -633,6 +635,138 @@ int tree_delete(tree_t *tree, int key)
     return 0;
 }
 
+
+/* H14 helpers. */
+
+/* Recursively walk @p node, appending leaf pointers (no rbNode
+ * children) into @p out. Matches Python Node.leaves recursion. */
+static int _tree_collect_leaves(struct rbNode *node, array_t *out)
+{
+    if (node == NULL)
+        return 0;
+    if (nodeIsLeaf(node))
+    {
+        data_t *d = object_ptr_data(node, sizeof(struct rbNode));
+        if (d == NULL)
+            return ENOMEM;
+        return array_append(out, d);
+    }
+    int err = _tree_collect_leaves(node->left, out);
+    if (err != 0)
+        return err;
+    return _tree_collect_leaves(node->right, out);
+}
+
+int tree_node_leaves(struct rbNode *node, array_t **leaves_out)
+{
+    if (leaves_out == NULL)
+        return EINVAL;
+    array_t *list = NULL;
+    int err = array_create(&list);
+    if (err != 0)
+        return err;
+    /* A NULL node yields an empty list (matches Python: a None
+     * subtree contributes nothing). */
+    if (node != NULL)
+    {
+        err = _tree_collect_leaves(node, list);
+        if (err != 0)
+        {
+            array_free(list);
+            return err;
+        }
+    }
+    *leaves_out = list;
+    return 0;
+}
+
+/* Recursive build of the (key, left_json, right_json) shape. Returns
+ * an empty JSON array for NULL nodes, matching Python's `()` for
+ * absent children. */
+static json_t *_tree_node_to_json(const struct rbNode *node)
+{
+    if (node == NULL)
+        return json_array();
+    json_t *arr = json_array();
+    if (arr == NULL)
+        return NULL;
+    if (json_array_append_new(arr, json_integer(node->key)) != 0)
+        goto err;
+    json_t *left = _tree_node_to_json(node->left);
+    if (left == NULL || json_array_append_new(arr, left) != 0)
+    {
+        if (left != NULL) json_decref(left);
+        goto err;
+    }
+    json_t *right = _tree_node_to_json(node->right);
+    if (right == NULL || json_array_append_new(arr, right) != 0)
+    {
+        if (right != NULL) json_decref(right);
+        goto err;
+    }
+    return arr;
+err:
+    json_decref(arr);
+    return NULL;
+}
+
+void *tree_to_json(tree_t *tree)
+{
+    if (tree == NULL || tree->root == NULL)
+        return json_array();
+    return _tree_node_to_json(tree->root);
+}
+
+/* Recursive insertion driver — walks the [key, left, right] shape and
+ * inserts each key into @p tree. The encoding preserves the original
+ * topology by construction order: pre-order insertion. */
+static int _tree_insert_from_json(tree_t *tree, json_t *j)
+{
+    if (j == NULL || !json_is_array(j))
+        return EINVAL;
+    size_t n = json_array_size(j);
+    if (n == 0)
+        return 0;
+    json_t *jkey = json_array_get(j, 0);
+    if (!json_is_integer(jkey))
+        return EINVAL;
+    int err = tree_insert(tree, NULL, (int)json_integer_value(jkey));
+    if (err != 0)
+        return err;
+    if (n > 1)
+    {
+        err = _tree_insert_from_json(tree, json_array_get(j, 1));
+        if (err != 0)
+            return err;
+    }
+    if (n > 2)
+    {
+        err = _tree_insert_from_json(tree, json_array_get(j, 2));
+        if (err != 0)
+            return err;
+    }
+    return 0;
+}
+
+int tree_from_json(void *j, tree_t **tree_out)
+{
+    if (j == NULL || tree_out == NULL)
+        return EINVAL;
+    if (!json_is_array((json_t *)j))
+        return EINVAL;
+    tree_t *t = NULL;
+    int err = tree_create(&t);
+    if (err != 0)
+        return err;
+    err = _tree_insert_from_json(t, (json_t *)j);
+    if (err != 0)
+    {
+        tree_free(t);
+        return err;
+    }
+    *tree_out = t;
+    return 0;
+}
 
 /* Frama-C: skipped — [solver-timeout] map_free/smrt_deref preconditions */
 void tree_free(tree_t *tree) {

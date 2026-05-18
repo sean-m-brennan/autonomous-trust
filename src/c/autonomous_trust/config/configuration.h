@@ -35,10 +35,41 @@ extern "C" {
 
 /**
  * @brief Paths to config files cannot exceed this length
- * 
+ *
  */
 #define CFG_PATH_LEN 256
 #define CFG_NAME_SIZE 64
+
+/**
+ * @brief On-disk serialization mode for configuration files.
+ *
+ * Wire values match Python's `SerializeMode` enum
+ * (`core/_python/config/configuration.py:52`) so a `AT_SERIALIZE_MODE`
+ * env var set against either implementation picks the same path.
+ * - @ref AT_SERIALIZE_PROTO  — binary `.cfg.pb` via protobuf-c.
+ * - @ref AT_SERIALIZE_JSON   — pretty `.cfg.json` via jansson (default).
+ * - @ref AT_SERIALIZE_PJSON  — `.cfg.json` extension but protobuf-derived
+ *                              JSON shape; treated identically to JSON
+ *                              by the C reader (jansson handles both).
+ */
+typedef enum {
+    AT_SERIALIZE_PROTO = 1,
+    AT_SERIALIZE_JSON  = 2,
+    AT_SERIALIZE_PJSON = 3,
+} at_serialize_mode_t;
+
+/**
+ * @brief Read the active serialize mode from the `AT_SERIALIZE_MODE`
+ *        env var (cached after first call). Defaults to
+ *        @ref AT_SERIALIZE_JSON when unset or unparseable.
+ */
+at_serialize_mode_t at_serialize_mode_current(void);
+
+/**
+ * @brief Return the file extension for @p mode (`".cfg.pb"` or
+ *        `".cfg.json"`). Returns a static string; do not free.
+ */
+const char *at_serialize_mode_file_ext(at_serialize_mode_t mode);
 
 /**
  * @brief Get the config directory
@@ -80,6 +111,14 @@ typedef struct
     int (*from_json)(const json_t *obj, void *data_struct);                /**< Parse JSON → @c data_struct. */
     size_t data_len;                                                       /**< Size of the backing struct in bytes. */
     void *data_struct;                                                     /**< Pointer to the backing struct. */
+    /** Optional: serialize @c data_struct → packed protobuf bytes. NULL
+     *  means the config has no proto serializer yet — write_config_file
+     *  in PROTO mode falls back to the JSON path with a one-time warning.
+     *  Caller frees @c *buf_out. */
+    int (*to_proto)(const void *data_struct, void **buf_out, size_t *len_out);
+    /** Optional: parse packed protobuf bytes → @c data_struct. NULL
+     *  means the config has no proto deserializer yet. */
+    int (*from_proto)(const void *buf, size_t len, void *data_struct);
 } config_t;
 
 #ifndef CONFIG_IMPL

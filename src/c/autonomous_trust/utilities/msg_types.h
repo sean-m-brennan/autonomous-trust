@@ -69,6 +69,12 @@ typedef struct
     public_identity_t from_whom;
     bool encrypt;
     char return_to[PROC_NAME_LEN+1];
+    /* 32-char hex (UUID4 without dashes) + NUL — must match
+     * NET_TRACE_ID_LEN in network/net_message.h. Carried across the IPC
+     * hop between net_proc and sibling processes so probes_trace_msg
+     * stays correlated end-to-end. Empty string means "not set"; the
+     * wire serializer mints one in that case. */
+    char trace_id[33];
 } net_msg_t;
 
 typedef enum {
