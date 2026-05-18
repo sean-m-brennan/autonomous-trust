@@ -198,6 +198,38 @@ void probes_emit_kv(const char *layer, const char *event, ...)
     json_decref(fields);
 }
 
+void probes_trace_msg(const char *trace_id, const char *process,
+                      const char *function, const char *hook, ...)
+{
+    _ensure_init();
+    if (!g_enabled || hook == NULL) return;
+    /* Mirror Python: no trace_id → no correlation key → drop the event
+     * rather than emit an orphan trace. */
+    if (trace_id == NULL || trace_id[0] == '\0') return;
+
+    json_t *fields = json_object();
+    if (fields == NULL) return;
+    json_object_set_new(fields, "trace_id", json_string(trace_id));
+    json_object_set_new(fields, "process",
+                        process != NULL ? json_string(process) : json_null());
+    json_object_set_new(fields, "function",
+                        function != NULL ? json_string(function) : json_null());
+
+    va_list ap;
+    va_start(ap, hook);
+    for (;;) {
+        const char *k = va_arg(ap, const char *);
+        if (k == NULL) break;
+        const char *v = va_arg(ap, const char *);
+        if (v == NULL) v = "";
+        json_object_set_new(fields, k, json_string(v));
+    }
+    va_end(ap);
+
+    probes_emit("msg", hook, fields);
+    json_decref(fields);
+}
+
 void probes_counter(const char *layer, const char *event, const char *reason)
 {
     probes_counter_n(layer, event, reason, 1);

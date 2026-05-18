@@ -1197,6 +1197,12 @@ static int _merge_to_mesh(process_t *proc, directory_t *queues)
     if (proc == NULL)
         return EINVAL;
 
+    /* TODO (divergence.md C14 follow-up): Python's `_merge_to_mesh` and
+     * sibling history-merge paths emit `id.receive_history/arrived` and
+     * related counters via `_probes.counter`. Mirror those here so
+     * cross-impl dashboards (probes JSONL ➜ tail tool) line up. The
+     * framework is wired — just add `probes_counter("id.receive_history",
+     * "arrived", shape)` and friends at the matching call sites. */
     log_info(proc->logger,
              "Identity: merging self-bootstrap into mesh (re-announcing)\n");
 
@@ -1379,6 +1385,47 @@ static bool handle_receive_history(const process_t *proc, directory_t *queues, g
  * Phase 3 only. Receives a peer proposal for voting.
  ****************************/
 
+/* Worker arguments for async vote dispatch. Owned by the worker; freed
+ * after the messaging_send call returns. Carries only the small inputs
+ * the send path needs so the proc/queues structures don't escape the
+ * handler scope. */
+typedef struct {
+    char              proposed_uuid[UUID_STRING_LEN + 1];
+    public_identity_t to_whom;
+    logger_t         *logger;
+} vote_on_peer_args_t;
+
+static void _vote_on_peer_send(vote_on_peer_args_t *args)
+{
+    json_t *vote_json = json_object();
+    if (vote_json == NULL) {
+        log_error(args->logger, "Identity: json_object OOM (vote)\n");
+        return;
+    }
+    json_object_set_new(vote_json, "uuid", json_string(args->proposed_uuid));
+    json_object_set_new(vote_json, "approved", json_true());
+
+    generic_msg_t vote_msg = {0};
+    vote_msg.type = NET_MESSAGE;
+    strncpy(vote_msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    vote_msg.info.net_msg.function = ID_VOTE;
+    memcpy(&vote_msg.info.net_msg.to_whom, &args->to_whom, sizeof(public_identity_t));
+    vote_msg.info.net_msg.encrypt = true;
+    net_msg_pack_json(&vote_msg.info.net_msg, vote_json);
+    json_decref(vote_json);
+
+    messaging_send("network", NET_MESSAGE, &vote_msg, false);
+    log_debug(args->logger, "Identity: sent approval vote for %s\n", args->proposed_uuid);
+}
+
+static void *vote_on_peer_worker(void *arg)
+{
+    vote_on_peer_args_t *args = (vote_on_peer_args_t *)arg;
+    _vote_on_peer_send(args);
+    free(args);
+    return NULL;
+}
+
 /* Frama-C: skipped —
  * identity_run + all handlers + helpers: [solver-timeout] every function copies
  * public_identity_t structs (memcpy of struct→struct triggers WP "Hide sub-term
@@ -1416,35 +1463,48 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
         return true;
     }
 
-    char proposed_uuid[UUID_STRING_LEN + 1];
-    strncpy(proposed_uuid, proposed_uuid_raw, UUID_STRING_LEN);
-    proposed_uuid[UUID_STRING_LEN] = '\0';
-    json_decref(payload);
-
-    log_info(proc->logger, "Identity: received peer proposal for %s\n", proposed_uuid);
-
-    /* Pack approval vote */
-    json_t *vote_json = json_object();
-    if (vote_json == NULL) {
-        log_error(proc->logger, "Identity: json_object OOM (vote)\n");
+    vote_on_peer_args_t *args = calloc(1, sizeof(*args));
+    if (args == NULL) {
+        json_decref(payload);
+        log_error(proc->logger, "Identity: vote_on_peer alloc failed\n");
         return true;
     }
-    json_object_set_new(vote_json, "uuid", json_string(proposed_uuid));
-    json_object_set_new(vote_json, "approved", json_true());
+    strncpy(args->proposed_uuid, proposed_uuid_raw, UUID_STRING_LEN);
+    args->proposed_uuid[UUID_STRING_LEN] = '\0';
+    json_decref(payload);
+    memcpy(&args->to_whom, &nmsg->from_whom, sizeof(public_identity_t));
+    args->logger = proc->logger;
 
-    /* Send vote back to the proposer (from_whom = sender after decryption) */
-    generic_msg_t vote_msg = {0};
-    vote_msg.type = NET_MESSAGE;
-    strncpy(vote_msg.info.net_msg.process, "identity", PROC_NAME_LEN);
-    vote_msg.info.net_msg.function = ID_VOTE;
-    memcpy(&vote_msg.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-    vote_msg.info.net_msg.encrypt = true;
-    net_msg_pack_json(&vote_msg.info.net_msg, vote_json);
-    json_decref(vote_json);
+    log_info(proc->logger, "Identity: received peer proposal for %s\n",
+             args->proposed_uuid);
 
-    messaging_send("network", NET_MESSAGE, &vote_msg, false);
+    /* Async unless conformance/sync mode is active. Mirrors Python
+     * idprocess.py:749-769 which spawns `_process_id` via _spawn (which
+     * respects `synchronous_dispatch`). In sync mode we run inline so
+     * scenario steps stay deterministic. See [[synchronous-dispatch-hooks]]. */
+    pthread_mutex_lock(&id_state.lock);
+    bool sync = id_state.synchronous_dispatch;
+    pthread_mutex_unlock(&id_state.lock);
 
-    log_debug(proc->logger, "Identity: sent approval vote for %s\n", proposed_uuid);
+    if (sync) {
+        _vote_on_peer_send(args);
+        free(args);
+        return true;
+    }
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int rc = pthread_create(&tid, &attr, vote_on_peer_worker, args);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        log_warn(proc->logger,
+                 "Identity: vote_on_peer pthread_create failed (rc=%d) — falling back to inline\n",
+                 rc);
+        _vote_on_peer_send(args);
+        free(args);
+    }
     return true;
 }
 
