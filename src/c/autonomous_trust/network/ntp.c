@@ -14,6 +14,16 @@
  *   limitations under the License.
  *******************/
 
+/* Implementation note (divergence.md L2):
+ *
+ * Python uses `ntplib` (a third-party PyPI client) for NTP sync; C
+ * carries a native RFC 5905 sync client to avoid pulling a new library
+ * dependency just for one query. Both are functional and not interop-
+ * blocking — the audit row tracks the stylistic mismatch, not a
+ * behavioral one. Keep the native implementation: it has zero runtime
+ * dependencies, the protocol surface is small (one UDP exchange), and
+ * a Python-side ntplib upgrade does not require any C-side change. */
+
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>

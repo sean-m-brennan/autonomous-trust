@@ -21,6 +21,8 @@
  *  @{
  */
 
+#include <stdbool.h>
+
 #include "network/network.h"
 #include "identity/identity.h"
 #include "utilities/exception.h"
@@ -71,25 +73,38 @@ int discover_network(net_iface_t *iface);
 /**
  * @brief Create a fresh identity (keypairs + UUID) and write it to disk.
  *
+ * The active transport's @c net_proto (looked up via the @c AT_TRANSPORT
+ * env var, default `udp_net_4`) picks the address family — IPv4, IPv6,
+ * or MAC. Mirrors Python `generate.generate_identity` (generate.py:57).
+ *
  * @param[in] fullname  Human-readable name to embed in the identity.
  * @param[in] cfg_dir   Directory where @c identity.json should be written.
+ * @param[in] preserve  When true, skip writes if the target file already
+ *                      exists (parity with Python `preserve=True`).
+ * @param[in] defaults  Currently a no-op on the C side (kept for signature
+ *                      parity with Python; the C generator already runs
+ *                      non-interactively).
  * @return 0 on success, non-zero on keygen or I/O failure.
  */
-int generate_identity(const char *fullname, const char *cfg_dir);
+int generate_identity(const char *fullname, const char *cfg_dir,
+                      bool preserve, bool defaults);
 
 /**
  * @brief Run discover_network() and write the result to @c cfg_dir/network.json.
  *
- * @param[in] cfg_dir  Config directory to write into.
+ * @param[in] cfg_dir   Config directory to write into.
+ * @param[in] preserve  When true, leave an existing @c network.cfg.json
+ *                      file alone.
  * @return 0 on success, non-zero on failure.
  */
-int generate_network_config(const char *cfg_dir);
+int generate_network_config(const char *cfg_dir, bool preserve);
 
 /**
  * @brief Write default subsystem configurations to @c cfg_dir.
  *
  * Populates each registered @ref config_t section with its defaults so the
- * daemon can start on first boot.
+ * daemon can start on first boot. The `network` subsystem's implementation
+ * name is taken from the @c AT_TRANSPORT env var (default `udp_net_4`).
  *
  * @param[in] cfg_dir  Config directory to write into.
  * @return 0 on success, non-zero on failure.
@@ -102,10 +117,46 @@ int generate_subsystems_config(const char *cfg_dir);
  *
  * Intended for test/demo bring-up where no pre-existing config exists.
  *
- * @param[in] cfg_dir  Config directory to write into.
+ * Identity-name selection (in priority order):
+ *   1. @c AT_PEER_NAME env var, if set;
+ *   2. seed-indexed @c _names[] entry if @p seed_str is non-NULL OR
+ *      @c AT_PEER_SEED env var is set (mirrors Python `_names[idx]`);
+ *   3. UUID-derived `agent-XXXXXXXX` fallback.
+ *
+ * @param[in] cfg_dir   Config directory to write into.
+ * @param[in] seed_str  Optional seed string. Integer-parseable strings are
+ *                      used directly; otherwise the per-char-ord sum is
+ *                      hashed in (same as Python). NULL falls back to
+ *                      @c AT_PEER_SEED, then to the UUID branch.
  * @return 0 on success, non-zero on failure.
  */
-int random_config(const char *cfg_dir);
+int random_config(const char *cfg_dir, const char *seed_str);
+
+/**
+ * @brief Generic worker-config bootstrap — writes a zero-initialized
+ *        default for the registered config @p proc_name.
+ *
+ * Counterpart to Python `generate_worker_config(cfg_dir, proc_name,
+ * cfg_class, defaults=True)` (generate.py:194). Python's reflective
+ * auto-prompt path (using `inspect.getfullargspec`) is *not* ported —
+ * C lacks runtime signature introspection. The C variant covers only
+ * the `defaults=True` slice: it allocates a buffer of @c data_len from
+ * the registered @ref config_t, writes it via @ref write_config_file
+ * with the mode-aware extension, and exits.
+ *
+ * Production code already uses dedicated `generate_identity` /
+ * `generate_network_config` / `generate_subsystems_config` for the
+ * three configs that need non-zero defaults. Use this helper for
+ * additional zero-init configs (zta_policy, timeouts, etc.) that
+ * just need a placeholder file on first boot.
+ *
+ * @param[in] cfg_dir    Config directory to write into.
+ * @param[in] proc_name  Registered config section name (matches the
+ *                       string in @ref DECLARE_CONFIGURATION).
+ * @return 0 on success or "already exists"; non-zero if @p proc_name is
+ *         not registered or the write fails.
+ */
+int generate_worker_config(const char *cfg_dir, const char *proc_name);
 
 
 /** @} */ /* end of internal_config */

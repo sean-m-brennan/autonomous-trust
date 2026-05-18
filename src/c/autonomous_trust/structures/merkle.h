@@ -25,6 +25,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <jansson.h>
 #include <sodium.h>
 
 #include "array.h"
@@ -219,6 +220,23 @@ int merkle_merge(merkle_tree_t *tree, merkle_tree_t *other);
 int merkle_root_digest(merkle_tree_t *tree, uint8_t *digest_out);
 
 /**
+ * @brief Produce an observability snapshot of the tree state as JSON.
+ *
+ * Mirrors Python `Merkle.to_dict()` (structures/merkle.py:86) for the
+ * scope of read-only state inspection: the root hash, blob count, and
+ * whether a super_hash has been set. The on-disk blob payloads
+ * themselves are not serialized — they're caller-typed via
+ * @ref blob_designation_fn, so round-tripping a Merkle through JSON
+ * isn't well-defined without the application schema. Use this for
+ * dashboards / checkpoints; reconstruct trees by re-inserting blobs.
+ *
+ * @param[in]  tree     The tree to snapshot. May be NULL → returns NULL.
+ * @return A new @c json_t object (owned by the caller; @c json_decref
+ *         to release). NULL on allocation failure.
+ */
+json_t *merkle_to_json(const merkle_tree_t *tree);
+
+/**
  * @brief Generate an inclusion proof (path from leaf to root).
  */
 /*@
@@ -316,6 +334,11 @@ bool merkle_consistent(merkle_tree_t *tree, int other_size,
  * collisions when two nodes share a UUID — never under auto-UUID
  * generation. We port the documented intent (digest collisions)
  * rather than the literal bug.
+ *
+ * Parent-child digest lifts inherent to CVE-2012-2459 protection
+ * (a single-child parent inherits its lone child's digest, see
+ * `_rehash`) are filtered out — those pairs share a digest by
+ * design and do not represent a duplicate subtree.
  *
  * @param tree       merkle tree to scan.
  * @param idx_out    out param; receives a malloc'd `int*` array

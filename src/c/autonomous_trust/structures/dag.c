@@ -541,6 +541,51 @@ int dag_fork(step_dag_t *dag, const char *branch, linked_step_t **head_out)
     return 0;
 }
 
+/* M8: snapshot all branch heads. The returned map references the
+ * DAG's live linked_step_t nodes; this is a shallow copy of the
+ * heads map rather than Python's deepcopy semantics — see header
+ * doc for the rationale. */
+int dag_fork_all(step_dag_t *dag, map_t **heads_out)
+{
+    if (dag == NULL || heads_out == NULL)
+        return EINVAL;
+    if (dag->heads == NULL)
+        return EINVAL;
+
+    map_t *snap = NULL;
+    int err = map_create(&snap);
+    if (err != 0)
+        return err;
+
+    /* Iterate the heads map, mirroring each entry into the snapshot.
+     * map_set inside map_entries_for_each is safe — we are walking
+     * `dag->heads` keys, not `snap`. */
+    map_key_t key = NULL;
+    data_t *value = NULL;
+    map_entries_for_each(dag->heads, key, value)
+    {
+        ptr_t ptr = NULL;
+        if (data_object_ptr(value, &ptr) != 0 || ptr == NULL)
+            continue;
+        data_t *clone = object_ptr_data(ptr, sizeof(linked_step_t));
+        if (clone == NULL)
+        {
+            map_free(snap);
+            return ENOMEM;
+        }
+        int set_err = map_set(snap, key, clone);
+        if (set_err != 0)
+        {
+            map_free(snap);
+            return set_err;
+        }
+    }
+    map_end_for_each;
+
+    *heads_out = snap;
+    return 0;
+}
+
 /* Frama-C: skipped — [recursive-ds] recursive step chain replay */
 int dag_recite(step_dag_t *dag, const char *branch, linked_step_t *root,
                array_t **steps_out)
