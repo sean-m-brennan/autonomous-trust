@@ -74,30 +74,27 @@ capability_t *find_capability(const char *name);
 */
 int build_local_capabilities(const char *my_uuid, array_t **caps_out);
 
-#define DECLARE_CAPABILITY(config_name, data_size, struct_to_json, struct_from_json)
+/**
+ * @brief Invoke @p cap with @p args. Mirrors Python `Capability.execute()`
+ *        (capabilities.py:35-40).
+ *
+ * Returns 0 on dispatch (caller doesn't get the function's return value;
+ * the @c capability_function_t typedef returns void). Returns -1 if @p cap
+ * has a NULL @c function pointer (remote-only capabilities synced in via
+ * `proto_to_capability` always have function==NULL — they describe a
+ * peer's ability, not a callable here).
+ */
+int capability_execute(const capability_t *cap, thread_args_t args);
+
+/* Reflection placeholder consumed by scripts/preprocess.py to emit a
+ * `capability_table[]` static initializer from `DECLARE_CAPABILITY(...)`
+ * call sites. Currently no call sites exist — the table is populated
+ * dynamically via register_ability-style helpers — so the macro is a
+ * no-op declaration. See `capability_table_priv.h.in` for the LIST__
+ * expansion shape if/when call sites get added. */
+#define DECLARE_CAPABILITY(cap_name, func)
 
 #define QUOTE(x) #x
-
-/**
- * @brief Local capabilities are discovered at compile time
- *
- */
-#define DEFINE_CAPABILITY(cap_name, func, args, arg_num)                          \
-    void __attribute__((constructor)) CONCAT(register_capability_, __COUNTER__)() \
-    {                                                                             \
-        if (capability_table_size >= CAPABILITY_TABLE_CAPACITY) {                 \
-          (void)fprintf(stderr,                                                   \
-                        "capability_table overflow at " QUOTE(cap_name) "\n");    \
-          return;                                                                 \
-        }                                                                         \
-        capability_init(&capability_table[capability_table_size]);                \
-        capability_table[capability_table_size].name = QUOTE(cap_name);           \
-        capability_table[capability_table_size].function = func;                  \
-        capability_table[capability_table_size].args = args;                      \
-        capability_table[capability_table_size].arg_num = arg_num;                \
-        capability_table[capability_table_size].local = true;                     \
-        capability_table_size++;                                                  \
-    }
 
 
 /** @} */ /* end of internal_processes */

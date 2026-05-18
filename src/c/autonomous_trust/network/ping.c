@@ -14,6 +14,18 @@
  *   limitations under the License.
  *******************/
 
+/* Implementation note (divergence.md L3):
+ *
+ * Python carries two ping paths: the synchronous one and an async wrapper
+ * (`_do_ping_async` in netprocess.py) that runs the sync call in a worker.
+ * The async wrapper itself is deprecated as a separate API surface —
+ * callers reach it indirectly by sending a `function=ping` Message to
+ * the network process. C keeps only the synchronous `ping()` here; the
+ * async-from-caller pattern lives one layer up in net_proc's
+ * `dispatch_ping_async`, which spawns a detached worker that runs the
+ * sync function. That mirrors Python's effective surface area without
+ * duplicating the deprecated standalone async entry point. */
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>

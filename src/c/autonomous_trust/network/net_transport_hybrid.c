@@ -589,6 +589,11 @@ static int hybrid_send_broadcast_except_leg(net_transport_ctx_t *ctx_opaque,
 
 const net_transport_t hybrid_net_transport = {
     .name                     = "hybrid_net",
+    /* Hybrid wraps an inner socket leg (typically udp_net_4) plus a DTN
+     * leg. Treat it as IPv4 for identity-address selection — the inner
+     * leg carries node-local traffic and that's what `address` in
+     * identity.json represents. */
+    .net_proto                = NETPROTO_IPV4,
     .open                     = hybrid_open,
     .send_unicast             = hybrid_send_unicast,
     .send_broadcast           = hybrid_send_broadcast,

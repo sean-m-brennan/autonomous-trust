@@ -33,10 +33,57 @@
 #include "config/generate.h"
 #include "config/configuration.h"
 #include "network/network.h"
+#include "network/net_transport.h"
 #include "processes/process_tracker.h"
 #include "utilities/util.h"
 
 DEFINE_ERROR(EGEN_NOIF, "No suitable network interface found");
+
+/* Seed-indexed identity names (mirrors Python generate.py:34-45). Used
+ * when AT_PEER_NAME is unset but a seed is available — gives parity
+ * with Python's randomize=True path. */
+static const char *const _names[] = {
+    "j.h.watson@tekfive.com",
+    "a.hastings@tekfive.com",
+    "a.goodwin@tekfive.com",
+    "j.may@tekfive.com",
+    "a.bryant@tekfive.com",
+    "t.beresford@tekfive.com",
+    "n.charles@tekfive.com",
+    "d.selby@tekfive.com",
+    "m.archer@tekfive.com",
+    "r.lewis@tekfive.com",
+};
+static const size_t _names_count = sizeof(_names) / sizeof(_names[0]);
+
+/* Resolve the active transport name. Mirrors Python's `communications`
+ * env override (system.py:49). Falls back to the long-standing default. */
+static const char *default_transport_name(void)
+{
+    const char *t = getenv("AT_TRANSPORT");
+    if (t != NULL && t[0] != '\0')
+        return t;
+    return "udp_net_4";
+}
+
+/* Convert Python's `int(seed) or sum(ord(c) for c in seed)` into C.
+ * Returns the parsed seed value, or a per-char hash when the string
+ * isn't pure-integer. Negative inputs are mapped to their absolute
+ * value so `% _names_count` is well-defined. */
+static unsigned int parse_seed(const char *seed_str)
+{
+    if (seed_str == NULL || seed_str[0] == '\0') return 0;
+    char *end = NULL;
+    long v = strtol(seed_str, &end, 10);
+    if (end != NULL && *end == '\0') {
+        if (v < 0) v = -v;
+        return (unsigned int)v;
+    }
+    unsigned int sum = 0;
+    for (const char *p = seed_str; *p != '\0'; p++)
+        sum += (unsigned int)(unsigned char)*p;
+    return sum;
+}
 
 /****************************
  * Bootstrap config reader
@@ -245,8 +292,28 @@ int discover_network(net_iface_t *iface)
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] identity creation + JSON file write */
-int generate_identity(const char *fullname, const char *cfg_dir)
+int generate_identity(const char *fullname, const char *cfg_dir,
+                      bool preserve, bool defaults)
 {
+    (void)defaults;  /* parity-only — C generator already runs non-interactively */
+
+    char filepath[CFG_PATH_LEN + 1];
+    /* File extension follows AT_SERIALIZE_MODE — Python generate.py
+     * builds `cfg_dir + CfgIds.identity + Configuration.file_ext`. */
+    char fname[CFG_NAME_SIZE + 16];
+    snprintf(fname, sizeof(fname), "identity%s",
+             at_serialize_mode_file_ext(at_serialize_mode_current()));
+    if (path_join(filepath, sizeof(filepath), cfg_dir, fname) < 0)
+        return -1;
+
+    /* preserve: skip if the identity file already exists. Mirrors Python
+     * generate.py:121 (`not os.path.exists(ident_file) or not preserve`). */
+    if (preserve) {
+        struct stat st;
+        if (stat(filepath, &st) == 0)
+            return 0;
+    }
+
     uuid_t uuid;
     uuid_generate(uuid);
 
@@ -257,22 +324,46 @@ int generate_identity(const char *fullname, const char *cfg_dir)
     /* Discover the right interface (preferring bootstrap subnet) */
     net_iface_t iface;
     char address[ADDR_LEN + 1] = {0};
-    if (discover_network_for(&iface, bootstrap_addr[0] ? bootstrap_addr : NULL) == 0)
-        strncpy(address, iface.ip4_addr, ADDR_LEN);
-    else
-        strncpy(address, "127.0.0.1", ADDR_LEN);
+    int disc = discover_network_for(&iface, bootstrap_addr[0] ? bootstrap_addr : NULL);
+
+    /* Address-family selection: ask the active transport which family it
+     * speaks. Mirrors Python generate.py:80-85 (`proto_cls.net_proto`). */
+    const net_transport_t *active = net_transport_find(default_transport_name());
+    network_protocol_t fam = (active != NULL) ? active->net_proto : NETPROTO_IPV4;
+
+    /* Manual byte-copy with explicit truncation — ADDR_LEN (32) is shorter
+     * than IPV6_ADDR_LEN (46), so a long IPv6 address may truncate. The
+     * compiler's -Wformat-truncation / -Wstringop-truncation can't see
+     * that truncation is intentional here, so we copy bytes and NUL-
+     * terminate by hand. Widening `public_identity_t.address` is a
+     * separate (L4-class) wire-format change. */
+    const char *src = NULL;
+    if (disc == 0) {
+        switch (fam) {
+        case NETPROTO_IPV6:
+            src = (iface.ip6_addr[0] != '\0') ? iface.ip6_addr : iface.ip4_addr;
+            break;
+        case NETPROTO_MAC:
+            src = iface.mac_addr;
+            break;
+        case NETPROTO_IPV4:
+        case NETPROTO_NONE:
+        default:
+            src = iface.ip4_addr;
+            break;
+        }
+    } else {
+        src = "127.0.0.1";
+    }
+    size_t copy_len = strlen(src);
+    if (copy_len > ADDR_LEN) copy_len = ADDR_LEN;
+    memcpy(address, src, copy_len);
+    address[copy_len] = '\0';
 
     identity_t *ident = NULL;
     int err = identity_create(&uuid, address, (char *)fullname, NULL, NULL, &ident);
     if (err != 0)
         return err;
-
-    char filepath[CFG_PATH_LEN + 1];
-    if (path_join(filepath, sizeof(filepath), cfg_dir, "identity.cfg.json") < 0)
-    {
-        identity_free(ident);
-        return -1;
-    }
 
     config_t *cfg = find_configuration("identity");
     if (cfg == NULL)
@@ -291,8 +382,21 @@ int generate_identity(const char *fullname, const char *cfg_dir)
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] network config + JSON file write */
-int generate_network_config(const char *cfg_dir)
+int generate_network_config(const char *cfg_dir, bool preserve)
 {
+    char filepath[CFG_PATH_LEN + 1];
+    char fname[CFG_NAME_SIZE + 16];
+    snprintf(fname, sizeof(fname), "network%s",
+             at_serialize_mode_file_ext(at_serialize_mode_current()));
+    if (path_join(filepath, sizeof(filepath), cfg_dir, fname) < 0)
+        return -1;
+
+    if (preserve) {
+        struct stat st;
+        if (stat(filepath, &st) == 0)
+            return 0;
+    }
+
     /* Check bootstrap for a provisioned address */
     char bootstrap_addr[IPV4_ADDR_LEN + 1] = {0};
     read_bootstrap(cfg_dir, bootstrap_addr, sizeof(bootstrap_addr), NULL, 0);
@@ -310,10 +414,6 @@ int generate_network_config(const char *cfg_dir)
     /* default multicast groups; user may override in cfg file */
     snprintf(net_cfg.mcast4_addr, sizeof(net_cfg.mcast4_addr), "%s", DEFAULT_MCAST4_ADDR);
     snprintf(net_cfg.mcast6_addr, sizeof(net_cfg.mcast6_addr), "%s", DEFAULT_MCAST6_ADDR);
-
-    char filepath[CFG_PATH_LEN + 1];
-    if (path_join(filepath, sizeof(filepath), cfg_dir, "network.cfg.json") < 0)
-        return -1;
 
     config_t *cfg = find_configuration("network");
     if (cfg == NULL)
@@ -337,7 +437,7 @@ int generate_subsystems_config(const char *cfg_dir)
     if (err != 0)
         return err;
 
-    err = tracker_register_subsystem(&tracker, "network", "udp_net_4");
+    err = tracker_register_subsystem(&tracker, "network", default_transport_name());
     if (err != 0)
         return err;
     err = tracker_register_subsystem(&tracker, "identity", "id_proc");
@@ -373,26 +473,31 @@ int generate_subsystems_config(const char *cfg_dir)
  * Non-interactive wrapper
  ****************************/
 
-int random_config(const char *cfg_dir)
+int random_config(const char *cfg_dir, const char *seed_str)
 {
-    /* Only generate identity if it doesn't already exist.
-     * Regenerating would create new keys, breaking existing peer
-     * relationships (peers still hold the old public key). */
-    char id_path[CFG_PATH_LEN + 1];
-    snprintf(id_path, sizeof(id_path), "%s/identity.cfg.json", cfg_dir);
-    struct stat st;
-    if (stat(id_path, &st) != 0)
-    {
-        char fullname[NAME_LEN + 1];
-        /* AT_PEER_NAME override — mirrors Python generate.py:87-107
-         * (uses an env var on the identity nickname so multi-agent
-         * compose runs label their peers by container role). Falls
-         * back to a UUID-derived `agent-XXXXXXXX` when unset. The full
-         * `_names` list / seed-modulo indexing (Python's randomize=True
-         * path) isn't ported yet — see divergence.md H5. */
-        const char *peer_name = getenv("AT_PEER_NAME");
-        if (peer_name != NULL && peer_name[0] != '\0') {
-            strncpy(fullname, peer_name, NAME_LEN);
+    char fullname[NAME_LEN + 1];
+
+    /* Identity-name selection priority (mirrors Python generate.py:87-107
+     * plus the seed-indexed _names path the C side previously skipped).
+     *   1. AT_PEER_NAME env (operator override — multi-agent compose).
+     *   2. seed-indexed _names[] entry when a seed is available.
+     *   3. UUID-derived `agent-XXXXXXXX` fallback.
+     *
+     * Seed source: explicit seed_str argument wins; falls back to the
+     * AT_PEER_SEED env var (parity with how Python's __main__.py wires
+     * a CLI --ident through random_config(base, ident)). */
+    const char *peer_name = getenv("AT_PEER_NAME");
+    if (peer_name != NULL && peer_name[0] != '\0') {
+        strncpy(fullname, peer_name, NAME_LEN);
+        fullname[NAME_LEN] = '\0';
+    } else {
+        const char *seed_src = seed_str;
+        if (seed_src == NULL || seed_src[0] == '\0')
+            seed_src = getenv("AT_PEER_SEED");
+        if (seed_src != NULL && seed_src[0] != '\0') {
+            unsigned int seed = parse_seed(seed_src);
+            const char *picked = _names[seed % _names_count];
+            strncpy(fullname, picked, NAME_LEN);
             fullname[NAME_LEN] = '\0';
         } else {
             uuid_t name_uuid;
@@ -401,15 +506,58 @@ int random_config(const char *cfg_dir)
             uuid_unparse_lower(name_uuid, name_str);
             snprintf(fullname, NAME_LEN, "agent-%.*s", 8, name_str);
         }
-
-        int err = generate_identity(fullname, cfg_dir);
-        if (err != 0)
-            return err;
     }
 
-    int err = generate_network_config(cfg_dir);
+    /* preserve=true so existing keys / network / subsystem files survive
+     * an idempotent re-run. Regenerating identity would mint new keys
+     * and break peer relationships. Mirrors Python random_config which
+     * only writes when the cfg_dir is empty. */
+    int err = generate_identity(fullname, cfg_dir, /*preserve=*/true,
+                                /*defaults=*/true);
+    if (err != 0)
+        return err;
+
+    err = generate_network_config(cfg_dir, /*preserve=*/true);
     if (err != 0)
         return err;
 
     return generate_subsystems_config(cfg_dir);
+}
+
+/* Defaults-only counterpart to Python's reflective generate_worker_config.
+ * See header for the parity rationale (no C-side `inspect` analog). */
+int generate_worker_config(const char *cfg_dir, const char *proc_name)
+{
+    if (cfg_dir == NULL || proc_name == NULL)
+        return EXCEPTION(EINVAL);
+
+    config_t *cfg = find_configuration(proc_name);
+    if (cfg == NULL)
+        return EXCEPTION(ECFG_NOIMPL);
+
+    /* Build the destination path using the active serialize mode's
+     * extension — Python's equivalent does
+     * `proc_name + Configuration.file_ext`. */
+    char fname[CFG_NAME_SIZE + 16];
+    snprintf(fname, sizeof(fname), "%s%s", proc_name,
+             at_serialize_mode_file_ext(at_serialize_mode_current()));
+    char filepath[CFG_PATH_LEN + 1];
+    if (path_join(filepath, sizeof(filepath), cfg_dir, fname) < 0)
+        return -1;
+
+    /* Idempotent — Python's `not os.path.exists(cfg_file)` guard. */
+    struct stat st;
+    if (stat(filepath, &st) == 0)
+        return 0;
+
+    /* Zero-initialized backing struct ⇒ "all defaults" wire form.
+     * Configs whose to_json/to_proto require non-zero invariants set
+     * their own constructors via the dedicated `generate_*_config()`
+     * helpers (network/identity/subsystems). */
+    void *data = calloc(1, cfg->data_len);
+    if (data == NULL)
+        return SYS_EXCEPTION();
+    int err = write_config_file(cfg, data, filepath);
+    free(data);
+    return err;
 }

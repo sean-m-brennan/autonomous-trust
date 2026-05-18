@@ -21,13 +21,19 @@
 
 #define QUOTE(x) #x
 
-#define DECLARE_CAPABILITY(cap_name, func, args, arg_num) \
-    {                                                     \
-        .name = QUOTE(cap_name),                          \
-        .num_args = data_size,                            \
-        .local = true,                                    \
-        .function = func,                                 \
-        .arguments = args,                                \
+/* Expanded once per DECLARE_CAPABILITY(cap_name, func) call site by
+ * scripts/preprocess.py and concatenated into the LIST__ macro below.
+ * Emits a row initializer for the static `capability_table[]`. Matches
+ * the `capability_t` shape in `processes/capabilities.h` — name + local
+ * + function are the bare minimum; `arguments` defaults to a zero-
+ * initialized map_t (callers populate it at runtime if they have
+ * type metadata). */
+#define DECLARE_CAPABILITY(cap_name, func) \
+    {                                      \
+        .name = QUOTE(cap_name),           \
+        .local = true,                     \
+        .function = func,                  \
+        .arguments = {0},                  \
     },
 
 

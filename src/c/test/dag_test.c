@@ -249,7 +249,48 @@ DEFINE_TEST(test_dag_catch_up_validation_rejected)
 }
 END_TEST_DEFINITION()
 
+/* M8: dag_fork_all snapshots all branch heads into a fresh map. */
+DEFINE_TEST(test_dag_fork_all)
+{
+    step_dag_t dag;
+    ck_assert_ret_ok(dag_init(&dag));
+
+    /* Add a step to main and a new branch so there are two heads. */
+    linked_step_t *s1 = NULL;
+    ck_assert_ret_ok(linked_step_create("fa-1", NULL, &s1));
+    ck_assert_ret_ok(dag_add_step(&dag, s1, NULL));
+
+    linked_step_t *s2 = NULL;
+    ck_assert_ret_ok(linked_step_create("fa-2", NULL, &s2));
+    ck_assert_ret_ok(dag_branch(&dag, "side", s2, "genesis"));
+
+    map_t *snapshot = NULL;
+    ck_assert_ret_ok(dag_fork_all(&dag, &snapshot));
+    ck_assert_ptr_nonnull(snapshot);
+
+    /* Both branches must be present in the snapshot. */
+    data_t *main_val = NULL;
+    data_t *side_val = NULL;
+    ck_assert_ret_ok(map_get(snapshot, (map_key_t)"main", &main_val));
+    ck_assert_ret_ok(map_get(snapshot, (map_key_t)"side", &side_val));
+    ck_assert_ptr_nonnull(main_val);
+    ck_assert_ptr_nonnull(side_val);
+
+    /* The pointers reference the live nodes — shallow snapshot. */
+    ptr_t main_p = NULL;
+    ptr_t side_p = NULL;
+    ck_assert_ret_ok(data_object_ptr(main_val, &main_p));
+    ck_assert_ret_ok(data_object_ptr(side_val, &side_p));
+    ck_assert_ptr_eq(main_p, s1);
+    ck_assert_ptr_eq(side_p, s2);
+
+    map_free(snapshot);
+    dag_free(&dag);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(DAG, test_dag_create_and_add, test_dag_branch_and_merge,
           test_dag_diff, test_dag_recite, test_dag_ingest_branch,
           test_dag_branch_exists_error,
-          test_dag_catch_up_success, test_dag_catch_up_validation_rejected)
+          test_dag_catch_up_success, test_dag_catch_up_validation_rejected,
+          test_dag_fork_all)

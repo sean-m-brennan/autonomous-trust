@@ -88,6 +88,19 @@ void probes_counter_n(const char *layer, const char *event,
  *  Useful on shutdown or before a hard transition. */
 void probes_flush(void);
 
+/** Emit a message-correlation trace event. Mirrors Python
+ *  `_probes.trace_msg(msg, hook, **ctx)` (autonomous_trust/core/_python/_probes/__init__.py:70):
+ *  records the `msg` layer with @p hook as the event name and three
+ *  standard fields (trace_id, process, function) sourced from the
+ *  message header. Additional key/value pairs may follow, NUL-
+ *  terminated like @ref probes_emit_kv.
+ *
+ *  @p trace_id may be NULL or empty — the helper is a no-op in that
+ *  case (no correlation key → no useful trace). @p process and
+ *  @p function may be NULL; they are recorded as JSON null. */
+void probes_trace_msg(const char *trace_id, const char *process,
+                      const char *function, const char *hook, ...);
+
 /** @} */ /* end of internal_probes */
 
 #ifdef __cplusplus

@@ -432,6 +432,14 @@ static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_st
   requires \valid(msg);
   requires proc->logger == \null || \valid(proc->logger);
 */
+/* TODO (divergence.md C14 follow-up): Python negprocess.py emits
+ * `proc.negotiation/{iter_drained, ...}` counters and per-handler
+ * `_probes.counter('proc.negotiation', 'unhandled', message.function)`
+ * tags at the dispatch sites in this file. Mirror those here so
+ * negotiation-side instrumentation parity completes. The framework is
+ * wired (probes.h is included via processes.c) — just add focused
+ * `probes_counter` calls inside each handler when interesting branches
+ * fire (haggle-vs-accept, refuse-with-reason, etc.). */
 static bool handle_start_task(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -812,11 +820,16 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
  * the peer's pending slot from the tracker's results map and decrements
  * the expected-participant count. If the remaining count falls below
  * what we need to satisfy the task, surfaces the cancellation through
- * the same log path handle_refuse uses (the C build doesn't yet route
- * partial results back to the main process as a typed message — Python
- * puts the result-dict on queues[CfgIds.main]; doing the same in C
- * requires a new generic_msg_t variant for partial-result snapshots,
- * which is out of scope here).
+ * the same log path handle_refuse uses.
+ *
+ * TODO (divergence.md M5 follow-up): Python additionally posts a
+ * partial-result dict to `queues[CfgIds.main]` so the main process can
+ * react to a sub-quorum cancellation in real time. The C build does
+ * not yet route partial results back to main as a typed IPC message —
+ * it requires a new `generic_msg_t` variant (e.g.
+ * `negotiation_partial_result_t`) plus a NEG_PARTIAL_RESULT message
+ * type and a sender hook here. Out of scope until a main-side consumer
+ * needs the signal.
  *
  * Caller MUST hold neg_state.lock.
  ****************************/

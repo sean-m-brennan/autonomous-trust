@@ -336,6 +336,7 @@ static int tcp_link_class_ms(const net_transport_ctx_t *ctx, const char *target)
 
 const net_transport_t tcp_ip4_transport = {
     .name           = "tcp_net_4",
+    .net_proto      = NETPROTO_IPV4,
     .open           = tcp4_open,
     .send_unicast   = tcp_send_unicast,
     .send_broadcast = tcp_send_broadcast,
@@ -346,6 +347,7 @@ const net_transport_t tcp_ip4_transport = {
 
 const net_transport_t tcp_ip6_transport = {
     .name           = "tcp_net_6",
+    .net_proto      = NETPROTO_IPV6,
     .open           = tcp6_open,
     .send_unicast   = tcp_send_unicast,
     .send_broadcast = tcp_send_broadcast,
