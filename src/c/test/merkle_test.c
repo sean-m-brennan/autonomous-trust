@@ -222,5 +222,106 @@ DEFINE_TEST(test_merkle_consistent)
 }
 END_TEST_DEFINITION()
 
+/* H11: a fresh tree of unique blobs has no duplicate subtrees. */
+DEFINE_TEST(test_merkle_subtree_duplications_none)
+{
+    merkle_tree_t *tree = NULL;
+    ck_assert_ret_ok(merkle_tree_create(&tree));
+
+    merkle_blob_t *blob1 = make_test_blob("dup-a");
+    merkle_blob_t *blob2 = make_test_blob("dup-b");
+    merkle_blob_t *blob3 = make_test_blob("dup-c");
+    ck_assert_ret_ok(merkle_insert(tree, blob1));
+    ck_assert_ret_ok(merkle_insert(tree, blob2));
+    ck_assert_ret_ok(merkle_insert(tree, blob3));
+
+    int *idx = NULL;
+    size_t count = (size_t)-1;
+    ck_assert_ret_ok(merkle_subtree_duplications(tree, &idx, &count));
+    ck_assert_int_eq((int)count, 0);
+    ck_assert_ptr_null(idx);
+
+    merkle_tree_free(tree);
+    free(blob1);
+    free(blob2);
+    free(blob3);
+}
+END_TEST_DEFINITION()
+
+/* H12: merkle_audit_chain with no extra chain and super_hash =
+ * root_digest is equivalent to merkle_audit (true result). */
+DEFINE_TEST(test_merkle_audit_chain_equivalent)
+{
+    merkle_tree_t *tree = NULL;
+    ck_assert_ret_ok(merkle_tree_create(&tree));
+
+    merkle_blob_t *blob1 = make_test_blob("chain-1");
+    merkle_blob_t *blob2 = make_test_blob("chain-2");
+    merkle_blob_t *blob3 = make_test_blob("chain-3");
+    ck_assert_ret_ok(merkle_insert(tree, blob1));
+    ck_assert_ret_ok(merkle_insert(tree, blob2));
+    ck_assert_ret_ok(merkle_insert(tree, blob3));
+
+    merkle_proof_step_t *proof = NULL;
+    int proof_len = 0;
+    ck_assert_ret_ok(merkle_inclusion_proof(tree, blob2, &proof, &proof_len));
+
+    uint8_t root[MERKLE_DIGEST_LEN];
+    ck_assert_ret_ok(merkle_root_digest(tree, root));
+
+    /* No extra chain: pass-through must match merkle_audit. */
+    ck_assert(merkle_audit_chain(tree, blob2, proof, proof_len,
+                                 NULL, 0, root));
+    /* Mismatched super_hash must reject. */
+    uint8_t bogus[MERKLE_DIGEST_LEN] = {0};
+    ck_assert(!merkle_audit_chain(tree, blob2, proof, proof_len,
+                                  NULL, 0, bogus));
+
+    free(proof);
+    merkle_tree_free(tree);
+    free(blob1);
+    free(blob2);
+    free(blob3);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_merkle_to_json_snapshot)
+{
+    /* Empty tree → root_digest is null and counts are zero. */
+    merkle_tree_t *tree = NULL;
+    ck_assert_ret_ok(merkle_tree_create(&tree));
+
+    json_t *snap0 = merkle_to_json(tree);
+    ck_assert_ptr_nonnull(snap0);
+    ck_assert(json_is_null(json_object_get(snap0, "root_digest")));
+    ck_assert_int_eq((int)json_integer_value(json_object_get(snap0, "blob_count")), 0);
+    ck_assert_int_eq((int)json_integer_value(json_object_get(snap0, "node_count")), 0);
+    json_decref(snap0);
+
+    /* After one insert: root_digest is a 64-hex-char string,
+     * blob_count == 1, node_count > 0. */
+    merkle_blob_t *blob1 = make_test_blob("snap-1");
+    ck_assert_ret_ok(merkle_insert(tree, blob1));
+
+    json_t *snap1 = merkle_to_json(tree);
+    ck_assert_ptr_nonnull(snap1);
+    const char *hex = json_string_value(json_object_get(snap1, "root_digest"));
+    ck_assert_ptr_nonnull(hex);
+    ck_assert_int_eq((int)strlen(hex), MERKLE_DIGEST_LEN * 2);
+    ck_assert_int_eq((int)json_integer_value(json_object_get(snap1, "blob_count")), 1);
+    ck_assert(json_integer_value(json_object_get(snap1, "node_count")) > 0);
+    json_decref(snap1);
+
+    /* NULL input → NULL out. */
+    ck_assert_ptr_null(merkle_to_json(NULL));
+
+    merkle_tree_free(tree);
+    free(blob1);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(merkle, test_merkle_hash, test_merkle_insert, test_merkle_delete,
-          test_merkle_proof_audit, test_merkle_merge, test_merkle_consistent)
+          test_merkle_proof_audit, test_merkle_merge, test_merkle_consistent,
+          test_merkle_subtree_duplications_none,
+          test_merkle_audit_chain_equivalent,
+          test_merkle_to_json_snapshot)

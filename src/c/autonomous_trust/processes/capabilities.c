@@ -29,6 +29,14 @@
   assigns \nothing;
   ensures \result == \null || \valid(\result);
 */
+/* TODO (divergence.md C14 follow-up): Python emits `peer.set/caps_*`
+ * counter probes around capability-query traffic
+ * (idprocess.py:884-977). The C side already covers
+ * `peer.set/self_announce` and `peer.set/amnesia_caps_registered`; the
+ * caps_query/response path inside `id_proc.c` doesn't yet emit the
+ * matching `caps_query_sent`, `caps_response_sent`, `caps_response_*`
+ * counters. Mirror those once the caps_query/response handlers land
+ * the same shape Python uses. */
 capability_t *find_capability(const char *name)
 {
     for (int i = 0; i < capability_table_size; i++)
@@ -42,6 +50,15 @@ capability_t *find_capability(const char *name)
         END_IGNORE_GCC_DIAGNOSTIC
     }
     return NULL;
+}
+
+/* Frama-C: skipped — [func-ptr] indirect call through capability_function_t. */
+int capability_execute(const capability_t *cap, thread_args_t args)
+{
+    if (cap == NULL || cap->function == NULL)
+        return -1;
+    cap->function(args);
+    return 0;
 }
 
 /* Frama-C: skipped —
@@ -353,6 +370,14 @@ int peer_capabilities_from_json(const json_t *obj, void *data_struct)
     return 0;
 }
 
+/* TODO (divergence.md H3 follow-up): `peer_capabilities_to_proto` and
+ * `proto_to_peer_capabilities` already live above — wire them through
+ * here so this config participates in PROTO mode. Same for the
+ * standalone `capability` config in any future DECLARE_CONFIGURATION
+ * for it (its proto converters `capability_to_proto` /
+ * `proto_to_capability` also exist already). Blocked only on widening
+ * the macro signature to take optional proto callbacks, or adding the
+ * fields at runtime via find_configuration(). */
 DECLARE_CONFIGURATION(peer_capabilities, sizeof(peer_capabilities_matrix_t),
                       peer_capabilities_to_json, peer_capabilities_from_json);
 

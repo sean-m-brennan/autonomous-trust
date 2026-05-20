@@ -314,6 +314,7 @@ static int udp_link_class_ms(const net_transport_ctx_t *ctx, const char *target)
 
 const net_transport_t udp_ip4_transport = {
     .name           = "udp_net_4",
+    .net_proto      = NETPROTO_IPV4,
     .open           = udp4_open,
     .send_unicast   = udp_send_unicast,
     .send_broadcast = udp_send_broadcast,
@@ -324,6 +325,7 @@ const net_transport_t udp_ip4_transport = {
 
 const net_transport_t udp_ip6_transport = {
     .name           = "udp_net_6",
+    .net_proto      = NETPROTO_IPV6,
     .open           = udp6_open,
     .send_unicast   = udp_send_unicast,
     .send_broadcast = udp_send_broadcast,

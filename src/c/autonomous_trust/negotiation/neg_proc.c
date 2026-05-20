@@ -46,11 +46,29 @@ char NEG_PROTO_CANCEL[]   = "cancel";
  * Process state (file-scope static, thread-safe via mutex)
  ****************************/
 
+/* TaskParameters constants — mirrors Python TaskParameters class-level
+ * defaults (negotiation.py:61-62). Kept as #defines because protobuf
+ * task_t has no per-instance field for either, and changing the proto
+ * would be a wire-format break. Override per-task by extending
+ * TaskParameters in a subclass on the Python side, which has no C
+ * analog today. */
+#define NEG_TIMEOUT_EXTENSION_SEC 120L
+#define NEG_DURATION_FRACTION_PCT 10L
+
 static struct {
     job_queue_t task_stack;
     map_t proposed_tasks;  /* uuid_str -> task_t* */
     map_t my_tasks;        /* uuid_str -> task_tracker_t* */
-    map_t confirmed;       /* uuid_str -> int */
+    map_t confirmed;       /* uuid_str -> int (acceptance count, used by
+                            * negotiation_has_confirmed_any) */
+    /* Per-(task, peer) acceptance membership, keyed
+     * "task_uuid_str:peer_uuid_str_lower" → presence marker (int 1).
+     * Required for the confirmation-prereq guard in handle_stat_resp's
+     * timeout-extension path (mirrors Python's `message.from_whom in
+     * self.confirmed[task.uuid]` test in negprocess.py:271). The
+     * existing `confirmed` count map keeps its semantics for the
+     * negotiation_has_confirmed_any export. */
+    map_t confirmed_pairs;
     array_t status_pending;
     int max_concurrency;
     pthread_mutex_t lock;
@@ -80,6 +98,7 @@ static void _ensure_init(void)
         map_init(&neg_state.proposed_tasks);
         map_init(&neg_state.my_tasks);
         map_init(&neg_state.confirmed);
+        map_init(&neg_state.confirmed_pairs);
         array_init(&neg_state.status_pending);
         neg_state.max_concurrency = 4;
         pthread_mutex_init(&neg_state.lock, NULL);
@@ -230,6 +249,8 @@ void negotiation_reset_state(void)
     map_init(&neg_state.my_tasks);
     map_free(&neg_state.confirmed);
     map_init(&neg_state.confirmed);
+    map_free(&neg_state.confirmed_pairs);
+    map_init(&neg_state.confirmed_pairs);
     array_free(&neg_state.status_pending);
     array_init(&neg_state.status_pending);
     map_free(&neg_state.own_caps_by_proc);
@@ -411,6 +432,14 @@ static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_st
   requires \valid(msg);
   requires proc->logger == \null || \valid(proc->logger);
 */
+/* TODO (divergence.md C14 follow-up): Python negprocess.py emits
+ * `proc.negotiation/{iter_drained, ...}` counters and per-handler
+ * `_probes.counter('proc.negotiation', 'unhandled', message.function)`
+ * tags at the dispatch sites in this file. Mirror those here so
+ * negotiation-side instrumentation parity completes. The framework is
+ * wired (probes.h is included via processes.c) — just add focused
+ * `probes_counter` calls inside each handler when interesting branches
+ * fire (haggle-vs-accept, refuse-with-reason, etc.). */
 static bool handle_start_task(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -785,6 +814,78 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
 }
 
 /****************************
+ * Helper: _cancel_participant
+ *
+ * Mirrors Python's _cancel_participant (negprocess.py:182-188). Drops
+ * the peer's pending slot from the tracker's results map and decrements
+ * the expected-participant count. If the remaining count falls below
+ * what we need to satisfy the task, surfaces the cancellation through
+ * the same log path handle_refuse uses.
+ *
+ * TODO (divergence.md M5 follow-up): Python additionally posts a
+ * partial-result dict to `queues[CfgIds.main]` so the main process can
+ * react to a sub-quorum cancellation in real time. The C build does
+ * not yet route partial results back to main as a typed IPC message —
+ * it requires a new `generic_msg_t` variant (e.g.
+ * `negotiation_partial_result_t`) plus a NEG_PARTIAL_RESULT message
+ * type and a sender hook here. Out of scope until a main-side consumer
+ * needs the signal.
+ *
+ * Caller MUST hold neg_state.lock.
+ ****************************/
+static void _cancel_participant(const process_t *proc,
+                                task_tracker_t *tracker,
+                                const char *task_uuid_str,
+                                const uuid_t peer_uuid)
+{
+    if (tracker == NULL)
+        return;
+
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_str);
+
+    /* Python only deletes the slot if it's still pending (None). The C
+     * tracker->results map stores result bytes; an absent or NULL entry
+     * is the equivalent of "still pending". Always remove the entry —
+     * if the peer already submitted a result, dropping it would be
+     * wrong, but in that case the result_data is non-NULL and we leave
+     * it. Mirror Python's `if result[uuid] is None: del result[uuid]`. */
+    data_t *cur = NULL;
+    if (map_get(&tracker->results, peer_str, &cur) == 0 && cur != NULL) {
+        ptr_t ptr = NULL;
+        data_object_ptr(cur, &ptr);
+        if (ptr == NULL)  /* pending — drop it */
+            map_remove(&tracker->results, peer_str);
+    } else {
+        /* Entry was never created (e.g. participant never accepted).
+         * No-op — keeps the helper safe to call from both refuse and
+         * dead/zombie status paths. */
+    }
+
+    /* Drop the per-(task, peer) confirmation marker so a subsequent
+     * stat_resp from this peer won't be mistaken for confirmed and
+     * extend a timeout we've already cancelled them out of. */
+    char pair_key[UUID_STRING_LEN * 2 + 4];
+    snprintf(pair_key, sizeof(pair_key), "%s:%s",
+             task_uuid_str ? task_uuid_str : "", peer_str);
+    map_remove(&neg_state.confirmed_pairs, pair_key);
+
+    /* Quorum-check parity with handle_refuse's existing log lines. */
+    tracker->expected--;
+    int collected = task_tracker_result_count(tracker);
+    if (tracker->expected <= 0 && collected == 0)
+        log_error(proc->logger,
+                  "Negotiation: all peers refused/cancelled task %s — "
+                  "no participants\n",
+                  task_uuid_str ? task_uuid_str : "?");
+    else if (tracker->expected < 1)
+        log_warn(proc->logger,
+                 "Negotiation: insufficient participants remaining for "
+                 "task %s (cancelled %s)\n",
+                 task_uuid_str ? task_uuid_str : "?", peer_str);
+}
+
+/****************************
  * Handler: handle_refuse (nack) — NEG_PROTO_REFUSE
  * Extract task UUID, decrement expected count in tracker; log failure if insufficient.
  ****************************/
@@ -821,28 +922,17 @@ static bool handle_refuse(const process_t *proc, directory_t *queues, generic_ms
 
     if (have_task_uuid)
     {
-        /* Look up tracker in my_tasks; decrement expected */
+        /* Look up tracker in my_tasks; drop the refusing peer and run
+         * the quorum-impact log via _cancel_participant. Mirrors
+         * Python's handle_refuse → _cancel_participant chain
+         * (negprocess.py:225-233). */
         data_t *trk_dat = NULL;
         if (map_get(&neg_state.my_tasks, task_uuid_str, &trk_dat) == 0 && trk_dat)
         {
             task_tracker_t *tracker = NULL;
             if (data_object_ptr(trk_dat, (ptr_t *)&tracker) == 0 && tracker)
-            {
-                tracker->expected--;
-                int collected = task_tracker_result_count(tracker);
-                if (tracker->expected <= 0 && collected == 0)
-                {
-                    log_error(proc->logger,
-                              "Negotiation: all peers refused task %s — no participants\n",
-                              task_uuid_str);
-                }
-                else if (tracker->expected < 1)
-                {
-                    log_warn(proc->logger,
-                             "Negotiation: insufficient participants remaining for task %s\n",
-                             task_uuid_str);
-                }
-            }
+                _cancel_participant(proc, tracker, task_uuid_str,
+                                    nmsg->from_whom.uuid);
         }
     }
 
@@ -891,16 +981,36 @@ static bool handle_accept(const process_t *proc, directory_t *queues, generic_ms
     }
 
     /* Keyed by task UUID, count confirmed peer acceptances */
-    const char *key = have_task_uuid ? task_uuid_str : "unknown";
+    char key[UUID_STRING_LEN + 1];
+    if (have_task_uuid)
+        strncpy(key, task_uuid_str, UUID_STRING_LEN);
+    else
+        strncpy(key, "unknown", UUID_STRING_LEN);
+    key[UUID_STRING_LEN] = '\0';
 
     data_t *count_dat = NULL;
     int count = 0;
-    if (map_get(&neg_state.confirmed, (map_key_t)key, &count_dat) == 0 && count_dat)
+    if (map_get(&neg_state.confirmed, key, &count_dat) == 0 && count_dat)
         data_integer(count_dat, &count);
 
     count++;
     data_t *new_count = integer_data(count);
-    map_set(&neg_state.confirmed, (map_key_t)key, new_count);
+    map_set(&neg_state.confirmed, key, new_count);
+
+    /* Per-peer membership entry. Composite key "<task>:<peer>" so
+     * handle_stat_resp can answer the Python check
+     * `message.from_whom in self.confirmed[task.uuid]`
+     * (negprocess.py:271) without restructuring the count map above. */
+    if (have_task_uuid)
+    {
+        char peer_lower[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(nmsg->from_whom.uuid, peer_lower);
+        char pair_key[UUID_STRING_LEN * 2 + 4];
+        snprintf(pair_key, sizeof(pair_key), "%s:%s", task_uuid_str, peer_lower);
+        data_t *marker = integer_data(1);
+        if (marker != NULL)
+            map_set(&neg_state.confirmed_pairs, pair_key, marker);
+    }
 
     log_debug(proc->logger,
               "Negotiation: task %s now has %d confirmed peer(s)\n",
@@ -950,13 +1060,17 @@ static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_
         json_decref(j);
     }
 
-    /* Determine status */
+    /* Determine status. A task sitting on the task_stack has been queued
+     * but has not yet been picked up by an executor, so the correct status
+     * is `pending`, not `running`. Returning RUNNING here causes the
+     * requestor's clock-sync detector (handle_stat_resp:269 on the Python
+     * side) to miss the discrepancy. Mirrors negprocess.py:238-239. */
     neg_status_t status = NEG_UNKNOWN;
     if (have_task_uuid)
     {
         pthread_mutex_lock(&neg_state.lock);
         if (job_queue_contains(&neg_state.task_stack, task_uuid))
-            status = NEG_RUNNING;
+            status = NEG_PENDING;
         pthread_mutex_unlock(&neg_state.lock);
     }
 
@@ -1026,20 +1140,96 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
             case NEG_RUNNING:
             case NEG_SLEEPING:
             case NEG_PENDING:
-                /* Task is active — extend its timeout */
-                if (tracker)
+            {
+                /* Clock-sync error log on PENDING — mirrors Python's
+                 * `if task.status == Status.pending: logger.error(...)`
+                 * at negprocess.py:269-270. The remote claims the task
+                 * is still queued; if we asked for status we expected
+                 * it to be at least running, so our clocks differ. */
+                if (status == NEG_PENDING)
+                    log_error(proc->logger,
+                              "Negotiation: clock synchronization error "
+                              "with %s (task %s still pending)\n",
+                              nmsg->from_whom.fullname, task_uuid_str);
+
+                /* Confirmation-prereq guard (C11) — only extend timeout
+                 * for peers that have ack'd this task. Mirrors Python's
+                 * `if task.uuid in self.confirmed and message.from_whom
+                 *    in self.confirmed[task.uuid]` test in
+                 * negprocess.py:271. */
+                bool peer_confirmed = false;
                 {
-                    /* Find the job in task_stack and bump its end_time */
-                    uuid_t task_uuid;
-                    if (uuid_parse(task_uuid_str, task_uuid) == 0
-                        && job_queue_contains(&neg_state.task_stack, task_uuid))
-                    {
-                        log_debug(proc->logger,
-                                  "Negotiation: task %s active (status=%d), extending timeout\n",
-                                  task_uuid_str, (int)status);
+                    char peer_lower[UUID_STRING_LEN + 1];
+                    uuid_unparse_lower(nmsg->from_whom.uuid, peer_lower);
+                    char pair_key[UUID_STRING_LEN * 2 + 4];
+                    snprintf(pair_key, sizeof(pair_key), "%s:%s",
+                             task_uuid_str, peer_lower);
+                    data_t *m = NULL;
+                    if (map_get(&neg_state.confirmed_pairs, pair_key, &m) == 0
+                        && m != NULL)
+                        peer_confirmed = true;
+                }
+
+                /* Locate the live task in neg_state.proposed_tasks —
+                 * tracker_t doesn't carry the task body in C (the
+                 * proto'd task lives there instead). */
+                task_t *live_task = NULL;
+                {
+                    data_t *t_dat = NULL;
+                    if (map_get(&neg_state.proposed_tasks, task_uuid_str,
+                                &t_dat) == 0 && t_dat != NULL)
+                        data_object_ptr(t_dat, (ptr_t *)&live_task);
+                }
+
+                if (tracker && peer_confirmed && live_task) {
+                    /* Compute the extension. Mirrors Python's
+                     * three-way choice at negprocess.py:273-277.
+                     * Order matters: explicit timeout wins over
+                     * duration-derived; both fall back to the class
+                     * default. */
+                    long extend = NEG_TIMEOUT_EXTENSION_SEC;
+                    if (live_task->timeout > 0) {
+                        extend = live_task->timeout;
+                    } else {
+                        long dur_secs = live_task->duration.seconds
+                                      + (long)live_task->duration.days * 86400L;
+                        if (dur_secs > 0)
+                            extend = (dur_secs * NEG_DURATION_FRACTION_PCT) / 100L + 1L;
                     }
+                    live_task->timeout += extend;
+                    log_debug(proc->logger,
+                              "Negotiation: task %s active (status=%d), "
+                              "extending timeout by %lds (peer %s)\n",
+                              task_uuid_str, (int)status, extend,
+                              nmsg->from_whom.fullname);
+
+                    /* Drop the matching task uuid from status_pending —
+                     * Python does `self.status_pending.remove(task)` so
+                     * the periodic poller stops nagging until the next
+                     * cycle. The C status_pending array holds uuid
+                     * strings; zero out the slot like the cleanup loop
+                     * already does below for the response itself. */
+                    for (size_t i = 0; i < array_size(&neg_state.status_pending); i++)
+                    {
+                        data_t *item = NULL;
+                        if (array_get(&neg_state.status_pending, i, &item) != 0)
+                            continue;
+                        char *stored = NULL;
+                        if (data_string_ptr(item, &stored) == 0 && stored
+                            && strncmp(stored, task_uuid_str, UUID_STRING_LEN) == 0)
+                        {
+                            stored[0] = '\0';
+                            break;
+                        }
+                    }
+                } else if (tracker && !peer_confirmed) {
+                    log_debug(proc->logger,
+                              "Negotiation: stat_resp from unconfirmed peer "
+                              "%s for task %s — not extending timeout\n",
+                              nmsg->from_whom.fullname, task_uuid_str);
                 }
                 break;
+            }
 
             case NEG_DEAD:
             case NEG_ZOMBIE:
@@ -1049,6 +1239,12 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
                 log_warn(proc->logger,
                          "Negotiation: task %s cancelled/dead/rejected (status=%d)\n",
                          task_uuid_str, (int)status);
+                /* Cancel-participant parity with Python's
+                 * `handle_stat_resp` dead/zombie/stopped branch
+                 * (negprocess.py:280-284). */
+                if (tracker)
+                    _cancel_participant(proc, tracker, task_uuid_str,
+                                        nmsg->from_whom.uuid);
                 break;
 
             case NEG_UNKNOWN:

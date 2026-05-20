@@ -36,8 +36,51 @@
 #define CIDR6_LEN (IPV6_ADDR_LEN + 4)
 #define MAC_ADDR_LEN 17
 
-#define DEFAULT_MCAST4_ADDR "239.0.0.1"
-#define DEFAULT_MCAST6_ADDR "ff02::1"
+/* Per-peer duplicate-broadcast threshold before demotion. Mirrors
+ * Python NetworkProcess.annoy_limit (netprocess.py:90). The pest-
+ * tracking map itself isn't yet wired into the C receive path —
+ * defining the constant here so it's discoverable at the matching
+ * call sites and so a future implementer has one knob to tune.
+ * See divergence.md M13. */
+#define NET_ANNOY_LIMIT 5
+
+/**
+ * @brief Address family / link-layer family a transport operates on.
+ *
+ * Mirrors Python's `NetworkProtocol` enum (netprocess.py:40-44). Values
+ * match the Python wire values so cross-impl config files agree.
+ */
+typedef enum {
+    NETPROTO_NONE = 0,  /**< Abstract base / unset; transports must override. */
+    NETPROTO_MAC  = 2,  /**< Link-layer addressing only (no IP). */
+    NETPROTO_IPV4 = 4,  /**< IPv4 socket transports. */
+    NETPROTO_IPV6 = 6,  /**< IPv6 socket transports. */
+} network_protocol_t;
+
+/* Wire-protocol function selectors handled by the network process
+ * outbound queue (mirrors Python Network.{stats_req,stats_resp,ping}
+ * in network.py:33-35). Defined via `extern char[]` so callers compare
+ * against the same bytes the wire serializer emits — see
+ * project_proto_string_arrays. */
+extern char NET_FN_STATS_REQ[];
+extern char NET_FN_STATS_RESP[];
+extern char NET_FN_PING[];
+
+/* Python's INBOUND_BUDGET=32 per-channel drain cap (netprocess.py:581).
+ * C's receive path is thread-per-channel, so OS scheduling provides the
+ * equivalent fairness invariant — no shared drain loop exists to cap. The
+ * constant is recorded here for cross-reference with the Python audit
+ * and as a documentation hook for [[divergence-sweep]] H9. */
+#define NET_INBOUND_BUDGET 32
+
+/* Multicast group addresses for peer discovery. These must match the
+ * Python reference (network.py:31-32) so the two implementations join the
+ * same groups by default; otherwise C and Python peers cannot see each
+ * other's multicast traffic. The v4 address sits in the admin-scoped
+ * 239/8 block; the v6 address is a randomly generated organization-local
+ * address. Operators can still override via configuration. */
+#define DEFAULT_MCAST4_ADDR "239.0.0.65"
+#define DEFAULT_MCAST6_ADDR "ff00::41e9:dddc:e4c7:e7e7"
 
 typedef struct
 {

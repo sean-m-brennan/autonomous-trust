@@ -16,6 +16,7 @@
 
 #define _DEFAULT_SOURCE
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
@@ -39,9 +40,9 @@
 
 static const char *required_configs[] = {
     "subsystems", "network", "identity",
-    //"negotitation, "reputation"
+    "negotiation", "reputation",
 };
-static const int num_req_cfgs = 3;
+static const int num_req_cfgs = 5;
 
 const char ROOT_ENV_VAR[] = "AUTONOMOUS_TRUST_ROOT";
 
@@ -55,6 +56,38 @@ const char *rootDir()
     if (root == NULL)
         root = "";
     return root;
+}
+
+/* Cached on first call; getenv is read-once for the process lifetime
+ * (matches Python's class-attribute evaluation at module import). */
+static int  _serialize_mode_cache = 0;  /* 0 = uninitialized */
+
+at_serialize_mode_t at_serialize_mode_current(void)
+{
+    if (_serialize_mode_cache != 0)
+        return (at_serialize_mode_t)_serialize_mode_cache;
+
+    int mode = (int)AT_SERIALIZE_JSON;
+    const char *env = getenv("AT_SERIALIZE_MODE");
+    if (env != NULL && env[0] != '\0') {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != NULL && *end == '\0' &&
+            (v == AT_SERIALIZE_PROTO || v == AT_SERIALIZE_JSON || v == AT_SERIALIZE_PJSON))
+            mode = (int)v;
+    }
+    _serialize_mode_cache = mode;
+    return (at_serialize_mode_t)mode;
+}
+
+const char *at_serialize_mode_file_ext(at_serialize_mode_t mode)
+{
+    switch (mode) {
+    case AT_SERIALIZE_PROTO: return ".cfg.pb";
+    case AT_SERIALIZE_JSON:
+    case AT_SERIALIZE_PJSON: return ".cfg.json";
+    }
+    return ".cfg.json";
 }
 
 /* Frama-C: skipped — get_data_dir / get_cfg_dir: path_join with assigns. */
@@ -122,7 +155,11 @@ int all_config_files(char dir[], array_t *paths)
         if (de->d_type == DT_REG || de->d_type == DT_UNKNOWN)
         {
             char *dot = strchr(de->d_name, '.');
-            if (dot && (!strcmp(dot, ".cfg.jsn") || !strcmp(dot, ".cfg.json")))
+            /* Accept all three legacy/current extensions regardless of
+             * the env-var mode. A mode-switched node may still need to
+             * read pre-existing files from before the switch. */
+            if (dot && (!strcmp(dot, ".cfg.jsn") || !strcmp(dot, ".cfg.json")
+                        || !strcmp(dot, ".cfg.pb")))
             {
                 char *path = malloc(CFG_PATH_LEN + 1);
                 if (path == NULL)
@@ -190,6 +227,52 @@ int config_absolute_path(const char *path_in, char *path_out)
     return 0;
 }
 
+/* Detect on-disk format from the filename extension. PROTO mode files
+ * may live alongside JSON files in a mixed cfg dir during migration; the
+ * extension is authoritative, NOT the AT_SERIALIZE_MODE env. */
+static bool _filename_is_proto(const char *filename)
+{
+    if (filename == NULL) return false;
+    size_t n = strlen(filename);
+    return n >= 7 && strcmp(filename + n - 7, ".cfg.pb") == 0;
+}
+
+/* Read a .cfg.pb file. Looks up the config by basename (filename without
+ * the extension) since binary protobuf carries no field equivalent to
+ * JSON's "typename". @p data_struct is populated via the per-config
+ * from_proto callback. */
+static int _read_proto_config(const char *filename, void *data_struct)
+{
+    /* basename without extension */
+    const char *slash = strrchr(filename, '/');
+    const char *base = (slash != NULL) ? slash + 1 : filename;
+    char cfg_name[CFG_NAME_SIZE + 1] = {0};
+    const char *dot = strchr(base, '.');
+    size_t n = (dot != NULL) ? (size_t)(dot - base) : strlen(base);
+    if (n > CFG_NAME_SIZE) n = CFG_NAME_SIZE;
+    memcpy(cfg_name, base, n);
+
+    config_t *cfg = find_configuration(cfg_name);
+    if (cfg == NULL || cfg->from_proto == NULL)
+        return EXCEPTION(ECFG_NOIMPL);
+
+    FILE *f = fopen(filename, "rb");
+    if (f == NULL) return SYS_EXCEPTION();
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return EXCEPTION(ECFG_BADFMT); }
+    uint8_t *buf = malloc((size_t)sz);
+    if (buf == NULL) { fclose(f); return SYS_EXCEPTION(); }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (got != (size_t)sz) { free(buf); return EXCEPTION(ECFG_BADFMT); }
+
+    int err = cfg->from_proto(buf, (size_t)sz, data_struct);
+    free(buf);
+    return err;
+}
+
 /* Frama-C: skipped —
  * [syscall] read_config_file: file I/O + strncpy + 3x set_exception + terminates_part
  * cascade.
@@ -205,6 +288,12 @@ int config_absolute_path(const char *path_in, char *path_out)
 */
 int read_config_file(const char *filename, void *data_struct)
 {
+    /* Dispatch by on-disk extension, NOT by the env-var mode. A node
+     * configured for JSON may still need to read a leftover .cfg.pb
+     * file (or vice versa) during an in-place mode migration. */
+    if (_filename_is_proto(filename))
+        return _read_proto_config(filename, data_struct);
+
     char typename[CFG_NAME_SIZE + 1] = {0};
     json_t *root = json_load_file(filename, 0, NULL);
     if (root == NULL)
@@ -248,6 +337,37 @@ int read_config_file(const char *filename, void *data_struct)
 */
 int write_config_file(const config_t *cfg_obj, const void *data_struct, const char *filename)
 {
+    /* Dispatch by on-disk extension so a path ending in `.cfg.pb` is
+     * always written as protobuf regardless of the env-var mode (and a
+     * `.cfg.json` path is always JSON). Callers that respect the global
+     * mode build filenames via at_serialize_mode_file_ext(); ad-hoc
+     * callers still get a coherent format. */
+    if (_filename_is_proto(filename)) {
+        if (cfg_obj->to_proto == NULL) {
+            /* TODO (divergence.md H3 follow-up): no proto serializer is
+             * wired for this config yet. The framework supports PROTO
+             * mode; each `DECLARE_CONFIGURATION` call site needs its
+             * `.to_proto` / `.from_proto` filled in to participate.
+             * `processes/capabilities.c` already has `capability_to_proto`
+             * / `peer_capabilities_to_proto` ready — exposing them
+             * through this dispatch is the cheapest first wiring. Falling
+             * back to JSON-with-renamed-extension would corrupt the
+             * on-disk shape, so refuse instead. */
+            return EXCEPTION(ECFG_NOIMPL);
+        }
+        void  *buf = NULL;
+        size_t len = 0;
+        int err = cfg_obj->to_proto(data_struct, &buf, &len);
+        if (err != 0) return err;
+        FILE *f = fopen(filename, "wb");
+        if (f == NULL) { free(buf); return SYS_EXCEPTION(); }
+        size_t wrote = fwrite(buf, 1, len, f);
+        fclose(f);
+        free(buf);
+        if (wrote != len) return EXCEPTION(EJSN_DUMP);
+        return 0;
+    }
+
     json_t *root;
     int err = cfg_obj->to_json(data_struct, &root);
     if (err != 0)
@@ -319,8 +439,15 @@ int load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger)
             num_err++;
         }
     }
+    /* Python `load_configs` (discover.py:35-44) is lenient — it loads
+     * whatever is present in the cfg dir without asserting required
+     * names. Downgrade from error to warning so a minimal setup that
+     * omits one of the standard configs doesn't surface as a hard
+     * failure in C while passing on the Python side. Hard failures
+     * still come from `num_err` (file-parse errors). Mirrors the
+     * divergence.md M11 audit note. */
     if (required > 0)
-        log_error(logger, "%d required configurations not found\n", required);
+        log_warn(logger, "%d required configurations not found\n", required);
     return num_err;
 }
 
