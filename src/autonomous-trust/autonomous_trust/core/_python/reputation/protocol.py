@@ -51,6 +51,15 @@ class ReputationProtocol(Protocol):
     backdate = 'out of date'
     transaction = 'transaction'
     accepted = 'tx accepted'
+    # Phase 3 — proposer announces commit to the group once majority
+    # acceptance is reached.  Acceptors handle this by writing
+    # (task_id, proposer_id, score) to their own history, which is
+    # how bilateral Transactions form: when peer A and peer B each
+    # submit a TransactionScore for the same task_id, each commit
+    # broadcast lets the other side fill the missing slot.  Without
+    # this, every peer's local history is single-sided (only its own
+    # submissions) and CTFT can never find a bilateral entry.
+    committed = 'tx committed'
     outdated = 'update needed'
     update = 'latest update'
     rep_req = 'request reputation'

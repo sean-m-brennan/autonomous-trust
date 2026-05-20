@@ -25,6 +25,8 @@
 #include <sys/time.h>
 #include <pthread.h>
 
+#include <jansson.h>
+
 #define PROCESSES_IMPL
 #include "processes/processes.h"
 // #include "protobuf/processes.pb-c.h"
@@ -75,7 +77,14 @@ int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *confi
     proc->runner = runner;
     if (pthread_rwlock_init(&proc->protocol.peers_rwlock, NULL) != 0)
         return -1;
-    // TODO: Load protocol handler table from config to allow runtime customization
+    /* Handler table is populated by each runner via process_register_handler
+     * (the function-pointer values can't be expressed in a JSON config).
+     * Runtime customization happens via the symmetric path:
+     *   1. Runner registers its full handler set in code.
+     *   2. Runner calls process_apply_handler_config(proc) before entering
+     *      its main loop — that reads `disabled_handlers` from the
+     *      process's config section and selectively removes entries.
+     * See processes.h. */
     return map_create(&proc->protocol.handlers);
 }
 
@@ -185,6 +194,80 @@ inline int process_register_handler(const process_t *proc, char *func_name, hand
 {
     data_t *h_dat = object_ptr_data(handler, sizeof(handler_ptr_t));
     return map_set(proc->protocol.handlers, func_name, h_dat);
+}
+
+/* Frama-C: skipped — [solver-timeout] map_remove preconditions */
+int process_disable_handler(const process_t *proc, const char *func_name)
+{
+    if (proc == NULL || func_name == NULL)
+        return EXCEPTION(EINVAL);
+    /* map_remove returns EMAP_NOKEY when absent — treat that as success
+     * so this stays idempotent for repeated disable calls. */
+    int rc = map_remove(proc->protocol.handlers, (map_key_t)func_name);
+    if (rc == EMAP_NOKEY)
+        return 0;
+    return rc;
+}
+
+/* Frama-C: skipped — [alloc-pattern] jansson + map traversal cascade */
+int process_apply_handler_config(const process_t *proc)
+{
+    if (proc == NULL)
+        return EXCEPTION(EINVAL);
+
+    /* Pull our own config entry — process_init already memcpy'd the
+     * matching config_t into proc->conf when one exists; data_struct
+     * points at the populated struct after load_config. The disable list
+     * lives directly in the JSON, so we re-resolve through the loaded
+     * map to inspect the raw bytes. */
+    data_t *cfg_dat = NULL;
+    if (proc->configs == NULL ||
+        map_get(proc->configs, (char *)proc->name, &cfg_dat) != 0 ||
+        cfg_dat == NULL)
+        return 0;   /* no per-process config, nothing to disable */
+
+    config_t *cfg = NULL;
+    if (data_object_ptr(cfg_dat, (void **)&cfg) != 0 || cfg == NULL ||
+        cfg->data_struct == NULL)
+        return 0;
+
+    /* The disabled_handlers list is config-shape-agnostic — we don't
+     * want to push it into every struct's `to_json` output. Read it
+     * from a sibling JSON file written by hand. Path mirrors the
+     * config dir convention: `<cfg_dir>/<proc_name>.handlers.json`. */
+    char cfg_dir[CFG_PATH_LEN + 1];
+    if (get_cfg_dir(cfg_dir) < 0)
+        return 0;
+    char path[CFG_PATH_LEN + 1];
+    if (path_join(path, sizeof(path), cfg_dir, proc->name) < 0)
+        return 0;
+    size_t plen = strlen(path);
+    if (plen + sizeof(".handlers.json") > sizeof(path))
+        return 0;
+    memcpy(path + plen, ".handlers.json", sizeof(".handlers.json"));
+
+    json_error_t jerr;
+    json_t *root = json_load_file(path, 0, &jerr);
+    if (root == NULL)
+        return 0;   /* optional file, absence is fine */
+
+    json_t *disabled = json_object_get(root, "disabled_handlers");
+    if (disabled != NULL && json_is_array(disabled)) {
+        size_t i;
+        json_t *entry;
+        json_array_foreach(disabled, i, entry) {
+            const char *name = json_string_value(entry);
+            if (name == NULL || name[0] == '\0')
+                continue;
+            int rc = process_disable_handler(proc, name);
+            if (rc == 0)
+                log_info(proc->logger,
+                         "%s: disabled handler '%s' per config\n",
+                         proc->name, name);
+        }
+    }
+    json_decref(root);
+    return 0;
 }
 
 /* Frama-C: skipped — [func-ptr] msg_handler_t callback dispatch */

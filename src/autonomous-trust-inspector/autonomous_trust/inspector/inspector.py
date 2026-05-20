@@ -72,7 +72,12 @@ class Inspector(AutonomousTrust):
                 ping = Message(CfgIds.network, Network.ping, 5, peer, return_to=self.proc_name)
                 queues[CfgIds.network].put(ping, block=True, timeout=queue_cadence)
         if self.tasking_tick(2, 5.0):  # every 5 sec
-            # FIXME peer connections?? (i.e. peers of peers of ...)
+            # Open design question: should the inspector visualize
+            # transitive trust — peers-of-peers? Currently only direct
+            # peers appear in self.latest_reputation. Adding a
+            # transitive view needs (a) a way for each peer to share
+            # its own peer list with the inspector, (b) a UI decision
+            # on how deep to walk + how to render layered trust.
             for peer_id in self.latest_reputation:
                 self.data_queue.put((LiveData.reputation, self.latest_reputation[peer_id]),
                                     block=True, timeout=queue_cadence)

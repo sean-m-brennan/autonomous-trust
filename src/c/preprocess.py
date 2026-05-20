@@ -16,12 +16,25 @@
 # ******************
 
 import os
+import re
 import sys
 from typing import List, Tuple
 
 
 class MalformedError(RuntimeError):
     pass
+
+
+# Matches // line-comments and /* block-comments. Comments are stripped
+# before scanning for the DECLARE_* delimiter so doc references like
+# ``@ref DECLARE_CONFIGURATION`` don't get picked up as macro call sites
+# (see configuration/generate.h: the @ref token is immediately followed
+# by an unrelated function declaration whose parens then get consumed).
+_C_COMMENT_RE = re.compile(r"//[^\n]*|/\*[\s\S]*?\*/")
+
+
+def _strip_c_comments(text: str) -> str:
+    return _C_COMMENT_RE.sub("", text)
 
 
 def find_next_matching_parens(content, index) -> Tuple[int, int]:
@@ -99,7 +112,7 @@ def preprocess(target_filepath: str, output_file: str, directory: str, rel_path:
                     ignore = True
             if (filename.endswith('.c') or filename.endswith('.h')) and not ignore:
                 with open(os.path.join(root, filename), 'r') as f:
-                    contents = f.read()
+                    contents = _strip_c_comments(f.read())
                     if delimiter in contents:
                         index = contents.find(delimiter)
                         while index > -1:

@@ -49,7 +49,15 @@ class MetaIdentity(object):
         data_cfg = os.path.join(path, 'data-source' + Configuration.file_ext)
         if os.path.exists(data_cfg):
             data = DataConfig.from_file(data_cfg)
-            #if data.channels != meta.data_meta:  # FIXME either eliminate DataSrc files or remove from Metadata
+            # Open: the consistency check below is commented out
+            # because `data.channels` and `meta.data_meta` carry
+            # duplicate-but-shaped-differently info. Resolution path
+            # is one of: (a) drop the DataSrc files and let
+            # Metadata.data_meta be the single source of truth, or
+            # (b) keep DataSrc and remove the redundant field from
+            # Metadata. Until we pick, the check stays disabled so
+            # legitimate configs don't trip it.
+            #if data.channels != meta.data_meta:
             #   raise RuntimeError('DataSource and Metadata configs are inconsistent for %s (%s vs %s)' %
             #                      (path, data.channels, meta.data_channels))
         return cls(ident, meta, data)

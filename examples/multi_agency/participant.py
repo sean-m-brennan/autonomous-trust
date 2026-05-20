@@ -59,6 +59,15 @@ class MultiAgencyParticipant(AutonomousTrust):
 
 
 def main():
+    # See examples/dod_mission/coordinator.py:main() — AT only handler-
+    # binds its own framework logger, so this module's `logger.info(...)`
+    # is otherwise dropped by Python's lastResort handler.
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <peer-name> [--setup] [--log-level LEVEL]")
         sys.exit(1)
@@ -72,20 +81,24 @@ def main():
         if arg == "--log-level" and i + 1 < len(sys.argv):
             log_level = LogLevel[sys.argv[i + 1].upper()]
 
-    # Per-peer root directory
-    root_dir = os.environ.get("AUTONOMOUS_TRUST_ROOT",
+    # Per-peer root directory.  AT derives etc/at + var/at from
+    # AUTONOMOUS_TRUST_ROOT.  generate_identity needs cfg_dir explicitly.
+    root_dir = os.environ.get(Configuration.ROOT_VARIABLE_NAME,
                               str(Path(__file__).parent / peer_name))
-    os.environ["AUTONOMOUS_TRUST_ROOT"] = root_dir
-    os.makedirs(os.path.join(root_dir, "etc", "at"), exist_ok=True)
-    os.makedirs(os.path.join(root_dir, "var", "at"), exist_ok=True)
+    os.environ[Configuration.ROOT_VARIABLE_NAME] = root_dir
+    cfg_dir = Configuration.get_cfg_dir()
+    dat_dir = Configuration.get_data_dir()
+    os.makedirs(cfg_dir, exist_ok=True)
+    os.makedirs(dat_dir, exist_ok=True)
 
     # Generate identity (preserves existing keys)
-    generate_identity(preserve=True)
+    generate_identity(cfg_dir, preserve=True, defaults=True)
 
     if setup_mode:
-        generate_worker_config(DataProcess, DataConfig)
+        # generate_worker_config(cfg_dir, proc_name, cfg_class, defaults)
+        generate_worker_config(cfg_dir, DataProcess.name, DataConfig, True)
         if HAS_SIMULATOR:
-            generate_worker_config(SimMetadataSource, SimMetadata)
+            generate_worker_config(cfg_dir, SimMetadataSource.name, SimMetadata, True)
         print(f"Setup complete for {peer_name}")
         return
 

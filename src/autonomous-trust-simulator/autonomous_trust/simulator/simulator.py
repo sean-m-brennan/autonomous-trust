@@ -220,7 +220,12 @@ class Simulator(net.SelectServer):
         pass  # do nothing
 
     def process(self, **kwargs):  # synchronous alternative
-        while not self.halt: # and self.tick < self.max_time_steps:  # FIXME continuous
+        # Feature decision open: continuous run vs. bounded by
+        # `self.tick < self.max_time_steps`. Current behavior runs
+        # forever until `self.halt` is set; restoring the tick bound
+        # (commented out) would make scenarios finite. Pick one as
+        # the supported mode and document.
+        while not self.halt:
             if not isinstance(self, net.SelectServer):
                 for client_socket in self.clients:
                     self.send_state(self.tick, client_socket)

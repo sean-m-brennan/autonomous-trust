@@ -1,0 +1,15 @@
+{
+  "name": "command",
+  "agency": "Command",
+  "kind": "command-node",
+  "capabilities": [
+    "coordination",
+    "asset_authorization",
+    "fire_mission_relay"
+  ],
+  "position": {
+    "lat": 33.5186,
+    "lon": -86.8104,
+    "alt": 200.0
+  }
+}

@@ -98,7 +98,12 @@ def get_ip_addr():
 
 
 class WSClient(object):
-    def __init__(self, sock):  # FIXME get other client info
+    # Minimal client record: just the socket + peer IP. Extending this
+    # (auth token, session id, capability hints) is held back until a
+    # concrete use case asks for it — the dashboard fan-out currently
+    # treats all clients identically (see DashControl.serve_websockets
+    # below for the "differentiate" companion deferral).
+    def __init__(self, sock):
         self.socket: WebSocketConnection = sock
         self.address = sock.remote_address[0]
 
@@ -230,7 +235,13 @@ class DashControl(object):
                 pass
             await asyncio.sleep(0.1)
 
-    def serve_websockets(self):  # FIXME differentiate
+    # DEFERRED FEATURE: per-client message routing. `_websocket_sender`
+    # broadcasts each enqueued message to every connected client
+    # (lines 226-228). Differentiated routing — sending tailored updates
+    # per client based on auth/session/subscription — needs (a) richer
+    # WSClient state (see above) and (b) a routing predicate plumbed
+    # through ws_send_queue. Not blocking current dashboard use cases.
+    def serve_websockets(self):
         threading.Thread(target=self._websocket_event_loop, daemon=True).start()
         asyncio.run_coroutine_threadsafe(self._websocket_service(), self.ws_loop)
         asyncio.run_coroutine_threadsafe(self._websocket_sender(), self.ws_loop)

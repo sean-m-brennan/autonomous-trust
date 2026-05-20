@@ -123,8 +123,11 @@ time_res_config_t set_time_resolution(time_resolution_t res)
   disjoint behaviors;
 */
 /* Frama-C: skipped — [string-loop] strtol timezone string parsing */
-int str_to_offset(const char *str, float *offset)  // FIXME different sig for errors
+int str_to_offset(const char *str, float *offset)
 {
+    if (str == NULL || offset == NULL)
+        return EXCEPTION(EINVAL);
+
     char s[MAX_TZ_OFFSET_STR+1] = {0};
     /* strcpy is safe here because the only in-tree caller passes the
      * output of strftime(..., "%z", ...), which is always 5 bytes
@@ -138,14 +141,26 @@ int str_to_offset(const char *str, float *offset)  // FIXME different sig for er
         return EXCEPTION(EDT_FMT);
     first[0] = 0;
     second[0] = 0;
-    long hours = strtol(s, NULL, 10);
-    float minutes = strtol(first + 1, NULL, 10);
+
+    /* strtol uses endptr to distinguish "no digits parsed" (which would
+     * silently return 0) from a real zero value. Reject any segment
+     * that didn't advance the cursor. */
+    char *end = NULL;
+    long hours = strtol(s, &end, 10);
+    if (end == s)
+        return EXCEPTION(EDT_FMT);
+    long minutes_raw = strtol(first + 1, &end, 10);
+    if (end == first + 1)
+        return EXCEPTION(EDT_FMT);
+    float minutes = (float)minutes_raw;
     if (first != second)
     {
-        long seconds = strtol(second + 1, NULL, 10);
-        minutes = (seconds / 60.0) + minutes;
+        long seconds = strtol(second + 1, &end, 10);
+        if (end == second + 1)
+            return EXCEPTION(EDT_FMT);
+        minutes = (seconds / 60.0f) + minutes;
     }
-    *offset = (minutes / 60.0) + hours;
+    *offset = (minutes / 60.0f) + (float)hours;
     return 0;
 }
 
@@ -434,6 +449,41 @@ int timedelta_sync_in(AutonomousTrust__Core__Protobuf__Structures__TimeDelta *pr
     td->days = proto->days;
     td->seconds = proto->seconds;
     td->nsecs = proto->nanoseconds;
+    return 0;
+}
+
+/* Frama-C: skipped — [arith] carry-propagation requires bound reasoning. */
+int timedelta_normalize_long(long days, long seconds, long nsecs,
+                             timedelta_t *out)
+{
+    if (out == NULL)
+        return EINVAL;
+
+    /* Carry nsecs → seconds. Use floor-division semantics so negative
+     * remainders stay non-negative (i.e. -1 / 1e9 = -1 rem 999999999,
+     * not 0 rem -1). C's `/` and `%` round toward zero for negative
+     * operands, so we adjust by hand. */
+    long ns_per_sec = 1000000000L;
+    long sec_carry = nsecs / ns_per_sec;
+    long ns_rem    = nsecs % ns_per_sec;
+    if (ns_rem < 0) {
+        ns_rem    += ns_per_sec;
+        sec_carry -= 1;
+    }
+    seconds += sec_carry;
+
+    long sec_per_day = 86400L;
+    long day_carry = seconds / sec_per_day;
+    long sec_rem   = seconds % sec_per_day;
+    if (sec_rem < 0) {
+        sec_rem   += sec_per_day;
+        day_carry -= 1;
+    }
+    days += day_carry;
+
+    out->days    = days;
+    out->seconds = (unsigned int)sec_rem;
+    out->nsecs   = (unsigned int)ns_rem;
     return 0;
 }
 

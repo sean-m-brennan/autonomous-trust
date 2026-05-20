@@ -207,9 +207,25 @@ static int _test_count    = 0;
         return _test_failures > 0 ? 1 : 0; \
     }
 
-#define _GET_RUN_MACRO(_1, _2, _3, _4, _5, _6, _7, _8, _9, NAME, ...) NAME
+#define RUN_TESTS_10(suite, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10) \
+    int main(void) { \
+        printf("=== %s ===\n", #suite); \
+        t1(); t2(); t3(); t4(); t5(); t6(); t7(); t8(); t9(); t10(); \
+        printf("=== %d checks, %d failures ===\n", _test_count, _test_failures); \
+        return _test_failures > 0 ? 1 : 0; \
+    }
+
+#define RUN_TESTS_11(suite, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11) \
+    int main(void) { \
+        printf("=== %s ===\n", #suite); \
+        t1(); t2(); t3(); t4(); t5(); t6(); t7(); t8(); t9(); t10(); t11(); \
+        printf("=== %d checks, %d failures ===\n", _test_count, _test_failures); \
+        return _test_failures > 0 ? 1 : 0; \
+    }
+
+#define _GET_RUN_MACRO(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, NAME, ...) NAME
 #define RUN_TESTS(suite, ...) \
-    _GET_RUN_MACRO(__VA_ARGS__, RUN_TESTS_9, RUN_TESTS_8, RUN_TESTS_7, RUN_TESTS_6, RUN_TESTS_5, RUN_TESTS_4, RUN_TESTS_3, RUN_TESTS_2, RUN_TESTS_1)(suite, __VA_ARGS__)
+    _GET_RUN_MACRO(__VA_ARGS__, RUN_TESTS_11, RUN_TESTS_10, RUN_TESTS_9, RUN_TESTS_8, RUN_TESTS_7, RUN_TESTS_6, RUN_TESTS_5, RUN_TESTS_4, RUN_TESTS_3, RUN_TESTS_2, RUN_TESTS_1)(suite, __VA_ARGS__)
 
 #else  /* DEBUG_TESTS == 0: use libcheck */
 
@@ -358,9 +374,43 @@ static int _test_count    = 0;
         return nfail > 0 ? 1 : 0; \
     }
 
-#define _GET_RUN_MACRO(_1, _2, _3, _4, _5, _6, _7, _8, _9, NAME, ...) NAME
+#define RUN_TESTS_10(suite, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10) \
+    int main(void) { \
+        Suite *s = suite_create(#suite); \
+        TCase *tc = tcase_create("core"); \
+        tcase_add_test(tc, t1); tcase_add_test(tc, t2); tcase_add_test(tc, t3); \
+        tcase_add_test(tc, t4); tcase_add_test(tc, t5); tcase_add_test(tc, t6); \
+        tcase_add_test(tc, t7); tcase_add_test(tc, t8); tcase_add_test(tc, t9); \
+        tcase_add_test(tc, t10); \
+        suite_add_tcase(s, tc); \
+        SRunner *sr = srunner_create(s); \
+        srunner_set_fork_status(sr, CK_NOFORK); \
+        srunner_run_all(sr, CK_NORMAL); \
+        int nfail = srunner_ntests_failed(sr); \
+        srunner_free(sr); \
+        return nfail > 0 ? 1 : 0; \
+    }
+
+#define RUN_TESTS_11(suite, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11) \
+    int main(void) { \
+        Suite *s = suite_create(#suite); \
+        TCase *tc = tcase_create("core"); \
+        tcase_add_test(tc, t1); tcase_add_test(tc, t2); tcase_add_test(tc, t3); \
+        tcase_add_test(tc, t4); tcase_add_test(tc, t5); tcase_add_test(tc, t6); \
+        tcase_add_test(tc, t7); tcase_add_test(tc, t8); tcase_add_test(tc, t9); \
+        tcase_add_test(tc, t10); tcase_add_test(tc, t11); \
+        suite_add_tcase(s, tc); \
+        SRunner *sr = srunner_create(s); \
+        srunner_set_fork_status(sr, CK_NOFORK); \
+        srunner_run_all(sr, CK_NORMAL); \
+        int nfail = srunner_ntests_failed(sr); \
+        srunner_free(sr); \
+        return nfail > 0 ? 1 : 0; \
+    }
+
+#define _GET_RUN_MACRO(_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, NAME, ...) NAME
 #define RUN_TESTS(suite, ...) \
-    _GET_RUN_MACRO(__VA_ARGS__, RUN_TESTS_9, RUN_TESTS_8, RUN_TESTS_7, RUN_TESTS_6, RUN_TESTS_5, RUN_TESTS_4, RUN_TESTS_3, RUN_TESTS_2, RUN_TESTS_1)(suite, __VA_ARGS__)
+    _GET_RUN_MACRO(__VA_ARGS__, RUN_TESTS_11, RUN_TESTS_10, RUN_TESTS_9, RUN_TESTS_8, RUN_TESTS_7, RUN_TESTS_6, RUN_TESTS_5, RUN_TESTS_4, RUN_TESTS_3, RUN_TESTS_2, RUN_TESTS_1)(suite, __VA_ARGS__)
 
 #endif  /* DEBUG_TESTS */
 

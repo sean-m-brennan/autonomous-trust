@@ -41,9 +41,13 @@ class VideoFeed(DashComponent):
         if self.via_ws:
             threading.Thread(target=self.xmit).start()
         else:
-            # FIXME must be able to dynamically add this?
-            # note: cannot be called once the server is running
-            #self.ctl.server.view_functions[
+            # Flask constraint (documented as deferred): add_url_rule
+            # MUST be called before app.run() — the route table is
+            # frozen at server start. That's why VideoFeed registers
+            # its route at __init__ time even when the peer's metadata
+            # doesn't (yet) declare a video stream. A Flask Blueprint
+            # + dynamic blueprint registration could work around it
+            # but adds significant wiring; not blocking current use.
             self.ctl.server.add_url_rule(f'/video_feed_{self.number}', f'video_feed_{self.number}',
                                      lambda: Response(self.rcv(), mimetype='multipart/x-mixed-replace; boundary=frame'))
 

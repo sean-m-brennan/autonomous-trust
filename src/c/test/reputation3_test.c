@@ -125,6 +125,127 @@ DEFINE_TEST(test_reputation_contrite_tft)
 }
 END_TEST_DEFINITION()
 
+/* Branch-coverage pins for reputation_contrite_tft.  These mirror the
+ * Python tests in src/autonomous-trust/tests/a_unit/test_reputation.py
+ * (TestContriteTitForTat) using identical inputs and expected
+ * outputs.  A drift on either side fails its own test. */
+DEFINE_TEST(test_reputation_contrite_tft_cooperative_self_p2)
+{
+    /* Same as cooperative-p1 above, but peer fills p1 first.  Result
+     * must be order-symmetric in which side filled p1 — the earlier
+     * Python revision had p1/p2 score indices swapped and silently
+     * produced different answers depending on insertion order. */
+    tx_history_t hist;
+    reputations_t reps;
+    ck_assert_ret_ok(tx_history_init(&hist));
+    ck_assert_ret_ok(reputations_init(&reps));
+
+    uuid_t self_id, peer_id, task;
+    uuid_generate(self_id);
+    uuid_generate(peer_id);
+    uuid_generate(task);
+
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.8));  /* peer → p1 */
+    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.9));  /* self → p2 */
+
+    double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
+    ck_assert_double_eq_tol(score, 0.8, 0.001);
+
+    tx_history_free(&hist);
+    reputations_free(&reps);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_reputation_contrite_tft_retaliation)
+{
+    /* Peer defected on last tx (peer_last < 0.5) and self's standing
+     * is good → retaliation branch → min(0.49, peer_standing). */
+    tx_history_t hist;
+    reputations_t reps;
+    ck_assert_ret_ok(tx_history_init(&hist));
+    ck_assert_ret_ok(reputations_init(&reps));
+
+    uuid_t self_id, peer_id, t1, t2;
+    uuid_generate(self_id);
+    uuid_generate(peer_id);
+    uuid_generate(t1);
+    uuid_generate(t2);
+
+    /* tx1: cooperate/cooperate. */
+    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 0.9));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 0.8));
+    /* tx2: self cooperates, peer defects. peer_last = 0.2. */
+    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 0.9));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 0.2));
+
+    double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
+    /* peer_standing = (0.8 + 0.2)/2 = 0.5; my_standing = 0.9.
+     * peer_last < 0.5, my_standing >= 0.5 → min(0.49, 0.5) = 0.49. */
+    ck_assert_double_eq_tol(score, 0.49, 0.001);
+
+    tx_history_free(&hist);
+    reputations_free(&reps);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_reputation_contrite_tft_contrition)
+{
+    /* Peer defected on last tx but my own standing is also poor →
+     * contrition branch → max(0.51, peer_standing). */
+    tx_history_t hist;
+    reputations_t reps;
+    ck_assert_ret_ok(tx_history_init(&hist));
+    ck_assert_ret_ok(reputations_init(&reps));
+
+    uuid_t self_id, peer_id, t1, t2;
+    uuid_generate(self_id);
+    uuid_generate(peer_id);
+    uuid_generate(t1);
+    uuid_generate(t2);
+
+    /* Both defect, both times. */
+    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 0.2));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 0.3));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 0.2));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 0.4));
+
+    double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
+    /* peer_standing = (0.3 + 0.4)/2 = 0.35; my_standing = 0.2.
+     * peer_last < 0.5, my_standing < 0.5 → max(0.51, 0.35) = 0.51. */
+    ck_assert_double_eq_tol(score, 0.51, 0.001);
+
+    tx_history_free(&hist);
+    reputations_free(&reps);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_reputation_contrite_tft_third_party_ignored)
+{
+    /* Transactions involving the queried peer but not self must not
+     * enter the bilateral computation → no-history default. */
+    tx_history_t hist;
+    reputations_t reps;
+    ck_assert_ret_ok(tx_history_init(&hist));
+    ck_assert_ret_ok(reputations_init(&reps));
+
+    uuid_t self_id, peer_id, other, task;
+    uuid_generate(self_id);
+    uuid_generate(peer_id);
+    uuid_generate(other);
+    uuid_generate(task);
+
+    /* peer ↔ other tx, no self involvement. */
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.1));
+    ck_assert_ret_ok(tx_history_update(&hist, task, other,   0.1));
+
+    double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
+    ck_assert_double_eq_tol(score, 0.49, 0.001);
+
+    tx_history_free(&hist);
+    reputations_free(&reps);
+}
+END_TEST_DEFINITION()
+
 DEFINE_TEST(test_reputation_pure_with_counterparty)
 {
     tx_history_t hist;
@@ -147,14 +268,41 @@ DEFINE_TEST(test_reputation_pure_with_counterparty)
 
     /* Pure reputation for peer1: counterparty is peer2, score = 0.7 * 0.6 = 0.42 */
     double score = reputation_pure(&hist, &reps, peer1);
-    ck_assert(score >= 0.0);
-    ck_assert(score <= 1.0);
+    ck_assert_double_eq_tol(score, 0.42, 0.001);
 
     /* No transactions: default to 0.5 */
     uuid_t unknown;
     uuid_generate(unknown);
     double def_score = reputation_pure(&hist, &reps, unknown);
     ck_assert_double_eq_tol(def_score, 0.5, 0.001);
+
+    tx_history_free(&hist);
+    reputations_free(&reps);
+}
+END_TEST_DEFINITION()
+
+/* Pure-reputation branch pin: counterparty missing from reputations
+ * uses 0.5 fallback rather than silently skipping.  Mirrors Python
+ * TestPureReputation::test_unknown_counterparty_uses_default_0_5. */
+DEFINE_TEST(test_reputation_pure_unknown_counterparty_default_0_5)
+{
+    tx_history_t hist;
+    reputations_t reps;
+    ck_assert_ret_ok(tx_history_init(&hist));
+    ck_assert_ret_ok(reputations_init(&reps));
+
+    uuid_t self_id, peer_id, task;
+    uuid_generate(self_id);
+    uuid_generate(peer_id);
+    uuid_generate(task);
+
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.9));
+    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.6));
+    /* No reputations set — counterparty fallback should be 0.5. */
+
+    double score = reputation_pure(&hist, &reps, peer_id);
+    /* counterparty_score = 0.6, cp_rep = 0.5 → 0.3. */
+    ck_assert_double_eq_tol(score, 0.3, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);
@@ -207,5 +355,11 @@ DEFINE_TEST(test_reputations_get_missing)
 END_TEST_DEFINITION()
 
 RUN_TESTS(Reputation3, test_tx_history_json_roundtrip, test_tx_two_peer_transaction,
-          test_reputation_contrite_tft, test_reputation_pure_with_counterparty,
+          test_reputation_contrite_tft,
+          test_reputation_contrite_tft_cooperative_self_p2,
+          test_reputation_contrite_tft_retaliation,
+          test_reputation_contrite_tft_contrition,
+          test_reputation_contrite_tft_third_party_ignored,
+          test_reputation_pure_with_counterparty,
+          test_reputation_pure_unknown_counterparty_default_0_5,
           test_paxos_id_index, test_reputations_get_missing)

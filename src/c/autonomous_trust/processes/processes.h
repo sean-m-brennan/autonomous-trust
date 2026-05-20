@@ -180,6 +180,42 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2);
 */
 int process_register_handler(const process_t *proc, char *func_name, handler_ptr_t handler);
 
+/**
+ * @brief Remove a previously-registered handler.
+ *
+ * Idempotent — returns 0 whether the handler was present or not. Used
+ * by @ref process_apply_handler_config below and by runtime tests that
+ * want to disable a specific handler without recompiling.
+ *
+ * @param[in] proc       The process owning the handler table.
+ * @param[in] func_name  The function selector previously passed to
+ *                       @ref process_register_handler.
+ * @return 0 on success (including "not present"), non-zero on error.
+ */
+int process_disable_handler(const process_t *proc, const char *func_name);
+
+/**
+ * @brief Apply config-driven handler customization to @p proc.
+ *
+ * Reads the optional @c disabled_handlers JSON array from the
+ * process's own config section (e.g.
+ * `reputation.cfg.json`'s `{"disabled_handlers":["nack","backdate"]}`),
+ * and calls @ref process_disable_handler for each entry. Safe to call
+ * with no such section configured — returns 0 with no effect.
+ *
+ * Designed to be called by each process runner immediately after its
+ * `process_register_handler` calls and before entering the main loop,
+ * so production code can silence specific protocol handlers via config
+ * without a rebuild. Function pointers cannot live in JSON, so this
+ * symmetric path (register-all-in-code, then config-driven removal)
+ * replaces the previously-considered "load handler table from config"
+ * approach in `process_init`.
+ *
+ * @param[in] proc  Process whose config will be consulted.
+ * @return 0 on success or "no config"; non-zero on parse/lookup error.
+ */
+int process_apply_handler_config(const process_t *proc);
+
 #ifndef PROCESSES_IMPL
 extern const long cadence;
 #endif

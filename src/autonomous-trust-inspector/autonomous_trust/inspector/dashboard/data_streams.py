@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Optional
 
+from dash_extensions.enrich import html
+
 from autonomous_trust.services.data import Reading
 
 
@@ -91,6 +93,55 @@ class DataStreamsPanel:
     @property
     def active_count(self) -> int:
         return sum(1 for s in self._streams.values() if s.active)
+
+    def to_dash_children(self) -> list:
+        """Render as Dash html children, suitable for setting on an
+        ``Output(..., 'children')``.  The caller is expected to provide
+        the outer scrollable Div (with ``overflowY:auto`` + the rest of
+        the panel styling) so that re-rendering this method's output
+        replaces only the *inner* table — Dash patches children in
+        place rather than recreating the DOM node, which preserves the
+        user's scroll position across the ``dcc.Interval`` cadence.
+        """
+        rows = []
+        for key in sorted(self._streams.keys()):
+            s = self._streams[key]
+            peer_color = self._peer_colors.get(s.peer_name, "#888")
+            opacity = "1.0" if s.active else "0.4"
+            strike = "line-through" if not s.active else "none"
+            rows.append(html.Tr(
+                style={"opacity": opacity, "textDecoration": strike},
+                children=[
+                    html.Td(s.peer_name, style={"color": peer_color}),
+                    html.Td(s.data_type),
+                    html.Td(f"{s.last_value:.1f} {s.unit}",
+                            style={"textAlign": "right"}),
+                    html.Td(s.rate_str, style={"textAlign": "right"}),
+                    html.Td(f"{s.avg_quality:.0%}",
+                            style={"textAlign": "center",
+                                   "color": s.quality_color}),
+                ],
+            ))
+        header = html.Tr(
+            style={"color": "#94A3B8", "fontSize": "10px",
+                   "borderBottom": "1px solid #334155"},
+            children=[
+                html.Th("Peer",    style={"textAlign": "left"}),
+                html.Th("Type",    style={"textAlign": "left"}),
+                html.Th("Latest",  style={"textAlign": "right"}),
+                html.Th("Count",   style={"textAlign": "right"}),
+                html.Th("Quality", style={"textAlign": "center"}),
+            ],
+        )
+        return [
+            html.Div(f"Active Streams: {self.active_count}",
+                     style={"color": "#94A3B8", "fontSize": "10px",
+                            "marginBottom": "4px"}),
+            html.Table(
+                style={"width": "100%", "borderCollapse": "collapse"},
+                children=[html.Tbody([header] + rows)],
+            ),
+        ]
 
     def to_html(self, height: str = "250px") -> str:
         """Render as a scrollable HTML table."""

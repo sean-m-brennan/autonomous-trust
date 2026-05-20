@@ -31,7 +31,11 @@ class LiveData(object, metaclass=ClassEnumMeta):
 
     @classmethod
     def run_data_handlers(cls, graph, which, data):
-        # FIXME read node data. add to self.G.nodes
+        # Feature not yet implemented: all four LiveData branches
+        # below are stubs. Each should read `data` into `graph.G`
+        # (peers as nodes, reputation/latencies as edge attributes,
+        # commands as event annotations). Until then the live-graph
+        # view shows the static initial topology only.
         if which == cls.peers:
             pass
         elif which == cls.reputation:

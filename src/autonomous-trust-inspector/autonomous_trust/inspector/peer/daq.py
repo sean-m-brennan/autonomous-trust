@@ -154,15 +154,28 @@ class Cohort(CohortInterface):
         pass
 
     def acquire_data(self):
-        # TODO implement live data acquisition from peer queues
+        # Feature gap (open): implement live data acquisition by
+        # draining each peer's data queue (allocated from
+        # self.queue_pool in update_group) into the matching
+        # PeerDataAcq. The warning log keeps the no-op visible at
+        # runtime; without this, downstream renderers stay empty.
         self.logger.warning('Cohort.acquire_data is not yet implemented; no live data will be collected')
 
     def update_group(self, group_ids: dict[str, Identity]):
+        # Known limitation (documented as deferred for security reasons):
+        # Each new peer consumes two pre-allocated queues from
+        # `self.queue_pool` rather than creating fresh ones. Spawning
+        # multiprocessing.Queue objects after the daemon parent has
+        # forked workers triggers Python's
+        # "Pickling an AuthenticationString object is disallowed for
+        # security reasons" — an intentional CPython mitigation that
+        # prevents cross-process credential leakage. The pool is sized
+        # to MAX_PEERS at startup; if a deployment exceeds it the right
+        # fix is enlarging the pool, not dynamic creation.
         for idx, uuid in enumerate(group_ids):
             if uuid not in self.peers:
                 self.peers[uuid] = PeerDataAcq(uuid, idx, group_ids[uuid], NullPeerData(), self,
                                                self.queue_pool.next(), self.queue_pool.next())
-                # FIXME dynamically creating queues is a problem: "Pickling an AuthenticationString object is disallowed for security reasons"
         to_remove = [uuid for uuid in self.peers if uuid not in group_ids]
         for uuid in to_remove:
             del self.peers[uuid]

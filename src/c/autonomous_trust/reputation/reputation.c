@@ -131,11 +131,29 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
         }
         else if (!tx->p2_set)
         {
+            /* Bilateral guard: a Transaction is intrinsically two-party.
+             * If the same peer is about to occupy both slots — almost
+             * always from a duplicate `committed` broadcast for the
+             * same paxos round — silently drop and skip the peer_map
+             * append. Without this, p2 = p1 = proposer, producing a
+             * self-transaction that CTFT's `p1==peer && p2==self`
+             * check then silently rejects. Mirrors Python
+             * Transaction.add at reputation.py:46-58. */
+            if (uuid_compare(tx->p1_uuid, peer_uuid) == 0)
+                return 0;
             uuid_copy(tx->p2_uuid, peer_uuid);
             tx->p2_score = score;
             tx->p2_set = true;
         }
-        /* Both slots already filled: ignore (shouldn't happen in normal flow) */
+        else
+        {
+            /* Both slots already filled: silently drop AND skip the
+             * peer_map append below. The previous fall-through
+             * appended a duplicate index to peer_map[peer_str] on
+             * every replayed/late message, inflating by_peer() counts
+             * and skewing downstream reputation math. */
+            return 0;
+        }
     }
 
     /* Update peer_map: add this index to the peer's list */

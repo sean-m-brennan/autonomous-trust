@@ -1,0 +1,15 @@
+{
+  "name": "sensor-3",
+  "agency": "Leave-Behind",
+  "kind": "ground-sensor",
+  "capabilities": [
+    "seismic",
+    "acoustic",
+    "perimeter"
+  ],
+  "position": {
+    "lat": 34.71996225,
+    "lon": -86.63826575,
+    "alt": 195.0
+  }
+}
