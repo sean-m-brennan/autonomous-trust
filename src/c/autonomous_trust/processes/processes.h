@@ -258,6 +258,18 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
 */
 int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
+/**
+ * @brief Broadcast a message to every queue in the directory except the
+ *  caller's own. Mirrors Python's `Process.update` queue-broadcast loop
+ *  (processes.py:195-218) — including the per-queue full-error logging
+ *  and probe-on-failure instrumentation.
+ *
+ *  @return number of queues the send succeeded on; negative on
+ *  argument error.
+ */
+int process_update(const process_t *proc, directory_t *queues,
+                   generic_msg_t *msg);
+
 /*@
   requires proc == \null || \valid(proc);
   frees proc;

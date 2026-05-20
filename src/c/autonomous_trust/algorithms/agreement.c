@@ -160,13 +160,51 @@ static void _authority_prep_vote(agreement_protocol_t *proto)
     (void)proto;
 }
 
+/* AUTHORITY_THRESHOLD_DERIVE lives in agreement.h so callers outside
+ * this TU can ask for the derived behavior by name rather than passing
+ * a magic -1. */
+
+/* qsort comparator for sort-descending of int. */
+static int _int_desc_cmp(const void *a, const void *b)
+{
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    return (ia < ib) ? 1 : (ia > ib) ? -1 : 0;
+}
+
+/* Derive the effective threshold rank. If an explicit non-negative
+ * threshold was supplied at create-time, use it verbatim; otherwise
+ * compute the top-1/3 cutoff over the current voter set. Mirrors
+ * Python's authority.py:31-39 — sort ranks descending, take
+ * ranks[max(1, len//3) - 1]. Empty voter set degrades to 0. */
+static int _authority_effective_threshold(const agreement_protocol_t *proto)
+{
+    if (proto->state.authority.threshold_rank >= 0)
+        return proto->state.authority.threshold_rank;
+    int n = proto->voter_count;
+    if (n <= 0)
+        return 0;
+    /* Stack copy of voter ranks. voter_count is bounded by the size of
+     * the peers list, which is small at runtime. */
+    int *ranks = (int *)malloc(sizeof(int) * (size_t)n);
+    if (ranks == NULL)
+        return 0;
+    for (int i = 0; i < n; i++)
+        ranks[i] = proto->voters[i].rank;
+    qsort(ranks, (size_t)n, sizeof(int), _int_desc_cmp);
+    int cutoff_idx = (n / 3 > 1) ? (n / 3) : 1;
+    int result = ranks[cutoff_idx - 1];
+    free(ranks);
+    return result;
+}
+
 static void _authority_count_vote(agreement_protocol_t *proto, merkle_blob_t *blob,
                                   agreement_proof_t *proof, agreement_voter_t *voter,
                                   int *rank_out, bool *approval_out)
 {
     (void)blob;
     *rank_out = voter->rank;
-    if (voter->rank >= proto->state.authority.threshold_rank)
+    if (voter->rank >= _authority_effective_threshold(proto))
         *approval_out = proof->approval;
     else
         *approval_out = false;
@@ -174,6 +212,14 @@ static void _authority_count_vote(agreement_protocol_t *proto, merkle_blob_t *bl
 
 static bool _authority_accumulate(agreement_protocol_t *proto, int *ranks, bool *approvals, int count)
 {
+    /* Python authority.py:54-55 short-circuits on empty voter set to
+     * `return False` via the `if not self.voters` guard above the dict
+     * lookup. The audit (divergence.md M15) called out a "Python returns
+     * 0 from the threshold property, C returns false" mechanical
+     * difference — the OUTCOME is identical (no approval) because no
+     * vote has a rank >= 0 when there are no voters. Documented here so
+     * a future reader doesn't try to "harmonize" by switching to a
+     * sentinel. */
     int leader_rank = -1;
     for (int i = 0; i < proto->voter_count; i++)
     {
@@ -217,6 +263,12 @@ static void _stake_count_vote(agreement_protocol_t *proto, merkle_blob_t *blob,
         proto->state.stake.yea += stake;
     else
         proto->state.stake.nay += stake;
+    /* Python's _count_vote returns None (stake.py:35-40) because stake
+     * decides via yea/nay accumulators rather than the votes list. The
+     * C signature uses out-params for uniformity with the authority/
+     * work variants; the rank/approval values are written for shape
+     * compatibility but never consulted by _stake_accumulate, which
+     * decides purely on yea > nay. Audit ref divergence.md M14. */
     *rank_out = voter->rank;
     *approval_out = proof->approval;
 }

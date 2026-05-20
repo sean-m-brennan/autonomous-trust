@@ -111,6 +111,17 @@ typedef struct net_transport_s {
     const char *name;
 
     /**
+     * @brief Address family this transport operates on.
+     *
+     * Mirrors Python's per-transport `net_proto` class attribute
+     * (network/udp.py:29, tcp.py:46). Consumed at config-generation time
+     * by `generate_identity` to pick the right address out of the
+     * `net_iface_t` snapshot (IPv4 vs IPv6 vs MAC). Transports must
+     * set this to a non-NONE value at definition time.
+     */
+    network_protocol_t net_proto;
+
+    /**
      * @brief Bind/open any sockets or endpoints needed for the three channels.
      *
      * The returned @p *out_ctx is opaque; the orchestrator passes it back

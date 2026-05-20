@@ -1,0 +1,111 @@
+#!/bin/bash
+# Validate-and-retry wrapper for ar / ranlib.
+#
+# Companion to cmake/cc-validate-output. Same root cause (virtiofs page-cache
+# reconciliation), different victim: when ar/ranlib writes a static archive
+# through virtiofs, the on-disk file is sometimes truncated at a page boundary
+# (observed: exactly 65536 bytes). The truncation drops most archive members
+# silently, ar's symbol index reflects only the surviving members, and later
+# links fail with "undefined reference" on symbols that should have been
+# present.
+#
+# Invocation:
+#   ar-validate-output ar     <ar-binary>     <ar-args...>
+#   ar-validate-output ranlib <ranlib-binary> <archive>
+#
+# In "ar" mode the wrapper counts the .o file arguments to know the expected
+# member count, runs ar, then verifies that `ar t` lists at least that many
+# members and that the file size is plausibly larger than a single page when
+# many objects were requested. On a short read or truncated archive it
+# removes the archive (so the next attempt's `ar qc` rebuilds from scratch
+# rather than appending duplicates) and retries.
+#
+# In "ranlib" mode it runs ranlib, then re-checks `ar t` to confirm the
+# archive is still readable. ranlib rewrites the symbol index in place, and
+# the same truncation hazard applies; on detection we delete the archive
+# and exit non-zero so make reruns the whole CREATE+FINISH sequence.
+#
+# Bounded retry; matches cc-validate-output's max=10 for the same reason
+# (cascades of 3-5 bad writes have been seen, with one observation needing
+# 6+ before a clean write landed).
+
+set -u
+
+mode="${1:-}"
+shift || true
+
+if [ "$mode" != "ar" ] && [ "$mode" != "ranlib" ]; then
+    echo "ar-validate-output: unknown mode '$mode' (expected ar|ranlib)" >&2
+    exit 2
+fi
+
+# First non-flag arg is the tool binary; everything else is forwarded to it.
+tool="${1:-}"
+shift || true
+
+# Locate the archive path (first *.a arg) and, for ar mode, count object args.
+archive=""
+expected_objs=0
+for a in "$@"; do
+    case "$a" in
+        *.a)
+            if [ -z "$archive" ]; then
+                archive="$a"
+            fi
+            ;;
+        *.o|*.obj)
+            if [ "$mode" = "ar" ]; then
+                expected_objs=$((expected_objs + 1))
+            fi
+            ;;
+    esac
+done
+
+validate() {
+    [ -n "$archive" ] || return 0
+    [ -f "$archive" ] || { echo "missing"; return 1; }
+
+    local listing
+    if ! listing=$(/usr/bin/ar t "$archive" 2>&1); then
+        echo "unreadable: $listing"
+        return 1
+    fi
+    local actual
+    actual=$(printf '%s\n' "$listing" | grep -c '\.o$' || true)
+
+    if [ "$mode" = "ar" ] && [ "$expected_objs" -gt 0 ]; then
+        if [ "$actual" -lt "$expected_objs" ]; then
+            echo "short: $actual of $expected_objs members"
+            return 1
+        fi
+    elif [ "$actual" -le 0 ]; then
+        echo "empty"
+        return 1
+    fi
+    return 0
+}
+
+attempt=0
+max=10
+while [ $attempt -lt $max ]; do
+    "$tool" "$@"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        exit $rc
+    fi
+
+    why=$(validate)
+    if [ -z "$why" ]; then
+        exit 0
+    fi
+
+    attempt=$((attempt + 1))
+    echo "ar-validate-output: ${mode} on $archive failed validation ($why); attempt $attempt" >&2
+    # Delete the archive so the next ar qc rebuilds from scratch instead of
+    # appending to a corrupt prefix. For ranlib this also forces make to
+    # re-run the CREATE step.
+    rm -f "$archive"
+done
+
+echo "ar-validate-output: gave up after $max attempts on $archive" >&2
+exit 1

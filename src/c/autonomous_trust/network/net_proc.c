@@ -39,10 +39,12 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
 #include "utilities/logger.h"
+#include "utilities/probes.h"
 #include "network/network.h"
 #include "network/net_message.h"
 #include "network/net_transport.h"
 #include "network/net_proc_priv.h"
+#include "network/ping.h"
 #ifdef AT_NET_ENVELOPE
 #include "network/net_envelope.h"
 #endif
@@ -57,6 +59,11 @@
 
 DEFINE_ERROR(ENET_SEND, "Network send failed");
 DEFINE_ERROR(ENET_RECV, "Network receive failed");
+
+/* Protocol-string definitions (declared `extern char[]` in network.h). */
+char NET_FN_STATS_REQ[]  = "stats_req";
+char NET_FN_STATS_RESP[] = "stats_resp";
+char NET_FN_PING[]       = "ping";
 
 static const int RECV_POLL_TIMEOUT_MS = 100;
 
@@ -99,6 +106,66 @@ static void blacklist_address(const char *address)
         rejected_count++;
     }
     pthread_mutex_unlock(&rejected_lock);
+}
+
+/****************************
+ * Per-peer "pest" counter (divergence.md M13)
+ *
+ * Tracks repeated misbehavior (failed decryption, malformed wire) from
+ * a known sender. Once a peer's count exceeds NET_ANNOY_LIMIT it is
+ * added to the rejection list so subsequent traffic is dropped before
+ * any further processing. Mirrors Python NetworkProcess.pests +
+ * annoy_limit (netprocess.py:307-312).
+ ****************************/
+
+#define MAX_PESTS DEFAULT_MAX_PEERS
+typedef struct {
+    char  address[ADDR_LEN + 1];
+    int   count;
+} peer_pest_t;
+
+static peer_pest_t   peer_pests[MAX_PESTS];
+static size_t        pest_count = 0;
+static pthread_mutex_t pest_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Increment the annoy counter for @p address; promote to the rejection
+ * list (and clear the counter slot) once the count exceeds
+ * NET_ANNOY_LIMIT. Safe to call with an empty/NULL address — it's a
+ * no-op then. */
+static void pest_track_annoy(const char *address)
+{
+    if (address == NULL || address[0] == '\0') return;
+    pthread_mutex_lock(&pest_lock);
+    size_t slot = pest_count;  /* default: append if not found */
+    for (size_t i = 0; i < pest_count; i++) {
+        if (strcmp(peer_pests[i].address, address) == 0) {
+            slot = i;
+            break;
+        }
+    }
+    int new_count = 0;
+    bool over_limit = false;
+    if (slot < pest_count) {
+        peer_pests[slot].count++;
+        new_count = peer_pests[slot].count;
+    } else if (pest_count < MAX_PESTS) {
+        slot = pest_count;
+        snprintf(peer_pests[slot].address, sizeof(peer_pests[slot].address),
+                 "%s", address);
+        peer_pests[slot].count = 1;
+        new_count = 1;
+        pest_count++;
+    }
+    over_limit = (new_count > NET_ANNOY_LIMIT);
+    if (over_limit) {
+        /* compact slot out of the array */
+        for (size_t i = slot; i + 1 < pest_count; i++)
+            peer_pests[i] = peer_pests[i + 1];
+        pest_count--;
+    }
+    pthread_mutex_unlock(&pest_lock);
+    if (over_limit)
+        blacklist_address(address);
 }
 
 /****************************
@@ -339,6 +406,13 @@ static int decrypt_message(const identity_t *myself, const public_identity_t *pe
  ****************************/
 
 /* Frama-C: skipped — [alloc-pattern] route_to_process: at_memcpy + strdup + messaging_send. */
+/* stats_req / ping interception (divergence.md H7, H8) does NOT live here —
+ * it lives in the outbound queue drain at the end of net_process_run(),
+ * mirroring Python netprocess.py:501-528 which intercepts on the OUTBOUND
+ * path (after the local process puts the request into the network process's
+ * own queue). A remote peer's stats_req routes through route_to_process →
+ * messaging_send("network", ...) → outbound drain, so a single intercept
+ * site there handles both local and remote requesters. */
 static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
                             directory_t *queues, logger_t *logger)
 {
@@ -363,6 +437,10 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
     gmsg.info.net_msg.len = wmsg->data_len;
     memcpy(&gmsg.info.net_msg.from_whom, &wmsg->from_whom, sizeof(public_identity_t));
     gmsg.info.net_msg.encrypt = wmsg->encrypt;
+    /* Carry trace_id across the IPC hop so probes_trace_msg in the
+     * downstream process stays correlated with the wire side. */
+    memcpy(gmsg.info.net_msg.trace_id, wmsg->trace_id,
+           sizeof(gmsg.info.net_msg.trace_id));
 
     int ret = messaging_send(wmsg->process, NET_MESSAGE, &gmsg, false);
     if (ret != 0) {
@@ -547,6 +625,163 @@ static int envelope_forward(const net_envelope_t *env_in,
 }
 #endif /* AT_NET_ENVELOPE */
 
+/* Forward declaration; defined immediately below this section. */
+static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *msg,
+                                const net_transport_t *transport,
+                                net_transport_ctx_t *ctx,
+                                int port, logger_t *logger);
+
+/****************************
+ * stats_req / ping outbound interception (divergence.md H7, H8)
+ *
+ * Mirrors Python netprocess.py:501-528. The local outbound drain
+ * checks `process==network` plus a function selector and either
+ * (H7) synthesizes a stats_resp pointed back at from_whom, or
+ * (H8) dispatches a worker thread that runs the blocking ping()
+ * RFC5905-style synchronous loop and posts a stats Message back
+ * into the requester's queue via return_to.
+ ****************************/
+
+/* Serialize peer_stats[] as a JSON object keyed by address. C tracks
+ * cumulative bytes + error counts (not bps like Python — no timestamp
+ * series), so the value is an array `[bytes_sent, bytes_recv,
+ * send_errors, recv_errors]`. Returns a heap-allocated NUL-terminated
+ * byte buffer (caller frees). Returns NULL on allocation failure. */
+static uint8_t *peer_stats_to_json_bytes(size_t *out_len)
+{
+    json_t *root = json_object();
+    if (root == NULL) return NULL;
+    for (size_t i = 0; i < stats_count; i++) {
+        json_t *arr = json_array();
+        if (arr == NULL) { json_decref(root); return NULL; }
+        json_array_append_new(arr, json_integer((json_int_t)peer_stats[i].bytes_sent));
+        json_array_append_new(arr, json_integer((json_int_t)peer_stats[i].bytes_recv));
+        json_array_append_new(arr, json_integer((json_int_t)peer_stats[i].send_errors));
+        json_array_append_new(arr, json_integer((json_int_t)peer_stats[i].recv_errors));
+        json_object_set_new(root, peer_stats[i].address, arr);
+    }
+    char *s = json_dumps(root, JSON_COMPACT);
+    json_decref(root);
+    if (s == NULL) return NULL;
+    *out_len = strlen(s);
+    return (uint8_t *)s;
+}
+
+/* Worker arguments for the async ping dispatch. Owned by the worker;
+ * the worker frees this after posting the result (or on error). */
+typedef struct {
+    char     target_addr[ADDR_LEN + 1];
+    int      count;
+    char     return_to[PROC_NAME_LEN + 1];
+    logger_t *logger;
+} ping_worker_args_t;
+
+static void *ping_worker_thread(void *arg)
+{
+    ping_worker_args_t *args = (ping_worker_args_t *)arg;
+    ping_stats_t stats = {0};
+    int rc = ping(args->target_addr, args->count, &stats);
+    if (rc != 0) {
+        log_warn(args->logger, "Ping (async) to %s failed (rc=%d)\n",
+                 args->target_addr, rc);
+        free(args);
+        return NULL;
+    }
+    /* Serialize the ping_stats_t as JSON. Mirror Python's ping result
+     * shape loosely — sender treats obj as opaque bytes here. */
+    json_t *jr = json_object();
+    if (jr == NULL) { free(args); return NULL; }
+    json_object_set_new(jr, "host", json_string(stats.host));
+    json_object_set_new(jr, "sent", json_integer(stats.sent));
+    json_object_set_new(jr, "received", json_integer(stats.received));
+    json_object_set_new(jr, "min_rtt", json_real(stats.min_rtt));
+    json_object_set_new(jr, "max_rtt", json_real(stats.max_rtt));
+    json_object_set_new(jr, "avg_rtt", json_real(stats.avg_rtt));
+    json_object_set_new(jr, "loss", json_real(stats.loss));
+    char *body = json_dumps(jr, JSON_COMPACT);
+    json_decref(jr);
+    if (body == NULL) { free(args); return NULL; }
+    size_t body_len = strlen(body);
+
+    generic_msg_t gmsg = {0};
+    gmsg.type = NET_MESSAGE;
+    snprintf(gmsg.info.net_msg.process, sizeof(gmsg.info.net_msg.process), "network");
+    gmsg.info.net_msg.function = strdup(NET_FN_PING);
+    gmsg.info.net_msg.obj = (uint8_t *)body;
+    gmsg.info.net_msg.len = body_len;
+    gmsg.info.net_msg.encrypt = false;
+    if (messaging_send(args->return_to, NET_MESSAGE, &gmsg, false) != 0) {
+        log_warn(args->logger, "Ping (async): failed to post result to '%s'\n",
+                 args->return_to);
+    }
+    if (gmsg.info.net_msg.function != NULL) free(gmsg.info.net_msg.function);
+    free(body);
+    free(args);
+    return NULL;
+}
+
+/* Dispatch a detached worker. Returns 0 on dispatch, non-zero if the
+ * thread couldn't be started (caller logs). */
+static int dispatch_ping_async(const char *target_addr, int count,
+                               const char *return_to, logger_t *logger)
+{
+    ping_worker_args_t *args = calloc(1, sizeof(*args));
+    if (args == NULL) return SYS_EXCEPTION();
+    snprintf(args->target_addr, sizeof(args->target_addr), "%s", target_addr);
+    args->count = count > 0 ? count : PING_COUNT;
+    snprintf(args->return_to, sizeof(args->return_to), "%s", return_to);
+    args->logger = logger;
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int rc = pthread_create(&tid, &attr, ping_worker_thread, args);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        free(args);
+        return rc;
+    }
+    return 0;
+}
+
+/* Handle a stats_req intercepted on the outbound drain. Sends a
+ * stats_resp wire message back to the requester via the same transport
+ * the outbound drain would have used. Returns 0 on dispatch (caller
+ * skips net_encrypt_and_send for this message). */
+static int handle_outbound_stats_req(const net_msg_t *nmsg,
+                                     const identity_t *myself,
+                                     const net_transport_t *transport,
+                                     net_transport_ctx_t *tctx,
+                                     int port, logger_t *logger)
+{
+    size_t body_len = 0;
+    uint8_t *body = peer_stats_to_json_bytes(&body_len);
+    if (body == NULL) return SYS_EXCEPTION();
+
+    net_wire_msg_t resp = {0};
+    snprintf(resp.process, sizeof(resp.process), "network");
+    resp.function = strdup(NET_FN_STATS_RESP);
+    resp.data     = body;
+    resp.data_len = body_len;
+    resp.encrypt  = nmsg->encrypt;
+    /* The requester rides on from_whom (preserved by route_to_process
+     * from the inbound wire message). Reply unicast to that peer. */
+    resp.to_whom.type = RECIPIENT_PEER;
+    memcpy(&resp.to_whom.target.peer, &nmsg->from_whom, sizeof(public_identity_t));
+
+    int rc = net_encrypt_and_send(myself, &resp, transport, tctx, port, logger);
+    if (rc != 0)
+        log_error(logger, "Network: stats_resp send to %s failed\n",
+                  nmsg->from_whom.address);
+    else
+        log_debug(logger, "Network: replied stats_resp to %s\n",
+                  nmsg->from_whom.address);
+
+    if (resp.function != NULL) free(resp.function);
+    free(body);
+    return 0;
+}
+
 /****************************
  * Encrypt + send (transport-agnostic)
  ****************************/
@@ -689,6 +924,16 @@ static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *
  * net_proc_priv.h so tests can drive them directly without bringing up
  * real sockets or daemonize()'d processes. The thread loop owns the
  * recv-buffer lifetime — it frees @c buf after the handler returns.
+ *
+ * Fairness (divergence.md H9, Python INBOUND_BUDGET=32): C parallelizes
+ * the three logical channels (peer / broadcast / group) across distinct
+ * OS threads, each blocking in recv() with RECV_POLL_TIMEOUT_MS=100ms.
+ * One channel's traffic cannot starve another's because they have no
+ * shared drain loop or shared work queue; OS scheduling provides the
+ * fairness invariant that Python's single-event-loop drain has to
+ * enforce manually with a per-iter cap. NET_INBOUND_BUDGET stays in
+ * network.h as a documentation hook (cross-references Python's audit
+ * site) but no C code path consumes it.
  ****************************/
 
 /* Return the local address string for comparing to the packet sender. */
@@ -744,13 +989,22 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
                                   &plain, &plain_len);
         if (dec == 0) {
             net_wire_msg_t wmsg;
-            if (net_message_from_wire(plain, plain_len, peer, &wmsg) == 0)
+            if (net_message_from_wire(plain, plain_len, peer, &wmsg) == 0) {
                 route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+            } else {
+                /* Decrypted successfully but the inner wire is malformed —
+                 * still annoy-worthy from a known peer. */
+                pest_track_annoy(from_addr);
+            }
             free(plain);
             net_wire_msg_free(&wmsg);
         } else {
             log_error(ctx->logger, "Network: decrypt failed (%d) from peer %s\n",
                       dec, from_addr);
+            /* Mirror Python netprocess.py:307-312 pest tracking. Each
+             * undecryptable frame from a known peer adds one annoy
+             * point; over NET_ANNOY_LIMIT triggers blacklist. */
+            pest_track_annoy(from_addr);
         }
     } else {
         /* Try as unencrypted (e.g. access_granted to unknown peer) */
@@ -1200,12 +1454,41 @@ static int network_run(const net_transport_t *transport,
         if (buf.type == NET_MESSAGE) {
             net_msg_t *nmsg = &buf.info.net_msg;
 
+            /* H7/H8 intercept: messages addressed to "network" with a
+             * stats_req / ping selector never leave on the wire as-is.
+             * stats_req synthesizes a stats_resp reply back to from_whom;
+             * ping spawns a worker that posts the result into return_to.
+             * See divergence.md H7, H8 and Python netprocess.py:501-528. */
+            if (nmsg->function != NULL &&
+                strcmp(nmsg->process, "network") == 0) {
+                if (strcmp(nmsg->function, NET_FN_STATS_REQ) == 0) {
+                    handle_outbound_stats_req(nmsg, myself, transport, tctx,
+                                              port_num, logger);
+                    continue;
+                }
+                if (strcmp(nmsg->function, NET_FN_PING) == 0) {
+                    int count = PING_COUNT;
+                    if (nmsg->obj != NULL && nmsg->len == sizeof(int))
+                        count = *(const int *)nmsg->obj;
+                    const char *ret_q = nmsg->return_to[0] != '\0'
+                                         ? nmsg->return_to : "network";
+                    if (dispatch_ping_async(nmsg->to_whom.address, count,
+                                            ret_q, logger) != 0)
+                        log_warn(logger, "Network: ping dispatch failed for %s\n",
+                                 nmsg->to_whom.address);
+                    continue;
+                }
+            }
+
             net_wire_msg_t wmsg = {0};
             snprintf(wmsg.process, sizeof(wmsg.process), "%s", nmsg->process);
             wmsg.function = nmsg->function;
             wmsg.data     = nmsg->obj;
             wmsg.data_len = nmsg->len;
             wmsg.encrypt  = nmsg->encrypt;
+            /* Forward trace_id if the sibling process set one; an empty
+             * string causes net_message_to_wire to mint a fresh id. */
+            memcpy(wmsg.trace_id, nmsg->trace_id, sizeof(wmsg.trace_id));
 
             /* Stamp from_whom with our identity so unencrypted-to-unknown-peer
              * messages carry full identity (UUID, name, keys). */
@@ -1238,6 +1521,16 @@ static int network_run(const net_transport_t *transport,
                 log_info(logger, "Network: sent %s.%s to %s\n",
                          nmsg->process, nmsg->function,
                          is_broadcast ? bcast_addr : nmsg->to_whom.address);
+                /* Mirrors Python netprocess.py:495 outbound-routed trace.
+                 * The wire-side trace_id is in wmsg (possibly minted by
+                 * net_message_to_wire when nmsg's was empty) — read from
+                 * there so the trace event reflects what actually went
+                 * onto the wire. */
+                probes_trace_msg(wmsg.trace_id, nmsg->process, nmsg->function,
+                                 "outbound_routed",
+                                 "to_addr",
+                                 is_broadcast ? bcast_addr : nmsg->to_whom.address,
+                                 NULL);
             }
         }
         else if (buf.type == PEER) {

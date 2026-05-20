@@ -35,6 +35,7 @@ extern "C" {
 
 #define DAG_UUID_LEN 37
 #define DAG_MAIN_BRANCH "main"
+#define DAG_ALL_BRANCHES "all"
 
 typedef struct linked_step_s linked_step_t;
 
@@ -71,10 +72,29 @@ extern const linked_step_t dag_genesis;
       s->uuid[DAG_UUID_LEN - 1] == '\0';
 */
 
-typedef struct {
+typedef struct step_dag_s step_dag_t;
+
+/**
+ * @brief Per-DAG branch validation hook (parity with Python
+ *        `StepDAG._validate`, dag.py:283-285).
+ *
+ * Invoked by `dag_catch_up` after a foreign branch is ingested and
+ * before it is merged into the target. Implementations decide what
+ * "valid" means for the payload domain (e.g. timestamp monotonicity
+ * for `IdentityHistory`, dag.py history.py:155-168). A NULL hook is
+ * treated as "always valid", matching the Python abstract-base
+ * default of subclasses opting in.
+ *
+ * @return true to allow the merge, false to leave the branch unmerged.
+ */
+typedef bool (*dag_validate_fn)(step_dag_t *dag, const char *branch, void *ctx);
+
+struct step_dag_s {
     map_t *heads;          /* branch_name -> linked_step_t* (as object_ptr_data) */
     map_t *branch_lists;   /* branch_name -> array_t* of linked_step_t* */
-} step_dag_t;
+    dag_validate_fn validate_fn;  /* NULL => always-valid (Python ABC default) */
+    void *validate_ctx;           /* opaque, passed to validate_fn */
+};
 
 /*@ predicate valid_dag{L}(step_dag_t *d) =
       d != \null && \valid(d) &&
@@ -102,6 +122,20 @@ typedef struct {
   disjoint behaviors;
 */
 int linked_step_create(const char *uuid, void *payload, linked_step_t **step);
+
+/**
+ * @brief Recompute @p step->length by walking the parent chain.
+ *
+ * The C representation caches `length` at insert time. Python's
+ * `LinkedStep._length` recomputes on demand from the parent chain
+ * (dag.py:74-76). If a step has been reparented (e.g. a branch merge
+ * moved it under a different ancestor), the cached length is stale.
+ * Call this helper after any parent-mutation to bring it back into
+ * line. Stops at NULL or the genesis sentinel.
+ *
+ * @return new length, or -1 if @p step is NULL.
+ */
+int linked_step_recompute_length(linked_step_t *step);
 
 /**
  * @brief Free a linked step (does not free genesis).
@@ -291,6 +325,61 @@ int dag_fork(step_dag_t *dag, const char *branch, linked_step_t **head_out);
   disjoint behaviors;
 */
 int dag_recite(step_dag_t *dag, const char *branch, linked_step_t *root, array_t **steps_out);
+
+/**
+ * @brief M8 — snapshot all branch heads (parity with Python
+ *        `StepDAG.fork(head=all_branches)`, dag.py:254-261).
+ *
+ * Allocates a map of branch_name → linked_step_t* covering every
+ * branch currently in the DAG. The step pointers refer to the DAG's
+ * live nodes — they are NOT deep-copied, so the caller must not
+ * outlive the DAG. (Python's deepcopy semantics aren't preserved
+ * because no current call site needs them and a deep clone would
+ * require walking the parent chain of every head.)
+ *
+ * Caller owns @p heads_out and frees it via `map_free`.
+ *
+ * @return 0 on success, EINVAL on bad args, ENOMEM on alloc failure.
+ */
+int dag_fork_all(step_dag_t *dag, map_t **heads_out);
+
+/**
+ * @brief Install a per-DAG validation hook (C13).
+ *
+ * The hook is consulted by `dag_catch_up` before merging an ingested
+ * foreign branch. Pass NULL @p fn to clear an installed hook. The
+ * @p ctx pointer is opaque to the DAG and is passed verbatim to the
+ * validator on each invocation.
+ */
+void dag_set_validator(step_dag_t *dag, dag_validate_fn fn, void *ctx);
+
+/**
+ * @brief Incorporate an external branch (C12, parity with Python
+ *        `StepDAG.catch_up`, dag.py:287-297).
+ *
+ * Sequence: `dag_ingest_branch` the inbound steps into a freshly
+ * named branch, then `dag_diff` against main to locate the common
+ * root, then `dag_recite` from that root to populate @p diff_out
+ * with the divergent steps, then run the installed validator (if
+ * any), and finally `dag_merge` on success.
+ *
+ * On validation failure the temporary branch is left in the DAG
+ * but not merged (mirrors Python). @p diff_out is populated either
+ * way so callers can inspect the divergence even if the merge was
+ * vetoed; pass NULL if not needed.
+ *
+ * @param dag         destination DAG.
+ * @param steps       head-to-root step list (same layout as
+ *                    `dag_ingest_branch`).
+ * @param count       number of entries in @p steps; must be > 0.
+ * @param diff_out    optional out parameter; receives an
+ *                    allocated `array_t*` of `linked_step_t*` in
+ *                    head-first order, owned by the caller.
+ * @return 0 on success (whether or not the validator allowed the
+ *         merge), non-zero on ingest/diff/recite failure.
+ */
+int dag_catch_up(step_dag_t *dag, linked_step_t **steps, size_t count,
+                 array_t **diff_out);
 
 /**
  * @brief Free all DAG resources (maps for heads and branch_lists).
