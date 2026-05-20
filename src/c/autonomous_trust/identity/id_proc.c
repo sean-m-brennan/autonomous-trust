@@ -18,8 +18,10 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sodium.h>
 
 #include "processes/processes.h"
 #include "structures/map.h"
@@ -63,6 +65,18 @@ static char ID_CAPS_RESPONSE[] = "peer_caps_response";
  * 2-element JSON array `[peer_uuid_str, new_rank_int]`. Mirrors
  * Python IdentityProtocol.rank_update (idprocess.py:139 / protocol.py:78). */
 static char ID_RANK[]        = "rank_update";
+/* Group partition recovery (doc/architecture/partition-recovery.md).
+ *   ID_PARTITION_SIGNAL: local-only IPC from NetProcess when group-channel
+ *                        traffic is rejected (no wire egress). Payload is
+ *                        the from_addr string.
+ *   ID_PARTITION_PROBE / ID_PARTITION_RESPONSE: wire-facing, sent on the
+ *                        unsecured-broadcast channel. Encrypt=false in
+ *                        the outbound Message; receivers verify the
+ *                        embedded identity signature themselves.
+ * Mirrors Python IdentityProtocol.partition_{signal,probe,response}. */
+static char ID_PARTITION_SIGNAL[]   = "partition_signal";
+static char ID_PARTITION_PROBE[]    = "group_partition_probe";
+static char ID_PARTITION_RESPONSE[] = "group_partition_response";
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -120,6 +134,24 @@ static struct {
      * call the matching `identity_history_by_*_create`. NULL until
      * first use. */
     identity_history_t *history;
+    /* Group partition recovery state (doc/architecture/partition-recovery.md).
+     * Mirrors Python's idprocess.py:_partition_probe_cooldown /
+     * _partition_response_cooldown / _partition_recovery_in_progress.
+     *   partition_probe_cooldown:   key=from_addr string,
+     *                                val=int64_t epoch_us (CLOCK_MONOTONIC)
+     *   partition_response_cooldown: key=probing peer uuid hex,
+     *                                val=int64_t epoch_us
+     *   partition_recovery_target:   the foreign group_uuid we asked
+     *                                request_access from; empty when no
+     *                                recovery is in flight.
+     *   partition_recovery_started_us: monotonic-epoch timestamp; 0 when
+     *                                no recovery is in flight. The 15s
+     *                                lockout window is enforced
+     *                                independently in the handlers. */
+    map_t partition_probe_cooldown;
+    map_t partition_response_cooldown;
+    char partition_recovery_target[64];
+    int64_t partition_recovery_started_us;
 } id_state;
 
 static void _ensure_id_init(void)
@@ -132,6 +164,10 @@ static void _ensure_id_init(void)
         map_init(&id_state.own_caps_by_proc);
         map_init(&id_state.peer_caps_map);
         map_init(&id_state.peer_ranks);
+        map_init(&id_state.partition_probe_cooldown);
+        map_init(&id_state.partition_response_cooldown);
+        id_state.partition_recovery_target[0] = '\0';
+        id_state.partition_recovery_started_us = 0;
         id_state.self_rank = 0;
         id_state.choosing_group = false;
         id_state.self_bootstrapped = false;
@@ -1583,6 +1619,12 @@ void identity_reset_state(void)
     map_init(&id_state.peer_caps_map);
     map_free(&id_state.peer_ranks);
     map_init(&id_state.peer_ranks);
+    map_free(&id_state.partition_probe_cooldown);
+    map_init(&id_state.partition_probe_cooldown);
+    map_free(&id_state.partition_response_cooldown);
+    map_init(&id_state.partition_response_cooldown);
+    id_state.partition_recovery_target[0] = '\0';
+    id_state.partition_recovery_started_us = 0;
     id_state.self_rank = 0;
     id_state.choosing_group = false;
     id_state.self_bootstrapped = false;
@@ -2202,6 +2244,46 @@ int identity_get_self_rank(void)
     return r;
 }
 
+size_t identity_get_partition_recovery_target(char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0) return 0;
+    if (!id_state.initialized) {
+        out[0] = '\0';
+        return 0;
+    }
+    pthread_mutex_lock(&id_state.lock);
+    size_t n = strnlen(id_state.partition_recovery_target,
+                       sizeof(id_state.partition_recovery_target));
+    if (n >= out_len) n = out_len - 1;
+    memcpy(out, id_state.partition_recovery_target, n);
+    out[n] = '\0';
+    pthread_mutex_unlock(&id_state.lock);
+    return n;
+}
+
+int identity_partition_canonical_probe(const char *group_uuid,
+                                       int group_size,
+                                       char *out, size_t out_len)
+{
+    if (group_uuid == NULL || out == NULL || out_len == 0) return -1;
+    int n = snprintf(out, out_len, "%s|%d", group_uuid, group_size);
+    if (n < 0 || (size_t)n >= out_len) return -1;
+    return n;
+}
+
+int identity_partition_canonical_response(const char *group_uuid,
+                                          int group_size,
+                                          const char *in_response_to,
+                                          char *out, size_t out_len)
+{
+    if (group_uuid == NULL || in_response_to == NULL
+        || out == NULL || out_len == 0) return -1;
+    int n = snprintf(out, out_len, "%s|%d|%s", group_uuid, group_size,
+                     in_response_to);
+    if (n < 0 || (size_t)n >= out_len) return -1;
+    return n;
+}
+
 /****************************
  * Pre-loop: acquire capabilities and announce
  ****************************/
@@ -2304,6 +2386,529 @@ static int _announce_identity(const process_t *proc, directory_t *queues)
  * public_identity_t structs (memcpy of struct→struct triggers WP "Hide sub-term
  * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
  */
+/****************************
+ * Partition recovery (doc/architecture/partition-recovery.md).
+ *
+ * Cross-impl parity notes (read first if touching either side):
+ *
+ * 1. The signature wire format is hex-encoded raw Ed25519
+ *    (`crypto_sign_detached` → 64 bytes → hexlify → 128 ASCII chars).
+ *    Python's `signed.signature` already produces this hex form via
+ *    nacl's HexEncoder; both sides put the same ASCII string in the
+ *    `signature` field of the JSON payload.
+ *
+ * 2. The canonical signature inputs MUST byte-match Python's
+ *    `IdentityProcess._partition_probe_canonical` /
+ *    `_partition_response_canonical`. Python format:
+ *      probe:    "{group_uuid}|{group_size}"           (no spaces)
+ *      response: "{group_uuid}|{group_size}|{in_response_to}"
+ *    Use `snprintf` with `"%s|%d"` / `"%s|%d|%s"` exactly.
+ *
+ * 3. Cooldown timestamps use `CLOCK_MONOTONIC` microseconds — not
+ *    wall-clock — so NTP / DST adjustments don't invalidate them.
+ *
+ * 4. The Python side accepts size-tie merges using lexicographic uuid
+ *    comparison (smaller uuid wins). C must use the same: `strcmp`
+ *    on the uuid hex strings.
+ ****************************/
+
+/* Cooldown window constants (seconds → microseconds for the map). */
+#define PARTITION_PROBE_COOLDOWN_US      (10LL * 1000LL * 1000LL)
+#define PARTITION_RESPONSE_COOLDOWN_US   (30LL * 1000LL * 1000LL)
+#define PARTITION_RECOVERY_TIMEOUT_US    (15LL * 1000LL * 1000LL)
+
+static int64_t _partition_now_us(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (int64_t)ts.tv_sec * 1000000LL + (int64_t)ts.tv_nsec / 1000LL;
+}
+
+/* Check cooldown map for `key`; return true (and update the stamp) if
+ * the call is permitted, false if still within `threshold_us`. Caller
+ * must hold id_state.lock. */
+static bool _partition_cooldown_check(map_t *cooldown_map, const char *key,
+                                      int64_t threshold_us)
+{
+    int64_t now_us = _partition_now_us();
+    data_t *prev = NULL;
+    if (map_get(cooldown_map, (map_key_t)key, &prev) == 0 && prev != NULL) {
+        int prev_int = 0;
+        /* We store seconds-truncated ints to fit the existing
+         * integer_data() helper; that gives ~2s granularity in the
+         * worst case, which is well below the 5s/10s/30s thresholds. */
+        if (data_integer(prev, &prev_int) == 0) {
+            int64_t prev_us = (int64_t)prev_int * 1000000LL;
+            if (now_us - prev_us < threshold_us)
+                return false;
+        }
+    }
+    char key_buf[128];
+    snprintf(key_buf, sizeof(key_buf), "%s", key);
+    data_t *now_dat = integer_data((int)(now_us / 1000000LL));
+    if (now_dat != NULL)
+        map_set(cooldown_map, key_buf, now_dat);
+    return true;
+}
+
+/* Returns true iff a recovery is currently in flight and not yet
+ * timed out. Auto-clears stale state. Caller must hold id_state.lock. */
+static bool _partition_recovery_active_locked(void)
+{
+    if (id_state.partition_recovery_target[0] == '\0')
+        return false;
+    int64_t now_us = _partition_now_us();
+    if (now_us - id_state.partition_recovery_started_us
+            >= PARTITION_RECOVERY_TIMEOUT_US) {
+        id_state.partition_recovery_target[0] = '\0';
+        id_state.partition_recovery_started_us = 0;
+        return false;
+    }
+    return true;
+}
+
+/* Resolve our local identity from proc->configs. Returns NULL on
+ * failure (which the handlers treat as bootstrap-incomplete and
+ * silently skip — same as Python's `self.identity is None` guard
+ * implicit in choose_group). */
+static const identity_t *_partition_self_identity(const process_t *proc)
+{
+    if (proc == NULL || proc->configs == NULL) return NULL;
+    data_t *id_dat = NULL;
+    char id_key[] = "identity";
+    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
+        return NULL;
+    config_t *id_cfg = NULL;
+    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL)
+        return NULL;
+    return (const identity_t *)id_cfg->data_struct;
+}
+
+/* Sign `canonical[0..clen)` with our identity's private key, write the
+ * hex-encoded 64-byte signature to `hex_out` (must be >= 129 bytes).
+ * Returns 0 on success, -1 on failure. */
+static int _partition_sign_hex(const identity_t *ident,
+                               const unsigned char *canonical, size_t clen,
+                               char hex_out[129])
+{
+    if (ident == NULL || canonical == NULL || hex_out == NULL) return -1;
+    unsigned char sig[crypto_sign_BYTES];
+    if (crypto_sign_detached(sig, NULL, canonical, clen,
+                             ident->signature.private) != 0)
+        return -1;
+    hexlify(sig, crypto_sign_BYTES, (unsigned char *)hex_out);
+    return 0;
+}
+
+/* Hex-decode `hex_in` (128 chars) into a 64-byte signature buffer and
+ * verify it against `canonical[0..clen)` using the embedded public
+ * signing key in `pub`. Returns 0 on valid signature, -1 otherwise. */
+static int _partition_verify_hex(const public_identity_t *pub,
+                                 const unsigned char *canonical, size_t clen,
+                                 const char *hex_in)
+{
+    if (pub == NULL || canonical == NULL || hex_in == NULL) return -1;
+    size_t hlen = strnlen(hex_in, 130);
+    if (hlen != crypto_sign_BYTES * 2) return -1;
+    unsigned char sig[crypto_sign_BYTES];
+    if (unhexlify((const unsigned char *)hex_in, hlen, sig) != 0)
+        return -1;
+    if (crypto_sign_verify_detached(sig, canonical, clen,
+                                    pub->signature.public) != 0)
+        return -1;
+    return 0;
+}
+
+/* Local helper to emit a fully-built net_msg via the network process.
+ * Returns 0 on success. Mirrors the messaging_send pattern used by
+ * _announce_identity. */
+static int _partition_broadcast(const process_t *proc, generic_msg_t *buf)
+{
+    int ret = messaging_send("network", NET_MESSAGE, buf, false);
+    if (ret != 0) {
+        log_error(proc->logger,
+                  "Identity: partition-recovery: messaging_send failed (%d)\n",
+                  ret);
+    }
+    return ret;
+}
+
+static bool handle_partition_signal(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    if (proc == NULL || msg == NULL) return true;
+    /* Suppress while we have no group yet — the normal bootstrap flow
+     * (choose_group) will catch up. Mirrors Python's `self.group is
+     * None or self.choosing` guard. */
+    if (proc->protocol.group.uuid[0] == 0
+        && map_size(&((process_t *)proc)->protocol.group.address_map) == 0)
+        return true;
+    pthread_mutex_lock(&id_state.lock);
+    bool active = _partition_recovery_active_locked();
+    pthread_mutex_unlock(&id_state.lock);
+    if (active) return true;
+
+    /* Payload is the raw from_addr string the NetProcess detected the
+     * out-of-group traffic from. Stored in msg.info.net_msg via
+     * net_msg_pack_string upstream. */
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(&msg->info.net_msg, &payload) != 0
+        || payload == NULL || !json_is_string(payload)) {
+        if (payload != NULL) json_decref(payload);
+        log_debug(proc->logger,
+                  "Identity: partition_signal: malformed payload\n");
+        return true;
+    }
+    const char *from_addr = json_string_value(payload);
+    if (from_addr == NULL || from_addr[0] == '\0') {
+        json_decref(payload);
+        return true;
+    }
+
+    pthread_mutex_lock(&id_state.lock);
+    bool may_send = _partition_cooldown_check(
+        &id_state.partition_probe_cooldown, from_addr,
+        PARTITION_PROBE_COOLDOWN_US);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!may_send) {
+        json_decref(payload);
+        return true;
+    }
+
+    /* Build canonical signing input: "{group_uuid_str}|{group_size}". */
+    char group_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proc->protocol.group.uuid, group_uuid_str);
+    int group_size = (int)map_size(&((process_t *)proc)->protocol.group.address_map);
+    char canonical[UUID_STRING_LEN + 32];
+    int clen = snprintf(canonical, sizeof(canonical), "%s|%d",
+                        group_uuid_str, group_size);
+    if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+        json_decref(payload);
+        return true;
+    }
+
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) {
+        json_decref(payload);
+        return true;
+    }
+    char sig_hex[129];
+    if (_partition_sign_hex(self, (const unsigned char *)canonical,
+                            (size_t)clen, sig_hex) != 0) {
+        json_decref(payload);
+        return true;
+    }
+
+    /* Construct JSON payload: from_identity (public), my_group_uuid,
+     * my_group_size, signature. */
+    public_identity_t *self_pub = NULL;
+    if (identity_publish(self, &self_pub) != 0 || self_pub == NULL) {
+        json_decref(payload);
+        return true;
+    }
+    json_t *from_id_json = NULL;
+    if (public_identity_to_json(self_pub, &from_id_json) != 0
+        || from_id_json == NULL) {
+        smrt_deref(self_pub);
+        json_decref(payload);
+        return true;
+    }
+    smrt_deref(self_pub);
+
+    json_t *probe_json = json_object();
+    json_object_set_new(probe_json, "from_identity", from_id_json);
+    json_object_set_new(probe_json, "from_address",
+                        json_string(self->address));
+    json_object_set_new(probe_json, "my_group_uuid",
+                        json_string(group_uuid_str));
+    json_object_set_new(probe_json, "my_group_size",
+                        json_integer(group_size));
+    json_object_set_new(probe_json, "signature",
+                        json_string(sig_hex));
+
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_PARTITION_PROBE;
+    out.info.net_msg.encrypt = false;  /* unsecured broadcast */
+    memcpy(&out.info.net_msg.from_whom, _partition_self_identity(proc),
+           sizeof(public_identity_t));
+    net_msg_pack_json(&out.info.net_msg, probe_json);
+    json_decref(probe_json);
+
+    _partition_broadcast(proc, &out);
+    log_debug(proc->logger,
+              "Identity: partition_probe broadcast (group=%s size=%d trigger=%s)\n",
+              group_uuid_str, group_size, from_addr);
+    json_decref(payload);
+    return true;
+}
+
+static bool handle_partition_probe(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    if (proc == NULL || msg == NULL) return true;
+    /* Skip if we have no group yet. */
+    if (proc->protocol.group.uuid[0] == 0
+        && map_size(&((process_t *)proc)->protocol.group.address_map) == 0)
+        return true;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(&msg->info.net_msg, &payload) != 0
+        || payload == NULL || !json_is_object(payload)) {
+        if (payload != NULL) json_decref(payload);
+        return true;
+    }
+
+    json_t *j_from_id    = json_object_get(payload, "from_identity");
+    json_t *j_group_uuid = json_object_get(payload, "my_group_uuid");
+    json_t *j_group_size = json_object_get(payload, "my_group_size");
+    json_t *j_signature  = json_object_get(payload, "signature");
+    if (!json_is_object(j_from_id) || !json_is_string(j_group_uuid)
+        || !json_is_integer(j_group_size) || !json_is_string(j_signature)) {
+        json_decref(payload);
+        return true;
+    }
+    const char *sender_group_uuid = json_string_value(j_group_uuid);
+    int sender_group_size = (int)json_integer_value(j_group_size);
+    const char *sig_hex = json_string_value(j_signature);
+
+    /* Decode the sender's public identity. */
+    public_identity_t sender_pub;
+    memset(&sender_pub, 0, sizeof(sender_pub));
+    if (public_identity_from_json(j_from_id, &sender_pub) != 0) {
+        json_decref(payload);
+        return true;
+    }
+
+    /* Verify signature. */
+    char canonical[UUID_STRING_LEN + 32];
+    int clen = snprintf(canonical, sizeof(canonical), "%s|%d",
+                        sender_group_uuid, sender_group_size);
+    if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+        json_decref(payload);
+        return true;
+    }
+    if (_partition_verify_hex(&sender_pub,
+                              (const unsigned char *)canonical,
+                              (size_t)clen, sig_hex) != 0) {
+        log_debug(proc->logger,
+                  "Identity: partition_probe: bad signature, dropping\n");
+        json_decref(payload);
+        return true;
+    }
+
+    char sender_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(sender_pub.uuid, sender_uuid_str);
+
+    pthread_mutex_lock(&id_state.lock);
+    bool may_send = _partition_cooldown_check(
+        &id_state.partition_response_cooldown, sender_uuid_str,
+        PARTITION_RESPONSE_COOLDOWN_US);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!may_send) {
+        json_decref(payload);
+        return true;
+    }
+
+    /* Build response: same shape as probe + in_response_to + group leader.
+     * Leader heuristic: prefer a known peer; fall back to ourselves.
+     * Mirrors Python's `_select_partition_leader` simplification path. */
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) {
+        json_decref(payload);
+        return true;
+    }
+    char our_group_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proc->protocol.group.uuid, our_group_uuid_str);
+    int our_group_size = (int)map_size(&((process_t *)proc)->protocol.group.address_map);
+    char leader_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self->uuid, leader_uuid_str);
+    const char *leader_address = self->address;
+    if (proc->protocol.num_peers > 0) {
+        /* Use the most-recently-added peer's identity as leader
+         * (Python sorts by _admitted_at desc; we lack that field in C,
+         * so use the last peer added — same effect in the common case
+         * where peers are appended in admission order). */
+        size_t idx = proc->protocol.num_peers - 1;
+        uuid_unparse_lower(proc->protocol.peers[idx].uuid, leader_uuid_str);
+        leader_address = proc->protocol.peers[idx].address;
+    }
+
+    char resp_canonical[UUID_STRING_LEN * 2 + 64];
+    int rclen = snprintf(resp_canonical, sizeof(resp_canonical),
+                         "%s|%d|%s", our_group_uuid_str, our_group_size,
+                         sender_uuid_str);
+    if (rclen < 0 || (size_t)rclen >= sizeof(resp_canonical)) {
+        json_decref(payload);
+        return true;
+    }
+    char resp_sig_hex[129];
+    if (_partition_sign_hex(self,
+                            (const unsigned char *)resp_canonical,
+                            (size_t)rclen, resp_sig_hex) != 0) {
+        json_decref(payload);
+        return true;
+    }
+    public_identity_t *self_pub = NULL;
+    if (identity_publish(self, &self_pub) != 0 || self_pub == NULL) {
+        json_decref(payload);
+        return true;
+    }
+    json_t *from_id_json = NULL;
+    if (public_identity_to_json(self_pub, &from_id_json) != 0
+        || from_id_json == NULL) {
+        smrt_deref(self_pub);
+        json_decref(payload);
+        return true;
+    }
+    smrt_deref(self_pub);
+
+    json_t *resp_json = json_object();
+    json_object_set_new(resp_json, "from_identity", from_id_json);
+    json_object_set_new(resp_json, "from_address",
+                        json_string(self->address));
+    json_object_set_new(resp_json, "in_response_to",
+                        json_string(sender_uuid_str));
+    json_object_set_new(resp_json, "my_group_uuid",
+                        json_string(our_group_uuid_str));
+    json_object_set_new(resp_json, "my_group_size",
+                        json_integer(our_group_size));
+    json_object_set_new(resp_json, "my_group_leader",
+                        json_string(leader_uuid_str));
+    json_object_set_new(resp_json, "my_group_leader_address",
+                        json_string(leader_address));
+    json_object_set_new(resp_json, "signature",
+                        json_string(resp_sig_hex));
+
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_PARTITION_RESPONSE;
+    out.info.net_msg.encrypt = false;
+    memcpy(&out.info.net_msg.from_whom, _partition_self_identity(proc),
+           sizeof(public_identity_t));
+    net_msg_pack_json(&out.info.net_msg, resp_json);
+    json_decref(resp_json);
+
+    _partition_broadcast(proc, &out);
+    log_debug(proc->logger,
+              "Identity: partition_response broadcast (to=%s our_group=%s/%d)\n",
+              sender_uuid_str, our_group_uuid_str, our_group_size);
+    json_decref(payload);
+    return true;
+}
+
+static bool handle_partition_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    if (proc == NULL || msg == NULL) return true;
+    if (proc->protocol.group.uuid[0] == 0
+        && map_size(&((process_t *)proc)->protocol.group.address_map) == 0)
+        return true;
+    pthread_mutex_lock(&id_state.lock);
+    bool active = _partition_recovery_active_locked();
+    pthread_mutex_unlock(&id_state.lock);
+    if (active) return true;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(&msg->info.net_msg, &payload) != 0
+        || payload == NULL || !json_is_object(payload)) {
+        if (payload != NULL) json_decref(payload);
+        return true;
+    }
+
+    json_t *j_from_id     = json_object_get(payload, "from_identity");
+    json_t *j_in_resp     = json_object_get(payload, "in_response_to");
+    json_t *j_group_uuid  = json_object_get(payload, "my_group_uuid");
+    json_t *j_group_size  = json_object_get(payload, "my_group_size");
+    json_t *j_leader_addr = json_object_get(payload, "my_group_leader_address");
+    json_t *j_signature   = json_object_get(payload, "signature");
+    if (!json_is_object(j_from_id) || !json_is_string(j_in_resp)
+        || !json_is_string(j_group_uuid) || !json_is_integer(j_group_size)
+        || !json_is_string(j_leader_addr) || !json_is_string(j_signature)) {
+        json_decref(payload);
+        return true;
+    }
+
+    /* Filter responses addressed to other peers' probes. */
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) {
+        json_decref(payload);
+        return true;
+    }
+    char self_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self->uuid, self_uuid_str);
+    if (strncmp(json_string_value(j_in_resp), self_uuid_str,
+                UUID_STRING_LEN) != 0) {
+        json_decref(payload);
+        return true;
+    }
+
+    public_identity_t sender_pub;
+    memset(&sender_pub, 0, sizeof(sender_pub));
+    if (public_identity_from_json(j_from_id, &sender_pub) != 0) {
+        json_decref(payload);
+        return true;
+    }
+    const char *their_group_uuid = json_string_value(j_group_uuid);
+    int their_size = (int)json_integer_value(j_group_size);
+    const char *sig_hex = json_string_value(j_signature);
+
+    char canonical[UUID_STRING_LEN * 2 + 64];
+    int clen = snprintf(canonical, sizeof(canonical), "%s|%d|%s",
+                        their_group_uuid, their_size, self_uuid_str);
+    if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+        json_decref(payload);
+        return true;
+    }
+    if (_partition_verify_hex(&sender_pub,
+                              (const unsigned char *)canonical,
+                              (size_t)clen, sig_hex) != 0) {
+        log_debug(proc->logger,
+                  "Identity: partition_response: bad signature, dropping\n");
+        json_decref(payload);
+        return true;
+    }
+
+    char our_group_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proc->protocol.group.uuid, our_group_uuid_str);
+    int our_size = (int)map_size(&((process_t *)proc)->protocol.group.address_map);
+    bool adopt = (their_size > our_size)
+        || (their_size == our_size
+            && strcmp(their_group_uuid, our_group_uuid_str) < 0);
+    if (!adopt) {
+        log_debug(proc->logger,
+                  "Identity: partition_response: we_win (ours=%d theirs=%d)\n",
+                  our_size, their_size);
+        json_decref(payload);
+        return true;
+    }
+
+    /* Mark recovery in flight and re-broadcast request_access. The
+     * target group's welcoming-committee will admit us through the
+     * normal POA voting; the subsequent full_history delivery feeds
+     * _merge_to_mesh which adopts their group. */
+    pthread_mutex_lock(&id_state.lock);
+    snprintf(id_state.partition_recovery_target,
+             sizeof(id_state.partition_recovery_target), "%s",
+             their_group_uuid);
+    id_state.partition_recovery_started_us = _partition_now_us();
+    pthread_mutex_unlock(&id_state.lock);
+
+    /* Re-broadcast request_access on the open channel. */
+    int rc = _announce_identity(proc, queues);
+    if (rc != 0) {
+        log_error(proc->logger,
+                  "Identity: partition_response: _announce_identity failed (%d)\n",
+                  rc);
+    }
+    log_info(proc->logger,
+             "Identity: partition recovery initiated -> group=%s (size=%d > our %d)\n",
+             their_group_uuid, their_size, our_size);
+    json_decref(payload);
+    return true;
+}
+
 int identity_register_handlers(process_t *proc)
 {
     if (proc == NULL) return -1;
@@ -2318,6 +2923,12 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_CAPS_QUERY,    (handler_ptr_t)handle_caps_query);
     process_register_handler(proc, ID_CAPS_RESPONSE, (handler_ptr_t)handle_caps_response);
     process_register_handler(proc, ID_RANK,          (handler_ptr_t)handle_rank_update);
+    process_register_handler(proc, ID_PARTITION_SIGNAL,
+                             (handler_ptr_t)handle_partition_signal);
+    process_register_handler(proc, ID_PARTITION_PROBE,
+                             (handler_ptr_t)handle_partition_probe);
+    process_register_handler(proc, ID_PARTITION_RESPONSE,
+                             (handler_ptr_t)handle_partition_response);
     return 0;
 }
 
