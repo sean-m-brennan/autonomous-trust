@@ -48,7 +48,11 @@ _DEMO_FIRST_IP = 10   # first peer gets .10, peers assigned in order
 @dataclass
 class ComposeOptions:
     """Knobs for compose/k8s emission."""
-    image: str = "autonomous-trust"
+    # Peer image must include autonomous_trust.evaluation + .services so
+    # the disaster_response_demo entrypoint can import. The bare
+    # autonomous-trust image only ships .core; see
+    # src/autonomous-trust-evaluation/Dockerfile-disaster.
+    image: str = "autonomous-trust-disaster"
     registry: str = ""                   # e.g. "ghcr.io/tekfive/"
     image_tag: str = ""                  # e.g. ":demo" or "@sha256:..."
     log_level: str = "info"
@@ -91,6 +95,13 @@ def _peer_entry(peer_name: str, role, ip: str, delay_sec: int,
 
     env = {
         "ROUTER": opts.router,
+        # Boot the peer via the disaster-response entrypoint instead of
+        # the stock `autonomous_trust` module so DisasterResponseDemoAT
+        # is instantiated. That subclass adds the EnvData* worker matching
+        # AT_ROLE_KIND and writes the per-role envdata config so the
+        # service activates and starts publishing readings.
+        "AUTONOMOUS_TRUST_EXE": (
+            "-m autonomous_trust.evaluation.scenarios.disaster_response_demo"),
         "AUTONOMOUS_TRUST_ARGS": at_args,
         "AUTONOMOUS_TRUST_BACKEND": opts.backend,
         "AT_TRANSPORT": "autonomous_trust.core.network.TCPNetworkProcess",
@@ -341,6 +352,8 @@ def generate_k8s_manifests(scenario, namespace: str = "disaster-demo",
         for name, role in peers:
             env: dict[str, str] = {
                 "ROUTER": opts.router,
+                "AUTONOMOUS_TRUST_EXE": (
+                    "-m autonomous_trust.evaluation.scenarios.disaster_response_demo"),
                 "AUTONOMOUS_TRUST_ARGS": (
                     f"--live --test --exclude-logs {opts.exclude_logs} "
                     f"--log-level {opts.log_level}"),

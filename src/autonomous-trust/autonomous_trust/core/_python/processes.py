@@ -193,9 +193,29 @@ class Process(metaclass=ProcMeta):
             time.sleep(delta)
 
     def update(self, msg, queues):
+        # Per-queue best-effort: if one queue is full, log via probe and
+        # continue with the rest. The original implementation let a Full
+        # exception propagate up and abort the loop, so a single slow
+        # queue (e.g. main proc backlogged with rep_resp traffic) would
+        # silently block updates from reaching every queue iterated
+        # AFTER it — manifested as PeerCapabilities updates landing on
+        # main but never on bridge-data-rcvr in the civilian demo.
+        from queue import Full as _Full
+        try:
+            from . import _probes
+        except Exception:
+            _probes = None
         for name, q in queues.items():
-            if name != self.name:
+            if name == self.name:
+                continue
+            try:
                 q.put(msg, block=True, timeout=self.q_cadence)
+            except _Full:
+                if _probes is not None:
+                    try:
+                        _probes.counter('proc.update', 'queue_full', name)
+                    except Exception:
+                        pass
 
     def process(self, queues, signal):
         raise NotImplementedError
