@@ -56,6 +56,12 @@ extern char REP_PROTO_NACK[];
 extern char REP_PROTO_BACKDATE[];
 extern char REP_PROTO_TX[];
 extern char REP_PROTO_ACCEPTED[];
+/* Phase 3 — proposer broadcasts the committed (task_id, peer_id,
+ * score) tuple to the group after handle_accepted reaches majority.
+ * Acceptors handle this by writing the entry to their own history,
+ * which is how bilateral Transactions form across all peers' views.
+ * Matches Python's ReputationProtocol.committed verbatim. */
+extern char REP_PROTO_COMMITTED[];
 extern char REP_PROTO_OUTDATED[];
 extern char REP_PROTO_UPDATE[];
 extern char REP_PROTO_REP_REQ[];

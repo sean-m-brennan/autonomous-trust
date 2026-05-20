@@ -27,7 +27,33 @@
 #include "config/configuration.h"
 #include "utilities/util.h"
 
-// TODO: Add protobuf serialization for inter-host network messages
+/* Design note — protobuf wire path for inter-host network messages.
+ *
+ * Inter-host network messages currently ride the JSON wire format in
+ * `network/net_message.c::net_message_to_wire`. A protobuf wire path is
+ * structurally enabled by `at_serialize_mode_current()` + per-mode
+ * dispatch already in `config/configuration.c`; applying the same shape
+ * here is straightforward in C but requires four coordinated pieces:
+ *
+ *   1. A `network/net_message.proto` schema for `net_wire_msg_t`
+ *      (process, function, data bytes, encrypt, trace_id, from_whom,
+ *      to_whom, signature). Codegen lands in `src/c/build/...` via the
+ *      existing CMake protobuf-c plumbing.
+ *   2. `net_message_to_wire_proto` / `net_message_from_wire_proto`
+ *      siblings of the JSON path. Signature canonicalization (the
+ *      "<process>|<function>|<base64(data)>" pre-image in
+ *      net_message.c:98-119) MUST stay byte-identical to Python; the
+ *      proto path signs the same canonical string, only the envelope
+ *      changes.
+ *   3. Dispatch by `at_serialize_mode_current()` at the top of
+ *      `net_message_to_wire` (read side branches on a one-byte magic
+ *      prefix to support mixed-mode peers during migration).
+ *   4. The Python side adds the matching `to_wire_proto` /
+ *      `from_wire_proto` paths in `core/_python/network/net_message.py`
+ *      and the conformance corpus gains a `--wire-mode=proto` variant.
+ *
+ * Until items 1 and 4 ship together, JSON remains the only safe wire
+ * format — a one-sided switch would silently break interop. */
 
 
 /* Frama-C: skipped — [inet] inet_pton with network byte order */

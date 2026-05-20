@@ -1,0 +1,507 @@
+# ******************
+#  Copyright 2025 Sean M. Brennan and contributors
+#  Licensed under the Apache License, Version 2.0
+# ******************
+"""DoD mission demo participant node.
+
+Each peer in the DoD scenario (squad member, microdrone, RQ-86, MQ-800,
+leave-behind sensor, fighter jet, command) runs as one instance of this
+class.  The peer's role is looked up in `DoDMissionScenario`, and the
+right generator bundle is bound based on `PeerRole.kind`:
+
+  Role kind         Generator bundle              Notes
+  ----------------  ----------------------------  -------------------------
+  soldier           (none)                        consumer-only
+  command-node      (none)                        consumer-only
+  microdrone        MicrodroneGenerators          target position + motion + audio
+  recon-drone       OverheadISRGenerators         honest cross-validated ISR
+  armed-drone       OverheadISRGenerators*        wrapped by contradictory_isr
+  ground-sensor     GroundSensorGenerators        honest *or* ForgedIdentitySensor
+  fighter-jet       (minimal)                     joins late; ISR not yet wired
+
+Env-var selectors:
+  AT_PEER_NAME            Peer roster name (overrides argv[1])
+  AT_AGENCY               Agency label (informational)
+  AT_COMPROMISED          "true" → MQ-800 wraps its OverheadISRGenerators
+                          with the contradictory_isr compromise
+  AT_COMPROMISE_MODE      "abrupt" | "gradual"
+  AT_FORGERY_MODE         "unsigned" | "self_signed" | "sybil" — when set,
+                          this peer's ground-sensor bundle is wrapped in
+                          ForgedIdentitySensor.  Pairs with AT_SYBIL_TARGET
+                          for sybil mode.
+  AT_SYBIL_TARGET         Peer name to impersonate (sybil only)
+  AT_JOIN_DELAY_SEC       Sleep before joining; used for MQ-800 (~240s),
+                          leave-behind sensors (~120s), jet (~360s) so
+                          their join times line up with scenario phases.
+
+The generator bundle is pushed through ``DoDDataProcess.acquire()``
+each tick; the coordinator's autonomous_tasking drains the resulting
+readings from ``cohort.peers[*].data_stream`` and feeds them into the
+sensor-comparison charts + cross-source validators.
+
+Usage:
+    python participant.py <peer-name> [--setup] [--log-level debug]
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import random
+import sys
+import time
+from datetime import timedelta
+from pathlib import Path
+from typing import Optional
+
+from queue import Full
+from uuid import uuid4
+
+from autonomous_trust.core import (
+    AutonomousTrust, CfgIds, Configuration, LogLevel, Process, ProcMeta,
+    to_yaml_string,
+)
+from autonomous_trust.core.config.generate import (
+    generate_identity, generate_worker_config,
+)
+from autonomous_trust.core.network import Message
+from autonomous_trust.core.reputation.reputation import TransactionScore
+from autonomous_trust.core.system import queue_cadence
+from autonomous_trust.services.data.server import (
+    DataProcess, DataConfig, DataProtocol,
+)
+from autonomous_trust.services.network_statistics import NetStatsSource
+
+try:
+    from autonomous_trust.simulator.peer.peer_metadata import (
+        SimMetadataSource, SimMetadata,
+    )
+    HAS_SIMULATOR = True
+except ImportError:
+    HAS_SIMULATOR = False
+
+# Sibling modules (dashed package layout — same trick as coordinator.py)
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+from scenario import DoDMissionScenario  # noqa: E402
+
+sys.path.insert(0, str(_HERE / "generators"))
+from isr import OverheadISRGenerators, MicrodroneGenerators  # noqa: E402
+from ground_sensor import GroundSensorGenerators  # noqa: E402
+
+sys.path.insert(0, str(_HERE / "compromise"))
+from contradictory_isr import (  # noqa: E402
+    create_compromised_mq800_position_x,
+    create_compromised_mq800_position_y,
+    create_compromised_mq800_electronic_noise,
+    DEFAULT_ACTIVATE_AT,
+)
+from forged_identity import create_forged_identity_sensor  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+
+class DoDDataProcess(DataProcess, metaclass=ProcMeta,
+                     proc_name='data-source',
+                     description='DoD ISR / sensor data source'):
+    """DataProcess subclass that drains a generator bundle each tick.
+
+    The bare DataProcess is a generic stub: its ``acquire()`` warns
+    "not implemented" and returns ``[None, None, None]``.  Here we
+    override it to call ``self.generators.tick(t)`` and ship the
+    resulting Readings to subscribers as a list of dicts (YAML-
+    serialized over the wire by the base class).
+
+    ``t`` is computed against ``self.t0_epoch`` so every peer's
+    timestamps share a common origin -- the launcher exports
+    ``AT_DEMO_T0_EPOCH`` (unix seconds at launch) and
+    generate_compose plumbs it through ``common_env``, so the
+    sensor charts on the coordinator can line up consensus across
+    peers that joined at different real times.
+    """
+
+    def __init__(self, configurations, subsystems, log_queue,
+                 dependencies, **kwargs):
+        super().__init__(configurations, subsystems, log_queue,
+                         dependencies)
+        self.generators = kwargs.get('generators')
+        self.t0_epoch = float(kwargs.get('t0_epoch') or time.time())
+        # DataProcess.__init__ sets ``self.active`` from
+        # ``self.name in configurations`` — i.e. only when a DataConfig
+        # has been written.  Our generators don't need a DataConfig
+        # (the bundle replaces the device_path/frame_size knobs), so
+        # force-enable when there's a bundle attached.  Without this,
+        # the parent process() loop skips acquire() and the data
+        # stream is silent.
+        if self.generators is not None:
+            self.active = True
+
+    _logged_first_acquire = False
+    _logged_first_emit = False
+    _logged_first_tx_submit = False
+
+    def acquire(self):
+        if self.generators is None:
+            if not DoDDataProcess._logged_first_acquire:
+                self.logger.info(
+                    "DoDDataProcess.acquire: no generator bundle attached "
+                    "(role has no continuous data source)")
+                DoDDataProcess._logged_first_acquire = True
+            return None
+        t = timedelta(seconds=time.time() - self.t0_epoch)
+        readings = self.generators.tick(t)
+        if not DoDDataProcess._logged_first_acquire:
+            self.logger.info(
+                "DoDDataProcess.acquire: first call returned %d readings "
+                "(t=%.1fs, active=%s, clients=%d)",
+                len(readings or []), t.total_seconds(),
+                self.active, len(self.clients))
+            DoDDataProcess._logged_first_acquire = True
+        if not readings:
+            return None
+        if not DoDDataProcess._logged_first_emit and self.clients:
+            self.logger.info(
+                "DoDDataProcess: emitting first batch of %d readings to "
+                "%d subscriber(s)", len(readings), len(self.clients))
+            DoDDataProcess._logged_first_emit = True
+        # Stamp every reading in this tick with the same task_id so
+        # the coordinator can identify which deliveries belong to the
+        # same paxos round.  The generator submits a single
+        # TransactionScore(task_id, 0.9) per tick (in process()
+        # below); the coordinator submits a single
+        # TransactionScore(task_id, 0.8|0.3) per tick.  Bilateral
+        # transactions then form in everyone's reputation history,
+        # so _contrite_tit_for_tat has real input to score against.
+        batch_id = str(uuid4())
+        emitted: list[dict] = []
+        for r in readings:
+            d = r.to_dict()
+            meta = d.setdefault("metadata", {})
+            meta["task_id"] = batch_id
+            emitted.append(d)
+        # Stash the task_id for process() to pick up after the
+        # parent's broadcast loop runs.
+        self._last_batch_id = batch_id
+        return emitted
+
+    _last_batch_id: Optional[str] = None
+
+    def process(self, queues, signal):
+        """Override the parent loop only so we can submit a
+        TransactionScore after each successful broadcast.  The body
+        is intentionally a close copy of DataProcess.process so the
+        message-handling and acquire-then-send sequence stays
+        identical; the only addition is the
+        reputation_queue.put(TransactionScore(...)) call after a
+        batch goes out.
+        """
+        from queue import Empty as _Empty
+        while self.keep_running(signal):
+            # mirror DataProcess.process_messages
+            try:
+                message = queues[self.name].get(
+                    block=True, timeout=self.q_cadence)
+            except _Empty:
+                message = None
+            if message:
+                if not self.protocol.run_message_handlers(queues, message):
+                    self.logger.error(
+                        "Unhandled message %r",
+                        getattr(message, "function", type(message).__name__))
+
+            if self.active:
+                data = self.acquire()
+                if data is not None and self.clients:
+                    msg_obj = to_yaml_string(data)
+                    for client_id, (proc_name, peer) in self.clients.items():
+                        msg = Message(proc_name, DataProtocol.data,
+                                      msg_obj, peer)
+                        try:
+                            queues[CfgIds.network].put(
+                                msg, block=True, timeout=self.q_cadence)
+                        except Full:
+                            self.logger.warning(
+                                "Network queue full; dropping data for %s",
+                                client_id)
+                    batch_id = self._last_batch_id
+                    self._last_batch_id = None
+                    if batch_id is not None and self.clients:
+                        # Sender's "I delivered" score for this batch.
+                        # Pinned to 0.9 to match automate.py:537 — the
+                        # AT convention for successful local task
+                        # execution.
+                        ts = TransactionScore(task_id=batch_id, score=0.9)
+                        try:
+                            queues[CfgIds.reputation].put(
+                                ts, block=True, timeout=self.q_cadence)
+                            if not DoDDataProcess._logged_first_tx_submit:
+                                self.logger.info(
+                                    "DoDDataProcess: first "
+                                    "TransactionScore submitted "
+                                    "(batch=%s, score=0.9)", batch_id)
+                                DoDDataProcess._logged_first_tx_submit = True
+                        except Full:
+                            self.logger.warning(
+                                "Reputation queue full; dropping "
+                                "TransactionScore for batch %s",
+                                batch_id)
+            self.sleep_until(self.cadence)
+
+
+class DoDMissionParticipant(AutonomousTrust):
+    """A peer in the DoD squad infiltration scenario.
+
+    Looks up its own role in the scenario, selects the appropriate
+    generator bundle, and registers the standard AT workers
+    (network stats, simulator metadata, data service).
+    """
+
+    def __init__(self, peer_name: str, scenario: DoDMissionScenario,
+                 compromised: bool = False,
+                 compromise_mode: str = "abrupt",
+                 forgery_mode: Optional[str] = None,
+                 sybil_target: Optional[str] = None,
+                 **kwargs):
+        self.peer_name = peer_name
+        self.scenario = scenario
+        self.role = scenario.peers.get(peer_name)
+        if self.role is None:
+            raise ValueError(
+                f"Peer {peer_name!r} not defined in scenario {scenario.name!r}"
+            )
+        self.compromised = compromised
+        self.compromise_mode = compromise_mode
+        self.forgery_mode = forgery_mode
+        self.sybil_target = sybil_target
+
+        # silent=False so participant logs reach stdout / docker logs
+        # (matches the coordinator).  Otherwise diagnostics are buried
+        # in the per-container rotating logfile under /var/at/.
+        super().__init__(silent=False, **kwargs)
+
+        # Standard workers.
+        self.add_worker(NetStatsSource)
+        # SimMetadataSource intentionally NOT registered.  Its parent
+        # MetadataSource.__init__ unconditionally reads
+        # ``configurations['metadata-source']`` (see
+        # services/peer/metadata.py:129), which would KeyError every
+        # peer at startup unless we ran a separate setup pass to
+        # pre-populate the config file.  SimMetadata.initialize() also
+        # has non-default fields (type_of_peer, sim_host) so
+        # generate_worker_config(..., defaults=True) can't write it
+        # non-interactively.  The simulator integration drives
+        # position/time updates; without it peers sit at their
+        # scenario.py-defined coords forever, which is fine for the
+        # data-stream/divergence demo — the ISR generators don't read
+        # simulator state, they use the role's initial coords passed
+        # in via sensor_xy.  Re-enable when a position-driven map
+        # update is back on the critical path; will need to write a
+        # SimMetadata config explicitly (not via setup_mode prompts).
+
+        # Role-driven generator bundle.  Built before the DataProcess
+        # worker is registered so the bundle can be passed in as a
+        # kwarg -- DoDDataProcess.acquire() drains it each tick.  Peers
+        # with no role-specific data source (soldier, command-node,
+        # fighter-jet) still get a DataProcess so the service is
+        # available, but with no bundle attached it just no-ops.
+        self.generators = self._build_generators()
+
+        # Shared epoch for cross-peer timestamp alignment in the
+        # sensor-comparison charts.  See DoDDataProcess docstring.
+        t0_epoch = float(os.environ.get("AT_DEMO_T0_EPOCH") or time.time())
+        self.add_worker(DoDDataProcess,
+                        generators=self.generators,
+                        t0_epoch=t0_epoch)
+
+        logger.info("Participant %s initialized: role=%s, generators=%s, "
+                    "compromised=%s, forgery_mode=%s",
+                    peer_name, self.role.kind,
+                    type(self.generators).__name__ if self.generators else "none",
+                    compromised, forgery_mode)
+
+    def _build_generators(self):
+        """Pick the right generator bundle for this peer's role."""
+        kind = self.role.kind
+        # Microdrones / overhead ISR need a position to compute bearings
+        # against.  Use the peer's roster position as a stand-in (the
+        # simulator-side movement will overwrite it at runtime).
+        sensor_xy = (self.role.position.lat, self.role.position.lon)
+
+        if kind == "microdrone":
+            return MicrodroneGenerators(self.peer_name, sensor_xy)
+
+        if kind == "recon-drone":
+            return OverheadISRGenerators(self.peer_name, sensor_xy)
+
+        if kind == "armed-drone":
+            # MQ-800: honest ISR generators, optionally wrapped by the
+            # contradictory_isr compromise after activation.
+            bundle = OverheadISRGenerators(self.peer_name, sensor_xy)
+            if self.compromised:
+                logger.info("Wrapping %s in contradictory_isr (mode=%s)",
+                            self.peer_name, self.compromise_mode)
+                # Replace each honest position / noise generator with its
+                # compromised counterpart.  Bearing remains honest — even
+                # a hostile platform cannot easily lie about its own
+                # position-relative geometry without breaking the math.
+                bundle.target_x = create_compromised_mq800_position_x(
+                    peer_name=self.peer_name,
+                    mode=self.compromise_mode,
+                )
+                bundle.target_y = create_compromised_mq800_position_y(
+                    peer_name=self.peer_name,
+                    mode=self.compromise_mode,
+                )
+                bundle.electronic_noise = create_compromised_mq800_electronic_noise(
+                    peer_name=self.peer_name,
+                    mode=self.compromise_mode,
+                )
+                bundle._generators = [
+                    bundle.target_x, bundle.target_y,
+                    bundle.bearing, bundle.electronic_noise,
+                ]
+            return bundle
+
+        if kind == "ground-sensor":
+            if self.forgery_mode:
+                # ForgedIdentitySensor wraps a GroundSensorGenerators
+                # bundle and adds the identity-layer attack marker.
+                return create_forged_identity_sensor(
+                    peer_name=self.peer_name,
+                    forgery_mode=self.forgery_mode,
+                    sybil_target=self.sybil_target,
+                )
+            return GroundSensorGenerators(self.peer_name)
+
+        # soldier, command-node, fighter-jet: consumer-only or
+        # event-driven; no continuous data sources yet.
+        return None
+
+    def autonomous_ability(self, queues):
+        """Advertise this peer's data capability.
+
+        ``self.capabilities`` is set on the AutonomousTrust instance but
+        idprocess + DataRcvr live in worker subprocesses and only learn
+        what they need via the queue.  Mirror the framework's testing-
+        mode broadcast: register the ability, then put the
+        ``Capabilities`` object onto every worker queue so
+        ``Protocol.run_message_handlers`` updates their snapshots.
+        Until this fires, the coordinator's DataRcvr never sees any
+        peer advertise ``data`` and never subscribes — the per-peer
+        ``data_stream`` queues stay empty and the sensor charts
+        render blank.
+        """
+        if self.generators is not None:
+            self.capabilities.register_ability(
+                DataProcess.capability_name, None)
+        logger.info(
+            "autonomous_ability: peer=%s capabilities=%s — "
+            "broadcasting to %d worker queue(s)",
+            self.peer_name, self.capabilities.to_list(),
+            len([q for q in queues if q != self.proc_name]))
+        for q_name in queues:
+            if q_name == self.proc_name:
+                continue
+            try:
+                queues[q_name].put(self.capabilities,
+                                   block=True, timeout=queue_cadence)
+            except Exception:
+                logger.warning("Failed to publish capabilities to %s",
+                               q_name)
+
+    def autonomous_tasking(self, queues):
+        """Called each AT tick.  Data emission lives in DoDDataProcess
+        (its own worker loop), so this hook stays a no-op for now."""
+        pass
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def main():
+    # See coordinator.py:main() for the rationale — AT only handler-binds
+    # its own framework logger, so this module's `logger.info(...)` is
+    # otherwise dropped by Python's lastResort handler.
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    if len(sys.argv) < 2 and "AT_PEER_NAME" not in os.environ:
+        print(f"Usage: {sys.argv[0]} <peer-name> [--setup] [--log-level LEVEL]")
+        sys.exit(1)
+
+    peer_name = os.environ.get("AT_PEER_NAME") or sys.argv[1]
+    agency = os.environ.get("AT_AGENCY", "")
+    setup_mode = "--setup" in sys.argv
+    log_level = LogLevel.DEBUG
+    for i, arg in enumerate(sys.argv):
+        if arg == "--log-level" and i + 1 < len(sys.argv):
+            log_level = LogLevel[sys.argv[i + 1].upper()]
+
+    compromised = _env_flag("AT_COMPROMISED", default=False)
+    compromise_mode = os.environ.get("AT_COMPROMISE_MODE", "abrupt")
+    forgery_mode = os.environ.get("AT_FORGERY_MODE")  # None if not hacked
+    sybil_target = os.environ.get("AT_SYBIL_TARGET")
+
+    # Per-peer root directory.  AT derives etc/at + var/at from
+    # AUTONOMOUS_TRUST_ROOT; mirror the mission/coordinator.py pattern.
+    root_dir = os.environ.get(Configuration.ROOT_VARIABLE_NAME,
+                              str(Path(__file__).parent / peer_name))
+    os.environ[Configuration.ROOT_VARIABLE_NAME] = root_dir
+    cfg_dir = Configuration.get_cfg_dir()
+    dat_dir = Configuration.get_data_dir()
+    os.makedirs(cfg_dir, exist_ok=True)
+    os.makedirs(dat_dir, exist_ok=True)
+
+    generate_identity(cfg_dir, preserve=True, defaults=True)
+
+    # Build the scenario from the same env-var knobs the coordinator uses,
+    # so all peers agree on the peer roster (squad_size, swarm_size, ...).
+    scenario = DoDMissionScenario(
+        squad_size=int(os.environ.get("AT_SQUAD_SIZE", "4")),
+        swarm_size=int(os.environ.get("AT_SWARM_SIZE", "4")),
+        sensor_count=int(os.environ.get("AT_SENSOR_COUNT", "3")),
+        hacked_sensors=int(os.environ.get("AT_HACKED_SENSORS", "2")),
+        include_mq800=os.environ.get("AT_INCLUDE_MQ800", "1") != "0",
+        include_jet=os.environ.get("AT_INCLUDE_JET", "1") != "0",
+        include_command=os.environ.get("AT_INCLUDE_COMMAND", "1") != "0",
+    )
+
+    if setup_mode:
+        # Signature: generate_worker_config(cfg_dir, proc_name, cfg_class, defaults).
+        generate_worker_config(cfg_dir, DataProcess.name, DataConfig, True)
+        if HAS_SIMULATOR:
+            generate_worker_config(cfg_dir, SimMetadataSource.name, SimMetadata, True)
+        print(f"Setup complete for {peer_name} ({agency or 'no-agency'})")
+        return
+
+    # Stagger startup — either explicitly via AT_JOIN_DELAY_SEC, or a
+    # random 1-5s jitter to avoid thundering-herd identity exchanges.
+    delay = int(os.environ.get("AT_JOIN_DELAY_SEC", "0"))
+    if delay > 0:
+        logger.info("Delaying startup by %ds (AT_JOIN_DELAY_SEC)", delay)
+        time.sleep(delay)
+    else:
+        time.sleep(random.uniform(1.0, 5.0))
+
+    logger.info("Starting DoD participant: %s (%s)", peer_name, agency)
+    participant = DoDMissionParticipant(
+        peer_name=peer_name,
+        scenario=scenario,
+        compromised=compromised,
+        compromise_mode=compromise_mode,
+        forgery_mode=forgery_mode,
+        sybil_target=sybil_target,
+        log_level=log_level,
+    )
+    participant.run_forever()
+
+
+if __name__ == "__main__":
+    main()

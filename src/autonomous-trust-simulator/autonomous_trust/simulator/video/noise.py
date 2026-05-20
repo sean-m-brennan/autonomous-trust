@@ -49,7 +49,12 @@ def add_noise(noise, image, shape=None):
         cv2.normalize(noisy, noisy, 0, 255, cv2.NORM_MINMAX, dtype=-1)
         noisy = noisy.astype(np.uint8)
         return noisy
-    elif noise == Noise.SALT_PEPPER:  # FIXME the rest of these do not work
+    # Open: only GAUSSIAN (above) and SALT_PEPPER are known-working
+    # today; the POISSON / SPECKLE / others below were either never
+    # finished or regressed without notice. Validate each branch
+    # against a reference image set and either fix or remove the
+    # broken modes.
+    elif noise == Noise.SALT_PEPPER:
         s_vs_p = 0.5
         amount = 0.004
         out = np.copy(image)
