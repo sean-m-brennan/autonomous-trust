@@ -54,7 +54,7 @@ from dash_extensions.enrich import (
 
 from autonomous_trust.inspector.dash_components.core import DashControl
 from autonomous_trust.inspector.dashboard.disaster_response_layout import (
-    IDS, build_dashboard, classify_status, format_clock, format_phase,
+    IDS, build_dashboard, format_clock, format_phase,
 )
 from autonomous_trust.inspector.dashboard.data_streams import DataStreamsPanel
 from autonomous_trust.inspector.dashboard.disaster_response_graph import (
@@ -103,7 +103,7 @@ _TICK_SAMPLE_SEC = 2.0  # how often the timeline samples reputation
 
 # Stage-2c element IDs.
 _GRAPH_GRAPH = "demo-trust-graph"
-_STREAMS_IFRAME = "demo-streams-iframe"
+_STREAMS_PANEL = "demo-streams-panel"
 _STREAMS_TICK_SEC = 1.0  # synthesize one reading per stream at 1 Hz
 
 # 3h sensor-comparison chart, embedded inside panel_detail. The chart
@@ -306,11 +306,21 @@ class MultiAgencyDemo:
                       config={"displayModeBar": False},
                       responsive=True,
                       style={"height": "100%", "width": "100%"}))
+        # Native scrolling Div instead of an iframe srcDoc: Dash patches
+        # this node's `children` in place each tick, so the wrapping
+        # scrollable container keeps its identity and the user's scroll
+        # position survives the refresh. (Iframe srcDoc replacement
+        # tears down the whole document and forces a scroll-to-top.)
         self._replace_child_by_id(
             dashboard, IDS["panel_streams"],
-            html.Iframe(id=_STREAMS_IFRAME, srcDoc="",
-                        style={"width": "100%", "height": "100%",
-                               "border": "0", "background": "transparent"}))
+            html.Div(id=_STREAMS_PANEL,
+                     style={"width": "100%", "height": "100%",
+                            "overflowY": "auto",
+                            "background": "#1E1E2E",
+                            "padding": "8px",
+                            "borderRadius": "6px",
+                            "fontSize": "11px",
+                            "fontFamily": "monospace"}))
         return html.Div(children=[
             dcc.Interval(id=_TICK_INTERVAL_ID,
                          interval=_TICK_MS, n_intervals=0),
@@ -396,8 +406,6 @@ class MultiAgencyDemo:
         @self._dash.callback(
             Output(IDS["topbar_clock"], "children"),
             Output(IDS["topbar_phase"], "children"),
-            Output(IDS["topbar_status"], "children"),
-            Output(IDS["topbar_status"], "className"),
             Output(IDS["topbar_keystats"], "children"),
             Output(IDS["panel_log"], "children"),
             Output(IDS["narration_overlay"], "children"),
@@ -409,7 +417,7 @@ class MultiAgencyDemo:
             Output(_TIMELINE_GRAPH, "figure"),
             Output(_DETAIL_IFRAME, "srcDoc"),
             Output(_GRAPH_GRAPH, "figure"),
-            Output(_STREAMS_IFRAME, "srcDoc"),
+            Output(_STREAMS_PANEL, "children"),
             Output(_SENSOR_GRAPH, "figure"),
             Output(_SENSOR_DETAILS, "style"),
             Input(_TICK_INTERVAL_ID, "n_intervals"),
@@ -419,18 +427,6 @@ class MultiAgencyDemo:
             iface.tick()
             tel = iface.telemetry()
             states = scenario.peer_states
-            any_onboarding = any(
-                s == PeerState.PENDING for s in states.values())
-            any_detected = any(
-                s in (PeerState.DETECTED, PeerState.EXCLUDED)
-                for s in states.values())
-            any_excluded = any(
-                s == PeerState.EXCLUDED for s in states.values())
-            label, css = classify_status(
-                has_compromise_detected=any_detected,
-                has_rogue_excluded=any_excluded,
-                any_peer_onboarding=any_onboarding,
-            )
 
             clock = format_clock(tel.scenario_time)
             phase_str = format_phase(tel.current_phase_idx,
@@ -508,13 +504,13 @@ class MultiAgencyDemo:
             )
             graph_fig.update_layout(uirevision="demo-graph")
             demo._update_streams(tel.scenario_time, states)
-            streams_html = demo._streams_panel.to_html(height="100%")
+            streams_children = demo._streams_panel.to_dash_children()
 
-            return (clock, phase_str, label, css, keystats_children,
+            return (clock, phase_str, keystats_children,
                     log_children, nchildren, nstyle,
                     play_icon, time_label, progress_style,
                     map_fig, timeline_fig, detail_html,
-                    graph_fig, streams_html,
+                    graph_fig, streams_children,
                     sensor_fig, sensor_style)
 
         @self._dash.callback(

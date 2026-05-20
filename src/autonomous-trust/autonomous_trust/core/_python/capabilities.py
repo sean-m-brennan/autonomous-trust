@@ -43,7 +43,14 @@ class Capability(Configuration):
         return self.name == other.name
 
     def to_dict(self):
-        return dict(name=self.name)  # TODO more info
+        # Intentionally minimal — `to_dict` is for log/repr surfaces; the
+        # cross-impl wire form is the protobuf `Capability` message
+        # (capabilities.proto / sync_to_message). `arg_names` and
+        # `keywords` are runtime-only fields cleared by sync_from_message,
+        # so they have no meaningful serialized representation. See
+        # divergence.md H15 (re-audit) for the unified C-side equivalent
+        # via `capability_t.arguments`.
+        return dict(name=self.name)
 
     def sync_to_message(self):
         self.message.name = self.name

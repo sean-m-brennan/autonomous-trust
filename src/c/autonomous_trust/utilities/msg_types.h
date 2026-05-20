@@ -62,8 +62,12 @@ typedef enum {
 typedef struct
 {
     char process[PROC_NAME_LEN+1];
-    char *function;  //??
-    uint8_t *obj;  // FIXME protobuf obj member, needs max size
+    char *function;
+    /* Heap-allocated payload + explicit length. Wire-side cap is
+     * `NET_MSG_MAX_DATA = 1 MB` (see `net_message.h:31`); the
+     * transport rejects oversized envelopes before they reach this
+     * struct, so callers can treat `len` as already-bounded. */
+    uint8_t *obj;
     size_t len;
     public_identity_t to_whom;
     public_identity_t from_whom;

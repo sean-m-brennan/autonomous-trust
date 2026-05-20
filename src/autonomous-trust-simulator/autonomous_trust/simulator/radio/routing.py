@@ -184,7 +184,15 @@ class Router(net.Client):
                 if peer not in self.all_peers:
                     self.all_peers.append(peer)
 
-                for chain in ['POSTROUTING']:  # FIXME 'PREROUTING'??
+                # OS-level deferred: consider also installing
+                # rate-limit rules on the PREROUTING chain. Today we
+                # only attach to POSTROUTING, so traffic is shaped on
+                # egress; PREROUTING would let us shape ingress before
+                # policy routing kicks in. Requires nontrivial
+                # Netfilter ordering analysis — confirm the rule set
+                # won't conflict with the existing OUTPUT/INPUT
+                # branches below.
+                for chain in ['POSTROUTING']:
                     if not self.chain_available(chain):
                         self.iptables('-N %s' % chain)
                         if chain.startswith('PRE'):
