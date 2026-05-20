@@ -41,6 +41,7 @@ from .history import IdentityObj
 from .protocol import IdentityProtocol
 from ..structures.dag import LinkedStep
 from ..system import CfgIds, encoding, PackageHash, now
+from .. import _probes
 
 
 VoteData = tuple[IdentityObj, AgreementProof, tuple[bytes, bytes]]
@@ -63,6 +64,18 @@ class IdentityProcess(Process, metaclass=ProcMeta,
 
     def __init__(self, configurations, subsystems, log_q, **kwargs):
         super().__init__(configurations, subsystems, log_q, dependencies=[CfgIds.network], **kwargs)
+        # Optional override of the choose_group bootstrap window. The
+        # default 5s is fine for the bootstrap node of a fresh group, but
+        # late joiners that need an existing group's history to arrive
+        # over UDP broadcast (e.g. an observer container coming up beside
+        # an already-running peer mesh) routinely lose the race and end
+        # up self-grouping. Set AT_INIT_TIMEOUT_SEC on those containers.
+        try:
+            override = float(os.environ.get('AT_INIT_TIMEOUT_SEC', '0'))
+            if override > 0:
+                self.init_timeout = override
+        except (TypeError, ValueError):
+            pass
         self.identity = configurations[self.cfg_name]
         self.protocol = IdentityProtocol(self.name, self.logger, configurations)
         self.peers = self.protocol.peers
@@ -83,7 +96,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             raise RuntimeError('Invalid identity history implementation: %s' % impl)
         self.messages: list[Message] = []
         self.border_guard_mode = True
-        self.histories: list[tuple[Group, list[LinkedStep]]] = []
+        # 3-tuple: (group, history-steps, peer-identities). The peer
+        # list rides along to seed self.peers with welcomer-known peers
+        # whose admission confirm broadcasts predated our join. Older
+        # sender versions send a 2-tuple; choose_group() tolerates both.
+        self.histories: list[tuple] = []
         self.package_hash = self.configs[PackageHash.key]
         self.choosing = False
         self.peer_potentials = {}
@@ -118,10 +135,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         else:
                             json.dump((obj[0], obj[1]), cfg, cls=ConfigJSONEncoder, indent=2)
                     self.update(obj[0], queues)
-                    try:
-                        self.update(obj[1], queues)
-                    except Exception as broadcast_err:
-                        self.logger.warning('Failed to broadcast group history: %s' % broadcast_err)
+                    # The history (obj[1]) is intentionally NOT broadcast.
+                    # protocol.run_message_handlers has no isinstance branch
+                    # for IdentityHistory / IdentityByAuthority, so every
+                    # consumer logs "Unhandled message of type
+                    # IdentityByAuthority" and discards it. The history is
+                    # already persisted to disk above for any process that
+                    # needs to reload it.
         except Exception as err:
             self.logger.error('Error saving %s for %s: %s' % (name, obj.__class__.__name__, err))
             try:
@@ -133,7 +153,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     def _record_group(self, queues):
         if self.group is None:
             return
-        self.logger.debug('Add group')
+        # Demoted to verbose: every peer-acceptance triggers _add_peer →
+        # _record_group, which cascades log lines O(N²) across the mesh.
+        # The meaningful event ("Process accepted peer:") is logged by
+        # _peer_accepted at debug level, which is enough.
+        self.logger.verbose('Add group')
         self._remember_activity(queues, CfgIds.group, (self.group, self._history))
 
     def _record_peers(self, queues):
@@ -202,10 +226,32 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     elif (now() - history_seen_at).total_seconds() >= grace:
                         break
                 time.sleep(self.cadence)
+            # accepted is (group, steps) — group/steps come from the
+            # one chosen welcomer (longest history wins). Peer
+            # identities, however, are unioned across ALL received
+            # histories so we don't miss peers any one welcomer
+            # happens to be unaware of (each welcomer's peer view can
+            # be partial due to admit-time confirm propagation gaps).
             accepted: tuple[Optional[Group], Optional[list[LinkedStep]]] = None, None
+            unioned_peers: dict = {}  # uuid_str -> Identity
 
             self.logger.debug('%d histories' % len(self.histories))
-            for group, steps in self.histories:
+            for hist_tpl in self.histories:
+                # Tolerate 2-tuple (legacy) and 3-tuple (group, steps,
+                # peer_idents) wire shapes.
+                if len(hist_tpl) >= 3:
+                    group, steps, peer_idents = hist_tpl[0], hist_tpl[1], hist_tpl[2]
+                else:
+                    group, steps = hist_tpl[0], hist_tpl[1]
+                    peer_idents = None
+                # Merge peer identities from every history that arrived
+                # — even ones we won't pick for our group/DAG — so the
+                # peer set is the union of what all welcomers saw.
+                if peer_idents:
+                    for ident in peer_idents:
+                        uuid = getattr(ident, 'uuid', None)
+                        if uuid is not None:
+                            unioned_peers.setdefault(str(uuid), ident)
                 if not steps:
                     continue
                 if CfgIds.group in self.configs and self.configs[CfgIds.group] == group:
@@ -221,10 +267,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.group, hist = accepted
                     self.logger.debug('Updated group key')
                     self._record_group(queues)
-                    # TODO: Peers are not synced alongside history. When receiving a
-                    # history from another peer, we get DAG steps (merkle root digests)
-                    # but not the actual peer identities behind them. Need to request
-                    # peer data separately or embed peer info in the history exchange.
+                    self._populate_peers_from_history(
+                        queues, list(unioned_peers.values()))
                     existing = hist
                     diff: list[LinkedStep] = self._history.catch_up(existing)
                     msg_str = to_json_string(diff)  # to self.handle_history_diff()
@@ -247,7 +291,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         self.logger.debug('No history/group key: generate my own.')
                         self.group = Group.initialize({self.identity.uuid: self.identity.address},
                                                       names.random_name())
-                    self.logger.debug('Generated group: %s', self.group.nickname)
+                    self.logger.debug('Generated group: %s' % self.group.nickname)
                     self._record_group(queues)
             except Full:
                 self.logger.error('choose_group: Network queue full')
@@ -268,6 +312,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if message.function == IdentityProtocol.history:
             self.logger.debug('Received existing history')
             hist_tpl = from_json_string(message.obj)  # from self._peer_accepted()
+            shape = ('3tuple' if isinstance(hist_tpl, (list, tuple))
+                     and len(hist_tpl) >= 3 else '2tuple')
+            _probes.counter('id.receive_history', 'arrived', shape)
             with self.lock:
                 self.histories.append(hist_tpl)  # see choose_group
             if not self.choosing:
@@ -334,25 +381,36 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=blob.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
-        # send group key + history so peer can decrypt future group messages;  to self.receive_history()
-        msg_str = to_json_string((self.group, self._history.recite()))
+        # send group key + history + my peer set so the new peer can
+        # decrypt future group messages AND populate identities for the
+        # peers I already admitted (otherwise it never receives confirm
+        # broadcasts for those peers — see project_inspector_peer_set_gap).
+        # Peer identities are stripped of private keys via publish().
+        peers_payload = [p.publish() for p in self.peers.all]
+        msg_str = to_json_string((self.group, self._history.recite(),
+                                  peers_payload))
         message = Message(self.name, IdentityProtocol.history, msg_str, to_whom=blob.identity)
-        self.logger.debug('Send full history')
+        self.logger.debug('Send full history (+%d peer identities)' %
+                          len(peers_payload))
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
         if not amnesia:  # otherwise, already in listings
             # add to group and peer list (after history is queued, so peer
             # receives the group key before any group-encrypted messages)
+            _probes.emit('peer.set', 'add_request',
+                         peer_uuid=str(blob.identity.uuid),
+                         peer_addr=getattr(blob.identity, 'address', None),
+                         source='peer_accepted')
             self._add_peer(queues, blob.identity, amnesia)
 
     def welcoming_committee(self, queues, message):
         """
-        Handle incoming newbies
-        :param queues: Interprocess communication queues
-        :param message: The new Identity
-        :return: bool (message handled)
+        Handle incoming newbies. Every peer in phase 3 caches the
+        announcement (so handle_confirm_peer can later add the peer
+        when the admission broadcast arrives). Only border-guards
+        drive the vote/broadcast/welcome cycle.
         """
-        if self.phase != 3 or not self.border_guard_mode:
+        if self.phase != 3:
             return False
         if message.function == IdentityProtocol.announce:
             try:
@@ -367,16 +425,23 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 existing = self.peers.find_by_uuid(new_id.uuid)
                 if new_id == existing:  # don't care if it's a different address
                     self.logger.debug('Amnesiac peer: %s' % new_id.nickname)
-                    self._peer_accepted(queues, id_obj, amnesia=True)
+                    if self.border_guard_mode:
+                        self._peer_accepted(queues, id_obj, amnesia=True)
                     return True
 
                 self.logger.debug('Received new identity: %s - %s - %s' % (new_id.nickname, new_id.address, new_id.uuid))
-                with self.lock:
-                    self.peer_potentials[new_id.uuid] = caps
-
                 if not id_obj.validate():
                     self.logger.warning('Invalid identity object from %s' % new_id.nickname)
                     return True
+                # Cache the announcement on every peer (regardless of
+                # border_guard_mode). Without this, non-welcomers later
+                # silent-drop the peer_accepted broadcast in
+                # handle_confirm_peer because peer.uuid is not in
+                # peer_potentials.
+                with self.lock:
+                    self.peer_potentials[new_id.uuid] = caps
+                if not self.border_guard_mode:
+                    return True  # cache-only path; voting is welcomers' job
                 threading.Thread(target=self._vote_collection,
                                  args=(queues, id_obj), daemon=True).start()
                 msg_str = id_obj.to_string()  # to self.handle_vote_on_peer()
@@ -393,6 +458,102 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             message = Message(self.name, IdentityProtocol.update, grp_msg, to_whom=to_peer)
             queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
             self.logger.debug('Sent group %s to %s (%s)' % (group.nickname, to_peer.nickname, to_peer.address))
+
+    def _populate_peers_from_history(self, queues, peer_idents):
+        """Seed self.peers from a welcomer's bundled peer list.
+
+        Late joiners never receive the confirm broadcasts for peers
+        admitted before they joined — admit-time `_peer_accepted`
+        targets the welcomer's group at that moment. _peer_accepted
+        therefore now includes a peer-identity payload alongside the
+        history; this helper merges those into self.peers.
+
+        We deliberately do NOT call `_add_peer` here because:
+          * `self._history.catch_up` (the caller) already adopted the
+            welcomer's history DAG, which contains an admission step
+            for each of these peers. `_history.insert_peer` would
+            double-write.
+          * `self.group` was just replaced with the welcomer's group,
+            which already lists these peers; `_add_peer` would re-emit
+            address-add side effects.
+
+        Capabilities are not part of the history bundle (would balloon
+        wire size); peer_capabilities entries for these peers stay
+        absent until the normal `peer-capabilities` broadcasts catch
+        up. Reputation/messaging works without them.
+
+        After populating, calls `_announce_self_to_bundled_peers` so
+        the bundled peers learn about us — without this, the symmetry
+        breaks: we know them but they don't know us, and our encrypted
+        messages to them can't be decrypted (find_by_address fails →
+        unknown-sender path → defer → mystery-handler timeout → drop).
+        """
+        if not peer_idents:
+            return
+        newly_added = []
+        for ident in peer_idents:
+            if ident is None:
+                continue
+            uuid = getattr(ident, 'uuid', None)
+            if uuid is None:
+                continue
+            if str(uuid) == str(self.identity.uuid):
+                continue
+            if self.peers.find_by_uuid(uuid) is not None:
+                continue
+            self.peers.add(ident)
+            _probes.emit('peer.set', 'add_request',
+                         peer_uuid=str(uuid),
+                         peer_addr=getattr(ident, 'address', None),
+                         source='history_bundle')
+            newly_added.append(ident)
+        if newly_added:
+            self._record_peers(queues)
+            self.logger.debug('History bundle: added %d previously '
+                              'unknown peer identities' % len(newly_added))
+            self._announce_self_to_bundled_peers(queues, newly_added)
+
+    def _announce_self_to_bundled_peers(self, queues, peer_idents):
+        """Send `identity:accept` (containing self) to each peer
+        learned via the history bundle.
+
+        Mirrors the welcomer's accept payload format
+        (`(self.identity.publish(), self.package_hash,
+        self.capabilities.to_list())`) so the receivers' existing
+        `handle_acceptance` adds us to their peer list. The package
+        hash check on their side is the security gate.
+
+        Without this, only welcomers (the few peers that voted on us
+        at announce time) ever add us; everyone else stays in the
+        unknown-sender path for our encrypted traffic and silently
+        defers/drops it via the mystery-handler.
+        """
+        if self.identity is None or self.package_hash is None:
+            return
+        try:
+            payload = to_json_string((self.identity.publish(),
+                                      self.package_hash,
+                                      self.capabilities.to_list()))
+        except Exception as err:
+            self.logger.error(
+                '_announce_self_to_bundled_peers: payload build failed: %s' % err)
+            return
+        sent = 0
+        for peer in peer_idents:
+            try:
+                message = Message(self.name, IdentityProtocol.accept,
+                                  payload, to_whom=peer, encrypt=False)
+                queues[CfgIds.network].put(
+                    message, block=True, timeout=self.q_cadence)
+                _probes.counter('peer.set', 'self_announce', 'sent')
+                sent += 1
+            except Full:
+                _probes.counter('peer.set', 'self_announce', 'queue_full')
+                self.logger.error(
+                    '_announce_self_to_bundled_peers: Network queue full')
+        if sent:
+            self.logger.debug(
+                'Announced self to %d bundled peers' % sent)
 
     def _add_peer(self, queues, identity, amnesia=False):
         # TODO: Use 'amnesia' parameter — when True, treat this peer as if
@@ -506,6 +667,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 return True
             with self.lock:
                 self.peer_potentials[ident.uuid] = caps
+            _probes.emit('peer.set', 'add_request',
+                         peer_uuid=str(ident.uuid),
+                         peer_addr=getattr(ident, 'address', None),
+                         source='handle_acceptance')
             self._add_peer(queues, ident)
             return True
         return False
@@ -525,11 +690,26 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if isinstance(blob, str):
                 blob = Configuration.from_string(blob)
             if hasattr(blob, 'validate') and not blob.validate():
+                _probes.counter('peer.set', 'silent_drop', 'invalid_blob')
                 self.logger.warning('Invalid peer confirmation blob')
                 return True
             peer = blob.identity if hasattr(blob, 'identity') else blob
+            # Note: peer_potentials membership was previously a hard gate here.
+            # It was redundant — blob.validate() already checked authenticity,
+            # the confirm broadcast comes from a trusted group member, and the
+            # gate fought UDP loss of the prior announcement multicast.
+            # We now proceed unconditionally and emit a probe when the prior
+            # potential is missing, so the announcement-loss rate is still
+            # observable.
             if peer.uuid not in self.peer_potentials:
-                return True
+                _probes.counter('peer.set', 'no_prior_potential')
+                _probes.emit('peer.set', 'no_prior_potential',
+                             peer_uuid=str(peer.uuid),
+                             peer_addr=getattr(peer, 'address', None))
+            _probes.emit('peer.set', 'add_request',
+                         peer_uuid=str(peer.uuid),
+                         peer_addr=getattr(peer, 'address', None),
+                         source='handle_confirm_peer')
             self._add_peer(queues, peer)
             return True
         return False

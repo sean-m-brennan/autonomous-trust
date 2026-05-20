@@ -40,7 +40,12 @@ ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 
 # Network tools + C build toolchain
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
+# AllowInsecure / --allow-unauthenticated tolerate transient apt
+# InRelease "not live until" timestamps when the host clock is earlier
+# than Debian's daily resign cycle. Harmless for a dev image fetched
+# behind an HTTPS proxy.
+RUN (apt-get update -y -o Acquire::AllowInsecureRepositories=true || true) && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
         iproute2 iputils-ping \
         cmake clang make pkg-config \
         uuid-dev libsodium-dev libjansson-dev \
@@ -54,10 +59,11 @@ ENTRYPOINT ["/bin/entrypoint.sh"]
 COPY src/autonomous-trust/requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt && pip install protobuf cffi
 
-# Build C library (src/c/protobuf is a symlink to src/protobuf — copy real dir separately)
+# Build C library. CMake expects protobuf as a sibling of c-src:
+# ${CMAKE_CURRENT_SOURCE_DIR}/../protobuf
 ARG GIT_VERSION="unknown"
 COPY src/c /app/c-src
-COPY src/protobuf /app/c-src/protobuf
+COPY src/protobuf /app/protobuf
 RUN rm -rf /app/c-src/build && mkdir -p /app/c-src/build && cd /app/c-src/build && \
     CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DREVISION="$GIT_VERSION" && \
     make -j$(nproc) && \

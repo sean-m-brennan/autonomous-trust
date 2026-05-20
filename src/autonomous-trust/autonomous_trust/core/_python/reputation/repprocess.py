@@ -28,6 +28,7 @@ from ..config import Configuration, from_json_string, to_json_string
 from .protocol import ReputationProtocol
 from .reputation import TransactionHistory, Reputation, Reputations, TransactionScore
 from ..system import CfgIds, now, encoding
+from .. import _probes
 
 
 @dataclass
@@ -336,6 +337,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # TODO can we use the transaction memory to do better than CTFT before reputation kicks in?
 
     def _compute_reputation(self, peer, req_proc, requestor):
+        _probes.counter('rep.compute', 'enter')
         try:
             peer_uuid = peer if isinstance(peer, UUID) else peer.uuid
             previous = 0.0
@@ -354,7 +356,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             except (OSError, IOError) as e:
                 self.logger.warning('Could not persist reputations: %s' % e)
             self.requested_reps.append((Reputation(peer_uuid, rep_score), req_proc, requestor))
+            _probes.counter('rep.compute', 'queued')
         except Exception as e:
+            _probes.counter('rep.compute', 'exception', type(e).__name__)
             self.logger.warning('_compute_reputation failed: %s' % e)
 
     def handle_reputation_request(self, _, message):
@@ -363,8 +367,24 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 ident, req_proc = from_json_string(message.obj)
             else:
                 ident, req_proc = message.obj
+            requestor = message.from_whom
+            # Tag the requestor type so we can correlate
+            # rep.handle_req with rep.compute and rep.forward.
+            if requestor is None:
+                _probes.counter('rep.handle_req', 'enter', 'requestor_none')
+            elif isinstance(requestor, str):
+                _probes.counter('rep.handle_req', 'enter', 'requestor_str')
+            else:
+                req_uuid = getattr(requestor, 'uuid', None)
+                if req_uuid is None:
+                    _probes.counter('rep.handle_req', 'enter',
+                                    'no_uuid:' + type(requestor).__name__)
+                elif str(req_uuid) == str(self.identity.uuid):
+                    _probes.counter('rep.handle_req', 'enter', 'requestor_self')
+                else:
+                    _probes.counter('rep.handle_req', 'enter', 'requestor_other')
             threading.Thread(target=self._compute_reputation,
-                             args=(ident, req_proc, message.from_whom), daemon=True).start()
+                             args=(ident, req_proc, requestor), daemon=True).start()
             return True
         return False
 
@@ -373,25 +393,79 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             reputation, req_proc, requestor = self.requested_reps.pop(0)
             self.logger.debug('Forward reps to %s at %s' % (req_proc, requestor))
             try:
-                msg = Message(req_proc, ReputationProtocol.rep_resp, reputation, requestor)
-                queues[req_proc].put(msg, block=True, timeout=self.q_cadence)
+                # Route the rep_resp back where the rep_req came from.
+                # If the requestor is a remote Identity (e.g. an Inspector
+                # bridge issuing peer-to-peer rep_req over the network),
+                # the response must traverse the network too — the
+                # original code put the response on the LOCAL `main`
+                # queue, where it was absorbed by this peer's own AT
+                # main loop and never left the responder. For local
+                # (loopback) requests, requestor is None or our own
+                # identity, and the historical local-queue path is fine.
+                msg = Message(req_proc, ReputationProtocol.rep_resp,
+                              reputation, requestor, from_whom=self.identity)
+                if (requestor is not None
+                        and getattr(requestor, 'uuid', None) is not None
+                        and str(requestor.uuid) != str(self.identity.uuid)):
+                    _probes.counter('rep.forward', 'route_network')
+                    queues[CfgIds.network].put(
+                        msg, block=True, timeout=self.q_cadence)
+                else:
+                    # Local fallback. Distinguish the failure modes so we
+                    # can tell "stranger sender lost on wire" (string IP
+                    # requestor — Change-3 territory) from a genuine
+                    # loopback rep_req.
+                    if requestor is None:
+                        _probes.counter('rep.forward', 'route_local', 'requestor_none')
+                    elif isinstance(requestor, str):
+                        _probes.counter('rep.forward', 'route_local', 'requestor_str')
+                    elif getattr(requestor, 'uuid', None) is None:
+                        _probes.counter('rep.forward', 'route_local',
+                                        'no_uuid:' + type(requestor).__name__)
+                    elif str(requestor.uuid) == str(self.identity.uuid):
+                        _probes.counter('rep.forward', 'route_local', 'self')
+                    else:
+                        _probes.counter('rep.forward', 'route_local', 'other')
+                    queues[req_proc].put(
+                        msg, block=True, timeout=self.q_cadence)
             except Full:
                 self.logger.error('forward_reputation: %s queue full' % req_proc)
 
     def process(self, queues, signal):
+        # Drain budget per iter. Each handle_reputation_request spawns
+        # a short-lived thread, so processing many per iter is cheap
+        # and lets us stay ahead of inbound rep_req volume. The hard
+        # cap prevents one process from monopolizing the GIL when the
+        # queue is deeply backlogged.
+        DRAIN_BUDGET = 64
         while self.keep_running(signal):
             try:
-                try:
-                    message = queues[self.name].get(block=True, timeout=self.q_cadence)
-                except Empty:
-                    message = None
-                if message:
+                drained = 0
+                # First iteration blocks briefly so we don't hot-spin
+                # when the queue is empty; subsequent iterations are
+                # non-blocking so we drain bursts immediately.
+                first = True
+                while drained < DRAIN_BUDGET:
+                    try:
+                        if first:
+                            message = queues[self.name].get(
+                                block=True, timeout=self.q_cadence)
+                            first = False
+                        else:
+                            message = queues[self.name].get_nowait()
+                    except Empty:
+                        break
+                    drained += 1
                     if not self.protocol.run_message_handlers(queues, message):
                         if not self.forward_transaction(queues, message):
                             if isinstance(message, Message):
+                                _probes.counter('proc.reputation', 'unhandled', message.function)
+                                _probes.trace_msg(message, 'unhandled', proc='reputation')
                                 self.logger.error('Unhandled message %s' % message.function)
                             else:
+                                _probes.counter('proc.reputation', 'unhandled', 'type:' + message.__class__.__name__)
                                 self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                _probes.counter('proc.reputation', 'iter_drained', str(drained))
                 self.forward_reputation(queues)
 
                 present = now().timestamp()
@@ -401,8 +475,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 for prop in dict(self.proposals):
                     if present - prop[0] > self.expiration:
                         del self.proposals[prop]
-
-                self.sleep_until(self.cadence)
+                # No sleep_until here: removing the 0.5 s cadence
+                # throttle was the whole point. Pacing is already
+                # provided by queue.get's q_cadence-second blocking
+                # timeout when no work is pending.
             except Exception as err:
                 self.logger.error(err)
                 self.logger.error(traceback.format_exc())

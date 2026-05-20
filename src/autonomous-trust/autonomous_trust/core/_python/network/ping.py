@@ -72,6 +72,12 @@ class PingServer(threading.Thread):
         self.logger = logger
         if logger is None:
             self.logger = logging.getLogger()
+        # Use global setdefaulttimeout, not per-socket settimeout —
+        # Python 3.13's settimeout(positive) leaves the socket in
+        # non-blocking mode (recvfrom raises BlockingIOError immediately).
+        # The 0.1s default was already set by NetworkProcess.__init__,
+        # so this is mostly a no-op safety net for direct PingServer
+        # instantiation outside the AT runtime.
         timeout = 0.1
         socket.setdefaulttimeout(timeout)
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)

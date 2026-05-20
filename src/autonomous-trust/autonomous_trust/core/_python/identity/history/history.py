@@ -176,8 +176,37 @@ class IdentityHistory(StepDAG, VoterTracker):
             self.logger.debug('Identity validation failed')
             return False
         if sig is not None and proof is not None:
+            # The signature was made by the *voter* (proof.uuid), not by
+            # the subject (blob.identity). Look up the voter — either
+            # ourselves or a known peer. Cf. the parallel lookup at
+            # IdentityHistory._pre_verify above.
+            voter = None
+            myself = getattr(self, 'myself', None)
+            if myself is not None and myself.uuid == proof.uuid:
+                voter = myself
+            elif self._peers is not None:
+                voter = self._peers.find_by_uuid(proof.uuid)
+            if voter is None:
+                self.logger.warning(
+                    f'Unknown voter {proof.uuid} for proof on '
+                    f'{blob.identity.nickname}')
+                return False
+            # _process_id stores the vote signature as a (msg, sig)
+            # tuple, where both are HexEncoder-encoded by Identity.sign
+            # (msg = hex of proof.to_string().encode(); sig = hex of the
+            # 64-byte raw signature). PyNaCl's VerifyKey.verify expects
+            # either a single SignedMessage (signature+message
+            # concatenated) or msg+raw-signature — but with HexEncoder
+            # it only decodes the smessage, not a separately-passed
+            # signature. Reconstructing signature+message gives the
+            # SignedMessage form that round-trips correctly.
+            if isinstance(sig, tuple) and len(sig) == 2:
+                sig_msg, sig_signature = sig
+                smessage = sig_signature + sig_msg
+            else:
+                smessage = sig
             try:
-                blob.identity.verify(bytes(proof), sig)
+                voter.verify(smessage)
             except (BadSignatureError, Exception) as e:
                 self.logger.warning(f'Signature verification failed: {e}')
                 return False
