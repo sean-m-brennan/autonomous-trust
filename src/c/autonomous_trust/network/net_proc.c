@@ -53,6 +53,88 @@
 #endif
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
+#include "structures/map.h"
+#include "structures/data.h"
+
+/* Group partition recovery — drop-site signal to IdentityProcess.
+ *   See doc/architecture/partition-recovery.md §5.1 and the matching
+ *   id_proc.c side. The string MUST match id_proc.c's
+ *   ID_PARTITION_SIGNAL[] (which mirrors Python
+ *   IdentityProtocol.partition_signal). Drift between the two breaks
+ *   dispatch silently. */
+static char NET_ID_PARTITION_SIGNAL[] = "partition_signal";
+
+/* Per-from-addr last-signal-timestamp (CLOCK_MONOTONIC microseconds,
+ * truncated to seconds for `integer_data` compatibility). 5s cooldown
+ * per address keeps the identity queue clear under a chatty foreign
+ * group. The map is initialized lazily on first use. */
+static struct {
+    map_t cooldown;
+    bool inited;
+    pthread_mutex_t lock;
+} _net_partition_signal_state = {
+    .inited = false,
+};
+
+static void _net_partition_signal_init_once(void)
+{
+    if (!_net_partition_signal_state.inited) {
+        map_init(&_net_partition_signal_state.cooldown);
+        pthread_mutex_init(&_net_partition_signal_state.lock, NULL);
+        _net_partition_signal_state.inited = true;
+    }
+}
+
+/* Forward a partition-recovery signal to IdentityProcess. Rate-limited
+ * at one signal per `from_addr` per 5 seconds. Called from the group-
+ * channel drop site (group_decrypt failure) — same role as Python's
+ * NetProcess._signal_partition. */
+static void _net_signal_partition(net_thread_ctx_t *ctx, const char *from_addr)
+{
+    if (ctx == NULL || from_addr == NULL || from_addr[0] == '\0') return;
+    _net_partition_signal_init_once();
+
+    /* 5s cooldown lookup. */
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return;
+    int64_t now_s = (int64_t)ts.tv_sec;
+
+    pthread_mutex_lock(&_net_partition_signal_state.lock);
+    data_t *prev = NULL;
+    if (map_get(&_net_partition_signal_state.cooldown,
+                (map_key_t)from_addr, &prev) == 0 && prev != NULL) {
+        int prev_s = 0;
+        if (data_integer(prev, &prev_s) == 0 && now_s - prev_s < 5) {
+            pthread_mutex_unlock(&_net_partition_signal_state.lock);
+            return;
+        }
+    }
+    char key_buf[64];
+    snprintf(key_buf, sizeof(key_buf), "%s", from_addr);
+    data_t *now_dat = integer_data((int)now_s);
+    if (now_dat != NULL)
+        map_set(&_net_partition_signal_state.cooldown, key_buf, now_dat);
+    pthread_mutex_unlock(&_net_partition_signal_state.lock);
+
+    /* Build a Message-like envelope with the from_addr as a JSON
+     * string payload. */
+    generic_msg_t sig = {0};
+    sig.type = NET_MESSAGE;
+    strncpy(sig.info.net_msg.process, "identity", PROC_NAME_LEN);
+    sig.info.net_msg.function = NET_ID_PARTITION_SIGNAL;
+    sig.info.net_msg.encrypt = false;
+    json_t *body = json_string(from_addr);
+    if (body != NULL) {
+        net_msg_pack_json(&sig.info.net_msg, body);
+        json_decref(body);
+        int rc = messaging_send("identity", NET_MESSAGE, &sig, false);
+        if (rc != 0) {
+            log_debug(ctx->logger,
+                      "Network: partition_signal: messaging_send failed (%d)\n",
+                      rc);
+        }
+    }
+}
 #include "identity/group.h"
 #include "structures/data.h"
 #include "structures/array.h"
@@ -1304,6 +1386,15 @@ void handle_inbound_group(net_thread_ctx_t *ctx,
     } else {
         log_error(ctx->logger, "Network: group decrypt failed (%d) from %s\n",
                   dec, from_addr);
+        /* Forward a partition-recovery signal to IdentityProcess. The
+         * decrypt failure is the C analog of Python's
+         * `from_addr not in self.group.addresses`: in both cases we've
+         * received traffic from a peer who is not (currently) part of
+         * our group. IdentityProcess will rate-limit + emit a
+         * `partition_probe` and, on a response, initiate a normal
+         * request_access to absorb the foreign group. See
+         * doc/architecture/partition-recovery.md §5.1. */
+        _net_signal_partition(ctx, from_addr);
     }
     free(plain);
 }
