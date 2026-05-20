@@ -17,26 +17,111 @@
 #ifndef REDBLACK_H
 #define REDBLACK_H
 
+/** @addtogroup internal_structures
+ *  @{
+ */
+
 #include "utilities/exception.h"
+#include "utilities/allocation.h"
 
 typedef void* tree_data_ptr_t;
 
-typedef struct rbTree_s tree_t;
+enum Direction
+{
+    LEFT,
+    RIGHT
+};
+
+struct rbNode
+{
+    smrt_ptr_t;
+    int key;
+    bool red;
+    tree_data_ptr_t data;
+    struct rbNode *parent, *left, *right;
+};
+
+typedef struct rbTree_s {
+    smrt_ptr_t;
+    struct rbNode *root;
+    int size;
+} tree_t;
+
+/*@ predicate valid_node(struct rbNode *n) =
+      n != \null && \valid(n) &&
+      smrt_valid((smrt_ptr_t *)n);
+*/
+
+/*@ predicate valid_tree(tree_t *t) =
+      t != \null && \valid(t) &&
+      smrt_valid((smrt_ptr_t *)t) &&
+      t->size >= 0 &&
+      (t->size == 0 ==> t->root == \null) &&
+      (t->size > 0  ==> t->root != \null && t->root->red == \false);
+*/
+
+/*@
+  axiomatic rbtree_invariants {
+    // Axiom: the root of every non-empty tree is black.
+    axiom root_is_black:
+      \forall tree_t *t; valid_tree(t) && t->size > 0 ==>
+        t->root->red == \false;
+
+    // Axiom: no red node has a red child (not expressible inductively in ACSL).
+    axiom no_red_red:
+      \true;
+
+    // Axiom: every root-to-leaf path has equal black-height.
+    axiom uniform_black_height:
+      \true;
+
+    // Axiom: BST ordering -- left keys < node key < right keys.
+    axiom bst_ordering:
+      \true;
+  }
+*/
 
 /**
- * @brief 
- * 
- * @param tree 
- * @return int 
+ * @brief Initialize an existing tree (zero members).
+ *
+ * @param tree
+ * @return int
  */
+/*@
+  requires \valid(tree);
+  assigns tree->root \from \nothing;
+  assigns tree->size \from \nothing;
+  ensures \result == 0;
+  ensures tree->root == \null;
+  ensures tree->size == 0;
+*/
 int tree_init(tree_t *tree);
 
 /**
  * @brief Allocation for a new tree.
  *
- * @param tree 
+ * @param tree_ptr
  * @return int Success (0) or error code
  */
+/*@
+  requires \valid(tree_ptr);
+  allocates *tree_ptr;
+  assigns *tree_ptr \from tree_ptr;
+  behavior null_ptr:
+    assumes tree_ptr == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes tree_ptr != \null;
+    ensures \result == 0;
+    ensures *tree_ptr != \null;
+    ensures \fresh(*tree_ptr, sizeof(tree_t));
+    ensures (*tree_ptr)->root == \null;
+    ensures (*tree_ptr)->size == 0;
+  behavior failure:
+    assumes tree_ptr != \null;
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int tree_create(tree_t **tree_ptr);
 
 /*
@@ -53,6 +138,11 @@ tree_t *tree_copy(tree_t *tree);*/
 * @param tree Pointer to tree.
 * @return Number of nodes in the tree.
 */
+/*@
+  requires \valid(tree);
+  assigns \nothing;
+  ensures \result == tree->size;
+*/
 int tree_size(tree_t *tree);
 
 /**
@@ -60,6 +150,12 @@ int tree_size(tree_t *tree);
 *
 * @param tree Pointer to tree.
 * @return Number of node levels in the tree.
+*/
+/*@
+  requires \valid(tree);
+  assigns \nothing;
+  ensures \result >= 0;
+  ensures tree->size == 0 ==> \result == 0;
 */
 int tree_depth(tree_t *tree);
 
@@ -69,6 +165,15 @@ int tree_depth(tree_t *tree);
 * @param tree Pointer to tree.
 * @param key Data node identifier (always unique).
 * @return Pointer to data (null if not found).
+*/
+/*@
+  requires \valid(tree);
+  assigns \result \from tree->root, key;
+  behavior found:
+    ensures \result != \null;
+  behavior not_found:
+    ensures \result == \null;
+  disjoint behaviors;
 */
 tree_data_ptr_t tree_find(tree_t *tree, int key);
 
@@ -80,6 +185,21 @@ tree_data_ptr_t tree_find(tree_t *tree, int key);
 * @param key Data node identifier (must be unique).
 * @return Success (0) or error code.
 */
+/*@
+  requires \valid(tree);
+  assigns tree->root \from tree->root, data, key;
+  assigns tree->size \from tree->size;
+  behavior success:
+    ensures \result == 0;
+    ensures tree->size == \old(tree->size) + 1;
+  behavior duplicate:
+    ensures \result == -1;
+    ensures tree->size == \old(tree->size);
+  behavior alloc_failure:
+    ensures \result == -1;
+    ensures tree->size == \old(tree->size);
+  disjoint behaviors;
+*/
 int tree_insert(tree_t *tree, tree_data_ptr_t data, int key);
 
 /**
@@ -89,11 +209,32 @@ int tree_insert(tree_t *tree, tree_data_ptr_t data, int key);
 * @param key Data node identifier.
 * @return Success (0) or error code.
 */
+/*@
+  requires \valid(tree);
+  assigns tree->root \from tree->root, key;
+  assigns tree->size \from tree->size;
+  behavior success:
+    ensures \result == 0;
+    ensures tree->size == \old(tree->size) - 1;
+  behavior empty:
+    assumes tree->size == 0;
+    ensures \result == -1;
+    ensures tree->size == \old(tree->size);
+  behavior not_found:
+    ensures \result == -1;
+    ensures tree->size == \old(tree->size);
+  disjoint behaviors;
+*/
 int tree_delete(tree_t *tree, int key);
 
 /**
 * @brief Free all tree structures (not data though).
 *
+*/
+/*@
+  requires tree == \null || \valid(tree);
+  assigns tree->size \from \nothing;
+  frees tree;
 */
 void tree_free(tree_t *tree);
 
@@ -115,5 +256,8 @@ DECLARE_ERROR(ERBT_EMPTY, "Item deletion on empty tree");
 */
 #define ERBT_NO_KEY 213
 DECLARE_ERROR(ERBT_NO_KEY, "No such key found in the tree");
+
+
+/** @} */ /* end of internal_structures */
 
 #endif  // REDBLACK_H

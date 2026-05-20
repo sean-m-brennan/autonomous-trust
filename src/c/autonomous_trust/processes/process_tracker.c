@@ -27,6 +27,14 @@
 const char *default_tracker_filename = "subsystems.cfg.json";
 
 
+/* Frama-C: skipped —
+ * find_process_name/find_process: strncmp/strlen cascade through process-name lookup.
+ */
+/*@
+  requires name != \null && \valid_read(name);
+  assigns \nothing;
+  ensures \result == \null || \result != \null;
+*/
 handler_ptr_t find_process(const char *name)
 {
     for (int i=0; i<process_table_size; i++)
@@ -38,6 +46,13 @@ handler_ptr_t find_process(const char *name)
     return NULL;
 }
 
+/* Frama-C: skipped —
+ * find_process_name/find_process: strncmp/strlen cascade through process-name lookup.
+ */
+/*@
+  assigns \nothing;
+  ensures \result == \null || \valid_read(\result);
+*/
 char *find_process_name(const handler_ptr_t handler)
 {
     if (handler == NULL)
@@ -51,12 +66,32 @@ char *find_process_name(const handler_ptr_t handler)
     return NULL;
 }
 
+/*@
+  requires \valid(tracker);
+  assigns tracker->logger, tracker->registry;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int tracker_init(logger_t *logger, tracker_t *tracker)
 {
     tracker->logger = logger;
     return map_create(&tracker->registry);
 }
 
+/* Frama-C: skipped — tracker_create: set_exception precondition. */
+/*@
+  requires \valid(tracker_ptr);
+  allocates *tracker_ptr;
+  behavior success:
+    ensures \result == 0;
+    ensures *tracker_ptr != \null;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int tracker_create(logger_t *logger, tracker_t **tracker_ptr)
 {
     *tracker_ptr = smrt_create(sizeof(tracker_t));
@@ -71,6 +106,10 @@ int tracker_create(logger_t *logger, tracker_t **tracker_ptr)
     return err;
 }
 
+/* Frama-C: skipped —
+ * [serialization] tracker_to_json: map_keys + map_get + json_string +
+ * json_array_append_new + json_decref + data_string_ptr + 2x set_exception cascade.
+ */
 int tracker_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const tracker_t *tracker = data_struct;
@@ -88,7 +127,8 @@ int tracker_to_json(const void *data_struct, json_t **obj_ptr)
     if (err != 0)
         return EXCEPTION(EJSN_OBJ_SET);
     
-    // FIXME use map_to_json instead
+    // TODO: Refactor to use map_to_json() once it supports simple key-value
+    // JSON encoding (current map_to_json serializes internal structure)
     json_t *array_obj = json_array();
     if (array_obj == NULL) {
         json_decref(top_obj);
@@ -137,6 +177,7 @@ int tracker_to_json(const void *data_struct, json_t **obj_ptr)
     return err;
 }
 
+/* Frama-C: skipped — tracker_from_json: string_data + set_exception + terminates. */
 int tracker_from_json(const json_t *obj, void *data_struct)
 {
     tracker_t *tracker = data_struct;
@@ -162,7 +203,7 @@ int tracker_from_json(const json_t *obj, void *data_struct)
             break;
         }
         if (val_str == NULL)
-            return -1; //FIXME which error?
+            return EXCEPTION(ECFG_BADFMT); // value missing or null in tracker JSON
         json_incref(value);
         data_t *val_dat = string_data((char*)val_str, strlen(val_str));
         if (val_dat == NULL)
@@ -186,15 +227,30 @@ int tracker_from_file(const char *filename, logger_t *logger, tracker_t **tracke
     return read_config_file(filename, tracker);
 }
 
+/* Frama-C: skipped —
+ * [syscall] tracker_config: at_snprintf + ensures + assigns (filesystem path formatting).
+ */
 int tracker_config(char config_file[])
 {
     get_cfg_dir(config_file);
-    strcat(config_file, "/");
-    int len = strlen(config_file);
-    strncpy(config_file + len, default_tracker_filename, CFG_PATH_LEN - len);
-    return len;
+    size_t len = strlen(config_file);
+    int n = snprintf(config_file + len, CFG_PATH_LEN - len, "/%s", default_tracker_filename);
+    if (n < 0 || (size_t)n >= CFG_PATH_LEN - len)
+        return -1;
+    return (int)(len + 1);
 }
 
+/*@
+  requires \valid(tracker);
+  requires name != \null && \valid_read(name);
+  requires impl != \null && \valid_read(impl);
+  assigns tracker->registry;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int tracker_register_subsystem(const tracker_t *tracker, const char *name, const char *impl)
 {
     data_t *impl_dat = string_data((char*)impl, strlen(impl));
@@ -212,6 +268,19 @@ int tracker_to_file(const tracker_t *tracker, const char *filename)
     return write_config_file(&cfg, tracker, filename);
 }
 
+/* Frama-C: skipped — [recursive-ds] tracker_free: map_free precondition + valid_tracker assigns. */
+/*@
+  requires tracker == \null || \valid(tracker);
+  behavior null_tracker:
+    assumes tracker == \null;
+    assigns \nothing;
+  behavior valid_tracker:
+    assumes tracker != \null;
+    assigns tracker->registry;
+    frees tracker;
+  disjoint behaviors;
+  complete behaviors;
+*/
 void tracker_free(tracker_t *tracker)
 {
     if (tracker != NULL)

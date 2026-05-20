@@ -14,6 +14,7 @@
  *   limitations under the License.
  *******************/
 
+#include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -68,9 +69,14 @@ static const char *nouns[] = {
 #define NUM_ADJECTIVES (sizeof(adjectives) / sizeof(adjectives[0]))
 #define NUM_NOUNS (sizeof(nouns) / sizeof(nouns[0]))
 
+/* Frama-C: skipped — [solver-timeout] strncpy valid_nstring_src precondition */
 int random_name(char *out, size_t out_len, char sep, bool capitalize)
 {
     if (out == NULL || out_len < 4)
+        return -1;
+
+    /* libsodium init is idempotent; defensive per identity.c:79-94 */
+    if (sodium_init() < 0)
         return -1;
 
     uint32_t a_idx = randombytes_uniform((uint32_t)NUM_ADJECTIVES);

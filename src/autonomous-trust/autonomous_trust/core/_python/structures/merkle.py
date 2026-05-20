@@ -149,6 +149,8 @@ class MerkleTree(Tree, Configuration):
             super().delete(self.last.key)
         while len(self.leaves) < len(self.blobs):
             super().insert(None)
+        self.unique.clear()
+        self.non_unique.clear()
         for idx, blob in enumerate(self.blobs):
             leaf = self.leaves[idx]
             leaf.blob = blob
@@ -156,11 +158,23 @@ class MerkleTree(Tree, Configuration):
             self.unique[leaf.uuid].append(leaf)
             if len(self.unique[leaf.uuid]) > 1:
                 self.non_unique += [node.key for node in self.unique[leaf.uuid]]
-        # FIXME: level_nodes is never populated - inner node rehashing is incomplete.
-        # Need to collect nodes at each level from the tree to rehash them bottom-up.
-        for level in range(len(self), -1, -1):
-            level_nodes = []  # get nodes at level
-            for node in level_nodes:
+        # Collect nodes by level via BFS, then rehash inner nodes bottom-up
+        if not isinstance(self.root, _MerkleNode):
+            return
+        nodes_by_level = defaultdict(list)
+        queue = [self.root]
+        while queue:
+            node = queue.pop(0)
+            if not isinstance(node, _MerkleNode):
+                continue
+            nodes_by_level[node.level].append(node)
+            if isinstance(node.left, _MerkleNode):
+                queue.append(node.left)
+            if isinstance(node.right, _MerkleNode):
+                queue.append(node.right)
+        max_level = max(nodes_by_level.keys()) if nodes_by_level else 0
+        for level in range(max_level, -1, -1):
+            for node in nodes_by_level[level]:
                 if node.is_leaf():
                     continue
                 self._hash_inner_node(node)

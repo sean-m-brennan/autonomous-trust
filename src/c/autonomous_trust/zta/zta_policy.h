@@ -17,6 +17,10 @@
 #ifndef ZTA_POLICY_H
 #define ZTA_POLICY_H
 
+/** @addtogroup internal_zta
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <jansson.h>
 
@@ -39,25 +43,30 @@ extern "C" {
  */
 typedef struct {
     smrt_ptr_t;
-    bool enabled;                       /* Master switch: must be true for ZTA to activate */
-    bool require_at_admission;          /* Require valid ZTA credential at admission */
-    int reverify_interval_sec;          /* Periodic re-verification interval; 0 = disable */
-    double revocation_reputation_penalty; /* Reputation penalty on revocation (0.0-1.0) */
-    bool allow_ddil_fallback;           /* Allow admission when ZTA infrastructure unreachable */
-    double ddil_fallback_reputation_cap;  /* Max reputation for peers admitted without ZTA */
-    bool audit_deferred_verifications;  /* Log deferred checks for compliance */
-    char verifier_type[ZTA_VERIFIER_TYPE_LEN]; /* "x509", "oidc", "null" */
-    /* Verifier-specific config (X.509 fields) */
-    double delegated_verification_min_reputation; /* Min reputation to accept delegated verification */
-    int delegated_verification_quorum;    /* Number of independent verifications needed to lift cap */
-    char ca_bundle_path[ZTA_PATH_LEN];
-    char ocsp_url[ZTA_PATH_LEN];
-    char crl_path[ZTA_PATH_LEN];
+    bool enabled;                                  /**< Master switch; when @c false all other fields are ignored and ZTA code paths become no-ops. */
+    bool require_at_admission;                     /**< Require a valid credential before admitting a peer. Mutually informative with @c allow_ddil_fallback. */
+    int reverify_interval_sec;                     /**< Periodic re-verification cadence; 0 disables periodic re-checks. */
+    double revocation_reputation_penalty;          /**< Reputation delta (0.0–1.0) applied on credential revocation. */
+    bool allow_ddil_fallback;                      /**< Permit admission when the PKI/OIDC backend is unreachable (Disconnected/Degraded/Intermittent/Limited). */
+    double ddil_fallback_reputation_cap;           /**< Maximum reputation a peer admitted via fallback can earn until verified. */
+    bool audit_deferred_verifications;             /**< Emit an audit log entry for every deferred verification. */
+    char verifier_type[ZTA_VERIFIER_TYPE_LEN];     /**< "x509", "oidc", or "null"; selects the verifier constructed by zta_policy_create_verifier(). */
+    /* Fields below are used only when @c verifier_type == "x509". */
+    double delegated_verification_min_reputation;  /**< Min peer reputation whose delegated verification this node trusts. */
+    int delegated_verification_quorum;             /**< Count of independent delegated verifications that lifts @c ddil_fallback_reputation_cap. */
+    char ca_bundle_path[ZTA_PATH_LEN];             /**< X.509: path to the trusted CA bundle (PEM). */
+    char ocsp_url[ZTA_PATH_LEN];                   /**< X.509: OCSP responder URL; empty disables OCSP. */
+    char crl_path[ZTA_PATH_LEN];                   /**< X.509: path to the CRL; empty disables CRL checks. */
 } zta_policy_t;
 
 /**
  * @brief Initialize a zta_policy_t with default values (disabled)
  */
+/*@
+  requires \valid(policy);
+  assigns *policy;
+  ensures policy->enabled == \false;
+*/
 void zta_policy_defaults(zta_policy_t *policy);
 
 /**
@@ -82,10 +91,24 @@ int zta_policy_from_json(const json_t *obj, void *data_struct);
  * @param out    Output: newly allocated verifier (caller must destroy)
  * @return 0 on success, error code on failure
  */
+/*@
+  requires \valid(policy);
+  requires \valid(out);
+  allocates *out;
+  behavior success:
+    ensures \result == 0;
+    ensures *out != \null;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int zta_policy_create_verifier(const zta_policy_t *policy, zta_verifier_t **out);
 
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+
+/** @} */ /* end of internal_zta */
 
 #endif /* ZTA_POLICY_H */

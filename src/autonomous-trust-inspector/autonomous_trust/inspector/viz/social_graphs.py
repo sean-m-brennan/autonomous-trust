@@ -37,10 +37,10 @@ class DeceitNetwork(ng.NetworkGraph):
 
     def _node_init(self, n):
         super()._node_init(n)
-        for node in list(self.G):
-            self.G.nodes[node]["group"] = self.groupLabels[0]
 
     def _post_init(self):
+        for node in list(self.G):
+            self.G.nodes[node]["group"] = self.groupLabels[0]
         super()._post_init()
         self.G.nodes[self.problem]["group"] = self.groupLabels[-1]
         self.G.nodes[self.problem]["persist"] = True
@@ -87,10 +87,10 @@ class BetrayalNetwork(ng.NetworkGraph):
 
     def _node_init(self, n):
         super()._node_init(n)
-        for node in list(self.G):
-            self.G.nodes[node]["group"] = self.groupLabels[0]
 
     def _post_init(self):
+        for node in list(self.G):
+            self.G.nodes[node]["group"] = self.groupLabels[0]
         super()._post_init()
         self.G.nodes[self.problem]["group"] = self.groupLabels[-1]
         self.G.nodes[self.target]["group"] = self.groupLabels[-2]

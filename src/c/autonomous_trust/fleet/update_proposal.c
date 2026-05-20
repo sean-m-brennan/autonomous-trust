@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Frama-C: skipped — [serialization] jansson JSON serialization */
 json_t *update_proposal_to_json(const update_proposal_t *prop)
 {
     json_t *obj = json_object();
@@ -48,6 +49,7 @@ json_t *update_proposal_to_json(const update_proposal_t *prop)
     return obj;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON deserialization */
 int update_proposal_from_json(const json_t *json, update_proposal_t *prop)
 {
     memset(prop, 0, sizeof(*prop));
@@ -84,6 +86,7 @@ int update_proposal_from_json(const json_t *json, update_proposal_t *prop)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] crypto signature preconditions */
 static size_t build_signable(const update_proposal_t *prop, uint8_t *buf, size_t buflen)
 {
     size_t offset = 0;
@@ -105,6 +108,7 @@ static size_t build_signable(const update_proposal_t *prop, uint8_t *buf, size_t
     return offset;
 }
 
+/* Frama-C: skipped — [solver-timeout] libsodium sign preconditions */
 int update_proposal_sign(update_proposal_t *prop, const uint8_t *sk)
 {
     uint8_t msg[256];
@@ -115,6 +119,7 @@ int update_proposal_sign(update_proposal_t *prop, const uint8_t *sk)
     return crypto_sign_detached(prop->signature, &sig_len, msg, msg_len, sk);
 }
 
+/* Frama-C: skipped — [solver-timeout] libsodium verify preconditions */
 int update_proposal_verify(const update_proposal_t *prop, const uint8_t *pk)
 {
     uint8_t msg[256];

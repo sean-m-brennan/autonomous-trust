@@ -24,9 +24,8 @@
 #include "reputation/reputation.h"
 #include "algorithms/paxos.h"
 #include "structures/map.h"
-#include "structures/map_priv.h"
-#include "structures/array_priv.h"
-#include "structures/data_priv.h"
+#include "structures/array.h"
+#include "structures/data.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
@@ -74,6 +73,12 @@ static void _ensure_init(void)
  * Validate peer, check id1 > last_id AND chain index matches → grant/nack/backdate
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -98,11 +103,11 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
         return false;
     }
 
-    double id1 = json_real_value(j_id1);
-    double id2 = json_real_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
 
-    double out_last_id = 0.0;
+    int64_t out_last_id = 0;
     int out_chain_len = 0;
     paxos_response_t result = paxos_handle_request(&rep_state.paxos, id1, id2,
                                                    &out_last_id, &out_chain_len);
@@ -113,10 +118,10 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     {
         /* Build grant payload: (id1, id2, peer_uuid, last_id, chain_len) */
         json_t *grant_json = json_object();
-        json_object_set_new(grant_json, "id1", json_real(id1));
-        json_object_set_new(grant_json, "id2", json_real(id2));
+        json_object_set_new(grant_json, "id1", json_integer(id1));
+        json_object_set_new(grant_json, "id2", json_integer(id2));
         json_object_set_new(grant_json, "peer_uuid", json_string(peer_uuid_str));
-        json_object_set_new(grant_json, "last_id", json_real(out_last_id));
+        json_object_set_new(grant_json, "last_id", json_integer(out_last_id));
         json_object_set_new(grant_json, "chain_len", json_integer(out_chain_len));
 
         generic_msg_t grant = {0};
@@ -136,8 +141,8 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     {
         /* BACKDATE: chain index mismatch */
         json_t *bd_json = json_object();
-        json_object_set_new(bd_json, "id1", json_real(id1));
-        json_object_set_new(bd_json, "id2", json_real(id2));
+        json_object_set_new(bd_json, "id1", json_integer(id1));
+        json_object_set_new(bd_json, "id2", json_integer(id2));
 
         generic_msg_t backdate = {0};
         backdate.type = NET_MESSAGE;
@@ -156,8 +161,8 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     {
         /* NACK: id1 <= last_id */
         json_t *nack_json = json_object();
-        json_object_set_new(nack_json, "id1", json_real(id1));
-        json_object_set_new(nack_json, "id2", json_real(id2));
+        json_object_set_new(nack_json, "id1", json_integer(id1));
+        json_object_set_new(nack_json, "id2", json_integer(id2));
 
         generic_msg_t nack = {0};
         nack.type = NET_MESSAGE;
@@ -181,6 +186,13 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
  * Count grants; on majority, broadcast REP_PROTO_TX
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires rep_state.paxos.initialized == \true;
+*/
 static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -205,8 +217,8 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
         return false;
     }
 
-    double id1 = json_real_value(j_id1);
-    double id2 = json_real_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
 
     pthread_mutex_lock(&rep_state.lock);
@@ -249,8 +261,8 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
     {
         /* Broadcast REP_PROTO_TX to all peers */
         json_t *tx_json = json_object();
-        json_object_set_new(tx_json, "id1", json_real(id1));
-        json_object_set_new(tx_json, "id2", json_real(id2));
+        json_object_set_new(tx_json, "id1", json_integer(id1));
+        json_object_set_new(tx_json, "id2", json_integer(id2));
         json_object_set_new(tx_json, "peer_uuid", json_string(peer_uuid_str));
         json_object_set_new(tx_json, "score", json_real(tx_score));
         if (task_uuid_str[0] != '\0')
@@ -258,6 +270,7 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
 
         log_debug(proc->logger, "Reputation: Submit transaction score\n");
 
+        peers_read_lock(proc);
         for (size_t i = 0; i < proc->protocol.num_peers; i++)
         {
             generic_msg_t tx_msg = {0};
@@ -270,6 +283,7 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
             net_msg_pack_json(&tx_msg.info.net_msg, tx_json);
             messaging_send("network", NET_MESSAGE, &tx_msg, false);
         }
+        peers_read_unlock(proc);
         json_decref(tx_json);
     }
 
@@ -281,6 +295,13 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
  * Handler: handle_nack (try again) — exponential backoff retry
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires rep_state.paxos.initialized == \true;
+*/
 static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -288,13 +309,13 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
 
     /* Unpack (id1, id2) from payload for retry capability */
     json_t *payload = NULL;
-    double id1 = 0.0, id2 = 0.0;
+    int64_t id1 = 0, id2 = 0;
     if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL)
     {
         json_t *j_id1 = json_object_get(payload, "id1");
         json_t *j_id2 = json_object_get(payload, "id2");
-        if (j_id1) id1 = json_real_value(j_id1);
-        if (j_id2) id2 = json_real_value(j_id2);
+        if (j_id1) id1 = json_integer_value(j_id1);
+        if (j_id2) id2 = json_integer_value(j_id2);
         json_decref(payload);
     }
 
@@ -311,6 +332,14 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
  * Remote peer tells us our chain index is behind; request update.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] memcpy of public_identity_t triggers
+ * "Hide sub-term definition" cast warning blocking valid_dest/src/separation */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_backdate(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -334,6 +363,13 @@ static bool handle_backdate(const process_t *proc, directory_t *queues, generic_
  * Validate that we granted this proposal, then send accepted.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires rep_state.paxos.initialized == \true;
+*/
 static bool handle_transaction(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -359,8 +395,8 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
         return false;
     }
 
-    double id2 = json_real_value(j_id2);
-    double id1 = json_real_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
     double score = json_real_value(j_score);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
     const char *task_uuid_str = json_string_value(json_object_get(payload, "task_uuid"));
@@ -378,8 +414,8 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
 
     /* Send ACCEPTED back */
     json_t *acc_json = json_object();
-    json_object_set_new(acc_json, "id1", json_real(id1));
-    json_object_set_new(acc_json, "id2", json_real(id2));
+    json_object_set_new(acc_json, "id1", json_integer(id1));
+    json_object_set_new(acc_json, "id2", json_integer(id2));
     json_object_set_new(acc_json, "peer_uuid", json_string(peer_uuid_str));
     if (task_uuid_str)
         json_object_set_new(acc_json, "task_uuid", json_string(task_uuid_str));
@@ -403,6 +439,13 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
  * Count acceptances; commit to history on majority.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires rep_state.paxos.initialized == \true;
+*/
 static bool handle_accepted(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -427,13 +470,13 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
         return false;
     }
 
-    double id1 = json_real_value(j_id1);
-    double id2 = json_real_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
 
     /* Look up score from paxos proposals */
     char paxos_key[PAXOS_KEY_LEN];
-    snprintf(paxos_key, sizeof(paxos_key), "%.0f:%.0f", id1, id2);
+    paxos_id_index(paxos_key, sizeof(paxos_key), id1, id2);
 
     pthread_mutex_lock(&rep_state.paxos.lock);
     data_t *prop_dat = NULL;
@@ -482,6 +525,14 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
  * Send chain slice to requesting peer.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] memcpy of public_identity_t triggers
+ * "Hide sub-term definition" cast warning blocking valid_dest/src/separation */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_outdated(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -520,6 +571,12 @@ static bool handle_outdated(const process_t *proc, directory_t *queues, generic_
  * Collect chain slices, vote on consistency, merge.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -627,6 +684,12 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
  * Compute reputation for a peer and respond.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_rep_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -694,6 +757,12 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
  * Handler: handle_rep_response (reputation response)
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_rep_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -722,6 +791,12 @@ static bool handle_rep_response(const process_t *proc, directory_t *queues, gene
  * Responds via local IPC to the requesting process.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_local_rep_query(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -784,6 +859,13 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
  * Called when TRANSACTION_SCORE message arrives from negotiation.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] uuid_unparse + strncpy + memcpy +
+ * json_object_set_new + smrt_create cascade with peer-loop too complex for SMT */
+/*@
+  requires \valid(proc);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires rep_state.paxos.initialized == \true;
+*/
 void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
                           const uuid_t peer_uuid, double score)
 {
@@ -807,7 +889,7 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
     pthread_mutex_unlock(&rep_state.lock);
 
     /* Compute Paxos IDs via shared engine */
-    double id1, id2;
+    int64_t id1, id2;
     paxos_next_ids(&rep_state.paxos, &id1, &id2);
 
     /* Get identity UUID for the request */
@@ -815,6 +897,7 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
     uuid_unparse_lower(peer_uuid, identity_uuid);
 
     /* Broadcast Paxos Phase 1a: request permission from all peers */
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         generic_msg_t req = {0};
@@ -827,14 +910,15 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
 
         /* Pack (id1, id2, identity_uuid) as JSON into the request */
         json_t *req_json = json_object();
-        json_object_set_new(req_json, "id1", json_real(id1));
-        json_object_set_new(req_json, "id2", json_real(id2));
+        json_object_set_new(req_json, "id1", json_integer(id1));
+        json_object_set_new(req_json, "id2", json_integer(id2));
         json_object_set_new(req_json, "peer_uuid", json_string(identity_uuid));
         net_msg_pack_json(&req.info.net_msg, req_json);
         json_decref(req_json);
 
         messaging_send("network", NET_MESSAGE, &req, false);
     }
+    peers_read_unlock(proc);
 
 }
 
@@ -842,11 +926,16 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
  * Reputation process main entry
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] state-cascade through paxos_init +
+ * process_register_handler stubs prevents WP from discharging
+ * valid_rw(proc) and valid_rd(signal) at downstream call sites */
 int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();
 
+    peers_read_lock(proc);
     rep_state.num_peers = (int)proc->protocol.num_peers;
+    peers_read_unlock(proc);
     paxos_init(&rep_state.paxos, rep_state.num_peers, logger);
 
     /* Register protocol handlers */

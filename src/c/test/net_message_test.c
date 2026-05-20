@@ -23,6 +23,8 @@
 #include <uuid/uuid.h>
 
 #include "network/net_message.h"
+#include "identity/identity.h"
+#include "identity/identity_priv.h"
 
 DEFINE_TEST(test_wire_roundtrip)
 {
@@ -42,7 +44,7 @@ DEFINE_TEST(test_wire_roundtrip)
 
     uint8_t *wire    = NULL;
     size_t   wire_len = 0;
-    ck_assert_ret_ok(net_message_to_wire(&msg, &wire, &wire_len));
+    ck_assert_ret_ok(net_message_to_wire(&msg, NULL, &wire, &wire_len));
     ck_assert_ptr_nonnull(wire);
     ck_assert(wire_len > 0);
 
@@ -77,7 +79,7 @@ DEFINE_TEST(test_wire_empty_data)
 
     uint8_t *wire    = NULL;
     size_t   wire_len = 0;
-    ck_assert_ret_ok(net_message_to_wire(&msg, &wire, &wire_len));
+    ck_assert_ret_ok(net_message_to_wire(&msg, NULL, &wire, &wire_len));
     ck_assert_ptr_nonnull(wire);
     ck_assert(wire_len > 0);
 
@@ -114,7 +116,7 @@ DEFINE_TEST(test_wire_roundtrip_with_identity)
 
     uint8_t *wire    = NULL;
     size_t   wire_len = 0;
-    ck_assert_ret_ok(net_message_to_wire(&msg, &wire, &wire_len));
+    ck_assert_ret_ok(net_message_to_wire(&msg, NULL, &wire, &wire_len));
     ck_assert_ptr_nonnull(wire);
 
     /* Deserialize without peer (broadcast path) */
@@ -153,7 +155,7 @@ DEFINE_TEST(test_wire_peer_overrides_json_identity)
 
     uint8_t *wire    = NULL;
     size_t   wire_len = 0;
-    ck_assert_ret_ok(net_message_to_wire(&msg, &wire, &wire_len));
+    ck_assert_ret_ok(net_message_to_wire(&msg, NULL, &wire, &wire_len));
 
     /* When peer is provided, from_whom should come from peer, not JSON */
     public_identity_t peer;
@@ -176,5 +178,45 @@ DEFINE_TEST(test_wire_peer_overrides_json_identity)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_wire_signed_message)
+{
+    ck_assert_int_eq(sodium_init() >= 0 ? 0 : -1, 0);
+
+    /* create a full identity for signing */
+    identity_t *signer = NULL;
+    ck_assert_ret_ok(identity_create(NULL, "127.0.0.1", "Signer",
+                                     "signer", "signer", &signer));
+
+    const uint8_t payload[] = {0xAA, 0xBB};
+    net_wire_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    strncpy(msg.process, "test", PROC_NAME_LEN);
+    msg.function = (char *)"check";
+    msg.data     = (uint8_t *)payload;
+    msg.data_len = sizeof(payload);
+    msg.encrypt  = false;
+    memcpy(&msg.from_whom, (public_identity_t *)signer, sizeof(public_identity_t));
+
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    ck_assert_ret_ok(net_message_to_wire(&msg, signer, &wire, &wire_len));
+
+    net_wire_msg_t out;
+    memset(&out, 0, sizeof(out));
+    ck_assert_ret_ok(net_message_from_wire(wire, wire_len, NULL, &out));
+
+    /* signature should be present and verified */
+    ck_assert(out.has_signature);
+    ck_assert(out.verified);
+    ck_assert_str_eq(out.process, "test");
+    ck_assert_str_eq(out.function, "check");
+
+    free(wire);
+    net_wire_msg_free(&out);
+    smrt_deref(signer);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(NetMessage, test_wire_roundtrip, test_wire_empty_data,
-          test_wire_roundtrip_with_identity, test_wire_peer_overrides_json_identity)
+          test_wire_roundtrip_with_identity, test_wire_peer_overrides_json_identity,
+          test_wire_signed_message)

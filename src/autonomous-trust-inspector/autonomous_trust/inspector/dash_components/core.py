@@ -171,7 +171,7 @@ class DashControl(object):
         param_str = ''
         if params is not None and len(params) > 0:
             param_str = '/' + '/'.join(map(str, params))
-        return 'ws://%s:%d/%s%s' % (self.server_address[0], self.ws_port, component_name, param_str)
+        return f'ws://{self.server_address[0]}:{self.ws_port}/{component_name}{param_str}'
 
     def _websocket_event_loop(self):
         asyncio.set_event_loop(self.ws_loop)
@@ -264,19 +264,16 @@ class DashControl(object):
                 elif isinstance(args[0], (list, tuple)):
                     if not isinstance(ret_val, (list, tuple)) or len(ret_val) != len(args[0]):
                         raise RuntimeError(
-                            'Non-matching callback output: expected %d outputs but got %r'
-                            % (len(args[0]), ret_val))
+                            f'Non-matching callback output: expected {len(args[0])} outputs but got {ret_val!r}')
                     for idx, output in enumerate(args[0]):
                         if isinstance(output, Output):
                             add_mod(output, ret_val[idx], mods)
                         else:
                             raise RuntimeError(
-                                'Invalid output element at index %d: expected Output, got %s'
-                                % (idx, type(output).__name__))
+                                f'Invalid output element at index {idx}: expected Output, got {type(output).__name__}')
                 else:
                     raise RuntimeError(
-                        'Invalid first callback argument: expected Output or list of Outputs, got %s'
-                        % type(args[0]).__name__)
+                        f'Invalid first callback argument: expected Output or list of Outputs, got {type(args[0]).__name__}')
                 for mod in mods:
                     self.push_mods(mod)
                 return ret_val
@@ -350,6 +347,7 @@ class DashControl(object):
 
     def run(self, host: str, port: int, **kwargs):
         kwargs['use_reloader'] = False  # *never* allow reloader (causes subtle bugs)
-        # FIXME Ctl-C handler to call self.halt
+        import signal
+        signal.signal(signal.SIGINT, lambda s, f: self.halt())
         self.serve_websockets()
         self.app.run(host, port, **kwargs)

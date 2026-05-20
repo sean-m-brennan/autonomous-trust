@@ -37,6 +37,14 @@ typedef struct
     const char *time_fmt;
 } time_res_config_t;
 
+/*@
+  requires \valid_read(dt);
+  requires \valid(proto);
+  assigns proto->nanosecond, proto->second, proto->minute, proto->hour,
+          proto->day, proto->month, proto->year, proto->weekday,
+          proto->day_of_year, proto->utc_offset;
+  ensures \result == 0;
+*/
 int datetime_sync_out(datetime_t *dt, AutonomousTrust__Core__Protobuf__Structures__DateTime *proto)
 {
     proto->nanosecond = dt->tm_nsec;
@@ -52,6 +60,14 @@ int datetime_sync_out(datetime_t *dt, AutonomousTrust__Core__Protobuf__Structure
     return 0;
 }
 
+/*@
+  requires \valid_read(proto);
+  requires \valid(dt);
+  assigns dt->tm_nsec, dt->tm_sec, dt->tm_min, dt->tm_hour,
+          dt->tm_mday, dt->tm_mon, dt->tm_year, dt->tm_wday,
+          dt->tm_yday, dt->tm_tz_offset;
+  ensures \result == 0;
+*/
 int datetime_sync_in(AutonomousTrust__Core__Protobuf__Structures__DateTime *proto, datetime_t *dt)
 {
     dt->tm_nsec = proto->nanosecond;
@@ -67,9 +83,15 @@ int datetime_sync_in(AutonomousTrust__Core__Protobuf__Structures__DateTime *prot
     return 0;
 }
 
+/*@
+  requires res == MILLISECONDS || res == MICROSECONDS || res == NANOSECONDS;
+  assigns \nothing;
+  ensures \result.time_fmt != \null;
+*/
 time_res_config_t set_time_resolution(time_resolution_t res)
 {
     time_res_config_t config = {0};
+    config.time_fmt = ".%03d";
     switch (res)
     {
     case NANOSECONDS:
@@ -89,9 +111,24 @@ time_res_config_t set_time_resolution(time_resolution_t res)
     return config;
 }
 
+/*@
+  requires str != \null && \valid_read(str);
+  requires \valid(offset);
+  assigns *offset;
+  behavior success:
+    ensures \result == 0;
+    ensures *offset >= -14.0 && *offset <= 14.0;
+  behavior parse_error:
+    ensures \result == 214;
+  disjoint behaviors;
+*/
+/* Frama-C: skipped — [string-loop] strtol timezone string parsing */
 int str_to_offset(const char *str, float *offset)  // FIXME different sig for errors
 {
     char s[MAX_TZ_OFFSET_STR+1] = {0};
+    /* strcpy is safe here because the only in-tree caller passes the
+     * output of strftime(..., "%z", ...), which is always 5 bytes
+     * ("+0000" format). If this helper ever becomes public, re-evaluate. */
     strcpy(s, str);
     char *first = strchr(s, ':');
     if (first == NULL)
@@ -112,6 +149,12 @@ int str_to_offset(const char *str, float *offset)  // FIXME different sig for er
     return 0;
 }
 
+/*@
+  requires \valid(str + (0 .. MAX_TZ_OFFSET_STR));
+  assigns str[0 .. MAX_TZ_OFFSET_STR];
+  ensures \result >= 0;
+*/
+/* Frama-C: skipped — [solver-timeout] snprintf stub assigns cascade */
 int offset_to_str(float offset, char *str)
 {
     const char *sign = "";
@@ -121,15 +164,18 @@ int offset_to_str(float offset, char *str)
     float frac = fabsf(modff(offset, &hour));
     int minutes = (int)(60 * frac);
     int seconds = (int)(3600 * (frac - (60.0 / minutes)));
-    const char *format = "%s%d:%d";
     if (seconds > 0)
-        format = "%s%d:%d:%d";
-    return sprintf(str, format, sign, (int)hour, minutes, seconds);
+        return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%s%d:%d:%d", sign, (int)hour, minutes, seconds);
+    return snprintf(str, MAX_TZ_OFFSET_STR + 1, "%s%d:%d", sign, (int)hour, minutes);
 }
 
 const char *conversions[] = {"%f", "%z", "%Z"};
 size_t c_size = sizeof(conversions) / sizeof(conversions[0]);
 
+/* WP deferred: snprintf with pointer arithmetic and non-literal format
+   strings generates unbounded ranges that WP cannot model.
+   Contract kept in datetime.h for callers. */
+/* Frama-C: skipped — [solver-timeout] snprintf stub assigns cascade through format operations */
 int datetime_strftime_res(const datetime_t *dt, const char *format, const time_resolution_t tr, char *s, size_t max)
 {
     time_res_config_t res_cfg = set_time_resolution(tr);
@@ -171,10 +217,15 @@ int datetime_strftime_res(const datetime_t *dt, const char *format, const time_r
                     }
                     prev = fmt + i + 2;
                 }
-                if (j == 0) // %f - subsecond
-                    len += sprintf(s + len, res_cfg.time_fmt, ns);
-                else if (j == 1 || j == 2) // %z, %Z - timezone offset
-                    len += sprintf(s + len, "%s", tz);
+                if (j == 0) { // %f - subsecond
+                    if (res_cfg.res >= 1000000000.0)
+                        len += snprintf(s + len, remaining, ".%09d", ns);
+                    else if (res_cfg.res >= 1000000.0)
+                        len += snprintf(s + len, remaining, ".%06d", ns);
+                    else
+                        len += snprintf(s + len, remaining, ".%03d", ns);
+                } else if (j == 1 || j == 2) // %z, %Z - timezone offset
+                    len += snprintf(s + len, remaining, "%s", tz);
                 if (len > max)
                 {
                     err = E2BIG;
@@ -208,6 +259,7 @@ inline int datetime_to_isoformat(const datetime_t *dt, char *s, size_t max)
     return datetime_strftime(dt, iso8601_format, s, max);
 }
 
+/* Frama-C: skipped — [string-loop] strptime format parsing with pointer arithmetic */
 int datetime_strptime(const char *s, const char *format, datetime_t *dt)
 {
     if (s == NULL || format == NULL || dt == NULL)
@@ -320,6 +372,7 @@ inline int datetime_from_isostring(const char *s, datetime_t *dt)
     return datetime_strptime(s, "%FT%T%f%z", dt);
 }
 
+/* Frama-C: skipped — [syscall] localtime/gmtime timezone conversion */
 int datetime_from_time(time_t time, long nsec, bool local, datetime_t *dt)
 {
     struct tm *tm;
@@ -343,6 +396,7 @@ int datetime_from_time(time_t time, long nsec, bool local, datetime_t *dt)
     return 0;
 }
 
+/* Frama-C: skipped — [syscall] clock_gettime system time */
 int datetime_now(bool local, datetime_t *dt)
 {
     struct timespec ts;
@@ -355,6 +409,12 @@ int datetime_now(bool local, datetime_t *dt)
     return datetime_from_time(now, ts.tv_nsec, local, dt);
 }
 
+/*@
+  requires \valid_read(td);
+  requires \valid(proto);
+  assigns proto->days, proto->seconds, proto->nanoseconds;
+  ensures \result == 0;
+*/
 int timedelta_sync_out(timedelta_t *td, AutonomousTrust__Core__Protobuf__Structures__TimeDelta *proto)
 {
     proto->days = td->days;
@@ -363,6 +423,12 @@ int timedelta_sync_out(timedelta_t *td, AutonomousTrust__Core__Protobuf__Structu
     return 0;
 }
 
+/*@
+  requires \valid_read(proto);
+  requires \valid(td);
+  assigns td->days, td->seconds, td->nsecs;
+  ensures \result == 0;
+*/
 int timedelta_sync_in(AutonomousTrust__Core__Protobuf__Structures__TimeDelta *proto, timedelta_t *td)
 {
     td->days = proto->days;
@@ -371,6 +437,7 @@ int timedelta_sync_in(AutonomousTrust__Core__Protobuf__Structures__TimeDelta *pr
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] snprintf stub interaction with string parsing */
 int timedelta_from_string(const char *s, timedelta_t *td)
 {
     if (s == NULL || td == NULL)
@@ -442,6 +509,7 @@ int timedelta_from_string(const char *s, timedelta_t *td)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] snprintf stub assigns cascade */
 int timedelta_to_string(const timedelta_t *td, char *s, size_t max)
 {
     if (td == NULL || s == NULL || max == 0)

@@ -17,6 +17,10 @@
 #ifndef NETWORK_H
 #define NETWORK_H
 
+/** @addtogroup internal_network
+ *  @{
+ */
+
 #include <stdint.h>
 #include <jansson.h>
 #include "utilities/allocation.h"
@@ -32,6 +36,9 @@
 #define CIDR6_LEN (IPV6_ADDR_LEN + 4)
 #define MAC_ADDR_LEN 17
 
+#define DEFAULT_MCAST4_ADDR "239.0.0.1"
+#define DEFAULT_MCAST6_ADDR "ff02::1"
+
 typedef struct
 {
     smrt_ptr_t;
@@ -44,17 +51,96 @@ typedef struct
     char mcast6_addr[IPV6_ADDR_LEN + 1];
 } network_config_t;
 
+/*@
+  requires cidr != \null && \valid_read(cidr);
+  requires addr != \null && \valid(addr + (0 .. IPV4_ADDR_LEN - 1));
+  requires mask == \null || \valid(mask + (0 .. 2));
+  assigns addr[0 .. IPV4_ADDR_LEN - 1];
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int cidr_split(char * cidr, char *addr, char *mask);
 
+/*@
+  requires cidr != \null && \valid_read(cidr);
+  requires \valid(ip);
+  requires \valid(mask);
+  assigns *ip, *mask;
+  behavior success:
+    ensures \result == 0;
+    ensures *mask <= 32;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int cidr4_to_ip4_binary(char *cidr, uint32_t *ip, uint8_t *mask);
+
+/*@
+  requires \valid(addr + (0 .. IPV4_ADDR_LEN - 1));
+  assigns addr[0 .. IPV4_ADDR_LEN - 1];
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int ip4_binary_to_addr(uint32_t ip, char *addr);
+
+/*@
+  requires cidr != \null && \valid_read(cidr);
+  requires \valid(bcast_addr + (0 .. IPV4_ADDR_LEN - 1));
+  assigns bcast_addr[0 .. IPV4_ADDR_LEN - 1];
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int cidr4_to_broadcast(char *cidr, char *bcast_addr);
 
+#ifdef __FRAMAC__
+typedef struct { uint64_t lo; uint64_t hi; } uint128_t;
+#else
 typedef unsigned __int128 uint128_t;
+#endif
+
+/*@
+  requires cidr != \null && \valid_read(cidr);
+  requires \valid(ip);
+  requires \valid(mask);
+  assigns *ip, *mask;
+  behavior success:
+    ensures \result == 0;
+    ensures *mask <= 128;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int cidr6_to_ip6_binary(char *cidr, uint128_t *ip, uint8_t *mask);
+
+/*@
+  requires \valid(addr + (0 .. IPV6_ADDR_LEN - 1));
+  assigns addr[0 .. IPV6_ADDR_LEN - 1];
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int ip6_binary_to_addr(uint128_t ip, char *addr);
 
 int network_to_json(const void *data_struct, json_t **obj_ptr);
 int network_from_json(const json_t *obj, void *data_struct);
+
+#include "utilities/exception.h"
+
+#define ENET_INVALID_MASK 220
+DECLARE_ERROR(ENET_INVALID_MASK, "CIDR prefix length exceeds maximum for address family");
+
+
+/** @} */ /* end of internal_network */
 
 #endif  // NETWORK_H

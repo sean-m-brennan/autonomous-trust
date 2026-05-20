@@ -272,34 +272,34 @@ class Tree(object):
         if pivot in self.leaves:
             self.leaves.remove(pivot)
 
-    def _recolor_insert(self, node):  # TODO reduce verbosity (duplication)
+    def _recolor_insert_side(self, node, parent_side):
+        """Handle one side of the insert recoloring.
+
+        :param node: the newly inserted node being fixed up
+        :param parent_side: the direction from grandparent to parent (left or right)
+        """
+        other_side = parent_side.incr()
+        uncle = node.parent.parent.get_child(other_side)
+        if uncle.red:
+            uncle.red = False
+            node.parent.red = False
+            node.parent.parent.red = True
+            node = node.parent.parent
+        else:
+            if node == node.parent.get_child(other_side):
+                node = node.parent
+                self._rotate(parent_side, node)
+            node.parent.red = False
+            node.parent.parent.red = True
+            self._rotate(other_side, node.parent.parent)
+        return node
+
+    def _recolor_insert(self, node):
         while node != self.root and node.parent.red:
             if node.parent == node.parent.parent.right:
-                if node.parent.parent.left.red:
-                    node.parent.parent.left.red = False
-                    node.parent.red = False
-                    node.parent.parent.red = True
-                    node = node.parent.parent
-                else:
-                    if node == node.parent.left:
-                        node = node.parent
-                        self._rotate(_Direction.right, node)
-                    node.parent.red = False
-                    node.parent.parent.red = True
-                    self._rotate(_Direction.left, node.parent.parent)
+                node = self._recolor_insert_side(node, _Direction.right)
             else:
-                if node.parent.parent.right.red:
-                    node.parent.parent.right.red = False
-                    node.parent.red = False
-                    node.parent.parent.red = True
-                    node = node.parent.parent
-                else:
-                    if node == node.parent.right:
-                        node = node.parent
-                        self._rotate(_Direction.left, node)
-                    node.parent.red = False
-                    node.parent.parent.red = True
-                    self._rotate(_Direction.right, node.parent.parent)
+                node = self._recolor_insert_side(node, _Direction.left)
         self.root.red = False
 
     def delete(self, key):
@@ -353,51 +353,37 @@ class Tree(object):
             u.parent.right = v
         v.parent = u.parent
 
-    def _recolor_del(self, node):  # TODO reduce verbosity (duplication)
+    def _recolor_del_side(self, node, direction):
+        """Handle one side of the delete recoloring (direction = side node is on)."""
+        counter = direction.incr()
+        sibling = node.parent.get_child(counter)
+        if sibling.red:
+            sibling.red = False
+            node.parent.red = True
+            self._rotate(direction, node.parent)
+            sibling = node.parent.get_child(counter)
+        if not sibling.get_child(direction).red and not sibling.get_child(counter).red:
+            sibling.red = True
+            node = node.parent
+        else:
+            if not sibling.get_child(counter).red:
+                sibling.get_child(direction).red = False
+                sibling.red = True
+                self._rotate(counter, sibling)
+                sibling = node.parent.get_child(counter)
+            sibling.red = node.parent.red
+            node.parent.red = False
+            sibling.get_child(counter).red = False
+            self._rotate(direction, node.parent)
+            node = self.root
+        return node
+
+    def _recolor_del(self, node):
         while node != self.root and not node.red:
             if node == node.parent.left:
-                sibling = node.parent.right
-                if sibling.red:
-                    sibling.red = False
-                    node.parent.red = True
-                    self._rotate(_Direction.left, node.parent)
-                    sibling = node.parent.right
-                if not sibling.left.red and not sibling.right.red:
-                    sibling.red = True
-                    node = node.parent
-                else:
-                    if not sibling.right.red:
-                        sibling.left.red = False
-                        sibling.red = True
-                        self._rotate(_Direction.right, sibling)
-                        sibling = node.parent.right
-                    sibling.red = node.parent.red
-                    node.parent.red = False
-                    sibling.right.red = False
-                    self._rotate(_Direction.left, node.parent)
-                    node = self.root
-            else:  # node is right child
-                sibling = node.parent.left
-                if sibling.red:
-                    sibling.red = False
-                    node.parent.red = True
-                    self._rotate(_Direction.right, node.parent)
-                    sibling = node.parent.left
-                if not sibling.left.red and not sibling.right.red:
-                    sibling.red = True
-                    node = node.parent
-                else:
-                    if not sibling.left.red:
-                        sibling.right.red = False
-                        sibling.red = True
-                        self._rotate(_Direction.left, sibling)
-                        sibling = node.parent.left
-
-                    sibling.red = node.parent.red
-                    node.parent.red = False
-                    sibling.left.red = False
-                    self._rotate(_Direction.right, node.parent)
-                    node = self.root
+                node = self._recolor_del_side(node, _Direction.left)
+            else:
+                node = self._recolor_del_side(node, _Direction.right)
         node.red = False
 
     def find(self, key) -> Optional[Node]:

@@ -25,6 +25,29 @@ int _set_exception(int err, size_t line, const char *file)
 {
     _exception.errnum = err;
     _exception.line = line;
-    strncpy(_exception.file, file, 255);
+
+    /* Hand-rolled bounded copy replicating strncpy(_exception.file, file, 255)
+     * semantics (copy up to first NUL, then pad remainder with NUL).  Avoids
+     * WP's strncpy stub whose valid_nstring_src precondition cannot be
+     * discharged from the `\valid_read(file+(0..255))` we have in hand. */
+    size_t i = 0;
+    /*@
+      loop invariant 0 <= i <= 255;
+      loop assigns i, _exception.file[0 .. 254];
+      loop variant 255 - i;
+    */
+    while (i < 255 && file[i] != '\0') {
+        _exception.file[i] = file[i];
+        i++;
+    }
+    /*@
+      loop invariant 0 <= i <= 255;
+      loop assigns i, _exception.file[0 .. 254];
+      loop variant 255 - i;
+    */
+    while (i < 255) {
+        _exception.file[i] = '\0';
+        i++;
+    }
     return -1;
 }

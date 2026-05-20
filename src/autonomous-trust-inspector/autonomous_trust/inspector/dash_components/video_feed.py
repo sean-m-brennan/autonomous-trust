@@ -37,14 +37,14 @@ class VideoFeed(DashComponent):
         self.number = str(number)
         self.peer = peer
         self.halt = False
-        self.img_id = 'feed_%s' % self.number
+        self.img_id = f'feed_{self.number}'
         if self.via_ws:
             threading.Thread(target=self.xmit).start()
         else:
             # FIXME must be able to dynamically add this?
             # note: cannot be called once the server is running
             #self.ctl.server.view_functions[
-            self.ctl.server.add_url_rule('/video_feed_%s' % self.number, 'video_feed_%s' % self.number,
+            self.ctl.server.add_url_rule(f'/video_feed_{self.number}', f'video_feed_{self.number}',
                                      lambda: Response(self.rcv(), mimetype='multipart/x-mixed-replace; boundary=frame'))
 
     def xmit(self):

@@ -26,9 +26,8 @@
 #include "fleet/artifact_store.h"
 #include "algorithms/paxos.h"
 #include "structures/map.h"
-#include "structures/map_priv.h"
-#include "structures/array_priv.h"
-#include "structures/data_priv.h"
+#include "structures/array.h"
+#include "structures/data.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
@@ -72,6 +71,12 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
  * Receive an update proposal, verify signature, store it, initiate Paxos vote.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_update_proposal(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -122,14 +127,20 @@ static bool handle_update_proposal(const process_t *proc, directory_t *queues, g
     json_decref(payload);
 
     /* Initiate Paxos vote: broadcast vote request to all peers */
-    double id1, id2;
+    int64_t id1, id2;
     paxos_next_ids(&fleet_state.vote_paxos, &id1, &id2);
 
     json_t *req_json = json_object();
-    json_object_set_new(req_json, "id1", json_real(id1));
-    json_object_set_new(req_json, "id2", json_real(id2));
+    if (!req_json)
+    {
+        log_error(proc->logger, "Fleet: json_object() OOM building vote request\n");
+        return false;
+    }
+    json_object_set_new(req_json, "id1", json_integer(id1));
+    json_object_set_new(req_json, "id2", json_integer(id2));
     json_object_set_new(req_json, "proposal_uuid", json_string(prop_uuid_str));
 
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         generic_msg_t req = {0};
@@ -142,6 +153,7 @@ static bool handle_update_proposal(const process_t *proc, directory_t *queues, g
         net_msg_pack_json(&req.info.net_msg, req_json);
         messaging_send("network", NET_MESSAGE, &req, false);
     }
+    peers_read_unlock(proc);
     json_decref(req_json);
 
     log_info(proc->logger, "Fleet: Proposal %s stored, vote initiated\n", prop_uuid_str);
@@ -153,6 +165,12 @@ static bool handle_update_proposal(const process_t *proc, directory_t *queues, g
  * Paxos Phase 1a: check proposal via paxos_handle_request, send grant or nack.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_vote_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -176,15 +194,15 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
         return false;
     }
 
-    double id1 = json_real_value(j_id1);
-    double id2 = json_real_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
     const char *prop_uuid_raw = json_string_value(j_prop_uuid);
     char prop_uuid_str[UUID_STRING_LEN + 1];
     strncpy(prop_uuid_str, prop_uuid_raw ? prop_uuid_raw : "", UUID_STRING_LEN);
     prop_uuid_str[UUID_STRING_LEN] = '\0';
     json_decref(payload);
 
-    double out_last_id = 0.0;
+    int64_t out_last_id = 0;
     int out_chain_len = 0;
     paxos_response_t result = paxos_handle_request(&fleet_state.vote_paxos, id1, id2,
                                                    &out_last_id, &out_chain_len);
@@ -193,10 +211,15 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
     {
         /* Build grant payload */
         json_t *grant_json = json_object();
-        json_object_set_new(grant_json, "id1", json_real(id1));
-        json_object_set_new(grant_json, "id2", json_real(id2));
+        if (!grant_json)
+        {
+            log_error(proc->logger, "Fleet: json_object() OOM building grant\n");
+            return false;
+        }
+        json_object_set_new(grant_json, "id1", json_integer(id1));
+        json_object_set_new(grant_json, "id2", json_integer(id2));
         json_object_set_new(grant_json, "proposal_uuid", json_string(prop_uuid_str));
-        json_object_set_new(grant_json, "last_id", json_real(out_last_id));
+        json_object_set_new(grant_json, "last_id", json_integer(out_last_id));
         json_object_set_new(grant_json, "chain_len", json_integer(out_chain_len));
 
         generic_msg_t grant = {0};
@@ -216,8 +239,13 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
     {
         /* NACK */
         json_t *nack_json = json_object();
-        json_object_set_new(nack_json, "id1", json_real(id1));
-        json_object_set_new(nack_json, "id2", json_real(id2));
+        if (!nack_json)
+        {
+            log_error(proc->logger, "Fleet: json_object() OOM building nack\n");
+            return false;
+        }
+        json_object_set_new(nack_json, "id1", json_integer(id1));
+        json_object_set_new(nack_json, "id2", json_integer(id2));
         json_object_set_new(nack_json, "proposal_uuid", json_string(prop_uuid_str));
 
         generic_msg_t nack = {0};
@@ -242,6 +270,12 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
  * Paxos Phase 1b: count grants; on quorum, broadcast accepted.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_vote_grant(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -265,8 +299,8 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
         return false;
     }
 
-    double id1 = json_real_value(j_id1);
-    double id2 = json_real_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
     const char *prop_uuid_raw = json_string_value(j_prop_uuid);
     char prop_uuid_str[UUID_STRING_LEN + 1];
     strncpy(prop_uuid_str, prop_uuid_raw ? prop_uuid_raw : "", UUID_STRING_LEN);
@@ -295,14 +329,20 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
 
         /* Broadcast FLEET_PROTO_ACCEPTED to all peers (include artifact hash) */
         json_t *acc_json = json_object();
-        json_object_set_new(acc_json, "id1", json_real(id1));
-        json_object_set_new(acc_json, "id2", json_real(id2));
+        if (!acc_json)
+        {
+            log_error(proc->logger, "Fleet: json_object() OOM building accepted\n");
+            return false;
+        }
+        json_object_set_new(acc_json, "id1", json_integer(id1));
+        json_object_set_new(acc_json, "id2", json_integer(id2));
         json_object_set_new(acc_json, "proposal_uuid", json_string(prop_uuid_str));
         json_object_set_new(acc_json, "artifact_hash", json_string(artifact_hash_hex));
 
         log_info(proc->logger, "Fleet: Quorum reached for proposal %s, broadcasting accepted\n",
                  prop_uuid_str);
 
+        peers_read_lock(proc);
         for (size_t i = 0; i < proc->protocol.num_peers; i++)
         {
             generic_msg_t acc_msg = {0};
@@ -315,6 +355,7 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
             net_msg_pack_json(&acc_msg.info.net_msg, acc_json);
             messaging_send("network", NET_MESSAGE, &acc_msg, false);
         }
+        peers_read_unlock(proc);
         json_decref(acc_json);
 
         paxos_advance_chain(&fleet_state.vote_paxos);
@@ -325,6 +366,11 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
         strncpy(self_acc.info.net_msg.process, "fleet", PROC_NAME_LEN);
         self_acc.info.net_msg.function = (char *)FLEET_PROTO_ACCEPTED;
         json_t *self_json = json_object();
+        if (!self_json)
+        {
+            log_error(proc->logger, "Fleet: json_object() OOM building self-accept\n");
+            return false;
+        }
         json_object_set_new(self_json, "proposal_uuid", json_string(prop_uuid_str));
         json_object_set_new(self_json, "artifact_hash", json_string(artifact_hash_hex));
         net_msg_pack_json(&self_acc.info.net_msg, self_json);
@@ -344,19 +390,26 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
  * Record nack with exponential backoff.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires fleet_state.vote_paxos.initialized == \true;
+*/
 static bool handle_vote_nack(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Fleet: vote nack from %s\n", nmsg->from_whom.fullname);
 
     json_t *payload = NULL;
-    double id1 = 0.0, id2 = 0.0;
+    int64_t id1 = 0, id2 = 0;
     if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL)
     {
         json_t *j_id1 = json_object_get(payload, "id1");
         json_t *j_id2 = json_object_get(payload, "id2");
-        if (j_id1) id1 = json_real_value(j_id1);
-        if (j_id2) id2 = json_real_value(j_id2);
+        if (j_id1) id1 = json_integer_value(j_id1);
+        if (j_id2) id2 = json_integer_value(j_id2);
         json_decref(payload);
     }
 
@@ -373,6 +426,12 @@ static bool handle_vote_nack(const process_t *proc, directory_t *queues, generic
  * Move proposal from pending to accepted.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_update_accepted(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -443,6 +502,11 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
         {
             /* Request artifact from the proposer who sent us the acceptance */
             json_t *fetch_req = json_object();
+            if (!fetch_req)
+            {
+                log_error(proc->logger, "Fleet: json_object() OOM building artifact fetch\n");
+                return false;
+            }
             json_object_set_new(fetch_req, "hash", json_string(artifact_hash_hex));
 
             generic_msg_t artifact_msg = {0};
@@ -470,11 +534,16 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
  * Fleet process main entry
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] state-cascade through paxos_init +
+ * process_register_handler stubs prevents WP from discharging
+ * valid_rw(proc) and valid_rd(signal) at downstream call sites */
 int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();
 
+    peers_read_lock(proc);
     fleet_state.num_peers = (int)proc->protocol.num_peers;
+    peers_read_unlock(proc);
     paxos_init(&fleet_state.vote_paxos, fleet_state.num_peers, logger);
 
     /* Register protocol handlers */

@@ -14,12 +14,16 @@
  *   limitations under the License.
  *******************/
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <jansson.h>
 
 #include "msg_types_priv.h"
+#include "logger.h"
 
 #include "fleet/update_proposal.h"
 #include "identity/identity_priv.h"
@@ -28,6 +32,10 @@
 #include "negotiation/task.pb-c.h"
 #include "google/protobuf/any.pb-c.h"
 
+/*@
+  assigns \nothing;
+  ensures \result >= 0;
+*/
 size_t message_size(message_type_t type)
 {
     switch (type)
@@ -39,7 +47,7 @@ size_t message_size(message_type_t type)
     case PEER:
         return sizeof(public_identity_t);
     case PEER_CAPABILITIES:
-        return sizeof(capability_t) * MAX_PEERS * MAX_CAPABILITIES;
+        return sizeof(capability_t) * DEFAULT_MAX_PEERS * MAX_CAPABILITIES;
     case NET_MESSAGE:
         return sizeof(net_msg_t);
     case TASK:
@@ -56,6 +64,8 @@ size_t message_size(message_type_t type)
         return sizeof(update_vote_msg_t);
     case UPDATE_ACCEPTED:
         return sizeof(update_accepted_msg_t);
+    case PEER_RTT_UPDATE:
+        return sizeof(peer_rtt_update_msg_t);
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
@@ -66,6 +76,11 @@ size_t message_size(message_type_t type)
     }
 }
 
+/*@
+  assigns \nothing;
+  ensures \result != \null;
+  ensures \valid_read(\result);
+*/
 char *message_type_to_string(message_type_t type)
 {
     switch (type)
@@ -94,6 +109,8 @@ char *message_type_to_string(message_type_t type)
         return (char*)"UPDATE_VOTE";
     case UPDATE_ACCEPTED:
         return (char*)"UPDATE_ACCEPTED";
+    case PEER_RTT_UPDATE:
+        return (char*)"PEER_RTT_UPDATE";
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
         return (char*)"ZTA_REVOCATION_ALERT";
@@ -105,6 +122,16 @@ char *message_type_to_string(message_type_t type)
     }
 }
 
+/* Frama-C: skipped —
+ * [serialization] protobuf pack/unpack with dynamic type switch [solver-timeout]
+ * net_msg_pack_json/to_proto/from_proto: JSON+protobuf; string_to_message_type: string
+ * comparison cascade; wrap_in_any: protobuf wrapper string_to_message_type: strcmp
+ * valid_string predicate mismatch + protobuf descriptor c_name validity…
+ */
+/*@
+  requires str != \null && \valid_read(str);
+  assigns \nothing;
+*/
 message_type_t string_to_message_type(const char *str)
 {
     if (strcmp(str, "SIGNAL") == 0)
@@ -131,6 +158,8 @@ message_type_t string_to_message_type(const char *str)
         return UPDATE_VOTE;
     if (strcmp(str, "UPDATE_ACCEPTED") == 0)
         return UPDATE_ACCEPTED;
+    if (strcmp(str, "PEER_RTT_UPDATE") == 0)
+        return PEER_RTT_UPDATE;
     return -1;  // No matching message type found (all valid types are > 0)
 }
 
@@ -144,6 +173,7 @@ int signal_to_proto(const signal_t *msg, void **data_ptr, size_t *data_len_ptr)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] JSON + protobuf preconditions */
 int net_msg_pack_json(net_msg_t *msg, json_t *json)
 {
     char *str = json_dumps(json, JSON_COMPACT);
@@ -173,6 +203,7 @@ int net_msg_unpack_json(const net_msg_t *msg, json_t **json)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] protobuf serialization preconditions */
 int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr)
 {
     json_t *root = json_object();
@@ -227,6 +258,7 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] protobuf wrapper preconditions */
 int wrap_in_any(message_type_t type, void *data_in, size_t data_in_len, void **data_ptr, size_t *data_len_ptr)
 {
     Google__Protobuf__Any pb_msg = GOOGLE__PROTOBUF__ANY__INIT;
@@ -251,6 +283,7 @@ int wrap_in_any(message_type_t type, void *data_in, size_t data_in_len, void **d
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] protobuf pack with dynamic type switch */
 int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
 {
     void *subdata = NULL;
@@ -333,6 +366,14 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.update_accepted, subdata_len);
         break;
     }
+    case PEER_RTT_UPDATE:
+    {
+        subdata_len = sizeof(peer_rtt_update_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_rtt_update, subdata_len);
+        break;
+    }
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
@@ -353,12 +394,67 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     return wrap_in_any(msg->type, subdata, subdata_len, data, data_len);
 }
 
+/* Frama-C: skipped — [solver-timeout] strtol + at_memcpy x2 + set_exception
+ * stub-precondition cascade (8 goals). No contract; same pattern as
+ * path_join/strremove skips. */
 int proto_to_signal(uint8_t *data, size_t len, signal_t *sig)
 {
-    sscanf((const char*)data, "%d-%s", &sig->sig, sig->descr);
+    if (data == NULL || sig == NULL || len == 0)
+    {
+        log_error(NULL, "proto_to_signal: null data/sig or zero len (len=%zu)\n", len);
+        return EXCEPTION(EINVAL);
+    }
+
+    /* Find the "N-" separator within the first `len` bytes; the payload is
+     * NOT guaranteed NUL-terminated (it is a raw protobuf value), so stay
+     * inside `len` throughout. */
+    const char *s = (const char *)data;
+    size_t dash = 0;
+    while (dash < len && s[dash] != '-')
+        dash++;
+    if (dash == 0 || dash >= len)
+    {
+        log_error(NULL, "proto_to_signal: malformed frame, no 'N-' separator in %zu bytes\n", len);
+        return EXCEPTION(EINVAL);
+    }
+
+    /* Parse the integer prefix through strtol.  Cap the prefix at enough
+     * digits to hold INT_MIN ("-2147483648" + NUL = 12 bytes). */
+    char num_buf[16];
+    if (dash >= sizeof(num_buf))
+    {
+        log_error(NULL, "proto_to_signal: signal int prefix %zu bytes exceeds limit\n", dash);
+        return EXCEPTION(EINVAL);
+    }
+    memcpy(num_buf, s, dash);
+    num_buf[dash] = '\0';
+
+    char *endp = NULL;
+    long v = strtol(num_buf, &endp, 10);
+    if (endp == num_buf || *endp != '\0' || v < INT_MIN || v > INT_MAX)
+    {
+        log_error(NULL, "proto_to_signal: unparseable signal int '%s'\n", num_buf);
+        return EXCEPTION(EINVAL);
+    }
+    sig->sig = (int)v;
+
+    /* Copy the descr body bounded by BOTH the wire length and SIGNAL_LEN,
+     * then explicitly NUL-terminate.  Stop at the first embedded NUL so we
+     * do not copy protobuf padding. */
+    size_t body_start = dash + 1;
+    size_t body_len = len - body_start;
+    if (body_len > SIGNAL_LEN)
+        body_len = SIGNAL_LEN;
+    size_t copy_len = 0;
+    while (copy_len < body_len && s[body_start + copy_len] != '\0')
+        copy_len++;
+    memcpy(sig->descr, s + body_start, copy_len);
+    sig->descr[copy_len] = '\0';
+
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] protobuf deserialization preconditions */
 int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
 {
     json_error_t error;
@@ -373,6 +469,8 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     const char *func = json_string_value(json_object_get(root, "function"));
     if (func && func[0] != '\0')
     {
+        /* strcpy is bounded: the destination was just allocated for
+         * strlen(func) + 1 bytes.  Not a missing-bounds-check site. */
         net_msg->function = smrt_create(strlen(func) + 1);
         if (net_msg->function != NULL)
             strcpy(net_msg->function, func);
@@ -433,6 +531,7 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] protobuf unpack with union unpacking */
 int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
 {
     Google__Protobuf__Any *pb_msg;
@@ -472,6 +571,9 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         return 0;
     case UPDATE_ACCEPTED:
         memcpy(&msg->info.update_accepted, pb_msg->value.data, sizeof(update_accepted_msg_t));
+        return 0;
+    case PEER_RTT_UPDATE:
+        memcpy(&msg->info.peer_rtt_update, pb_msg->value.data, sizeof(peer_rtt_update_msg_t));
         return 0;
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:

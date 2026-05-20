@@ -59,8 +59,9 @@ static void make_test_dirs(void)
 
 static void write_test_file(const char *name, const char *content)
 {
-    char path[512];
-    snprintf(path, sizeof(path), "%s/etc/at/%s", test_root, name);
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/etc/at/%s", test_root, name);
+    ck_assert(n > 0 && (size_t)n < sizeof(path));
     FILE *f = fopen(path, "w");
     ck_assert_ptr_nonnull(f);
     fputs(content, f);
@@ -129,8 +130,9 @@ DEFINE_TEST(test_read_config_file_bad_json)
     /* Write invalid JSON */
     write_test_file("bad.cfg.json", "not json at all");
 
-    char path[512];
-    snprintf(path, sizeof(path), "%s/etc/at/bad.cfg.json", test_root);
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/etc/at/bad.cfg.json", test_root);
+    ck_assert(n > 0 && (size_t)n < sizeof(path));
 
     char buf[1024] = {0};
     int ret = read_config_file(path, buf);
@@ -147,8 +149,9 @@ DEFINE_TEST(test_read_config_file_no_typename)
     /* Valid JSON but no typename field */
     write_test_file("notype.cfg.json", "{\"key\": \"value\"}");
 
-    char path[512];
-    snprintf(path, sizeof(path), "%s/etc/at/notype.cfg.json", test_root);
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/etc/at/notype.cfg.json", test_root);
+    ck_assert(n > 0 && (size_t)n < sizeof(path));
 
     char buf[1024] = {0};
     int ret = read_config_file(path, buf);
@@ -165,8 +168,9 @@ DEFINE_TEST(test_read_config_file_unknown_type)
     /* Valid JSON with unknown typename */
     write_test_file("unknown.cfg.json", "{\"typename\": \"nonexistent_type_xyz\"}");
 
-    char path[512];
-    snprintf(path, sizeof(path), "%s/etc/at/unknown.cfg.json", test_root);
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/etc/at/unknown.cfg.json", test_root);
+    ck_assert(n > 0 && (size_t)n < sizeof(path));
 
     char buf[1024] = {0};
     int ret = read_config_file(path, buf);

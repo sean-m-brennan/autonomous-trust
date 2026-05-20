@@ -89,16 +89,17 @@ class TestSendTcpBytes:
         assert mock_sock.send.call_count == 2
 
     def test_bytes_msg_prefix_format(self):
-        """Length prefix sent is '<len>|' encoded as bytes."""
+        """Length prefix sent as 4-byte big-endian unsigned int."""
+        import struct
         proc = _make_proc()
         msg = b'hello'
-        mock_sock = _make_context_sock(send_side_effect=[2, 5])
+        mock_sock = _make_context_sock(send_side_effect=[4, 5])
 
         with patch('socket.socket', return_value=mock_sock):
             TCPNetworkProcess._send_tcp(proc, msg, 'remotehost', 9000)
 
         prefix_arg = mock_sock.send.call_args_list[0][0][0]
-        assert prefix_arg == b'5|'
+        assert prefix_arg == struct.pack('!I', 5)
 
     def test_bytes_msg_data_sent_as_bytes(self):
         """Data send argument is the original bytes message (not re-encoded)."""
@@ -160,15 +161,16 @@ class TestSendTcpString:
 
     def test_string_prefix_reflects_encoded_length(self):
         """The length prefix matches the byte length of the encoded string."""
+        import struct
         proc = _make_proc()
         # 'hello' encodes to 5 bytes in utf-8
-        mock_sock = _make_context_sock(send_side_effect=[2, 5])
+        mock_sock = _make_context_sock(send_side_effect=[4, 5])
 
         with patch('socket.socket', return_value=mock_sock):
             TCPNetworkProcess._send_tcp(proc, 'hello', 'remotehost', 9000)
 
         prefix_arg = mock_sock.send.call_args_list[0][0][0]
-        assert prefix_arg == b'5|'
+        assert prefix_arg == struct.pack('!I', 5)
 
     def test_non_ascii_string_uses_enc(self):
         """Non-ASCII strings are encoded using proc.enc (utf-8)."""
@@ -315,16 +317,15 @@ class TestSendPeerGroupDelegation:
 
 def _build_recv_sock(msg_bytes, enc='utf-8', empty_chunk=False):
     """
-    Build a mock socket whose recv(1) calls replay the length prefix byte-by-byte,
-    followed by a recv(N) call that returns msg_bytes (or b'' to trigger the error
-    path when empty_chunk=True).
+    Build a mock socket whose recv() calls return the 4-byte binary length
+    prefix, followed by the message body (or b'' to trigger the error path).
     """
+    import struct
     sock = MagicMock()
-    length_str = str(len(msg_bytes))
-    prefix = (length_str + '|').encode(enc)
-    single_byte_calls = [bytes([b]) for b in prefix]
-    single_byte_calls.append(b'' if empty_chunk else msg_bytes)
-    sock.recv.side_effect = single_byte_calls
+    prefix = struct.pack('!I', len(msg_bytes))
+    calls = [prefix]
+    calls.append(b'' if empty_chunk else msg_bytes)
+    sock.recv.side_effect = calls
     return sock
 
 
@@ -341,28 +342,23 @@ class TestRecv:
         assert result == 'hello world'
 
     def test_empty_body_message(self):
-        """_recv handles a zero-length body (prefix '0|') without error."""
+        """_recv handles a zero-length body without error."""
+        import struct
         proc = _make_proc()
-        # '0|' then recv returns b'' — but b'' for chunk triggers the error;
-        # A 0-length message means the while loop condition is immediately false,
-        # so recv(N) is never called.
         sock = MagicMock()
-        prefix = b'0|'
-        single_byte_calls = [bytes([b]) for b in prefix]
-        sock.recv.side_effect = single_byte_calls
+        prefix = struct.pack('!I', 0)
+        sock.recv.side_effect = [prefix]
         result = TCPNetworkProcess._recv(proc, sock)
         assert result == ''
 
     def test_multi_chunk_message(self):
         """_recv reassembles multi-chunk messages correctly."""
+        import struct
         proc = _make_proc()
         msg = b'x' * 4096
         sock = MagicMock()
-        prefix = (str(len(msg)) + '|').encode('utf-8')
-        calls = [bytes([b]) for b in prefix]
-        # Simulate recv returning 2048 bytes at a time
-        calls.append(msg[:2048])
-        calls.append(msg[2048:])
+        prefix = struct.pack('!I', len(msg))
+        calls = [prefix, msg[:2048], msg[2048:]]
         sock.recv.side_effect = calls
         result = TCPNetworkProcess._recv(proc, sock)
         assert result == 'x' * 4096

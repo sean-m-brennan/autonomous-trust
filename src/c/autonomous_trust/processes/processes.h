@@ -17,6 +17,13 @@
 #ifndef PROCESSES_H
 #define PROCESSES_H
 
+/** @addtogroup internal_processes
+ *  @{
+ */
+
+#include <sys/time.h>
+#include <pthread.h>
+
 #include "utilities/message.h"
 #include "config/configuration.h"
 #include "identity/identity_priv.h"
@@ -40,18 +47,63 @@ struct process_s
     {
         map_t *handlers;
         group_t group;
-        public_identity_t peers[MAX_PEERS];
+        public_identity_t peers[DEFAULT_MAX_PEERS];
         size_t num_peers;
+        /* Protects peers[] and num_peers against concurrent reader/writer
+         * threads within a single process (e.g., net_proc peer_receiver_thread
+         * writing while other threads iterate). */
+        pthread_rwlock_t peers_rwlock;
+        /* Parallel array: expected one-way transport latency to peers[i] in
+         * milliseconds, as reported by the transport at admission time.
+         * Zero means "unknown; treat as fast LAN default when scaling".
+         * See at_timeout_scale_ms() in utilities/timeout.h. Indices align
+         * with peers[] and are covered by the same rwlock. */
+        int peer_rtt_ms[DEFAULT_MAX_PEERS];
         map_t *peer_capabilities;
         int phase;
         array_t *unhandled_messages;
     } protocol;
 };
 
+static inline void peers_read_lock(const process_t *proc)
+{
+    if (proc != NULL)
+        pthread_rwlock_rdlock((pthread_rwlock_t *)&proc->protocol.peers_rwlock);
+}
+static inline void peers_read_unlock(const process_t *proc)
+{
+    if (proc != NULL)
+        pthread_rwlock_unlock((pthread_rwlock_t *)&proc->protocol.peers_rwlock);
+}
+static inline void peers_write_lock(process_t *proc)
+{
+    if (proc != NULL)
+        pthread_rwlock_wrlock(&proc->protocol.peers_rwlock);
+}
+static inline void peers_write_unlock(process_t *proc)
+{
+    if (proc != NULL)
+        pthread_rwlock_unlock(&proc->protocol.peers_rwlock);
+}
+
 #define SIG_NAME_LEN PROC_NAME_LEN + 2
 
+/*@
+  requires name != \null && \valid_read(name);
+  requires \valid(sig + (0 .. SIG_NAME_LEN));
+  assigns sig[0 .. SIG_NAME_LEN];
+*/
 void process_name_to_signal(const char *name, char *sig);
 
+/*@
+  requires name_in != \null && \valid_read(name_in);
+  assigns \nothing;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int set_process_name(const char *name_in);
 
 typedef char* queue_id_t;
@@ -79,12 +131,26 @@ extern const char *sig_quit;
  * @param log_level
  * @return int
  */
+/*@
+  requires \valid(proc);
+  requires name != \null && \valid_read(name);
+  requires \valid(configurations);
+  assigns proc->name[0 .. PROC_NAME_LEN],
+          proc->conf, proc->configs, proc->subsystems,
+          proc->logger, proc->dependencies, proc->runner,
+          proc->protocol.handlers;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies);
 
 int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
-                  map_t *procs, directory_t *queues, logger_t *logger);
+                  map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger);
 
-int restart_process(pid_t orig, char *pname, map_t *procs, directory_t *queues, logger_t *logger);
+int restart_process(pid_t orig, char *pname, map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger);
 
 
 /**
@@ -106,14 +172,39 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2);
  * @param handler 
  * @return int 
  */
+/*@
+  requires \valid(proc);
+  requires func_name != \null && \valid_read(func_name);
+  assigns proc->protocol.handlers;
+  ensures \result == 0 || \result != 0;
+*/
 int process_register_handler(const process_t *proc, char *func_name, handler_ptr_t handler);
 
 #ifndef PROCESSES_IMPL
 extern const long cadence;
 #endif
 
+/*@
+  requires \valid(proc);
+  requires \valid(sig_q);
+  assigns \nothing;
+  ensures \result == \true || \result == \false;
+*/
 bool keep_running(const process_t *proc, queue_t *sig_q, logger_t *logger);
+
+/*@
+  requires \valid(proc);
+  assigns \nothing;
+*/
 void sleep_until(const process_t *proc, long how_long);
+
+/*@
+  requires \valid(proc);
+  requires \valid(msg);
+  assigns proc->protocol.group, proc->protocol.peers[0 .. DEFAULT_MAX_PEERS - 1],
+          proc->protocol.num_peers;
+  ensures \result == \true || \result == \false;
+*/
 bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, generic_msg_t *msg);
 
 /**
@@ -130,20 +221,50 @@ typedef struct
 /**
  * @brief Daemonize and initialize messaging. Call before process_loop().
  */
+/*@
+  requires \valid(proc);
+  requires signal != \null && \valid_read(signal);
+  requires \valid(ctx);
+  assigns ctx->my_q, ctx->sig_q, ctx->fd1, ctx->fd2;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
                   process_ctx_t *ctx);
 
 /**
  * @brief Run the message-handling loop. Call after process_setup().
  */
+/*@
+  requires \valid(proc);
+  requires \valid(ctx);
+  assigns \nothing;
+  ensures \result == 0;
+*/
 int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
                  process_ctx_t *ctx);
 
 /**
  * @brief Combined setup + loop (convenience for simple processes).
  */
+/*@
+  requires \valid(proc);
+  requires signal != \null && \valid_read(signal);
+  assigns \nothing;
+  ensures \result == 0 || \result != 0;
+*/
 int process_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
+/*@
+  requires proc == \null || \valid(proc);
+  frees proc;
+*/
 void process_free(process_t *proc);
+
+
+/** @} */ /* end of internal_processes */
 
 #endif  // PROCESSES_H

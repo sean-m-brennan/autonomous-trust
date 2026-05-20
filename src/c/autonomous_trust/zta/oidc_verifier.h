@@ -17,6 +17,10 @@
 #ifndef OIDC_VERIFIER_H
 #define OIDC_VERIFIER_H
 
+/** @addtogroup internal_zta
+ *  @{
+ */
+
 #include "zta_verifier.h"
 
 #ifdef __cplusplus
@@ -33,10 +37,19 @@ extern "C" {
  * @param out Output: newly allocated verifier (caller must destroy)
  * @return 0 on success
  */
+/*@
+  requires \valid(out);
+  allocates *out;
+  ensures \result == 0;
+  ensures *out != \null;
+*/
 int oidc_verifier_create(zta_verifier_t **out);
 
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+
+/** @} */ /* end of internal_zta */
 
 #endif /* OIDC_VERIFIER_H */

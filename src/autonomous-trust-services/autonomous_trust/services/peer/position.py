@@ -77,7 +77,7 @@ class Position(Configuration):
         mid_z = None
         if len(z) > 0:
             mid_z = (max(z) + min(z)) / 2.
-        if cls == UTMPosition:  # FIXME
+        if issubclass(cls, UTMPosition):
             return UTMPosition(others[0].zone, mid_x, mid_y, mid_z)  # noqa
         return GeoPosition(mid_x, mid_y, mid_z)
 

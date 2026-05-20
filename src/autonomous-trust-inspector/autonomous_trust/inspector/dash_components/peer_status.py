@@ -34,6 +34,11 @@ class PeerStatus(DashComponent):
     _count = 0
     icon_height = 40
 
+    @classmethod
+    def reset_count(cls):
+        """Reset the instance counter (e.g. between test runs or layout rebuilds)."""
+        cls._count = 0
+
     def __init__(self, ctl: DashControl, peer: PeerDataAcq, cohort: CohortInterface, mapp: DynamicMap,
                  parent: Any, icons: dict[str, str]):
         super().__init__(ctl.app)
@@ -45,7 +50,7 @@ class PeerStatus(DashComponent):
 
         self.idx = int(PeerStatus._count)
         PeerStatus._count += 1
-        self.peer_detail_id = 'peer_status_%d' % self.idx
+        self.peer_detail_id = f'peer_status_{self.idx}'
 
         # FIXME dependent on 'video' in peer.metadata
         self.vid_feed = VideoFeed(self.ctl, peer, self.idx)
@@ -81,19 +86,19 @@ class PeerStatus(DashComponent):
 
         # FIXME must record all data, render is fully dynamic - only one at a time
 
-        @ctl.callback(Output('offcanvas-%d' % self.idx, 'is_open'),
-                      Input('more-btn-%d' % self.idx, "n_clicks"),
-                      State('offcanvas-%d' % self.idx, 'is_open'))
+        @ctl.callback(Output(f'offcanvas-{self.idx}', 'is_open'),
+                      Input(f'more-btn-{self.idx}', "n_clicks"),
+                      State(f'offcanvas-{self.idx}', 'is_open'))
         def toggle_peer_detail(clicks, is_open):
             if clicks > 0:
-                ctl.push_mods({'peer-detail-%d' % self.idx: {'children': self.full_div()}})
+                ctl.push_mods({f'peer-detail-{self.idx}': {'children': self.full_div()}})
                 self.peer.active = True
                 return not is_open
             self.peer.active = False
             return is_open
 
-        @ctl.callback(Output('follow-target-%d' % self.idx, 'children'),
-                      Input('follow-btn-%d' % self.idx, 'n_clicks'))
+        @ctl.callback(Output(f'follow-target-{self.idx}', 'children'),
+                      Input(f'follow-btn-{self.idx}', 'n_clicks'))
         def follow_unit(_):
             mapp.following = self.peer.uuid
             return html.Div()
@@ -121,7 +126,7 @@ class PeerStatus(DashComponent):
                                             'threshold': {'line': {'color': "white", 'width': 4},
                                                           'thickness': 0.75,
                                                           'value': 50}},
-                                     name='trust-gauge-%d' % idx,
+                                     name=f'trust-gauge-{idx}',
                                      value=0.))
         self.trust_figs[idx] = gauge
         return gauge
@@ -131,12 +136,12 @@ class PeerStatus(DashComponent):
             return self.net_figs[idx]
         fig = go.Figure()
         xes, yes = self.update_net(other)
-        fig.add_trace(go.Scatter(x=xes, y=yes, name='net-fig-%d' % idx))
+        fig.add_trace(go.Scatter(x=xes, y=yes, name=f'net-fig-{idx}'))
         self.net_figs[idx] = fig
         return fig
 
     def update_micrograph(self):
-        div_id = 'micrograph-%d' % self.idx
+        div_id = f'micrograph-{self.idx}'
         x_vals, y1_vals, y2_vals, y3_vals = self.update_summary()
         self.fig.update_traces(selector=dict(name='network-up'), x=x_vals, y=y1_vals, overwrite=True)
         self.fig.update_traces(selector=dict(name='network-dn'), x=x_vals, y=y2_vals, overwrite=True)
@@ -146,27 +151,32 @@ class PeerStatus(DashComponent):
 
     def update_trust_levels(self):
         for idx, other in enumerate(self.peer.others):
-            div_id = 'trust-%d-%d' % (self.idx, idx)
+            div_id = f'trust-{self.idx}-{idx}'
             try:
                 trust_gauge = self.trust_figs[idx]
             except KeyError:
                 trust_gauge = self.add_trust_gauge(idx)
-            rep = self.peer.reputation_history[-1]
-            rep = random.random()  # FIXME
-            trust_gauge.update_traces(selector=dict(name='trust-gauge-%d' % idx),
-                                      value=rep, overwrite=True)  # FIXME per-other rep (with idx)
+            # TODO per-other reputation requires PeerDataAcq.reputation_history
+            #  to be keyed by peer uuid (dict[str, deque]) instead of a single deque.
+            #  For now, use the aggregate reputation as a stand-in for all others.
+            if self.peer.reputation_history:
+                rep = self.peer.reputation_history[-1]
+            else:
+                rep = 0.0
+            trust_gauge.update_traces(selector=dict(name=f'trust-gauge-{idx}'),
+                                      value=rep, overwrite=True)
             #if self.parent.displayed_detail == self.idx:
             #    self.ctl.push_mods({div_id: {'figure': trust_gauge.to_dict()}})
 
     def update_net_graphs(self):
         for idx, other in enumerate(self.peer.others):
-            div_id = 'net-graph-%d-%d' % (self.idx, idx)
+            div_id = f'net-graph-{self.idx}-{idx}'
             try:
                 net_fig = self.net_figs[idx]
             except KeyError:
                 net_fig = self.add_net_graph(idx, other)
             x_vals, y_vals = self.update_net(other)
-            net_fig.update_traces(selector=dict(name='net-fig-%d' % idx), x=x_vals, y=y_vals, overwrite=True)
+            net_fig.update_traces(selector=dict(name=f'net-fig-{idx}'), x=x_vals, y=y_vals, overwrite=True)
             #if self.parent.displayed_detail == self.idx:
             #    self.ctl.push_mods({div_id: {'figure': net_fig.to_dict()}})
 
@@ -180,15 +190,15 @@ class PeerStatus(DashComponent):
         y3s = list(self.peer.reputation_history)
         return xes, y1s, y2s, y3s
 
-    def update_net(self, other):  # FIXME as NetworkStats objects
-        net_history = list(self.peer.network_history[other])
-        yes = list(map(lambda x: x.sent, net_history))
-        xes = list(range(1, len(yes)))
+    def update_net(self, other):
+        net_history: list = list(self.peer.network_history[other])  # list[NetworkStats]
+        yes = [stats.sent for stats in net_history]
+        xes = list(range(1, len(yes) + 1))
         return xes, yes
 
     def peer_details(self):
-        return dbc.Offcanvas(html.Div([self.full_div()], id='peer-detail-%d' % self.idx),
-                             id='offcanvas-%d' % self.idx,
+        return dbc.Offcanvas(html.Div([self.full_div()], id=f'peer-detail-{self.idx}'),
+                             id=f'offcanvas-{self.idx}',
                              is_open=False,
                              style=dict(width='75%'))
 
@@ -205,7 +215,7 @@ class PeerStatus(DashComponent):
         if active:
             display = dict(display='block', visibility='visible')
         return html.Div([
-            html.Div(id='follow-target-%d' % self.idx),  # dummy for callback output
+            html.Div(id=f'follow-target-{self.idx}'),  # dummy for callback output
             dbc.Row([
                 dbc.Col([
                     dbc.Stack([
@@ -213,14 +223,14 @@ class PeerStatus(DashComponent):
                             make_icon(self.icon_map[self.peer.kind], self.peer.kind.capitalize(),
                                       size=IconSize.SMALL),
                             title=self.peer.nickname,
-                            id='follow-btn-%d' % self.idx, color='light'),
-                        dcc.Graph(id='micrograph-%d' % self.idx, figure=self.fig,
+                            id=f'follow-btn-{self.idx}', color='light'),
+                        dcc.Graph(id=f'micrograph-{self.idx}', figure=self.fig,
                                   config=dict(displayModeBar=False),
                                   style=dict(width=self.micro_width, height=self.micro_height)),
                         dbc.Button(
                             make_icon('carbon:overflow-menu-vertical',
                                       size=IconSize.SMALL),
-                            id='more-btn-%d' % self.idx, n_clicks=0, color='rgba(0,0,0,0)'),
+                            id=f'more-btn-{self.idx}', n_clicks=0, color='rgba(0,0,0,0)'),
                     ], gap=2, direction="horizontal"),
                 ]),
             ]),
@@ -238,35 +248,35 @@ class PeerStatus(DashComponent):
         trust_levels = []
         network = []
         self.populate()  # in case it isn't
-        #print('Num other peers %d' % len(self.peer.others))  # Updating too fast?
+        #print(f'Num other peers {len(self.peer.others)}')  # Updating too fast?
         for idx, other in enumerate(self.peer.others):
             # FIXME still not populating
-            trust_levels.append(dbc.Col([dcc.Graph(id='trust-%d-%d' % (self.idx, idx),
+            trust_levels.append(dbc.Col([dcc.Graph(id=f'trust-{self.idx}-{idx}',
                                                    figure=self.trust_figs[idx],
                                                    config=dict(displayModeBar=False),
                                                    style=dict(width=self.micro_width, height=self.micro_height)
                                                    )]))
-            network.append(dbc.Col([dcc.Graph(id='net-graph-%d-%d' % (self.idx, idx),
+            network.append(dbc.Col([dcc.Graph(id=f'net-graph-{self.idx}-{idx}',
                                               figure=self.net_figs[idx],
                                               config=dict(displayModeBar=False),
                                               style=dict(width=self.micro_width, height=self.micro_height)
                                               )]))
-        #print('Trust %d' % len(trust_levels))
-        #print('Net %d' % len(trust_levels))
+        #print(f'Trust {len(trust_levels)}')
+        #print(f'Net {len(trust_levels)}')
 
         return html.Div([
-            html.Div(id='peer-details-target-%d' % self.idx, style={'display': 'none'}),
+            html.Div(id=f'peer-details-target-{self.idx}', style={'display': 'none'}),
             html.Div([
                 dbc.Container([
                     dbc.Row([
-                        dbc.Col(['%s (%s) - %s' % (self.peer.name, self.peer.nickname, self.peer.uuid)]),
+                        dbc.Col([f'{self.peer.name} ({self.peer.nickname}) - {self.peer.uuid}']),
                     ]),
                     dbc.Row([
                         # FIXME modification
-                        dbc.Col(self.vid_feed.div("%f m above %f, %f" % (pos.alt, pos.lat, pos.lon))),
+                        dbc.Col(self.vid_feed.div(f"{pos.alt:f} m above {pos.lat:f}, {pos.lon:f}")),
                     ]),
                     dbc.Row([
-                        dbc.Col(self.data_feed.div("%s data" % self.data_type)),
+                        dbc.Col(self.data_feed.div(f"{self.data_type} data")),
                     ]),
                     dbc.Row(trust_levels),
                     dbc.Row(network),

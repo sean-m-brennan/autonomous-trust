@@ -29,3 +29,12 @@ dependencies:
   - git
   - lcov
   - llvmdev
+  - opam
+  - autoconf
+  - gmp
+  - pcre2
+  - sqlite
+  - automake
+  - libtool
+  - pkg-config
+  - libexpat

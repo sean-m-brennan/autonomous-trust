@@ -265,6 +265,20 @@ class NetworkGraph(object):
         n2 = self._random_node(limit_to=limit_to, exclude=n1)
         return n1, n2
 
+    def _random_pair_prefer_same_group(self, limit_to=None, same_group_pct=70):
+        """Select a random pair of nodes, preferring nodes from the same group."""
+        n1 = self._random_node(limit_to=limit_to)
+        if random.randint(1, 100) <= same_group_pct:
+            group = self.G.nodes[n1].get("group")
+            if group is not None:
+                candidates = limit_to if limit_to is not None else self.node_ids
+                same_group = [n for n in candidates if n != n1 and self.G.nodes[n].get("group") == group]
+                if same_group:
+                    n2 = same_group[random.randint(0, len(same_group) - 1)]
+                    return n1, n2
+        n2 = self._random_node(limit_to=limit_to, exclude=n1)
+        return n1, n2
+
     def node_addition_rejected(self):  # noqa
         return False
 
@@ -289,14 +303,14 @@ class NetworkGraph(object):
                 self.G.nodes[node_num]["persist"] = persist
         elif add_nodes < r <= add_edges:
             if len(self.G) > 1:
-                # FIXME prefer nodes from the same group
                 limit = self.link_addition_limit()
                 n = len(self.G) if limit is None else len(limit)
                 max_edges = n * (n - 1) // 2
                 if len(self.G.edges) < max_edges:
-                    edge = self._random_pair(limit_to=limit)
+                    # Prefer nodes from the same group (70% chance) for more realistic clustering
+                    edge = self._random_pair_prefer_same_group(limit_to=limit)
                     while self.G.has_edge(*edge) or self.link_addition_rejected(*edge):
-                        edge = self._random_pair(limit_to=limit)
+                        edge = self._random_pair_prefer_same_group(limit_to=limit)
                     self.add_edge(*edge)
                     self.propagate_node_grouping()
                     if self.G.has_edge(*edge):

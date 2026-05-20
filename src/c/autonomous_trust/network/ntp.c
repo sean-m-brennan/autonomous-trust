@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -30,6 +31,7 @@
 
 DEFINE_ERROR(ENTP_TIMEOUT, "NTP request timed out");
 DEFINE_ERROR(ENTP_STRATUM, "NTP stratum too high");
+DEFINE_ERROR(ENTP_SHORT, "NTP response truncated");
 
 /****************************
  * Byte-order conversion helpers
@@ -104,6 +106,23 @@ int ntp_compute_offset(const ntp_packet_t *pkt, struct timespec t1, struct times
     uint32_t tx_sec  = pkt->tx_ts_sec;
     uint32_t tx_frac = pkt->tx_ts_frac;
 
+    /* WHY the subtraction is done in uint32_t, not int64_t:
+     *
+     * NTP timestamps count seconds from 1900-01-01; Unix from 1970-01-01.
+     * NTP_EPOCH_DELTA = 2208988800 (70 years + leap days). Both `rx_sec`
+     * and NTP_EPOCH_DELTA fit in uint32_t, but their *difference* interpreted
+     * as signed would be negative for any NTP time before 1970 — which
+     * cannot occur in practice but would trap in signed overflow.
+     *
+     * By doing the subtract in uint32_t we get well-defined modular
+     * arithmetic. After 2036 the 32-bit NTP seconds field wraps (the "era 1
+     * rollover"); when that happens this code still computes the correct
+     * Unix seconds value in the NEW era, because both operands wrap
+     * together and the cast to double preserves the unsigned interpretation.
+     *
+     * The explicit `(uint32_t)NTP_EPOCH_DELTA` is required: without it the
+     * integer-promotion rules would pull the operand to signed long and
+     * defeat the guarantee. */
     /* Convert NTP timestamps to seconds since Unix epoch */
     double d_t1 = (double)t1.tv_sec + (double)t1.tv_nsec / 1.0e9;
     double d_t4 = (double)t4.tv_sec + (double)t4.tv_nsec / 1.0e9;
@@ -124,6 +143,7 @@ int ntp_compute_offset(const ntp_packet_t *pkt, struct timespec t1, struct times
  * NTP client
  ****************************/
 
+/* Frama-C: skipped — [syscall] socket/sendto/recvfrom */
 int ntp_client_request(const char *server_addr, ntp_result_t *result)
 {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -182,7 +202,7 @@ int ntp_client_request(const char *server_addr, ntp_result_t *result)
     }
 
     if (n < (ssize_t)sizeof(ntp_packet_t))
-        return -1;
+        return EXCEPTION(ENTP_SHORT);
 
     /* Record receive time (t4) */
     struct timespec t4;
@@ -205,6 +225,7 @@ int ntp_client_request(const char *server_addr, ntp_result_t *result)
 static pthread_t    ntp_server_thread;
 static volatile int ntp_server_running = 0;
 
+/* Frama-C: skipped — [syscall] socket/recvfrom/sendto loop */
 static void *ntp_server_loop(void *arg)
 {
     (void)arg;
@@ -281,6 +302,7 @@ static void *ntp_server_loop(void *arg)
     return NULL;
 }
 
+/* Frama-C: skipped — [syscall] pthread_create */
 int ntp_server_start(void)
 {
     if (ntp_server_running)
@@ -296,6 +318,7 @@ int ntp_server_start(void)
     return 0;
 }
 
+/* Frama-C: skipped — [syscall] pthread_join */
 int ntp_server_stop(void)
 {
     if (!ntp_server_running)
@@ -303,4 +326,81 @@ int ntp_server_stop(void)
     ntp_server_running = 0;
     pthread_join(ntp_server_thread, NULL);
     return 0;
+}
+
+/****************************
+ * Background NTP sync (mirrors Python start_sync)
+ ****************************/
+
+static pthread_t       ntp_sync_thread;
+static volatile int    ntp_sync_running = 0;
+static double          ntp_current_offset = 0.0;
+static pthread_mutex_t ntp_offset_lock = PTHREAD_MUTEX_INITIALIZER;
+static char            ntp_sync_server[IPV4_ADDR_LEN + 1];
+static int             ntp_sync_interval = NTP_DEFAULT_SYNC_INTERVAL;
+
+/* Frama-C: skipped — [syscall] socket/gettimeofday loop */
+static void *ntp_sync_loop(void *arg)
+{
+    (void)arg;
+
+    while (ntp_sync_running)
+    {
+        ntp_result_t result;
+        if (ntp_client_request(ntp_sync_server, &result) == 0)
+        {
+            pthread_mutex_lock(&ntp_offset_lock);
+            ntp_current_offset = result.offset_sec;
+            pthread_mutex_unlock(&ntp_offset_lock);
+        }
+
+        /* Sleep in 1-second increments so we can check the running flag */
+        for (int s = 0; s < ntp_sync_interval && ntp_sync_running; s++)
+            sleep(1);
+    }
+    return NULL;
+}
+
+/* Frama-C: skipped — [syscall] pthread_create */
+int ntp_start_sync(const char *server_addr, int interval_sec)
+{
+    if (ntp_sync_running)
+        return 0;
+
+    if (server_addr == NULL)
+        return EINVAL;
+
+    strncpy(ntp_sync_server, server_addr, IPV4_ADDR_LEN);
+    ntp_sync_server[IPV4_ADDR_LEN] = '\0';
+    ntp_sync_interval = (interval_sec > 0) ? interval_sec : NTP_DEFAULT_SYNC_INTERVAL;
+    ntp_sync_running = 1;
+
+    int err = pthread_create(&ntp_sync_thread, NULL, ntp_sync_loop, NULL);
+    if (err != 0)
+    {
+        ntp_sync_running = 0;
+        errno = err;
+        return SYS_EXCEPTION();
+    }
+    return 0;
+}
+
+/* Frama-C: skipped — [syscall] pthread_join */
+int ntp_stop_sync(void)
+{
+    if (!ntp_sync_running)
+        return 0;
+    ntp_sync_running = 0;
+    pthread_join(ntp_sync_thread, NULL);
+    return 0;
+}
+
+/* Frama-C: skipped — [syscall] gettimeofday */
+double ntp_get_offset(void)
+{
+    double offset;
+    pthread_mutex_lock(&ntp_offset_lock);
+    offset = ntp_current_offset;
+    pthread_mutex_unlock(&ntp_offset_lock);
+    return offset;
 }

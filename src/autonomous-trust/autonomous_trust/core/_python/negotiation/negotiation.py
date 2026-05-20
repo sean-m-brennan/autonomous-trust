@@ -37,6 +37,8 @@ class Status(Enum):
     dead = 'dead'
     pending = 'pending'  # has not started yet
     unknown = 'unknown'  # not tracking this task
+    no_peers = 'no_peers'  # no capable peers found
+    rejected = 'rejected'  # task rejected (reputation too low, etc.)
 
     @classmethod
     def from_ps(cls, status):

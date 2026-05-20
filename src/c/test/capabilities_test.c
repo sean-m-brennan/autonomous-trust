@@ -48,11 +48,14 @@ DEFINE_TEST(test_capability_name_copy)
     /* Name truncation at CAP_NAMELEN */
     capability_t cap2;
     memset(&cap2, 0, sizeof(cap2));
-    /* Fill with a string that's exactly CAP_NAMELEN long */
+    /* Fill with a string that's exactly CAP_NAMELEN long. Use memcpy with a
+     * fixed clamp so neither -Wstringop-truncation nor -Wformat-truncation
+     * fire — this is an intentional-truncation test. */
     char long_name[CAP_NAMELEN + 10];
     memset(long_name, 'x', CAP_NAMELEN + 9);
     long_name[CAP_NAMELEN + 9] = '\0';
-    strncpy(cap2.name, long_name, CAP_NAMELEN);
+    memcpy(cap2.name, long_name, CAP_NAMELEN);
+    cap2.name[CAP_NAMELEN] = '\0';
     ck_assert(strlen(cap2.name) == CAP_NAMELEN);
 }
 END_TEST_DEFINITION()

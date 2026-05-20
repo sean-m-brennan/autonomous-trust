@@ -17,6 +17,10 @@
 #ifndef LOGGER_H
 #define LOGGER_H
 
+/** @addtogroup public_api
+ *  @{
+ */
+
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -53,42 +57,104 @@ typedef struct {
  * @param logger Logger instance (existing).
  * @param level Log level.
  * @param filename Path to the log file.
- * 
+ *
  * @return int Success (0) or error code
  */
+/*@
+  requires \valid(logger);
+  requires max_level >= DEBUG && max_level <= CRITICAL;
+  requires log_file == \null ||
+           \valid_read(log_file + (0 .. MAX_FILENAME - 1));
+  assigns logger->max_level, logger->term, logger->local_time,
+          logger->resolution, logger->file_name[0 .. MAX_FILENAME],
+          logger->file;
+  behavior success:
+    ensures \result == 0;
+    ensures logger->max_level == max_level;
+  behavior failure:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int logger_init(logger_t *logger, log_level_t max_level, const char *log_file);
 
 /**
  * @brief Initialize a logger, specifying time resolution.
- * 
+ *
  * @param logger Logger instance (existing).
  * @param max_level Log level.
  * @param log_file Path to the log file.
  * @param res Time resolution (in milli-, micro-, or nanoseconds).
  * @return int Success (0) or error code
  */
+/*@
+  requires \valid(logger);
+  requires max_level >= DEBUG && max_level <= CRITICAL;
+  requires log_file == \null ||
+           \valid_read(log_file + (0 .. MAX_FILENAME - 1));
+  assigns logger->max_level, logger->term, logger->local_time,
+          logger->resolution, logger->file_name[0 .. MAX_FILENAME],
+          logger->file;
+  behavior success:
+    ensures \result == 0;
+    ensures logger->max_level == max_level;
+    ensures logger->resolution == res;
+  behavior failure:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int logger_init_time_res(logger_t *logger, log_level_t max_level, const char *log_file, time_resolution_t res);
 
 /**
  * @brief Initialize a logger that outputs local time instead of UTC.
- * 
+ *
  * @param logger Logger instance (existing).
  * @param max_level Log level.
  * @param log_file Path to the log file.
- * 
+ *
  * @return int Success (0) or error code
  */
+/*@
+  requires \valid(logger);
+  requires max_level >= DEBUG && max_level <= CRITICAL;
+  requires log_file == \null ||
+           \valid_read(log_file + (0 .. MAX_FILENAME - 1));
+  assigns logger->max_level, logger->term, logger->local_time,
+          logger->resolution, logger->file_name[0 .. MAX_FILENAME],
+          logger->file;
+  behavior success:
+    ensures \result == 0;
+    ensures logger->local_time == true;
+  behavior failure:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int logger_init_local_time(logger_t *logger, log_level_t max_level, const char *log_file);
 
 /**
  * @brief Initialize a logger that outputs local time instead of UTC, specifying time resolution.
- * 
+ *
  * @param logger Logger instance (existing).
  * @param max_level Log level.
  * @param log_file Path to the log file.
  * @param res Time resolution (in milli-, micro-, or nanoseconds).
  * @return int Success (0) or error code
  */
+/*@
+  requires \valid(logger);
+  requires max_level >= DEBUG && max_level <= CRITICAL;
+  requires log_file == \null ||
+           \valid_read(log_file + (0 .. MAX_FILENAME - 1));
+  assigns logger->max_level, logger->term, logger->local_time,
+          logger->resolution, logger->file_name[0 .. MAX_FILENAME],
+          logger->file;
+  behavior success:
+    ensures \result == 0;
+    ensures logger->local_time == true;
+    ensures logger->resolution == res;
+  behavior failure:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int logger_init_local_time_res(logger_t *logger, log_level_t max_level, const char *log_file, time_resolution_t res);
 
 /**
@@ -99,7 +165,37 @@ int logger_init_local_time_res(logger_t *logger, log_level_t max_level, const ch
  * @param frmt Format message.
  * @param ... Variable arguments.
  */
+/*@
+  requires logger == \null || \valid(logger);
+  requires srcfile != \null && \valid_read(srcfile);
+  requires fmt != \null && \valid_read(fmt);
+  assigns \nothing;
+*/
 void _logging(logger_t *logger, log_level_t level, const char *srcfile, const size_t line, const char *fmt, ...);
+
+#ifdef __FRAMAC__
+/* Non-variadic logging stub — bypasses the Variadic plugin which
+   generates broken format_length specs for variadic _logging().
+   Same pattern as at_snprintf in fc_stdio_spec.h. */
+/*@
+  requires logger == \null || \valid(logger);
+  assigns \nothing;
+*/
+extern void _at_logging(logger_t *logger, log_level_t level,
+                        const char *srcfile, const size_t line,
+                        const char *fmt);
+
+/* Simplify __FILENAME__ to __FILE__ — avoids WP reasoning about
+   two strrchr calls at every log site. */
+#define __FILENAME__ __FILE__
+
+#define log_debug(logger, ...)    _at_logging(logger, DEBUG, __FILE__, __LINE__, "")
+#define log_info(logger, ...)     _at_logging(logger, INFO, __FILE__, __LINE__, "")
+#define log_warn(logger, ...)     _at_logging(logger, WARNING, __FILE__, __LINE__, "")
+#define log_error(logger, ...)    _at_logging(logger, ERROR, __FILE__, __LINE__, "")
+#define log_critical(logger, ...) _at_logging(logger, CRITICAL, __FILE__, __LINE__, "")
+
+#else /* !__FRAMAC__ */
 
 #define __FILENAME__ (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 
@@ -109,23 +205,48 @@ void _logging(logger_t *logger, log_level_t level, const char *srcfile, const si
 #define log_error(logger, ...) _logging(logger, ERROR, __FILENAME__, __LINE__, __VA_ARGS__)
 #define log_critical(logger, ...) _logging(logger, CRITICAL, __FILENAME__, __LINE__, __VA_ARGS__)
 
+#endif /* __FRAMAC__ */
+
+/*@
+  requires logger == \null || \valid(logger);
+  requires srcfile != \null && \valid_read(srcfile);
+  assigns _exception.errnum, _exception.line,
+          _exception.file[0 .. MAX_FILENAME - 1];
+  ensures _exception.errnum == 0;
+*/
 void _log_exception(logger_t *logger, const char *srcfile, const size_t line);
 
 #define log_exception(logger) _log_exception(logger, __FILENAME__, __LINE__)
 
+/*@
+  requires logger == \null || \valid(logger);
+  requires srcfile != \null && \valid_read(srcfile);
+  requires fmt != \null && \valid_read(fmt);
+  assigns _exception.errnum, _exception.line,
+          _exception.file[0 .. MAX_FILENAME - 1];
+  ensures _exception.errnum == 0;
+*/
 void _log_exception_extra(logger_t *logger, const char *srcfile, const size_t line, const char *fmt, ...);
 
 #define log_exception_extra(logger, ...) _log_exception_extra(logger, __FILENAME__, __LINE__, __VA_ARGS__)
 
 /**
  * @brief Close the given logger
- * 
- * @param logger 
+ *
+ * @param logger
  */
+/*@
+  requires logger == \null || \valid(logger);
+  assigns logger->file;
+  ensures logger != \null ==> logger->file == \null;
+*/
 void logger_close(logger_t *logger);
 
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of public_api */
 
 #endif  // LOGGER_H

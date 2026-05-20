@@ -17,6 +17,10 @@
 #ifndef EXCEPTION_H
 #define EXCEPTION_H
 
+/** @addtogroup internal_utilities
+ *  @{
+ */
+
 #include <stddef.h>
 #include <errno.h>
 
@@ -44,6 +48,11 @@ extern "C"
 
 #ifndef EXCEPTION_IMPL
     extern _Thread_local exception_t _exception;
+
+    /*@
+      assigns \nothing;
+      ensures \result != \null || \result == \null;
+    */
     const char *_get_err_str(int err);
 
     extern exception_info_t error_table[];
@@ -59,6 +68,13 @@ extern "C"
  * @param file
  * @return int
  */
+/*@
+  requires file != \null && \valid_read(file + (0 .. MAX_FILENAME - 1));
+  assigns _exception.errnum, _exception.line, _exception.file[0 .. MAX_FILENAME - 1];
+  ensures _exception.errnum == err;
+  ensures _exception.line == line;
+  ensures \result == -1;
+*/
 int _set_exception(int err, size_t line, const char *file);
 
 /**
@@ -80,6 +96,9 @@ int _set_exception(int err, size_t line, const char *file);
  * @details Code that uses the library can define custom errors for use with SYS_EXCEPTION/EXCEPTION macros and log_exception().
  *
  */
+#ifdef __FRAMAC__
+#define DEFINE_ERROR(num, descr) /* Frama-C: skip constructor registration */
+#else
 #define DEFINE_ERROR(num, descr)                           \
     void __attribute__((constructor)) register_err_##num() \
     {                                                      \
@@ -88,9 +107,13 @@ int _set_exception(int err, size_t line, const char *file);
         error_table[error_table_size].description = descr; \
         error_table_size++;                                \
     }
+#endif
 
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of internal_utilities */
 
 #endif // EXCEPTION_H

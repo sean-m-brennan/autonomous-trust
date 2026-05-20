@@ -26,7 +26,12 @@
 #define ENET_WIRE 232
 DEFINE_ERROR(ENET_WIRE, "Wire message serialization error");
 
-int net_message_to_wire(const net_wire_msg_t *msg, uint8_t **wire_out, size_t *wire_len)
+/* Frama-C: skipped —
+ * [serialization] net_message_to_wire: 11x json_object_set_new/json_string + 2x
+ * crypto_sign_detached + strlen/snprintf/sodium_bin2base64 cascade.
+ */
+int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
+                        uint8_t **wire_out, size_t *wire_len)
 {
     if (msg == NULL || wire_out == NULL || wire_len == NULL)
         return EXCEPTION(EINVAL);
@@ -40,25 +45,75 @@ int net_message_to_wire(const net_wire_msg_t *msg, uint8_t **wire_out, size_t *w
                         json_string(msg->function ? msg->function : ""));
     json_object_set_new(root, "encrypt", json_boolean(msg->encrypt));
 
+    /* base64-encode binary data */
+    char *data_b64 = NULL;
     if (msg->data != NULL && msg->data_len > 0)
     {
+        /* WHY sodium_base64_VARIANT_ORIGINAL and not _URLSAFE or _NOPAD:
+         *
+         * The Python side (autonomous_trust/network/net_message.py) uses
+         * stdlib `base64.b64encode`, which produces the "standard" alphabet
+         * with `+` and `/` and mandatory `=` padding. libsodium's ORIGINAL
+         * variant matches that byte-for-byte. The other variants differ in
+         * either alphabet (URLSAFE: `-` `_`) or padding (NOPAD: none), and
+         * even a single differing byte would cause the signature below to
+         * verify against a different canonical string on the Python side
+         * and fail every verification. Do not change this variant without
+         * also updating the Python encoder. */
         size_t b64_len = sodium_base64_encoded_len(msg->data_len,
                                                     sodium_base64_VARIANT_ORIGINAL);
-        char *b64 = malloc(b64_len);
-        if (b64 == NULL)
+        data_b64 = malloc(b64_len);
+        if (data_b64 == NULL)
         {
             json_decref(root);
             return EXCEPTION(ENOMEM);
         }
-        sodium_bin2base64(b64, b64_len, msg->data, msg->data_len,
+        sodium_bin2base64(data_b64, b64_len, msg->data, msg->data_len,
                           sodium_base64_VARIANT_ORIGINAL);
-        json_object_set_new(root, "data", json_string(b64));
-        free(b64);
+        json_object_set_new(root, "data", json_string(data_b64));
     }
     else
     {
         json_object_set_new(root, "data", json_string(""));
     }
+
+    /* WHY the signed content is "<process>|<function>|<base64(data)>" in
+     * THIS exact order:
+     *
+     * This string is the canonical pre-image the Python side signs and
+     * verifies (`_content_str` in net_message.py). The order and the `|`
+     * separator are part of the protocol; if we reorder fields or use a
+     * different separator the peer's Ed25519 verifier will see a different
+     * byte sequence and reject every message with a "bad signature" that
+     * is NOT a bug in crypto but a canonicalization mismatch.
+     *
+     * `data` here is the *base64-encoded* bytes, not the raw payload —
+     * again matching Python. An empty data field contributes an empty
+     * string (not absent), so the trailing `|` is always present. */
+    if (signer != NULL)
+    {
+        const char *func_str = msg->function ? msg->function : "";
+        const char *data_str = data_b64 ? data_b64 : "";
+        size_t content_len = strlen(msg->process) + 1 + strlen(func_str) + 1 + strlen(data_str);
+        char *content = malloc(content_len + 1);
+        if (content != NULL)
+        {
+            snprintf(content, content_len + 1, "%s|%s|%s", msg->process, func_str, data_str);
+            unsigned char sig[crypto_sign_BYTES];
+            if (crypto_sign_detached(sig, NULL,
+                                     (const unsigned char *)content, content_len,
+                                     signer->signature.private) == 0)
+            {
+                char sig_hex[crypto_sign_BYTES * 2 + 1];
+                sodium_bin2hex(sig_hex, sizeof(sig_hex), sig, crypto_sign_BYTES);
+                json_object_set_new(root, "signature", json_string(sig_hex));
+            }
+            free(content);
+        }
+    }
+
+    if (data_b64 != NULL)
+        free(data_b64);
 
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
@@ -80,6 +135,10 @@ int net_message_to_wire(const net_wire_msg_t *msg, uint8_t **wire_out, size_t *w
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [serialization] net_message_from_wire: json_loadb spec dropped by kernel ("Cannot use a
+ * pointer to void here.
+ */
 int net_message_from_wire(const uint8_t *data, size_t len,
                           const public_identity_t *peer, net_wire_msg_t *msg_out)
 {
@@ -157,6 +216,36 @@ int net_message_from_wire(const uint8_t *data, size_t len,
         const char *from_enc = json_string_value(json_object_get(root, "from_enc_hex"));
         if (from_enc != NULL && from_enc[0] != '\0')
             public_encryptor_init(&msg_out->from_whom.encryptor, (const unsigned char *)from_enc);
+    }
+
+    /* extract and verify signature if present */
+    msg_out->has_signature = false;
+    msg_out->verified = false;
+    const char *sig_hex = json_string_value(json_object_get(root, "signature"));
+    if (sig_hex != NULL && strlen(sig_hex) == crypto_sign_BYTES * 2)
+    {
+        sodium_hex2bin(msg_out->signature, crypto_sign_BYTES,
+                       sig_hex, crypto_sign_BYTES * 2,
+                       NULL, NULL, NULL);
+        msg_out->has_signature = true;
+
+        /* reconstruct content string: "process|function|data" */
+        const char *func_str = msg_out->function ? msg_out->function : "";
+        size_t content_len = strlen(msg_out->process) + 1 + strlen(func_str) + 1 +
+                             (data_b64 ? strlen(data_b64) : 0);
+        char *content = malloc(content_len + 1);
+        if (content != NULL)
+        {
+            snprintf(content, content_len + 1, "%s|%s|%s",
+                     msg_out->process, func_str, data_b64 ? data_b64 : "");
+            if (crypto_sign_verify_detached(msg_out->signature,
+                                            (const unsigned char *)content, content_len,
+                                            msg_out->from_whom.signature.public) == 0)
+            {
+                msg_out->verified = true;
+            }
+            free(content);
+        }
     }
 
     json_decref(root);

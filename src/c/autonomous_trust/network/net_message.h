@@ -17,6 +17,10 @@
 #ifndef NET_MESSAGE_H
 #define NET_MESSAGE_H
 
+/** @addtogroup internal_network
+ *  @{
+ */
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -26,31 +30,113 @@
 
 #define NET_MSG_MAX_DATA (1024 * 1024)  /* 1 MB max wire message */
 
+/** @brief Whether a wire message is addressed to one peer or to all. */
 typedef enum {
-    RECIPIENT_PEER = 0,
-    RECIPIENT_BROADCAST = 1
+    RECIPIENT_PEER = 0,     /**< @c target.peer holds the intended recipient. */
+    RECIPIENT_BROADCAST = 1 /**< Message is broadcast to the group; @c target is unused. */
 } recipient_type_t;
 
+/** @brief Recipient descriptor discriminated by @ref recipient_type_t. */
 typedef struct {
-    recipient_type_t type;
+    recipient_type_t type;      /**< Discriminates @c target. */
     union {
-        public_identity_t peer;
+        public_identity_t peer; /**< Live when @c type == @ref RECIPIENT_PEER. */
     } target;
 } net_recipient_t;
 
+/**
+ * @brief Decoded representation of a network wire message.
+ *
+ * @c signature is only meaningful when @c has_signature is @c true;
+ * otherwise its bytes are uninitialized. @c verified is set by the receiver
+ * after a successful signature check and is never serialized onto the wire.
+ */
 typedef struct {
-    char process[PROC_NAME_LEN + 1];
-    char *function;
-    uint8_t *data;
-    size_t data_len;
-    net_recipient_t to_whom;
-    public_identity_t from_whom;
-    bool encrypt;
+    char process[PROC_NAME_LEN + 1];        /**< Destination process name (NUL-terminated). */
+    char *function;                         /**< Heap-allocated function selector; freed by net_wire_msg_free(). */
+    uint8_t *data;                          /**< Heap-allocated payload; freed by net_wire_msg_free(). */
+    size_t data_len;                        /**< Length of @c data in bytes. */
+    net_recipient_t to_whom;                /**< Recipient (peer or broadcast). */
+    public_identity_t from_whom;            /**< Declared sender identity. */
+    bool encrypt;                           /**< Request per-peer encryption of @c data. */
+    uint8_t signature[crypto_sign_BYTES];   /**< Ed25519 signature bytes (valid iff @c has_signature). */
+    bool has_signature;                     /**< Discriminant: true when @c signature is populated. */
+    bool verified;                          /**< Receiver-side flag after signature verification (not wire-serialized). */
 } net_wire_msg_t;
 
-int net_message_to_wire(const net_wire_msg_t *msg, uint8_t **wire_out, size_t *wire_len);
+/**
+ * @brief Serialize a wire message to JSON, optionally signing it.
+ * @param signer If non-NULL, the message is signed with this identity's private key.
+ */
+/*@
+  requires msg == \null || \valid(msg);
+  requires \valid(wire_out);
+  requires \valid(wire_len);
+  allocates *wire_out;
+  behavior null_msg:
+    assumes msg == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes msg != \null;
+    ensures \result == 0 ==> *wire_out != \null && *wire_len > 0;
+  behavior failure:
+    assumes msg != \null;
+    ensures \result != 0;
+  disjoint behaviors null_msg, success;
+*/
+int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
+                        uint8_t **wire_out, size_t *wire_len);
+
+/**
+ * @brief Parse a wire-format buffer into a @ref net_wire_msg_t.
+ *
+ * If @p peer is non-NULL and the wire data carries a signature, the
+ * signature is verified against @p peer's public key and @c msg_out->verified
+ * is set accordingly.
+ *
+ * @param[in]  data     Serialized wire bytes.
+ * @param[in]  len      Length of @p data.
+ * @param[in]  peer     Purported sender (used for signature verification); may be NULL.
+ * @param[out] msg_out  Receives the parsed message (own's heap fields; free with net_wire_msg_free()).
+ * @return 0 on successful parse, non-zero on malformed input or signature failure.
+ */
+/*@
+  requires data == \null || \valid_read(data + (0 .. len - 1));
+  requires msg_out == \null || \valid(msg_out);
+  assigns *msg_out;
+  behavior null_args:
+    assumes data == \null || msg_out == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes data != \null && msg_out != \null;
+    ensures \result == 0 || \result != 0;
+  disjoint behaviors;
+*/
 int net_message_from_wire(const uint8_t *data, size_t len,
                           const public_identity_t *peer, net_wire_msg_t *msg_out);
+
+/**
+ * @brief Release heap fields (@c function, @c data) inside a @ref net_wire_msg_t.
+ *
+ * Does not free @p msg itself. Safe to call with NULL.
+ */
+/*@
+  requires msg == \null || \valid(msg);
+  behavior null_msg:
+    assumes msg == \null;
+    assigns \nothing;
+  behavior valid_msg:
+    assumes msg != \null;
+    assigns msg->function, msg->data;
+    frees msg->function, msg->data;
+    ensures msg->function == \null;
+    ensures msg->data == \null;
+  disjoint behaviors;
+  complete behaviors;
+*/
 void net_wire_msg_free(net_wire_msg_t *msg);
+
+
+/** @} */ /* end of internal_network */
 
 #endif  /* NET_MESSAGE_H */

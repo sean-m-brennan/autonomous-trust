@@ -17,6 +17,10 @@
 #ifndef ALGORITHMS_H
 #define ALGORITHMS_H
 
+/** @addtogroup internal_algorithms
+ *  @{
+ */
+
 enum block_impl {
     POW,
     POS,
@@ -24,5 +28,8 @@ enum block_impl {
 };
 
 typedef enum block_impl block_impl_t;
+
+
+/** @} */ /* end of internal_algorithms */
 
 #endif // ALGORITHMS_H

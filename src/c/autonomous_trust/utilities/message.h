@@ -17,6 +17,10 @@
 #ifndef MESSAGE_H
 #define MESSAGE_H
 
+/** @addtogroup public_api
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <sys/socket.h>
 
@@ -24,7 +28,21 @@
 #include "msg_types.h"
 
 #define MSG_KEY_LEN PROC_NAME_LEN
-#define MAX_MSG_SIZE 1024  // FIXME
+#define DEFAULT_MAX_MSG_SIZE 1024
+/* MAX_MSG_SIZE is configurable at runtime via messaging_set_max_size() */
+#define MAX_MSG_SIZE (messaging_max_size())
+
+/*@
+  assigns \nothing;
+  ensures \result >= DEFAULT_MAX_MSG_SIZE || \result > 0;
+*/
+size_t messaging_max_size(void);
+
+/*@
+  requires size > 0;
+  assigns \nothing;
+*/
+void messaging_set_max_size(size_t size);
 
 typedef struct
 {
@@ -39,34 +57,75 @@ typedef struct
  * @param queue Queue object
  * @return int Success or error
  */
+/*@
+  requires id != \null && \valid_read(id);
+  requires \valid(queue);
+  assigns queue->key[0 .. MSG_KEY_LEN - 1], queue->fd;
+  behavior success:
+    ensures \result == 0;
+    ensures queue->fd >= 0;
+  behavior failure:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int messaging_init(const char *id, queue_t *queue);
 
 /**
  * @brief Identify the queue that belong to this process.
- * 
+ *
  * @param queue Queue object
  */
+/*@
+  requires queue == \null || \valid(queue);
+  assigns \nothing;
+*/
 void messaging_assign(queue_t *queue);
 
 /**
  * @brief Receive a message from a specific queue (usually external)
- * 
+ *
  * @param queue Queue object
  * @param msg Generic message
  * @param their_addr Sender's info
- * @param blocking 
- * @return int 
+ * @param blocking
+ * @return int
  */
+/*@
+  requires \valid(q);
+  requires q->fd > 0;
+  requires \valid(msg);
+  requires their_addr == \null || \valid(their_addr);
+  assigns msg->type, msg->size, msg->info;
+  behavior success:
+    ensures \result == 0;
+  behavior no_message:
+    ensures \result == ENOMSG;
+  behavior error:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int messaging_recv_on(queue_t *q, generic_msg_t *msg, struct sockaddr_storage *their_addr, bool blocking);
 
 /**
  * @brief Receive a message from the assigned queue
- * 
- * @param data 
- * @param their_addr 
- * @param blocking 
- * @return int 
+ *
+ * @param data
+ * @param their_addr
+ * @param blocking
+ * @return int
  */
+/*@
+  requires \valid(data);
+  requires their_addr == \null || \valid(their_addr);
+  assigns data->type, data->size, data->info;
+  behavior no_queue:
+    ensures \result == -1;
+  behavior success:
+    ensures \result == 0;
+  behavior no_message:
+    ensures \result == ENOMSG;
+  disjoint behaviors;
+*/
 int messaging_recv_from(generic_msg_t *data, struct sockaddr_storage *their_addr, bool blocking);
 
 /**
@@ -75,6 +134,21 @@ int messaging_recv_from(generic_msg_t *data, struct sockaddr_storage *their_addr
  */
 #define messaging_recv(data) messaging_recv_from(data, NULL, false)
 
+/*@
+  requires \valid(q);
+  requires q->fd > 0;
+  requires \valid(msg_type);
+  requires \valid(sig);
+  assigns *msg_type, sig->descr[0 .. SIGNAL_LEN], sig->sig;
+  behavior success:
+    ensures \result == 0;
+    ensures *msg_type == SIGNAL;
+  behavior wrong_type:
+    ensures \result == -2;
+  behavior recv_error:
+    ensures \result != 0 && \result != -2;
+  disjoint behaviors;
+*/
 int signal_recv(queue_t *q, long *msg_type, signal_t * sig);
 
 /**
@@ -85,22 +159,52 @@ int signal_recv(queue_t *q, long *msg_type, signal_t * sig);
  * @param msg
  * @return int
  */
+/*@
+  requires key != \null && \valid_read(key);
+  requires \valid(msg);
+  assigns \nothing;
+  behavior no_queue:
+    ensures \result == -1;
+  behavior success:
+    ensures \result == 0;
+  behavior would_block:
+    ensures \result == EAGAIN;
+  behavior error:
+    ensures \result == -1;
+  disjoint behaviors no_queue, success, would_block;
+*/
 int messaging_send(const char *key, const message_type_t type, generic_msg_t *msg, bool blocking);
 
 /**
- * @brief 
- * 
- * @param queue 
+ * @brief Close a specific message queue and remove its socket file.
+ *
+ * @param queue
  */
+/*@
+  requires queue == \null || \valid(queue);
+  behavior null_queue:
+    assumes queue == \null;
+    assigns \nothing;
+  behavior valid_queue:
+    assumes queue != \null;
+    assigns queue->fd;
+  disjoint behaviors;
+*/
 void messaging_qclose(queue_t *queue);
 
 /**
- * @brief 
- * 
+ * @brief Close the process's assigned message queue.
+ *
  */
+/*@
+  assigns \nothing;
+*/
 void messaging_close();
 
 #define EMSG_NOCONN 204
 DECLARE_ERROR(EMSG_NOCONN, "Attempting to send/recv without a queue (see message_assign())");
+
+
+/** @} */ /* end of public_api */
 
 #endif  // MESSAGE_H

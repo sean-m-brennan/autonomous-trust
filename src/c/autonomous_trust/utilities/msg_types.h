@@ -17,6 +17,10 @@
 #ifndef MSG_TYPES_H
 #define MSG_TYPES_H
 
+/** @addtogroup internal_utilities
+ *  @{
+ */
+
 #include <stdint.h>
 
 #include "identity/identity.h"
@@ -26,22 +30,26 @@
 #include "negotiation/task.h"
 #include "utilities/util.h"
 
+/**
+ * @brief Tags discriminating the payload carried by @ref generic_msg_t.
+ */
 typedef enum {
-    SIGNAL = 1,
-    GROUP,
-    PEER,
-    PEER_CAPABILITIES,
-    TASK,
-    NET_MESSAGE,  // generic
-    TASK_STATUS,
-    TASK_RESULT,
-    TRANSACTION_SCORE,
-    UPDATE_PROPOSAL,
-    UPDATE_VOTE,
-    UPDATE_ACCEPTED,
+    SIGNAL = 1,              /**< Process-control signal (@ref signal_t). */
+    GROUP,                   /**< Group announcement / rekey. */
+    PEER,                    /**< Peer identity advertisement. */
+    PEER_CAPABILITIES,       /**< Peer capability matrix. */
+    TASK,                    /**< New task assignment. */
+    NET_MESSAGE,             /**< Generic network message (@ref net_msg_t). */
+    TASK_STATUS,             /**< Task status update. */
+    TASK_RESULT,             /**< Task completion payload. */
+    TRANSACTION_SCORE,       /**< Reputation transaction score. */
+    UPDATE_PROPOSAL,         /**< Fleet update proposal. */
+    UPDATE_VOTE,             /**< Vote on an update proposal. */
+    UPDATE_ACCEPTED,         /**< Announcement that an update was accepted. */
+    PEER_RTT_UPDATE,         /**< Net-proc → sibling processes: peer RTT telemetry. Local IPC only — not part of identity.proto / public_identity_t network serialization. */
 #ifdef AT_ZTA_ENABLED
-    ZTA_REVOCATION_ALERT,
-    ZTA_VERIFICATION_RESULT
+    ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
+    ZTA_VERIFICATION_RESULT  /**< Outcome of a deferred ZTA verification. */
 #endif
 } message_type_t;
 
@@ -104,6 +112,20 @@ typedef struct {
     int reject_count;
 } update_accepted_msg_t;
 
+/**
+ * @brief Net-proc → sibling processes: latest per-peer RTT estimate.
+ *
+ * Emitted after net_proc stores @c peer_rtt_ms[idx] for a new or
+ * re-measured peer. Carries (peer uuid, rtt_ms) so sibling processes
+ * can look up the peer in their own @c peers[] and update the matching
+ * @c peer_rtt_ms[] slot. Local IPC only — not serialized via
+ * identity.proto on the network transport.
+ */
+typedef struct {
+    uuid_t  peer_uuid;
+    int32_t rtt_ms;
+} peer_rtt_update_msg_t;
+
 #define SIGNAL_LEN 32
 
 typedef struct
@@ -122,10 +144,17 @@ typedef struct {
 } zta_event_msg_t;
 #endif
 
+/**
+ * @brief Tagged union carrying any message the IPC layer understands.
+ *
+ * The @c type field (a @ref message_type_t cast to @c long for ABI stability
+ * with the message queue) selects which member of @c info is live. Use
+ * @ref message_size to learn the serialized size for a given @c type.
+ */
 typedef struct
 {
-    long type;
-    size_t size;
+    long type;      /**< @ref message_type_t tag. */
+    size_t size;    /**< Payload size in bytes (populated by senders). */
     union {
         signal_t signal;
         group_t group;
@@ -138,13 +167,26 @@ typedef struct
         tx_score_msg_t tx_score;
         update_vote_msg_t update_vote;
         update_accepted_msg_t update_accepted;
+        peer_rtt_update_msg_t peer_rtt_update;
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;
 #endif
-    } info;
+    } info;         /**< Discriminated-union payload keyed by @c type. */
 } generic_msg_t;
 
+/**
+ * @brief Return the @c sizeof the struct associated with @p type.
+ *
+ * Used to size buffers for the message queue. Returns 0 for unknown types.
+ */
+/*@
+  assigns \nothing;
+  ensures \result >= 0;
+*/
 size_t message_size(message_type_t type);
 
+
+
+/** @} */ /* end of internal_utilities */
 
 #endif  // MSG_TYPES_H

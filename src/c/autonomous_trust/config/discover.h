@@ -17,18 +17,38 @@
 #ifndef DISCOVER_H
 #define DISCOVER_H
 
+/** @addtogroup internal_config
+ *  @{
+ */
+
 #include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+/** @brief Filename suffix identifying a config file on disk. */
 #define CFG_FILE_EXT ".cfg.json"
 
+/**
+ * @brief Extract the config section name embedded in a config-file path.
+ *
+ * Given a path ending in @ref CFG_FILE_EXT, copies the leading
+ * filename stem (the section name) into @p type_out.
+ *
+ * @param[in]  path      Absolute or relative path to a config file.
+ * @param[out] type_out  Destination buffer for the section name.
+ * @param[in]  type_len  Size of @p type_out.
+ * @return 0 on success, non-zero if @p path does not match the expected
+ *         pattern or @p type_out is too small.
+ */
 int get_cfg_type(const char *path, char *type_out, size_t type_len);
 
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of internal_config */
 
 #endif  // DISCOVER_H

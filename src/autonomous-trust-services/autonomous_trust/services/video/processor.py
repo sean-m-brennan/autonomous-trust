@@ -63,7 +63,8 @@ class VideoProcessor(VideoProcess):
     def process_frame(self, frame):
         self.count += 1
         if self.count % self.cadence == 0:
-            # FIXME takes about .5 sec so only do this for some
+            # Detection takes ~0.5s; cadence-based frame skipping limits how
+            # often we run it so that only every Nth frame is processed.
             detection_result = self.detector.detect(frame)
             frame = self.visualize(frame, detection_result)
         return frame

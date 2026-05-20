@@ -23,11 +23,11 @@
 #include "fleet/artifact_proc.h"
 #include "fleet/artifact_store.h"
 #include "structures/map.h"
-#include "structures/map_priv.h"
-#include "structures/data_priv.h"
+#include "structures/data.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
+#include "utilities/util.h"
 #include "network/net_message.h"
 
 #define EARTIFACT 270
@@ -44,6 +44,20 @@ static struct {
     pthread_mutex_t lock;
 } artifact_state;
 
+/* WHY this is safe despite looking like a classic TOCTOU race:
+ *
+ * In the current deployment model the artifact process is single-threaded
+ * per node: all of its message-handling dispatch runs on one thread driven
+ * by the process event loop (see processes/processes.c). _ensure_init() is
+ * only invoked from that dispatch path, so the read/write on `initialized`
+ * cannot race with itself.
+ *
+ * If this ever grows a worker-thread pool, replace this with pthread_once()
+ * or a double-checked-lock that holds a separate bootstrap mutex — the
+ * in-struct mutex cannot guard its own initialization.
+ *
+ * The check is deliberately cheap (one load) on the hot path; the cost of
+ * wrong once-semantics would only show up on first call after startup. */
 static void _ensure_init(void)
 {
     if (!artifact_state.initialized)
@@ -60,6 +74,13 @@ static void _ensure_init(void)
  * Send a JSON message via the network process.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires function != \null && \valid_read(function);
+  requires payload == \null || \valid(payload);
+  requires \valid_read(peer);
+  ensures \result == 0 || \result == -1;
+*/
 static int send_to_peer(const process_t *proc, const char *function,
                         json_t *payload, const public_identity_t *peer)
 {
@@ -87,6 +108,12 @@ static int send_to_peer(const process_t *proc, const char *function,
  * A peer asks us for an artifact we may have.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_artifact_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -114,18 +141,24 @@ static bool handle_artifact_request(const process_t *proc, directory_t *queues, 
         return false;
     }
 
-    if (artifact_store_has(hash_hex))
+    /* Load-as-presence-check: a stat-then-load would race with concurrent
+     * deletion. load_manifest returns nonzero on ENOENT too, so treat its
+     * failure as "not cached" rather than an error. */
+    artifact_manifest_t manifest;
+    if (artifact_store_load_manifest(hash_hex, &manifest) != 0)
     {
-        /* Load manifest and send it back */
-        artifact_manifest_t manifest;
-        if (artifact_store_load_manifest(hash_hex, &manifest) != 0)
+        log_debug(proc->logger, "Artifact: we don't have artifact %s\n", hash_hex);
+        json_decref(payload);
+    }
+    else
+    {
+        json_t *resp = json_object();
+        if (!resp)
         {
+            log_error(proc->logger, "Artifact: json_object() OOM building manifest reply\n");
             json_decref(payload);
-            log_error(proc->logger, "Artifact: failed to load manifest for %s\n", hash_hex);
             return false;
         }
-
-        json_t *resp = json_object();
         json_object_set_new(resp, "hash", json_string(hash_hex));
         json_object_set_new(resp, "total_chunks", json_integer(manifest.total_chunks));
         json_object_set_new(resp, "total_size", json_integer((json_int_t)manifest.total_size));
@@ -134,11 +167,6 @@ static bool handle_artifact_request(const process_t *proc, directory_t *queues, 
 
         json_decref(payload);
         send_to_peer(proc, ARTIFACT_PROTO_MANIFEST, resp, &nmsg->from_whom);
-    }
-    else
-    {
-        log_debug(proc->logger, "Artifact: we don't have artifact %s\n", hash_hex);
-        json_decref(payload);
     }
 
     return true;
@@ -150,6 +178,12 @@ static bool handle_artifact_request(const process_t *proc, directory_t *queues, 
  * We received manifest info for a requested artifact.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_artifact_manifest(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -221,11 +255,11 @@ static bool handle_artifact_manifest(const process_t *proc, directory_t *queues,
     /* Save manifest to disk */
     artifact_manifest_t manifest;
     memset(&manifest, 0, sizeof(manifest));
-    strncpy(manifest.hash_hex, hash_hex, sizeof(manifest.hash_hex) - 1);
+    snprintf(manifest.hash_hex, sizeof(manifest.hash_hex), "%s", hash_hex);
     manifest.total_chunks = total_chunks;
     manifest.total_size = total_size;
     manifest.chunk_size = chunk_size;
-    strncpy(manifest.version, version, sizeof(manifest.version) - 1);
+    snprintf(manifest.version, sizeof(manifest.version), "%s", version);
 
     if (artifact_store_save_manifest(&manifest) != 0)
     {
@@ -261,6 +295,11 @@ static bool handle_artifact_manifest(const process_t *proc, directory_t *queues,
 
     /* Request first chunk */
     json_t *req = json_object();
+    if (!req)
+    {
+        log_error(proc->logger, "Artifact: json_object() OOM requesting first chunk\n");
+        return false;
+    }
     json_object_set_new(req, "hash", json_string(hash_hex));
     json_object_set_new(req, "chunk_index", json_integer(0));
     send_to_peer(proc, ARTIFACT_PROTO_CHUNK_REQ, req, &nmsg->from_whom);
@@ -274,6 +313,12 @@ static bool handle_artifact_manifest(const process_t *proc, directory_t *queues,
  * A peer wants a specific chunk from us.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_chunk_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -324,6 +369,11 @@ static bool handle_chunk_request(const process_t *proc, directory_t *queues, gen
 
     /* Build response */
     json_t *resp = json_object();
+    if (!resp)
+    {
+        log_error(proc->logger, "Artifact: json_object() OOM building chunk reply\n");
+        return false;
+    }
     json_object_set_new(resp, "hash", json_string(hash_hex));
     json_object_set_new(resp, "chunk_index", json_integer(chunk_index));
     json_object_set_new(resp, "data", json_string(data_hex));
@@ -341,6 +391,12 @@ static bool handle_chunk_request(const process_t *proc, directory_t *queues, gen
  * We received a chunk for an in-progress download.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_chunk_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -458,6 +514,11 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
 
         /* Send ARTIFACT_PROTO_COMPLETE to source peer */
         json_t *comp = json_object();
+        if (!comp)
+        {
+            log_error(proc->logger, "Artifact: json_object() OOM building complete notice\n");
+            return false;
+        }
         json_object_set_new(comp, "hash", json_string(hash_hex));
         json_object_set_new(comp, "verified", json_boolean(verify_ok));
         send_to_peer(proc, ARTIFACT_PROTO_COMPLETE, comp, &nmsg->from_whom);
@@ -467,6 +528,11 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         artifact_store_get_path(hash_hex, path_buf, sizeof(path_buf));
 
         json_t *ready = json_object();
+        if (!ready)
+        {
+            log_error(proc->logger, "Artifact: json_object() OOM building ready notice\n");
+            return false;
+        }
         json_object_set_new(ready, "hash", json_string(hash_hex));
         json_object_set_new(ready, "path", json_string(path_buf));
         json_object_set_new(ready, "version", json_string(version));
@@ -474,9 +540,9 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         generic_msg_t ready_msg = {0};
         ready_msg.type = NET_MESSAGE;
         net_msg_t *rnmsg = &ready_msg.info.net_msg;
-        strncpy(rnmsg->process, notify_target, PROC_NAME_LEN);
+        snprintf(rnmsg->process, sizeof(rnmsg->process), "%s", notify_target);
         rnmsg->function = (char *)ARTIFACT_PROTO_READY;
-        strncpy(rnmsg->return_to, "artifact", PROC_NAME_LEN);
+        snprintf(rnmsg->return_to, sizeof(rnmsg->return_to), "%s", "artifact");
 
         if (net_msg_pack_json(rnmsg, ready) == 0)
         {
@@ -502,6 +568,11 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         if (next_chunk < total)
         {
             json_t *req = json_object();
+            if (!req)
+            {
+                log_error(proc->logger, "Artifact: json_object() OOM requesting next chunk\n");
+                return false;
+            }
             json_object_set_new(req, "hash", json_string(hash_hex));
             json_object_set_new(req, "chunk_index", json_integer(next_chunk));
             send_to_peer(proc, ARTIFACT_PROTO_CHUNK_REQ, req, &nmsg->from_whom);
@@ -517,6 +588,12 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
  * Informational: a peer finished downloading an artifact from us.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_artifact_complete(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -543,17 +620,28 @@ static bool handle_artifact_complete(const process_t *proc, directory_t *queues,
  * Artifact process main entry
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] state-cascade through getenv/path_join/
+ * artifact_store_init stubs prevents WP from discharging string-literal
+ * validity, valid_rw(proc), and valid_rd(signal) at downstream call sites */
 int artifact_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();
 
-    /* Initialize artifact store */
+    /* Initialize artifact store.
+     * Use path_join instead of snprintf to avoid variadic va_arg state
+     * transitions that prevent WP from propagating \valid(proc) across
+     * the call.  A single path_join call (with the branch choosing its
+     * arguments) avoids a WP typed-allocation discharge that times out
+     * when there are two path_join sites on distinct branches. */
     const char *root = getenv("AUTONOMOUS_TRUST_ROOT");
+    const char *base = (root != NULL) ? root   : "/tmp";
+    const char *sub  = (root != NULL) ? "var/at" : "at_artifacts";
     char data_dir[256];
-    if (root != NULL)
-        snprintf(data_dir, sizeof(data_dir), "%s/var/at", root);
-    else
-        snprintf(data_dir, sizeof(data_dir), "/tmp/at_artifacts");
+    if (path_join(data_dir, sizeof(data_dir), base, sub) < 0)
+    {
+        log_error(logger, "Artifact: data-dir path too long\n");
+        return -1;
+    }
 
     if (artifact_store_init(data_dir) != 0)
     {

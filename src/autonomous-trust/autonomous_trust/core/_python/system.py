@@ -44,15 +44,16 @@ class CfgIds(object, metaclass=ClassEnumMeta):
 
 
 # Constants for system tweaking
-# communications = pkg + '.network.TCPNetworkProcess'  # FIXME not working
-communications = pkg + '.network.UDPNetworkProcess'
+tcp_communications = pkg + '.network.TCPNetworkProcess'
+udp_communications = pkg + '.network.UDPNetworkProcess'
+communications = os.environ.get('AT_TRANSPORT', udp_communications)
 comm_port = 27787
 ping_rcv_port = comm_port + 2
 ping_snd_port = ping_rcv_port + 1
 ntp_port = comm_port + 4
 preferred_proto_ver = 4
 net_cadence = 0.0001
-encoding = 'utf-8'  # FIXME hex?
+encoding = 'utf-8'
 cadence = 0.5
 queue_cadence = 0.01
 agreement_impl = AgreementImpl.POA.value
@@ -69,8 +70,10 @@ base_system_deps = core_system.keys()
 QueueType = Union[queue.Queue, multiprocessing.Queue]
 
 
-def now():  # FIXME NTP sourced
-    return datetime.now(UTC)
+def now():
+    """Return current time adjusted by NTP offset (if available)."""
+    from .network.ntp import get_offset
+    return datetime.now(UTC) + get_offset()
 
 
 class PackageHash(object):

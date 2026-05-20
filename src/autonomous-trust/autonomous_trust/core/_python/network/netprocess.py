@@ -110,6 +110,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.protocol = Protocol(self.name, self.logger, configurations)
         self.stop = False
         self.statistics = {}
+        self._rejected_addresses: set[str] = set()
+        self._crypto_error_counts: dict[str, int] = {}
 
     @property
     def my_ip(self):
@@ -199,8 +201,13 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             return False
         return self.accept_peer_message(address)
 
-    def reject_message(self, address):  # FIXME
-        return False
+    def reject_message(self, address):
+        """Check if an address has been blacklisted."""
+        return address in self._rejected_addresses
+
+    def blacklist_address(self, address):
+        """Add an address to the rejection list."""
+        self._rejected_addresses.add(address)
 
     def _encr_recv(self, method, msg_queue):
         while not self.stop:
@@ -364,7 +371,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     self.logger.error('Network: %s' % err)
                                     self.track_send_error(self.unknown_peer)
                             elif isinstance(message.to_whom, Group):
-                                if message.encrypt:  # FIXME self.group must be non-None
+                                if message.encrypt and self.group is not None:
                                     msg = self.group.encrypt(bytes(message), self.group)
                                 else:
                                     msg = bytes(message)
@@ -416,15 +423,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             decrypt_msg = self.myself.decrypt(raw_msg, from_whom)
                             self._msg_to_queue(decrypt_msg, from_whom, queues, 'point-to-point')
                         except Exception:
-                            # Some peer messages are intentionally unencrypted
-                            # (e.g. identity accept), so try plaintext fallback
-                            self.logger.warning(f"Decryption failed for peer {from_whom}, falling back to plaintext")
-                            try:
-                                self._msg_to_queue(raw_msg, from_whom, queues, 'point-to-point', validate=False)
-                                self.logger.debug('Unencrypted peer message from %s' % from_whom.nickname)
-                            except Exception:
-                                self.logger.error('Decryption error, msg from %s: %s' % (
-                                    from_whom.nickname, traceback.format_exc()))
+                            self.logger.error('Decryption failed for known peer %s, rejecting message' %
+                                              from_whom.nickname)
                     else:
                         self.logger.error(
                             'Recvd transmission from %s - not recognized as a peer. Ignoring.' % from_addr)
@@ -450,11 +450,16 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                 name = from_addr
                                 if from_whom is not None:
                                     name = '%s (%s)' % (from_whom.nickname, name)
-                                self.logger.error('CryptoError decrypting message from %s' % name)  # FIXME too often
+                                count = self._crypto_error_counts.get(name, 0) + 1
+                                self._crypto_error_counts[name] = count
+                                if count == 1 or count % 10 == 0:
+                                    self.logger.error('CryptoError decrypting message from %s (count: %d)' % (name, count))
                         else:
                             self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
                             self.logger.debug('Ignored message: %s' % str(message))
-                            # FIXME ask others in group
+                            # TODO: Query other group members for the unknown sender's
+                            # identity — they may have admitted this peer while we were
+                            # partitioned. Requires a group-level identity gossip protocol.
                 except IndexError:
                     pass
 

@@ -16,6 +16,7 @@
 
 #define DEBUG_TESTS 1
 #include "test_setup.h"
+#include <stdint.h>
 #include "autonomous_trust/algorithms/paxos.h"
 #include "autonomous_trust/utilities/logger.h"
 
@@ -32,7 +33,7 @@ DEFINE_TEST(test_paxos_init)
     ck_assert_ret_ok(paxos_init(&inst, 5, &test_logger));
     ck_assert_int_eq(inst.num_peers, 5);
     ck_assert_int_eq(inst.chain_len, 0);
-    ck_assert_double_eq_tol(inst.last_id, 0.0, 1e-9);
+    ck_assert(inst.last_id == 0);
     ck_assert(inst.initialized);
     paxos_destroy(&inst);
 }
@@ -40,10 +41,15 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_paxos_id_index)
 {
-    ck_assert_double_eq_tol(paxos_id_index(1.0, 5.0),  1.5,   1e-9);
-    ck_assert_double_eq_tol(paxos_id_index(3.0, 42.0), 3.42,  1e-9);
-    ck_assert_double_eq_tol(paxos_id_index(1.0, 0.0),  1.0,   1e-9);
-    ck_assert_double_eq_tol(paxos_id_index(7.0, 1.0),  7.1,   1e-9);
+    char buf[PAXOS_KEY_LEN];
+    paxos_id_index(buf, sizeof(buf), 1, 5);
+    ck_assert_str_eq(buf, "1:5");
+    paxos_id_index(buf, sizeof(buf), 3, 42);
+    ck_assert_str_eq(buf, "3:42");
+    paxos_id_index(buf, sizeof(buf), 1, 0);
+    ck_assert_str_eq(buf, "1:0");
+    paxos_id_index(buf, sizeof(buf), 7, 1);
+    ck_assert_str_eq(buf, "7:1");
 }
 END_TEST_DEFINITION()
 
@@ -52,10 +58,10 @@ DEFINE_TEST(test_paxos_handle_request_grant)
     paxos_instance_t inst;
     ck_assert_ret_ok(paxos_init(&inst, 3, &test_logger));
 
-    double out_last_id = -1.0;
+    int64_t out_last_id = -1;
     int out_chain_len = -1;
 
-    paxos_response_t r = paxos_handle_request(&inst, 1.0, 1.0,
+    paxos_response_t r = paxos_handle_request(&inst, 1, 1,
                                                &out_last_id, &out_chain_len);
     ck_assert_int_eq(r, PAXOS_GRANT);
     ck_assert_int_eq(out_chain_len, 0);
@@ -69,12 +75,12 @@ DEFINE_TEST(test_paxos_handle_request_nack)
     paxos_instance_t inst;
     ck_assert_ret_ok(paxos_init(&inst, 3, &test_logger));
 
-    double out_last_id;
+    int64_t out_last_id;
     int out_chain_len;
 
-    paxos_handle_request(&inst, 2.0, 1.0, &out_last_id, &out_chain_len);
+    paxos_handle_request(&inst, 2, 1, &out_last_id, &out_chain_len);
 
-    paxos_response_t r = paxos_handle_request(&inst, 1.0, 1.0,
+    paxos_response_t r = paxos_handle_request(&inst, 1, 1,
                                                &out_last_id, &out_chain_len);
     ck_assert_int_eq(r, PAXOS_NACK);
 
@@ -89,10 +95,10 @@ DEFINE_TEST(test_paxos_handle_request_backdate)
 
     paxos_advance_chain(&inst);
 
-    double out_last_id;
+    int64_t out_last_id;
     int out_chain_len;
 
-    paxos_response_t r = paxos_handle_request(&inst, 1.0, 1.0,
+    paxos_response_t r = paxos_handle_request(&inst, 1, 1,
                                                &out_last_id, &out_chain_len);
     ck_assert_int_eq(r, PAXOS_BACKDATE);
 
@@ -105,10 +111,10 @@ DEFINE_TEST(test_paxos_quorum_3_peers)
     paxos_instance_t inst;
     ck_assert_ret_ok(paxos_init(&inst, 3, &test_logger));
 
-    int count1 = paxos_record_grant(&inst, 1.0, 1.0, 0.75);
+    int count1 = paxos_record_grant(&inst, 1, 1, 0.75);
     ck_assert_int_eq(count1, 1);
 
-    int count2 = paxos_record_grant(&inst, 1.0, 1.0, 0.75);
+    int count2 = paxos_record_grant(&inst, 1, 1, 0.75);
     ck_assert_int_eq(count2, 2);
     ck_assert(count2 >= PAXOS_MAJORITY(3));
 
@@ -121,9 +127,9 @@ DEFINE_TEST(test_paxos_quorum_5_peers)
     paxos_instance_t inst;
     ck_assert_ret_ok(paxos_init(&inst, 5, &test_logger));
 
-    paxos_record_grant(&inst, 1.0, 1.0, 0.5);
-    paxos_record_grant(&inst, 1.0, 1.0, 0.5);
-    int count3 = paxos_record_grant(&inst, 1.0, 1.0, 0.5);
+    paxos_record_grant(&inst, 1, 1, 0.5);
+    paxos_record_grant(&inst, 1, 1, 0.5);
+    int count3 = paxos_record_grant(&inst, 1, 1, 0.5);
     ck_assert_int_eq(count3, 3);
     ck_assert(count3 >= PAXOS_MAJORITY(5));
 
@@ -136,10 +142,10 @@ DEFINE_TEST(test_paxos_acceptance_quorum)
     paxos_instance_t inst;
     ck_assert_ret_ok(paxos_init(&inst, 3, &test_logger));
 
-    int a1 = paxos_record_acceptance(&inst, 1.0, 1.0);
+    int a1 = paxos_record_acceptance(&inst, 1, 1);
     ck_assert_int_eq(a1, 1);
 
-    int a2 = paxos_record_acceptance(&inst, 1.0, 1.0);
+    int a2 = paxos_record_acceptance(&inst, 1, 1);
     ck_assert_int_eq(a2, 2);
     ck_assert(a2 >= PAXOS_MAJORITY(3));
 
@@ -152,10 +158,24 @@ DEFINE_TEST(test_paxos_next_ids)
     paxos_instance_t inst;
     ck_assert_ret_ok(paxos_init(&inst, 3, &test_logger));
 
-    double id1, id2;
+    int64_t id1, id2;
     paxos_next_ids(&inst, &id1, &id2);
-    ck_assert_double_eq_tol(id2, 1.0, 1e-9);
-    ck_assert(id1 > 0.0);
+    ck_assert(id2 == 1);
+    ck_assert(id1 > 0);
+
+    /* Regression for paxos.c:214-223 — id1 must be strictly monotonic, even
+     * for back-to-back calls within the same millisecond.  Original code
+     * derived id1 from clock_gettime(ms), so a tight loop of calls all
+     * produced the same id1, violating Paxos safety.  Fix folds a per-
+     * instance counter (and the node_id) into id1. */
+    int64_t prev = id1;
+    for (int i = 0; i < 32; i++)
+    {
+        int64_t next_id1 = 0, next_id2 = 0;
+        paxos_next_ids(&inst, &next_id1, &next_id2);
+        ck_assert(next_id1 > prev);
+        prev = next_id1;
+    }
 
     paxos_destroy(&inst);
 }

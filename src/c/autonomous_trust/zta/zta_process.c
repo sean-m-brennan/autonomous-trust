@@ -104,6 +104,7 @@ static struct {
 /**
  * @brief Send a reputation penalty for a peer via TRANSACTION_SCORE message
  */
+/* Frama-C: skipped — [solver-timeout] logging/network preconditions */
 static void _send_reputation_penalty(process_t *proc, const uuid_t peer_uuid,
                                      double penalty, logger_t *logger)
 {
@@ -128,6 +129,7 @@ static void _send_reputation_penalty(process_t *proc, const uuid_t peer_uuid,
 /**
  * @brief Broadcast a revocation alert to the group
  */
+/* Frama-C: skipped — [solver-timeout] logging/network preconditions */
 static void _broadcast_revocation_alert(process_t *proc, const uuid_t peer_uuid,
                                         const uint8_t *cred_hash, logger_t *logger)
 {
@@ -153,6 +155,16 @@ static void _broadcast_revocation_alert(process_t *proc, const uuid_t peer_uuid,
 /**
  * @brief Find or create a vouch tracker for a peer
  */
+/* Frama-C: skipped —
+ * zta_process_run + all helpers: [solver-timeout] memcpy of public_identity_t/uuid_t (19
+ * sites) + reputation cache + delegated vouch lifecycle + peer iteration + json/network
+ * cascades.
+ */
+/*@
+  requires zta_state.vouch_count >= 0;
+  requires zta_state.vouch_count <= MAX_DELEGATED_PEERS;
+  assigns zta_state.vouch_count, zta_state.vouches[0 .. MAX_DELEGATED_PEERS - 1];
+*/
 static delegated_vouch_t *_find_or_create_vouch(const uuid_t peer_uuid)
 {
     for (int i = 0; i < zta_state.vouch_count; i++) {
@@ -170,6 +182,11 @@ static delegated_vouch_t *_find_or_create_vouch(const uuid_t peer_uuid)
 /**
  * @brief Check if a voucher UUID is already recorded for this peer
  */
+/*@
+  requires \valid_read(v);
+  requires v->vouch_count >= 0;
+  requires \valid_read(v->vouchers + (0 .. v->vouch_count - 1));
+*/
 static bool _has_voucher(const delegated_vouch_t *v, const uuid_t voucher_uuid)
 {
     for (int i = 0; i < v->vouch_count; i++) {
@@ -183,6 +200,17 @@ static bool _has_voucher(const delegated_vouch_t *v, const uuid_t voucher_uuid)
  * @brief Look up a peer's reputation in the local cache.
  * @return true if found and not expired, with score written to *score_out
  */
+/* Frama-C: skipped —
+ * zta_process_run + all helpers: [solver-timeout] memcpy of public_identity_t/uuid_t (19
+ * sites) + reputation cache + delegated vouch lifecycle + peer iteration + json/network
+ * cascades.
+ */
+/*@
+  requires \valid(score_out);
+  requires zta_state.rep_cache_count >= 0;
+  requires zta_state.rep_cache_count <= MAX_REP_CACHE;
+  assigns *score_out, zta_state.rep_cache[0 .. MAX_REP_CACHE - 1].valid;
+*/
 static bool _rep_cache_lookup(const uuid_t peer_uuid, double *score_out)
 {
     struct timeval now;
@@ -193,9 +221,10 @@ static bool _rep_cache_lookup(const uuid_t peer_uuid, double *score_out)
             continue;
         if (uuid_compare(e->uuid, peer_uuid) != 0)
             continue;
-        /* Check TTL */
-        long age = now.tv_sec - e->fetched_at.tv_sec;
-        if (age > REP_CACHE_TTL_SEC) {
+        /* Check TTL — microsecond precision matters during sub-second bursts */
+        long age_us = (now.tv_sec - e->fetched_at.tv_sec) * 1000000L +
+                      (now.tv_usec - e->fetched_at.tv_usec);
+        if (age_us > REP_CACHE_TTL_SEC * 1000000L) {
             e->valid = false;
             return false;
         }
@@ -208,6 +237,17 @@ static bool _rep_cache_lookup(const uuid_t peer_uuid, double *score_out)
 /**
  * @brief Insert or update a reputation cache entry.
  */
+/* Frama-C: skipped —
+ * zta_process_run + all helpers: [solver-timeout] memcpy of public_identity_t/uuid_t (19
+ * sites) + reputation cache + delegated vouch lifecycle + peer iteration + json/network
+ * cascades.
+ */
+/*@
+  requires zta_state.rep_cache_count >= 0;
+  requires zta_state.rep_cache_count <= MAX_REP_CACHE;
+  assigns zta_state.rep_cache_count,
+          zta_state.rep_cache[0 .. MAX_REP_CACHE - 1];
+*/
 static void _rep_cache_update(const uuid_t peer_uuid, double score)
 {
     /* Update existing entry if present */
@@ -250,6 +290,7 @@ static void _rep_cache_update(const uuid_t peer_uuid, double score)
 /**
  * @brief Send a local IPC query to the reputation process for a peer's score.
  */
+/* Frama-C: skipped — [solver-timeout] logging/network preconditions */
 static void _request_reputation(process_t *proc, const uuid_t peer_uuid,
                                 logger_t *logger)
 {
@@ -275,6 +316,7 @@ static void _request_reputation(process_t *proc, const uuid_t peer_uuid,
 /**
  * @brief Store a vouch as pending until we get the voucher's reputation.
  */
+/* Frama-C: skipped — [solver-timeout] array/map lifecycle preconditions */
 static void _defer_vouch(const zta_event_msg_t *event, const uuid_t voucher_uuid,
                          logger_t *logger)
 {
@@ -291,6 +333,7 @@ static void _defer_vouch(const zta_event_msg_t *event, const uuid_t voucher_uuid
 /**
  * @brief Broadcast our own verification result so other peers can use it
  */
+/* Frama-C: skipped — [solver-timeout] logging/network preconditions */
 static void _broadcast_verification(process_t *proc, const uuid_t peer_uuid,
                                     const zta_result_t *result, logger_t *logger)
 {
@@ -299,9 +342,11 @@ static void _broadcast_verification(process_t *proc, const uuid_t peer_uuid,
     msg.type = ZTA_VERIFICATION_RESULT;
     msg.size = sizeof(zta_event_msg_t);
 
+    _Static_assert(sizeof(msg.info.zta_event.credential_hash) == ZTA_HASH_LEN,
+                   "zta_event credential_hash size must equal ZTA_HASH_LEN");
     memcpy(msg.info.zta_event.peer_uuid, peer_uuid, sizeof(uuid_t));
     memcpy(msg.info.zta_event.voucher_uuid, zta_state.self_uuid, sizeof(uuid_t));
-    memcpy(msg.info.zta_event.credential_hash, result->credential_hash, 32);
+    memcpy(msg.info.zta_event.credential_hash, result->credential_hash, ZTA_HASH_LEN);
     msg.info.zta_event.status = (int)result->status;
     snprintf(msg.info.zta_event.reason, sizeof(msg.info.zta_event.reason),
              "%s", result->reason);
@@ -325,6 +370,7 @@ static void _broadcast_verification(process_t *proc, const uuid_t peer_uuid,
  * Reputation gating prevents a DDIL-admitted attacker (capped at
  * ddil_fallback_reputation_cap) from vouching for a confederate.
  */
+/* Frama-C: skipped — [solver-timeout] logging/json handler */
 static void _handle_delegated_verification(process_t *proc,
                                            const zta_event_msg_t *event,
                                            const uuid_t voucher_uuid,
@@ -422,8 +468,10 @@ static void _handle_delegated_verification(process_t *proc,
 /**
  * @brief Re-verify all known peers with ZTA credentials
  */
+/* Frama-C: skipped — [solver-timeout] peer iteration preconditions */
 static void _reverify_peers(process_t *proc, logger_t *logger)
 {
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++) {
         public_identity_t *peer = &proc->protocol.peers[i];
 
@@ -498,11 +546,13 @@ static void _reverify_peers(process_t *proc, logger_t *logger)
             break;
         }
     }
+    peers_read_unlock(proc);
 }
 
 /**
  * @brief Attempt to resolve deferred verifications
  */
+/* Frama-C: skipped — [solver-timeout] array iteration preconditions */
 static void _resolve_deferred(process_t *proc, logger_t *logger)
 {
     if (!zta_state.verifier->is_available(zta_state.verifier))
@@ -514,26 +564,36 @@ static void _resolve_deferred(process_t *proc, logger_t *logger)
         if (zta_audit_get_deferred(&zta_state.audit, i, &entry) != 0)
             continue;
 
-        /* Find the peer to get their credential */
-        public_identity_t *peer = NULL;
+        /* Find the peer and snapshot the credential bytes we need — avoid
+         * holding peers_rwlock across the external verifier call. */
+        uint8_t *cred = NULL;
+        size_t cred_len = 0;
+        uint8_t cred_hash[32];
+        bool have_peer = false;
+        peers_read_lock(proc);
         for (size_t p = 0; p < proc->protocol.num_peers; p++) {
             if (uuid_compare(proc->protocol.peers[p].uuid, entry.peer_uuid) == 0) {
-                peer = &proc->protocol.peers[p];
+                public_identity_t *peer = &proc->protocol.peers[p];
+                cred = peer->zta_credential;
+                cred_len = peer->zta_credential_len;
+                memcpy(cred_hash, peer->zta_credential_hash, sizeof(cred_hash));
+                have_peer = true;
                 break;
             }
         }
-        if (!peer)
+        peers_read_unlock(proc);
+        if (!have_peer)
             continue;
 
         zta_result_t result;
-        if (peer->zta_credential && peer->zta_credential_len > 0) {
+        if (cred && cred_len > 0) {
             zta_state.verifier->verify_credential(
                 zta_state.verifier,
-                peer->zta_credential, peer->zta_credential_len,
+                cred, cred_len,
                 &result);
         } else {
             zta_state.verifier->check_revocation(
-                zta_state.verifier, peer->zta_credential_hash, &result);
+                zta_state.verifier, cred_hash, &result);
         }
 
         if (result.status == ZTA_UNAVAILABLE || result.status == ZTA_DEFERRED)
@@ -563,6 +623,11 @@ static void _resolve_deferred(process_t *proc, logger_t *logger)
  * Re-evaluates each pending vouch whose voucher now has a cached score.
  * Accepted vouches are fed back through _handle_delegated_verification;
  * rejected ones are logged and discarded.
+ */
+/* Frama-C: skipped —
+ * zta_process_run + all helpers: [solver-timeout] memcpy of public_identity_t/uuid_t (19
+ * sites) + reputation cache + delegated vouch lifecycle + peer iteration + json/network
+ * cascades.
  */
 static void _process_pending_vouches(process_t *proc, logger_t *logger)
 {
@@ -595,6 +660,7 @@ static void _process_pending_vouches(process_t *proc, logger_t *logger)
  *
  * Updates the reputation cache and triggers pending vouch processing.
  */
+/* Frama-C: skipped — [solver-timeout] logging/json handler */
 static bool _handle_rep_response(const process_t *proc, directory_t *queues,
                                  generic_msg_t *msg)
 {
@@ -648,6 +714,7 @@ static bool _handle_rep_response(const process_t *proc, directory_t *queues,
  * Process runner
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] logging/snprintf/process preconditions */
 int zta_process_run(process_t *proc, directory_t *queues,
                     queue_id_t signal, logger_t *logger)
 {

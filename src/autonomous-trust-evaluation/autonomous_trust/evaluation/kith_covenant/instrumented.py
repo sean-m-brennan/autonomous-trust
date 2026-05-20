@@ -14,21 +14,21 @@
 #   limitations under the License.
 # ******************
 
-"""Instrumented AT node with both MetricsCollector and PoliteObserver."""
+"""Instrumented AT node with both MetricsCollector and KithCovenantObserver."""
 
 from autonomous_trust.evaluation.instrumented import InstrumentedAT
-from autonomous_trust.evaluation.polite.observer import PoliteObserver
+from autonomous_trust.evaluation.kith_covenant.observer import KithCovenantObserver
 
 
-class PoliteInstrumentedAT(InstrumentedAT):
-    """AT node that tees messages to both MetricsCollector and PoliteObserver."""
+class KithCovenantInstrumentedAT(InstrumentedAT):
+    """AT node that tees messages to both MetricsCollector and KithCovenantObserver."""
 
-    _polite_policy = None
-    _polite_output = None
+    _kith_covenant_policy = None
+    _kith_covenant_output = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if self._polite_policy:
-            self.add_worker(PoliteObserver,
-                            policy=self._polite_policy,
-                            output_path=self._polite_output)
+        if self._kith_covenant_policy:
+            self.add_worker(KithCovenantObserver,
+                            policy=self._kith_covenant_policy,
+                            output_path=self._kith_covenant_output)

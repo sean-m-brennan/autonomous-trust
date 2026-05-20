@@ -17,6 +17,10 @@
 #ifndef NAMES_H
 #define NAMES_H
 
+/** @addtogroup internal_config
+ *  @{
+ */
+
 #include <stddef.h>
 #include <stdbool.h>
 
@@ -24,10 +28,25 @@
 extern "C" {
 #endif
 
+/*@
+  requires out == \null || \valid(out + (0 .. out_len - 1));
+  requires out_len >= 4;
+  assigns out[0 .. out_len - 1];
+  behavior null_out:
+    assumes out == \null || out_len < 4;
+    ensures \result == -1;
+  behavior success:
+    assumes out != \null && out_len >= 4;
+    ensures \result == 0 || \result == -1;
+  disjoint behaviors;
+*/
 int random_name(char *out, size_t out_len, char sep, bool capitalize);
 
 #ifdef __cplusplus
 } // extern "C"
 #endif
+
+
+/** @} */ /* end of internal_config */
 
 #endif  // NAMES_H

@@ -98,8 +98,11 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                         if peer is not None:
                             participants.append(peer)
             if len(participants) < 1:
-                self.logger.warning('No capable peers')
-                # FIXME send error to main
+                self.logger.warning('No capable peers for task %s' % task.capability.name)
+                queues[CfgIds.main].put(
+                    TaskResult(task, Status.no_peers, None),
+                    block=True, timeout=self.q_cadence)
+                return True
             try:
                 for peer in participants:
                     tracker.results[peer.uuid] = None
@@ -125,8 +128,13 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                     self.logger.debug('Remote task refused: not capable')
                 else:
-                    # TODO reputation too low, etc.
-                    if task.parameters.acceptable():
+                    sender_level = self.peers._find(self.peers._index_by(message.from_whom))
+                    if sender_level is not None and sender_level == 0:
+                        msg = Message(self.name, NegotiationProtocol.refusal,
+                                      task.to_json_string(), message.from_whom)
+                        queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+                        self.logger.debug('Remote task refused: peer reputation too low')
+                    elif task.parameters.acceptable():
                         if self._add_task(task):
                             msg = Message(self.name, NegotiationProtocol.acceptance,
                                           task.to_json_string(), message.from_whom)
@@ -162,8 +170,14 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             task = message.obj
             if task.parameters.flexible:
                 try:
-                    alt_task = task  # FIXME address any conflicts in parameters
-                    msg = Message(self.name, NegotiationProtocol.announce, alt_task.to_json_string(), message.from_whom)
+                    # Accept the peer's counter-proposal if our parameters allow it
+                    if task.uuid in self.my_tasks:
+                        original = self.my_tasks[task.uuid].task
+                        if task.parameters.when != original.parameters.when:
+                            original.parameters.when = task.parameters.when
+                        original.adjust()
+                        task = original
+                    msg = Message(self.name, NegotiationProtocol.announce, task.to_json_string(), message.from_whom)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                     self.logger.debug('Attempt to resolve haggling')
                 except Full:

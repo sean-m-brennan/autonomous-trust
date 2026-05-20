@@ -30,8 +30,21 @@
         .arguments = args,                                \
     },
 
-capability_t capability_table[] = {
-    LIST__DECLARE_CAPABILITY
+
+#ifndef CAPABILITY_TABLE_CAPACITY
+#define CAPABILITY_TABLE_CAPACITY 128
+#endif
+
+/* Trailing sentinel uses a designated initializer so GCC's
+ * -Werror=missing-braces accepts it (capability_t has nested sub-structs
+ * including an anonymous smrt_ptr_t). Also gives Frama-C's strict parser
+ * a non-empty initializer when the declaration list expands to nothing.
+ * The sentinel MUST share a line with LIST__... because preprocess.py
+ * emits `size_t capability_table_size = N;` on the line immediately
+ * following the LIST__ line, and that line must be `};` for the
+ * generated code to parse. */
+capability_t capability_table[CAPABILITY_TABLE_CAPACITY] = {
+    LIST__DECLARE_CAPABILITY { .name = "" }
 };
 
 #endif // CAPABILITY_TABLE_PRIV_H_IN

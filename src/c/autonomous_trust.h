@@ -14,6 +14,16 @@
  *   limitations under the License.
  *******************/
 
+/**
+ * @file autonomous_trust.h
+ * @ingroup public_api
+ * @brief Top-level public header for embedding AutonomousTrust.
+ *
+ * Include this single header to pull in everything an application needs to
+ * run an AutonomousTrust daemon: message queues, logging, configuration,
+ * signal handling, and the node-lifecycle API. See @ref public_api.
+ */
+
 #ifndef AUTONOMOUS_TRUST_H
 #define AUTONOMOUS_TRUST_H
 
@@ -28,20 +38,36 @@ extern "C" {
 #include "autonomous_trust/utilities/sighandler.h"
 #include "autonomous_trust/node.h"
 
-/**
- * @brief 
- * 
- * @param q_in 
- * @param q_out 
- * @param capabilities 
- * @param cap_len 
- * @param log_level 
- * @param log_file 
- * @return int 
+/** @addtogroup public_api
+ *  @{
  */
-int run_autonomous_trust(char *q_in, char *q_out, 
-                         void *capabilities, size_t cap_len, // FIXME from config file?
+
+/**
+ * @brief Run an AutonomousTrust daemon in the current process.
+ *
+ * Blocks until the daemon exits (on signal or fatal error). Most embedders
+ * should prefer the higher-level @ref at_node_init / @ref at_node_start
+ * lifecycle in `node.h`, which forks this routine into a child process and
+ * wires up the IPC queues for the caller.
+ *
+ * @param q_in          IPC queue name used for messages **into** the daemon
+ *                      (application → AT). NUL-terminated.
+ * @param q_out         IPC queue name used for messages **out of** the daemon
+ *                      (AT → application). NUL-terminated.
+ * @param capabilities  Optional serialized capabilities buffer that overrides
+ *                      the on-disk configuration. Pass `NULL` to use the
+ *                      config file alone.
+ * @param cap_len       Length of @p capabilities in bytes. Ignored when
+ *                      @p capabilities is `NULL`.
+ * @param log_level     Minimum severity to emit (see @ref log_level_t).
+ * @param log_file      Path to the log file; empty string routes to stderr.
+ * @return 0 on clean shutdown, non-zero on startup or runtime failure.
+ */
+int run_autonomous_trust(char *q_in, char *q_out,
+                         void *capabilities, size_t cap_len,
                          log_level_t log_level, char log_file[]);
+
+/** @} */ /* end of public_api */
 
 #ifdef __cplusplus
 } // extern "C"

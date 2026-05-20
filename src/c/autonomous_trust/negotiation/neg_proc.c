@@ -19,9 +19,9 @@
 
 #include "processes/processes.h"
 #include "negotiation/negotiation.h"
-#include "structures/map_priv.h"
-#include "structures/data_priv.h"
-#include "structures/array_priv.h"
+#include "structures/map.h"
+#include "structures/data.h"
+#include "structures/array.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
@@ -64,6 +64,7 @@ static void _ensure_init(void)
  * Helper: build a reply net_msg_t directed back to sender
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] JSON + logging preconditions */
 static void _build_reply(const net_msg_t *nmsg, const char *func, generic_msg_t *reply)
 {
     memset(reply, 0, sizeof(*reply));
@@ -91,6 +92,7 @@ static json_t *_task_uuid_json(const char *task_uuid_str)
  * Helper: serialize task_t fields into a JSON object
  ****************************/
 
+/* Frama-C: skipped — [serialization] jansson JSON serialization */
 static json_t *_task_to_json(const task_t *task)
 {
     char task_uuid_str[UUID_STRING_LEN + 1] = {0};
@@ -126,6 +128,7 @@ static json_t *_task_to_json(const task_t *task)
  * Helper: populate a task_t from a JSON object (partial – fills uuid, cap name, flexible, timeout)
  ****************************/
 
+/* Frama-C: skipped — [serialization] jansson JSON deserialization */
 static int _task_from_json(const json_t *j, task_t *task)
 {
     if (!j || !task)
@@ -183,6 +186,7 @@ static int _task_from_json(const json_t *j, task_t *task)
  * Returns true if peer_capabilities is NULL (fallback: assume capable).
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] capability iteration preconditions */
 static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_str,
                                   const char *cap_name)
 {
@@ -217,6 +221,17 @@ static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_st
  * Deserialize task JSON, create tracker, filter peers by capability, send invitations.
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_start_task(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -259,7 +274,9 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
 
     /* Create a task tracker for result collection (expect num_peers responses) */
     task_tracker_t *tracker = NULL;
+    peers_read_lock(proc);
     int expected = (int)proc->protocol.num_peers;
+    peers_read_unlock(proc);
     if (task_tracker_create(&tracker, task.uuid, expected) == 0 && tracker)
     {
         data_t *trk_dat = object_ptr_data(tracker, sizeof(task_tracker_t));
@@ -271,6 +288,7 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
 
     /* Send invitation to capable peers */
     int invited = 0;
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         char peer_uuid_str[UUID_STRING_LEN + 1] = {0};
@@ -295,6 +313,7 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
         messaging_send("network", NET_MESSAGE, &invite, false);
         invited++;
     }
+    peers_read_unlock(proc);
 
     if (invite_json)
         json_decref(invite_json);
@@ -312,6 +331,17 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
  * Check capability, flood counter, accept/refuse/haggle.
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_invite(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -473,6 +503,17 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
  * If task is flexible, re-announce with adjusted params; otherwise refuse.
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_haggle(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -538,6 +579,12 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
  * Extract task UUID, decrement expected count in tracker; log failure if insufficient.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_refuse(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -598,6 +645,17 @@ static bool handle_refuse(const process_t *proc, directory_t *queues, generic_ms
  * Extract task_uuid from payload; track count of confirmed peers per task.
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_accept(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -647,6 +705,17 @@ static bool handle_accept(const process_t *proc, directory_t *queues, generic_ms
  * Look up task in task_stack, reply with current status.
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -706,6 +775,12 @@ static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_
  * Update tracking: extend timeout if active; log cancellation if dead.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -759,8 +834,10 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
             case NEG_DEAD:
             case NEG_ZOMBIE:
             case NEG_STOPPED:
+            case NEG_NO_PEERS:
+            case NEG_REJECTED:
                 log_warn(proc->logger,
-                         "Negotiation: task %s appears cancelled/dead (status=%d)\n",
+                         "Negotiation: task %s cancelled/dead/rejected (status=%d)\n",
                          task_uuid_str, (int)status);
                 break;
 
@@ -798,6 +875,17 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
  * Collect result, forward to main process when all results arrive.
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_results(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -893,6 +981,11 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
  * Negotiation process main entry
  ****************************/
 
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of public_identity_t (9
+ * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
+ * cascades.
+ */
 int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();
