@@ -418,6 +418,32 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             json_object_set_new(body, "task_uuid", json_string(task_str));
         }
     }
+    else if (strcmp(function, REP_PROTO_COMMITTED) == 0)
+    {
+        /* Phase 3 — (task_uuid, peer_uuid, score).  Mirrors the
+         * commit-broadcast payload built by handle_accepted. */
+        double score = 1.0;
+        const char *task_slug = NULL;
+        if (payload && json_is_object(payload))
+        {
+            json_t *s_j = json_object_get(payload, "score");
+            if (json_is_real(s_j))    score = json_real_value(s_j);
+            else if (json_is_integer(s_j)) score = (double)json_integer_value(s_j);
+            json_t *t_j = json_object_get(payload, "task_id");
+            if (json_is_string(t_j)) task_slug = json_string_value(t_j);
+        }
+        body = json_object();
+        json_object_set_new(body, "peer_uuid", json_string(proposer_str));
+        json_object_set_new(body, "score", json_real(score));
+        if (task_slug)
+        {
+            uuid_t task_uuid;
+            _uuid5("tx:", task_slug, task_uuid);
+            char task_str[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(task_uuid, task_str);
+            json_object_set_new(body, "task_uuid", json_string(task_str));
+        }
+    }
     else if (strcmp(function, REP_PROTO_OUTDATED) == 0
              || strcmp(function, REP_PROTO_UPDATE) == 0)
     {

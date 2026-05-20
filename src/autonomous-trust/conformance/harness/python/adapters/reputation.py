@@ -390,6 +390,12 @@ class ReputationAdapter:
         elif function == ReputationProtocol.accepted:
             tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
             obj = to_json_string(tup)
+        elif function == ReputationProtocol.committed:
+            # Phase 3 broadcast — (task_id, peer_id, score).  Mirrors
+            # repprocess.py's commit_msg payload in handle_accepted.
+            task_id = str(uuid5(_NS, f'tx:{payload.get("task_id", "default")}'))
+            obj = to_json_string((task_id, proposer_uuid,
+                                  float(payload.get('score', 1.0))))
         elif function == ReputationProtocol.outdated:
             obj = str(payload.get('length', 0))
         elif function == ReputationProtocol.update:

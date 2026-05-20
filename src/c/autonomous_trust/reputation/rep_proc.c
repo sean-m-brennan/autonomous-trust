@@ -84,6 +84,7 @@ char REP_PROTO_NACK[]        = "try again";
 char REP_PROTO_BACKDATE[]    = "out of date";
 char REP_PROTO_TX[]          = "transaction";
 char REP_PROTO_ACCEPTED[]    = "tx accepted";
+char REP_PROTO_COMMITTED[]   = "tx committed";
 char REP_PROTO_OUTDATED[]    = "update needed";
 char REP_PROTO_UPDATE[]      = "latest update";
 char REP_PROTO_REP_REQ[]     = "request reputation";
@@ -122,6 +123,14 @@ static struct {
      * rank_update IPC when the tier hasn't changed. Mirrors Python's
      * self.peer_ranks in repprocess.py:100. */
     map_t peer_ranks;
+    /* Paxos rounds already committed locally. Keyed by paxos_id_index
+     * (id1,id2), value is integer_data(1) — used as a set. Prevents
+     * handle_accepted from re-firing its commit block on every late
+     * ACCEPTED that arrives after majority is crossed; without this,
+     * the same proposer would broadcast `committed` once per peer above
+     * majority, and duplicate broadcasts corrupt the bilateral
+     * Transaction (tx_history_update would set p2 = p1 = proposer). */
+    map_t committed_paxos_rounds;
 } rep_state;
 
 static void _ensure_init(void)
@@ -134,6 +143,7 @@ static void _ensure_init(void)
         map_init(&rep_state.updates);
         array_init(&rep_state.requested_reps);
         map_init(&rep_state.peer_ranks);
+        map_init(&rep_state.committed_paxos_rounds);
         /* paxos_init is called in reputation_run after num_peers is known */
         rep_state.num_peers = 0;
         pthread_mutex_init(&rep_state.lock, NULL);
@@ -679,13 +689,32 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
 
     if (commit)
     {
+        /* Idempotency guard: every ACCEPTED that arrives after the
+         * majority threshold has been crossed would otherwise re-fire
+         * the commit-and-broadcast block. That fans out ~N-majority
+         * extra `committed` broadcasts per round, and duplicate
+         * broadcasts corrupt the Transaction (tx_history_update would
+         * set p2 = p1 = proposer because the bilateral guard there
+         * would also be needed if this slipped through). Mirrors
+         * repprocess.handle_accepted's `committed_paxos_rounds` set. */
+        data_t *already = NULL;
+        if (map_get(&rep_state.committed_paxos_rounds, paxos_key, &already) == 0)
+        {
+            json_decref(payload);
+            return true;
+        }
+        data_t *mark = integer_data(1);
+        map_set(&rep_state.committed_paxos_rounds, paxos_key, mark);
+
         /* Parse UUIDs and commit to history */
         uuid_t peer_uuid;
         uuid_t task_uuid;
         uuid_parse(peer_uuid_str, peer_uuid);
 
         const char *task_uuid_str = json_string_value(json_object_get(payload, "task_uuid"));
-        if (task_uuid_str && uuid_parse(task_uuid_str, task_uuid) == 0)
+        bool have_task_uuid = (task_uuid_str
+                               && uuid_parse(task_uuid_str, task_uuid) == 0);
+        if (have_task_uuid)
         {
             tx_history_update(&rep_state.history, task_uuid, peer_uuid, score);
         }
@@ -695,11 +724,122 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
         }
         paxos_advance_chain(&rep_state.paxos);
         log_info(proc->logger, "Reputation: Transaction committed\n");
+
+        /* Phase 3 — broadcast committed (task_id, peer_id, score) to
+         * the group so acceptors can write the same entry to their
+         * own histories.  Bilateral Transactions form across peers
+         * when both sides eventually run this for each other's
+         * submissions. */
+        json_t *commit_json = json_object();
+        if (commit_json != NULL)
+        {
+            if (have_task_uuid)
+                json_object_set_new(commit_json, "task_uuid",
+                                    json_string(task_uuid_str));
+            json_object_set_new(commit_json, "peer_uuid",
+                                json_string(peer_uuid_str));
+            json_object_set_new(commit_json, "score", json_real(score));
+
+            generic_msg_t bcast = {0};
+            bcast.type = NET_MESSAGE;
+            strncpy(bcast.info.net_msg.process, "reputation", PROC_NAME_LEN);
+            bcast.info.net_msg.function = REP_PROTO_COMMITTED;
+            bcast.info.net_msg.encrypt = true;
+            /* Group broadcast — handlers use the group key.  Mirror
+             * the convention used by _forward_transaction's REQUEST
+             * broadcast at rep_proc.c:1113-1122 (a per-peer loop on
+             * the proc->protocol.peers list). */
+            net_msg_pack_json(&bcast.info.net_msg, commit_json);
+            json_decref(commit_json);
+
+            peers_read_lock(proc);
+            for (size_t i = 0; i < proc->protocol.num_peers; i++)
+            {
+                generic_msg_t per = bcast;  /* shallow copy */
+                memcpy(&per.info.net_msg.to_whom,
+                       &proc->protocol.peers[i],
+                       sizeof(public_identity_t));
+                messaging_send("network", NET_MESSAGE, &per, false);
+            }
+            peers_read_unlock(proc);
+        }
     }
     else
     {
         log_debug(proc->logger, "Reputation: Tx accepted (%d so far)\n", acc_count);
     }
+
+    json_decref(payload);
+    return true;
+}
+
+/****************************
+ * Handler: handle_committed (tx committed) — Phase 3
+ * Acceptor receives the proposer's commit announcement and writes
+ * (task_id, peer_id, score) to local history.  The proposer's own
+ * broadcast bounces back to itself — we skip the self-update because
+ * handle_accepted already wrote the entry locally.
+ ****************************/
+
+/*@
+  requires \valid(proc);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
+static bool handle_committed(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_error(proc->logger, "Reputation: handle_committed: failed to unpack JSON\n");
+        return false;
+    }
+
+    json_t *j_peer_uuid = json_object_get(payload, "peer_uuid");
+    json_t *j_task_uuid = json_object_get(payload, "task_uuid");
+    json_t *j_score     = json_object_get(payload, "score");
+
+    if (!j_peer_uuid || !j_score)
+    {
+        json_decref(payload);
+        log_error(proc->logger, "Reputation: handle_committed: missing JSON fields\n");
+        return false;
+    }
+
+    const char *peer_uuid_str = json_string_value(j_peer_uuid);
+    double score = json_real_value(j_score);
+
+    /* No self-bounce check needed in C — handle_accepted's broadcast
+     * loop iterates proc->protocol.peers, which excludes self.  The
+     * Python twin keeps a self-skip as a safety net because its
+     * encrypted-group broadcast may or may not loop back through
+     * the local network process. */
+
+    uuid_t peer_uuid;
+    if (uuid_parse(peer_uuid_str, peer_uuid) != 0)
+    {
+        json_decref(payload);
+        log_error(proc->logger, "Reputation: handle_committed: bad peer_uuid\n");
+        return false;
+    }
+
+    uuid_t task_uuid;
+    const char *task_uuid_str = j_task_uuid ? json_string_value(j_task_uuid) : NULL;
+    if (task_uuid_str && uuid_parse(task_uuid_str, task_uuid) == 0)
+    {
+        tx_history_update(&rep_state.history, task_uuid, peer_uuid, score);
+    }
+    else
+    {
+        /* Same fallback handle_accepted uses when task_uuid is
+         * missing: key the entry by peer_uuid. */
+        tx_history_update(&rep_state.history, peer_uuid, peer_uuid, score);
+    }
+    log_debug(proc->logger, "Reputation: Recorded committed tx from %s\n",
+              peer_uuid_str);
 
     json_decref(payload);
     return true;
@@ -1151,6 +1291,7 @@ int reputation_register_handlers(process_t *proc)
     process_register_handler(proc, REP_PROTO_BACKDATE,  (handler_ptr_t)handle_backdate);
     process_register_handler(proc, REP_PROTO_TX,        (handler_ptr_t)handle_transaction);
     process_register_handler(proc, REP_PROTO_ACCEPTED,  (handler_ptr_t)handle_accepted);
+    process_register_handler(proc, REP_PROTO_COMMITTED, (handler_ptr_t)handle_committed);
     process_register_handler(proc, REP_PROTO_OUTDATED,  (handler_ptr_t)handle_outdated);
     process_register_handler(proc, REP_PROTO_UPDATE,    (handler_ptr_t)handle_update);
     process_register_handler(proc, REP_PROTO_REP_REQ,   (handler_ptr_t)handle_rep_request);
@@ -1193,6 +1334,8 @@ void reputation_reset_state(int num_peers)
     tx_history_init(&rep_state.history);
     map_free(&rep_state.peer_ranks);
     map_init(&rep_state.peer_ranks);
+    map_free(&rep_state.committed_paxos_rounds);
+    map_init(&rep_state.committed_paxos_rounds);
     rep_state.num_peers = num_peers;
     paxos_init(&rep_state.paxos, num_peers, NULL);
     rep_state.synchronous_dispatch = was_sync;

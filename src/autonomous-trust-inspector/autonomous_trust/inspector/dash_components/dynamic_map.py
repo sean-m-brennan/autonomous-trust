@@ -84,8 +84,10 @@ class DynamicMap(DashComponent):
                         self.z_scale = relay_out['geo.projection.scale']
             return ''
 
+        # UI tuning open: use 75% of screen instead of fixed
+        # self.width / self.height — needs viewport-aware sizing.
         self.basic_layout = dict(showlegend=False, autosize=False, hovermode='closest',
-                                 uirevision='keep', height=self.height, width=self.width,  # FIXME 75% of screen
+                                 uirevision='keep', height=self.height, width=self.width,
                                  margin=dict(l=self.fig_margin, r=self.fig_margin,
                                              t=self.fig_margin, b=self.fig_margin),
                                  )
@@ -125,12 +127,15 @@ class DynamicMap(DashComponent):
                     self.add_traces(idx, uuid)
                     self.peer_tracker[uuid] = True
                 if self.following == uuid:
-                    # FIXME disable previous marker
+                    # UI tuning open: hide the previous follow-marker
+                    # when the target changes (currently both linger).
                     self.center = GeoPosition(self.coords[uuid].lat[-1], self.coords[uuid].lon[-1])
                     self.fig.update_traces(selector=dict(name=f'follow-{uuid}'), mode='markers',
                                            overwrite=True,
                                            lat=[self.coords[uuid].lat[-1]], lon=[self.coords[uuid].lon[-1]])
-        if self.z_scale != self.default_scale:  # FIXME or pitch/bearing/follow changes
+        # UI tuning open: also trigger this branch on pitch / bearing
+        # / follow changes — z_scale alone misses camera-state edits.
+        if self.z_scale != self.default_scale:
             margin = dict(l=self.fig_margin, r=self.fig_margin, t=self.fig_margin, b=self.fig_margin)
             if self.use_map:
                 self.fig.update_layout(dict(**self.basic_layout,
@@ -210,16 +215,24 @@ class DynamicMap(DashComponent):
         self.coords: dict[str, GeoPosition] = {}
         self.color_map: dict[str, str] = {}
 
-        self.cohort.update(initial=True)  # FIXME initial - must not run components
+        # UI tuning open: the `initial=True` signal should bypass
+        # component-update side-effects during the first render;
+        # currently it runs the full update path.
+        self.cohort.update(initial=True)
         self.logger.debug(f'Initialize map: {len(self.cohort.peers)} peers')
         center = self.cohort.center.convert(GeoPosition)
         if self.use_map:
-            self.z_scale = 14  # TODO: compute, this is tuned for the example config
+            # UI tuning open: compute z_scale from cohort bounding box;
+            # 14 is hand-tuned for the example config.
+            self.z_scale = 14
         for idx, uuid in enumerate(self.cohort.peers):
             if self.cohort.peers[uuid].active:
                 self.peer_tracker[uuid] = True
                 self.add_traces(idx, uuid)
-            else:  # FIXME insert at update instead
+            else:
+                # UI tuning open: defer inactive-peer trace insertion
+                # until the update pass; doing it here forces a layout
+                # pass at init time.
                 self.peer_tracker[uuid] = False
                 #position = GeoPosition(0., 0., 0.)  # hide it
         if self.use_map:

@@ -1,0 +1,15 @@
+{
+  "name": "squad-intel",
+  "agency": "ODA",
+  "kind": "soldier",
+  "capabilities": [
+    "heads_up_display",
+    "sensor_fusion",
+    "tactical_comms"
+  ],
+  "position": {
+    "lat": 34.706545,
+    "lon": -86.633667,
+    "alt": 197.0
+  }
+}

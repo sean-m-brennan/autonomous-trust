@@ -14,6 +14,7 @@ The reputation subsystem uses a leaderless Byzantine Multi-Paxos protocol to rea
 | `out of date` | `backdate` | peer -> proposer | Phase 1: proposer's index is behind |
 | `transaction` | `transaction` | proposer -> group | Phase 2: propose transaction score |
 | `tx accepted` | `accepted` | peer -> proposer | Phase 2: accept the proposed transaction |
+| `tx committed` | `committed` | proposer -> group | Phase 3: announce commit so acceptors update their history |
 | `update needed` | `outdated` | behind-peer -> top-n peers | Sync: request missing history |
 | `latest update` | `update` | peer -> behind-peer | Sync: send history segment |
 | `request reputation` | `rep_req` | any process -> reputation | Query: compute a peer's score |
@@ -53,6 +54,8 @@ sequenceDiagram
 - **Backdate — `out of date`.** If the proposer's chain index is behind the acceptor's recorded chain length, the acceptor emits `out of date` carrying its own `chain_len`. The proposer triggers the sync sub-protocol. Trace: [`request-backdated-chain-mismatch.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/request-backdated-chain-mismatch.yaml).
 
 **Phase 2 — Accept.** Once the proposer reaches majority grants (`> peers/2`), it emits a `transaction` carrying the score, keyed by the same `(id1, id2, proposer)` tuple. Each acceptor verifies the round was previously granted (`paxos_has_granted_id` on the C side; `my_requests` lookup on Python) and emits `tx accepted`. The proposer commits to history on majority acceptance. Trace: [`transaction-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-accepted.yaml).
+
+**Phase 3 — Commit broadcast.** After the proposer commits to its own history, it broadcasts `tx committed` carrying `(task_id, proposer_id, score)` to the group. Each acceptor writes the same entry to its own history; the proposer skips its own bounce-back. Without this phase, every peer's local history would contain only its own submissions — when peer A and peer B independently score the same task, A's history would have `(task_id, A, A_score)` only and B's would have `(task_id, B, B_score)` only, and CTFT's bilateral check (`p1==peer && p2==self`) could never match. Phase 3 is what makes a single bilateral Transaction appear in *every* peer's view. Trace: [`transaction-committed-bilateral.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-committed-bilateral.yaml).
 
 **Sync sub-protocol.** When a proposer falls behind (signalled by `out of date`), it sends `update needed` to its top-3 most-trusted peers (encrypted peer-to-peer) carrying its current chain length. Each recipient responds with `latest update` carrying any history segment beyond the proposer's chain length. The proposer majority-votes across the 3 responses and catches up. Traces: [`chain-outdated-notification.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-outdated-notification.yaml), [`chain-replay-update.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-replay-update.yaml).
 

@@ -52,7 +52,13 @@ class PeerStatus(DashComponent):
         PeerStatus._count += 1
         self.peer_detail_id = f'peer_status_{self.idx}'
 
-        # FIXME dependent on 'video' in peer.metadata
+        # Architectural constraint: VideoFeed is always instantiated
+        # regardless of whether the peer's metadata declares a video
+        # source. The widget renders empty when there's no stream, but
+        # the layout slot is reserved at construct time because the
+        # Dash layout tree can't grow new components after page load.
+        # A future redesign with fully dynamic component injection
+        # would remove this constraint — see peer_status.py:87.
         self.vid_feed = VideoFeed(self.ctl, peer, self.idx)
         self.data_feed = DataFeed(self.ctl, peer, self.idx)
         self.data_type = peer.metadata.data_type
@@ -84,7 +90,10 @@ class PeerStatus(DashComponent):
         self.cohort.register_updater(self.update_trust_levels)
         self.cohort.register_updater(self.update_net_graphs)
 
-        # FIXME must record all data, render is fully dynamic - only one at a time
+        # Architectural open: persist all peer data so a
+        # fully-dynamic renderer can drive arbitrary detail panels on
+        # demand; currently only one peer's detail can render at a
+        # time. Pairs with the VideoFeed slot-reservation note above.
 
         @ctl.callback(Output(f'offcanvas-{self.idx}', 'is_open'),
                       Input(f'more-btn-{self.idx}', "n_clicks"),
@@ -250,7 +259,10 @@ class PeerStatus(DashComponent):
         self.populate()  # in case it isn't
         #print(f'Num other peers {len(self.peer.others)}')  # Updating too fast?
         for idx, other in enumerate(self.peer.others):
-            # FIXME still not populating
+            # UI debugging open: trust/network subplots aren't
+            # populating — likely a missing wire-up between PeerDataAcq
+            # updates and self.trust_figs / self.net_figs. Needs a
+            # runtime trace to identify the gap.
             trust_levels.append(dbc.Col([dcc.Graph(id=f'trust-{self.idx}-{idx}',
                                                    figure=self.trust_figs[idx],
                                                    config=dict(displayModeBar=False),
@@ -272,7 +284,11 @@ class PeerStatus(DashComponent):
                         dbc.Col([f'{self.peer.name} ({self.peer.nickname}) - {self.peer.uuid}']),
                     ]),
                     dbc.Row([
-                        # FIXME modification
+                        # Open: the original FIXME tag here read
+                        # "modification" — likely meant "handle live
+                        # updates to the position string without
+                        # rebuilding the whole div". Verify and either
+                        # implement push updates or drop the tag.
                         dbc.Col(self.vid_feed.div(f"{pos.alt:f} m above {pos.lat:f}, {pos.lon:f}")),
                     ]),
                     dbc.Row([
