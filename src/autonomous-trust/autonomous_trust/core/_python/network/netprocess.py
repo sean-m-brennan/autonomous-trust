@@ -28,6 +28,7 @@ import nacl
 
 from ..protocol import Protocol
 from ..identity import Identity
+from ..identity.protocol import IdentityProtocol
 from ..processes import Process, ProcMeta
 from .. import _probes
 from ..identity import Group
@@ -114,6 +115,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.statistics = {}
         self._rejected_addresses: set[str] = set()
         self._crypto_error_counts: dict[str, int] = {}
+        # Partition-recovery signal cooldown: per-source-address timestamp
+        # of the last signal we forwarded to IdentityProcess. Bounded at
+        # one signal per address per 5 seconds so a chatty rejected-group
+        # peer can't flood the identity queue.
+        #   See doc/architecture/partition-recovery.md §5.1.
+        self._partition_signal_lru: dict[str, datetime] = {}
         # Lazily created in process(). ThreadPoolExecutor can't be
         # pickled, so creating it here would break the multiprocessing
         # spawn handoff. See `_ensure_ping_pool`.
@@ -221,6 +228,44 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     def blacklist_address(self, address):
         """Add an address to the rejection list."""
         self._rejected_addresses.add(address)
+
+    _PARTITION_SIGNAL_COOLDOWN = 5.0  # seconds, per from_addr
+
+    def _signal_partition(self, queues, from_addr):
+        """Forward a partition-recovery signal to IdentityProcess.
+
+        Called from the group-channel drop site when ``from_addr`` is
+        not in our group's address list — a possible split-brain
+        indication. We do not validate or decrypt the original message
+        (we can't; it was encrypted under another group's key); the
+        signal payload is just the source address so IdentityProcess
+        can decide whether to emit an unsecured-multicast
+        ``partition_probe`` toward that address's group.
+
+        Rate-limited at one signal per ``from_addr`` per 5 seconds —
+        a chatty cross-group peer would otherwise let this queue grow
+        without bound and starve real identity traffic.
+
+        See doc/architecture/partition-recovery.md §5.1.
+        """
+        now = datetime.now()
+        last = self._partition_signal_lru.get(from_addr)
+        if (last is not None
+                and (now - last).total_seconds() < self._PARTITION_SIGNAL_COOLDOWN):
+            return
+        self._partition_signal_lru[from_addr] = now
+        target = queues.get(CfgIds.identity)
+        if target is None:
+            return
+        signal = Message(CfgIds.identity,
+                         IdentityProtocol.partition_signal,
+                         from_addr,
+                         encrypt=False)
+        try:
+            target.put(signal, block=True, timeout=self.q_cadence)
+            _probes.counter('net.group', 'partition_signal_emitted', from_addr)
+        except Full:
+            _probes.counter('net.group', 'partition_signal_drop', 'queue_full')
 
     def _ensure_ping_pool(self):
         """Lazily instantiate the ping thread pool inside the subprocess.
@@ -649,9 +694,13 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         _probes.counter('net.group', 'drop', 'sender_not_in_group')
                         self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
                         self.logger.debug('Ignored payload: %d bytes from %s' % (len(raw_msg), from_addr))
-                        # TODO: Query other group members for the unknown sender's
-                        # identity — they may have admitted this peer while we were
-                        # partitioned. Requires a group-level identity gossip protocol.
+                        # Forward a partition-recovery signal to IdentityProcess
+                        # so it can probe the foreign group and, if larger,
+                        # initiate a normal request_access against it. The
+                        # actual merge runs through the existing _merge_to_mesh
+                        # path; this signal only kicks the probe.
+                        #   See doc/architecture/partition-recovery.md §5.1.
+                        self._signal_partition(queues, from_addr)
                 total_inbound += drained_grp
 
                 # async recv stranger messages (separate channel)

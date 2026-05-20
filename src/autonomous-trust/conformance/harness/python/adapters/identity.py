@@ -475,6 +475,49 @@ class IdentityAdapter:
             # as a list of capability names. Build that native form.
             caps_list = payload.get('caps', []) if isinstance(payload, dict) else []
             obj = to_json_string(caps_list)
+        elif function == IdentityProtocol.partition_signal:
+            # Local-only IPC from NetProcess: the payload is the raw
+            # from_addr string of the rejected cross-group message.
+            # See doc/architecture/partition-recovery.md §5.1.
+            from_addr = payload.get('from_addr', 'mock-addr:0') \
+                if isinstance(payload, dict) else 'mock-addr:0'
+            obj = from_addr
+        elif function == IdentityProtocol.partition_probe:
+            # Cross-group probe: structured JSON payload (see §4.1).
+            # For conformance the harness builds a self-consistent
+            # payload signed by the sender; the receiver verifies and
+            # emits a partition_response.
+            from nacl.encoding import HexEncoder
+            group_uuid = payload.get('group_uuid', '00000000-0000-0000-0000-000000000000')
+            group_size = int(payload.get('group_size', 1))
+            from autonomous_trust.core.identity.idprocess import IdentityProcess
+            canon = IdentityProcess._partition_probe_canonical(group_uuid, group_size)
+            signed = sender_identity.sign(canon)
+            obj = to_json_string({
+                'from_identity':   sender_identity.publish(),
+                'from_address':    sender_identity.address,
+                'my_group_uuid':   group_uuid,
+                'my_group_size':   group_size,
+                'signature':       signed.signature.decode('ascii'),
+            })
+        elif function == IdentityProtocol.partition_response:
+            from autonomous_trust.core.identity.idprocess import IdentityProcess
+            group_uuid = payload.get('group_uuid', '00000000-0000-0000-0000-000000000000')
+            group_size = int(payload.get('group_size', 1))
+            in_response_to = payload.get('in_response_to', '00000000-0000-0000-0000-000000000000')
+            canon = IdentityProcess._partition_response_canonical(
+                group_uuid, group_size, in_response_to)
+            signed = sender_identity.sign(canon)
+            obj = to_json_string({
+                'from_identity':           sender_identity.publish(),
+                'from_address':            sender_identity.address,
+                'in_response_to':          in_response_to,
+                'my_group_uuid':           group_uuid,
+                'my_group_size':           group_size,
+                'my_group_leader':         payload.get('leader_uuid', '00000000-0000-0000-0000-000000000000'),
+                'my_group_leader_address': payload.get('leader_address', sender_identity.address),
+                'signature':               signed.signature.decode('ascii'),
+            })
         else:
             obj = to_json_string(payload)
 

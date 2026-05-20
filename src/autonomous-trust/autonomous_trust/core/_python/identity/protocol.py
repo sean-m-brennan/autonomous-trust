@@ -76,6 +76,25 @@ class IdentityProtocol(Protocol):
     # peer mirror; the next POA vote tally then weighs the elevated rank.
     # See BUGS.md §P2.
     rank_update = 'rank_update'  # msg.obj <- (peer_uuid_str, new_rank_int)
+    # Group partition recovery (doc/architecture/partition-recovery.md).
+    # partition_signal: local-only IPC. NetProcess emits this when it
+    # receives group-channel traffic from a sender that is not in our
+    # group's address list — a possible split-brain signal.
+    #   msg.obj <- str (from_addr "host:port" of the rejected message)
+    partition_signal = 'partition_signal'
+    # partition_probe / partition_response: wire-facing, unsecured
+    # multicast. Probe broadcasts our group's uuid+size; response
+    # carries the responder's group uuid+size+leader-address so the
+    # probe sender can decide whether to initiate a normal request_access
+    # to join the larger group.
+    #   probe.obj    <- {"from_uuid", "from_address", "my_group_uuid",
+    #                    "my_group_size", "signature"}
+    #   response.obj <- {"from_uuid", "from_address", "in_response_to",
+    #                    "my_group_uuid", "my_group_size",
+    #                    "my_group_leader", "my_group_leader_address",
+    #                    "signature"}
+    partition_probe = 'group_partition_probe'
+    partition_response = 'group_partition_response'
 
 
 if __name__ == '__main__':

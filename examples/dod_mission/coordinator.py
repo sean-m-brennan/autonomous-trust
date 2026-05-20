@@ -70,7 +70,7 @@ try:
     HAS_DATA = True
 
     from queue import Empty as _DQ_Empty
-    from autonomous_trust.core import CfgIds as _DQ_CfgIds
+    from autonomous_trust.core import CfgIds as _DQ_CfgIds, from_yaml_string as _DQ_from_yaml_string
     from autonomous_trust.core.network import Message as _DQ_Message
     from autonomous_trust.services.data.server import (  # noqa
         DataProcess as _DQ_DataProcess, DataProtocol as _DQ_DataProtocol,
@@ -93,7 +93,56 @@ try:
         thereafter.  This override resolves uuid → Identity via
         ``protocol.peers.find_by_uuid`` before constructing the
         subscribe message.
+
+        Also overrides ``handle_data`` to push received payloads onto
+        a coordinator-owned drain queue rather than into
+        ``self.cohort.peers[uuid].data_stream``.  AT's queue_pool
+        assigns mp.Queue slots inside ``Cohort.update_group``, which
+        runs per-process; CohortTracker (one worker), DataRcvr (this
+        worker), and the coordinator main proc each maintain their
+        own forked ``Cohort`` instance.  Worker subprocs assigning
+        ``peer.data_stream = queue_pool.next()`` in any local order
+        means the queue object the worker writes to is NOT the queue
+        object the main proc reads from — payloads vanish.  A single
+        shared mp.Queue (created in the main proc, passed via
+        ``add_worker(..., reading_drain=...)``) sidesteps the
+        per-process cohort indirection entirely.
         """
+
+        def __init__(self, configurations, subsystems, log_queue,
+                     dependencies, **kwargs):
+            # Pop reading_drain before super().__init__ so DataRcvr's
+            # kwargs['cohort'] access still succeeds and we don't leak
+            # the extra kwarg into the Protocol base class.
+            self.reading_drain = kwargs.pop('reading_drain', None)
+            super().__init__(configurations, subsystems, log_queue,
+                             dependencies, **kwargs)
+
+        def handle_data(self, _queues, message):
+            if message.function != _DQ_DataProtocol.data:
+                return False
+            uuid_str = None
+            try:
+                uuid_str = str(message.from_whom.uuid)
+                data = _DQ_from_yaml_string(message.obj)
+            except Exception:
+                self.logger.exception(
+                    "DiagDataRcvr.handle_data: failed to decode payload")
+                return True
+            if self.reading_drain is None:
+                # Fallback: keep the legacy per-peer cohort path so
+                # we don't silently lose data if reading_drain wasn't
+                # wired up.
+                return super().handle_data(_queues, message)
+            try:
+                self.reading_drain.put(
+                    (uuid_str, data),
+                    block=True, timeout=self.q_cadence)
+            except Exception:
+                self.logger.warning(
+                    "DiagDataRcvr.handle_data: drain put failed for %s",
+                    uuid_str, exc_info=True)
+            return True
 
         def process(self, queues, signal):
             import traceback as _tb
@@ -283,12 +332,22 @@ class DoDMissionCoordinator(AutonomousTrust):
             self._cohort = Cohort(self.queue_pool)
             self.add_worker(CohortTracker, cohort=self._cohort)
 
-        # DataRcvr.handle_data dispatches into cohort.peers, so the
-        # inspector cohort must exist before we register it.  Using
-        # the diagnostic wrapper so any startup/loop exception is
-        # surfaced (AT's framework swallows worker tracebacks).
+        # Single mp.Queue that DiagDataRcvr writes into and
+        # _drain_peer_readings reads from.  Created here (before
+        # add_worker) so the worker subproc gets a forked reference
+        # to the same underlying mp.Queue object.  Bypasses the
+        # per-process Cohort indirection that silently drops data —
+        # see DiagDataRcvr docstring.
+        self._reading_drain = self.queue_type()
+
+        # DataRcvr.handle_data is overridden to push to
+        # self._reading_drain rather than self.cohort.peers — see
+        # DiagDataRcvr docstring for why.  The cohort kwarg is still
+        # required by DataRcvr.__init__ (and useful for peer-metadata
+        # bookkeeping); pass it alongside.
         if HAS_DATA and HAS_INSPECTOR:
-            self.add_worker(DiagDataRcvr, cohort=self._cohort)
+            self.add_worker(DiagDataRcvr, cohort=self._cohort,
+                            reading_drain=self._reading_drain)
 
         # Subscribe to the scenario's event stream so we can record
         # PhaseEvents (PEER_JOIN, COMPROMISE_START, PEER_EXCLUDE) to
@@ -340,9 +399,17 @@ class DoDMissionCoordinator(AutonomousTrust):
     _logged_missing_task_id = False
 
     def _drain_peer_readings(self, queues=None):
-        """Pull anything DataRcvr.handle_data has staged into each
-        peer's data_stream, reconstruct Reading objects, and fan them
-        out through the validator + chart pipeline.
+        """Drain payloads that DiagDataRcvr has put onto the shared
+        ``self._reading_drain`` queue, reconstruct ``Reading``
+        objects, and fan them out through the validator + chart
+        pipeline.
+
+        The cohort sync below is kept only for the dashboard's
+        per-peer metadata view; the data path itself runs through
+        the single shared queue so it doesn't depend on cohort
+        consistency across worker subprocesses.  See DiagDataRcvr
+        docstring for the per-process cohort issue this works
+        around.
 
         ``queues`` is forwarded into submit_reading_for_validation so
         that path can put a ``TransactionScore`` on the reputation
@@ -351,6 +418,16 @@ class DoDMissionCoordinator(AutonomousTrust):
         None."""
         if not HAS_INSPECTOR:
             return
+        # Sync the main proc's cohort view from the protocol-level
+        # `self.peers` list — only for dashboard population.  See
+        # DiagDataRcvr docstring for why this view of cohort.peers is
+        # not authoritative for the data path itself.
+        try:
+            if self.peers is not None and self.peers.all:
+                self._cohort.update_group(
+                    {str(p.uuid): p for p in self.peers.all})
+        except Exception:
+            logger.exception("Cohort sync from self.peers failed")
         if (not DoDMissionCoordinator._logged_first_peers
                 and self._cohort.peers):
             logger.info(
@@ -365,48 +442,59 @@ class DoDMissionCoordinator(AutonomousTrust):
                 "_drain_peer_readings: tick=%d, cohort_size=%d "
                 "(awaiting first reading)",
                 self._tick_count, len(self._cohort.peers))
-        for peer_acq in self._cohort.peers.values():
-            stream = peer_acq.data_stream
-            while True:
-                try:
-                    payload = stream.get_nowait()
-                except queue.Empty:
-                    break
-                except Exception:
-                    # Multiproc Queue can raise broken-pipe-ish errors
-                    # if the producer side has gone away; bail on this
-                    # peer for this tick instead of failing the loop.
-                    break
-                if not payload:
+
+        if getattr(self, '_reading_drain', None) is None:
+            return
+
+        # Used only for nicer log lines below.
+        peers_by_uuid = {str(p.uuid): p for p in self.peers.all} \
+            if self.peers is not None else {}
+
+        while True:
+            try:
+                item = self._reading_drain.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
+            if not item:
+                continue
+            try:
+                uuid_str, payload = item
+            except (TypeError, ValueError):
+                logger.warning(
+                    "_drain_peer_readings: unexpected drain item shape: %r",
+                    item)
+                continue
+            peer = peers_by_uuid.get(uuid_str)
+            peer_name = (getattr(peer, 'nickname', None)
+                         or getattr(peer, 'fullname', None)
+                         or uuid_str[:8])
+            if not DoDMissionCoordinator._logged_first_reading:
+                logger.info(
+                    "_drain_peer_readings: first reading payload from "
+                    "%s: type=%s len=%s",
+                    peer_name, type(payload).__name__,
+                    len(payload) if hasattr(payload, '__len__') else 'n/a')
+                DoDMissionCoordinator._logged_first_reading = True
+                DoDMissionCoordinator._logged_first_drain = True
+            entries = payload if isinstance(payload, list) else [payload]
+            for entry in entries:
+                if not isinstance(entry, dict):
                     continue
-                if not DoDMissionCoordinator._logged_first_reading:
-                    logger.info(
-                        "_drain_peer_readings: first reading payload "
-                        "from %s: type=%s len=%s",
-                        peer_acq.nickname, type(payload).__name__,
-                        len(payload) if hasattr(payload, '__len__')
-                        else 'n/a')
-                    DoDMissionCoordinator._logged_first_reading = True
-                    DoDMissionCoordinator._logged_first_drain = True
-                # DoDDataProcess.acquire returns a list of Reading
-                # dicts; tolerate single-dict shipments too.
-                entries = payload if isinstance(payload, list) else [payload]
-                for entry in entries:
-                    if not isinstance(entry, dict):
-                        continue
-                    try:
-                        reading = _reading_from_dict(entry)
-                    except Exception:
-                        logger.exception(
-                            "Malformed reading from %s: %r",
-                            peer_acq.nickname, entry)
-                        continue
-                    try:
-                        self.submit_reading_for_validation(reading, queues)
-                    except Exception:
-                        logger.exception(
-                            "Validator/chart dispatch failed for %s",
-                            peer_acq.nickname)
+                try:
+                    reading = _reading_from_dict(entry)
+                except Exception:
+                    logger.exception(
+                        "Malformed reading from %s: %r",
+                        peer_name, entry)
+                    continue
+                try:
+                    self.submit_reading_for_validation(reading, queues)
+                except Exception:
+                    logger.exception(
+                        "Validator/chart dispatch failed for %s",
+                        peer_name)
 
     def cleanup(self):
         """Flush the event log to disk on shutdown."""

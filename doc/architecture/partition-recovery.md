@@ -149,11 +149,17 @@ Both Python and C network processes already have the drop site:
 - Python: `netprocess.py:648-651` (`else:` of the `from_addr in addresses` check)
 - C: `net_proc.c:1304-1307` (`group_decrypt` failure)
 
-Replace the silent drop with a rate-limited push onto a new
-**internal-only** queue named `CfgIds.partition_signal` (or similar —
-must not collide with existing CfgIds entries). The signal payload is
-just the `from_addr` of the rejected message — that's enough for the
-identity process to know "someone at X is in another group; investigate."
+Replace the silent drop with a rate-limited `Message` push onto the
+**existing identity queue** (`queues[CfgIds.identity]`), with
+`function=IdentityProtocol.partition_signal` and `obj=from_addr`. This
+matches the existing pattern for internal-only IPC events
+(`IdentityProtocol.rank_update` at `protocol.py:78` is the precedent —
+ReputationProcess uses the same approach to nudge IdentityProcess
+without a wire round-trip). No new `CfgIds` entry or new queue is
+needed; the Identity process's existing `Protocol.run_message_handlers`
+dispatch picks it up by function name. This is a design refinement
+from the first-draft "new CfgIds entry" approach; it's identical in
+effect and substantially smaller in surface area.
 
 Rate limiting: at most **one signal per `from_addr` per 5 seconds**.
 The NetProcess keeps a small LRU dict (`from_addr → last_signal_ts`).
@@ -307,7 +313,10 @@ Files affected:
   - The error log can be downgraded to debug once the recovery path
     fires (or keep at error for one cycle then quiet — measure first)
 - `src/autonomous-trust/autonomous_trust/core/_python/system.py`
-  - Add `CfgIds.partition_signal` (or wherever `CfgIds` is defined)
+  - **No change needed.** The partition signal is routed via the
+    existing `CfgIds.identity` queue using `IdentityProtocol.partition_signal`
+    as the message function name (see §5.1 design refinement and the
+    `rank_update` precedent in `protocol.py:73-78`).
 
 Tests:
 
