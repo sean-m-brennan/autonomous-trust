@@ -20,12 +20,20 @@ if(DEFINED ENV{CONDA_PREFIX})
     set(CMAKE_C_COMPILE_OPTIONS_SYSROOT "--sysroot=")
     set(CMAKE_CXX_COMPILE_OPTIONS_SYSROOT "--sysroot=")
     set(CONDA_SYSROOT ${CONDA_ROOT}/x86_64-conda-linux-gnu/sysroot)
-    set(CMAKE_PREFIX_PATH ${CONDA_SYSROOT})
+    # Put conda's env root FIRST in CMAKE_PREFIX_PATH so find_library picks
+    # conda's libuuid/libsodium/libjansson before the system versions in
+    # /usr/lib/x86_64-linux-gnu — otherwise RPATH points at conda but we
+    # linked against system, creating a load-time mismatch risk.
+    list(PREPEND CMAKE_PREFIX_PATH ${CONDA_ROOT} ${CONDA_SYSROOT})
     #set(CMAKE_SYSROOT ${CONDA_SYSROOT})  # Doesn't work
     set(sysroot_flag --sysroot=${CONDA_SYSROOT})
-    # Ensure conda libs are found at runtime even without conda activated
+    # Ensure conda libs are found at runtime even without conda activated.
+    # Append link-time dirs so conda RPATH is preferred over system paths,
+    # and emit new-style DT_RUNPATH so LD_LIBRARY_PATH is still respected.
     set(CMAKE_INSTALL_RPATH "${CONDA_ROOT}/lib")
     set(CMAKE_BUILD_RPATH "${CONDA_ROOT}/lib")
+    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
     message("-- Conda is active; sysroot now at ${CONDA_SYSROOT}")
 endif()
 
@@ -55,7 +63,7 @@ set(useful_warnings
     -Winit-self
 )
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
-    list(APPEND useful_warnings -Wuse-after-free -Wfree-nonheap-object -Wno-cast-function-type -Wno-stringop-truncation -Wno-format-truncation)
+    list(APPEND useful_warnings -Wuse-after-free -Wfree-nonheap-object -Wno-cast-function-type)
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
     list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align -Wno-cast-function-type-mismatch)
@@ -78,7 +86,51 @@ option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)
 # Zero Trust Architecture integration (requires OpenSSL)
 option(AT_ZTA "Enable Zero Trust Architecture credential integration" OFF)
 
+# DTN / Bundle Protocol transport (see at-over-dtn.md). Adds the "dtn_bp"
+# network transport and compiles a DTN-specific receiver path.
+option(AT_NET_DTN "Enable DTN/Bundle-Protocol network transport" OFF)
+# Which BP backend to link — currently only "stub" (no external deps);
+# add ION / uD3TN backends by implementing dtn_backend.h and selecting here.
+set(AT_NET_DTN_BACKEND "stub" CACHE STRING "BP library backend: stub | ion | ud3tn")
+set_property(CACHE AT_NET_DTN_BACKEND PROPERTY STRINGS stub ion ud3tn)
+
+# Plaintext forwarding envelope (see at-over-dtn.md §4.3, net_envelope.h).
+# When ON, peer-to-peer wire frames carry a 36-byte plaintext routing header
+# so gateway nodes can bridge transports without decrypting the inner payload.
+# Default OFF so traffic on non-gateway deployments stays byte-for-byte
+# compatible with pre-2b builds until net_proc.c opts into wrapping.
+option(AT_NET_ENVELOPE "Enable plaintext forwarding envelope for gateway relay" OFF)
+
+# Group UUID -> gateway leg routing for cross-group bridging
+# (at-over-dtn.md §4.3 stage F). Gateway receives a GROUP-addressed envelope
+# for a remote group UUID, looks up a configured leg, and re-emits via that
+# leg. Requires AT_NET_ENVELOPE since envelope-less wire frames carry no
+# destination UUID for the routing lookup.
+option(AT_NET_GROUP_FORWARD "Enable group UUID -> gateway routing for cross-leg bridging" OFF)
+
+# Cross-cluster peer discovery (at-over-dtn.md §4.3 stage E). When ON,
+# gateway-forwarded ID_ANNOUNCE broadcasts carrying NET_ENV_FLAG_FORWARDED
+# register the originating peer as a remote peer whose address is left as-is
+# so the hybrid CIDR matcher routes replies back via the gateway. Requires
+# AT_NET_ENVELOPE since the forwarding trust signal comes from the envelope
+# flag byte.
+option(AT_DISCOVERY_CROSS_CLUSTER "Enable cross-cluster peer discovery via gateway forwarding" OFF)
+
+if(AT_NET_GROUP_FORWARD AND NOT AT_NET_ENVELOPE)
+    message(FATAL_ERROR "AT_NET_GROUP_FORWARD=ON requires AT_NET_ENVELOPE=ON")
+endif()
+
+if(AT_DISCOVERY_CROSS_CLUSTER AND NOT AT_NET_ENVELOPE)
+    message(FATAL_ERROR "AT_DISCOVERY_CROSS_CLUSTER=ON requires AT_NET_ENVELOPE=ON")
+endif()
+
 if(AT_STATIC)
+    # Prefer .a archives in subsequent find_library() calls AND pass -static to
+    # the linker so transitive deps resolve statically too. Must come BEFORE the
+    # find_package()/find_library() calls below for the suffix override to take
+    # effect. find_package(Protobuf) uses its own lookup logic that may still
+    # return the .so if no .a is available — verify with `ldd <binary>` after
+    # building; an AT_STATIC build should produce "not a dynamic executable".
     set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
 endif()
@@ -88,8 +140,8 @@ endif()
 # library/program dependencies
 
 # UUID
-find_path(LIBUUID_INCLUDE_DIR uuid.h PATH_SUFFIXES uuid PATHS ${CONDA_ROOT})
-find_library(LIBUUID_LIBRARY NAMES uuid PATHS ${CONDA_ROOT})
+find_path(LIBUUID_INCLUDE_DIR uuid.h PATH_SUFFIXES uuid HINTS ${CONDA_ROOT})
+find_library(LIBUUID_LIBRARY NAMES uuid HINTS ${CONDA_ROOT})
 include_directories(${LIBUUID_INCLUDE_DIR})
 if(LIBUUID_LIBRARY)
     message("-- Found libuuid at ${LIBUUID_LIBRARY}")
@@ -98,8 +150,8 @@ else()
 endif()
 
 # libsodium
-find_path(LIBSODIUM_INCLUDE_DIR sodium.h PATHS ${CONDA_ROOT})
-find_library(LIBSODIUM_LIBRARY NAMES sodium PATHS ${CONDA_ROOT})
+find_path(LIBSODIUM_INCLUDE_DIR sodium.h HINTS ${CONDA_ROOT})
+find_library(LIBSODIUM_LIBRARY NAMES sodium HINTS ${CONDA_ROOT})
 include_directories(${LIBSODIUM_INCLUDE_DIR})
 if(LIBSODIUM_LIBRARY)
     message("-- Found libsodium at ${LIBSODIUM_LIBRARY}")
@@ -108,8 +160,8 @@ else()
 endif()
 
 # jansson
-find_path(LIBJANSSON_INCLUDE_DIR jansson.h PATHS ${CONDA_ROOT})
-find_library(LIBJANSSON_LIBRARY NAMES jansson PATHS ${CONDA_ROOT})
+find_path(LIBJANSSON_INCLUDE_DIR jansson.h HINTS ${CONDA_ROOT})
+find_library(LIBJANSSON_LIBRARY NAMES jansson HINTS ${CONDA_ROOT})
 include_directories(${LIBJANSSON_INCLUDE_DIR})
 if(LIBJANSSON_LIBRARY)
     message("-- Found libjansson at ${LIBJANSSON_LIBRARY}")
@@ -119,10 +171,10 @@ endif()
 
 # protobuf
 find_package(Protobuf REQUIRED)  # paths doesn't work
-#find_path(Protobuf_INCLUDE_DIRS message.h PATH_SUFFIXES google/protobuf PATHS ${CONDA_ROOT})
-#find_library(Protobuf_LIBRARY libprotobuf.so PATHS ${CONDA_ROOT})
+#find_path(Protobuf_INCLUDE_DIRS message.h PATH_SUFFIXES google/protobuf HINTS ${CONDA_ROOT})
+#find_library(Protobuf_LIBRARY libprotobuf.so HINTS ${CONDA_ROOT})
 include_directories(${Protobuf_INCLUDE_DIRS})
-#find_program(Protobuf_PROTOC_EXECUTABLE protoc PATHS ${CONDA_ROOT})
+#find_program(Protobuf_PROTOC_EXECUTABLE protoc HINTS ${CONDA_ROOT})
 #string(REPLACE "/google/protobuf" "" PROTOBUF_INCLUDE_DIR ${Protobuf_INCLUDE_DIRS})
 #include_directories(${PROTOBUF_INCLUDE_DIR})
 if(Protobuf_LIBRARY)
@@ -132,10 +184,10 @@ else()
 endif()
 
 # protobuf-c
-find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c PATHS ${CONDA_ROOT})
-find_library(LIBPROTOBUF_C_LIBRARY NAMES protobuf-c PATHS ${CONDA_ROOT})
+find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c HINTS ${CONDA_ROOT})
+find_library(LIBPROTOBUF_C_LIBRARY NAMES protobuf-c HINTS ${CONDA_ROOT})
 include_directories(${LIBPROTOBUF_C_INCLUDE_DIR})
-#find_program(PROTOC_C_EXE protoc-c PATHS ${CONDA_ROOT})
+#find_program(PROTOC_C_EXE protoc-c HINTS ${CONDA_ROOT})
 if(LIBPROTOBUF_C_LIBRARY)
     message("-- Found libprotobuf-c at ${LIBPROTOBUF_C_LIBRARY}")
 else()
@@ -143,8 +195,8 @@ else()
 endif()
 
 # check (testing only — optional for non-test builds)
-find_path(LIBCHECK_INCLUDE_DIR check.h PATHS ${CONDA_ROOT})
-find_library(LIBCHECK_LIBRARY NAMES check libcheck.so libcheck.a PATHS ${CONDA_ROOT})
+find_path(LIBCHECK_INCLUDE_DIR check.h HINTS ${CONDA_ROOT})
+find_library(LIBCHECK_LIBRARY NAMES check libcheck.so libcheck.a HINTS ${CONDA_ROOT})
 if(LIBCHECK_LIBRARY)
     include_directories(${LIBCHECK_INCLUDE_DIR})
     message("-- Found libcheck at ${LIBCHECK_LIBRARY}")
@@ -165,7 +217,7 @@ endif()
 set(DEPENDENCIES
     ${LIBUUID_LIBRARY}
     ${LIBSODIUM_LIBRARY}
-    ${Protobuf_LIBRARY}
+    ${Protobuf_LIBRARIES}
     ${LIBPROTOBUF_LIBRARY}
     ${LIBPROTOBUF_C_LIBRARY}
     ${LIBJANSSON_LIBRARY}
@@ -177,8 +229,12 @@ if(AT_ZTA)
     list(APPEND DEPENDENCIES OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
-# Expose DEPENDENCIES to parent scope so examples/ can link them
-set(DEPENDENCIES "${DEPENDENCIES}" PARENT_SCOPE)
+# Expose DEPENDENCIES to parent scope so examples/ can link them — but only
+# when actually built via add_subdirectory(); a standalone build has no parent.
+get_directory_property(_has_parent PARENT_DIRECTORY)
+if(_has_parent)
+    set(DEPENDENCIES "${DEPENDENCIES}" PARENT_SCOPE)
+endif()
 
 set(TEST_DEPENDENCIES ${DEPENDENCIES})
 if(LIBCHECK_LIBRARY)
@@ -246,6 +302,11 @@ set(libsrc
     autonomous_trust/network/ntp.c
     autonomous_trust/network/net_message.c
     autonomous_trust/network/net_proc.c
+    autonomous_trust/network/net_transport_ip.c
+    autonomous_trust/network/net_transport_udp.c
+    autonomous_trust/network/net_transport_tcp.c
+    autonomous_trust/network/net_transport_hybrid.c
+    autonomous_trust/network/net_transport_registry.c
     autonomous_trust/network/network.c
     autonomous_trust/processes/capabilities.c
     autonomous_trust/processes/daemonize.c
@@ -268,6 +329,7 @@ set(libsrc
     autonomous_trust/utilities/protobuf_shutdown.cpp
     autonomous_trust/utilities/queue_pool.c
     autonomous_trust/utilities/sighandler.c
+    autonomous_trust/utilities/timeout.c
     autonomous_trust/utilities/util.c
     autonomous_trust/fleet/update_proposal.c
     autonomous_trust/fleet/fleet_helpers.c
@@ -295,6 +357,151 @@ if(AT_ZTA)
     )
 endif()
 
+# DTN sources (only compiled when AT_NET_DTN is enabled). Files live in
+# a `dtn/` subdirectory so the process-table preprocessor can exclude them
+# cleanly when AT_NET_DTN is off (see `_exclude_args` in preprocess()).
+if(AT_NET_DTN)
+    list(APPEND libsrc
+        autonomous_trust/network/dtn/dtn_eid.c
+        autonomous_trust/network/dtn/net_transport_dtn.c
+    )
+    if(AT_NET_DTN_BACKEND STREQUAL "stub")
+        list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_stub.c)
+    elseif(AT_NET_DTN_BACKEND STREQUAL "ion")
+        # NASA ION bp_* API. Two modes:
+        #   (a) Submodule present at ./ION-DTN — we build it via
+        #       autotools into a build-local prefix. No sudo required.
+        #   (b) Submodule absent — fall back to system-installed ION (or
+        #       paths supplied explicitly via -DION_* cache vars).
+        # The node's local EID must be pre-provisioned via bpadmin before
+        # the transport is used at runtime.
+        set(ION_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/ION-DTN)
+        set(ION_PREFIX    ${CMAKE_BINARY_DIR}/ion-install)
+
+        if(EXISTS ${ION_SUBMODULE}/configure.ac)
+            message("-- ION: building from submodule into ${ION_PREFIX}")
+
+            # Surface autotools-missing failures at CMake-configure time
+            # with a useful message, rather than a cryptic build-time error.
+            find_program(AUTORECONF_EXEC autoreconf)
+            find_program(AUTOMAKE_EXEC   automake)
+            find_program(LIBTOOLIZE_EXEC NAMES libtoolize glibtoolize)
+            if(NOT AUTORECONF_EXEC OR NOT AUTOMAKE_EXEC OR NOT LIBTOOLIZE_EXEC)
+                message(FATAL_ERROR
+                    "AT_NET_DTN_BACKEND=ion needs autotools to build the submodule. "
+                    "Install: sudo apt-get install -y autoconf automake libtool pkg-config libexpat1-dev")
+            endif()
+
+            include(ExternalProject)
+            include(ProcessorCount)
+            ProcessorCount(ION_PARALLEL)
+            if(ION_PARALLEL EQUAL 0)
+                set(ION_PARALLEL 1)
+            endif()
+
+            # BUILD_IN_SOURCE because ION's autotools setup does not cleanly
+            # support out-of-tree builds. Artifacts land inside the submodule
+            # checkout (ION-DTN's own .gitignore covers them).
+            ExternalProject_Add(ion_external
+                SOURCE_DIR        ${ION_SUBMODULE}
+                BUILD_IN_SOURCE   1
+                CONFIGURE_COMMAND
+                    sh -c "cd <SOURCE_DIR> && (make distclean 2>/dev/null || true) && rm -f *.la libtool config.status && autoreconf -fi && ./configure --prefix=${ION_PREFIX} --enable-shared --disable-static"
+                BUILD_COMMAND
+                    make -C <SOURCE_DIR> -j${ION_PARALLEL}
+                INSTALL_COMMAND
+                    make -C <SOURCE_DIR> install
+                BUILD_BYPRODUCTS
+                    ${ION_PREFIX}/lib/libbp${CMAKE_SHARED_LIBRARY_SUFFIX}
+                    ${ION_PREFIX}/lib/libici${CMAKE_SHARED_LIBRARY_SUFFIX}
+                LOG_CONFIGURE 1
+                LOG_BUILD     1
+                LOG_INSTALL   1
+            )
+            # Pre-create the include dir so include_directories() below has
+            # something to add even before the first build runs.
+            file(MAKE_DIRECTORY ${ION_PREFIX}/include)
+            set(ION_INCLUDE_DIR ${ION_PREFIX}/include)
+            set(ION_BP_LIB  ${ION_PREFIX}/lib/libbp${CMAKE_SHARED_LIBRARY_SUFFIX})
+            set(ION_ICI_LIB ${ION_PREFIX}/lib/libici${CMAKE_SHARED_LIBRARY_SUFFIX})
+            set(ION_EXTERNAL_TARGET ion_external)
+            # Propagate RPATH so AT executables can find the in-build ION
+            # shared libs at runtime without LD_LIBRARY_PATH.
+            list(APPEND CMAKE_BUILD_RPATH   ${ION_PREFIX}/lib)
+            list(APPEND CMAKE_INSTALL_RPATH ${ION_PREFIX}/lib)
+        else()
+            find_path(ION_INCLUDE_DIR bp.h PATH_SUFFIXES ion)
+            find_library(ION_BP_LIB  NAMES bp)
+            find_library(ION_ICI_LIB NAMES ici)
+            if(NOT ION_INCLUDE_DIR OR NOT ION_BP_LIB OR NOT ION_ICI_LIB)
+                message(FATAL_ERROR
+                    "AT_NET_DTN_BACKEND=ion selected but the ION-DTN submodule is missing "
+                    "AND no system install was found. Fix one of:\n"
+                    "  git submodule update --init src/c/autonomous_trust/network/dtn/ION-DTN\n"
+                    "  sudo make install (in a cloned ION-DTN)\n"
+                    "  cmake ... -DION_INCLUDE_DIR=... -DION_BP_LIB=... -DION_ICI_LIB=...")
+            endif()
+            message("-- Found ION bp at ${ION_BP_LIB}, ici at ${ION_ICI_LIB}")
+            set(ION_EXTERNAL_TARGET "")
+        endif()
+
+        list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_ion.c)
+        include_directories(${ION_INCLUDE_DIR})
+        list(APPEND DEPENDENCIES      ${ION_BP_LIB} ${ION_ICI_LIB})
+        list(APPEND TEST_DEPENDENCIES ${ION_BP_LIB} ${ION_ICI_LIB})
+    elseif(AT_NET_DTN_BACKEND STREQUAL "ud3tn")
+        # uD3TN legacy AAP v1 binary protocol over Unix-socket or TCP — no
+        # external library needed; the daemon must be reachable at runtime via
+        # AT_DTN_UD3TN_SOCKET (e.g. "unix:./ud3tn.aap.socket" or "tcp:host:port").
+        list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_ud3tn.c)
+    elseif(AT_NET_DTN_BACKEND STREQUAL "ud3tnv2")
+        # uD3TN AAP 2.0: protobuf-delimited framing. Schema lives at
+        # autonomous_trust/network/dtn/proto/aap2.proto, vendored verbatim
+        # from https://gitlab.com/d3tn/ud3tn/-/raw/master/components/aap2/aap2.proto
+        # Currently symlinked to submodule location in ./ud3tn/
+        #
+        # Codegen is a standalone protoc-c run — we don't reuse the main
+        # `protos` list because aap2.proto lives under the DTN tree, not the
+        # AT protobuf/ root. Generated sources land in the build tree.
+        set(AAP2_PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/network/dtn/proto)
+        set(AAP2_GEN_DIR   ${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust/network/dtn/proto)
+        add_custom_command(
+            OUTPUT ${AAP2_GEN_DIR}/aap2.pb-c.c ${AAP2_GEN_DIR}/aap2.pb-c.h
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${AAP2_GEN_DIR}
+            COMMAND ${Protobuf_PROTOC_EXECUTABLE}
+                --c_out=${AAP2_GEN_DIR}
+                -I${AAP2_PROTO_DIR}
+                ${AAP2_PROTO_DIR}/aap2.proto
+            COMMENT "Generating protobuf-c sources for aap2.proto"
+            DEPENDS ${AAP2_PROTO_DIR}/aap2.proto
+            VERBATIM
+        )
+        list(APPEND libsrc
+            autonomous_trust/network/dtn/dtn_backend_ud3tnv2.c
+            ${AAP2_GEN_DIR}/aap2.pb-c.c
+        )
+        include_directories(${AAP2_GEN_DIR})
+    else()
+        message(FATAL_ERROR "Unknown AT_NET_DTN_BACKEND: ${AT_NET_DTN_BACKEND}")
+    endif()
+    add_compile_definitions(AT_NET_DTN)
+endif()
+
+# Forwarding envelope (see at-over-dtn.md §4.3). Codec only — consumers of
+# the header are wired in net_proc.c in slice 2b.2.
+if(AT_NET_ENVELOPE)
+    list(APPEND libsrc autonomous_trust/network/net_envelope.c)
+    add_compile_definitions(AT_NET_ENVELOPE)
+endif()
+
+if(AT_NET_GROUP_FORWARD)
+    add_compile_definitions(AT_NET_GROUP_FORWARD)
+endif()
+
+if(AT_DISCOVERY_CROSS_CLUSTER)
+    add_compile_definitions(AT_DISCOVERY_CROSS_CLUSTER)
+endif()
+
 set(libhdr
     autonomous_trust.h
     autonomous_trust/algorithms/agreement.h
@@ -307,6 +514,7 @@ set(libhdr
     autonomous_trust/identity/identity.h
     autonomous_trust/identity/peers.h
     autonomous_trust/network/net_message.h
+    autonomous_trust/network/net_transport.h
     autonomous_trust/processes/capabilities.h
     autonomous_trust/structures/array.h
     autonomous_trust/structures/dag.h
@@ -387,9 +595,16 @@ function(preprocess _file_in)
     set(_fullpath ${CMAKE_CURRENT_SOURCE_DIR}/${_file_in})
     set(_header_file ${CMAKE_CURRENT_BINARY_DIR}/${_base}.h)
     set(_src_dir ${CMAKE_CURRENT_SOURCE_DIR})
+    set(_exclude_args)                                                                                      
+    if(NOT AT_ZTA)
+        list(APPEND _exclude_args --exclude zta)
+    endif()
+    if(NOT AT_NET_DTN)
+        list(APPEND _exclude_args --exclude dtn)
+    endif()
     add_custom_command(
         OUTPUT ${_header_file}
-        COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust
+        COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust ${_exclude_args}
         COMMENT "Preprocessing table header from ${_file_in}"
         DEPENDS ${_fullpath}
     )
@@ -485,6 +700,14 @@ target_sources(autonomous_trust PUBLIC ${libsrc}
     PUBLIC FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
     )
+
+# If ION is being built from the in-tree submodule, force the ExternalProject
+# to complete (install libs + headers) before either AT library starts
+# compiling — otherwise dtn_backend_ion.c would fail on #include <bp.h>.
+if(DEFINED ION_EXTERNAL_TARGET AND ION_EXTERNAL_TARGET)
+    add_dependencies(autonomous_trust        ${ION_EXTERNAL_TARGET})
+    add_dependencies(autonomous_trust_static ${ION_EXTERNAL_TARGET})
+endif()
 
 
 ####################
@@ -739,6 +962,10 @@ target_link_libraries(paxos_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME paxos_test COMMAND $<TARGET_FILE:paxos_test>)
 
+# Critical and Major regression tests have been folded into the per-module
+# test files (array_test, array2_test, paxos_test, msg_types2_test,
+# identity2_test, config_test, group2_test).
+
 add_executable(update_proposal_test test/update_proposal_test.c)
 set_source_files_properties(test/update_proposal_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(update_proposal_test PRIVATE ${AT_TEST_LIBS})
@@ -748,10 +975,20 @@ add_test(NAME update_proposal_test COMMAND $<TARGET_FILE:update_proposal_test>)
 # Fleet tests compile their own .c files (not via the library), so they need
 # proto and table headers to exist before compilation starts.  Depend on the
 # static library target which already generates both.
+#
+# Fleet .c files call helpers from autonomous_trust/utilities/util.c
+# (path_join, makedirs, min/max, strremove).  Pulling those from the static
+# archive would cause duplicate-symbol conflicts against the directly-
+# compiled fleet sources, so compile util.c into each fleet test instead.
+set(fleet_test_util_srcs
+    autonomous_trust/utilities/util.c
+    autonomous_trust/utilities/exception.c)
+
 add_executable(fleet_proc_test
     test/fleet_proc_test.c
     autonomous_trust/fleet/fleet_helpers.c
-    autonomous_trust/fleet/update_proposal.c)
+    autonomous_trust/fleet/update_proposal.c
+    ${fleet_test_util_srcs})
 set_source_files_properties(test/fleet_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(fleet_proc_test PRIVATE ${TEST_DEPENDENCIES})
 add_dependencies(fleet_proc_test autonomous_trust_static)
@@ -760,7 +997,8 @@ add_test(NAME fleet_proc_test COMMAND $<TARGET_FILE:fleet_proc_test>)
 
 add_executable(artifact_store_test
     test/artifact_store_test.c
-    autonomous_trust/fleet/artifact_store.c)
+    autonomous_trust/fleet/artifact_store.c
+    ${fleet_test_util_srcs})
 set_source_files_properties(test/artifact_store_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(artifact_store_test PRIVATE ${TEST_DEPENDENCIES})
 add_dependencies(artifact_store_test autonomous_trust_static)
@@ -769,7 +1007,8 @@ add_test(NAME artifact_store_test COMMAND $<TARGET_FILE:artifact_store_test>)
 
 add_executable(artifact_proc_test
     test/artifact_proc_test.c
-    autonomous_trust/fleet/artifact_proc_helpers.c)
+    autonomous_trust/fleet/artifact_proc_helpers.c
+    ${fleet_test_util_srcs})
 set_source_files_properties(test/artifact_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(artifact_proc_test PRIVATE ${TEST_DEPENDENCIES})
 add_dependencies(artifact_proc_test autonomous_trust_static)
@@ -779,7 +1018,8 @@ add_test(NAME artifact_proc_test COMMAND $<TARGET_FILE:artifact_proc_test>)
 add_executable(update_proc_test
     test/update_proc_test.c
     autonomous_trust/fleet/update_proc_helpers.c
-    autonomous_trust/fleet/update_selftest.c)
+    autonomous_trust/fleet/update_selftest.c
+    ${fleet_test_util_srcs})
 set_source_files_properties(test/update_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(update_proc_test PRIVATE ${TEST_DEPENDENCIES})
 add_dependencies(update_proc_test autonomous_trust_static)
@@ -789,12 +1029,59 @@ add_test(NAME update_proc_test COMMAND $<TARGET_FILE:update_proc_test>)
 add_executable(config_proc_test
     test/config_proc_test.c
     autonomous_trust/fleet/config_proc_helpers.c
-    autonomous_trust/fleet/update_proc_helpers.c)
+    autonomous_trust/fleet/update_proc_helpers.c
+    ${fleet_test_util_srcs})
 set_source_files_properties(test/config_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(config_proc_test PRIVATE ${TEST_DEPENDENCIES})
 add_dependencies(config_proc_test autonomous_trust_static)
 
 add_test(NAME config_proc_test COMMAND $<TARGET_FILE:config_proc_test>)
+
+add_executable(util3_test test/util3_test.c)
+set_source_files_properties(test/util3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(util3_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(capabilities2_test test/capabilities2_test.c)
+set_source_files_properties(test/capabilities2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(capabilities2_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(identity2_test test/identity2_test.c)
+set_source_files_properties(test/identity2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(identity2_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(group2_test test/group2_test.c)
+set_source_files_properties(test/group2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group2_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(map3_test test/map3_test.c)
+set_source_files_properties(test/map3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(map3_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(data_proto_test test/data_proto_test.c)
+set_source_files_properties(test/data_proto_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(data_proto_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(array3_test test/array3_test.c)
+set_source_files_properties(test/array3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(array3_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(message2_test test/message2_test.c)
+set_source_files_properties(test/message2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(message2_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(capabilities3_test test/capabilities3_test.c)
+set_source_files_properties(test/capabilities3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(capabilities3_test PRIVATE ${AT_TEST_LIBS})
+
+add_test(NAME util3_test COMMAND $<TARGET_FILE:util3_test>)
+add_test(NAME capabilities2_test COMMAND $<TARGET_FILE:capabilities2_test>)
+add_test(NAME identity2_test COMMAND $<TARGET_FILE:identity2_test>)
+add_test(NAME group2_test COMMAND $<TARGET_FILE:group2_test>)
+add_test(NAME map3_test COMMAND $<TARGET_FILE:map3_test>)
+add_test(NAME data_proto_test COMMAND $<TARGET_FILE:data_proto_test>)
+add_test(NAME array3_test COMMAND $<TARGET_FILE:array3_test>)
+add_test(NAME message2_test COMMAND $<TARGET_FILE:message2_test>)
+add_test(NAME capabilities3_test COMMAND $<TARGET_FILE:capabilities3_test>)
 
 # ZTA tests (only when AT_ZTA is enabled)
 if(AT_ZTA)
@@ -826,6 +1113,124 @@ if(AT_ZTA)
     add_test(NAME zta_ocsp_test COMMAND $<TARGET_FILE:zta_ocsp_test>)
     add_test(NAME zta_delegation_test COMMAND $<TARGET_FILE:zta_delegation_test>)
 endif() # AT_ZTA
+
+# Hybrid-transport routing unit tests — always compiled; no backend needed,
+# this is a pure-math test of the matcher logic.
+add_executable(hybrid_route_test test/hybrid_route_test.c)
+set_source_files_properties(test/hybrid_route_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(hybrid_route_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME hybrid_route_test COMMAND $<TARGET_FILE:hybrid_route_test>)
+
+# IPv6 CIDR matching — split into its own binary to stay under the
+# RUN_TESTS 9-arg cap in test_setup.h.
+add_executable(hybrid_route6_test test/hybrid_route6_test.c)
+set_source_files_properties(test/hybrid_route6_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(hybrid_route6_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME hybrid_route6_test COMMAND $<TARGET_FILE:hybrid_route6_test>)
+
+# Timeout-scaling tests — the pure-arithmetic kernel of the
+# timeout-adaptation layer (utilities/timeout.h).
+add_executable(timeout_scale_test test/timeout_scale_test.c)
+set_source_files_properties(test/timeout_scale_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(timeout_scale_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME timeout_scale_test COMMAND $<TARGET_FILE:timeout_scale_test>)
+
+# PEER_RTT_UPDATE propagation (at-over-dtn §4.3 B-followup).
+# Drives run_message_handlers with a PEER_RTT_UPDATE and asserts the
+# target peer's peer_rtt_ms[] slot changes.
+add_executable(peer_rtt_update_test test/peer_rtt_update_test.c)
+set_source_files_properties(test/peer_rtt_update_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(peer_rtt_update_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME peer_rtt_update_test COMMAND $<TARGET_FILE:peer_rtt_update_test>)
+
+# Envelope codec unit tests — gated by AT_NET_ENVELOPE since the codec TU
+# itself is only compiled when that option is ON.
+if(AT_NET_ENVELOPE)
+    add_executable(net_envelope_test test/net_envelope_test.c)
+    set_source_files_properties(test/net_envelope_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(net_envelope_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME net_envelope_test COMMAND $<TARGET_FILE:net_envelope_test>)
+
+    # Multi-hop relay test — exercises the envelope forwarding protocol
+    # end-to-end across simulated A -> G [-> G2] -> B paths without
+    # bringing up real transports or threads.
+    add_executable(envelope_relay_test test/envelope_relay_test.c)
+    set_source_files_properties(test/envelope_relay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(envelope_relay_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME envelope_relay_test COMMAND $<TARGET_FILE:envelope_relay_test>)
+
+    # Cross-leg broadcast forwarding gate + dedup fingerprint. Split from
+    # envelope_relay_test to stay under the 9-test RUN_TESTS cap.
+    add_executable(envelope_bcast_test test/envelope_bcast_test.c)
+    set_source_files_properties(test/envelope_bcast_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(envelope_bcast_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME envelope_bcast_test COMMAND $<TARGET_FILE:envelope_bcast_test>)
+
+    # Integration-ish test: drives the real net_proc handle_inbound_peer()
+    # through a mock transport, asserting forward/drop/local behavior
+    # end-to-end without bringing up daemonize()'d processes or sockets.
+    add_executable(net_proc_relay_test test/net_proc_relay_test.c)
+    set_source_files_properties(test/net_proc_relay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(net_proc_relay_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME net_proc_relay_test COMMAND $<TARGET_FILE:net_proc_relay_test>)
+
+    # Deferred-message uuid-keyed retry (stage G). Verifies that under
+    # envelope mode the deferred-message ring keys by envelope src_uuid,
+    # not the gateway's transport from_addr.
+    add_executable(net_proc_defer_test test/net_proc_defer_test.c)
+    set_source_files_properties(test/net_proc_defer_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(net_proc_defer_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME net_proc_defer_test COMMAND $<TARGET_FILE:net_proc_defer_test>)
+
+    # Cross-group forward path (stage F) — gated on AT_NET_GROUP_FORWARD
+    # because it drives the code in handle_inbound_group that only exists
+    # under that option. Envelope is still needed for envelope pack/unpack.
+    if(AT_NET_GROUP_FORWARD)
+        add_executable(envelope_group_forward_test test/envelope_group_forward_test.c)
+        set_source_files_properties(test/envelope_group_forward_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+        target_link_libraries(envelope_group_forward_test PRIVATE ${AT_TEST_LIBS})
+        add_test(NAME envelope_group_forward_test COMMAND $<TARGET_FILE:envelope_group_forward_test>)
+    endif()
+
+    # Cross-cluster peer discovery (stage E) — verifies that forwarded
+    # ID_ANNOUNCE broadcasts preserve the announcer's self-reported
+    # address (so replies route back through the gateway).
+    if(AT_DISCOVERY_CROSS_CLUSTER)
+        add_executable(discovery_cross_cluster_test test/discovery_cross_cluster_test.c)
+        set_source_files_properties(test/discovery_cross_cluster_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+        target_link_libraries(discovery_cross_cluster_test PRIVATE ${AT_TEST_LIBS})
+        add_test(NAME discovery_cross_cluster_test COMMAND $<TARGET_FILE:discovery_cross_cluster_test>)
+    endif()
+
+    # Per-leg broadcast exclusion (stage D-followup). Verifies
+    # handle_inbound_broadcast uses send_broadcast_except_leg when the
+    # transport reports a known last_recv_leg, and falls back to
+    # send_broadcast otherwise. Compiled whenever envelope mode is on —
+    # the refinement is zero-cost when irrelevant, so no separate option.
+    add_executable(broadcast_except_leg_test test/broadcast_except_leg_test.c)
+    set_source_files_properties(test/broadcast_except_leg_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(broadcast_except_leg_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME broadcast_except_leg_test COMMAND $<TARGET_FILE:broadcast_except_leg_test>)
+endif()
+
+# DTN tests (only when AT_NET_DTN is enabled). dtn_eid_test is pure string
+# math so it runs against any backend. dtn_transport_test exercises the
+# transport's send/recv paths through the backend vtable; it assumes the
+# no-op stub (send returns 0, recv returns ENOMSG) and would misbehave
+# against a real daemon, so it is gated to the stub backend only.
+if(AT_NET_DTN)
+    add_executable(dtn_eid_test test/dtn_eid_test.c)
+    set_source_files_properties(test/dtn_eid_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(dtn_eid_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME dtn_eid_test COMMAND $<TARGET_FILE:dtn_eid_test>)
+
+    if(AT_NET_DTN_BACKEND STREQUAL "stub")
+        add_executable(dtn_transport_test test/dtn_transport_test.c)
+        set_source_files_properties(test/dtn_transport_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+        target_link_libraries(dtn_transport_test PRIVATE ${AT_TEST_LIBS})
+        add_test(NAME dtn_transport_test COMMAND $<TARGET_FILE:dtn_transport_test>)
+    endif()
+endif()
 
 endif() # LIBCHECK_LIBRARY
 

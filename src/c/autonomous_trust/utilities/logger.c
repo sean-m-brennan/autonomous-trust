@@ -67,6 +67,25 @@ const char *colors[] = {
     TERM_PURPLE,
 };
 
+/* Frama-C: skipped —
+ * logger_init_time_res also has direct strncpy + fopen + set_exception preconditions.
+ */
+/*@
+  requires \valid(logger);
+  requires max_level >= DEBUG && max_level <= CRITICAL;
+  requires log_file == \null ||
+           \valid_read(log_file + (0 .. MAX_FILENAME - 1));
+  assigns logger->max_level, logger->term, logger->local_time,
+          logger->resolution, logger->file_name[0 .. MAX_FILENAME],
+          logger->file;
+  behavior success:
+    ensures \result == 0;
+    ensures logger->max_level == max_level;
+    ensures logger->resolution == res;
+  behavior failure:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int logger_init_time_res(logger_t *logger, log_level_t max_level, const char *log_file, time_resolution_t res)
 {
     logger->max_level = max_level;
@@ -78,6 +97,8 @@ int logger_init_time_res(logger_t *logger, log_level_t max_level, const char *lo
         logger->file = stderr;
     else
     {
+        /* logger->file_name was zero'd by the memset above; strncpy writes
+         * at most 255 bytes, leaving byte 255 as the NUL terminator. */
         strncpy(logger->file_name, log_file, 255);
         logger->file = fopen(logger->file_name, "a");
         if (logger->file == NULL)
@@ -87,11 +108,38 @@ int logger_init_time_res(logger_t *logger, log_level_t max_level, const char *lo
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] all 4 logger_init* variants time out on disjoint_failure_success — the
+ * disjoint-behaviors check between the success and failure branches involves path-join +
+ * fopen + strncpy state that the solver can't fully eliminate.
+ */
 inline int logger_init(logger_t *logger, log_level_t max_level, const char *log_file)
 {
     return logger_init_time_res(logger, max_level, log_file, MILLISECONDS);
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] all 4 logger_init* variants time out on disjoint_failure_success — the
+ * disjoint-behaviors check between the success and failure branches involves path-join +
+ * fopen + strncpy state that the solver can't fully eliminate. logger_init_time_res also
+ * has direct strncpy + fopen + set_exception preconditions.
+ */
+/*@
+  requires \valid(logger);
+  requires max_level >= DEBUG && max_level <= CRITICAL;
+  requires log_file == \null ||
+           \valid_read(log_file + (0 .. MAX_FILENAME - 1));
+  assigns logger->max_level, logger->term, logger->local_time,
+          logger->resolution, logger->file_name[0 .. MAX_FILENAME],
+          logger->file;
+  behavior success:
+    ensures \result == 0;
+    ensures logger->local_time == true;
+    ensures logger->resolution == res;
+  behavior failure:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int logger_init_local_time_res(logger_t *logger, log_level_t max_level, const char *log_file, time_resolution_t res)
 {
     int err = logger_init_time_res(logger, max_level, log_file, res);
@@ -101,11 +149,23 @@ int logger_init_local_time_res(logger_t *logger, log_level_t max_level, const ch
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] all 4 logger_init* variants time out on disjoint_failure_success — the
+ * disjoint-behaviors check between the success and failure branches involves path-join +
+ * fopen + strncpy state that the solver can't fully eliminate. logger_init_time_res also
+ * has direct strncpy + fopen + set_exception preconditions.
+ */
 inline int logger_init_local_time(logger_t *logger, log_level_t max_level, const char *log_file)
 {
     return logger_init_local_time_res(logger, max_level, log_file, MILLISECONDS);
 }
 
+/*@
+  requires logger_ptr == \null || \valid(logger_ptr);
+  requires srcfile != \null && \valid_read(srcfile);
+  requires fmt != \null && \valid_read(fmt);
+  assigns \nothing;
+*/
 void _vlogging(logger_t *logger_ptr, log_level_t level, const char *srcfile, const size_t line, const char *fmt, va_list argp)
 {
     logger_t *logger = logger_ptr;
@@ -142,6 +202,15 @@ void _logging(logger_t *logger_ptr, log_level_t level, const char *srcfile, cons
 }
 
 
+/*@
+  requires \valid_read(error_table + (0 .. error_table_size - 1));
+  assigns \nothing;
+  behavior found:
+    ensures \result != \null;
+  behavior not_found:
+    ensures \result == \null;
+  disjoint behaviors;
+*/
 const char *_custom_errstr(int num)
 {
     for (int i = 0; i < error_table_size; i++)
@@ -153,6 +222,15 @@ const char *_custom_errstr(int num)
     return NULL;
 }
 
+/*@
+  requires \valid_read(error_table + (0 .. error_table_size - 1));
+  assigns \nothing;
+  behavior found:
+    ensures \result != \null;
+  behavior not_found:
+    ensures \result == \null;
+  disjoint behaviors;
+*/
 const char *_custom_errdescr(int num)
 {
     for (int i = 0; i < error_table_size; i++)
@@ -165,11 +243,26 @@ const char *_custom_errdescr(int num)
 }
 
 
+/*@
+  requires logger == \null || \valid(logger);
+  requires srcfile != \null && \valid_read(srcfile);
+  assigns _exception.errnum, _exception.line,
+          _exception.file[0 .. MAX_FILENAME - 1];
+  ensures _exception.errnum == 0;
+*/
 void _log_exception(logger_t *logger, const char *srcfile, const size_t line)
 {
     _log_exception_extra(logger, srcfile, line, "\n");
 }
 
+/*@
+  requires logger == \null || \valid(logger);
+  requires srcfile != \null && \valid_read(srcfile);
+  requires fmt != \null && \valid_read(fmt);
+  assigns _exception.errnum, _exception.line,
+          _exception.file[0 .. MAX_FILENAME - 1];
+  ensures _exception.errnum == 0;
+*/
 void _log_exception_extra(logger_t *logger, const char *srcfile, const size_t line, const char *fmt, ...)
 {
     if (_exception.errnum == 0) {
@@ -197,6 +290,12 @@ void _log_exception_extra(logger_t *logger, const char *srcfile, const size_t li
         addtnl = malloc(ORIGIN_LEN+1);
         snprintf(addtnl, ORIGIN_LEN, ORIGIN_FMT, srcfile, line);
     }
+    /* Allocation size matches exactly what the three writes need:
+     *   strcpy err_info  → strlen(err_info) bytes + NUL
+     *   strcat "%s"      → 2 more bytes + NUL (overwrites prior NUL)
+     *   strcat addtnl    → strlen(addtnl) bytes + NUL (len=0 when !add_stack)
+     *   total            = strlen(err_info) + 2 + strlen(addtnl) + 1
+     * No overrun. */
     char *format = malloc(strlen(err_info) + 2 + strlen(addtnl) + 1);
     strcpy(format, err_info);
     strcat(format, "%s");

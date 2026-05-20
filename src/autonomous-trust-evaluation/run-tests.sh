@@ -1,3 +1,4 @@
+#!/bin/bash
 # ******************
 #  Copyright 2025 Sean M. Brennan and contributors
 #
@@ -13,4 +14,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Polite protocol evaluation for AT simulator."""
+cd "$(dirname "$0")"
+python -m pytest -q \
+  --cov=autonomous_trust --cov-config=.coveragerc --cov-report=term-missing \
+  tests/a_unit/ tests/b_integration/ "$@"

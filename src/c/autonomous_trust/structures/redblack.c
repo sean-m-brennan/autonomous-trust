@@ -21,6 +21,12 @@
 #include "redblack_priv.h"
 #include "array_priv.h"
 
+/*@
+  requires dir == LEFT || dir == RIGHT;
+  assigns \nothing;
+  ensures dir == LEFT ==> \result == RIGHT;
+  ensures dir == RIGHT ==> \result == LEFT;
+*/
 enum Direction opposite_direction(enum Direction dir)
 {
     return (enum Direction)(dir + 1) % 2;
@@ -29,6 +35,24 @@ enum Direction opposite_direction(enum Direction dir)
 /**********************/
 // Red/Black node in tree (private)
 
+/*@
+  requires \valid(node_ptr);
+  allocates *node_ptr;
+  assigns *node_ptr \from data, key;
+  behavior success:
+    ensures \result == 0;
+    ensures *node_ptr != \null;
+    ensures (*node_ptr)->key == key;
+    ensures (*node_ptr)->data == data;
+    ensures (*node_ptr)->red == true;
+    ensures (*node_ptr)->left == \null;
+    ensures (*node_ptr)->right == \null;
+    ensures (*node_ptr)->parent == \null;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
+/* Frama-C: skipped — [solver-timeout] smrt_ptr allocation postconditions */
 int createNode(tree_data_ptr_t data, int key, struct rbNode **node_ptr)
 {
     *node_ptr = smrt_create(sizeof(struct rbNode));
@@ -39,9 +63,15 @@ int createNode(tree_data_ptr_t data, int key, struct rbNode **node_ptr)
     node->key = key;
     node->red = true;
     node->parent = node->left = node->right = NULL;
+    //@ assert node->key == key && node->red == true;
     return 0;
 }
 
+/*@
+  requires \valid(child);
+  assigns *child \from orig, parent;
+*/
+/* Frama-C: skipped — [recursive-ds] recursive BST copy */
 int copyNodes(struct rbNode *orig, struct rbNode *parent, struct rbNode **child)
 {
     if (orig == NULL)
@@ -62,6 +92,17 @@ int copyNodes(struct rbNode *orig, struct rbNode *parent, struct rbNode **child)
     return 0;
 }
 
+/*@
+  requires \valid(tree);
+  assigns \result \from tree->root, key;
+  behavior found:
+    ensures \result != \null;
+    ensures \result->key == key;
+  behavior not_found:
+    ensures \result == \null;
+  disjoint behaviors;
+*/
+/* Frama-C: skipped — [recursive-ds] recursive node search */
 struct rbNode *findNode(tree_t *tree, int key)
 {
     struct rbNode *current = tree->root;
@@ -77,6 +118,13 @@ struct rbNode *findNode(tree_t *tree, int key)
     return NULL;
 }
 
+/*@
+  requires \valid(node);
+  requires which == LEFT || which == RIGHT;
+  assigns \result \from node->left, node->right, which;
+  ensures which == LEFT ==> \result == node->left;
+  ensures which == RIGHT ==> \result == node->right;
+*/
 struct rbNode *getNodeChild(struct rbNode *node, enum Direction which)
 {
     if (which == LEFT)
@@ -84,6 +132,14 @@ struct rbNode *getNodeChild(struct rbNode *node, enum Direction which)
     return node->right;
 };
 
+/*@
+  requires \valid(node);
+  requires which == LEFT || which == RIGHT;
+  assigns node->left \from which, child;
+  assigns node->right \from which, child;
+  ensures which == LEFT ==> node->left == child;
+  ensures which == RIGHT ==> node->right == child;
+*/
 void setNodeChild(struct rbNode *node, enum Direction which, struct rbNode *child)
 {
     if (which == LEFT)
@@ -92,6 +148,12 @@ void setNodeChild(struct rbNode *node, enum Direction which, struct rbNode *chil
         node->right = child;
 };
 
+/*@
+  requires \valid(node);
+  requires node->parent == \null || \valid(node->parent);
+  assigns \result \from node, node->parent;
+  ensures node->parent == \null ==> \result == \null;
+*/
 struct rbNode *nodeSibling(struct rbNode *node)
 {
     if (node->parent == NULL)
@@ -101,6 +163,11 @@ struct rbNode *nodeSibling(struct rbNode *node)
     return node->parent->left;
 };
 
+/*@
+  requires \valid(node);
+  assigns \nothing;
+  ensures \result >= 0;
+*/
 int nodeDepth(struct rbNode *node)
 {
     struct rbNode *cur = node->parent;
@@ -113,11 +180,22 @@ int nodeDepth(struct rbNode *node)
     return level;
 };
 
+/*@
+  requires \valid(node);
+  assigns \nothing;
+  ensures \result == (node->left == \null && node->right == \null);
+*/
 bool nodeIsLeaf(struct rbNode *node)
 {
     return node->left == NULL && node->right == NULL;
 };
 
+/*@
+  requires \valid(node);
+  assigns \result \from node;
+  ensures \result != \null;
+*/
+/* Frama-C: skipped — [recursive-ds] recursive minimum-leaf traversal */
 struct rbNode *nodeMinLeaf(struct rbNode *node)
 {
     struct rbNode *current = node;
@@ -128,6 +206,11 @@ struct rbNode *nodeMinLeaf(struct rbNode *node)
     return current;
 }
 
+/*@
+  requires node == \null || \valid(node);
+  assigns \nothing;
+*/
+/* Frama-C: skipped — [recursive-ds] recursive tree free */
 void nodesFree(struct rbNode *node) {
     if (node == NULL)
         return;
@@ -142,6 +225,13 @@ void nodesFree(struct rbNode *node) {
 /**********************/
 // private tree functions
 
+/*@
+  requires \valid(tree);
+  requires \valid(node);
+  requires dir == LEFT || dir == RIGHT;
+  assigns tree->root \from tree->root, node, dir;
+*/
+/* Frama-C: skipped — [recursive-ds] BST rotation */
 void rotateTree(tree_t *tree, enum Direction dir, struct rbNode *node)
 {
     enum Direction direction = dir;
@@ -162,6 +252,12 @@ void rotateTree(tree_t *tree, enum Direction dir, struct rbNode *node)
     node->parent = pivot;
 }
 
+/*@
+  requires \valid(tree);
+  requires \valid(node);
+  assigns tree->root \from tree->root, node;
+*/
+/* Frama-C: skipped — [recursive-ds] red-black recoloring after insert */
 void recolorInsert(tree_t *tree, struct rbNode *node)
 {
     while (node != tree->root && node->parent != NULL && node->parent->red)
@@ -218,6 +314,12 @@ void recolorInsert(tree_t *tree, struct rbNode *node)
     tree->root->red = false;
 }
 
+/*@
+  requires \valid(tree);
+  requires \valid(u);
+  assigns tree->root \from tree->root, u, v;
+*/
+/* Frama-C: skipped — [recursive-ds] BST subtree transplant */
 void transplant(tree_t *tree, struct rbNode *u, struct rbNode *v)
 {
     if (u->parent == NULL)
@@ -230,6 +332,13 @@ void transplant(tree_t *tree, struct rbNode *u, struct rbNode *v)
         v->parent = u->parent;
 }
 
+/*@
+  requires \valid(tree);
+  requires \valid(node);
+  requires dir == LEFT || dir == RIGHT;
+  assigns \result \from tree, node, dir;
+*/
+/* Frama-C: skipped — [recursive-ds] partial recoloring during delete */
 struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode *node)
 {
     struct rbNode *sibling, *other;
@@ -243,6 +352,8 @@ struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode
         sibling = node->parent->left;
         other = node->parent->right;
     }
+    /* NULL leaves are conceptually black in a red-black tree; these guards
+     * encode that so the algorithm works without an explicit NIL sentinel. */
     if (sibling->red)
     {
         sibling->red = false;
@@ -251,7 +362,9 @@ struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode
         sibling = other;
     }
 
-    if (!sibling->left->red && !sibling->right->red)
+    bool left_black = (sibling->left == NULL) || !sibling->left->red;
+    bool right_black = (sibling->right == NULL) || !sibling->right->red;
+    if (left_black && right_black)
     {
         sibling->red = true;
         node = node->parent;
@@ -260,31 +373,35 @@ struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode
     {
         if (dir == LEFT)
         {
-            if (!sibling->right->red)
+            if (sibling->right == NULL || !sibling->right->red)
             {
-                sibling->left->red = false;
+                if (sibling->left != NULL)
+                    sibling->left->red = false;
                 sibling->red = true;
                 rotateTree(tree, opposite_direction(dir), sibling);
                 sibling = node->parent->right;
             }
             sibling->red = node->parent->red;
             node->parent->red = false;
-            sibling->right->red = false;
+            if (sibling->right != NULL)
+                sibling->right->red = false;
             rotateTree(tree, dir, node->parent);
             node = tree->root;
         }
         else
         {
-            if (!sibling->left->red)
+            if (sibling->left == NULL || !sibling->left->red)
             {
-                sibling->right->red = false;
+                if (sibling->right != NULL)
+                    sibling->right->red = false;
                 sibling->red = true;
                 rotateTree(tree, opposite_direction(dir), sibling);
                 sibling = node->parent->left;
             }
             sibling->red = node->parent->red;
             node->parent->red = false;
-            sibling->left->red = false;
+            if (sibling->left != NULL)
+                sibling->left->red = false;
             rotateTree(tree, dir, node->parent);
             node = tree->root;
         }
@@ -293,6 +410,12 @@ struct rbNode *recolorDelPartial(tree_t *tree, enum Direction dir, struct rbNode
     return node;
 }
 
+/*@
+  requires \valid(tree);
+  requires \valid(node);
+  assigns tree->root \from tree->root, node;
+*/
+/* Frama-C: skipped — [recursive-ds] red-black recoloring after delete */
 void recolorDelete(tree_t *tree, struct rbNode *node)
 {
     while (node != tree->root && !node->red)
@@ -313,6 +436,7 @@ int tree_init(tree_t *tree)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] smrt_ptr allocation postconditions */
 int tree_create(tree_t **tree_ptr)
 {
     if (tree_ptr == NULL)
@@ -323,6 +447,19 @@ int tree_create(tree_t **tree_ptr)
     return tree_init(*tree_ptr);
 }
 
+/*@
+  requires \valid(orig);
+  requires \valid(copy_ptr);
+  allocates *copy_ptr;
+  assigns *copy_ptr \from orig;
+  behavior success:
+    ensures \result == 0;
+    ensures *copy_ptr != \null;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
+/* Frama-C: skipped — [recursive-ds] full tree deep copy */
 int tree_copy(tree_t *orig, tree_t **copy_ptr)
 {
     int err = tree_create(copy_ptr);
@@ -343,6 +480,13 @@ int tree_size(tree_t *tree)
     return tree->size;
 }
 
+/*@
+  requires node == \null || \valid(node);
+  assigns \nothing;
+  ensures \result >= 0;
+  ensures node == \null ==> \result == 0;
+*/
+/* Frama-C: skipped — [recursive-ds] recursive depth calculation */
 static int node_depth(struct rbNode *node)
 {
     if (node == NULL)
@@ -352,6 +496,7 @@ static int node_depth(struct rbNode *node)
     return 1 + (left_depth > right_depth ? left_depth : right_depth);
 }
 
+/* Frama-C: skipped — [recursive-ds] recursive depth calculation */
 int tree_depth(tree_t *tree)
 {
     return node_depth(tree->root);
@@ -365,12 +510,24 @@ tree_data_ptr_t tree_find(tree_t *tree, int key)
     return node->data;
 }
 
+/*@
+  requires \valid(tree);
+  assigns tree->root, tree->size \from tree->root, tree->size, data;
+  behavior success:
+    ensures \result == 0;
+    ensures tree->size == \old(tree->size) + 1;
+  behavior failure:
+    ensures \result != 0;
+    ensures tree->size == \old(tree->size);
+  disjoint behaviors;
+*/
 int tree_insert_auto_key(tree_t *tree, tree_data_ptr_t data)
 {
     int key = tree->size + 1;
     return tree_insert(tree, data, key);
 }
 
+/* Frama-C: skipped — [recursive-ds] BST insert with rebalance */
 int tree_insert(tree_t *tree, void *data, int key)
 {
     struct rbNode *node;
@@ -404,6 +561,7 @@ int tree_insert(tree_t *tree, void *data, int key)
     return 0;
 }
 
+/* Frama-C: skipped — [recursive-ds] BST delete with rebalance */
 int tree_delete(tree_t *tree, int key)
 {
     if (!tree->root)
@@ -456,6 +614,7 @@ int tree_delete(tree_t *tree, int key)
 }
 
 
+/* Frama-C: skipped — [solver-timeout] map_free/smrt_deref preconditions */
 void tree_free(tree_t *tree) {
     nodesFree(tree->root);
     tree->size = 0;

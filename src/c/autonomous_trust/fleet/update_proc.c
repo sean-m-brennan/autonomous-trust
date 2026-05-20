@@ -55,6 +55,7 @@ static char update_data_dir[256] = {0};
  * copy_file - stream copy src to dst via 4096-byte buffer.
  * Sets dst to mode 0755 after copy.  Returns 0 on success, -1 on error.
  */
+/* Frama-C: skipped — [solver-timeout] filesystem I/O preconditions */
 static int copy_file(const char *src, const char *dst)
 {
     FILE *in = fopen(src, "rb");
@@ -70,22 +71,28 @@ static int copy_file(const char *src, const char *dst)
 
     char buf[4096];
     size_t n;
+    int write_err = 0;
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
     {
         if (fwrite(buf, 1, n, out) != n)
         {
-            fclose(in);
-            fclose(out);
-            return -1;
+            write_err = 1;
+            break;
         }
     }
 
     int read_err = ferror(in);
     fclose(in);
-    fclose(out);
+    /* fclose on the output flushes stdio buffers; ENOSPC/EIO can surface
+     * only here. Treat a close error as a write error so we unlink below. */
+    if (fclose(out) != 0)
+        write_err = 1;
 
-    if (read_err)
+    if (read_err || write_err)
+    {
+        unlink(dst);
         return -1;
+    }
 
     chmod(dst, 0755);
     return 0;
@@ -94,6 +101,7 @@ static int copy_file(const char *src, const char *dst)
 /**
  * ensure_staging_dir - create <update_data_dir>/update/ if it does not exist.
  */
+/* Frama-C: skipped — [solver-timeout] path_join + mkdir preconditions */
 static int ensure_staging_dir(void)
 {
     char dir[256];
@@ -119,6 +127,7 @@ static int ensure_staging_dir(void)
  *
  * This avoids the need for sudo (which fails under NoNewPrivileges=true).
  */
+/* Frama-C: skipped — [solver-timeout] process lifecycle preconditions */
 static void trigger_service_restart(void)
 {
     char pid_path[512];
@@ -143,6 +152,7 @@ static void trigger_service_restart(void)
 /**
  * broadcast_status - send update status to all known peers.
  */
+/* Frama-C: skipped — [solver-timeout] logging/json/network preconditions */
 static void broadcast_status(const process_t *proc,
                              const char *hash_hex,
                              const char *version,
@@ -155,6 +165,7 @@ static void broadcast_status(const process_t *proc,
     json_object_set_new(base, "status", json_string(status));
     json_object_set_new(base, "detail", json_string(detail));
 
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         json_t *copy = json_deep_copy(base);
@@ -176,6 +187,7 @@ static void broadcast_status(const process_t *proc,
         json_decref(copy);
         messaging_send("network", NET_MESSAGE, &out, false);
     }
+    peers_read_unlock(proc);
     json_decref(base);
 }
 
@@ -186,6 +198,7 @@ static void broadcast_status(const process_t *proc,
  * after signalling the AT daemon for a service restart).
  * Returns -1 on error.
  */
+/* Frama-C: skipped — [solver-timeout] filesystem + crypto preconditions */
 static int stage_and_apply(const process_t *proc,
                            const char *artifact_path,
                            const char *hash_hex,
@@ -227,11 +240,15 @@ static int stage_and_apply(const process_t *proc,
     update_state_t state;
     memset(&state, 0, sizeof(state));
     strncpy(state.state, "APPLYING", sizeof(state.state) - 1);
+    state.state[sizeof(state.state) - 1] = '\0';
     strncpy(state.version, version, sizeof(state.version) - 1);
+    state.version[sizeof(state.version) - 1] = '\0';
     strncpy(state.hash_hex, hash_hex, sizeof(state.hash_hex) - 1);
-    strncpy(state.backup_path, backup_path, sizeof(state.backup_path) - 1);
-    strncpy(state.binary_path, binary_path, sizeof(state.binary_path) - 1);
+    state.hash_hex[sizeof(state.hash_hex) - 1] = '\0';
+    snprintf(state.backup_path, sizeof(state.backup_path), "%s", backup_path);
+    snprintf(state.binary_path, sizeof(state.binary_path), "%s", binary_path);
     strncpy(state.type, "binary", sizeof(state.type) - 1);
+    state.type[sizeof(state.type) - 1] = '\0';
     state.timestamp = (long)time(NULL);
     state.attempt = 1;
 
@@ -252,6 +269,7 @@ static int stage_and_apply(const process_t *proc,
 /**
  * rollback - restore backup binary and restart.
  */
+/* Frama-C: skipped — [solver-timeout] filesystem + process preconditions */
 static void rollback(const process_t *proc, update_state_t *state)
 {
     if (strcmp(state->type, "config") == 0)
@@ -297,6 +315,7 @@ static void rollback(const process_t *proc, update_state_t *state)
  * On success: cleans up state file and backup, broadcasts success.
  * On failure: triggers rollback.
  */
+/* Frama-C: skipped — [solver-timeout] process + logging preconditions */
 static void run_health_check(const process_t *proc, update_state_t *state)
 {
     char cfg_dir[CFG_PATH_LEN];
@@ -320,6 +339,7 @@ static void run_health_check(const process_t *proc, update_state_t *state)
 
     /* Peer handshake test: try to reach at least one peer */
     bool handshake_ok = false;
+    peers_read_lock(proc);
     if (proc->protocol.num_peers == 0)
     {
         handshake_ok = true;  /* no peers to test — consider OK */
@@ -356,6 +376,7 @@ static void run_health_check(const process_t *proc, update_state_t *state)
             json_decref(ping);
         }
     }
+    peers_read_unlock(proc);
 
     if (!handshake_ok)
     {
@@ -390,6 +411,12 @@ static void run_health_check(const process_t *proc, update_state_t *state)
 /**
  * handle_config_ready - a new config has been written to disk, trigger restart.
  */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_config_ready(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -446,6 +473,12 @@ static bool handle_config_ready(const process_t *proc, directory_t *queues, gene
 /**
  * handle_artifact_ready - an artifact download completed and is ready for install.
  */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_artifact_ready(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -501,6 +534,12 @@ static bool handle_artifact_ready(const process_t *proc, directory_t *queues, ge
 /**
  * handle_update_status - receive a peer's update status broadcast (informational).
  */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_update_status(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -532,6 +571,7 @@ static bool handle_update_status(const process_t *proc, directory_t *queues, gen
 /* Process entry point                                                 */
 /* ------------------------------------------------------------------ */
 
+/* Frama-C: skipped — [solver-timeout] logging/snprintf/process preconditions */
 int update_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     /* Determine data directory */
@@ -545,6 +585,7 @@ int update_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
             snprintf(data_dir, sizeof(data_dir), "/tmp/at_update");
     }
     strncpy(update_data_dir, data_dir, sizeof(update_data_dir) - 1);
+    update_data_dir[sizeof(update_data_dir) - 1] = '\0';
 
     /* Check for pending update state file */
     if (update_state_exists(update_data_dir))

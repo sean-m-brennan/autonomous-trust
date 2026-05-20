@@ -17,7 +17,12 @@
 #ifndef CAPABILITIES_H
 #define CAPABILITIES_H
 
+/** @addtogroup internal_processes
+ *  @{
+ */
+
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdarg.h>
 
 #include "structures/map.h"
@@ -49,7 +54,25 @@ typedef struct
 
 typedef map_t peer_capabilities_matrix_t;   // map of UUID string to array of capabilities
 
+/*@
+  requires name != \null && \valid_read(name);
+  assigns \nothing;
+  ensures \result == \null || \valid(\result);
+*/
 capability_t *find_capability(const char *name);
+
+/*@
+  requires my_uuid != \null && \valid_read(my_uuid);
+  requires \valid(caps_out);
+  allocates *caps_out;
+  behavior success:
+    ensures \result == 0;
+    ensures *caps_out != \null;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
+int build_local_capabilities(const char *my_uuid, array_t **caps_out);
 
 #define DECLARE_CAPABILITY(config_name, data_size, struct_to_json, struct_from_json)
 
@@ -62,6 +85,11 @@ capability_t *find_capability(const char *name);
 #define DEFINE_CAPABILITY(cap_name, func, args, arg_num)                          \
     void __attribute__((constructor)) CONCAT(register_capability_, __COUNTER__)() \
     {                                                                             \
+        if (capability_table_size >= CAPABILITY_TABLE_CAPACITY) {                 \
+          (void)fprintf(stderr,                                                   \
+                        "capability_table overflow at " QUOTE(cap_name) "\n");    \
+          return;                                                                 \
+        }                                                                         \
         capability_init(&capability_table[capability_table_size]);                \
         capability_table[capability_table_size].name = QUOTE(cap_name);           \
         capability_table[capability_table_size].function = func;                  \
@@ -71,8 +99,7 @@ capability_t *find_capability(const char *name);
         capability_table_size++;                                                  \
     }
 
-// FIXME to/from json for configuration of peer capabilities (local capabilities are in the code)
 
-// FIXME build my own peer capability list for tx
+/** @} */ /* end of internal_processes */
 
 #endif  // CAPABILITIES_H

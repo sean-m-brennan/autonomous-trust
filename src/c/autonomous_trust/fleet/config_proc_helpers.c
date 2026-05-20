@@ -32,11 +32,13 @@
 #include <jansson.h>
 
 #include "fleet/config_proc.h"
+#include "utilities/util.h"
 
 /* ------------------------------------------------------------------ */
 /* Static helper: copy a file byte-for-byte                            */
 /* ------------------------------------------------------------------ */
 
+/* Frama-C: skipped — [solver-timeout] filesystem I/O preconditions */
 static int copy_file(const char *src, const char *dst)
 {
     FILE *in = fopen(src, "rb");
@@ -98,6 +100,7 @@ json_t *config_proposal_to_json(const config_proposal_t *prop)
     return obj;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON deserialization */
 int config_proposal_from_json(const json_t *json, config_proposal_t *prop)
 {
     memset(prop, 0, sizeof(*prop));
@@ -139,6 +142,7 @@ int config_proposal_from_json(const json_t *json, config_proposal_t *prop)
 /* Signing / verification                                              */
 /* ------------------------------------------------------------------ */
 
+/* Frama-C: skipped — [solver-timeout] crypto signature preconditions */
 static size_t build_config_signable(const config_proposal_t *prop, uint8_t *buf, size_t buflen)
 {
     size_t offset = 0;
@@ -194,6 +198,7 @@ bool config_is_identity(const char *config_name)
 /* JSON validation                                                     */
 /* ------------------------------------------------------------------ */
 
+/* Frama-C: skipped — [serialization] json_loadb cast triggers infinite range */
 bool config_validate_json(const uint8_t *data, size_t len)
 {
     json_error_t err;
@@ -214,9 +219,10 @@ bool config_validate_json(const uint8_t *data, size_t len)
 
 int config_backup_dir(const char *data_dir, char *buf, size_t buflen)
 {
-    return snprintf(buf, buflen, "%s/config_backup", data_dir) < (int)buflen ? 0 : -1;
+    return path_join(buf, buflen, data_dir, "config_backup") >= 0 ? 0 : -1;
 }
 
+/* Frama-C: skipped — [solver-timeout] filesystem + memcpy preconditions */
 int config_backup_all(const char *cfg_dir, const char *data_dir)
 {
     char backup[512];
@@ -240,8 +246,11 @@ int config_backup_all(const char *cfg_dir, const char *data_dir)
             continue;
 
         char src[512], dst[512];
-        snprintf(src, sizeof(src), "%s/%s", cfg_dir, ent->d_name);
-        snprintf(dst, sizeof(dst), "%s/%s", backup, ent->d_name);
+        if (path_join(src, sizeof(src), cfg_dir, ent->d_name) < 0 ||
+            path_join(dst, sizeof(dst), backup, ent->d_name) < 0) {
+            closedir(d);
+            return -1;
+        }
         if (copy_file(src, dst) != 0) {
             closedir(d);
             return -1;
@@ -252,6 +261,7 @@ int config_backup_all(const char *cfg_dir, const char *data_dir)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] filesystem + memcpy preconditions */
 int config_restore_all(const char *cfg_dir, const char *data_dir)
 {
     char backup[512];
@@ -269,8 +279,11 @@ int config_restore_all(const char *cfg_dir, const char *data_dir)
             continue;
 
         char src[512], dst[512];
-        snprintf(src, sizeof(src), "%s/%s", backup, ent->d_name);
-        snprintf(dst, sizeof(dst), "%s/%s", cfg_dir, ent->d_name);
+        if (path_join(src, sizeof(src), backup, ent->d_name) < 0 ||
+            path_join(dst, sizeof(dst), cfg_dir, ent->d_name) < 0) {
+            closedir(d);
+            return -1;
+        }
         if (copy_file(src, dst) != 0) {
             closedir(d);
             return -1;
@@ -281,6 +294,7 @@ int config_restore_all(const char *cfg_dir, const char *data_dir)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] filesystem preconditions */
 int config_backup_delete(const char *data_dir)
 {
     char backup[512];
@@ -299,7 +313,8 @@ int config_backup_delete(const char *data_dir)
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
             continue;
         char path[512];
-        snprintf(path, sizeof(path), "%s/%s", backup, ent->d_name);
+        if (path_join(path, sizeof(path), backup, ent->d_name) < 0)
+            continue;  /* skip truncated entries; do not remove unrelated files */
         unlink(path);
     }
 

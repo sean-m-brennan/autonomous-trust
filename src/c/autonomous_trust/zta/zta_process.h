@@ -17,6 +17,10 @@
 #ifndef ZTA_PROCESS_H
 #define ZTA_PROCESS_H
 
+/** @addtogroup internal_zta
+ *  @{
+ */
+
 #include "processes/processes.h"
 
 #ifdef __cplusplus
@@ -35,11 +39,20 @@ extern "C" {
  *
  * When ZTA is disabled at runtime, this process exits immediately.
  */
+/*@
+  requires \valid(proc);
+  requires \valid_read(signal);
+  requires logger == \null || \valid(logger);
+  assigns *proc;
+*/
 int zta_process_run(process_t *proc, directory_t *queues,
                     queue_id_t signal, logger_t *logger);
 
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+
+/** @} */ /* end of internal_zta */
 
 #endif /* ZTA_PROCESS_H */

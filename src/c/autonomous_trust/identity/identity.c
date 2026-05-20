@@ -29,8 +29,23 @@
 
 #include "identity_priv.h"
 
+static size_t _max_peers = DEFAULT_MAX_PEERS;
 
-int identity_init(uuid_t *uuid, char *address, char *fullname, identity_t *identity)
+size_t peers_max_count(void)
+{
+    return _max_peers;
+}
+
+void peers_set_max_count(size_t count)
+{
+    if (count > 0 && count <= DEFAULT_MAX_PEERS)
+        _max_peers = count;
+}
+
+
+/* Frama-C: skipped — [solver-timeout] complex multi-step initialization */
+int identity_init(uuid_t *uuid, const char *address, const char *fullname,
+                  const char *nickname, const char *petname, identity_t *identity)
 {
     if (uuid == NULL)
         uuid_generate((unsigned char *)identity->uuid);
@@ -39,6 +54,8 @@ int identity_init(uuid_t *uuid, char *address, char *fullname, identity_t *ident
 
     strncpy(identity->address, address, ADDR_LEN);
     strncpy(identity->fullname, fullname, NAME_LEN);
+    strncpy(identity->nickname, nickname ? nickname : "", NAME_LEN);
+    strncpy(identity->petname, petname ? petname : "", NAME_LEN);
 
     unsigned char *sseed = signature_generate();
     if (sseed == NULL)
@@ -55,8 +72,26 @@ int identity_init(uuid_t *uuid, char *address, char *fullname, identity_t *ident
     return 0;
 }
 
-int identity_create(uuid_t *uuid, char *address, char *fullname, identity_t **ident)
-{ // FIXME address + 4 names
+/* Frama-C: skipped — [solver-timeout] smrt_ptr allocation postconditions */
+int identity_create(uuid_t *uuid, const char *address, const char *fullname,
+                    const char *nickname, const char *petname, identity_t **ident)
+{
+    /* WHY we call sodium_init() here rather than from a one-shot bootstrap:
+     *
+     * libsodium's sodium_init() is documented as idempotent and thread-safe:
+     * calling it repeatedly returns 1 (already initialized) after the first
+     * successful call, and concurrent callers are serialized internally.
+     * See https://libsodium.gitbook.io/doc/usage — "it is safe to call
+     * sodium_init() multiple times, or from different threads".
+     *
+     * We therefore do not keep a library-wide `at_init()` function: every
+     * entry point that needs crypto just calls sodium_init() defensively.
+     * This avoids bootstrap ordering bugs when the library is embedded in
+     * an application that does not know about AT's crypto dependency, and
+     * keeps each public function self-sufficient.
+     *
+     * A negative return here means libsodium failed to seed its RNG (no
+     * /dev/urandom, no getrandom, no CPU RDRAND) — unrecoverable; bail. */
     if (sodium_init() < 0)
     {
         // sodium_init() failed: libsodium could not be initialized
@@ -67,9 +102,10 @@ int identity_create(uuid_t *uuid, char *address, char *fullname, identity_t **id
     if (identity == NULL)
         return EXCEPTION(ENOMEM);
 
-    return identity_init(uuid, address, fullname, identity);
+    return identity_init(uuid, address, fullname, nickname, petname, identity);
 }
 
+/* Frama-C: skipped — [solver-timeout] libsodium + hexlify preconditions */
 int identity_publish(const identity_t *ident, public_identity_t **pub_copy)
 {
     if (ident == NULL)
@@ -84,6 +120,10 @@ int identity_publish(const identity_t *ident, public_identity_t **pub_copy)
     newIdent->address[ADDR_LEN] = '\0';
     strncpy(newIdent->fullname, ident->fullname, NAME_LEN);
     newIdent->fullname[NAME_LEN] = '\0';
+    strncpy(newIdent->nickname, ident->nickname, NAME_LEN);
+    newIdent->nickname[NAME_LEN] = '\0';
+    strncpy(newIdent->petname, ident->petname, NAME_LEN);
+    newIdent->petname[NAME_LEN] = '\0';
 
     unsigned char *sseed = signature_publish(&ident->signature);
     if (sseed == NULL)
@@ -114,11 +154,13 @@ int identity_encrypt(const identity_t *ident, const msg_str_t *in, const public_
     return crypto_box_easy(cipher, in->msg, in->len, nonce, whom->encryptor.public, ident->encryptor.private);
 }
 
+/* Frama-C: skipped — [solver-timeout] libsodium decrypt preconditions */
 int identity_decrypt(const identity_t *ident, const msg_str_t *cipher, const public_identity_t *whom, const unsigned char *nonce, unsigned char *out)
 {
     return crypto_box_open_easy(out, cipher->msg, cipher->len, nonce, whom->encryptor.public, ident->encryptor.private);
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON serialization */
 int identity_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const identity_t *ident = data_struct;
@@ -155,6 +197,7 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON deserialization */
 int identity_from_json(const json_t *obj, void *data_struct)
 {
     identity_t *ident = data_struct;
@@ -186,6 +229,7 @@ int identity_from_json(const json_t *obj, void *data_struct)
 
 DECLARE_CONFIGURATION(identity, sizeof(identity_t), identity_to_json, identity_from_json);
 
+/* Frama-C: skipped — [serialization] protobuf serialization */
 int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core__Protobuf__Identity__Identity *proto)
 {
     AutonomousTrust__Core__Protobuf__Identity__Identity tmp = AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__IDENTITY__INIT;
@@ -194,6 +238,8 @@ int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core_
     proto->uuid.len = sizeof(uuid_t);
     proto->address = identity->address;
     proto->fullname = identity->fullname;
+    proto->nickname = identity->nickname;
+    proto->petname = identity->petname;
 
     proto->signature = malloc(sizeof(AutonomousTrust__Core__Protobuf__Identity__Signature));
     AutonomousTrust__Core__Protobuf__Identity__Signature tmp_s = AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__SIGNATURE__INIT;
@@ -220,11 +266,16 @@ int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core_
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] protobuf deserialization */
 int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity *proto, public_identity_t *identity)
 {
     memcpy(&identity->uuid, proto->uuid.data, sizeof(uuid_t));
     strncpy(identity->address, proto->address, ADDR_LEN);
     strncpy(identity->fullname, proto->fullname, NAME_LEN);
+    if (proto->nickname != NULL)
+        strncpy(identity->nickname, proto->nickname, NAME_LEN);
+    if (proto->petname != NULL)
+        strncpy(identity->petname, proto->petname, NAME_LEN);
     public_signature_init(&identity->signature, proto->signature->hex_seed.data);
     public_encryptor_init(&identity->encryptor, proto->encryptor->hex_seed.data);
 
@@ -243,6 +294,8 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
     if (proto->zta_issuer != NULL)
         snprintf(identity->zta_issuer, sizeof(identity->zta_issuer), "%s", proto->zta_issuer);
     if (proto->zta_credential.len > 0 && proto->zta_credential.data != NULL) {
+        if (proto->zta_credential.len > ZTA_CRED_MAX)
+            return EXCEPTION(EINVAL);
         identity->zta_credential = malloc(proto->zta_credential.len);
         if (identity->zta_credential) {
             memcpy(identity->zta_credential, proto->zta_credential.data, proto->zta_credential.len);
@@ -284,6 +337,12 @@ int proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer)
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] identity lifecycle + serialization: smrt_ptr allocation
+ * postconditions, JSON/protobuf encode/decode, libsodium decrypt preconditions
+ * identity_free: 4x sodium_memzero accumulates state; smrt_deref precondition times out
+ * (9 warnings)
+ */
 void identity_free(identity_t *ident)
 {
     if (ident == NULL)

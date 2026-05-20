@@ -21,15 +21,17 @@
 #include <errno.h>
 
 #include "task_priv.h"
+#include "negotiation/negotiation.h"
 #include "negotiation/task.pb-c.h"
 
 typedef void * (*pthread_function_t)(void *);
 
+/* Frama-C: skipped — [solver-timeout] complex lifecycle with logging/process/negotiation preconditions */
 int task_run(task_t *task)
 {
     capability_t *capability = find_capability(task->capability.name);
     if (capability == NULL)
-        return -1; // FIXME specific error
+        return EXCEPTION(ENEG_NOCAP);
 
     thread_args_t *args = smrt_create(sizeof(thread_args_t));
     if (args == NULL)
@@ -74,6 +76,7 @@ int task_to_proto(task_t *msg, size_t size, void **data_ptr, size_t *data_len_pt
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] protobuf deserialization */
 int proto_to_task(uint8_t *data, size_t len, task_t *task)
 {
     AutonomousTrust__Core__Protobuf__Negotiation__Task *proto =

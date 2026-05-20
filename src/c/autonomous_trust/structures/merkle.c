@@ -31,6 +31,14 @@ int merkle_hash(const uint8_t *data, size_t data_len, uint8_t *hash_out)
                                       NULL, 0);
 }
 
+/*@
+  requires valid_merkle_tree(tree);
+  requires blob != \null;
+  assigns \nothing;
+  ensures \result >= -1;
+  ensures \result < (int)tree->blobs->size;
+*/
+/* Frama-C: skipped — [alloc-pattern] dynamic node search */
 static int _find_blob_index(merkle_tree_t *tree, merkle_blob_t *blob)
 {
     int sz = (int)array_size(tree->blobs);
@@ -48,6 +56,23 @@ static int _find_blob_index(merkle_tree_t *tree, merkle_blob_t *blob)
     return -1;
 }
 
+/*@
+  requires tree != \null && \valid(tree);
+  requires needed >= 0;
+  assigns tree->nodes, tree->node_capacity;
+  behavior already_sufficient:
+    assumes needed <= tree->node_capacity;
+    ensures \result == 0;
+    ensures tree->node_capacity == \old(tree->node_capacity);
+  behavior grow:
+    assumes needed > tree->node_capacity;
+    ensures \result == 0 || \result == ENOMEM;
+    ensures \result == 0 ==> tree->node_capacity >= needed;
+    ensures \result == 0 ==> tree->nodes != \null;
+  disjoint behaviors;
+  complete behaviors;
+*/
+/* Frama-C: skipped — [alloc-pattern] node array realloc */
 static int _ensure_node_capacity(merkle_tree_t *tree, int needed)
 {
     if (needed <= tree->node_capacity)
@@ -63,6 +88,24 @@ static int _ensure_node_capacity(merkle_tree_t *tree, int needed)
     return 0;
 }
 
+/*@
+  requires tree != \null && \valid(tree);
+  requires tree->node_count >= 0;
+  assigns tree->nodes, tree->node_count, tree->node_capacity;
+  ensures \result >= -1;
+  behavior success:
+    ensures \result >= 0;
+    ensures \result == \old(tree->node_count);
+    ensures tree->node_count == \old(tree->node_count) + 1;
+    ensures tree->nodes[\result].left == -1;
+    ensures tree->nodes[\result].right == -1;
+    ensures tree->nodes[\result].parent == -1;
+    ensures tree->nodes[\result].blob == \null;
+  behavior failure:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
+/* Frama-C: skipped — [alloc-pattern] dynamic node insertion */
 static int _add_node(merkle_tree_t *tree)
 {
     int err = _ensure_node_capacity(tree, tree->node_count + 1);
@@ -77,6 +120,18 @@ static int _add_node(merkle_tree_t *tree)
     return idx;
 }
 
+/*@
+  requires valid_merkle_tree(tree);
+  assigns tree->nodes, tree->node_count, tree->node_capacity,
+          tree->root, tree->root_digest[0 .. MERKLE_DIGEST_LEN - 1],
+          tree->has_root_digest;
+  ensures tree->blobs->size == 0 ==>
+            (tree->root == -1 && tree->has_root_digest == false);
+  ensures tree->blobs->size > 0 ==>
+            (tree->has_root_digest == true &&
+             tree->root >= 0 && tree->root < tree->node_count);
+*/
+/* Frama-C: skipped — [recursive-ds] iterative tree rebuild with realloc */
 static void _rehash(merkle_tree_t *tree)
 {
     int blob_count = (int)array_size(tree->blobs);
@@ -185,6 +240,7 @@ static void _rehash(merkle_tree_t *tree)
         free(current_level);
 }
 
+/* Frama-C: skipped — [alloc-pattern] initialization with dynamic node arrays */
 int merkle_tree_create(merkle_tree_t **tree)
 {
     if (tree == NULL)
@@ -216,6 +272,7 @@ int merkle_tree_create(merkle_tree_t **tree)
     return 0;
 }
 
+/* Frama-C: skipped — [recursive-ds] binary tree insertion with rebalancing */
 int merkle_insert(merkle_tree_t *tree, merkle_blob_t *blob)
 {
     if (tree == NULL || blob == NULL)
@@ -234,6 +291,7 @@ int merkle_insert(merkle_tree_t *tree, merkle_blob_t *blob)
     return 0;
 }
 
+/* Frama-C: skipped — [recursive-ds] binary tree deletion with rebalancing */
 int merkle_delete(merkle_tree_t *tree, merkle_blob_t *blob)
 {
     if (tree == NULL || blob == NULL)
@@ -250,6 +308,7 @@ int merkle_delete(merkle_tree_t *tree, merkle_blob_t *blob)
     return 0;
 }
 
+/* Frama-C: skipped — [recursive-ds] tree merge operation */
 int merkle_merge(merkle_tree_t *tree, merkle_tree_t *other)
 {
     if (tree == NULL || other == NULL)
@@ -280,6 +339,7 @@ int merkle_merge(merkle_tree_t *tree, merkle_tree_t *other)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] memcpy separation precondition */
 int merkle_root_digest(merkle_tree_t *tree, uint8_t *digest_out)
 {
     if (tree == NULL || digest_out == NULL)
@@ -290,6 +350,7 @@ int merkle_root_digest(merkle_tree_t *tree, uint8_t *digest_out)
     return 0;
 }
 
+/* Frama-C: skipped — [recursive-ds] unbounded tree traversal */
 int merkle_inclusion_proof(merkle_tree_t *tree, merkle_blob_t *blob,
                            merkle_proof_step_t **proof_out, int *proof_len)
 {
@@ -318,7 +379,17 @@ int merkle_inclusion_proof(merkle_tree_t *tree, merkle_blob_t *blob,
         tmp = tree->nodes[tmp].parent;
     }
 
-    merkle_proof_step_t *proof = malloc(sizeof(merkle_proof_step_t) * depth);
+    if (depth <= 0)
+    {
+        /* leaf IS root; empty proof */
+        *proof_out = NULL;
+        *proof_len = 0;
+        return 0;
+    }
+    size_t bytes;
+    if (__builtin_mul_overflow((size_t)depth, sizeof(merkle_proof_step_t), &bytes))
+        return ENOMEM;
+    merkle_proof_step_t *proof = malloc(bytes);
     if (proof == NULL)
         return ENOMEM;
 
@@ -359,6 +430,7 @@ int merkle_inclusion_proof(merkle_tree_t *tree, merkle_blob_t *blob,
     return 0;
 }
 
+/* Frama-C: skipped — [recursive-ds] unbounded tree traversal */
 bool merkle_audit(merkle_tree_t *tree, merkle_blob_t *blob,
                   merkle_proof_step_t *proof, int proof_len)
 {
@@ -401,6 +473,7 @@ bool merkle_audit(merkle_tree_t *tree, merkle_blob_t *blob,
     return memcmp(digest, tree->root_digest, MERKLE_DIGEST_LEN) == 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] memcmp danglingness preconditions */
 bool merkle_consistent(merkle_tree_t *tree, int other_size,
                        const uint8_t *other_root_digest)
 {

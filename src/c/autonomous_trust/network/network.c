@@ -26,9 +26,10 @@
 #include "config/configuration.h"
 #include "utilities/util.h"
 
-// FIXME protobuf between hosts
+// TODO: Add protobuf serialization for inter-host network messages
 
 
+/* Frama-C: skipped — [inet] inet_pton with network byte order */
 int cidr_split(char * cidr, char *addr, char *mask)
 {
     if (addr == NULL)
@@ -40,17 +41,20 @@ int cidr_split(char * cidr, char *addr, char *mask)
     char *a = strtok_r(cidr_dup, "/", &saveptr);
     if (a == NULL)
         return EXCEPTION(EINVAL);  // empty string
-    strncpy(addr, a, IPV4_ADDR_LEN);
+    /* Callers pass addr[IPV4_ADDR_LEN] (16 bytes) and mask[3]; use snprintf
+     * to guarantee NUL termination and deterministic truncation. */
+    snprintf(addr, IPV4_ADDR_LEN, "%s", a);
     if (mask != NULL) {
         char *m = strtok_r(NULL, "/", &saveptr);
         if (m != NULL)
-            strncpy(mask, m, 3);
+            snprintf(mask, 3, "%s", m);
         // missing slash is acceptable
     }
     free(cidr_dup);
     return 0;
 }
 
+/* Frama-C: skipped — [inet] inet_pton IPv4 conversion */
 int cidr4_to_ip4_binary(char *cidr, uint32_t *ip, uint8_t *mask)
 {
     char addr[IPV4_ADDR_LEN] = {0};
@@ -63,10 +67,11 @@ int cidr4_to_ip4_binary(char *cidr, uint32_t *ip, uint8_t *mask)
     *ip = addr_struct.s_addr;
     *mask = atoi(mask_str);
     if (*mask > 32)
-        return EXCEPTION(EINVAL);  // FIXME custom?
+        return EXCEPTION(ENET_INVALID_MASK);
     return 0;
 }
 
+/* Frama-C: skipped — [inet] inet_ntop IPv4 conversion */
 int ip4_binary_to_addr(uint32_t ip, char *addr)
 {
     struct in_addr addr_struct = {0};
@@ -76,6 +81,7 @@ int ip4_binary_to_addr(uint32_t ip, char *addr)
     return 0;
 }
 
+/* Frama-C: skipped — [inet] bitwise CIDR mask calculation */
 int cidr4_to_broadcast(char *cidr, char *bcast_addr)
 {
     uint32_t ip = 0;
@@ -89,6 +95,7 @@ int cidr4_to_broadcast(char *cidr, char *bcast_addr)
     return ip4_binary_to_addr(bcast, bcast_addr);
 }
 
+/* Frama-C: skipped — [inet] inet_pton IPv6 conversion */
 int cidr6_to_ip6_binary(char *cidr, uint128_t *ip, uint8_t *mask)
 {
     char addr[IPV6_ADDR_LEN] = {0};
@@ -101,10 +108,11 @@ int cidr6_to_ip6_binary(char *cidr, uint128_t *ip, uint8_t *mask)
     memcpy(ip, &addr_struct.s6_addr, sizeof(uint128_t));  // keep in host order (internal only)
     *mask = atoi(mask_str);
     if (*mask > 128)
-        return EXCEPTION(EINVAL);  // FIXME custom?
+        return EXCEPTION(ENET_INVALID_MASK);
     return 0;
 }
 
+/* Frama-C: skipped — [inet] inet_ntop IPv6 conversion */
 int ip6_binary_to_addr(uint128_t ip, char *addr)
 {
     struct in6_addr addr_struct;
@@ -114,6 +122,7 @@ int ip6_binary_to_addr(uint128_t ip, char *addr)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON serialization */
 int network_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const network_config_t *net = data_struct;
@@ -135,6 +144,7 @@ int network_to_json(const void *data_struct, json_t **obj_ptr)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON deserialization */
 int network_from_json(const json_t *obj, void *data_struct)
 {
     network_config_t *net = data_struct;

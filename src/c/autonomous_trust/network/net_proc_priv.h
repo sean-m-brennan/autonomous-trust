@@ -17,7 +17,16 @@
 #ifndef NET_PROC_PRIV_H
 #define NET_PROC_PRIV_H
 
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <uuid/uuid.h>
+
 #include "processes/processes.h"
+#include "network/net_transport.h"
+#include "identity/identity.h"
+#include "identity/identity_priv.h"
+#include "utilities/logger.h"
 
 int network_udp_ip4_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
@@ -26,5 +35,97 @@ int network_udp_ip6_run(process_t *proc, directory_t *queues, queue_id_t signal,
 int network_tcp_ip4_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
 int network_tcp_ip6_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
+
+/* Shared runner selected by transport name; used by per-transport process
+ * declarations (including the dtn_bp entry when AT_NET_DTN is enabled). */
+int network_run_by_name(const char *impl_name, process_t *proc,
+                        directory_t *queues, queue_id_t signal,
+                        logger_t *logger);
+
+/**
+ * @brief State shared by a network process's three receiver threads.
+ *
+ * Exposed here (rather than being a private struct in net_proc.c) so
+ * tests can drive the inbound handlers directly without bringing up
+ * real sockets + daemonize()'d processes. See test/net_proc_relay_test.c.
+ */
+typedef struct {
+    const net_transport_t *transport;
+    net_transport_ctx_t   *ctx;
+    process_t             *proc;
+    directory_t           *queues;
+    logger_t              *logger;
+    network_config_t      *net_cfg;
+    identity_t            *myself;
+    bool                  *stop;
+
+    /** Optional pointer to the transport's extra-config struct (e.g.
+     *  hybrid_config_t for hybrid_net). NULL for transports that don't
+     *  use one, or when the matching config entry is absent. Consumed by
+     *  the AT_NET_GROUP_FORWARD path in handle_inbound_group to reach
+     *  hybrid_config_t::group_routes. */
+    const void            *transport_cfg;
+} net_thread_ctx_t;
+
+/**
+ * @brief Process one inbound PEER-channel frame.
+ *
+ * Extracted from peer_receiver_thread's loop body so integration tests
+ * can drive the handler with crafted bytes. @p buf / @p nbytes must
+ * already have been returned by transport->recv; @p from_addr is the
+ * sender's transport address as that transport reports it (IP for
+ * UDP/TCP, EID for DTN, gateway-IP for a forwarded frame).
+ *
+ * Consumes @p buf: the handler does NOT free it; the caller retains
+ * ownership (matching the thread-loop contract where the thread frees
+ * after the handler returns).
+ */
+void handle_inbound_peer(net_thread_ctx_t *ctx,
+                         uint8_t *buf, size_t nbytes,
+                         const char *from_addr);
+
+/** @brief Process one inbound BROADCAST-channel frame. See @ref handle_inbound_peer. */
+void handle_inbound_broadcast(net_thread_ctx_t *ctx,
+                              uint8_t *buf, size_t nbytes,
+                              const char *from_addr);
+
+/** @brief Process one inbound GROUP-channel frame. See @ref handle_inbound_peer. */
+void handle_inbound_group(net_thread_ctx_t *ctx,
+                          uint8_t *buf, size_t nbytes,
+                          const char *from_addr);
+
+/* ---- Test-only hooks for the deferred-message retry path ----
+ * These let tests observe and reset the module-local `deferred_messages`
+ * ring without exposing the struct itself. They are safe to call in
+ * production but have no legitimate non-test use. */
+
+/** @brief Number of entries currently pending retry. */
+size_t net_proc_test_deferred_count(void);
+
+/** @brief Reset the deferred ring to empty. Tests call this before
+ *         exercising defer behavior so they don't inherit sibling
+ *         tests' residue. */
+void net_proc_test_reset_deferred(void);
+
+/** @brief True iff the deferred entry at @p idx would be retried for
+ *         @p new_peer under the current match rules (envelope src_uuid
+ *         if present, else from_addr). Returns false if @p idx is out
+ *         of range. */
+bool net_proc_test_deferred_matches_peer(size_t idx,
+                                         const public_identity_t *new_peer);
+
+/* ---- Test-only: route_to_process capture ----
+ * Tests for AT_DISCOVERY_CROSS_CLUSTER observe whether a forwarded
+ * broadcast preserved the wire payload's self-reported from_whom.address
+ * or clobbered it with the gateway's transport address. */
+
+/** @brief Clear the capture buffer. Call before exercising a handler so
+ *         stale residue from a prior test doesn't confuse assertions. */
+void net_proc_test_reset_last_routed_from_addr(void);
+
+/** @brief Copy the most recent address observed by route_to_process into
+ *         @p out (NUL-terminated, truncated to @p outlen). Empty string
+ *         if no call has happened since the last reset. */
+void net_proc_test_get_last_routed_from_addr(char *out, size_t outlen);
 
 #endif  // NET_PROC_PRIV_H

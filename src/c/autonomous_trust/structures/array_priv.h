@@ -17,25 +17,15 @@
 #ifndef ARRAY_PRIV_H
 #define ARRAY_PRIV_H
 
-#include <stddef.h>
-#include <stdbool.h>
-
 #include <jansson.h>
 
 #include "array.h"
 #include "data_priv.h"
 #include "structures/data.pb-c.h"
 
-struct array_s
-{
-    smrt_ptr_t;
-    size_t size;
-    data_t **array;
-};
+int array_sync_out(array_t *array, AutonomousTrust__Core__Protobuf__Structures__Data ***parr_ptr, size_t *n);
 
-int array_sync_out(array_t *array, AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t *n);
-
-void array_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data **parr);
+void array_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t n);
 
 int array_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t n, array_t *array);
 

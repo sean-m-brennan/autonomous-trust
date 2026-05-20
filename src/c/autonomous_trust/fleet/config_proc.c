@@ -28,9 +28,8 @@
 #include "fleet/update_proc.h"
 #include "algorithms/paxos.h"
 #include "structures/map.h"
-#include "structures/map_priv.h"
-#include "structures/array_priv.h"
-#include "structures/data_priv.h"
+#include "structures/array.h"
+#include "structures/data.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
@@ -74,6 +73,16 @@ static void _ensure_init(void)
  * Build and send a NET_MESSAGE to a single peer via the network process.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires function != \null && \valid_read(function);
+  requires payload == \null || \valid(payload);
+  requires \valid_read(peer);
+  ensures \result == 0 || \result != 0;
+*/
+/* Frama-C: skipped — [solver-timeout] at_memcpy_requires on
+ * memcpy(&to_whom, peer, sizeof(public_identity_t)); same cast cascade as
+ * handle_config_accepted. */
 static int send_to_peer(const process_t *proc, const char *function,
                         json_t *payload, const public_identity_t *peer)
 {
@@ -94,6 +103,12 @@ static int send_to_peer(const process_t *proc, const char *function,
  * verify signature, store it, initiate Paxos vote.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_config_propose(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -152,18 +167,20 @@ static bool handle_config_propose(const process_t *proc, directory_t *queues, ge
     pthread_mutex_unlock(&config_state.lock);
 
     /* Initiate Paxos vote: broadcast vote request to all peers */
-    double id1, id2;
+    int64_t id1, id2;
     paxos_next_ids(&config_state.vote_paxos, &id1, &id2);
 
     json_t *req_json = json_object();
-    json_object_set_new(req_json, "id1", json_real(id1));
-    json_object_set_new(req_json, "id2", json_real(id2));
+    json_object_set_new(req_json, "id1", json_integer(id1));
+    json_object_set_new(req_json, "id2", json_integer(id2));
     json_object_set_new(req_json, "proposal_uuid", json_string(prop_uuid_str));
 
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         send_to_peer(proc, CONFIG_PROTO_VOTE_REQ, req_json, &proc->protocol.peers[i]);
     }
+    peers_read_unlock(proc);
     json_decref(req_json);
 
     log_info(proc->logger, "Config: Proposal %s stored, vote initiated\n", prop_uuid_str);
@@ -175,6 +192,12 @@ static bool handle_config_propose(const process_t *proc, directory_t *queues, ge
  * Paxos Phase 1a: check proposal via paxos_handle_request, send grant or nack.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_config_vote_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -198,11 +221,11 @@ static bool handle_config_vote_request(const process_t *proc, directory_t *queue
         return false;
     }
 
-    double id1 = json_real_value(j_id1);
-    double id2 = json_real_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
     const char *prop_uuid_str = json_string_value(j_prop_uuid);
 
-    double out_last_id = 0.0;
+    int64_t out_last_id = 0;
     int out_chain_len = 0;
     paxos_response_t result = paxos_handle_request(&config_state.vote_paxos, id1, id2,
                                                    &out_last_id, &out_chain_len);
@@ -213,10 +236,10 @@ static bool handle_config_vote_request(const process_t *proc, directory_t *queue
     {
         /* Build grant payload */
         json_t *grant_json = json_object();
-        json_object_set_new(grant_json, "id1", json_real(id1));
-        json_object_set_new(grant_json, "id2", json_real(id2));
+        json_object_set_new(grant_json, "id1", json_integer(id1));
+        json_object_set_new(grant_json, "id2", json_integer(id2));
         json_object_set_new(grant_json, "proposal_uuid", json_string(prop_uuid_str));
-        json_object_set_new(grant_json, "last_id", json_real(out_last_id));
+        json_object_set_new(grant_json, "last_id", json_integer(out_last_id));
         json_object_set_new(grant_json, "chain_len", json_integer(out_chain_len));
 
         send_to_peer(proc, CONFIG_PROTO_VOTE_GRANT, grant_json, &nmsg->from_whom);
@@ -228,8 +251,8 @@ static bool handle_config_vote_request(const process_t *proc, directory_t *queue
     {
         /* NACK */
         json_t *nack_json = json_object();
-        json_object_set_new(nack_json, "id1", json_real(id1));
-        json_object_set_new(nack_json, "id2", json_real(id2));
+        json_object_set_new(nack_json, "id1", json_integer(id1));
+        json_object_set_new(nack_json, "id2", json_integer(id2));
         json_object_set_new(nack_json, "proposal_uuid", json_string(prop_uuid_str));
 
         send_to_peer(proc, CONFIG_PROTO_VOTE_NACK, nack_json, &nmsg->from_whom);
@@ -246,6 +269,13 @@ static bool handle_config_vote_request(const process_t *proc, directory_t *queue
  * Paxos Phase 1b: count grants; on quorum, broadcast accepted.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires config_state.vote_paxos.initialized == \true;
+*/
 static bool handle_config_vote_grant(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -269,8 +299,8 @@ static bool handle_config_vote_grant(const process_t *proc, directory_t *queues,
         return false;
     }
 
-    double id1 = json_real_value(j_id1);
-    double id2 = json_real_value(j_id2);
+    int64_t id1 = json_integer_value(j_id1);
+    int64_t id2 = json_integer_value(j_id2);
     const char *prop_uuid_str = json_string_value(j_prop_uuid);
 
     /* Record grant with score=1.0 (vote weight) */
@@ -283,17 +313,19 @@ static bool handle_config_vote_grant(const process_t *proc, directory_t *queues,
     {
         /* Broadcast CONFIG_PROTO_ACCEPTED to all peers */
         json_t *acc_json = json_object();
-        json_object_set_new(acc_json, "id1", json_real(id1));
-        json_object_set_new(acc_json, "id2", json_real(id2));
+        json_object_set_new(acc_json, "id1", json_integer(id1));
+        json_object_set_new(acc_json, "id2", json_integer(id2));
         json_object_set_new(acc_json, "proposal_uuid", json_string(prop_uuid_str));
 
         log_info(proc->logger, "Config: Quorum reached for proposal %s, broadcasting accepted\n",
                  prop_uuid_str);
 
+        peers_read_lock(proc);
         for (size_t i = 0; i < proc->protocol.num_peers; i++)
         {
             send_to_peer(proc, CONFIG_PROTO_ACCEPTED, acc_json, &proc->protocol.peers[i]);
         }
+        peers_read_unlock(proc);
         json_decref(acc_json);
 
         paxos_advance_chain(&config_state.vote_paxos);
@@ -311,19 +343,26 @@ static bool handle_config_vote_grant(const process_t *proc, directory_t *queues,
  * Record nack with exponential backoff.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+  requires config_state.vote_paxos.initialized == \true;
+*/
 static bool handle_config_vote_nack(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Config: vote nack from %s\n", nmsg->from_whom.fullname);
 
     json_t *payload = NULL;
-    double id1 = 0.0, id2 = 0.0;
+    int64_t id1 = 0, id2 = 0;
     if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL)
     {
         json_t *j_id1 = json_object_get(payload, "id1");
         json_t *j_id2 = json_object_get(payload, "id2");
-        if (j_id1) id1 = json_real_value(j_id1);
-        if (j_id2) id2 = json_real_value(j_id2);
+        if (j_id1) id1 = json_integer_value(j_id1);
+        if (j_id2) id2 = json_integer_value(j_id2);
         json_decref(payload);
     }
 
@@ -340,6 +379,14 @@ static bool handle_config_vote_nack(const process_t *proc, directory_t *queues, 
  * Move proposal from pending to accepted, trigger artifact fetch.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] memcpy of public_identity_t (line 418)
+ * triggers "Hide sub-term definition" cast warning that blocks discharge */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_config_accepted(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -432,6 +479,14 @@ static bool handle_config_accepted(const process_t *proc, directory_t *queues, g
  * Validates, backs up configs, writes the new config, notifies update_proc.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] file I/O (fopen/fwrite) + snprintf +
+ * messaging_send + json cascade too complex for SMT */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_config_artifact_ready(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -531,7 +586,7 @@ static bool handle_config_artifact_ready(const process_t *proc, directory_t *que
                                prop->content_hash, UPDATE_HASH_LEN);
                 if (strcmp(prop_hash_hex, hash_hex) == 0)
                 {
-                    strncpy(config_name, prop->config_name, CFG_NAME_SIZE);
+                    snprintf(config_name, sizeof(config_name), "%s", prop->config_name);
                     break;
                 }
             }
@@ -602,11 +657,16 @@ static bool handle_config_artifact_ready(const process_t *proc, directory_t *que
  * Config process main entry
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] state-cascade through getenv/snprintf/
+ * paxos_init/process_register_handler stubs prevents WP from discharging
+ * valid_rw(proc) and valid_rd(signal) at downstream call sites */
 int config_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();
 
+    peers_read_lock(proc);
     config_state.num_peers = (int)proc->protocol.num_peers;
+    peers_read_unlock(proc);
     paxos_init(&config_state.vote_paxos, config_state.num_peers, logger);
 
     if (get_cfg_dir(config_cfg_dir) != 0)

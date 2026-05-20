@@ -24,7 +24,7 @@
 
 void public_signature_init(signature_t *sig, const unsigned char *hex_seed)
 {
-    memset(sig->private, 0, sizeof(sig->private));
+    sodium_memzero(sig->private, sizeof(sig->private));
     unhexlify(hex_seed, crypto_sign_PUBLICKEYBYTES * 2, (unsigned char *)sig->public);
     hexlify(sig->public, crypto_sign_PUBLICKEYBYTES, (unsigned char *)sig->public_hex);
 }
@@ -38,6 +38,7 @@ void signature_init(signature_t *sig, const unsigned char *hex_seed)
     hexlify(sig->public, crypto_sign_PUBLICKEYBYTES, (unsigned char *)sig->public_hex);
 }
 
+/* Frama-C: skipped — [solver-timeout] libsodium stub preconditions */
 unsigned char *signature_publish(const signature_t *sig)
 {
     unsigned char *hex = malloc(crypto_sign_PUBLICKEYBYTES * 2);
@@ -50,6 +51,7 @@ unsigned char *signature_publish(const signature_t *sig)
     return hex;
 }
 
+/* Frama-C: skipped — [solver-timeout] libsodium stub preconditions */
 unsigned char *signature_generate()
 {
     unsigned char key[crypto_sign_SEEDBYTES];

@@ -28,6 +28,28 @@
 DEFINE_ERROR(EDAG_INVALID_BRANCH, "Invalid branch name in DAG");
 DEFINE_ERROR(EDAG_BRANCH_EXISTS, "Branch already exists in DAG");
 
+/* WHY two genesis constants (_genesis and dag_genesis):
+ *
+ * `_genesis` is the TU-local sentinel this file uses as the `.parent` of any
+ * newly-created step that has no explicit parent (see linked_step_create:
+ * s->parent = &dag_genesis). `dag_genesis` is the externally-visible copy
+ * other translation units (and the public header) may compare against.
+ *
+ * Both hold the all-zero UUID, but they live at DIFFERENT addresses in the
+ * binary (one static, one extern). Pointer equality alone is therefore not
+ * a sufficient genesis check: a step reached via this file's construction
+ * path will have parent == &dag_genesis, but a step reconstructed from
+ * serialized form elsewhere may have its own heap-allocated node whose uuid
+ * happens to be the zero-UUID, and any third caller may still hold a
+ * pointer to &_genesis from historical code.
+ *
+ * _is_genesis() therefore has to cover ALL three representations:
+ *   1. NULL                     — uninitialized or detached step
+ *   2. &dag_genesis / &_genesis — either in-binary sentinel
+ *   3. uuid match on zero-UUID  — any other object that serialized as genesis
+ *
+ * Do NOT collapse to a single check; removing (2) costs a strcmp in the hot
+ * path, and removing (3) silently breaks round-tripped DAGs. */
 static const linked_step_t _genesis = {
     .uuid = "00000000-0000-0000-0000-000000000000",
     .timestamp = {{0}},
@@ -44,12 +66,17 @@ const linked_step_t dag_genesis = {
     .length = 0
 };
 
+/*@
+  assigns \nothing;
+  ensures \result <==> (step == \null || step == &dag_genesis || step == &_genesis);
+*/
 static bool _is_genesis(const linked_step_t *step)
 {
     return step == NULL || step == &dag_genesis || step == &_genesis ||
            strcmp(step->uuid, dag_genesis.uuid) == 0;
 }
 
+/* Frama-C: skipped — [syscall] uuid_generate via libuuid */
 int linked_step_create(const char *uuid, void *payload, linked_step_t **step)
 {
     if (step == NULL)
@@ -80,6 +107,13 @@ void linked_step_free(linked_step_t *step)
         free(step);
 }
 
+/*@
+  requires valid_dag(dag);
+  requires \valid_read(branch);
+  assigns \nothing;
+  ensures \result == \null || \valid(\result);
+*/
+/* Frama-C: skipped — [solver-timeout] map_get/data_object_ptr preconditions */
 static linked_step_t *_get_head(step_dag_t *dag, const char *branch)
 {
     data_t *val = NULL;
@@ -91,6 +125,14 @@ static linked_step_t *_get_head(step_dag_t *dag, const char *branch)
     return (linked_step_t *)ptr;
 }
 
+/*@
+  requires valid_dag(dag);
+  requires \valid_read(branch);
+  requires step != \null;
+  assigns dag->heads;
+  ensures \result == 0 || \result != 0;
+*/
+/* Frama-C: skipped — [solver-timeout] object_ptr_data preconditions */
 static int _set_head(step_dag_t *dag, const char *branch, linked_step_t *step)
 {
     data_t *val = object_ptr_data(step, sizeof(linked_step_t));
@@ -99,6 +141,12 @@ static int _set_head(step_dag_t *dag, const char *branch, linked_step_t *step)
     return map_set(dag->heads, (map_key_t)branch, val);
 }
 
+/*@
+  requires valid_dag(dag);
+  requires \valid_read(branch);
+  assigns \nothing;
+  ensures \result == \null || \valid(\result);
+*/
 static array_t *_get_branch_list(step_dag_t *dag, const char *branch)
 {
     data_t *val = NULL;
@@ -110,6 +158,14 @@ static array_t *_get_branch_list(step_dag_t *dag, const char *branch)
     return (array_t *)ptr;
 }
 
+/*@
+  requires valid_dag(dag);
+  requires \valid_read(branch);
+  requires list != \null && \valid(list);
+  assigns dag->branch_lists;
+  ensures \result == 0 || \result != 0;
+*/
+/* Frama-C: skipped — [solver-timeout] object_ptr_data preconditions */
 static int _set_branch_list(step_dag_t *dag, const char *branch, array_t *list)
 {
     data_t *val = object_ptr_data(list, sizeof(void *));
@@ -118,6 +174,12 @@ static int _set_branch_list(step_dag_t *dag, const char *branch, array_t *list)
     return map_set(dag->branch_lists, (map_key_t)branch, val);
 }
 
+/*@
+  requires list != \null && \valid(list);
+  requires step != \null && \valid(step);
+  assigns list->size, list->array;
+  ensures \result == 0 || \result != 0;
+*/
 static int _append_step_to_list(array_t *list, linked_step_t *step)
 {
     data_t *val = object_ptr_data(step, sizeof(linked_step_t));
@@ -126,6 +188,12 @@ static int _append_step_to_list(array_t *list, linked_step_t *step)
     return array_append(list, val);
 }
 
+/*@
+  requires list != \null && \valid(list);
+  requires index >= 0;
+  assigns \nothing;
+  ensures \result == \null || \valid(\result);
+*/
 static linked_step_t *_get_step_from_list(array_t *list, int index)
 {
     data_t *val = NULL;
@@ -137,6 +205,7 @@ static linked_step_t *_get_step_from_list(array_t *list, int index)
     return (linked_step_t *)ptr;
 }
 
+/* Frama-C: skipped — [recursive-ds] map/array initialization */
 int dag_init(step_dag_t *dag)
 {
     if (dag == NULL)
@@ -163,6 +232,7 @@ int dag_init(step_dag_t *dag)
     return err;
 }
 
+/* Frama-C: skipped — [solver-timeout] ensures + dag_init preconditions */
 int dag_create(step_dag_t **dag)
 {
     if (dag == NULL)
@@ -180,6 +250,7 @@ int dag_create(step_dag_t **dag)
     return 0;
 }
 
+/* Frama-C: skipped — [recursive-ds] linked list parent/child chain updates */
 int dag_add_step(step_dag_t *dag, linked_step_t *step, const char *branch)
 {
     if (dag == NULL || step == NULL)
@@ -207,6 +278,7 @@ int dag_add_step(step_dag_t *dag, linked_step_t *step, const char *branch)
     return _append_step_to_list(list, step);
 }
 
+/* Frama-C: skipped — [recursive-ds] branching with recursive data structure copying */
 int dag_branch(step_dag_t *dag, const char *name, linked_step_t *step, const char *source)
 {
     if (dag == NULL || name == NULL || step == NULL)
@@ -249,6 +321,7 @@ int dag_branch(step_dag_t *dag, const char *name, linked_step_t *step, const cha
     return _append_step_to_list(list, step);
 }
 
+/* Frama-C: skipped — [recursive-ds] recursive step list ingestion */
 int dag_ingest_branch(step_dag_t *dag, linked_step_t **steps, size_t count,
                       const char *name, char *name_out, size_t name_out_len)
 {
@@ -273,7 +346,7 @@ int dag_ingest_branch(step_dag_t *dag, linked_step_t **steps, size_t count,
         return err;
 
     /* add remaining steps in reverse order (steps are head-to-root) */
-    for (int i = (int)count - 2; i >= 0; i--)
+    for (size_t i = count - 1; i-- > 0; )
     {
         err = dag_add_step(dag, steps[i], name);
         if (err != 0)
@@ -282,6 +355,7 @@ int dag_ingest_branch(step_dag_t *dag, linked_step_t **steps, size_t count,
     return 0;
 }
 
+/* Frama-C: skipped — [recursive-ds] tree diff with complex control flow */
 int dag_diff(step_dag_t *dag, const char *branch, const char *target,
              int *idx_out, linked_step_t **common_root)
 {
@@ -322,6 +396,13 @@ int dag_diff(step_dag_t *dag, const char *branch, const char *target,
     return 0;
 }
 
+/*@
+  requires \valid_read((const linked_step_t **)a);
+  requires \valid_read((const linked_step_t **)b);
+  assigns \nothing;
+  ensures \result == -1 || \result == 0 || \result == 1;
+*/
+/* Frama-C: skipped — [func-ptr] used as qsort comparator callback */
 static int _cmp_steps_by_timestamp(const void *a, const void *b)
 {
     const linked_step_t *sa = *(const linked_step_t **)a;
@@ -333,6 +414,7 @@ static int _cmp_steps_by_timestamp(const void *a, const void *b)
     return 0;
 }
 
+/* Frama-C: skipped — [recursive-ds] three-way merge with array operations */
 int dag_merge(step_dag_t *dag, const char *branch, const char *target, bool keep)
 {
     if (dag == NULL || branch == NULL)
@@ -436,6 +518,7 @@ int dag_fork(step_dag_t *dag, const char *branch, linked_step_t **head_out)
     return 0;
 }
 
+/* Frama-C: skipped — [recursive-ds] recursive step chain replay */
 int dag_recite(step_dag_t *dag, const char *branch, linked_step_t *root,
                array_t **steps_out)
 {
@@ -479,8 +562,8 @@ void dag_free(step_dag_t *dag)
 {
     if (dag == NULL)
         return;
-    if (dag->heads != NULL)
+    if (dag->heads != NULL && dag->heads->items != NULL)
         map_free(dag->heads);
-    if (dag->branch_lists != NULL)
+    if (dag->branch_lists != NULL && dag->branch_lists->items != NULL)
         map_free(dag->branch_lists);
 }

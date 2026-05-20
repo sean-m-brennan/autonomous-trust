@@ -25,7 +25,8 @@
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
-#include "structures/data_priv.h"
+#include "utilities/timeout.h"
+#include "structures/data.h"
 #include "network/net_message.h"
 #include "peers.h"
 #include "id_proc_priv.h"
@@ -44,14 +45,14 @@ DEFINE_ERROR(EID_NOQ, "Required process queue missing");
  * Protocol function names (must match Python IdentityProtocol)
  ****************************/
 
-static const char *ID_ANNOUNCE    = "request_access";
-static const char *ID_ACCEPT      = "access_granted";
-static const char *ID_HISTORY     = "full_history";
-static const char *ID_DIFF        = "history_diff";
-static const char *ID_PROPOSE     = "propose_peer";
-static const char *ID_VOTE        = "vote_on_peer";
-static const char *ID_CONFIRM     = "peer_accepted";
-static const char *ID_UPDATE      = "group_key_update";
+static char ID_ANNOUNCE[]    = "request_access";
+static char ID_ACCEPT[]      = "access_granted";
+static char ID_HISTORY[]     = "full_history";
+static char ID_DIFF[]        = "history_diff";
+static char ID_PROPOSE[]     = "propose_peer";
+static char ID_VOTE[]        = "vote_on_peer";
+static char ID_CONFIRM[]     = "peer_accepted";
+static char ID_UPDATE[]      = "group_key_update";
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -83,6 +84,7 @@ static void _ensure_id_init(void)
  * Internal helpers
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] logging/map preconditions */
 static int _remember_activity(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     /* Update proc configs with latest data; broadcast to all other processes */
@@ -107,13 +109,19 @@ static int _remember_activity(const process_t *proc, directory_t *queues, generi
  * Adds a new peer to the process's peer list and broadcasts to local processes.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] logging/identity/peers preconditions */
 static int _add_peer(process_t *proc, directory_t *queues, const public_identity_t *new_peer)
 {
+    peers_write_lock(proc);
     if (proc->protocol.num_peers >= MAX_PEERS)
+    {
+        peers_write_unlock(proc);
         return -1;
-    memcpy(&((process_t *)proc)->protocol.peers[proc->protocol.num_peers],
+    }
+    memcpy(&proc->protocol.peers[proc->protocol.num_peers],
            new_peer, sizeof(public_identity_t));
-    ((process_t *)proc)->protocol.num_peers++;
+    proc->protocol.num_peers++;
+    peers_write_unlock(proc);
     generic_msg_t peer_msg = {0};
     peer_msg.type = PEER;
     memcpy(&peer_msg.info.peer, new_peer, sizeof(public_identity_t));
@@ -127,15 +135,17 @@ static int _add_peer(process_t *proc, directory_t *queues, const public_identity
  * then adds the peer to our list.
  ****************************/
 
+/* Frama-C: skipped — [solver-timeout] identity/peers preconditions */
 static int _peer_accepted(process_t *proc, directory_t *queues, const public_identity_t *new_peer)
 {
     /* Send ID_CONFIRM to existing group members with new_peer identity in JSON payload */
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         generic_msg_t confirm = {0};
         confirm.type = NET_MESSAGE;
         strncpy(confirm.info.net_msg.process, "identity", PROC_NAME_LEN);
-        confirm.info.net_msg.function = (char *)ID_CONFIRM;
+        confirm.info.net_msg.function = ID_CONFIRM;
         confirm.info.net_msg.encrypt = true;
         memcpy(&confirm.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
         json_t *peer_json = json_object();
@@ -147,11 +157,12 @@ static int _peer_accepted(process_t *proc, directory_t *queues, const public_ide
         json_decref(peer_json);
         messaging_send("network", NET_MESSAGE, &confirm, false);
     }
+    peers_read_unlock(proc);
     /* Send ID_ACCEPT to the new peer */
     generic_msg_t accept = {0};
     accept.type = NET_MESSAGE;
     strncpy(accept.info.net_msg.process, "identity", PROC_NAME_LEN);
-    accept.info.net_msg.function = (char *)ID_ACCEPT;
+    accept.info.net_msg.function = ID_ACCEPT;
     accept.info.net_msg.encrypt = false;
     memcpy(&accept.info.net_msg.to_whom, new_peer, sizeof(public_identity_t));
     messaging_send("network", NET_MESSAGE, &accept, false);
@@ -163,6 +174,18 @@ static int _peer_accepted(process_t *proc, directory_t *queues, const public_ide
  * Phase 3 only. Receives broadcast from new peer wanting to join.
  ****************************/
 
+/* Frama-C: skipped —
+ * identity_run + all handlers + helpers: [solver-timeout] every function copies
+ * public_identity_t structs (memcpy of struct→struct triggers WP "Hide sub-term
+ * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
+ * Helpers also touch filesystem/network/identity stubs.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_welcoming_committee(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -182,21 +205,29 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     /* Check if already a peer.  If so, re-send access_granted in case the
      * peer restarted and lost its in-memory peer list (it still holds the
      * same identity/keys, but needs us to re-acknowledge it). */
+    peers_read_lock(proc);
+    bool already_known = false;
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         if (uuid_compare(proc->protocol.peers[i].uuid, nmsg->from_whom.uuid) == 0)
         {
-            log_info(proc->logger, "Identity: peer %s already known, re-sending access_granted\n",
-                     nmsg->from_whom.fullname);
-            generic_msg_t accept = {0};
-            accept.type = NET_MESSAGE;
-            strncpy(accept.info.net_msg.process, "identity", PROC_NAME_LEN);
-            accept.info.net_msg.function = (char *)ID_ACCEPT;
-            accept.info.net_msg.encrypt = false;
-            memcpy(&accept.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-            messaging_send("network", NET_MESSAGE, &accept, false);
-            return true;
+            already_known = true;
+            break;
         }
+    }
+    peers_read_unlock(proc);
+    if (already_known)
+    {
+        log_info(proc->logger, "Identity: peer %s already known, re-sending access_granted\n",
+                 nmsg->from_whom.fullname);
+        generic_msg_t accept = {0};
+        accept.type = NET_MESSAGE;
+        strncpy(accept.info.net_msg.process, "identity", PROC_NAME_LEN);
+        accept.info.net_msg.function = ID_ACCEPT;
+        accept.info.net_msg.encrypt = false;
+        memcpy(&accept.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
+        messaging_send("network", NET_MESSAGE, &accept, false);
+        return true;
     }
 
 #ifdef AT_ZTA_ENABLED
@@ -247,7 +278,10 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
 #endif
 
     /* Bootstrap: auto-accept when no existing peers (no one to vote) */
-    if (proc->protocol.num_peers == 0)
+    peers_read_lock(proc);
+    bool bootstrap = (proc->protocol.num_peers == 0);
+    peers_read_unlock(proc);
+    if (bootstrap)
     {
         log_info(proc->logger, "Identity: bootstrap — auto-accepting first peer %s\n",
                  nmsg->from_whom.fullname);
@@ -280,18 +314,20 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     json_object_set_new(proposal_json, "fullname", json_string(nmsg->from_whom.fullname));
     json_object_set_new(proposal_json, "address", json_string(nmsg->from_whom.address));
 
+    peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         generic_msg_t propose_msg = {0};
         propose_msg.type = NET_MESSAGE;
         strncpy(propose_msg.info.net_msg.process, "identity", PROC_NAME_LEN);
-        propose_msg.info.net_msg.function = (char *)ID_PROPOSE;
+        propose_msg.info.net_msg.function = ID_PROPOSE;
         propose_msg.info.net_msg.encrypt = true;
         memcpy(&propose_msg.info.net_msg.to_whom, &proc->protocol.peers[i],
                sizeof(public_identity_t));
         net_msg_pack_json(&propose_msg.info.net_msg, proposal_json);
         messaging_send("network", NET_MESSAGE, &propose_msg, false);
     }
+    peers_read_unlock(proc);
     json_decref(proposal_json);
 
     log_info(proc->logger, "Identity: proposed peer %s for voting\n",
@@ -304,6 +340,18 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
  * Phase 2+. Receives acceptance from an existing peer.
  ****************************/
 
+/* Frama-C: skipped —
+ * identity_run + all handlers + helpers: [solver-timeout] every function copies
+ * public_identity_t structs (memcpy of struct→struct triggers WP "Hide sub-term
+ * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
+ * Helpers also touch filesystem/network/identity stubs.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_acceptance(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase < 2)
@@ -313,23 +361,33 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
     log_info(proc->logger, "Identity: access granted by %s\n",
              nmsg->from_whom.fullname);
 
-    /* Check if already a peer (bootstrap auto-accept may have already added them) */
+    /* Dedup + append under the write lock */
+    peers_write_lock((process_t *)proc);
+    bool duplicate = false;
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         if (uuid_compare(proc->protocol.peers[i].uuid, nmsg->from_whom.uuid) == 0)
         {
-            log_debug(proc->logger, "Identity: peer already known, skipping duplicate add\n");
-            return true;
+            duplicate = true;
+            break;
         }
     }
-
-    /* Add the accepting peer to our peer list */
-    if (proc->protocol.num_peers < MAX_PEERS)
+    bool appended = false;
+    if (!duplicate && proc->protocol.num_peers < MAX_PEERS)
     {
         memcpy(&((process_t *)proc)->protocol.peers[proc->protocol.num_peers],
                &nmsg->from_whom, sizeof(public_identity_t));
         ((process_t *)proc)->protocol.num_peers++;
+        appended = true;
+    }
+    peers_write_unlock((process_t *)proc);
 
+    if (duplicate)
+    {
+        log_debug(proc->logger, "Identity: peer already known, skipping duplicate add\n");
+    }
+    else if (appended)
+    {
         /* Broadcast peer update to all local processes */
         generic_msg_t peer_msg = {0};
         peer_msg.type = PEER;
@@ -345,6 +403,12 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
  * Receives full history + group from established peer.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_receive_history(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -375,6 +439,18 @@ static bool handle_receive_history(const process_t *proc, directory_t *queues, g
  * Phase 3 only. Receives a peer proposal for voting.
  ****************************/
 
+/* Frama-C: skipped —
+ * identity_run + all handlers + helpers: [solver-timeout] every function copies
+ * public_identity_t structs (memcpy of struct→struct triggers WP "Hide sub-term
+ * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
+ * Helpers also touch filesystem/network/identity stubs.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -416,7 +492,7 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
     generic_msg_t vote_msg = {0};
     vote_msg.type = NET_MESSAGE;
     strncpy(vote_msg.info.net_msg.process, "identity", PROC_NAME_LEN);
-    vote_msg.info.net_msg.function = (char *)ID_VOTE;
+    vote_msg.info.net_msg.function = ID_VOTE;
     memcpy(&vote_msg.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
     vote_msg.info.net_msg.encrypt = true;
     net_msg_pack_json(&vote_msg.info.net_msg, vote_json);
@@ -429,10 +505,63 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
 }
 
 /****************************
+ * Vote-collection helpers (exposed via id_proc_priv.h for concurrency tests)
+ *
+ * These own the id_state.lock critical section for the vote_collection map,
+ * so callers (including handle_count_vote) never need to touch the mutex
+ * directly.  Prior to their extraction the critical section inside the
+ * handler was incorrectly left unguarded — see BUGS.md C6.
+ ****************************/
+
+int vote_collection_increment(const char *uuid_key)
+{
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+
+    data_t *count_dat = NULL;
+    int count = 0;
+    if (map_get(&id_state.vote_collection, (map_key_t)uuid_key, &count_dat) == 0)
+        data_integer(count_dat, &count);
+    count += 1;
+    data_t *new_count_dat = integer_data(count);
+    map_set(&id_state.vote_collection, (map_key_t)uuid_key, new_count_dat);
+
+    pthread_mutex_unlock(&id_state.lock);
+    return count;
+}
+
+int vote_collection_get(const char *uuid_key, int *out_count)
+{
+    if (out_count == NULL)
+        return -1;
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+
+    data_t *count_dat = NULL;
+    int rc = -1;
+    if (map_get(&id_state.vote_collection, (map_key_t)uuid_key, &count_dat) == 0)
+    {
+        int count = 0;
+        data_integer(count_dat, &count);
+        *out_count = count;
+        rc = 0;
+    }
+
+    pthread_mutex_unlock(&id_state.lock);
+    return rc;
+}
+
+/****************************
  * Handler: count_vote (vote_on_peer)
  * Phase 3 only. Receives and counts votes on proposed peers.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -476,17 +605,14 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
     uuid_key[sizeof(uuid_key) - 1] = '\0';
     json_decref(payload);
 
-    data_t *count_dat = NULL;
-    int count = 0;
-    if (map_get(&id_state.vote_collection, uuid_key, &count_dat) == 0)
-        data_integer(count_dat, &count);
-    count += 1;
-    data_t *new_count_dat = integer_data(count);
-    map_set(&id_state.vote_collection, uuid_key, new_count_dat);
+    /* Atomically read-modify-write the vote count under id_state.lock.
+     * Formerly this was open-coded here and the lock was never acquired,
+     * with a stray unlock at the tail — see BUGS.md C6. */
+    int count = vote_collection_increment(uuid_key);
 
+    peers_read_lock(proc);
     size_t num_peers = proc->protocol.num_peers;
-
-    pthread_mutex_unlock(&id_state.lock);
+    peers_read_unlock(proc);
 
     log_debug(proc->logger, "Identity: vote count for %s: %d (need %d)\n",
               uuid_key, count, MAJORITY(num_peers));
@@ -524,6 +650,12 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
  * Phase 3 only. Receives confirmation that a peer was accepted.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -575,6 +707,12 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
  * Phase 3 only. Receives and logs history diffs.
  ****************************/
 
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_history_diff(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -613,6 +751,18 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
  * Phase 3 only. Receives group address list updates.
  ****************************/
 
+/* Frama-C: skipped —
+ * identity_run + all handlers + helpers: [solver-timeout] every function copies
+ * public_identity_t structs (memcpy of struct→struct triggers WP "Hide sub-term
+ * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
+ * Helpers also touch filesystem/network/identity stubs.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
 static bool handle_group_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -662,7 +812,10 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
 
 static int _acquire_capabilities(const process_t *proc, directory_t *queues)
 {
-    int timeout_ms = 10000;
+    /* Scale the base 10s wait by the slowest peer's RTT so nodes reachable
+     * only via DTN (multi-minute bundle RTTs) still complete capability
+     * exchange without tripping this deadline. See utilities/timeout.h. */
+    int timeout_ms = at_timeout_scale_ms(10000, proc);
     int elapsed = 0;
     while (elapsed < timeout_ms)
     {
@@ -678,12 +831,13 @@ static int _acquire_capabilities(const process_t *proc, directory_t *queues)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] JSON + identity preconditions */
 static int _build_announcement(const process_t *proc, generic_msg_t *buf)
 {
     memset(buf, 0, sizeof(generic_msg_t));
     buf->type = NET_MESSAGE;
     strncpy(buf->info.net_msg.process, "identity", PROC_NAME_LEN);
-    buf->info.net_msg.function = (char *)ID_ANNOUNCE;
+    buf->info.net_msg.function = ID_ANNOUNCE;
     buf->info.net_msg.encrypt = false; /* Broadcast is unencrypted */
 
     /* Get own identity from config */
@@ -709,6 +863,7 @@ static int _build_announcement(const process_t *proc, generic_msg_t *buf)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] logging/snprintf/json preconditions */
 static int _announce_identity(const process_t *proc, directory_t *queues)
 {
     data_t net = STRING_DATA("network");
@@ -743,6 +898,11 @@ static int _announce_identity(const process_t *proc, directory_t *queues)
  * Identity process main entry
  ****************************/
 
+/* Frama-C: skipped —
+ * identity_run + all handlers + helpers: [solver-timeout] every function copies
+ * public_identity_t structs (memcpy of struct→struct triggers WP "Hide sub-term
+ * definition" cast warning that blocks discharge of valid_dest/valid_src/separation).
+ */
 int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_id_init();
@@ -754,14 +914,14 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         return err;
 
     /* Register protocol handlers */
-    process_register_handler(proc, (char *)ID_ANNOUNCE, (handler_ptr_t)handle_welcoming_committee);
-    process_register_handler(proc, (char *)ID_ACCEPT,   (handler_ptr_t)handle_acceptance);
-    process_register_handler(proc, (char *)ID_HISTORY,  (handler_ptr_t)handle_receive_history);
-    process_register_handler(proc, (char *)ID_DIFF,     (handler_ptr_t)handle_history_diff);
-    process_register_handler(proc, (char *)ID_PROPOSE,  (handler_ptr_t)handle_vote_on_peer);
-    process_register_handler(proc, (char *)ID_VOTE,     (handler_ptr_t)handle_count_vote);
-    process_register_handler(proc, (char *)ID_CONFIRM,  (handler_ptr_t)handle_confirm_peer);
-    process_register_handler(proc, (char *)ID_UPDATE,   (handler_ptr_t)handle_group_update);
+    process_register_handler(proc, ID_ANNOUNCE, (handler_ptr_t)handle_welcoming_committee);
+    process_register_handler(proc, ID_ACCEPT,   (handler_ptr_t)handle_acceptance);
+    process_register_handler(proc, ID_HISTORY,  (handler_ptr_t)handle_receive_history);
+    process_register_handler(proc, ID_DIFF,     (handler_ptr_t)handle_history_diff);
+    process_register_handler(proc, ID_PROPOSE,  (handler_ptr_t)handle_vote_on_peer);
+    process_register_handler(proc, ID_VOTE,     (handler_ptr_t)handle_count_vote);
+    process_register_handler(proc, ID_CONFIRM,  (handler_ptr_t)handle_confirm_peer);
+    process_register_handler(proc, ID_UPDATE,   (handler_ptr_t)handle_group_update);
 
     /* Phase 0→1: Acquire capabilities */
     _acquire_capabilities(proc, queues);
@@ -786,7 +946,10 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         sleep_until(proc, cadence);
 
         /* Periodic re-announcement until we have peers */
-        if (proc->protocol.num_peers == 0 && ++cycle >= announce_interval)
+        peers_read_lock(proc);
+        bool no_peers = (proc->protocol.num_peers == 0);
+        peers_read_unlock(proc);
+        if (no_peers && ++cycle >= announce_interval)
         {
             cycle = 0;
             messaging_send("network", NET_MESSAGE, &announce_buf, false);

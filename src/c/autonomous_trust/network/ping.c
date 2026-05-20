@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -46,10 +47,16 @@ static double timespec_diff_ms(struct timespec start, struct timespec end)
  * Ping client
  ****************************/
 
-int ping(const char *host, ping_stats_t *stats)
+/* Frama-C: skipped — [syscall] raw socket send/recv */
+int ping(const char *host, int count, ping_stats_t *stats)
 {
     memset(stats, 0, sizeof(ping_stats_t));
     strncpy(stats->host, host, IPV4_ADDR_LEN);
+    if (count <= 0)
+        count = PING_COUNT;
+    if (count > MAX_PING_COUNT)
+        count = MAX_PING_COUNT;
+    stats->count = count;
 
     /* Sender socket: sends to PING_SND_PORT on the target host */
     int snd_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -100,7 +107,7 @@ int ping(const char *host, ping_stats_t *stats)
 
     int timed_out = 0;
 
-    for (int i = 0; i < PING_COUNT; i++)
+    for (int i = 0; i < count; i++)
     {
         uint32_t seq     = (uint32_t)(i + 1);
         uint32_t net_seq = htonl(seq);
@@ -112,7 +119,6 @@ int ping(const char *host, ping_stats_t *stats)
                               (struct sockaddr *)&dst, sizeof(dst));
         if (sent < 0)
         {
-            stats->sent++;
             timed_out++;
             continue;
         }
@@ -176,6 +182,7 @@ int ping(const char *host, ping_stats_t *stats)
 static pthread_t    ping_server_thread;
 static volatile int ping_server_running = 0;
 
+/* Frama-C: skipped — [syscall] socket/select loop */
 static void *ping_server_loop(void *arg)
 {
     (void)arg;
@@ -226,6 +233,7 @@ static void *ping_server_loop(void *arg)
     return NULL;
 }
 
+/* Frama-C: skipped — [syscall] pthread_create */
 int ping_server_start(void)
 {
     if (ping_server_running)
@@ -241,6 +249,7 @@ int ping_server_start(void)
     return 0;
 }
 
+/* Frama-C: skipped — [syscall] pthread_join */
 int ping_server_stop(void)
 {
     if (!ping_server_running)

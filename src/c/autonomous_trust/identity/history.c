@@ -20,12 +20,18 @@
 
 #include <sodium.h>
 #include <uuid/uuid.h>
+#include <jansson.h>
 
 #include "history.h"
+#include "identity_priv.h"
 #include "../utilities/allocation.h"
 
 /* IdentityObj blob interface implementations */
 
+/* Frama-C: skipped —
+ * [alloc-pattern] _identity_obj_designation: 12 at_memcpy + uuid_unparse + strnlen
+ * cascade through blob-designation assembly.
+ */
 static int _identity_obj_designation(const merkle_blob_t *blob, uint8_t **out, size_t *out_len)
 {
     const identity_obj_t *obj = (const identity_obj_t *)blob;
@@ -35,10 +41,15 @@ static int _identity_obj_designation(const merkle_blob_t *blob, uint8_t **out, s
     char uuid_str[37];
     uuid_unparse_lower(obj->identity->uuid, uuid_str);
 
-    /* originator + uuid + fullname + public_key */
-    size_t orig_len = strlen(obj->originator_uuid);
-    size_t uuid_len = strlen(uuid_str);
-    size_t name_len = strlen(obj->identity->fullname);
+    /* originator + uuid + fullname + public_key.  Use strnlen throughout
+     * so a wire-sourced identity that lacks a NUL terminator cannot walk
+     * past the field and read adjacent memory. */
+    size_t orig_len = strnlen(obj->originator_uuid, MERKLE_UUID_LEN);
+    size_t uuid_len = strnlen(uuid_str, sizeof(uuid_str));
+    size_t name_len = strnlen(obj->identity->fullname, NAME_LEN + 1);
+    if (orig_len >= MERKLE_UUID_LEN || uuid_len >= sizeof(uuid_str) ||
+        name_len > NAME_LEN)
+        return EINVAL;
     size_t key_len = crypto_sign_PUBLICKEYBYTES;
     size_t total = orig_len + uuid_len + name_len + key_len;
 
@@ -86,6 +97,10 @@ static int _identity_obj_get_hash(const merkle_blob_t *blob, const uint8_t *nonc
     return ret;
 }
 
+/* Frama-C: skipped —
+ * [string-loop] identity_obj_create: strncpy preconditions cascade into success/oom
+ * ensures; same pattern as names.c/random_name.
+ */
 int identity_obj_create(public_identity_t *identity, const char *originator_uuid,
                         identity_obj_t **obj)
 {
@@ -98,12 +113,18 @@ int identity_obj_create(public_identity_t *identity, const char *originator_uuid
 
     o->identity = identity;
     if (originator_uuid != NULL)
+    {
         strncpy(o->originator_uuid, originator_uuid, MERKLE_UUID_LEN - 1);
+        o->originator_uuid[MERKLE_UUID_LEN - 1] = '\0';
+    }
 
     /* set up blob interface */
     uuid_unparse_lower(identity->uuid, o->base.uuid);
     if (originator_uuid != NULL)
+    {
         strncpy(o->base.originator, originator_uuid, MERKLE_UUID_LEN - 1);
+        o->base.originator[MERKLE_UUID_LEN - 1] = '\0';
+    }
     o->base.designation = _identity_obj_designation;
     o->base.get_hash = _identity_obj_get_hash;
     o->base.user_data = identity;
@@ -123,6 +144,10 @@ void identity_obj_free(identity_obj_t *obj)
         free(obj);
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] identity_history_create: dag_init + success ensures (smrt_ptr
+ * allocation cascade).
+ */
 int identity_history_create(agreement_voter_t *myself,
                             peers_t *peers,
                             logger_t *logger,
@@ -225,23 +250,205 @@ bool identity_history_verify_existence(identity_history_t *history,
     return merkle_audit(history->merkle, item, proof, proof_len);
 }
 
-int identity_history_share(identity_history_t *history,
-                           array_t **steps_out)
+/* JSON serialization helpers for wire-compatible history exchange */
+
+/* Frama-C: skipped — linked_step_to_json / linked_step_from_json: jansson + hexlify cascades. */
+static json_t *linked_step_to_json(const linked_step_t *step)
 {
-    if (history == NULL || steps_out == NULL)
-        return EINVAL;
-    return dag_recite(&history->dag, NULL, NULL, steps_out);
+    if (step == NULL)
+        return NULL;
+
+    json_t *obj = json_object();
+    if (obj == NULL)
+        return NULL;
+
+    json_object_set_new(obj, "uuid", json_string(step->uuid));
+
+    char ts_buf[MAX_DT_STR];
+    if (datetime_to_isoformat(&step->timestamp, ts_buf, sizeof(ts_buf)) == 0)
+        json_object_set_new(obj, "timestamp", json_string(ts_buf));
+
+    /* payload is a merkle root digest (MERKLE_DIGEST_LEN bytes) */
+    if (step->payload != NULL)
+    {
+        char hex[MERKLE_DIGEST_LEN * 2 + 1];
+        hexlify((const unsigned char *)step->payload, MERKLE_DIGEST_LEN,
+                (unsigned char *)hex);
+        hex[MERKLE_DIGEST_LEN * 2] = '\0';
+        json_object_set_new(obj, "payload", json_string(hex));
+    }
+
+    return obj;
 }
 
-int identity_history_hear(identity_history_t *history,
-                          linked_step_t **steps, size_t count)
+/* Frama-C: skipped — linked_step_to_json / linked_step_from_json: jansson + hexlify cascades. */
+static int linked_step_from_json(const json_t *obj, linked_step_t **step_out)
 {
-    if (history == NULL || steps == NULL || count == 0)
+    if (obj == NULL || step_out == NULL)
         return EINVAL;
+
+    const char *uuid_str = json_string_value(json_object_get(obj, "uuid"));
+    if (uuid_str == NULL)
+        return EINVAL;
+
+    linked_step_t *step = NULL;
+    int err = linked_step_create(uuid_str, NULL, &step);
+    if (err != 0)
+        return err;
+
+    const char *ts_str = json_string_value(json_object_get(obj, "timestamp"));
+    if (ts_str != NULL)
+        datetime_from_isostring(ts_str, &step->timestamp);
+
+    const char *payload_hex = json_string_value(json_object_get(obj, "payload"));
+    if (payload_hex != NULL)
+    {
+        uint8_t *digest = malloc(MERKLE_DIGEST_LEN);
+        if (digest != NULL)
+        {
+            unhexlify((const unsigned char *)payload_hex,
+                      MERKLE_DIGEST_LEN * 2, digest);
+            step->payload = digest;
+        }
+    }
+
+    *step_out = step;
+    return 0;
+}
+
+int identity_history_share(identity_history_t *history,
+                           const identity_t *signer,
+                           uint8_t **wire_out, size_t *wire_len)
+{
+    if (history == NULL || signer == NULL || wire_out == NULL || wire_len == NULL)
+        return EINVAL;
+
+    array_t *steps = NULL;
+    int err = dag_recite(&history->dag, NULL, NULL, &steps);
+    if (err != 0)
+        return err;
+
+    /* serialize steps to JSON array */
+    json_t *arr = json_array();
+    if (arr == NULL)
+    {
+        array_free(steps);
+        return ENOMEM;
+    }
+
+    int idx;
+    data_t *val;
+    array_for_each(steps, idx, val)
+        ptr_t ptr = NULL;
+        if (data_object_ptr(val, &ptr) == 0 && ptr != NULL)
+        {
+            json_t *step_json = linked_step_to_json((const linked_step_t *)ptr);
+            if (step_json != NULL)
+                json_array_append_new(arr, step_json);
+        }
+    array_end_for_each
+
+    char *json_str = json_dumps(arr, JSON_COMPACT);
+    json_decref(arr);
+    array_free(steps);
+    if (json_str == NULL)
+        return ENOMEM;
+
+    /* sign the JSON payload */
+    size_t json_len = strlen(json_str);
+    size_t signed_len = crypto_sign_BYTES + json_len;
+    uint8_t *signed_buf = malloc(signed_len);
+    if (signed_buf == NULL)
+    {
+        free(json_str);
+        return ENOMEM;
+    }
+
+    unsigned long long actual_len = 0;
+    if (crypto_sign(signed_buf, &actual_len,
+                    (const uint8_t *)json_str, json_len,
+                    signer->signature.private) != 0)
+    {
+        free(json_str);
+        free(signed_buf);
+        return -1;
+    }
+    free(json_str);
+
+    *wire_out = signed_buf;
+    *wire_len = (size_t)actual_len;
+    return 0;
+}
+
+/* Frama-C: skipped — [serialization] identity_history_hear: dag_ingest_branch + json_decref. */
+int identity_history_hear(identity_history_t *history,
+                          const public_identity_t *sender,
+                          const uint8_t *wire, size_t wire_len)
+{
+    if (history == NULL || sender == NULL || wire == NULL || wire_len == 0)
+        return EINVAL;
+
+    /* verify signature and extract JSON payload */
+    size_t json_max = wire_len;
+    uint8_t *json_buf = malloc(json_max);
+    if (json_buf == NULL)
+        return ENOMEM;
+
+    unsigned long long json_len = 0;
+    if (crypto_sign_open(json_buf, &json_len, wire, wire_len,
+                         sender->signature.public) != 0)
+    {
+        free(json_buf);
+        return -1;  /* signature verification failed */
+    }
+
+    /* parse JSON array back to linked steps */
+    json_error_t jerr;
+    json_t *arr = json_loadb((const char *)json_buf, (size_t)json_len, 0, &jerr);
+    free(json_buf);
+    if (arr == NULL || !json_is_array(arr))
+    {
+        if (arr != NULL)
+            json_decref(arr);
+        return EINVAL;
+    }
+
+    size_t count = json_array_size(arr);
+    if (count == 0)
+    {
+        json_decref(arr);
+        return 0;
+    }
+
+    linked_step_t **steps = calloc(count, sizeof(linked_step_t *));
+    if (steps == NULL)
+    {
+        json_decref(arr);
+        return ENOMEM;
+    }
+
+    for (size_t i = 0; i < count; i++)
+    {
+        int err = linked_step_from_json(json_array_get(arr, i), &steps[i]);
+        if (err != 0)
+        {
+            for (size_t j = 0; j < i; j++)
+                linked_step_free(steps[j]);
+            free(steps);
+            json_decref(arr);
+            return err;
+        }
+    }
+    json_decref(arr);
+
+    /* rebuild parent chain (recite outputs head-to-root order) */
+    for (size_t i = 0; i + 1 < count; i++)
+        steps[i]->parent = steps[i + 1];
 
     char name_out[32];
     int err = dag_ingest_branch(&history->dag, steps, count, NULL,
                                 name_out, sizeof(name_out));
+    free(steps);
     if (err != 0)
         return err;
 
@@ -249,6 +456,11 @@ int identity_history_hear(identity_history_t *history,
     return dag_merge(&history->dag, name_out, NULL, false);
 }
 
+/* Frama-C: skipped —
+ * [recursive-ds] identity_history_free: composite destructor cascades through
+ * agreement_protocol_free + merkle_tree_free + dag_free + array_free; 4 consecutive
+ * free-valid preconditions time out.
+ */
 void identity_history_free(identity_history_t *history)
 {
     if (history == NULL)

@@ -17,13 +17,17 @@
 #ifndef NEGOTIATION_H
 #define NEGOTIATION_H
 
+/** @addtogroup internal_negotiation
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
 #include <uuid/uuid.h>
 
-#include "structures/map_priv.h"
-#include "structures/data_priv.h"
+#include "structures/map.h"
+#include "structures/data.h"
 #include "identity/identity.h"
 #include "negotiation/task.h"
 #include "utilities/exception.h"
@@ -53,7 +57,9 @@ typedef enum {
     NEG_STOPPED,
     NEG_DEAD,
     NEG_PENDING,
-    NEG_UNKNOWN
+    NEG_UNKNOWN,
+    NEG_NO_PEERS,
+    NEG_REJECTED
 } neg_status_t;
 
 /****************************
@@ -90,11 +96,55 @@ typedef struct {
     int expected;
 } task_tracker_t;
 
+/*@
+  requires \valid(tracker);
+  requires expected >= 0;
+  allocates *tracker;
+  behavior success:
+    ensures \result == 0;
+    ensures *tracker != \null;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int  task_tracker_create(task_tracker_t **tracker, const uuid_t task_uuid, int expected);
+
+/*@
+  requires \valid(tracker);
+  requires expected >= 0;
+  requires \separated(tracker + (0 .. 0), task_uuid + (0 .. 15));
+  assigns *tracker;
+  ensures \result == 0 || \result != 0;
+*/
 int  task_tracker_init(task_tracker_t *tracker, const uuid_t task_uuid, int expected);
+
+/*@
+  requires tracker == \null || \valid(tracker);
+  frees tracker;
+*/
 void task_tracker_destroy(task_tracker_t *tracker);
+
+/*@
+  requires \valid(tracker);
+  requires data != \null && \valid_read(data + (0 .. len - 1));
+  requires len > 0;
+  assigns tracker->results;
+  ensures \result == 0 || \result != 0;
+*/
 int  task_tracker_set_result(task_tracker_t *tracker, const uuid_t peer_uuid, const uint8_t *data, size_t len);
+
+/*@
+  requires \valid(tracker);
+  assigns \nothing;
+  ensures \result >= 0;
+*/
 int  task_tracker_result_count(const task_tracker_t *tracker);
+
+/*@
+  requires \valid(tracker);
+  requires tracker->results.length <= tracker->results.capacity;
+  assigns tracker->results;
+*/
 void task_tracker_free(task_tracker_t *tracker);
 
 /****************************
@@ -114,15 +164,111 @@ typedef struct {
     int count;
 } job_queue_t;
 
+/*@
+  requires \valid(q);
+  allocates *q;
+  behavior success:
+    ensures \result == 0;
+    ensures *q != \null;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int  job_queue_create(job_queue_t **q);
+
+/*@
+  requires \valid(q);
+  assigns *q;
+  ensures \result == 0;
+  ensures q->count == 0;
+*/
 int  job_queue_init(job_queue_t *q);
+
+/*@
+  requires q == \null || \valid(q);
+  frees q;
+*/
 void job_queue_destroy(job_queue_t *q);
+
+/*@
+  requires \valid(q);
+  requires \valid(job);
+  requires q->count >= 0;
+  assigns q->jobs[0 .. MAX_JOBS - 1], q->count;
+  behavior full:
+    assumes q->count >= MAX_JOBS;
+    ensures \result != 0;
+  behavior success:
+    assumes q->count < MAX_JOBS;
+    ensures \result == 0;
+    ensures q->count == \old(q->count) + 1;
+  disjoint behaviors;
+  complete behaviors;
+*/
 int  job_queue_push(job_queue_t *q, const job_t *job);
+
+/*@
+  requires \valid(q);
+  requires \valid(job);
+  assigns q->jobs[0 .. MAX_JOBS - 1], q->count, *job;
+  behavior empty:
+    assumes q->count == 0;
+    ensures \result != 0;
+  behavior success:
+    assumes q->count > 0;
+    ensures \result == 0;
+    ensures q->count == \old(q->count) - 1;
+  disjoint behaviors;
+  complete behaviors;
+*/
 int job_queue_pop(job_queue_t *q, job_t *job);
+
+/*@
+  requires \valid(q);
+  requires \valid(job);
+  assigns *job;
+  behavior empty:
+    assumes q->count == 0;
+    ensures \result != 0;
+  behavior success:
+    assumes q->count > 0;
+    ensures \result == 0;
+  disjoint behaviors;
+  complete behaviors;
+*/
 int job_queue_min(const job_queue_t *q, job_t *job);
+
+/*@
+  requires \valid(q);
+  assigns \nothing;
+  ensures \result == \true || \result == \false;
+*/
 bool job_queue_contains(const job_queue_t *q, const uuid_t task_uuid);
+
+/*@
+  requires \valid(q);
+  assigns \nothing;
+  ensures \result == q->count;
+  ensures \result >= 0;
+*/
 int job_queue_count(const job_queue_t *q);
+
+/*@
+  requires \valid(q);
+  requires duration > 0;
+  requires max_concurrency > 0;
+  requires \valid(slot_time);
+  assigns *slot_time;
+  ensures \result == 0;
+  ensures *slot_time >= 0;
+*/
 int job_queue_find_nearest_slot(const job_queue_t *q, time_t duration, int max_concurrency, time_t *slot_time);
+
+/*@
+  requires \valid(q);
+  assigns *q;
+  ensures q->count == 0;
+*/
 void job_queue_clear(job_queue_t *q);
 
 /****************************
@@ -137,5 +283,8 @@ DECLARE_ERROR(ENEG_FULL, "Job queue is full");
 
 #define ENEG_NOTASK 242
 DECLARE_ERROR(ENEG_NOTASK, "Task not found");
+
+
+/** @} */ /* end of internal_negotiation */
 
 #endif  /* NEGOTIATION_H */

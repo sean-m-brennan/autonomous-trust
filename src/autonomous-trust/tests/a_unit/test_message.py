@@ -73,9 +73,12 @@ class TestMessage:
         assert s == 'proc|func|hello'
 
     def test_bytes(self):
+        import json
         msg = Message('proc', 'func', 'hello')
         b = bytes(msg)
-        assert b == b'proc|func|hello'
+        wire = json.loads(b)
+        assert wire['process'] == 'proc'
+        assert wire['function'] == 'func'
 
     def test_parse_string(self):
         raw = 'proc|func|some data here'

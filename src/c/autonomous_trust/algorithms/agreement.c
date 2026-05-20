@@ -14,6 +14,7 @@
  *   limitations under the License.
  *******************/
 
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -23,6 +24,7 @@
 #include "../utilities/allocation.h"
 #include "algorithms/agreement.pb-c.h"
 
+/* Frama-C: skipped — [solver-timeout] smrt_ptr allocation postconditions */
 int agreement_proof_create(const char *uuid, const uint8_t *digest, size_t digest_len,
                            bool approval, const uint8_t *nonce, size_t nonce_len,
                            agreement_proof_t **proof)
@@ -49,6 +51,16 @@ int agreement_proof_create(const char *uuid, const uint8_t *digest, size_t diges
         p->digest_len = digest_len;
     }
 
+    /* WHY the cleanup here frees digest conditionally but not separately
+     * calloc'd fields: allocations happen in order (struct → digest → nonce);
+     * if we fail at the nonce step, digest may or may not have been
+     * allocated depending on whether digest_len > 0 above. The `if
+     * (p->digest)` guard handles both paths without needing a second
+     * control-flow branch. The struct itself came from calloc so all other
+     * pointer fields are guaranteed NULL — no risk of freeing uninitialized
+     * memory. Do NOT reorder the allocations; each error branch assumes
+     * everything earlier in the sequence is the *only* thing that might
+     * need freeing. */
     if (nonce != NULL && nonce_len > 0)
     {
         p->nonce = malloc(nonce_len);
@@ -66,6 +78,10 @@ int agreement_proof_create(const char *uuid, const uint8_t *digest, size_t diges
     return 0;
 }
 
+/*@
+  requires proof == \null || \valid(proof);
+  assigns \nothing;
+*/
 void agreement_proof_free(agreement_proof_t *proof)
 {
     if (proof == NULL)
@@ -77,6 +93,7 @@ void agreement_proof_free(agreement_proof_t *proof)
     free(proof);
 }
 
+/* Frama-C: skipped — [serialization] protobuf serialization */
 int agreement_proof_sync_out(agreement_proof_t *proof, void *proto_msg)
 {
     AutonomousTrust__Core__Protobuf__Algorithms__AgreementProof *msg = proto_msg;
@@ -93,6 +110,7 @@ int agreement_proof_sync_out(agreement_proof_t *proof, void *proto_msg)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] protobuf deserialization */
 int agreement_proof_sync_in(void *proto_msg, agreement_proof_t *proof)
 {
     AutonomousTrust__Core__Protobuf__Algorithms__AgreementProof *msg = proto_msg;
@@ -167,6 +185,8 @@ static bool _authority_accumulate(agreement_protocol_t *proto, int *ranks, bool 
         if (ranks[i] == leader_rank)
             return approvals[i];
     }
+    /* count == 0 case falls through here — a deliberate "no leader vote
+     * yet, so not approved" — approvals[0] is NEVER read unread. */
     return false;
 }
 
@@ -236,6 +256,7 @@ static bool _work_accumulate(agreement_protocol_t *proto, int *ranks, bool *appr
     return false; /* work uses verify/finalize pattern instead */
 }
 
+/* Frama-C: skipped — [solver-timeout] smrt_ptr + paxos init */
 int agreement_protocol_create(agreement_voter_t *myself,
                               agreement_voter_t *others, int other_count,
                               agreement_type_t type,
@@ -328,6 +349,7 @@ int agreement_by_work_create(agreement_voter_t *myself,
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] crypto + paxos preconditions */
 int agreement_prove(agreement_protocol_t *proto, merkle_blob_t *blob,
                     agreement_proof_t **proof_out)
 {
@@ -350,11 +372,11 @@ int agreement_prove(agreement_protocol_t *proto, merkle_blob_t *blob,
             else
                 break;
 
-            /* check if first difficulty bytes are zero */
+            /* check if first difficulty bytes are ASCII '0' */
             bool valid = true;
             for (unsigned int i = 0; i < (unsigned int)difficulty && i < MERKLE_DIGEST_LEN; i++)
             {
-                if (hash[i] != 0)
+                if (hash[i] != '0')
                 {
                     valid = false;
                     break;
@@ -381,6 +403,7 @@ int agreement_prove(agreement_protocol_t *proto, merkle_blob_t *blob,
     }
 }
 
+/* Frama-C: skipped — [solver-timeout] crypto verification preconditions */
 bool agreement_verify(agreement_protocol_t *proto, merkle_blob_t *blob,
                       agreement_proof_t *proof, const uint8_t *sig, size_t sig_len)
 {
@@ -399,7 +422,7 @@ bool agreement_verify(agreement_protocol_t *proto, merkle_blob_t *blob,
         bool prefix_ok = true;
         for (unsigned int i = 0; i < (unsigned int)proto->state.work.difficulty && i < MERKLE_DIGEST_LEN; i++)
         {
-            if (proof->digest[i] != 0)
+            if (proof->digest[i] != '0')
             {
                 prefix_ok = false;
                 break;
@@ -444,6 +467,7 @@ bool agreement_verify(agreement_protocol_t *proto, merkle_blob_t *blob,
     return true;
 }
 
+/* Frama-C: skipped — [solver-timeout] paxos/map precondition cascade */
 bool agreement_finalize(agreement_protocol_t *proto, merkle_blob_t *blob)
 {
     if (proto == NULL || blob == NULL)
@@ -543,9 +567,9 @@ void agreement_protocol_free(agreement_protocol_t *proto)
         return;
     if (proto->voters != NULL)
         free(proto->voters);
-    if (proto->votes != NULL)
-        map_free(proto->votes);
     if (proto->type == AGREEMENT_WORK && proto->state.work.approved != NULL)
         array_free(proto->state.work.approved);
+    if (proto->votes != NULL)
+        map_free(proto->votes);
     free(proto);
 }

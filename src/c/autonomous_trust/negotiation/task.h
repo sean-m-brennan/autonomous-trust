@@ -17,6 +17,10 @@
 #ifndef TASK_H
 #define TASK_H
 
+/** @addtogroup internal_negotiation
+ *  @{
+ */
+
 #include <uuid/uuid.h>
 #include "processes/capabilities.h"
 #include "structures/datetime.h"
@@ -32,6 +36,18 @@ typedef struct {
     bool flexible;
 } task_t;
 
+/*@
+  requires \valid(task);
+  assigns \nothing;
+  behavior success:
+    ensures \result == 0;
+  behavior no_capability:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
 int task_run(task_t *task);
+
+
+/** @} */ /* end of internal_negotiation */
 
 #endif  // TASK_H

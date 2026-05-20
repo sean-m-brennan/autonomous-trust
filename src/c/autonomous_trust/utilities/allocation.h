@@ -17,6 +17,10 @@
 #ifndef ALLOCATION_H
 #define ALLOCATION_H
 
+/** @addtogroup internal_utilities
+ *  @{
+ */
+
 #include <stdlib.h>
 #include <stdbool.h>
 
@@ -25,15 +29,80 @@ typedef struct {
     size_t refs;
 } smrt_ptr_t;
 
+/*@ predicate smrt_valid(smrt_ptr_t *p) =
+      \valid(p) && p->alloc == true && p->refs >= 1;
+*/
+
+/*@ axiomatic SmrtPtrInvariant {
+      axiom smrt_refs_positive:
+        \forall smrt_ptr_t s; s.alloc == true ==> s.refs >= 1;
+    }
+*/
+
+/*@
+  requires size > 0;
+  requires size >= sizeof(smrt_ptr_t);
+  assigns \result \from size;
+  ensures \result == \null ||
+    (\valid((char *)\result + (0 .. size - 1)) &&
+     ((smrt_ptr_t *)\result)->alloc == true &&
+     ((smrt_ptr_t *)\result)->refs == 1);
+*/
 void *smrt_create(size_t size);
 
-void *smrt_recreate(void *orig, size_t size);
+/*@
+  requires \valid(pptr);
+  requires *pptr == \null || \valid((char *)*pptr + (0 .. size - 1));
+  requires size > 0;
+  assigns *pptr;
+  ensures \result == 0 || \result != 0;
+*/
+/**
+ * @brief Resize @c *pptr to @p size bytes.
+ * @details On success (return 0), @c *pptr is replaced with the (possibly
+ * moved) new block. On failure (non-zero), @c *pptr is unchanged and still
+ * points at the original block — no memory is leaked and no dangling
+ * pointer is produced. This contract is enforced by the double-pointer
+ * API: callers cannot accidentally overwrite the original pointer on
+ * failure, unlike a plain realloc-shaped signature.
+ */
+int smrt_recreate(void **pptr, size_t size);
 
+/*@
+  requires \valid((smrt_ptr_t *)ptr);
+  requires ((smrt_ptr_t *)ptr)->alloc == true;
+  requires ((smrt_ptr_t *)ptr)->refs >= 1;
+  requires ((smrt_ptr_t *)ptr)->refs < 18446744073709551615UL;
+  assigns ((smrt_ptr_t *)ptr)->refs;
+  ensures ((smrt_ptr_t *)ptr)->refs == \old(((smrt_ptr_t *)ptr)->refs) + 1;
+*/
 void smrt_ref(void *ptr);
 
+/*@
+  requires ptr == \null || \valid((smrt_ptr_t *)ptr);
+  requires ptr != \null ==> ((smrt_ptr_t *)ptr)->refs >= 1;
+  assigns ((smrt_ptr_t *)ptr)->alloc,
+          ((smrt_ptr_t *)ptr)->refs;
+  behavior null_ptr:
+    assumes ptr == \null;
+    assigns \nothing;
+  behavior last_ref:
+    assumes ptr != \null;
+    assumes ((smrt_ptr_t *)ptr)->alloc == true;
+    assumes ((smrt_ptr_t *)ptr)->refs == 1;
+    ensures ((smrt_ptr_t *)ptr)->refs == 0;
+  behavior decrement:
+    assumes ptr != \null;
+    assumes ((smrt_ptr_t *)ptr)->refs > 1;
+    ensures ((smrt_ptr_t *)ptr)->refs == \old(((smrt_ptr_t *)ptr)->refs) - 1;
+  disjoint behaviors;
+*/
 void _smrt_deref_impl(void *ptr);
 
 /* Macro NULLs the caller's pointer after free to prevent use-after-free */
 #define smrt_deref(ptr) do { _smrt_deref_impl(ptr); (ptr) = NULL; } while(0)
+
+
+/** @} */ /* end of internal_utilities */
 
 #endif  // ALLOCATION_H

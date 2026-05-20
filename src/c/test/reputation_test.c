@@ -61,9 +61,12 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_paxos_id)
 {
-    /* paxos_id_index(id1, id2) == id1 + id2/10^digits(id2) */
-    ck_assert_double_eq_tol(paxos_id_index(1.0, 5.0),  1.5,   1e-9);
-    ck_assert_double_eq_tol(paxos_id_index(3.0, 42.0), 3.42,  1e-9);
+    /* paxos_id_index produces string keys "id1:id2" */
+    char buf[PAXOS_KEY_LEN];
+    paxos_id_index(buf, sizeof(buf), 1, 5);
+    ck_assert_str_eq(buf, "1:5");
+    paxos_id_index(buf, sizeof(buf), 3, 42);
+    ck_assert_str_eq(buf, "3:42");
 }
 END_TEST_DEFINITION()
 

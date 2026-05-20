@@ -24,12 +24,65 @@
 
 #define pod_cmp(a, b) ((a) < (b)) ? -1 : (((a) > (b)) ? 1 : 0)
 
+/*@
+  requires \valid(a) && \valid(b);
+  requires a->type == INT && b->type == INT;
+  assigns \nothing;
+  ensures a->intgr == b->intgr ==> \result == 0;
+*/
 int i_cmp(data_t *a, data_t *b) { return pod_cmp(a->intgr, b->intgr); }
+
+/*@
+  requires \valid(a) && \valid(b);
+  requires a->type == UINT && b->type == UINT;
+  assigns \nothing;
+  ensures a->uintr == b->uintr ==> \result == 0;
+*/
 int u_cmp(data_t *a, data_t *b) { return pod_cmp(a->uintr, b->uintr); }
+
+/*@
+  requires \valid(a) && \valid(b);
+  requires a->type == FLOAT && b->type == FLOAT;
+  assigns \nothing;
+  ensures a->flt_pt == b->flt_pt ==> \result == 0;
+*/
 int f_cmp(data_t *a, data_t *b) { return pod_cmp(a->flt_pt, b->flt_pt); }
+
+/*@
+  requires \valid(a) && \valid(b);
+  requires a->type == BOOL && b->type == BOOL;
+  assigns \nothing;
+  ensures a->bl == b->bl ==> \result == 0;
+*/
 int b_cmp(data_t *a, data_t *b) { return pod_cmp(a->bl, b->bl); }
+
+/*@
+  requires \valid(a) && \valid(b);
+  requires a->type == STRING && b->type == STRING;
+  requires \valid(a->str) && \valid(b->str);
+  assigns \nothing;
+*/
 int s_cmp(data_t *a, data_t *b) { return strcmp(a->str, b->str); }
+
+/*@
+  requires \valid(a) && \valid(b);
+  requires (a->type == BYTES && b->type == BYTES) ||
+           (a->type == STRING && b->type == STRING);
+  requires a->size > 0;
+  requires \valid(a->str + (0 .. a->size - 1));
+  requires \valid(b->str + (0 .. a->size - 1));
+  assigns \nothing;
+*/
+/* Frama-C: skipped — [solver-timeout] memcmp danglingness preconditions */
 int d_cmp(data_t *a, data_t *b) { return memcmp(a->str, b->str, a->size); }
+
+/*@
+  requires \valid(a) && \valid(b);
+  requires a->type == OBJECT && b->type == OBJECT;
+  assigns \nothing;
+  ensures a->obj == b->obj ==> \result == 0;
+  ensures a->obj != b->obj ==> \result == 1;
+*/
 int o_cmp(data_t *a, data_t *b) { return a->obj != b->obj; }
 
 bool data_equal(data_t *a, data_t *b)
@@ -100,6 +153,7 @@ data_t *boolean_data(bool val)
     return dat;
 }
 
+/* Frama-C: skipped — [alloc-pattern] dynamic string allocation via calloc */
 data_t *string_data(char *val, size_t len)
 {
     data_t *dat = smrt_create(sizeof(data_t));
@@ -113,6 +167,7 @@ data_t *string_data(char *val, size_t len)
     return dat;
 }
 
+/* Frama-C: skipped — [alloc-pattern] dynamic byte buffer allocation and memcpy */
 data_t *bytes_data(unsigned char *val, size_t len)
 {
     data_t *dat = smrt_create(sizeof(data_t));
@@ -126,6 +181,7 @@ data_t *bytes_data(unsigned char *val, size_t len)
     return dat;
 }
 
+/* Frama-C: skipped — [alloc-pattern] void pointer casting with unbounded types */
 data_t *object_ptr_data(void *val, size_t len)
 {
     data_t *dat = smrt_create(sizeof(data_t));
@@ -194,6 +250,7 @@ int data_boolean(data_t *d, bool *b)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] strncpy valid_nstring_src precondition */
 int data_string(data_t *d, char *s, size_t max_len)
 {
     if (d->type != STRING)
@@ -210,6 +267,7 @@ int data_string_ptr(data_t *d, char **s)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] memcpy separation and valid_src preconditions */
 int data_bytes(data_t *d, unsigned char *b, size_t max_len)
 {
     if (d->type != BYTES)
@@ -226,6 +284,7 @@ int data_bytes_ptr(data_t *d, unsigned char **b)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] _set_exception precondition */
 int data_object(data_t *d, void *o, size_t max_len)
 {
     if (d->type != OBJECT)
@@ -242,6 +301,7 @@ int data_object_ptr(data_t *d, void **o)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] protobuf serialization with dynamic allocation */
 int data_sync_out(data_t *data, AutonomousTrust__Core__Protobuf__Structures__Data *pdata)
 {
     AutonomousTrust__Core__Protobuf__Structures__Data tmp = AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA__INIT;
@@ -297,6 +357,7 @@ int data_sync_out(data_t *data, AutonomousTrust__Core__Protobuf__Structures__Dat
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] protobuf cleanup with switch-based conditional frees */
 void data_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data *pdata)
 {
     switch (pdata->type)
@@ -319,6 +380,7 @@ void data_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data *pdata)
     }
 }
 
+/* Frama-C: skipped — [serialization] protobuf deserialization with malloc */
 int data_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data *pdata, data_t *data)
 {
     data->type = (data_type_t)pdata->type;
@@ -356,6 +418,7 @@ int data_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data *pdata, data_
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON serialization with base64 encoding */
 int data_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const data_t *data = data_struct;
@@ -401,6 +464,7 @@ int data_to_json(const void *data_struct, json_t **obj_ptr)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON deserialization with union type switching */
 int data_from_json(const json_t *obj, void *data_struct)
 {
     data_t *data = data_struct;

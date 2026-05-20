@@ -29,7 +29,7 @@
 #include "processes/processes.h"
 // #include "protobuf/processes.pb-c.h"
 #include "config/configuration.h"
-#include "structures/map_priv.h"
+#include "structures/map.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/util.h"
 
@@ -39,11 +39,26 @@ const long cadence = 500000L; // microseconds
 
 typedef bool (*msg_handler_t)(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 
+/*@
+  requires \valid(proc);
+  requires name != \null && \valid_read(name);
+  requires \valid(configurations);
+  assigns proc->name[0 .. PROC_NAME_LEN],
+          proc->conf, proc->configs, proc->subsystems,
+          proc->logger, proc->dependencies, proc->runner,
+          proc->protocol.handlers;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
+/* Frama-C: skipped — [solver-timeout] logging/snprintf preconditions */
 int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies)
 {
     memset(proc->name, 0, PROC_NAME_LEN);
     memcpy(proc->name, name, PROC_NAME_LEN - 1);
-    // FIXME general config load/save
+    // Config loaded from per-process JSON files via load_all_configs()
     config_t *cfg = NULL;
     data_t *cfg_dat = NULL;
     memset(&proc->conf, 0, sizeof(config_t));
@@ -57,22 +72,30 @@ int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *confi
     proc->logger = logger;
     proc->dependencies = dependencies;
     proc->runner = runner;
-    return map_create(&proc->protocol.handlers); // FIXME protocol from config
+    if (pthread_rwlock_init(&proc->protocol.peers_rwlock, NULL) != 0)
+        return -1;
+    // TODO: Load protocol handler table from config to allow runtime customization
+    return map_create(&proc->protocol.handlers);
 }
 
+/* Frama-C: skipped — [solver-timeout] process lifecycle preconditions */
 int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
-                   map_t *procs, directory_t *queues, logger_t *logger)
+                   map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger)
 {
     process_t *proc;
     if (orig > 0)
     {
         char pid_str[32] = {0};
         snprintf(pid_str, 31, "%d", orig);
-        if (map_remove(procs, pid_str))
-            return -1;
-
-        data_t *proc_val;
-        if (map_get(procs, pname, &proc_val))
+        if (procs_lock != NULL)
+            pthread_mutex_lock(procs_lock);
+        int rc = map_remove(procs, pid_str);
+        data_t *proc_val = NULL;
+        if (rc == 0)
+            rc = map_get(procs, pname, &proc_val);
+        if (procs_lock != NULL)
+            pthread_mutex_unlock(procs_lock);
+        if (rc != 0)
             return -1;
         if (data_object_ptr(proc_val, (void **)&proc))
             return -1;
@@ -80,7 +103,7 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
     }
     else
     {
-        proc = smrt_create(sizeof(process_t)); // FIXME does this get freed?
+        proc = smrt_create(sizeof(process_t)); // freed via smrt_deref when process exits
         if (process_init(proc, pname, runner, configs, tracker, logger, NULL) != 0)
         {
             // process_init may fail if pname is not found in the configs map (EMAP_NOKEY);
@@ -92,7 +115,7 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
     char sig[SIG_NAME_LEN + 1] = {0};
     process_name_to_signal(pname, sig);
 
-    pid_t pid = proc->runner(proc, queues, sig, logger); // FIXME ensure child does run fnctn
+    pid_t pid = proc->runner(proc, queues, sig, logger);
     if (pid == -1)
     {
         log_error(logger, "Error starting process '%s'\n", pname);
@@ -104,27 +127,47 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
     snprintf(pid_str, 31, "%d", pid);
     // data_t *key_val = string_data(pname, strlen(pname));
     data_t *proc_val = object_ptr_data(proc, sizeof(process_t));
-    if (map_set(procs, pid_str, proc_val) != 0)
+    if (procs_lock != NULL)
+        pthread_mutex_lock(procs_lock);
+    int rc = map_set(procs, pid_str, proc_val);
+    if (procs_lock != NULL)
+        pthread_mutex_unlock(procs_lock);
+    if (rc != 0)
         return -1;
     return 0;
 }
 
 int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
-                  map_t *procs, directory_t *queues, logger_t *logger)
+                  map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger)
 {
-    return _process_start(-1, pname, runner, configs, tracker, procs, queues, logger);
+    return _process_start(-1, pname, runner, configs, tracker, procs, procs_lock, queues, logger);
 }
 
-int restart_process(pid_t orig, char *pname, map_t *procs, directory_t *queues, logger_t *logger)
+int restart_process(pid_t orig, char *pname, map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger)
 {
-    return _process_start(orig, pname, NULL, NULL, NULL, procs, queues, logger);
+    return _process_start(orig, pname, NULL, NULL, NULL, procs, procs_lock, queues, logger);
 }
 
+/*@
+  requires name != \null && \valid_read(name);
+  requires \valid(sig + (0 .. SIG_NAME_LEN));
+  assigns sig[0 .. SIG_NAME_LEN];
+*/
 void process_name_to_signal(const char *name, char *sig)
 {
     snprintf(sig, SIG_NAME_LEN, "%s_s", name);
 }
 
+/*@
+  requires name_in != \null && \valid_read(name_in);
+  assigns \nothing;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
+/* Frama-C: skipped — [solver-timeout] strncpy preconditions */
 int set_process_name(const char *name_in)
 {
     char name[PROC_NAME_LEN + 1] = {0};
@@ -136,12 +179,14 @@ int set_process_name(const char *name_in)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] logging/snprintf preconditions */
 inline int process_register_handler(const process_t *proc, char *func_name, handler_ptr_t handler)
 {
     data_t *h_dat = object_ptr_data(handler, sizeof(handler_ptr_t));
     return map_set(proc->protocol.handlers, func_name, h_dat);
 }
 
+/* Frama-C: skipped — [func-ptr] msg_handler_t callback dispatch */
 bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, generic_msg_t *msg)
 {
     switch (msgtype)
@@ -150,12 +195,39 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
         proc->protocol.group = msg->info.group;
         return true;
     case PEER:
-        memcpy(&proc->protocol.peers[proc->protocol.num_peers++], &msg->info.peer, sizeof(public_identity_t));
+        peers_write_lock(proc);
+        if (proc->protocol.num_peers < DEFAULT_MAX_PEERS)
+        {
+            memcpy(&proc->protocol.peers[proc->protocol.num_peers], &msg->info.peer, sizeof(public_identity_t));
+            proc->protocol.num_peers++;
+        }
+        peers_write_unlock(proc);
         return true;
+    case PEER_RTT_UPDATE: {
+        /* Net-proc → us: the authoritative RTT estimate for a peer. Look
+         * up by uuid and stash into peer_rtt_ms[]. If the PEER_RTT_UPDATE
+         * outran the PEER message, the peer isn't here yet — drop and
+         * rely on net_proc's future re-emission (or accept stale RTT).
+         * Scope of write lock is intentionally narrow: no callouts. */
+        const peer_rtt_update_msg_t *rtt = &msg->info.peer_rtt_update;
+        peers_write_lock(proc);
+        bool matched = false;
+        for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+            if (memcmp(proc->protocol.peers[i].uuid, rtt->peer_uuid, 16) == 0) {
+                proc->protocol.peer_rtt_ms[i] = rtt->rtt_ms;
+                matched = true;
+                break;
+            }
+        }
+        peers_write_unlock(proc);
+        if (!matched)
+            log_debug(proc->logger, "%s: rtt_update for unknown peer\n", proc->name);
+        return true;
+    }
     case PEER_CAPABILITIES:
         // pproc->peer_capabilities = message
         return true;
-    default:
+    default: {
         net_msg_t *nmsg = &msg->info.net_msg;
         if (strcmp(nmsg->process, proc->name) == 0)
         {
@@ -169,13 +241,18 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
             msg_handler_t handler;
             err = data_object_ptr(h_dat, (void *)&handler);
             if (err != 0)
+            {
+                log_warn(proc->logger, "%s: failed to extract handler for '%s'\n", proc->name, nmsg->function);
                 return false;
+            }
             return handler(proc, queues, msg);
         }
-    }
+    } // default
+    } // switch
     return false;
 }
 
+/* Frama-C: skipped — [syscall] IPC message queue read loop */
 bool keep_running(const process_t *proc, queue_t *sig_q, logger_t *logger)
 {
     if (gettimeofday((struct timeval *)&proc->start, NULL) != 0)
@@ -215,6 +292,12 @@ long timeval_subtract(struct timeval *a, struct timeval *b)
     return (sec * 1000L) + usec;
 }
 
+/* Frama-C: skipped —
+ * [func-ptr] run_message_handlers dispatches via msg_handler_t [syscall] keep_running
+ * reads from IPC message queue [solver-timeout] process_init/setup/start/loop/run:
+ * complex lifecycle with fork/queue/snprintf/strncpy preconditions; set_process_name:
+ * strncpy preconditions
+ */
 void sleep_until(const process_t *proc, long how_long)
 {
     struct timeval now;
@@ -225,6 +308,7 @@ void sleep_until(const process_t *proc, long how_long)
         usleep(delta);
 }
 
+/* Frama-C: skipped — [solver-timeout] complex lifecycle preconditions */
 int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
                   process_ctx_t *ctx)
 {
@@ -248,6 +332,12 @@ int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [func-ptr] run_message_handlers dispatches via msg_handler_t [syscall] keep_running
+ * reads from IPC message queue [solver-timeout] process_init/setup/start/loop/run:
+ * complex lifecycle with fork/queue/snprintf/strncpy preconditions; set_process_name:
+ * strncpy preconditions
+ */
 int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
                  process_ctx_t *ctx)
 {
@@ -259,8 +349,10 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
 
         generic_msg_t buf = {0};
         int err = messaging_recv(&buf);
-        if (err == -1)
-            continue; /* FIXME repair? */
+        if (err == -1) {
+            log_debug(proc->logger, "%s: message receive error\n", proc->name);
+            continue;
+        }
         if (err == ENOMSG)
             continue;
         if (!run_message_handlers(proc, queues, buf.type, &buf))
@@ -276,7 +368,7 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
             data_t *m_dat = object_ptr_data(msg, size);
             array_append(&unprocessed, m_dat);
         }
-        // FIXME post-msg handling activity
+        // Hook point for sub-process specific post-message activity (e.g. periodic tasks)
     }
     array_free(&unprocessed);
     array_free(queues);

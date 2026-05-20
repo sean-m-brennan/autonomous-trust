@@ -17,6 +17,10 @@
 #ifndef COMPILER_H
 #define COMPILER_H
 
+/** @addtogroup internal_utilities
+ *  @{
+ */
+
 #define QUOTE(x) #x
 
 #if defined __GNUC__
@@ -117,5 +121,8 @@
 #define _GCC_DIAGNOSTIC(which) QUOTE(GCC diagnostic ignored #which)
 
 #endif // __GNUC__
+
+
+/** @} */ /* end of internal_utilities */
 
 #endif // COMPILER_H

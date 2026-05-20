@@ -31,6 +31,7 @@ int array_init(array_t *a)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] _set_exception precondition */
 int array_create(array_t **array_ptr)
 {
     if (array_ptr == NULL)
@@ -43,6 +44,7 @@ int array_create(array_t **array_ptr)
     return err;
 }
 
+/* Frama-C: skipped — [solver-timeout] memcpy valid_src/valid_dest preconditions */
 int array_copy(array_t *a, array_t *cpy)
 {
     if (a == NULL)
@@ -55,8 +57,14 @@ int array_copy(array_t *a, array_t *cpy)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] not_found ensures */
 int array_find(array_t *a, data_t *element)
 {
+    /*@
+      loop invariant 0 <= i <= a->size;
+      loop assigns i;
+      loop variant a->size - i;
+    */
     for (int i = 0; i < a->size; i++)
     {
         if (data_equal(a->array[i], element))
@@ -67,6 +75,11 @@ int array_find(array_t *a, data_t *element)
 
 int array_filter(array_t *a, bool (*filter)(data_t*))
 {
+    /*@
+      loop invariant 0 <= i <= a->size;
+      loop assigns i;
+      loop variant a->size - i;
+    */
     for (int i = 0; i < a->size; i++)
     {
         if (filter(a->array[i]))
@@ -90,16 +103,18 @@ int array_append(array_t *a, data_t *element)
     return array_set(a, a->size, element);
 }
 
+/* Frama-C: skipped — [solver-timeout] in_bounds ensures + _set_exception */
 int array_get(array_t *a, int index, data_t **element)
 {
     if (index < 0)
         index = a->size + index;
-    if (index > a->size)
+    if (index >= (int)a->size)
         return EXCEPTION(EARR_OOB);
     *element = a->array[index];
     return 0;
 }
 
+/* Frama-C: skipped — [alloc-pattern] element replacement */
 int array_set(array_t *a, int index, data_t *element)
 {
     if (index < 0)
@@ -108,12 +123,13 @@ int array_set(array_t *a, int index, data_t *element)
         return EXCEPTION(EARR_OOB);
 
     if (index == a->size) {
+        /* Skip realloc only on the first insert into a freshly-init'd array:
+         * array_init pre-allocates 1 slot, so size==0 && array!=NULL means
+         * that slot is still free. Every other case must grow. */
         if (a->size > 0 || a->array == NULL) {
             size_t new_size = (a->size + 1) * sizeof(data_t);
-            data_t **bigger_array = smrt_recreate(a->array, new_size);
-            if (bigger_array == NULL)
+            if (smrt_recreate((void **)&a->array, new_size) != 0)
                 return EXCEPTION(ENOMEM);
-            a->array = bigger_array;
         }
         a->size++;
     }
@@ -121,6 +137,7 @@ int array_set(array_t *a, int index, data_t *element)
     return 0;
 }
 
+/* Frama-C: skipped — [alloc-pattern] memmove compaction */
 int array_remove(array_t *a, data_t *element)
 {
     int index = array_find(a, element);
@@ -134,8 +151,14 @@ int array_remove(array_t *a, data_t *element)
     return 0;
 }
 
+/* Frama-C: skipped — [alloc-pattern] iterative element free */
 void array_free(array_t *a)
 {
+    /*@
+      loop invariant 0 <= i <= a->size;
+      loop assigns i;
+      loop variant a->size - i;
+    */
     for (int i=0; i< a->size; i++)
         smrt_deref(a->array[i]);
     smrt_deref(a->array);
@@ -144,24 +167,47 @@ void array_free(array_t *a)
     smrt_deref(a);
 }
 
-int array_sync_out(array_t *array, AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t *n)
+/* Frama-C: skipped — [serialization] protobuf serialization */
+int array_sync_out(array_t *array, AutonomousTrust__Core__Protobuf__Structures__Data ***parr_ptr, size_t *n)
 {
-    parr = calloc(array->size, sizeof(AutonomousTrust__Core__Protobuf__Structures__Data));
     *n = array->size;
-    for (int i=0; i<array->size; i++) {
-        data_t *elt;
+    if (array->size == 0) {
+        *parr_ptr = NULL;
+        return 0;
+    }
+    AutonomousTrust__Core__Protobuf__Structures__Data **parr =
+        calloc(array->size, sizeof(AutonomousTrust__Core__Protobuf__Structures__Data *));
+    if (parr == NULL)
+        return EXCEPTION(ENOMEM);
+    for (size_t i = 0; i < array->size; i++) {
+        parr[i] = malloc(sizeof(AutonomousTrust__Core__Protobuf__Structures__Data));
+        if (parr[i] == NULL)
+            return EXCEPTION(ENOMEM);
+        autonomous_trust__core__protobuf__structures__data__init(parr[i]);
+        data_t *elt = NULL;
         if (array_get(array, i, &elt) != 0)
             return -1;
         data_sync_out(elt, parr[i]);
     }
+    *parr_ptr = parr;
     return 0;
 }
 
-void array_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data **parr)
+/* Frama-C: skipped — [serialization] protobuf cleanup */
+void array_proto_free(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t n)
 {
-    smrt_deref(parr);
+    if (parr == NULL)
+        return;
+    for (size_t i = 0; i < n; i++) {
+        if (parr[i] != NULL) {
+            data_proto_free(parr[i]);
+            free(parr[i]);
+        }
+    }
+    free(parr);
 }
 
+/* Frama-C: skipped — [serialization] protobuf deserialization */
 int array_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size_t n, array_t *array)
 {
     for(int i=0; i<n; i++) {
@@ -175,6 +221,7 @@ int array_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data **parr, size
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON serialization */
 int array_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const array_t *array = data_struct;
@@ -195,6 +242,7 @@ int array_to_json(const void *data_struct, json_t **obj_ptr)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON deserialization */
 int array_from_json(const json_t *obj, void *data_struct)
 {
     array_t *array = data_struct;

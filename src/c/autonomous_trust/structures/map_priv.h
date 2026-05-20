@@ -26,25 +26,76 @@
 #include "array_priv.h"
 #include "structures/map.pb-c.h"
 
-struct map_s
-{
-    smrt_ptr_t;
-    map_item_t *items;
-    size_t length;
-    size_t capacity;
-    array_t keys;
-    unsigned char hashkey[crypto_shorthash_KEYBYTES];
-};
+/* Verify our constant matches libsodium */
+_Static_assert(MAP_HASHKEY_BYTES == crypto_shorthash_KEYBYTES,
+               "MAP_HASHKEY_BYTES must match crypto_shorthash_KEYBYTES");
 
 
+/*@
+  requires map_valid(map);
+  requires \valid(dmap);
+  assigns dmap->map, dmap->n_map;
+  behavior success:
+    ensures \result == 0;
+    ensures dmap->n_map == map->length;
+  behavior failure:
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int map_sync_out(map_t *map, AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap);
 
+/*@
+  requires \valid(dmap);
+  assigns dmap->map;
+  frees dmap->map;
+  ensures dmap->map == \null;
+*/
 void map_proto_free(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap);
 
+/*@
+  requires \valid(dmap);
+  requires map_valid(map);
+  assigns map->items[0 .. map->capacity - 1], map->length, map->capacity, map->keys;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int map_sync_in(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap, map_t *map);
 
+/*@
+  requires \valid(data_struct);
+  requires \valid(obj_ptr);
+  assigns *obj_ptr;
+  behavior success:
+    ensures \result == 0;
+    ensures *obj_ptr != \null;
+  behavior failure:
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int map_to_json(const void *data_struct, json_t **obj_ptr);
 
+/*@
+  requires \valid_read(obj);
+  requires \valid(data_struct);
+  assigns ((map_t *)data_struct)->length,
+          ((map_t *)data_struct)->capacity,
+          ((map_t *)data_struct)->items,
+          ((map_t *)data_struct)->keys,
+          ((map_t *)data_struct)->hashkey[0 .. MAP_HASHKEY_BYTES - 1];
+  behavior success:
+    ensures \result == 0;
+    ensures ((map_t *)data_struct)->length <= ((map_t *)data_struct)->capacity;
+  behavior failure:
+    ensures \result != 0;
+  complete behaviors;
+  disjoint behaviors;
+*/
 int map_from_json(const json_t *obj, void *data_struct);
 
 #endif  // MAP_PRIV_H

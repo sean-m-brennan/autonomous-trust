@@ -57,16 +57,24 @@ const char *rootDir()
     return root;
 }
 
+/* Frama-C: skipped — get_data_dir / get_cfg_dir: path_join with assigns. */
 int get_cfg_dir(char path[])
 {
-    return snprintf(path, 255, "%s/%s", rootDir(), CFG_PATH);
+    return path_join(path, 255, rootDir(), CFG_PATH);
 }
 
+/* Frama-C: skipped — get_data_dir / get_cfg_dir: path_join with assigns. */
 int get_data_dir(char path[])
 {
-    return snprintf(path, 255, "%s/%s", rootDir(), DATA_PATH);
+    return path_join(path, 255, rootDir(), DATA_PATH);
 }
 
+/* Frama-C: skipped — find_configuration: 3x assigns + ensures. */
+/*@
+  requires name != \null && \valid_read(name);
+  assigns \nothing;
+  ensures \result == \null || \valid(\result);
+*/
 config_t *find_configuration(const char *name)
 {
     for (size_t i = 0; i < configuration_table_size; i++)
@@ -78,6 +86,7 @@ config_t *find_configuration(const char *name)
     return NULL;
 }
 
+/* Frama-C: skipped — num_config_files: terminates. */
 int num_config_files(char path[])
 {
     DIR *d = opendir(path);
@@ -95,6 +104,10 @@ int num_config_files(char path[])
     return i;
 }
 
+/* Frama-C: skipped —
+ * all_config_files: readdir + strncpy/strlen/strcmp/strchr + string_data + set_exception
+ * cascade.
+ */
 int all_config_files(char dir[], array_t *paths)
 {
     DIR *d = opendir(dir);
@@ -127,27 +140,80 @@ int all_config_files(char dir[], array_t *paths)
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [alloc-pattern] config_absolute_path: at_memcpy + strstr/strlen + 4x set_exception
+ * cascade.
+ */
 int config_absolute_path(const char *path_in, char *path_out)
 {
+    if (path_in == NULL || path_out == NULL)
+        return EXCEPTION(EINVAL);
+
     char cfg_dir[CFG_PATH_LEN + 1];
     int len = get_cfg_dir(cfg_dir);
     if (len < 0 || len > CFG_PATH_LEN)
         return -1;
-    if (strncmp(path_in, cfg_dir, strlen(cfg_dir)) != 0)
+
+    /* Reject traversal segments outright.  Legitimate config names never
+     * contain "..", so a substring check is acceptable even though it
+     * also rejects oddities like "foo..bar.cfg.json". */
+    if (strstr(path_in, "..") != NULL)
     {
-        int remain = snprintf(path_out, 255, "%s/%s", cfg_dir, path_in);
-        if (remain < 0)
-            return -1; // FIXME set error?
+        log_info(NULL, "config_absolute_path: rejected traversal in '%s'\n", path_in);
+        return EXCEPTION(EINVAL);
     }
+
+    /* Absolute inputs must already sit inside cfg_dir.  Require that the
+     * match is followed by '/' (or end of string) so "/etc/at_evil" is
+     * NOT accepted as prefixed by "/etc/at". */
+    if (path_in[0] == '/')
+    {
+        size_t dir_len = strlen(cfg_dir);
+        if (strncmp(path_in, cfg_dir, dir_len) != 0 ||
+            (path_in[dir_len] != '\0' && path_in[dir_len] != '/'))
+        {
+            log_info(NULL, "config_absolute_path: '%s' outside cfg_dir '%s'\n",
+                     path_in, cfg_dir);
+            return EXCEPTION(EINVAL);
+        }
+        size_t total = strlen(path_in);
+        if (total > CFG_PATH_LEN)
+            return EXCEPTION(EINVAL);
+        memcpy(path_out, path_in, total + 1);   /* includes NUL */
+        return 0;
+    }
+
+    /* Relative path: join under cfg_dir. */
+    int remain = path_join(path_out, CFG_PATH_LEN, cfg_dir, path_in);
+    if (remain < 0)
+        return EXCEPTION(EINVAL);
     return 0;
 }
 
+/* Frama-C: skipped —
+ * [syscall] read_config_file: file I/O + strncpy + 3x set_exception + terminates_part
+ * cascade.
+ */
+/*@
+  requires filename != \null && \valid_read(filename);
+  requires data_struct != \null && \valid(data_struct);
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int read_config_file(const char *filename, void *data_struct)
 {
     char typename[CFG_NAME_SIZE + 1] = {0};
     json_t *root = json_load_file(filename, 0, NULL);
-    if (root == NULL || !json_is_object(root))
-        return EXCEPTION(ECFG_BADFMT);  // FIXME 'network'
+    if (root == NULL)
+        return EXCEPTION(ECFG_BADFMT);  // caller (load_config) logs the config name
+    if (!json_is_object(root))
+    {
+        json_decref(root);
+        return EXCEPTION(ECFG_BADFMT);
+    }
 
     json_t *name_obj = json_object_get(root, "typename");
     if (name_obj == NULL || !json_is_string(name_obj))
@@ -159,13 +225,27 @@ int read_config_file(const char *filename, void *data_struct)
 
     config_t *cfg = find_configuration(typename);
     if (cfg == NULL)
+    {
+        json_decref(root);
         return EXCEPTION(ECFG_NOIMPL);
+    }
 
     int err = cfg->from_json(root, data_struct);
     json_decref(root); // frees created tree
     return err;
 }
 
+/*@
+  requires \valid(cfg_obj);
+  requires data_struct != \null && \valid_read(data_struct);
+  requires filename != \null && \valid_read(filename);
+  assigns \nothing;
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int write_config_file(const config_t *cfg_obj, const void *data_struct, const char *filename)
 {
     json_t *root;
@@ -174,10 +254,9 @@ int write_config_file(const config_t *cfg_obj, const void *data_struct, const ch
         return err;
 
     err = json_dump_file(root, filename, 0);
+    json_decref(root); // frees created tree
     if (err != 0)
         return EXCEPTION(EJSN_DUMP); // ECFG_BADFMT);
-
-    json_decref(root); // frees created tree
     return 0;
 }
 
@@ -245,6 +324,21 @@ int load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger)
     return num_err;
 }
 
+/* Frama-C: skipped —
+ * [solver-timeout] load_config: 9x assigns + smrt_deref/smrt_create + at_memcpy + success
+ * ensures + log_exception_extra precondition cascade.
+ */
+/*@
+  requires filepath == \null || \valid_read(filepath);
+  requires \valid(config_ptr);
+  behavior null_path:
+    assumes filepath == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes filepath != \null;
+    ensures \result == 0 ==> *config_ptr != \null;
+  disjoint behaviors;
+*/
 int load_config(char *filepath, config_t **config_ptr, char *cfg_name, logger_t *logger)
 {
     if (filepath == NULL)
@@ -269,7 +363,16 @@ int load_config(char *filepath, config_t **config_ptr, char *cfg_name, logger_t 
     char cfg_name_stack[CFG_NAME_SIZE + 1] = {0};
     if (cfg_name == NULL)
         cfg_name = cfg_name_stack;
-    strncpy(cfg_name, filename, min(CFG_PATH_LEN - 1, strlen(filename) - extlen));
+    /* Cap at the DESTINATION size (CFG_NAME_SIZE), not CFG_PATH_LEN — the
+     * latter is ~4x larger and was overflowing cfg_name for long basenames. */
+    size_t copy = (size_t)(strlen(filename) - extlen);
+    if (copy > CFG_NAME_SIZE)
+        copy = CFG_NAME_SIZE;
+    /* memcpy (not strncpy): `copy` is computed from src length, so there is
+     * never a NUL inside the range; explicit NUL at [copy]. Avoids
+     * -Wstringop-truncation false positive on length-from-source patterns. */
+    memcpy(cfg_name, filename, copy);
+    cfg_name[copy] = '\0';
     *config_ptr = find_configuration(cfg_name);
     config_t *config = *config_ptr;
     if (config == NULL)

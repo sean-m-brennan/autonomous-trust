@@ -129,7 +129,11 @@ class Identity(InitializableConfig, AgreementVoter):
         :param nonce: bytes
         :return: bytes
         """
-        return Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)  # TODO decode?
+        plaintext = Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)
+        try:
+            return plaintext.decode('utf-8')
+        except (UnicodeDecodeError, AttributeError):
+            return plaintext
 
     def publish(self):
         return Identity(self.uuid, self.address, self.fullname, self.nickname,

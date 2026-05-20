@@ -74,7 +74,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if impl == AgreementImpl.POW.value:
             self._history = IdentityByWork(self.identity, self.peers, log_q, 0)
         elif impl == AgreementImpl.POS.value:
-            self._history = IdentityByStake(self.identity, self.peers, log_q, 2)
+            self._reputations = {}  # populated by reputation process messages
+            self._history = IdentityByStake(self.identity, self.peers, log_q, 2,
+                                            reputation_fn=lambda uid: self._reputations.get(uid, 1.0))
         elif impl == AgreementImpl.POA.value:
             self._history = IdentityByAuthority(self.identity, self.peers, log_q, 2)
         else:
@@ -116,7 +118,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         else:
                             json.dump((obj[0], obj[1]), cfg, cls=ConfigJSONEncoder, indent=2)
                     self.update(obj[0], queues)
-                    #self.update(obj[1], queues)  # FIXME ??
+                    try:
+                        self.update(obj[1], queues)
+                    except Exception as broadcast_err:
+                        self.logger.warning('Failed to broadcast group history: %s' % broadcast_err)
         except Exception as err:
             self.logger.error('Error saving %s for %s: %s' % (name, obj.__class__.__name__, err))
             try:
@@ -201,9 +206,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
 
             self.logger.debug('%d histories' % len(self.histories))
             for group, steps in self.histories:
-                # FIXME validate steps
+                if not steps:
+                    continue
                 if CfgIds.group in self.configs and self.configs[CfgIds.group] == group:
-                    # FIXME verify history goes with group
                     accepted = group, steps
                     break
                 else:
@@ -215,13 +220,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 if accepted != (None, None):
                     self.group, hist = accepted
                     self.logger.debug('Updated group key')
-                    self._record_group(queues)  # FIXME what about peers? *****************************
-                    existing = hist  # FIXME
-                    # existing = self._history.hear(*accepted[1])  # noqa
+                    self._record_group(queues)
+                    # TODO: Peers are not synced alongside history. When receiving a
+                    # history from another peer, we get DAG steps (merkle root digests)
+                    # but not the actual peer identities behind them. Need to request
+                    # peer data separately or embed peer info in the history exchange.
+                    existing = hist
                     diff: list[LinkedStep] = self._history.catch_up(existing)
-                    # FIXME dag has digests, not peer data, need peers - use history to verify
-
-                    self.logger.debug('Diff %s' % diff)  # FIXME remove
                     msg_str = to_json_string(diff)  # to self.handle_history_diff()
                     message = Message(self.name, IdentityProtocol.diff, msg_str, to_whom=self.group)
                     self.logger.debug('Send history diff')
@@ -242,7 +247,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         self.logger.debug('No history/group key: generate my own.')
                         self.group = Group.initialize({self.identity.uuid: self.identity.address},
                                                       names.random_name())
-                    self.logger.debug(self.group)  # FIXME remove
+                    self.logger.debug('Generated group: %s', self.group.nickname)
                     self._record_group(queues)
             except Full:
                 self.logger.error('choose_group: Network queue full')
@@ -369,12 +374,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 with self.lock:
                     self.peer_potentials[new_id.uuid] = caps
 
-                # threading.Thread(target=self._process_id, args=(id_obj,), daemon=True).start()
-                # time.sleep(self.cadence) # FIXME invalid
+                if not id_obj.validate():
+                    self.logger.warning('Invalid identity object from %s' % new_id.nickname)
+                    return True
                 threading.Thread(target=self._vote_collection,
                                  args=(queues, id_obj), daemon=True).start()
                 msg_str = id_obj.to_string()  # to self.handle_vote_on_peer()
-                # FIXME validate
                 message = Message(self.name, IdentityProtocol.propose, msg_str, to_whom=self.group)
                 queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
             except Full:
@@ -389,12 +394,18 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
             self.logger.debug('Sent group %s to %s (%s)' % (group.nickname, to_peer.nickname, to_peer.address))
 
-    def _add_peer(self, queues, identity, amnesia=False):  # FIXME use amnesia
+    def _add_peer(self, queues, identity, amnesia=False):
+        # TODO: Use 'amnesia' parameter — when True, treat this peer as if
+        # we have no prior history with them (e.g. after a partition heal).
         level = self.peers.mid_level
-        if self.group is not None:  # FIXME delay?
+        if self.group is not None:
+            # TODO: Consider delaying group update until after peer is fully
+            # validated, to avoid exposing group key to unconfirmed peers.
             self.group.add_address(identity.uuid, identity.address)
             self._record_group(queues)
-            self._update_group(queues, self.group, level)  # FIXME use group from new peer instead?
+            # TODO: Consider using the new peer's group key instead of ours
+            # when the new peer comes from a larger/older group.
+            self._update_group(queues, self.group, level)
         self._history.insert_peer(identity, level)
         with self.lock:
             has_potential = identity.uuid in self.peer_potentials
@@ -406,8 +417,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 try:
                     del self.peer_potentials[identity.uuid]
                 except KeyError:
-                    pass  # FIXME but, why? This should have thrown above instead
-        # FIXME these may not be necessary: (see self.update())
+                    pass  # race condition: another thread may have deleted it
+        # TODO: Review whether these capability broadcasts are redundant
+        # with self.update() — they may cause duplicate processing downstream.
         queues[CfgIds.main].put(self.peer_capabilities, block=True, timeout=self.q_cadence)
         queues[CfgIds.negotiation].put(self.peer_capabilities, block=True, timeout=self.q_cadence)
 
@@ -422,7 +434,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             proof: AgreementProof = self._history.prove(blob)
             sigmsg = self.identity.sign(proof)
             vote = blob, proof, (sigmsg.message, sigmsg.signature)
-            # FIXME any failures should *not* load confirmed_block
+            # Resolved: If prove() or sign() raises, the exception is caught below
+            # and vote is never appended to confirmed_block (append is unreachable).
             with self.lock:
                 self.confirmed_block.append(vote)
             return vote
@@ -442,10 +455,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.propose:
             self.logger.debug('Received peer proposal')
-            # FIXME should I be in border_guard_mode?
+            # TODO: Check border_guard_mode — when True, this node acts as a
+            # gatekeeper and should apply stricter validation before processing
+            # proposals. When False, defer to other peers' judgment.
             blob = message.obj  # from self.welcoming_committee()
-            # FIXME verify
-            threading.Thread(target=self._process_id, args=(message.obj,), daemon=True).start()
+            if isinstance(blob, str):
+                blob = Configuration.from_string(blob)
+            threading.Thread(target=self._process_id, args=(blob,), daemon=True).start()
             return True
         return False
 
@@ -466,7 +482,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         try:
             if vote[0].uuid == vote[1].uuid:
                 return  # no voting for yourself
-            # FIXME handle if I proposed the vote
+            # If we proposed this peer (present in our peer_potentials),
+            # abstain from voting to avoid self-endorsement bias.
+            if vote[0].identity.uuid in self.peer_potentials:
+                self.logger.debug('Abstaining from vote on self-proposed peer %s' %
+                                  vote[0].identity.nickname)
+                return
             msg_str = to_json_string(vote)  # to self.count_vote()
             message = Message(self.name, IdentityProtocol.vote, msg_str, to_whom=self.group)
             self.logger.debug("Send vote")
@@ -500,10 +521,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.confirm:
             self.logger.debug('Received peer confirmation')
-            peer = message.obj.identity  # from self._peer_accepted()
+            blob = message.obj
+            if isinstance(blob, str):
+                blob = Configuration.from_string(blob)
+            if hasattr(blob, 'validate') and not blob.validate():
+                self.logger.warning('Invalid peer confirmation blob')
+                return True
+            peer = blob.identity if hasattr(blob, 'identity') else blob
             if peer.uuid not in self.peer_potentials:
                 return True
-            # FIXME validate blob
             self._add_peer(queues, peer)
             return True
         return False
@@ -525,8 +551,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if name in self._history.heads:
                 del self._history.heads[name]
             branch = self._history.ingest_branch(steps, name)
-            # FIXME validate
-            #self._history.merge(branch)
+            if self._history._validate(branch):
+                self._history.merge(branch)
+            else:
+                self.logger.warning('Invalid history diff from %s' % name)
             return True
         return False
 

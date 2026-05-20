@@ -13,18 +13,18 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Tests for PoliteObserver event parsing and policy evaluation."""
+"""Tests for KithCovenantObserver event parsing and policy evaluation."""
 
 from datetime import datetime, timedelta
 
 import pytest
 
 try:
-    from polite.policy import null_policy, strict_policy
+    from kith_covenant.policy import null_policy, strict_policy
 except ImportError:
-    pytest.skip("polite package not on PYTHONPATH", allow_module_level=True)
+    pytest.skip("kith_covenant package not on PYTHONPATH", allow_module_level=True)
 
-from autonomous_trust.evaluation.polite.observer import PoliteObserver
+from autonomous_trust.evaluation.kith_covenant.observer import KithCovenantObserver
 
 
 class TestEventParsing:
@@ -32,7 +32,7 @@ class TestEventParsing:
 
     @pytest.fixture
     def observer(self):
-        obs = PoliteObserver.__new__(PoliteObserver)
+        obs = KithCovenantObserver.__new__(KithCovenantObserver)
         obs.policy = null_policy()
         obs.output_path = None
         obs._init_state()
@@ -73,7 +73,7 @@ class TestPolicyEvaluation:
 
     @pytest.fixture
     def observer(self):
-        obs = PoliteObserver.__new__(PoliteObserver)
+        obs = KithCovenantObserver.__new__(KithCovenantObserver)
         obs.policy = strict_policy()  # min_reputation=0.5
         obs.output_path = None
         obs._init_state()
@@ -118,7 +118,7 @@ class TestPolicyEvaluation:
 class TestReport:
 
     def test_report_structure(self):
-        obs = PoliteObserver.__new__(PoliteObserver)
+        obs = KithCovenantObserver.__new__(KithCovenantObserver)
         obs.policy = null_policy()
         obs.output_path = None
         obs._init_state()

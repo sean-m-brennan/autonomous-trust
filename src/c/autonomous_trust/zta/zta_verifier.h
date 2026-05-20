@@ -17,6 +17,10 @@
 #ifndef ZTA_VERIFIER_H
 #define ZTA_VERIFIER_H
 
+/** @addtogroup internal_zta
+ *  @{
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -125,16 +129,32 @@ typedef struct zta_verifier_s {
  * @param out Output: newly allocated verifier (caller must destroy)
  * @return 0 on success
  */
+/*@
+  requires \valid(out);
+  allocates *out;
+  ensures \result == 0;
+  ensures *out != \null;
+*/
 int zta_null_verifier_create(zta_verifier_t **out);
 
 /**
  * @brief Fill a zta_result_t with the given status and reason
  */
+/*@
+  requires \valid(result);
+  assigns result->status, result->reason[0 .. ZTA_REASON_LEN - 1],
+          result->timestamp;
+  ensures result->status == status;
+*/
 void zta_result_set(zta_result_t *result, zta_status_t status, const char *reason);
 
 /**
  * @brief Return a human-readable string for a zta_status_t
  */
+/*@
+  assigns \nothing;
+  ensures \result != \null && \valid_read(\result);
+*/
 const char *zta_status_str(zta_status_t status);
 
 /* Error codes */
@@ -150,5 +170,8 @@ DECLARE_ERROR(EZTA_UNSUPPORTED, "Operation not supported by this verifier");
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+
+/** @} */ /* end of internal_zta */
 
 #endif /* ZTA_VERIFIER_H */

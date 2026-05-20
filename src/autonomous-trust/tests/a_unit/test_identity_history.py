@@ -269,10 +269,16 @@ class TestIdentityByStake:
         result = h.prove(blob)
         assert result is None
 
-    def test_get_stake(self):
+    def test_get_stake_default(self):
         h = self._make()
         voter = _make_mock_identity()
-        assert h._get_stake(voter) == 0
+        assert h._get_stake(voter) == 1.0  # default when no reputation_fn
+
+    def test_get_stake_with_reputation(self):
+        h = self._make()
+        h._reputation_fn = lambda uid: 0.75
+        voter = _make_mock_identity()
+        assert h._get_stake(voter) == 0.75
 
     def test_finalize(self):
         h = self._make()

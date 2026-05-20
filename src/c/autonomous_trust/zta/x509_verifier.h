@@ -17,6 +17,10 @@
 #ifndef X509_VERIFIER_H
 #define X509_VERIFIER_H
 
+/** @addtogroup internal_zta
+ *  @{
+ */
+
 #include "zta_verifier.h"
 
 #ifdef __cplusplus
@@ -45,6 +49,17 @@ typedef struct {
  * @param out   Output: newly allocated verifier (caller must destroy)
  * @return 0 on success, error code on failure
  */
+/*@
+  requires \valid(cfg);
+  requires \valid(out);
+  allocates *out;
+  behavior success:
+    ensures \result == 0;
+    ensures *out != \null;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
 int x509_verifier_create(const x509_verifier_config_t *cfg,
                          zta_verifier_t **out);
 
@@ -61,5 +76,8 @@ DECLARE_ERROR(EX509_VERIFY, "X.509 certificate verification failed");
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+
+/** @} */ /* end of internal_zta */
 
 #endif /* X509_VERIFIER_H */

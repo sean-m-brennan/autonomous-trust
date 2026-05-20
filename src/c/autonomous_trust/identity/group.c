@@ -24,9 +24,11 @@
 
 #include "config/configuration.h"
 #include "group.h"
+#include "structures/map_priv.h"
 #include "identity_priv.h"
 #include "utilities/util.h"
 
+/* Frama-C: skipped — [solver-timeout] container initialization preconditions */
 int group_init(uuid_t *uuid, char *address, group_t *group)
 {
     if (uuid == NULL)
@@ -34,6 +36,8 @@ int group_init(uuid_t *uuid, char *address, group_t *group)
     else
         memcpy(&group->uuid, uuid, sizeof(uuid_t));
     strncpy(group->address, address, ADDR_LEN);
+    group->address[ADDR_LEN] = '\0';   /* strncpy does not terminate when src is >= ADDR_LEN */
+    map_init(&group->address_map);
     unsigned char *eseed = encryptor_generate();
     if (eseed == NULL)
         return -1;
@@ -42,6 +46,7 @@ int group_init(uuid_t *uuid, char *address, group_t *group)
     return 0;
 }
 
+/* Frama-C: skipped — [solver-timeout] smrt_ptr allocation postconditions */
 int group_create(uuid_t *uuid, char *address, group_t **grp)
 {
     *grp = smrt_create(sizeof(group_t));
@@ -57,11 +62,46 @@ int group_encrypt(const group_t *ident, const msg_str_t *in, const group_t *whom
     return crypto_box_easy(cipher, in->msg, in->len, nonce, whom->encryptor.public, ident->encryptor.private);
 }
 
+/* Frama-C: skipped — [solver-timeout] libsodium decrypt preconditions */
 int group_decrypt(const group_t *ident, const msg_str_t *cipher, const group_t *whom, const unsigned char *nonce, unsigned char *out)
 {
     return crypto_box_open_easy(out, cipher->msg, cipher->len, nonce, whom->encryptor.public, ident->encryptor.private);
 }
 
+/* Frama-C: skipped — [solver-timeout] array precondition cascade */
+int group_add_address(group_t *group, const char *uuid_str, const char *address)
+{
+    if (group == NULL || uuid_str == NULL || address == NULL)
+        return EINVAL;
+
+    /* Check for address collision: remove any existing entry with same address
+       but different UUID (mirrors Python add_address collision handling) */
+    map_key_t key;
+    data_t *value;
+    char collision_key[UUID_STRING_LEN + 1] = {0};
+    bool found_collision = false;
+    map_entries_for_each(&group->address_map, key, value)
+        string_t addr = NULL;
+        if (data_string_ptr(value, &addr) == 0 && strcmp(addr, address) == 0)
+        {
+            if (strcmp(key, uuid_str) != 0)
+            {
+                strncpy(collision_key, key, UUID_STRING_LEN);
+                found_collision = true;
+            }
+        }
+    map_end_for_each
+
+    if (found_collision)
+        map_remove(&group->address_map, collision_key);
+
+    data_t *addr_data = string_data((char *)address, strlen(address));
+    if (addr_data == NULL)
+        return ENOMEM;
+    return map_set(&group->address_map, (map_key_t)uuid_str, addr_data);
+}
+
+/* Frama-C: skipped — [serialization] jansson JSON serialization */
 int group_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const group_t *ident = data_struct;
@@ -69,15 +109,19 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
     json_t *obj = *obj_ptr;
     if (obj == NULL)
         return EXCEPTION(ENOMEM);
- 
+
     int err = json_object_set_new(obj, "typename", json_string("group"));
     if (err != 0)
         return EXCEPTION(EJSN_OBJ_SET);
- 
+
     char uuid_str[UUID_STRING_LEN+1] = {0};
     uuid_unparse(ident->uuid, uuid_str);
     json_object_set(obj, "uuid", json_string(uuid_str));
     json_object_set(obj, "address", json_string((char *)ident->address));
+
+    json_t *addr_map;
+    map_to_json(&ident->address_map, &addr_map);
+    json_object_set_new(obj, "address_map", addr_map);
 
     json_t *encr = json_object();
     unsigned char *hex = encryptor_publish(&ident->encryptor); // encoded
@@ -88,6 +132,7 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] jansson JSON deserialization */
 int group_from_json(const json_t *obj, void *data_struct)
 {
     group_t *group = data_struct;
@@ -95,6 +140,24 @@ int group_from_json(const json_t *obj, void *data_struct)
     const char *uuid_str = json_string_value(uuid_obj);
     if (uuid_parse(uuid_str, group->uuid) < 0)
         return -1;
+
+    json_t *addr_obj = json_object_get(obj, "address");
+    if (addr_obj != NULL)
+    {
+        const char *addr = json_string_value(addr_obj);
+        if (addr != NULL)
+        {
+            strncpy(group->address, addr, ADDR_LEN);
+            group->address[ADDR_LEN] = '\0';
+        }
+    }
+
+    json_t *addr_map_obj = json_object_get(obj, "address_map");
+    if (addr_map_obj != NULL)
+        map_from_json(addr_map_obj, &group->address_map);
+    else
+        map_init(&group->address_map);
+
     uint8_t *seed = (uint8_t *)json_object_get(json_object_get(obj, "encryptor"), "hex_seed");
     encryptor_init(&group->encryptor, seed); // decoded
     return 0;
@@ -116,6 +179,7 @@ int group_sync_out(group_t *group, AutonomousTrust__Core__Protobuf__Identity__Gr
     return 0;
 }
 
+/* Frama-C: skipped — [serialization] protobuf deserialization */
 int group_sync_in(AutonomousTrust__Core__Protobuf__Identity__Group *proto, group_t *group)
 {
     memcpy(group->uuid, proto->uuid.data, sizeof(uuid_t));
@@ -154,5 +218,9 @@ int proto_to_group(uint8_t *data, size_t len, group_t *group)
 
 void group_free(group_t *group)
 {
+    if (group == NULL)
+        return;
+    if (group->address_map.items != NULL)
+        map_free(&group->address_map);
     smrt_deref(group);
 }
