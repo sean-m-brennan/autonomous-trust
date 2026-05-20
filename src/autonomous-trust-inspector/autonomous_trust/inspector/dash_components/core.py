@@ -125,9 +125,11 @@ class DashControl(object):
         self.verbose = verbose
         self.inherited_logger = logger
 
+        # Dash 4 bundles its own Plotly.js; the external "plotly-latest"
+        # CDN URL is frozen at v1.58.5 (July 2021) and only produces a
+        # console warning. jQuery is still needed by viz/js/force.js.
         external_scripts = [
             "https://code.jquery.com/jquery-3.6.0.min.js",
-            "https://cdn.plot.ly/plotly-latest.min.js"
         ]
 
         self.ws_loop = asyncio.new_event_loop()

@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AT-core probe viz</title>
+<!--
+  Single-file bootstrap-timeline visualizer for the AT_PROBES JSONL
+  stream (Stage 4 of the debug-tooling subproject). Drop one or many
+  `probes_*.jsonl` files here to see a peer x time swimlane.
+
+  No external dependencies. Open from file:// or serve from any
+  static webserver. The file is the documentation: read the FAQ at
+  the bottom of the page for what each marker means.
+
+  Companions: scripts/probe-tail.py (counter aggregator),
+  scripts/probe-flow.py (trace-id flow reader).
+-->
+<style>
+:root {
+  --bg: #0f1115;
+  --panel: #161a22;
+  --panel2: #1d222b;
+  --border: #2a313d;
+  --fg: #d8dee9;
+  --muted: #7a8290;
+  --accent: #88c0d0;
+  --warn: #ebcb8b;
+  --bad: #bf616a;
+  --good: #a3be8c;
+  --trace: #b48ead;
+  --row-h: 38px;
+}
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background: var(--bg); color: var(--fg);
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI",
+        Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+body { display: grid; grid-template-rows: auto 1fr auto; min-height: 100%; }
+header {
+  padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+}
+header h1 { font-size: 14px; font-weight: 600; margin: 0; color: var(--accent); }
+.dropzone {
+  border: 1px dashed var(--border); padding: 6px 12px; border-radius: 4px;
+  color: var(--muted); cursor: pointer; transition: 0.1s;
+}
+.dropzone.over { border-color: var(--accent); color: var(--fg); }
+input[type=file] { display: none; }
+.stats { color: var(--muted); }
+.layer-filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.layer-filters label {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 3px; background: var(--panel2);
+  cursor: pointer; user-select: none; font-size: 12px;
+}
+.layer-filters label .swatch {
+  width: 10px; height: 10px; border-radius: 2px; display: inline-block;
+}
+
+main {
+  display: grid; grid-template-columns: 1fr 360px; min-height: 0;
+}
+#swimlane-wrap {
+  position: relative; overflow: auto; padding: 0;
+  background: var(--bg);
+}
+#swimlane { display: block; }
+.peer-row-bg:nth-child(even) { fill: rgba(255,255,255,0.02); }
+.gridline { stroke: var(--border); stroke-width: 1; }
+.tick-label, .peer-label { fill: var(--muted); font-size: 11px; }
+.peer-label { font-weight: 600; fill: var(--fg); }
+.evt {
+  cursor: pointer; transition: r 0.1s, opacity 0.1s;
+}
+.evt:hover { r: 6; }
+.evt.dimmed { opacity: 0.18; }
+.evt.highlit { stroke: var(--trace); stroke-width: 2; }
+.trace-arrow {
+  stroke: var(--trace); stroke-width: 1.5; fill: none;
+  marker-end: url(#arrowhead); opacity: 0.85;
+}
+
+#detail {
+  background: var(--panel); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; min-height: 0;
+}
+#detail h2 {
+  font-size: 12px; font-weight: 600; margin: 0;
+  padding: 10px 14px; border-bottom: 1px solid var(--border);
+  color: var(--accent); text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+#detail-body {
+  padding: 10px 14px; flex: 1; overflow: auto;
+}
+#detail-body pre {
+  margin: 0; font-size: 11px; line-height: 1.45;
+  font-family: "JetBrains Mono", "Fira Code", "Source Code Pro", monospace;
+  white-space: pre-wrap; word-break: break-word;
+}
+.kv-row { display: grid; grid-template-columns: 90px 1fr; gap: 8px; padding: 2px 0; }
+.kv-row .k { color: var(--muted); }
+.kv-row .v { color: var(--fg); word-break: break-word; }
+.detail-section { margin-bottom: 14px; }
+.detail-section .section-title {
+  font-size: 11px; color: var(--accent); text-transform: uppercase;
+  margin-bottom: 6px; letter-spacing: 0.05em;
+}
+.trace-list { display: flex; flex-direction: column; gap: 3px; }
+.trace-list .trace-evt {
+  display: grid; grid-template-columns: 60px 80px 1fr; gap: 6px;
+  padding: 3px 5px; border-radius: 3px; cursor: pointer; font-size: 11px;
+}
+.trace-list .trace-evt:hover { background: var(--panel2); }
+.trace-list .trace-evt .t-time { color: var(--muted); font-family: monospace; }
+.trace-list .trace-evt .t-host { color: var(--accent); }
+
+footer {
+  padding: 8px 16px; background: var(--panel); border-top: 1px solid var(--border);
+  font-size: 11px; color: var(--muted);
+}
+footer details summary {
+  cursor: pointer; color: var(--fg); margin-bottom: 4px;
+}
+footer details[open] { padding-bottom: 4px; }
+footer details code {
+  background: var(--panel2); padding: 1px 4px; border-radius: 2px;
+}
+.empty-state {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  flex-direction: column; gap: 12px;
+  color: var(--muted); font-size: 14px; text-align: center;
+}
+.empty-state code {
+  background: var(--panel); color: var(--fg);
+  padding: 2px 6px; border-radius: 3px;
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>AT-core probe viz</h1>
+  <label class="dropzone" id="dropzone">
+    drop .jsonl files here, or click to pick
+    <input type="file" id="fileinput" multiple accept=".jsonl,application/json">
+  </label>
+  <span class="stats" id="stats">no data loaded</span>
+  <div class="layer-filters" id="layer-filters"></div>
+</header>
+
+<main>
+  <div id="swimlane-wrap">
+    <svg id="swimlane"></svg>
+    <div class="empty-state" id="empty">
+      <div>Drop one or more <code>probes_*.jsonl</code> files into the bar above.</div>
+      <div>Files are read locally — nothing leaves your browser.</div>
+    </div>
+  </div>
+  <aside id="detail">
+    <h2>event detail</h2>
+    <div id="detail-body">
+      <em style="color: var(--muted)">click an event in the swimlane</em>
+    </div>
+  </aside>
+</main>
+
+<footer>
+  <details>
+    <summary>How to read this view</summary>
+    <p>One row per peer (by <code>host</code>). Each marker is one
+    JSONL event. X axis is wall-clock seconds since the earliest
+    event in the loaded files. Color encodes the event <code>layer</code>
+    (legend at top).</p>
+    <p>Click any marker to inspect its full JSON in the side panel.
+    If the event carries a <code>trace_id</code>, every other event
+    sharing that trace is highlighted and arrows are drawn between
+    consecutive events in time order — that's the message's hop
+    chain across processes/peers.</p>
+    <p><b>What's plotted:</b> per-event probe writes (layer/event tuples
+    like <code>msg/new</code>, <code>msg/outbound_routed</code>,
+    <code>msg/dispatched</code>, <code>peer.set/added</code>,
+    <code>net.mystery/aged_out</code>). Counter snapshots (the
+    aggregated periodic dumps) are shown as small grey markers when
+    visible — most of the diagnostic value lives in the per-event
+    layers.</p>
+    <p><b>Companion tools:</b> <code>scripts/probe-tail.py --dir &lt;d&gt;</code>
+    aggregates counters across peers; <code>scripts/probe-flow.py
+    &lt;trace_prefix&gt;</code> reconstructs a trace text-mode.</p>
+  </details>
+</footer>
+
+<script>
+"use strict";
+
+// =========================================================================
+// state
+// =========================================================================
+
+const state = {
+  events: [],          // all parsed events, sorted by t
+  hosts: [],           // unique host names in load order
+  layers: new Map(),   // layer name -> { color, count, enabled }
+  t0: 0, t1: 0,        // earliest, latest t
+  selected: null,
+  highlightTraceId: null,
+};
+
+// stable color palette for layers
+const PALETTE = [
+  '#88c0d0', // accent (msg)
+  '#a3be8c', // good
+  '#ebcb8b', // warn
+  '#b48ead', // trace
+  '#5e81ac', // blue
+  '#d08770', // orange
+  '#bf616a', // bad
+  '#8fbcbb', // teal
+  '#5fa9c9',
+  '#a3a380',
+];
+function pickColor(idx) { return PALETTE[idx % PALETTE.length]; }
+
+// =========================================================================
+// loading
+// =========================================================================
+
+function readFiles(fileList) {
+  const promises = Array.from(fileList).map(f =>
+    f.text().then(txt => ({ name: f.name, text: txt }))
+  );
+  return Promise.all(promises).then(parts => {
+    let added = 0;
+    for (const p of parts) {
+      for (const line of p.text.split('\n')) {
+        const s = line.trim();
+        if (!s) continue;
+        try {
+          const ev = JSON.parse(s);
+          if (typeof ev.t !== 'number' || !ev.host) continue;
+          state.events.push(ev);
+          added++;
+        } catch (_) {}
+      }
+    }
+    rebuildIndex();
+    redraw();
+    return added;
+  });
+}
+
+function rebuildIndex() {
+  state.events.sort((a, b) => a.t - b.t);
+  if (state.events.length === 0) {
+    state.hosts = []; state.layers = new Map();
+    state.t0 = 0; state.t1 = 0;
+    return;
+  }
+  state.t0 = state.events[0].t;
+  state.t1 = state.events[state.events.length - 1].t;
+  // Hosts ordered by first-appearance.
+  const hostSet = new Set();
+  for (const ev of state.events) hostSet.add(ev.host);
+  state.hosts = Array.from(hostSet).sort();
+  // Layer summary.
+  const prevEnabled = new Map();
+  for (const [k, v] of state.layers) prevEnabled.set(k, v.enabled);
+  state.layers = new Map();
+  for (const ev of state.events) {
+    const l = ev.layer || 'other';
+    if (!state.layers.has(l)) {
+      state.layers.set(l, {
+        color: pickColor(state.layers.size),
+        count: 0,
+        enabled: prevEnabled.has(l) ? prevEnabled.get(l) : true,
+      });
+    }
+    state.layers.get(l).count++;
+  }
+}
+
+// =========================================================================
+// rendering
+// =========================================================================
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function redraw() {
+  const empty = document.getElementById('empty');
+  const stats = document.getElementById('stats');
+  const filters = document.getElementById('layer-filters');
+  const svg = document.getElementById('swimlane');
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+  if (state.events.length === 0) {
+    empty.style.display = '';
+    stats.textContent = 'no data loaded';
+    filters.innerHTML = '';
+    return;
+  }
+  empty.style.display = 'none';
+
+  const span = state.t1 - state.t0;
+  stats.textContent =
+    `${state.events.length} events · ${state.hosts.length} peers · ` +
+    `${span.toFixed(1)} s span`;
+
+  renderFilters(filters);
+
+  // Layout
+  const padL = 110, padR = 30, padT = 30, padB = 30;
+  const rowH = 38;
+  const innerW = Math.max(900, span * 25 + 600);  // 25 px/sec, min 900
+  const w = padL + innerW + padR;
+  const h = padT + rowH * state.hosts.length + padB;
+  svg.setAttribute('width', w);
+  svg.setAttribute('height', h);
+
+  // <defs> with arrow marker
+  const defs = document.createElementNS(SVG_NS, 'defs');
+  defs.innerHTML =
+    `<marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5"
+             markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="${getCSS('--trace')}"/>
+     </marker>`;
+  svg.appendChild(defs);
+
+  // Row backgrounds
+  for (let i = 0; i < state.hosts.length; i++) {
+    const rect = el('rect', {
+      class: 'peer-row-bg',
+      x: 0, y: padT + i * rowH, width: w, height: rowH,
+    });
+    svg.appendChild(rect);
+    // Peer label
+    const lbl = el('text', {
+      class: 'peer-label',
+      x: padL - 12, y: padT + i * rowH + rowH / 2 + 4,
+      'text-anchor': 'end',
+    }, state.hosts[i]);
+    svg.appendChild(lbl);
+  }
+
+  // Time gridlines + tick labels
+  const tickStep = pickTickStep(span);
+  for (let s = 0; s <= span; s += tickStep) {
+    const x = padL + (s / Math.max(span, 1e-9)) * innerW;
+    const line = el('line', {
+      class: 'gridline',
+      x1: x, y1: padT, x2: x, y2: padT + state.hosts.length * rowH,
+    });
+    svg.appendChild(line);
+    const lbl = el('text', {
+      class: 'tick-label',
+      x: x, y: padT + state.hosts.length * rowH + 14,
+      'text-anchor': 'middle',
+    }, s.toFixed(s < 10 ? 1 : 0) + 's');
+    svg.appendChild(lbl);
+  }
+
+  // Trace arrows go BEHIND markers — a separate layer.
+  const arrowLayer = el('g', { id: 'arrows' });
+  svg.appendChild(arrowLayer);
+
+  // Markers
+  const positions = new Map(); // event idx -> {x, y}
+  const visibleByTrace = new Map();
+  for (let i = 0; i < state.events.length; i++) {
+    const ev = state.events[i];
+    const layerInfo = state.layers.get(ev.layer || 'other');
+    if (!layerInfo || !layerInfo.enabled) continue;
+    const rowIdx = state.hosts.indexOf(ev.host);
+    if (rowIdx < 0) continue;
+    const x = padL + ((ev.t - state.t0) / Math.max(span, 1e-9)) * innerW;
+    const y = padT + rowIdx * rowH + rowH / 2;
+    const isHighlit =
+      state.highlightTraceId && ev.trace_id === state.highlightTraceId;
+    const isDimmed =
+      state.highlightTraceId && ev.trace_id !== state.highlightTraceId;
+    const dot = el('circle', {
+      class: 'evt' + (isHighlit ? ' highlit' : '') +
+             (isDimmed ? ' dimmed' : ''),
+      cx: x, cy: y, r: 4,
+      fill: layerInfo.color,
+    });
+    dot.dataset.idx = i;
+    dot.addEventListener('click', () => onSelectEvent(i));
+    svg.appendChild(dot);
+    positions.set(i, { x, y });
+    if (state.highlightTraceId && ev.trace_id === state.highlightTraceId) {
+      const lst = visibleByTrace.get(ev.trace_id) || [];
+      lst.push({ idx: i, x, y, t: ev.t });
+      visibleByTrace.set(ev.trace_id, lst);
+    }
+  }
+
+  // Trace arrows — connect consecutive same-trace_id markers.
+  if (state.highlightTraceId) {
+    const lst = (visibleByTrace.get(state.highlightTraceId) || [])
+      .sort((a, b) => a.t - b.t);
+    for (let i = 1; i < lst.length; i++) {
+      const a = lst[i - 1], b = lst[i];
+      const path = arrowPath(a.x, a.y, b.x, b.y);
+      const p = el('path', {
+        class: 'trace-arrow',
+        d: path,
+      });
+      arrowLayer.appendChild(p);
+    }
+  }
+}
+
+function renderFilters(container) {
+  container.innerHTML = '';
+  const layers = Array.from(state.layers.entries())
+    .sort((a, b) => b[1].count - a[1].count);
+  for (const [layer, info] of layers) {
+    const lab = document.createElement('label');
+    lab.title = `${info.count} events`;
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = info.enabled;
+    cb.addEventListener('change', () => {
+      info.enabled = cb.checked;
+      redraw();
+    });
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = info.color;
+    lab.appendChild(cb);
+    lab.appendChild(swatch);
+    lab.appendChild(document.createTextNode(`${layer} (${info.count})`));
+    container.appendChild(lab);
+  }
+}
+
+// Curved path so overlapping arrows don't pile up perfectly.
+function arrowPath(x1, y1, x2, y2) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const cx1 = x1 + dx * 0.5, cy1 = y1 + dy * 0.05 - 12;
+  const cx2 = x1 + dx * 0.5, cy2 = y2 - dy * 0.05 - 12;
+  return `M${x1},${y1} C${cx1},${cy1} ${cx2},${cy2} ${x2},${y2}`;
+}
+
+function pickTickStep(spanSec) {
+  if (spanSec <= 5) return 1;
+  if (spanSec <= 30) return 5;
+  if (spanSec <= 120) return 10;
+  if (spanSec <= 600) return 60;
+  return 300;
+}
+
+function getCSS(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function el(tag, attrs, text) {
+  const e = document.createElementNS(SVG_NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+// =========================================================================
+// selection / details
+// =========================================================================
+
+function onSelectEvent(idx) {
+  const ev = state.events[idx];
+  // Highlight follows the trace_id of whatever event was clicked.
+  // Clicking the same event twice in a row toggles highlight off so
+  // the user can drop back to the unfiltered view without picking
+  // anything else.
+  if (state.selected === idx && state.highlightTraceId) {
+    state.highlightTraceId = null;
+  } else if (ev.trace_id) {
+    state.highlightTraceId = ev.trace_id;
+  } else {
+    state.highlightTraceId = null;
+  }
+  state.selected = idx;
+  renderDetail(ev);
+  redraw();
+}
+
+function renderDetail(ev) {
+  const body = document.getElementById('detail-body');
+  body.innerHTML = '';
+
+  // Quick summary section
+  const top = document.createElement('div');
+  top.className = 'detail-section';
+  top.innerHTML = `
+    <div class="section-title">summary</div>
+    <div class="kv-row"><span class="k">layer</span><span class="v">${esc(ev.layer)}</span></div>
+    <div class="kv-row"><span class="k">event</span><span class="v">${esc(ev.event)}</span></div>
+    <div class="kv-row"><span class="k">host</span><span class="v">${esc(ev.host)}</span></div>
+    <div class="kv-row"><span class="k">t (rel)</span><span class="v">${(ev.t - state.t0).toFixed(3)} s</span></div>
+    <div class="kv-row"><span class="k">t (abs)</span><span class="v">${ev.t.toFixed(3)}</span></div>
+    ${ev.trace_id ? `<div class="kv-row"><span class="k">trace_id</span><span class="v">${esc(ev.trace_id)}</span></div>` : ''}
+  `;
+  body.appendChild(top);
+
+  // Trace chain section (if applicable)
+  if (ev.trace_id) {
+    const chain = state.events
+      .map((e, i) => ({ e, i }))
+      .filter(({ e }) => e.trace_id === ev.trace_id)
+      .sort((a, b) => a.e.t - b.e.t);
+    const sect = document.createElement('div');
+    sect.className = 'detail-section';
+    const title = document.createElement('div');
+    title.className = 'section-title';
+    title.textContent = `trace chain (${chain.length})`;
+    sect.appendChild(title);
+    const list = document.createElement('div');
+    list.className = 'trace-list';
+    for (const { e, i } of chain) {
+      const row = document.createElement('div');
+      row.className = 'trace-evt';
+      row.innerHTML =
+        `<span class="t-time">${(e.t - state.t0).toFixed(3)}</span>` +
+        `<span class="t-host">${esc(e.host)}</span>` +
+        `<span>${esc(e.layer)} / ${esc(e.event)} ${
+          e.process ? '(' + esc(e.process) + ')' : ''
+        }</span>`;
+      row.addEventListener('click', (evt) => {
+        evt.stopPropagation();
+        onSelectEvent(i);
+      });
+      list.appendChild(row);
+    }
+    sect.appendChild(list);
+    body.appendChild(sect);
+  }
+
+  // Counter snapshot pretty-print
+  if (ev.layer === 'counters' && ev.event === 'snapshot' && Array.isArray(ev.items)) {
+    const sect = document.createElement('div');
+    sect.className = 'detail-section';
+    const title = document.createElement('div');
+    title.className = 'section-title';
+    title.textContent = `counter snapshot (${ev.items.length} keys)`;
+    sect.appendChild(title);
+    const list = document.createElement('div');
+    list.className = 'trace-list';
+    for (const item of ev.items.slice().sort((a, b) =>
+      (b.count || 0) - (a.count || 0))) {
+      const row = document.createElement('div');
+      row.className = 'trace-evt';
+      row.innerHTML =
+        `<span class="t-time">${item.count}</span>` +
+        `<span class="t-host">${esc(item.layer || '')}</span>` +
+        `<span>${esc(item.event || '')} ${
+          item.reason ? '/' + esc(item.reason) : ''
+        }</span>`;
+      list.appendChild(row);
+    }
+    sect.appendChild(list);
+    body.appendChild(sect);
+  }
+
+  // Raw JSON
+  const raw = document.createElement('div');
+  raw.className = 'detail-section';
+  raw.innerHTML =
+    `<div class="section-title">raw json</div>
+     <pre>${esc(JSON.stringify(ev, null, 2))}</pre>`;
+  body.appendChild(raw);
+}
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// =========================================================================
+// drag and drop
+// =========================================================================
+
+function setupDnd() {
+  const dz = document.getElementById('dropzone');
+  const fi = document.getElementById('fileinput');
+  dz.addEventListener('click', () => fi.click());
+  fi.addEventListener('change', () => {
+    if (fi.files.length) readFiles(fi.files);
+  });
+  // Whole-document drop also accepted, since the dropzone is small.
+  for (const target of [dz, document.body]) {
+    target.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dz.classList.add('over');
+    });
+    target.addEventListener('dragleave', () => dz.classList.remove('over'));
+    target.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dz.classList.remove('over');
+      if (e.dataTransfer && e.dataTransfer.files.length) {
+        readFiles(e.dataTransfer.files);
+      }
+    });
+  }
+}
+
+document.addEventListener('DOMContentLoaded', setupDnd);
+</script>
+</body>
+</html>

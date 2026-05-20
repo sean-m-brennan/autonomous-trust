@@ -51,6 +51,7 @@ from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, N
 from .network import Message
 from .reputation import TransactionScore, ReputationProtocol
 from .queue_pool import QueuePool
+from . import _probes
 
 PoolType = Union[ProcessPool, ThreadPool]
 
@@ -92,6 +93,15 @@ class AutonomousTrust(Protocol):
             # Multiprocessing
             self._pool_type = ProcessPool
             ctx = mp.get_context(context)
+            # Forkserver children must inherit autonomous_trust.core
+            # fully loaded — otherwise the Manager server's per-client
+            # threads each re-import on first unpickle, and concurrent
+            # deep-chain imports race on _python.processes (intermittent
+            # "ImportError: cannot import name 'ProcessTracker' from
+            # partially initialized module"). Preloading hands the
+            # forkserver a fully-resolved module before any fork.
+            if context == Ctx.FORKSERVER:
+                ctx.set_forkserver_preload(['autonomous_trust.core'])
             manager = ctx.Manager()
             self._queue_type = manager.Queue  # noqa
         else:
@@ -116,6 +126,7 @@ class AutonomousTrust(Protocol):
         if not silent:
             handlers.append(logging.StreamHandler(sys.stdout))
         if logfile != Configuration.log_stdout:
+            os.makedirs(os.path.dirname(logfile), exist_ok=True)
             handlers.append(TimedRotatingFileHandler(logfile, when="midnight", interval=1, backupCount=5))
         if not handlers:
             handlers.append(logging.NullHandler())
@@ -143,6 +154,13 @@ class AutonomousTrust(Protocol):
         self.last_tick: dict[int, int] = {}
         self.tasking_start: datetime = now()
         self.latest_reputation: dict[str, Any] = {}
+        # Bilateral reputation: (observer_uuid_str, subject_uuid_str) ->
+        # Reputation. Populated alongside latest_reputation when a
+        # rep_resp arrives. The non-pair dict above is keyed by subject
+        # only and gets overwritten on every response, losing observer
+        # info; consumers that want a peer-to-peer matrix (the civilian
+        # demo's trust graph, for one) read from the pair dict.
+        self.latest_reputation_pairs: dict[tuple[str, str], Any] = {}
         self.unhandled_messages: list[Message] = []
         self.peer_count = 0
 
@@ -216,14 +234,16 @@ class AutonomousTrust(Protocol):
                     # check reputation for all known peers on first sighting
                     for peer in list(self.peers.all) + [self.identity]:
                         query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
-                                        to_json_string((peer, self.proc_name)), self.identity)
+                                        to_json_string((peer, self.proc_name)), self.identity,
+                                        from_whom=self.identity)
                         queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
                 elif self.tasking_tick(0):
                     self._random_task(queues)
                     # check reputation for all known peers (including self)
                     for peer in list(self.peers.all) + [self.identity]:
                         query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
-                                        to_json_string((peer, self.proc_name)), self.identity)
+                                        to_json_string((peer, self.proc_name)), self.identity,
+                                        from_whom=self.identity)
                         queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
         self._report_unhandled()
 
@@ -480,6 +500,12 @@ class AutonomousTrust(Protocol):
                         if peer:
                             self.print("%s's current reputation score:\033[32m %s\033[00m" % (peer.nickname, rep.score))
                     self.latest_reputation[str(rep.peer_id)] = rep
+                    # Bilateral capture: track WHO computed this score.
+                    observer = getattr(message, "from_whom", None)
+                    observer_uuid = getattr(observer, "uuid", None)
+                    if observer_uuid is not None:
+                        key = (str(observer_uuid), str(rep.peer_id))
+                        self.latest_reputation_pairs[key] = rep
                 else:
                     self.unhandled_messages.append(message)
         return True
@@ -488,8 +514,11 @@ class AutonomousTrust(Protocol):
         while len(self.unhandled_messages) > 0:
             message = self.unhandled_messages.pop()
             if isinstance(message, Message):
+                _probes.counter('proc.automate', 'unhandled', message.function)
+                _probes.trace_msg(message, 'unhandled', proc='automate')
                 self.logger.error(self.name + ': Unhandled message %s' % message.function)
             else:
+                _probes.counter('proc.automate', 'unhandled', 'type:' + message.__class__.__name__)
                 self.logger.error(self.name + ': Unhandled message of type %s' % message.__class__.__name__)  # noqa
 
     def _handle_results(self, queues: dict[str, QueueType], results: dict[str, AsyncResult]):

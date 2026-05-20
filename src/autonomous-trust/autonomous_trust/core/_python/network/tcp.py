@@ -19,6 +19,15 @@ import struct
 
 from .netprocess import NetworkProtocol, TransmissionError
 from .udp import UDPNetworkProcess
+from .. import _probes
+
+
+class PeerDisconnect(TransmissionError):
+    """Peer closed the TCP connection cleanly before sending any bytes
+    of the length prefix. A normal protocol event (e.g. during onboarding
+    when peers cycle accept/connect), surfaced as a distinct exception
+    type so the listener can log it at debug rather than error."""
+    pass
 
 
 class TCPNetworkProcess(UDPNetworkProcess):
@@ -27,11 +36,22 @@ class TCPNetworkProcess(UDPNetworkProcess):
     Can use either multicast or broadcast for UDP
     """
     mcast_ttl = 2
-    rcv_backlog = 5
+    # Listen-queue depth. The protocol does per-message connect/send/close,
+    # so during onboarding (9 peers simultaneously welcoming a new joiner)
+    # or bilateral O(N²) reputation rounds the kernel sees a burst of
+    # SYNs. With 5, the 6th SYN got RST/connection-refused — measured
+    # 16k+ "Network: Connect" errors per peer and inspector-onboarding
+    # accept frames silently dropped. 128 absorbs the burst comfortably.
+    rcv_backlog = 128
     net_proto = NetworkProtocol.IPV4
 
     def __init__(self, configurations, subsystems, log_q, acceptance_func=None, use_mcast=False, **kwargs):
         super().__init__(configurations, subsystems, log_q, acceptance_func, udp=False, **kwargs)
+        # Listener sockets inherit the global default timeout set by
+        # UDPNetworkProcess.__init__ (socket_timeout, currently 0.1s).
+        # Per-socket settimeout(positive) on Python 3.13 leaves the
+        # socket in non-blocking mode and the receiver thread crashes
+        # immediately with BlockingIOError.
         bind_address = self.net_cfg.ip4
         self.recv_ptp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.recv_ptp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -59,8 +79,22 @@ class TCPNetworkProcess(UDPNetworkProcess):
 
         self._init_mcast(use_mcast)
 
+    # Generous explicit timeout for outbound TCP. Was inheriting the
+    # 100ms global default, which under bursty cross-container load
+    # connect()-failed thousands of times per peer per minute. We swap
+    # the process-wide default rather than per-socket settimeout(),
+    # because Python 3.13's settimeout(positive) appears to leave the
+    # socket in non-blocking mode (BlockingIOError on first I/O).
+    send_timeout = 5.0
+
     def _send_tcp(self, msg, host, port):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        old_default = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(self.send_timeout)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        finally:
+            socket.setdefaulttimeout(old_default)
+        with sock:
             if not isinstance(msg, bytes):
                 msg = msg.encode(self.enc)
             self.logger.debug('Solo connect to %s:%s' % (host, port))
@@ -97,7 +131,17 @@ class TCPNetworkProcess(UDPNetworkProcess):
         while len(size_data) < 4:
             chunk = sock.recv(4 - len(size_data))
             if chunk == b'':
-                raise TransmissionError("Socket connection broken reading length prefix")
+                # A clean close before any bytes is a normal protocol
+                # event during onboarding (peers reset connections as
+                # they cycle accept/connect). A close *after* partial
+                # length-prefix bytes indicates a broken peer. The
+                # listener side classifies the two differently so
+                # routine resets don't surface as ERROR-level noise.
+                if len(size_data) == 0:
+                    raise PeerDisconnect("Peer closed before length prefix")
+                raise TransmissionError(
+                    "Socket connection broken reading length prefix "
+                    "(got %d/4 bytes)" % len(size_data))
             size_data += chunk
         msg_len = struct.unpack('!I', size_data)[0]
         max_msg_size = 64 * 1024 * 1024  # 64 MB
@@ -111,20 +155,53 @@ class TCPNetworkProcess(UDPNetworkProcess):
                 raise TransmissionError("Socket connection broken (no bytes sent)")
             chunks.append(chunk)
             bytes_recvd += len(chunk)
-        return b''.join(chunks).decode(self.enc)
+        # Return raw bytes — encrypted point-to-point payloads are not
+        # valid UTF-8. The peer_receiver thread used to crash on the
+        # first encrypted inbound (.decode(self.enc) raised
+        # UnicodeDecodeError uncaught), leaving the listener dead for
+        # the rest of the run. UDP's _recv_udp returns bytes too;
+        # downstream dispatch already handles bytes-vs-str correctly
+        # (Message.parse + the UnicodeDecodeError branch in
+        # netprocess.process for unknown senders).
+        return b''.join(chunks)
 
     def recv_peer(self):
+        # Mirror UDP's _recv_udp acceptance policy: take everything
+        # except own-address and blacklisted senders. The original
+        # accept_peer_message gate rejected any sender not already
+        # in self.peers, which broke bootstrap — a joining peer
+        # could never receive the unencrypted identity:accept that
+        # tells it who the welcomer is. The downstream dispatcher
+        # in netprocess.process() decides what to do with unknown
+        # senders (bootstrap path / mystery_handler retry).
         (clientsock, (addr, port)) = self.recv_ptp_sock.accept()
+        # NB: don't call clientsock.settimeout(positive) here — Python
+        # 3.13 puts it in non-blocking mode and _recv crashes with
+        # BlockingIOError. clientsock inherits the listener's timeout,
+        # which is the global default (0.1s) — tight, but works.
         if addr == self.my_address:
+            _probes.counter('net.tcp.peer', 'drop', 'own_address')
             return None, None, None  # my own message
-        if not self.accept_peer_message(addr):
-            return None, addr, port  # reject
+        if self.reject_message(addr):
+            _probes.counter('net.tcp.peer', 'drop', 'blacklisted')
+            clientsock.close()
+            return None, addr, port  # blacklisted
+        _probes.counter('net.tcp.peer', 'accepted')
         return self._recv(clientsock), addr, port
 
     def recv_group(self):
+        # Same relaxation as recv_peer: blacklist-only at the socket
+        # gate. Group decryption downstream still requires the sender
+        # to be a known group member (group.decrypt + group.addresses
+        # check), so this can't leak unencrypted group payloads to a
+        # stranger.
         (clientsock, (addr, port)) = self.recv_grp_sock.accept()
         if addr == self.my_address:
+            _probes.counter('net.tcp.group', 'drop', 'own_address')
             return None, None, None  # my own message
-        if not self.accept_group_message(addr):
-            return None, addr, port  # reject
+        if self.reject_message(addr):
+            _probes.counter('net.tcp.group', 'drop', 'blacklisted')
+            clientsock.close()
+            return None, addr, port  # blacklisted
+        _probes.counter('net.tcp.group', 'accepted')
         return self._recv(clientsock), addr, port
