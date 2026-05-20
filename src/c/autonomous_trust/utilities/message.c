@@ -237,9 +237,23 @@ int signal_recv(queue_t *q, long *msg_type, signal_t *sig)
     ensures \result == EAGAIN;
   disjoint behaviors no_queue, success, would_block;
 */
+static messaging_test_hook_t g_messaging_test_hook = NULL;
+
+void messaging_set_test_hook(messaging_test_hook_t hook)
+{
+    g_messaging_test_hook = hook;
+}
+
 /* Frama-C: skipped — [syscall] mq_send POSIX message queue */
 int messaging_send(const char *key, const message_type_t type, generic_msg_t *msg, bool blocking)
 {
+    /* Test-mode hook short-circuits the real transport. The conformance
+     * harness installs a hook that captures the message into a per-
+     * participant outbox and returns 0; production paths leave the hook
+     * NULL so this branch costs one predictable comparison per send. */
+    if (g_messaging_test_hook != NULL)
+        return g_messaging_test_hook(key, type, msg, blocking);
+
     if (my_q == NULL)
         return EXCEPTION(EMSG_NOCONN);
     int flags = 0;

@@ -62,6 +62,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     vote_timeout = 0.5  # seconds to wait for additional votes after own vote cast
     enc = encoding
 
+    # When True, _spawn replaces threading.Thread().start() with a direct,
+    # synchronous call. The conformance harness sets this so scenario steps
+    # are deterministic; production paths should leave it False.
+    synchronous_dispatch = False
+
+    def _spawn(self, target, args=(), kwargs=None, daemon=True):
+        kwargs = kwargs or {}
+        if self.synchronous_dispatch:
+            target(*args, **kwargs)
+            return None
+        thread = threading.Thread(target=target, args=args, kwargs=kwargs, daemon=daemon)
+        thread.start()
+        return thread
+
     def __init__(self, configurations, subsystems, log_q, **kwargs):
         super().__init__(configurations, subsystems, log_q, dependencies=[CfgIds.network], **kwargs)
         # Optional override of the choose_group bootstrap window. The
@@ -103,6 +117,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.histories: list[tuple] = []
         self.package_hash = self.configs[PackageHash.key]
         self.choosing = False
+        # P1 group-merge tracking: set when choose_group falls through to
+        # self-bootstrap (mesh didn't answer in init_timeout). A late
+        # `full_history` arriving after this point triggers a merge path
+        # that adopts the mesh's group AND re-broadcasts request_access so
+        # the mesh's BG admits us through the normal welcoming-committee
+        # flow. Cleared once the merge is in flight to prevent loops.
+        self.self_bootstrapped = False
+        self.merging = False
         self.peer_potentials = {}
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
         self.protocol.register_handler(IdentityProtocol.accept, self.handle_acceptance)
@@ -114,6 +136,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.update, self.handle_group_update)
         self.protocol.register_handler(IdentityProtocol.caps_query, self.handle_caps_query)
         self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
+        self.protocol.register_handler(IdentityProtocol.rank_update, self.handle_rank_update)
         self.lock = None
 
     @property
@@ -135,7 +158,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     # welcoming_committee amnesia branch) would land in
                     # idprocess's view but never reach the main proc /
                     # bridge.rcvr — manifesting as the EPA airquality_stream
-                    # gap in the civilian demo (idproc had 9 keys, main
+                    # gap in the multi-agency demo (idproc had 9 keys, main
                     # proc stayed at 8). The _add_peer path's explicit
                     # put to main+negotiation queues becomes redundant
                     # but harmless after this change.
@@ -193,6 +216,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         with self.lock:
             self.phase = 1
 
+    def _broadcast_request_access(self, queues):
+        """Build and broadcast the `request_access` envelope on the open
+        channel. Factored out of announce_identity so the group-merge
+        path (see _merge_to_mesh) can re-broadcast without a phase change.
+        Quiet on Full — caller logs."""
+        msg_str = to_json_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
+        message = Message(self.name, IdentityProtocol.announce,
+                          msg_str, to_whom=Network.broadcast, encrypt=False)
+        queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
+
     def announce_identity(self, queues):
         """
         Request access for my identity
@@ -206,11 +239,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return
         try:
             self.logger.debug('Announce myself')
-            # to self.welcoming_committee()
-            msg_str = to_json_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
-            message = Message(self.name, IdentityProtocol.announce,
-                              msg_str, to_whom=Network.broadcast, encrypt=False)
-            queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
+            self._broadcast_request_access(queues)
         except Full:
             self.logger.error('announce_identity: Network queue full')
         with self.lock:
@@ -306,6 +335,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                                                       names.random_name())
                     self.logger.debug('Generated group: %s' % self.group.nickname)
                     self._record_group(queues)
+                    # Mark self-bootstrap so a late-arriving `full_history`
+                    # from a real mesh triggers the merge path in
+                    # receive_history → _merge_to_mesh (BUGS.md §P1).
+                    with self.lock:
+                        self.self_bootstrapped = True
             except Full:
                 self.logger.error('choose_group: Network queue full')
             with self.lock:
@@ -330,10 +364,81 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             _probes.counter('id.receive_history', 'arrived', shape)
             with self.lock:
                 self.histories.append(hist_tpl)  # see choose_group
-            if not self.choosing:
-                threading.Thread(target=self.choose_group, args=(queues,), daemon=True).start()
+                should_merge = (self.self_bootstrapped
+                                and not self.merging
+                                and not self.choosing)
+                if should_merge:
+                    self.merging = True
+            if should_merge:
+                # Late history arrived after we already self-bootstrapped:
+                # adopt the mesh's group and re-announce so the mesh's BG
+                # admits us through the normal welcoming-committee path
+                # (BUGS.md §P1).
+                self._spawn(self._merge_to_mesh, args=(queues,))
+            elif not self.choosing:
+                self._spawn(self.choose_group, args=(queues,))
             return True
         return False
+
+    def _merge_to_mesh(self, queues):
+        """Merge from a self-bootstrap group of one into a real mesh.
+
+        Called when receive_history arrives AFTER choose_group fell through
+        to self-bootstrap. Discards our self-generated group and adopts the
+        mesh's group key + history, then re-broadcasts `request_access` on
+        the open channel so a BG admits us via welcoming_committee. The
+        eventual `access_granted` + `full_history` round-trip routes back
+        through the normal receive_history path with self_bootstrapped now
+        clear — no merge re-entry. See BUGS.md §P1.
+        """
+        try:
+            with self.lock:
+                snapshot = list(self.histories)
+            accepted: tuple[Optional[Group], Optional[list[LinkedStep]]] = None, None
+            unioned_peers: dict = {}
+            for hist_tpl in snapshot:
+                if len(hist_tpl) >= 3:
+                    group, steps, peer_idents = hist_tpl[0], hist_tpl[1], hist_tpl[2]
+                else:
+                    group, steps = hist_tpl[0], hist_tpl[1]
+                    peer_idents = None
+                if peer_idents:
+                    for ident in peer_idents:
+                        uuid = getattr(ident, 'uuid', None)
+                        if uuid is not None:
+                            unioned_peers.setdefault(str(uuid), ident)
+                if not steps:
+                    continue
+                if accepted == (None, None) or len(steps) > len(accepted[1]):  # noqa
+                    accepted = group, steps
+            if accepted == (None, None):
+                # All received histories were empty — nothing to merge to;
+                # leave self-bootstrap state alone and clear merging flag.
+                with self.lock:
+                    self.merging = False
+                return
+            self.group, hist = accepted
+            self.logger.info('Merging self-bootstrap into mesh group %s' %
+                             getattr(self.group, 'nickname', '?'))
+            self._record_group(queues)
+            self._populate_peers_from_history(queues, list(unioned_peers.values()))
+            # We were not a member of the new group; do NOT send a
+            # history_diff here. Re-announce on the open channel so a BG
+            # admits us through welcoming_committee. The subsequent
+            # `full_history` reply will re-enter receive_history with
+            # self_bootstrapped = False, and choose_group's normal path
+            # will catch_up + send a diff if needed.
+            with self.lock:
+                self.self_bootstrapped = False
+            try:
+                self._broadcast_request_access(queues)
+            except Full:
+                self.logger.error('_merge_to_mesh: Network queue full')
+        except Exception as err:
+            self.report_exception(err, '_merge_to_mesh')
+        finally:
+            with self.lock:
+                self.merging = False
 
     def count_vote(self, _, message):
         """
@@ -481,8 +586,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.peer_potentials[new_id.uuid] = caps
                 if not self.border_guard_mode:
                     return True  # cache-only path; voting is welcomers' job
-                threading.Thread(target=self._vote_collection,
-                                 args=(queues, id_obj), daemon=True).start()
+                self._spawn(self._vote_collection, args=(queues, id_obj))
                 msg_str = id_obj.to_string()  # to self.handle_vote_on_peer()
                 message = Message(self.name, IdentityProtocol.propose, msg_str, to_whom=self.group)
                 queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -661,7 +765,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             blob = message.obj  # from self.welcoming_committee()
             if isinstance(blob, str):
                 blob = Configuration.from_string(blob)
-            threading.Thread(target=self._process_id, args=(blob,), daemon=True).start()
+            self._spawn(self._process_id, args=(blob,))
             return True
         return False
 
@@ -894,6 +998,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if message.function == IdentityProtocol.diff:
             self.logger.debug('Received history diff')
             steps = from_json_string(message.obj)  # from self.choose_group()
+            # Empty-diff guard: `_history.ingest_branch` does `steps[-1]`
+            # without a length check (BUGS.md §P10). Production code path
+            # is from `choose_group()` which never sends empty diffs, but
+            # an empty payload on the wire reaches here too. Treat empty
+            # as a no-op rather than crashing.
+            if not steps:
+                return True
             self._record_group(queues)
             name = message.from_whom.nickname
             if name in self._history.heads:
@@ -905,6 +1016,46 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.logger.warning('Invalid history diff from %s' % name)
             return True
         return False
+
+    def handle_rank_update(self, _, message):
+        """Apply a reputation-derived rank to a peer (or self).
+
+        Local-only IPC from ReputationProcess (BUGS.md §P2). Mutating
+        `peer._rank` in `self.peers.all` is visible to AgreementByAuthority
+        because IdentityByAuthority shares this list as its voter set.
+        Self-rank bump updates `self.identity` so subsequent
+        `Identity.publish()` broadcasts carry the elevated rank.
+        """
+        if message.function != IdentityProtocol.rank_update:
+            return False
+        try:
+            payload = from_json_string(message.obj) if isinstance(
+                message.obj, (str, bytes)) else message.obj
+            if not (isinstance(payload, (list, tuple)) and len(payload) >= 2):
+                self.logger.warning('handle_rank_update: bad payload %r' % payload)
+                return True
+            peer_uuid_str, new_rank = str(payload[0]), int(payload[1])
+            target = None
+            if str(self.identity.uuid) == peer_uuid_str:
+                target = self.identity
+            else:
+                for peer in self.peers.all:
+                    if str(getattr(peer, 'uuid', '')) == peer_uuid_str:
+                        target = peer
+                        break
+            if target is None:
+                # Rank update arrived before we have the peer's identity.
+                # Drop quietly — the next reputation cycle will retry.
+                return True
+            old = getattr(target, '_rank', 0)
+            if old != new_rank:
+                target._rank = new_rank
+                self.logger.debug('Rank update for %s: %d -> %d' %
+                                  (getattr(target, 'nickname', peer_uuid_str),
+                                   old, new_rank))
+        except Exception as err:
+            self.report_exception(err, 'handle_rank_update')
+        return True
 
     def handle_group_update(self, queues, message):
         """
@@ -918,7 +1069,18 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if message.function == IdentityProtocol.update:
             self.logger.debug('Received group update')
             group = message.obj  # from self._update_group()
+            # Wire form arrives as a serialized string; parse it back to a
+            # Group object. handle_confirm_peer (idprocess.py:742-743) does
+            # the same — handle_group_update was missing it (BUGS.md §P11).
+            # Without this guard, accessing `theirs.uuid` below raises
+            # AttributeError on any over-the-wire delivery.
+            if isinstance(group, str):
+                if not group:
+                    return True  # empty payload — no-op
+                group = Configuration.from_string(group)
             mine, theirs = self.group, group
+            if mine is None or theirs is None:
+                return True
             if mine.uuid == theirs.uuid:
                 # Same group: adopt strictly larger membership, otherwise no-op.
                 if len(theirs.addresses) > len(mine.addresses):
@@ -963,7 +1125,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.announce_identity(queues)
         if not self.choosing:
             # initial run, may be called again
-            threading.Thread(target=self.choose_group, args=(queues,), daemon=True).start()
+            self._spawn(self.choose_group, args=(queues,))
         # Drain budget per iter — same shape as repprocess.py /
         # negprocess.py. The 0.5 s cadence-pacing sleep used to cap
         # each subsystem at ~2 msgs/s; welcoming-committee + confirm

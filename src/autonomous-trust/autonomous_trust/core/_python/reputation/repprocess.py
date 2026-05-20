@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from ..network import Message
 from ..processes import Process, ProcMeta
 from ..config import Configuration, from_json_string, to_json_string
+from ..identity.protocol import IdentityProtocol
 from .protocol import ReputationProtocol
 from .reputation import TransactionHistory, Reputation, Reputations, TransactionScore
 from ..system import CfgIds, now, encoding
@@ -43,6 +44,30 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     backoff_mult = 1.5
     backoff_max = 90
     expiration = 300
+    # Reputation-tied rank elevation (BUGS.md §P2). Each tier is
+    # (score_floor, rank); scores below the lowest floor map to rank 0.
+    # Sorted ascending so _rank_tier can iterate and pick the highest
+    # matching tier. Tunable, but keep monotonically increasing.
+    RANK_TIERS = (
+        (0.50, 1),
+        (0.65, 2),
+        (0.80, 3),
+        (0.90, 4),
+    )
+
+    # When True, _spawn replaces threading.Thread().start() with a direct,
+    # synchronous call. The conformance harness sets this so scenario steps
+    # are deterministic; production paths leave it False.
+    synchronous_dispatch = False
+
+    def _spawn(self, target, args=(), kwargs=None, daemon=True):
+        kwargs = kwargs or {}
+        if self.synchronous_dispatch:
+            target(*args, **kwargs)
+            return None
+        thread = threading.Thread(target=target, args=args, kwargs=kwargs, daemon=daemon)
+        thread.start()
+        return thread
 
     def __init__(self, configurations, subsystems, log_q, **kwargs):
         super().__init__(configurations, subsystems, log_q,
@@ -70,6 +95,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.requested_reps = []
         self.updates = {}
         self.num_updates = 3
+        # Last published rank per peer uuid-string. Suppresses redundant
+        # rank_update IPC when the tier hasn't changed (BUGS.md §P2).
+        self.peer_ranks: dict[str, int] = {}
+        # (peer_uuid, score) pairs produced by _compute_reputation in
+        # spawned threads, drained by the main `process` loop where
+        # `queues` is in scope. Same pattern as `requested_reps`.
+        self.pending_ranks: list = []
 
     @property
     def peers(self):
@@ -91,11 +123,24 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     if self.last_id is None or self.last_id < id1:
                         if len(self.history) + 1 == id2:
                             self.requests.append(self._paxos_id_index(id1, id2))
+                            # Ack carries the PRIOR last_id so the proposer
+                            # sees the state-before-this-grant; matches C's
+                            # `*out_last_id = inst->last_id;` capture in
+                            # paxos.c:114 (before the update at :123).
                             ack = ((id1, id2, peer_id), (self.last_id, len(self.history)), self.last_value)
                             msg = Message(self.name, ReputationProtocol.grant,
                                           to_json_string(ack), message.from_whom)
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                             self.logger.debug('Request granted')
+                            # Pin the ballot — second-grant guard. Without
+                            # this, a duplicate (id1, id2) ask would re-pass
+                            # the `last_id is None or last_id < id1` check
+                            # and grant again, double-appending to
+                            # self.requests. C's paxos_handle_request sets
+                            # `inst->last_id = id1` here (paxos.c:123); the
+                            # missing update was the cross-language
+                            # asymmetry tracked as BUGS.md P6.
+                            self.last_id = id1
                         else:
                             msg = Message(self.name, ReputationProtocol.backdate, message.obj, message.from_whom)
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
@@ -138,7 +183,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if (last_id is not None and last_id >= id1) or last_idx != len(self.history):  # peer is faulty
                 self.peers.demote(message.from_whom)
                 self.logger.debug('Grant from faulty peer')
-                threading.Thread(target=self._paxos_timeout, args=(queues, (id1, id2, peer_id)), daemon=True).start()
+                self._spawn(self._paxos_timeout, args=(queues, (id1, id2, peer_id)))
                 return True
             idx = self._paxos_id_index(id1, id2)
             if idx not in self.my_requests:
@@ -172,12 +217,18 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if message.function == ReputationProtocol.nack:
             id1, id2, _ = from_json_string(message.obj)
             idx = self._paxos_id_index(id1, id2)
+            if idx not in self.my_requests:
+                # Nack for an already-completed (grant succeeded, removed
+                # from my_requests) or never-issued (foreign id) request.
+                # Drop without retrying.
+                self.logger.debug('Nack for unknown or completed request')
+                return True
             if idx not in self.backoff:
                 self.backoff[idx] = 1
             if self.backoff[idx] < self.backoff_max:
                 self.backoff[idx] *= self.backoff_mult
-            threading.Thread(target=self._try_again,
-                             args=(self.backoff[idx], queues, self.requests[idx][0]), daemon=True).start()
+            self._spawn(self._try_again,
+                        args=(self.backoff[idx], queues, self.my_requests[idx].score))
             return True
         return False
 
@@ -336,6 +387,44 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     # TODO can we use the transaction memory to do better than CTFT before reputation kicks in?
 
+    @classmethod
+    def _rank_tier(cls, score: float) -> int:
+        """Map a reputation score to its rank tier.
+
+        Walks RANK_TIERS top-down, returning the highest tier whose
+        floor is met. Scores below the lowest floor map to 0.
+        """
+        for floor, rank in reversed(cls.RANK_TIERS):
+            if score >= floor:
+                return rank
+        return 0
+
+    def _publish_rank_change(self, queues, peer_uuid, score):
+        """Notify IdentityProcess of a tier crossing (BUGS.md §P2).
+
+        Suppressed if the tier hasn't changed from the last publication
+        for this peer. Local IPC only — message goes on the identity
+        queue with `IdentityProtocol.rank_update`.
+        """
+        try:
+            new_rank = self._rank_tier(score)
+            key = str(peer_uuid)
+            if self.peer_ranks.get(key) == new_rank:
+                return
+            self.peer_ranks[key] = new_rank
+            payload = to_json_string((key, new_rank))
+            # Local IPC: no to_whom (the consumer is the local
+            # IdentityProcess reading its own queue; no network egress).
+            msg = Message(CfgIds.identity, IdentityProtocol.rank_update,
+                          payload, to_whom=None, from_whom=self.identity)
+            queues[CfgIds.identity].put(msg, block=True, timeout=self.q_cadence)
+            self.logger.debug('Published rank_update for %s: %d (score=%.3f)' %
+                              (key, new_rank, score))
+        except Full:
+            self.logger.error('_publish_rank_change: identity queue full')
+        except Exception as err:
+            self.logger.warning('_publish_rank_change failed: %s' % err)
+
     def _compute_reputation(self, peer, req_proc, requestor):
         _probes.counter('rep.compute', 'enter')
         try:
@@ -355,6 +444,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                                                       CfgIds.reputation + Configuration.file_ext))
             except (OSError, IOError) as e:
                 self.logger.warning('Could not persist reputations: %s' % e)
+            # Queue a rank-update for IdentityProcess; drained by the
+            # process loop alongside forward_reputation. The spawned
+            # _compute_reputation thread doesn't have access to queues
+            # so it can't put directly.
+            self.pending_ranks.append((peer_uuid, rep_score))
             self.requested_reps.append((Reputation(peer_uuid, rep_score), req_proc, requestor))
             _probes.counter('rep.compute', 'queued')
         except Exception as e:
@@ -363,10 +457,23 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_reputation_request(self, _, message):
         if message.function == ReputationProtocol.rep_req:
+            # Accept both wire forms (BUGS.md §P9B):
+            #   object: {peer_uuid, requesting_process}  — canonical, matches C
+            #   tuple : (peer_uuid_str, req_proc_str)    — legacy
             if isinstance(message.obj, str):
-                ident, req_proc = from_json_string(message.obj)
+                parsed = from_json_string(message.obj)
             else:
-                ident, req_proc = message.obj
+                parsed = message.obj
+            if isinstance(parsed, dict):
+                ident = parsed.get('peer_uuid')
+                req_proc = parsed.get('requesting_process')
+            elif isinstance(parsed, (list, tuple)) and len(parsed) >= 2:
+                ident, req_proc = parsed[0], parsed[1]
+            else:
+                self.logger.error(
+                    'handle_reputation_request: unsupported payload shape %r'
+                    % type(parsed).__name__)
+                return True
             requestor = message.from_whom
             # Tag the requestor type so we can correlate
             # rep.handle_req with rep.compute and rep.forward.
@@ -383,8 +490,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     _probes.counter('rep.handle_req', 'enter', 'requestor_self')
                 else:
                     _probes.counter('rep.handle_req', 'enter', 'requestor_other')
-            threading.Thread(target=self._compute_reputation,
-                             args=(ident, req_proc, requestor), daemon=True).start()
+            self._spawn(self._compute_reputation,
+                        args=(ident, req_proc, requestor))
             return True
         return False
 
@@ -467,6 +574,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                                 self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
                 _probes.counter('proc.reputation', 'iter_drained', str(drained))
                 self.forward_reputation(queues)
+                # Drain rank updates queued by _compute_reputation.
+                while self.pending_ranks:
+                    peer_uuid, rep_score = self.pending_ranks.pop(0)
+                    self._publish_rank_change(queues, peer_uuid, rep_score)
 
                 present = now().timestamp()
                 for req in list(self.requests):

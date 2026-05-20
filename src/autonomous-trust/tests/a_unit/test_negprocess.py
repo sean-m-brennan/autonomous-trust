@@ -304,7 +304,7 @@ class TestHandleInviteDeeper:
         assert result is True
         assert not net_q.empty()
 
-    def test_invite_duplicate_demotes(self):
+    def test_invite_duplicate_refuses_past_threshold(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
         cap = Capability('video')
@@ -316,10 +316,12 @@ class TestHandleInviteDeeper:
         task.parameters.acceptable = MagicMock(return_value=True)
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
                       task, from_whom=peer)
-        # Send more than max_task_duplicates times
+        # Send more than max_task_duplicates times. The past-threshold
+        # iterations short-circuit to refuse-and-return (mirrors C's
+        # handle_invite). Peer is NOT demoted — the canonical action.
         for _ in range(np.max_task_duplicates + 2):
             np.handle_invite({CfgIds.network: queue.Queue()}, msg)
-        np.protocol.peers.demote.assert_called()
+        np.protocol.peers.demote.assert_not_called()
 
 
 class TestHandleHaggleDeeper:
@@ -708,7 +710,35 @@ class TestHandleInviteNewTask:
         assert np.proposed_tasks[task.uuid].count == 1
 
 
-class TestHandleHaggleFullException:
+class TestHandleInviteFloodCounter:
+    """Regression for BUGS.md §P7: per-task flood counter must persist
+    across `_add_task` admissions so the `max_task_duplicates` threshold
+    is reachable. Mirrors C's structurally-separate
+    "flood:<uuid>" map entry in negotiation/neg_proc.c."""
+
+    def test_flood_counter_persists_past_threshold(self):
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        cap = Capability('video')
+        np.protocol.capabilities.register_ability('video', lambda: None)
+
+        tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
+        task = Task(tp, peer)
+        task.to_json_string = MagicMock(return_value='yaml')
+        msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
+                      task, from_whom=peer)
+        net_q = queue.Queue()
+
+        for _ in range(np.max_task_duplicates + 1):
+            assert np.handle_invite({CfgIds.network: net_q}, msg) is True
+
+        # Counter advanced once per invite and was NOT cleared by _add_task.
+        assert np.flood_counts[task.uuid] == np.max_task_duplicates + 1
+        # Iteration past the threshold trips refuse-and-return; peer
+        # is NOT demoted (canonical action mirrors C's handle_invite).
+        np.peers.demote.assert_not_called()
+        last_msg = list(net_q.queue)[-1]
+        assert last_msg.function == NegotiationProtocol.refusal
     """Cover Full exception paths in handle_haggle (lines 167-168, 172-173)."""
 
     def test_flexible_task_full_queue(self):

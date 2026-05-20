@@ -1,0 +1,566 @@
+/********************
+ *  Copyright 2026 Sean M. Brennan and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
+/** @file Identity-protocol adapter.
+ *
+ *  Builds participants, installs the messaging_send test hook, and drives
+ *  the universal scenario_engine. The adapter's only protocol-specific
+ *  responsibilities are participant construction (per-id `process_t`
+ *  instantiation + handler registration) and inbound construction (turn a
+ *  scenario step into a `generic_msg_t` the C handler can dispatch).
+ *
+ *  Phase C: both amnesia-readmission and new-node-admission run end-to-
+ *  end. The adapter flips `identity_set_synchronous_dispatch(true)` on
+ *  the file-scope id_state so welcoming_committee inline-finalizes (no
+ *  inbound vote messages required) and emits propose_peer / peer_accepted
+ *  as one broadcast each — mirroring Python's group-targeted sends.
+ */
+
+#include "identity.h"
+
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include <sodium.h>
+#include <uuid/uuid.h>
+
+#include "identity/identity.h"
+#include "identity/id_proc_priv.h"
+#include "network/net_message.h"
+#include "processes/processes.h"
+#include "structures/array.h"
+#include "structures/map.h"
+#include "utilities/message.h"
+#include "utilities/msg_types_priv.h"
+
+#include "../negative_runner.h"
+#include "../scenario_engine.h"
+
+/* Provided by runner.c; needed for kind:negative case dispatch to resolve
+ * based_on references inside the JSON corpus mirror. */
+extern const char *at_runner_corpus_json_root(void);
+
+/* ------------------------------------------------------------------------- */
+/* Per-participant impl carries a process_t plus a public_identity_t copy    */
+/* for the to_whom→id resolution path.                                        */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    identity_t *full;
+    public_identity_t *pub;
+    process_t *proc;
+} ic_impl_t;
+
+/* The engine ctx is global because the messaging-hook signature has no
+ * void* context; one scenario runs at a time. */
+static sce_run_ctx_t *g_active_ctx = NULL;
+
+/* Scan ctx->participants for a uuid match — the messaging hook gets a
+ * net_msg.to_whom (public_identity_t) and needs to map back to a
+ * participant id.
+ *
+ * Identity protocol's `peer_accepted` and `propose_peer` are conceptually
+ * group broadcasts (Python sends each as a single `to_whom=self.group`
+ * Message). In synchronous_dispatch mode the C implementation now also
+ * emits one broadcast per call, with a zeroed to_whom — `is_broadcast`
+ * detects that. Either way we surface them as "broadcast" so cross-
+ * language scenarios match. */
+static bool _is_zero_uuid(const uuid_t u) {
+    for (size_t i = 0; i < sizeof(uuid_t); i++)
+        if (u[i] != 0) return false;
+    return true;
+}
+
+static const char *_resolve_to_id(const generic_msg_t *msg) {
+    if (msg->type != NET_MESSAGE) return "internal";
+    const char *fn = msg->info.net_msg.function;
+    if (fn != NULL
+        && (strcmp(fn, "peer_accepted") == 0
+            || strcmp(fn, "propose_peer") == 0)) {
+        return "broadcast";
+    }
+    if (_is_zero_uuid(msg->info.net_msg.to_whom.uuid)) {
+        return "broadcast";
+    }
+    if (g_active_ctx == NULL) return "unknown";
+    for (size_t i = 0; i < g_active_ctx->participant_count; i++) {
+        ic_impl_t *impl = (ic_impl_t *)g_active_ctx->participants[i].impl;
+        if (impl == NULL || impl->pub == NULL) continue;
+        if (uuid_compare(impl->pub->uuid, msg->info.net_msg.to_whom.uuid) == 0) {
+            return g_active_ctx->participants[i].id;
+        }
+    }
+    return "unknown";
+}
+
+static int _send_hook(const char *key,
+                      const message_type_t type,
+                      generic_msg_t *msg,
+                      bool blocking) {
+    (void)key; (void)blocking;
+    if (g_active_ctx == NULL) return 0;
+    const char *to_id = _resolve_to_id(msg);
+    const char *function = (type == NET_MESSAGE && msg->info.net_msg.function != NULL)
+        ? msg->info.net_msg.function : "__internal__";
+    sce_capture(g_active_ctx, to_id, function);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Participant construction                                                    */
+/* ------------------------------------------------------------------------- */
+
+static int _make_identity(const char *id, size_t idx, identity_t **out) {
+    uuid_t uuid;
+    crypto_generichash(uuid, sizeof(uuid_t),
+                       (const unsigned char *)id, strlen(id), NULL, 0);
+    /* Cosmetic v4-shaped uuid: clearer in logs than raw hash bytes. */
+    uuid[6] = (uuid[6] & 0x0F) | 0x40;
+    uuid[8] = (uuid[8] & 0x3F) | 0x80;
+    char addr[ADDR_LEN + 1] = {0};
+    snprintf(addr, sizeof(addr), "10.0.70.%zu", idx + 1);
+    char fullname[NAME_LEN + 1] = {0};
+    snprintf(fullname, sizeof(fullname), "%s.scenario", id);
+    return identity_create(&uuid, addr, fullname, id, "me", out);
+}
+
+static ic_impl_t *_build_participant_impl(const char *id, size_t idx) {
+    ic_impl_t *impl = calloc(1, sizeof(ic_impl_t));
+    if (impl == NULL) return NULL;
+    if (_make_identity(id, idx, &impl->full) != 0 || impl->full == NULL) goto fail;
+    if (identity_publish(impl->full, &impl->pub) != 0 || impl->pub == NULL) goto fail;
+    impl->proc = smrt_create(sizeof(process_t));
+    if (impl->proc == NULL) goto fail;
+    pthread_rwlock_init(&impl->proc->protocol.peers_rwlock, NULL);
+    strncpy(impl->proc->name, "identity", PROC_NAME_LEN);
+    if (map_create(&impl->proc->protocol.handlers) != 0) goto fail;
+    impl->proc->protocol.phase = 3;
+    if (identity_register_handlers(impl->proc) != 0) goto fail;
+    return impl;
+fail:
+    if (impl != NULL) {
+        if (impl->proc != NULL) {
+            if (impl->proc->protocol.handlers != NULL) map_free(impl->proc->protocol.handlers);
+            pthread_rwlock_destroy(&impl->proc->protocol.peers_rwlock);
+            smrt_deref(impl->proc);
+        }
+        if (impl->pub != NULL) smrt_deref(impl->pub);
+        if (impl->full != NULL) identity_free(impl->full);
+        free(impl);
+    }
+    return NULL;
+}
+
+static void _free_participant_impl(ic_impl_t *impl) {
+    if (impl == NULL) return;
+    if (impl->proc != NULL) {
+        if (impl->proc->protocol.handlers != NULL) map_free(impl->proc->protocol.handlers);
+        pthread_rwlock_destroy(&impl->proc->protocol.peers_rwlock);
+        smrt_deref(impl->proc);
+    }
+    if (impl->pub != NULL) smrt_deref(impl->pub);
+    if (impl->full != NULL) identity_free(impl->full);
+    free(impl);
+}
+
+/* Apply scenario fixtures: amnesia_known => pre-stage non-newcomer
+ * participants' peer lists with the newcomer (so welcoming_committee's
+ * already-known branch is reachable). */
+static void _apply_fixtures(sce_run_ctx_t *ctx) {
+    json_t *fixtures = json_object_get(ctx->case_data, "fixtures");
+    if (!json_is_object(fixtures)) return;
+
+    /* capabilities: { "<participant>": ["<cap>", ...], ... } —
+     * install each participant's own-capability allowlist via
+     * identity_set_own_capabilities so handle_caps_query emits the
+     * matching JSON-array payload. Mirrors the negotiation adapter's
+     * fixture wiring; Python's identity adapter populates
+     * `process.protocol.capabilities` from the same fixture key. */
+    json_t *caps = json_object_get(fixtures, "capabilities");
+    if (json_is_object(caps))
+    {
+        const char *pid;
+        json_t *cap_arr;
+        json_object_foreach(caps, pid, cap_arr) {
+            sce_participant_t *part = sce_find_participant(ctx, pid);
+            if (part == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            if (impl == NULL || impl->proc == NULL) continue;
+            if (!json_is_array(cap_arr)) continue;
+            size_t n = json_array_size(cap_arr);
+            const char **names = (n > 0) ? calloc(n, sizeof(char *)) : NULL;
+            size_t k = 0;
+            for (size_t i = 0; i < n; i++)
+            {
+                const char *name = json_string_value(json_array_get(cap_arr, i));
+                if (name) names[k++] = name;
+            }
+            identity_set_own_capabilities(impl->proc, names, k);
+            free((void *)names);
+        }
+    }
+
+    json_t *amnesia_j = json_object_get(fixtures, "amnesia_known");
+    bool amnesia_known = json_is_true(amnesia_j);
+
+    /* Find the new_node by role. */
+    int newcomer_idx = -1;
+    for (size_t i = 0; i < ctx->participant_count; i++) {
+        if (strcmp(ctx->participants[i].role, "new_node") == 0) {
+            newcomer_idx = (int)i;
+            break;
+        }
+    }
+    if (!amnesia_known || newcomer_idx < 0) return;
+
+    /* Add the newcomer to each existing peer's peers list. */
+    ic_impl_t *new_impl = (ic_impl_t *)ctx->participants[newcomer_idx].impl;
+    for (size_t i = 0; i < ctx->participant_count; i++) {
+        if ((int)i == newcomer_idx) continue;
+        ic_impl_t *impl = (ic_impl_t *)ctx->participants[i].impl;
+        process_t *p = impl->proc;
+        if (p->protocol.num_peers >= DEFAULT_MAX_PEERS) continue;
+        memcpy(&p->protocol.peers[p->protocol.num_peers],
+               new_impl->pub, sizeof(public_identity_t));
+        p->protocol.num_peers++;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Engine callbacks                                                           */
+/* ------------------------------------------------------------------------- */
+
+static int _build_inbound(sce_run_ctx_t *ctx,
+                          const char *from_id,
+                          const char *to_id,
+                          const char *function,
+                          json_t *payload,
+                          generic_msg_t *out) {
+    (void)to_id;
+    sce_participant_t *sender = sce_find_participant(ctx, from_id);
+    if (sender == NULL) {
+        snprintf(ctx->err, sizeof(ctx->err), "build_inbound: unknown from %s", from_id);
+        return -1;
+    }
+    ic_impl_t *sender_impl = (ic_impl_t *)sender->impl;
+
+    memset(out, 0, sizeof(*out));
+    out->type = NET_MESSAGE;
+    strncpy(out->info.net_msg.process, "identity", PROC_NAME_LEN);
+    /* function string is owned by the JSON loaded by the runner; lifetime
+     * spans the entire scenario, which is what the handler dispatch
+     * requires (strcmp against handler keys). */
+    out->info.net_msg.function = (char *)function;
+    out->info.net_msg.encrypt = false;
+    memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
+
+    /* peer_caps_response — pack the YAML `caps: [...]` list as a JSON
+     * array so handle_caps_response can parse + register it. Without
+     * this, the C handler sees no payload and silently no-ops. */
+    if (strcmp(function, "peer_caps_response") == 0 && json_is_object(payload)) {
+        json_t *src = json_object_get(payload, "caps");
+        if (json_is_array(src)) {
+            json_t *body = json_array();
+            size_t n = json_array_size(src);
+            for (size_t i = 0; i < n; i++) {
+                json_t *v = json_array_get(src, i);
+                if (json_is_string(v))
+                    json_array_append_new(body, json_string(json_string_value(v)));
+            }
+            net_msg_pack_json(&out->info.net_msg, body);
+            json_decref(body);
+        }
+        return 0;
+    }
+
+    /* vote_on_peer is the only identity function whose C handler
+     * (`handle_count_vote`) requires a structured JSON payload —
+     * `{uuid, approved}` keyed off the candidate's uuid. Other
+     * identity functions either expect empty/unused payloads or use
+     * the generic obj passthrough. */
+    if (strcmp(function, "vote_on_peer") == 0 && json_is_object(payload)) {
+        const char *cand_id = NULL;
+        json_t *c = json_object_get(payload, "candidate");
+        if (json_is_string(c)) cand_id = json_string_value(c);
+        bool approved = true;
+        json_t *a = json_object_get(payload, "approved");
+        if (json_is_boolean(a)) approved = json_boolean_value(a);
+
+        char uuid_buf[UUID_STRING_LEN + 1] = {0};
+        if (cand_id != NULL) {
+            sce_participant_t *cand = sce_find_participant(ctx, cand_id);
+            if (cand != NULL) {
+                ic_impl_t *cand_impl = (ic_impl_t *)cand->impl;
+                if (cand_impl && cand_impl->pub)
+                    uuid_unparse_lower(cand_impl->pub->uuid, uuid_buf);
+            }
+        }
+        json_t *body = json_object();
+        json_object_set_new(body, "uuid", json_string(uuid_buf));
+        json_object_set_new(body, "approved", json_boolean(approved));
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+    }
+
+    return 0;
+}
+
+static int _dispatch(sce_run_ctx_t *ctx,
+                     sce_participant_t *target,
+                     generic_msg_t *inbound) {
+    (void)ctx;
+    ic_impl_t *impl = (ic_impl_t *)target->impl;
+    /* directory_t is array_t; _remember_activity walks it without a NULL
+     * guard. Pass an empty array. */
+    array_t *queues = NULL;
+    array_create(&queues);
+    run_message_handlers(impl->proc, queues, NET_MESSAGE, inbound);
+    array_free(queues);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Adapter entry                                                              */
+/* ------------------------------------------------------------------------- */
+
+/* Validate `expected_state` against post-scenario participant state.
+ * Mirrors the Python identity adapter's _Participant._check_expected_state
+ * (src/autonomous-trust/conformance/harness/python/adapters/identity.py:86-111).
+ * Supported keys: phase (int), peer_count (int), has_peer (uuid string).
+ * Unsupported keys produce an error so the corpus and the two adapters
+ * stay aligned — an asymmetry caught at the gate beats a silent skip.
+ *
+ * Returns 0 if all checks pass, -1 with ctx->err on the first mismatch. */
+static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
+    json_t *expected = json_object_get(ctx->case_data, "expected_state");
+    if (!json_is_object(expected)) return 0;
+
+    const char *pid;
+    json_t *checks;
+    json_object_foreach(expected, pid, checks) {
+        if (strcmp(pid, "group") == 0) {
+            /* Engine convention from the Python side: group-state is
+             * adapter-driven; identity has no group-aware checks yet, so
+             * skip silently. */
+            continue;
+        }
+        if (!json_is_object(checks)) continue;
+        sce_participant_t *p = sce_find_participant(ctx, pid);
+        if (p == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "expected_state references unknown participant %s", pid);
+            return -1;
+        }
+        ic_impl_t *impl = (ic_impl_t *)p->impl;
+        process_t *proc = impl->proc;
+
+        const char *key;
+        json_t *val;
+        json_object_foreach(checks, key, val) {
+            if (strcmp(key, "phase") == 0) {
+                int want = (int)json_integer_value(val);
+                int got = (int)proc->protocol.phase;
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: phase=%d, expected %d", pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "peer_count") == 0) {
+                int want = (int)json_integer_value(val);
+                /* protocol.num_peers is the same field the production
+                 * peer-add path advances; mirrors Python's
+                 * `sum(len(level) for level in self.process.peers.hierarchy)`
+                 * (which collapses all hierarchy levels to a flat count). */
+                int got = (int)proc->protocol.num_peers;
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: peer_count=%d, expected %d", pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "has_peer") == 0) {
+                const char *uuid_str = json_string_value(val);
+                if (uuid_str == NULL) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: has_peer expects a uuid string", pid);
+                    return -1;
+                }
+                uuid_t want_uuid;
+                if (uuid_parse(uuid_str, want_uuid) != 0) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: has_peer uuid %s not parseable",
+                             pid, uuid_str);
+                    return -1;
+                }
+                bool found = false;
+                for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+                    if (memcmp(proc->protocol.peers[i].uuid, want_uuid,
+                               sizeof(uuid_t)) == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: has_peer %s not present (have %d peers)",
+                             pid, uuid_str, (int)proc->protocol.num_peers);
+                    return -1;
+                }
+            } else if (strcmp(key, "peer_caps_count") == 0) {
+                /* `peer_caps_count: <int>` — assert the number of caps
+                 * recorded for THIS participant under their own uuid in
+                 * id_state.peer_caps_map. Populated by handle_caps_response
+                 * on inbound peer_caps_response. Wait — actually we want
+                 * the caps recorded ABOUT a peer; the key references the
+                 * recipient and the value is the count under the SENDER
+                 * uuid. The scenario authoring convention is that
+                 * `peer_caps_count` is keyed by participant id whose
+                 * peer_caps_map entry under the OTHER participant's uuid
+                 * we want — but with a 2-party scenario the only sender
+                 * is the other participant. Simplest reading: assert
+                 * `id_state.peer_caps_map` has `int` total entries for
+                 * SOME peer registered after the scenario; we encode
+                 * that as: count across all entries in the map for THIS
+                 * participant. The map is shared, so the count is the
+                 * global peer count — that's fine for a 2-party probe. */
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->participant_count; i++) {
+                    ic_impl_t *other = (ic_impl_t *)ctx->participants[i].impl;
+                    if (other == NULL || other->pub == NULL) continue;
+                    if (strcmp(ctx->participants[i].id, pid) == 0) continue;
+                    got += identity_get_peer_caps_count(other->pub->uuid);
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: peer_caps_count=%d, expected %d",
+                             pid, got, want);
+                    return -1;
+                }
+            } else {
+                snprintf(ctx->err, sizeof(ctx->err),
+                         "%s: unsupported expected_state key %s", pid, key);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+void at_identity_run(const at_case_t *c, at_case_result_t *out) {
+    if (strcmp(c->kind, "negative") == 0) {
+        at_neg_run_wire(c, out);
+        return;
+    }
+    if (strcmp(c->kind, "scenario") != 0) {
+        char detail[160];
+        snprintf(detail, sizeof(detail),
+                 "C identity adapter only handles kind:scenario|negative (got %s)", c->kind);
+        at_case_result_set_skip(out, detail);
+        return;
+    }
+
+    char err[256] = {0};
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    /* Inline-finalize the welcoming-committee cascade and emit propose /
+     * peer_accepted as broadcasts, so a single-bg scenario sees the full
+     * outbound. Mirrors Python's per-instance synchronous_dispatch=True. */
+    identity_set_synchronous_dispatch(true);
+
+    sce_run_ctx_t ctx;
+    sce_init(&ctx);
+    ctx.case_data = c->data;
+    ctx.build_inbound = _build_inbound;
+    ctx.dispatch = _dispatch;
+
+    /* Wipe singleton id_state so observables (peer_caps_count etc.) are
+     * not polluted by prior scenarios. Preserves synchronous_dispatch. */
+    identity_reset_state();
+
+    /* Build participants. */
+    json_t *parts = json_object_get(c->data, "participants");
+    if (!json_is_array(parts)) {
+        snprintf(err, sizeof(err), "scenario: participants array missing");
+        goto fail;
+    }
+    size_t n = json_array_size(parts);
+    if (n > SCE_MAX_PARTICIPANTS) {
+        snprintf(err, sizeof(err), "scenario: too many participants (%zu)", n);
+        goto fail;
+    }
+    for (size_t i = 0; i < n; i++) {
+        json_t *p = json_array_get(parts, i);
+        const char *id = json_string_value(json_object_get(p, "id"));
+        const char *role = json_string_value(json_object_get(p, "role"));
+        if (id == NULL || role == NULL) {
+            snprintf(err, sizeof(err), "participants[%zu] missing id or role", i);
+            goto fail;
+        }
+        snprintf(ctx.participants[i].id, SCE_ID_LEN, "%s", id);
+        snprintf(ctx.participants[i].role, SCE_ID_LEN, "%s", role);
+        ctx.participants[i].impl = _build_participant_impl(id, i);
+        if (ctx.participants[i].impl == NULL) {
+            snprintf(err, sizeof(err),
+                     "participants[%zu] (%s) impl build failed", i, id);
+            goto fail;
+        }
+        ctx.participant_count++;
+    }
+
+    _apply_fixtures(&ctx);
+
+    g_active_ctx = &ctx;
+    messaging_set_test_hook(_send_hook);
+
+    int rc = sce_run(&ctx);
+    /* The engine's stub _check_expected_state is a no-op; per-protocol
+     * enforcement lives here so a scenario's bg.peer_count: 1 (and
+     * friends) is checked symmetrically with the Python adapter. */
+    if (rc == 0) rc = _identity_check_expected_state(&ctx);
+
+    messaging_set_test_hook(NULL);
+    g_active_ctx = NULL;
+    identity_set_synchronous_dispatch(false);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    int duration_ms = (int)((t1.tv_sec - t0.tv_sec) * 1000
+                            + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+    if (rc == 0) {
+        at_case_result_set_pass(out, duration_ms);
+    } else {
+        at_case_result_set_fail(out, duration_ms, "AssertionError", ctx.err);
+    }
+
+    /* Cleanup. */
+    for (size_t i = 0; i < ctx.participant_count; i++) {
+        _free_participant_impl((ic_impl_t *)ctx.participants[i].impl);
+    }
+    return;
+
+fail:
+    g_active_ctx = NULL;
+    messaging_set_test_hook(NULL);
+    identity_set_synchronous_dispatch(false);
+    for (size_t i = 0; i < ctx.participant_count; i++) {
+        _free_participant_impl((ic_impl_t *)ctx.participants[i].impl);
+    }
+    at_case_result_set_fail(out, 0, "AssertionError", err);
+}

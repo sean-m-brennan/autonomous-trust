@@ -1,0 +1,29 @@
+schema_version: "1"
+kind: agreement_vector
+protocol: agreement
+name: agreement-poa-leader-rejects
+description: |
+    POA: leader rejects despite minority approval; finalize returns False.
+    Demonstrates that POA is not majority-rule — only the leader's vote
+    counts toward the final outcome.
+impl: authority
+voters:
+  - id: alice
+    rank: 0
+  - id: carol
+    rank: 1
+  - id: bob
+    rank: 5
+myself: alice
+blob:
+  originator: bob
+  uuid: candidate-rejected
+votes:
+  - by: alice
+    approval: true
+  - by: carol
+    approval: true
+  - by: bob
+    approval: false
+expected:
+  outcome: false

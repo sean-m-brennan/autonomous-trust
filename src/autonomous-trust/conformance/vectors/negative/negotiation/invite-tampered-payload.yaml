@@ -1,0 +1,23 @@
+schema_version: "1"
+kind: negative
+protocol: negotiation
+name: invite-tampered-payload
+description: |
+    Flip one byte of the base64 `data` field on alice's negotiation
+    `invitation` message. Wire envelope still decodes (base64 alphabet
+    preserved) but the decoded payload differs from what alice signed,
+    so signature verification must fail. Cross-protocol companion to
+    identity/request-access-tampered-payload — confirms the shared
+    `run_wire_negative` framework reports the same reason_class when
+    payload tampering happens on a negotiation envelope.
+
+based_on: scenarios/negotiation/invite-accept.yaml
+
+mutation:
+  step_id: 1
+  op: flip_byte
+  target: payload
+  index: 0
+
+expected:
+  reason_class: signature_verification_failed

@@ -15,8 +15,22 @@
 # ******************
 
 from abc import ABC
+from nacl.encoding import HexEncoder
 from .agreement import AgreementProtocol, AgreementVoter, AgreementProof
 from ..system import encoding
+
+
+def _raw_hash(blob, nonce: bytes = None) -> bytes:
+    """Compute the raw 32-byte blake2b digest of `designation + nonce`.
+
+    `blob.get_hash` returns ASCII-hex bytes (MerkleTree.hash_func defaults
+    to nacl.hash.blake2b with HexEncoder); POW canonicalizes on raw bytes
+    so the digest is byte-identical to C's crypto_generichash_blake2b
+    output for the same input. Hex-decoding the existing output is
+    cheaper than re-implementing the hash from scratch and avoids
+    forking MerkleTree's encoder default.
+    """
+    return HexEncoder.decode(blob.get_hash(nonce))
 
 
 class AgreementByWork(AgreementProtocol, ABC):
@@ -24,27 +38,42 @@ class AgreementByWork(AgreementProtocol, ABC):
     Agreement by computation capability
     Still abstract
     """
-    DIFFICULTY = 2
+    DIFFICULTY = 2  # number of leading zero BYTES required of the raw digest
 
     def __init__(self, myself: AgreementVoter, peers: list[AgreementVoter]):
         super().__init__(myself, peers)
         self._approved = []
 
     def prove(self, blob):
-        nonce = 0
-        computed_hash = blob.get_hash()
         # WARNING: this is *designed* to take some time
+        nonce_used = None
+        computed_hash = _raw_hash(blob)
+        prefix = b'\x00' * self.DIFFICULTY
         try:
-            while not computed_hash.startswith(b'0' * self.DIFFICULTY):
-                nonce += 1
-                computed_hash = blob.get_hash(str(nonce).encode(encoding))
+            if not computed_hash.startswith(prefix):
+                nonce = 0
+                while True:
+                    nonce += 1
+                    nonce_bytes = str(nonce).encode(encoding)
+                    computed_hash = _raw_hash(blob, nonce_bytes)
+                    if computed_hash.startswith(prefix):
+                        nonce_used = nonce_bytes
+                        break
         except MemoryError:
             pass
-        return AgreementProof(self.myself.uuid, computed_hash, True)
+        # Store the nonce in the proof so verify() can recompute the same
+        # hash. Without this, any mined proof that needed >0 iterations
+        # would re-hash against the no-nonce form in verify and be
+        # rejected — see BUGS.md P5 (FIXED 2026-05-11). When the no-nonce
+        # hash already met the difficulty, nonce_used stays None and
+        # verify naturally re-hashes with no nonce, matching.
+        return AgreementProof(self.myself.uuid, computed_hash, True,
+                              nonce=nonce_used)
 
     def verify(self, blob, proof, sig):
         self._pre_verify(blob, proof, sig)
-        if proof.digest.startswith(b'0' * self.DIFFICULTY) and proof.digest == blob.get_hash(proof.nonce):
+        prefix = b'\x00' * self.DIFFICULTY
+        if proof.digest.startswith(prefix) and proof.digest == _raw_hash(blob, proof.nonce):
             self._approved.append(blob)
         return True
 

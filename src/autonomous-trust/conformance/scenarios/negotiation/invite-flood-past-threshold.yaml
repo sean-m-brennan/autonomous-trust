@@ -1,0 +1,75 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-flood-past-threshold
+byte_pinning: false
+description: |
+    Flood-counter probe at the threshold boundary. alice's
+    `invitation` for a single task is delivered to bob 6 times
+    via the universal scenario engine's `repeat: N` grammar — one
+    over the `max_task_duplicates = 5` ceiling both implementations
+    track:
+      - Python: `flood_counts[uuid]` in
+        `negotiation/negprocess.py` (persistent dict, separate
+        from `proposed_tasks` which `_add_task` clears on every
+        admission — see BUGS.md §P7).
+      - C: `flood:<uuid>` key on the `proposed_tasks` map in
+        `negotiation/neg_proc.c:529-540` (structurally separate
+        from the task-pointer entries).
+
+    Both counters now persist across admissions, so the
+    `flood_count: {task: t-flood, count: 6}` assertion holds
+    symmetrically. Pairs with `invite-replay-survives` (N=2;
+    engine path under the threshold) by exercising the same path
+    one over the documented `max_task_duplicates = 5` ceiling.
+
+    Past-threshold action: refuse-and-return on both sides
+    (canonical AT v1 behavior). Python and C both emit a
+    `refusal` and short-circuit further dispatch when
+    `flood_counts[uuid] > max_task_duplicates`. Step 2 asserts
+    that at least one refusal appears in step 1's outbox.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-flood
+    repeat: 6
+    description: |
+        alice invites bob to perform data_fetch — the same
+        invitation envelope is delivered 6 times, one past the
+        `max_task_duplicates = 5` threshold. Both impls' flood
+        counter is expected to read 6 after the run; iteration 6
+        emits a refusal back to alice (refuse-and-return).
+  - id: 2
+    from: bob
+    to: alice
+    function: nack
+    in_response_to: 1
+    no_propagate: true
+    description: |
+        Assertion-only: at least one `nack` (NegotiationProtocol.refusal)
+        appears in step 1's captured outbox (iteration 6 trips the flood
+        threshold on both Python and C). `no_propagate: true` keeps this
+        an observation step — the engine does not deliver this message
+        back to alice.
+
+expected_state:
+  bob:
+    task_in_stack: true
+    flood_count:
+      task: t-flood
+      count: 6

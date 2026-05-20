@@ -1,0 +1,57 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pow-mined-proof-finalizes-true
+byte_pinning: false
+description: |
+    Second POW scenario; introduces the `function: prove` step kind.
+    Each adapter mines a valid POW proof for `blob-x` using its own
+    `protocol.prove()` implementation, then runs verify and asserts
+    finalize=true.
+
+    Cross-language semantics are now aligned (BUGS.md §P5 CLOSED
+    2026-05-14): both Python and C use raw 32-byte blake2b digests
+    and check `DIFFICULTY` leading zero BYTES. The digest bytes for
+    the same input are byte-identical; see
+    `pow-cross-language-byte-pin.yaml` for the explicit assertion.
+    This scenario stays focused on the end-to-end outcome
+    (finalize=true) so a regression in the prove→verify→finalize
+    state machine surfaces independently of the digest format.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: work
+  difficulty: 2
+  myself: bob
+  blobs:
+    blob-x:
+      originator: alice
+      payload: "minable-payload"
+
+steps:
+  - id: 1
+    from: bob
+    to: agreement
+    function: prove
+    payload:
+      blob: blob-x
+    description: |
+        bob mines a valid POW proof for blob-x (per its impl's own
+        DIFFICULTY semantics) and submits via protocol.verify.
+  - id: 2
+    from: bob
+    to: agreement
+    function: finalize
+    payload:
+      blob: blob-x
+      expected_outcome: true
+    description: |
+        finalize sees the approved blob and returns true. After §P5
+        alignment the digest bytes are also cross-language identical;
+        this scenario asserts only the protocol outcome — see
+        `pow-cross-language-byte-pin.yaml` for the digest byte-pin.

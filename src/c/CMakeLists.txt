@@ -48,6 +48,41 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 set(CMAKE_C_FLAGS_DEBUG "-g -O0")
 
+# virtiofs page-cache reconciliation hazard (sandbox builds): when the
+# source/build trees live on virtiofs, gcc occasionally writes a .o with
+# a corrupt section header table. The on-disk file is short of what
+# ar/ranlib expect, so the bfd LTO plugin emits "ELF section name out
+# of range" and the symbol is silently dropped from the static archive's
+# TOC, breaking the eventual link. Detect virtiofs and install a
+# validate-and-retry compiler launcher that re-invokes gcc on bad
+# output. Off by default outside virtiofs (no false positives), and
+# always overridable via -DAT_CC_VALIDATE_OUTPUT={ON,OFF}.
+execute_process(
+    COMMAND stat -f --format=%T ${CMAKE_BINARY_DIR}
+    OUTPUT_VARIABLE _at_build_fs_type
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(_at_build_fs_type STREQUAL "fuseblk" OR
+   _at_build_fs_type STREQUAL "virtiofs" OR
+   _at_build_fs_type MATCHES "^9p")
+    set(_at_validate_default ON)
+else()
+    set(_at_validate_default OFF)
+endif()
+option(AT_CC_VALIDATE_OUTPUT
+    "Re-invoke the compiler when it emits a .o with a corrupt section header (virtiofs workaround)"
+    ${_at_validate_default})
+if(AT_CC_VALIDATE_OUTPUT)
+    set(_at_cc_launcher ${CMAKE_CURRENT_SOURCE_DIR}/cmake/cc-validate-output)
+    if(NOT EXISTS ${_at_cc_launcher})
+        message(FATAL_ERROR "AT_CC_VALIDATE_OUTPUT=ON but ${_at_cc_launcher} is missing")
+    endif()
+    set(CMAKE_C_COMPILER_LAUNCHER ${_at_cc_launcher})
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${_at_cc_launcher})
+    message("-- AT_CC_VALIDATE_OUTPUT enabled (build FS: ${_at_build_fs_type}); using ${_at_cc_launcher}")
+endif()
+
 set(warning_as_error -Werror)
 set(useful_warnings
     -Wshadow 
@@ -170,17 +205,76 @@ else()
 endif()
 
 # protobuf
-find_package(Protobuf REQUIRED)  # paths doesn't work
-#find_path(Protobuf_INCLUDE_DIRS message.h PATH_SUFFIXES google/protobuf HINTS ${CONDA_ROOT})
-#find_library(Protobuf_LIBRARY libprotobuf.so HINTS ${CONDA_ROOT})
+#
+# When the conda env provides libprotobuf, pre-seed Protobuf_INCLUDE_DIR /
+# Protobuf_LIBRARY / Protobuf_PROTOC_EXECUTABLE so FindProtobuf reads the
+# *conda* headers for its version-extraction step. Without this, conda's
+# cmake (4.x) lands on /usr/include/google/protobuf/stubs/common.h to
+# extract the version, but its sysroot is the conda toolchain root — the
+# /usr/include path is not readable through that sysroot, so `file
+# STRINGS` fails and the subsequent math(EXPR) calls explode on the empty
+# version string.
+#
+# If conda is active but lacks protobuf, fall through to a system search
+# that bypasses find_package(Protobuf) entirely — we emulate the small
+# subset of vars our build needs (INCLUDE_DIR/LIBRARY/PROTOC) using bare
+# find_*, dodging the broken file STRINGS read.  Recommend `conda install
+# protobuf libprotobuf` to stay inside the env.
+set(_at_protobuf_resolved FALSE)
+if(DEFINED ENV{CONDA_PREFIX})
+    find_path(_at_protobuf_inc google/protobuf/stubs/common.h
+              HINTS ${CONDA_ROOT} NO_DEFAULT_PATH)
+    find_library(_at_protobuf_lib NAMES protobuf
+                 HINTS ${CONDA_ROOT} NO_DEFAULT_PATH)
+    find_program(_at_protoc_exe protoc HINTS ${CONDA_ROOT} NO_DEFAULT_PATH)
+    if(_at_protobuf_inc AND _at_protobuf_lib)
+        set(Protobuf_INCLUDE_DIR ${_at_protobuf_inc} CACHE PATH "" FORCE)
+        set(Protobuf_LIBRARY ${_at_protobuf_lib} CACHE FILEPATH "" FORCE)
+        if(_at_protoc_exe)
+            set(Protobuf_PROTOC_EXECUTABLE ${_at_protoc_exe} CACHE FILEPATH "" FORCE)
+        endif()
+        find_package(Protobuf REQUIRED)
+        set(_at_protobuf_resolved TRUE)
+    else()
+        # Conda has no protobuf — fall back to a bare-find of the system
+        # copy.  Do NOT call find_package(Protobuf) here: conda's cmake
+        # cannot read the system header through its sysroot and would
+        # error out with `file STRINGS ... cannot be read`.
+        find_path(_at_sys_protobuf_inc google/protobuf/stubs/common.h)
+        find_library(_at_sys_protobuf_lib NAMES protobuf)
+        find_program(_at_sys_protoc_exe protoc)
+        if(_at_sys_protobuf_inc AND _at_sys_protobuf_lib)
+            set(Protobuf_INCLUDE_DIR  ${_at_sys_protobuf_inc} CACHE PATH "" FORCE)
+            set(Protobuf_INCLUDE_DIRS ${_at_sys_protobuf_inc})
+            set(Protobuf_LIBRARY      ${_at_sys_protobuf_lib} CACHE FILEPATH "" FORCE)
+            set(Protobuf_LIBRARIES    ${_at_sys_protobuf_lib})
+            if(_at_sys_protoc_exe)
+                set(Protobuf_PROTOC_EXECUTABLE ${_at_sys_protoc_exe} CACHE FILEPATH "" FORCE)
+            endif()
+            message(STATUS "Conda has no protobuf; using system at ${_at_sys_protobuf_lib} "
+                           "(install `protobuf libprotobuf` into the conda env to silence this)")
+            set(_at_protobuf_resolved TRUE)
+        endif()
+    endif()
+endif()
+if(NOT _at_protobuf_resolved)
+    find_package(Protobuf REQUIRED)
+endif()
 include_directories(${Protobuf_INCLUDE_DIRS})
-#find_program(Protobuf_PROTOC_EXECUTABLE protoc HINTS ${CONDA_ROOT})
-#string(REPLACE "/google/protobuf" "" PROTOBUF_INCLUDE_DIR ${Protobuf_INCLUDE_DIRS})
-#include_directories(${PROTOBUF_INCLUDE_DIR})
 if(Protobuf_LIBRARY)
     message("-- Found libprotobuf at ${Protobuf_LIBRARY}")
 else()
     message(FATAL_ERROR "Required dependency libprotobuf not found.")
+endif()
+
+# Legacy uppercase alias.  The system cmake 3.31 FindProtobuf still
+# back-fills PROTOBUF_INCLUDE_DIR from Protobuf_INCLUDE_DIR, but conda's
+# cmake 4.x dropped that fallback.  Three sites in this file (the protoc
+# `-I` flag plus the google/protobuf/*.proto source paths around line
+# 750) still reference the uppercase form, so set it explicitly here so
+# the build is portable across cmake versions.
+if(NOT DEFINED PROTOBUF_INCLUDE_DIR OR "${PROTOBUF_INCLUDE_DIR}" STREQUAL "")
+    set(PROTOBUF_INCLUDE_DIR ${Protobuf_INCLUDE_DIR})
 endif()
 
 # protobuf-c
@@ -320,6 +414,7 @@ set(libsrc
     autonomous_trust/structures/merkle.c
     autonomous_trust/structures/redblack.c
     autonomous_trust/utilities/allocation.c
+    autonomous_trust/utilities/at_jansson.c
     autonomous_trust/utilities/b64.c
     autonomous_trust/utilities/err_str.c
     autonomous_trust/utilities/exception.c
@@ -329,6 +424,7 @@ set(libsrc
     autonomous_trust/utilities/protobuf_shutdown.cpp
     autonomous_trust/utilities/queue_pool.c
     autonomous_trust/utilities/sighandler.c
+    autonomous_trust/utilities/socket_helpers.c
     autonomous_trust/utilities/timeout.c
     autonomous_trust/utilities/util.c
     autonomous_trust/fleet/update_proposal.c
@@ -369,13 +465,13 @@ if(AT_NET_DTN)
         list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_stub.c)
     elseif(AT_NET_DTN_BACKEND STREQUAL "ion")
         # NASA ION bp_* API. Two modes:
-        #   (a) Submodule present at ./ION-DTN — we build it via
-        #       autotools into a build-local prefix. No sudo required.
+        #   (a) Submodule present at ./third_party/ION-DTN — we build it
+        #       via autotools into a build-local prefix. No sudo required.
         #   (b) Submodule absent — fall back to system-installed ION (or
         #       paths supplied explicitly via -DION_* cache vars).
         # The node's local EID must be pre-provisioned via bpadmin before
         # the transport is used at runtime.
-        set(ION_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/ION-DTN)
+        set(ION_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ION-DTN)
         set(ION_PREFIX    ${CMAKE_BINARY_DIR}/ion-install)
 
         if(EXISTS ${ION_SUBMODULE}/configure.ac)
@@ -401,7 +497,7 @@ if(AT_NET_DTN)
 
             # BUILD_IN_SOURCE because ION's autotools setup does not cleanly
             # support out-of-tree builds. Artifacts land inside the submodule
-            # checkout (ION-DTN's own .gitignore covers them).
+            # checkout under third_party/ION-DTN (its own .gitignore covers them).
             ExternalProject_Add(ion_external
                 SOURCE_DIR        ${ION_SUBMODULE}
                 BUILD_IN_SOURCE   1
@@ -437,7 +533,7 @@ if(AT_NET_DTN)
                 message(FATAL_ERROR
                     "AT_NET_DTN_BACKEND=ion selected but the ION-DTN submodule is missing "
                     "AND no system install was found. Fix one of:\n"
-                    "  git submodule update --init src/c/autonomous_trust/network/dtn/ION-DTN\n"
+                    "  git submodule update --init src/c/third_party/ION-DTN\n"
                     "  sudo make install (in a cloned ION-DTN)\n"
                     "  cmake ... -DION_INCLUDE_DIR=... -DION_BP_LIB=... -DION_ICI_LIB=...")
             endif()
@@ -458,7 +554,7 @@ if(AT_NET_DTN)
         # uD3TN AAP 2.0: protobuf-delimited framing. Schema lives at
         # autonomous_trust/network/dtn/proto/aap2.proto, vendored verbatim
         # from https://gitlab.com/d3tn/ud3tn/-/raw/master/components/aap2/aap2.proto
-        # Currently symlinked to submodule location in ./ud3tn/
+        # Currently symlinked to submodule location in ./third_party/ud3tn/
         #
         # Codegen is a standalone protoc-c run — we don't reuse the main
         # `protos` list because aap2.proto lives under the DTN tree, not the
@@ -684,6 +780,24 @@ if(AT_ZTA)
     include_directories(${OPENSSL_INCLUDE_DIR})
 endif()
 
+# Ryu (shortest-decimal d2s) for JCS number formatting.  Pulled in as a
+# git submodule under third_party/ryu/; the upstream repo's C sources live
+# in its `ryu/` subdir, so source paths read `third_party/ryu/ryu/...`.
+# Includes go via `ryu/ryu.h` — the include-dir at `third_party/ryu/`
+# lets that resolve to `third_party/ryu/ryu/ryu.h`.
+#
+# Build target defined here at top level so both the conformance runner
+# and the jcs_test target can link against it.
+add_library(at_ryu STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu/ryu/d2s.c
+)
+target_include_directories(at_ryu PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ryu
+)
+# Ryu emits a few unused-variable warnings on some compilers; suppress
+# rather than patch the submodule.
+target_compile_options(at_ryu PRIVATE -O2 -Wno-error -Wno-unused-function)
+
 add_library(autonomous_trust SHARED ${libsrc} ${libhdr} ${proto_c_src} ${table_hdrs})
 set_target_properties(autonomous_trust PROPERTIES COMPILE_FLAGS "${lib_compile_flags}")
 target_sources(autonomous_trust PUBLIC ${libsrc}
@@ -771,6 +885,14 @@ add_executable(net_message_test test/net_message_test.c)
 set_source_files_properties(test/net_message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_message_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(socket_helpers_test test/socket_helpers_test.c)
+set_source_files_properties(test/socket_helpers_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(socket_helpers_test PRIVATE ${AT_TEST_LIBS} pthread)
+
+add_executable(at_jansson_test test/at_jansson_test.c)
+set_source_files_properties(test/at_jansson_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(at_jansson_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(negotiation_test test/negotiation_test.c)
 set_source_files_properties(test/negotiation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(negotiation_test PRIVATE ${AT_TEST_LIBS} m)
@@ -839,6 +961,26 @@ add_executable(negotiation2_test test/negotiation2_test.c)
 set_source_files_properties(test/negotiation2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(negotiation2_test PRIVATE ${AT_TEST_LIBS})
 
+# Cross-language parity test for the C JCS canonicalizer.  Pulls in
+# conformance/jcs.c directly so the test is independent of whether the
+# conformance harness build is enabled.  Doesn't need the full AT static
+# archive — only jansson, Ryu, libcheck (+ subunit when libcheck is
+# statically linked) and libm for isnan/isinf.
+add_executable(jcs_test
+    test/jcs_test.c
+    conformance/jcs.c
+)
+set_source_files_properties(test/jcs_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(jcs_test PRIVATE
+    at_ryu
+    ${LIBJANSSON_LIBRARY}
+    ${LIBCHECK_LIBRARY}
+    subunit
+    m
+    pthread
+    rt
+)
+
 enable_testing()
 
 add_test(NAME array_test COMMAND $<TARGET_FILE:array_test>)
@@ -852,6 +994,8 @@ add_test(NAME merkle_test COMMAND $<TARGET_FILE:merkle_test>)
 add_test(NAME dag_test COMMAND $<TARGET_FILE:dag_test>)
 add_test(NAME agreement_test COMMAND $<TARGET_FILE:agreement_test>)
 add_test(NAME net_message_test COMMAND $<TARGET_FILE:net_message_test>)
+add_test(NAME socket_helpers_test COMMAND $<TARGET_FILE:socket_helpers_test>)
+add_test(NAME at_jansson_test COMMAND $<TARGET_FILE:at_jansson_test>)
 add_test(NAME negotiation_test COMMAND $<TARGET_FILE:negotiation_test>)
 add_test(NAME reputation_test COMMAND $<TARGET_FILE:reputation_test>)
 add_test(NAME history_test COMMAND $<TARGET_FILE:history_test>)
@@ -869,6 +1013,7 @@ add_test(NAME reputation2_test COMMAND $<TARGET_FILE:reputation2_test>)
 add_test(NAME map_json_test COMMAND $<TARGET_FILE:map_json_test>)
 add_test(NAME array2_test COMMAND $<TARGET_FILE:array2_test>)
 add_test(NAME negotiation2_test COMMAND $<TARGET_FILE:negotiation2_test>)
+add_test(NAME jcs_test COMMAND $<TARGET_FILE:jcs_test>)
 
 add_executable(msg_types_test test/msg_types_test.c)
 set_source_files_properties(test/msg_types_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1019,6 +1164,7 @@ add_executable(update_proc_test
     test/update_proc_test.c
     autonomous_trust/fleet/update_proc_helpers.c
     autonomous_trust/fleet/update_selftest.c
+    autonomous_trust/utilities/at_jansson.c
     ${fleet_test_util_srcs})
 set_source_files_properties(test/update_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(update_proc_test PRIVATE ${TEST_DEPENDENCIES})
@@ -1030,6 +1176,7 @@ add_executable(config_proc_test
     test/config_proc_test.c
     autonomous_trust/fleet/config_proc_helpers.c
     autonomous_trust/fleet/update_proc_helpers.c
+    autonomous_trust/utilities/at_jansson.c
     ${fleet_test_util_srcs})
 set_source_files_properties(test/config_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(config_proc_test PRIVATE ${TEST_DEPENDENCIES})
@@ -1233,6 +1380,17 @@ if(AT_NET_DTN)
 endif()
 
 endif() # LIBCHECK_LIBRARY
+
+####################
+# Conformance harness (cross-language test corpus runner)
+#
+# Reads JSON-mirrored corpus produced from src/autonomous-trust/conformance/
+# at build time, runs each case through C-side adapters, emits a results
+# JSON whose shape matches the Python harness output. Optional — only
+# wired when the autonomous-trust Python sources are present alongside.
+if(EXISTS ${CMAKE_SOURCE_DIR}/../autonomous-trust/conformance)
+    add_subdirectory(conformance)
+endif()
 
 ####################
 # Packaging

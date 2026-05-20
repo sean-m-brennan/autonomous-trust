@@ -91,6 +91,17 @@ class TaskParameters(Configuration):
     def capability(self):
         return self._capability
 
+    @property
+    def flexible(self):
+        # `_flexible` is the constructor-time storage (private to mirror
+        # `_capability`); production handlers read `parameters.flexible`,
+        # so expose it as a property — without this, `handle_haggle` (and
+        # any other reader) raises AttributeError. Surfaced by the
+        # negotiation `invite-haggle-counterprop` conformance scenario
+        # (the prior corpus never delivered a haggle, so this code path
+        # was unreachable in tests).
+        return self._flexible
+
 
 class TaskInfo(Configuration):
     def __init__(self, requestor, uuid: UUID = None, size=1, **kwargs):

@@ -1,0 +1,64 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: report-results-forwarded
+byte_pinning: false
+description: |
+    Exercises the `report results` (NegotiationProtocol.result)
+    handler — the path a worker takes when reporting completion
+    back to the requestor. handle_results looks up the task in
+    `my_tasks`, records the per-peer result, forwards a
+    TaskResult to the main queue when all participants have
+    reported, and then deletes my_tasks[uuid] so no further
+    results are accepted.
+
+    Setup: step 1 has alice spawn a local task (populating
+    alice.my_tasks via start_task and fan-outing an invitation to
+    bob); step 2 has bob report results back to alice. After
+    step 2, alice.my_tasks no longer contains the task and
+    alice.task_stack is empty — both pinned via expected_state.
+
+    The negative-form `has_my_task: {slug, present:false}` and the
+    `task_in_stack: false` assertion rely on per-scenario state
+    reset in the C adapter (negotiation_reset_state) — without it,
+    file-static neg_state would carry residue from alphabetically
+    earlier scenarios.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: spawn task
+    payload:
+      capability: data_fetch
+      task_id: t-results
+    description: |
+        alice locally spawns the task; start_task adds it to
+        my_tasks and fan-outs an invitation to bob.
+  - id: 2
+    from: bob
+    to: alice
+    function: report results
+    payload:
+      task_id: t-results
+      result: done
+    description: |
+        bob reports the task as complete. handle_results records
+        the result in my_tasks[uuid].results and (with task.size
+        defaulting to 1) forwards the TaskResult to the main
+        queue, then deletes my_tasks[uuid].
+
+expected_state:
+  alice:
+    has_my_task: {slug: t-results, present: false}
+    task_in_stack: false

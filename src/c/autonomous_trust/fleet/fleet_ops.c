@@ -138,7 +138,7 @@ int fleet_propose_update(const uint8_t *artifact_hash, const char *version,
     msg.type = NET_MESSAGE;
     net_msg_t *nmsg = &msg.info.net_msg;
     strncpy(nmsg->process, "fleet", PROC_NAME_LEN);
-    nmsg->function = (char *)FLEET_PROTO_PROPOSE;
+    nmsg->function = FLEET_PROTO_PROPOSE;
     strncpy(nmsg->return_to, "fleet", PROC_NAME_LEN);
     memcpy(nmsg->from_whom.signature.public, signing_pk,
            crypto_sign_PUBLICKEYBYTES);

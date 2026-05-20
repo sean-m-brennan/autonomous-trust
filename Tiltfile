@@ -14,8 +14,14 @@
 #   limitations under the License.
 # ******************
 # Top-level Tiltfile — dispatches to a variant-specific Tiltfile
-# Usage: tilt up -- --variant=python [--num-nodes=4 ...]
-#        tilt up -- --variant=native [--num-nodes=4 ...]
+# Usage: tilt up -- --variant=python   [--num-nodes=4 ...]
+#        tilt up -- --variant=native   [--num-nodes=4 ...]
+#        tilt up -- --variant=multi-agency [--namespace=disaster-demo]
+#                                          [--log-level=info]
+#
+# The multi-agency variant deploys the disaster-response demo to the
+# current kube context (typically minikube). Peer count is set by the
+# scenario, not --num-nodes.
 
 config.define_string("variant")
 config.define_string("num-nodes")
@@ -23,6 +29,7 @@ config.define_string("exclude-logs")
 config.define_string("log-level")
 config.define_string("backend")
 config.define_string("metrics-dir")
+config.define_string("namespace")
 cfg = config.parse()
 variant = cfg.get("variant", "python")
 
@@ -33,10 +40,13 @@ os.putenv("_TILT_EXCLUDE_LOGS", cfg.get("exclude-logs", "network"))
 os.putenv("_TILT_LOG_LEVEL", cfg.get("log-level", "info"))
 os.putenv("_TILT_BACKEND", cfg.get("backend", "native"))
 os.putenv("_TILT_METRICS_DIR", cfg.get("metrics-dir", ""))
+os.putenv("_TILT_NAMESPACE", cfg.get("namespace", "disaster-demo"))
 
 if variant == "native":
     include("tilt/native.tiltfile")
 elif variant == "python":
     include("tilt/python.tiltfile")
+elif variant == "multi-agency":
+    include("tilt/multi_agency.tiltfile")
 else:
-    fail("Unknown variant '{}'. Use 'python' or 'native'.".format(variant))
+    fail("Unknown variant '{}'. Use 'python', 'native', or 'multi-agency'.".format(variant))

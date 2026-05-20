@@ -30,6 +30,18 @@
 
 DEFINE_ERROR(ENEG_NOPEERS, "No capable peers available");
 
+/* Protocol-string definitions (declared `extern char[]` in
+ * negotiation.h). Writable arrays for direct assignment to `char *`. */
+char NEG_PROTO_START[]    = "spawn task";
+char NEG_PROTO_ANNOUNCE[] = "invitation";
+char NEG_PROTO_RESPONSE[] = "haggle";
+char NEG_PROTO_ACCEPT[]   = "ack";
+char NEG_PROTO_REFUSE[]   = "nack";
+char NEG_PROTO_STAT_REQ[] = "status request";
+char NEG_PROTO_STAT_RSP[] = "status response";
+char NEG_PROTO_RESULT[]   = "report results";
+char NEG_PROTO_CANCEL[]   = "cancel";
+
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
  ****************************/
@@ -43,6 +55,21 @@ static struct {
     int max_concurrency;
     pthread_mutex_t lock;
     bool initialized;
+    /* Per-process conformance-only overrides. Key form is the process_t*
+     * pointer cast to a string (printed as "%p") so it doesn't collide
+     * with the uuid-string keys used elsewhere in this state struct.
+     *
+     * own_caps_by_proc:  process_t* (as %p)        -> array_t* of dup'd cap-name strings
+     * peer_levels:       "{proc}|{peer_uuid_str}"  -> int* (level)
+     *
+     * Populated by negotiation_set_own_capabilities and
+     * negotiation_set_peer_level; cleared via
+     * negotiation_clear_test_state. Production code MUST NOT touch
+     * these and they are silently ignored when handle_invite finds no
+     * entry, so the static capability_table fallback still drives
+     * non-test paths. */
+    map_t own_caps_by_proc;
+    map_t peer_levels;
 } neg_state;
 
 static void _ensure_init(void)
@@ -56,8 +83,160 @@ static void _ensure_init(void)
         array_init(&neg_state.status_pending);
         neg_state.max_concurrency = 4;
         pthread_mutex_init(&neg_state.lock, NULL);
+        map_init(&neg_state.own_caps_by_proc);
+        map_init(&neg_state.peer_levels);
         neg_state.initialized = true;
     }
+}
+
+/* ---- Conformance test hooks (see neg_proc_priv.h doc) ---------------------- */
+
+static void _proc_key(const process_t *proc, char *out, size_t n)
+{
+    snprintf(out, n, "%p", (const void *)proc);
+}
+
+/* Look up a process's test-installed own-capability allowlist.
+ * Returns the array_t* (whose elements are char* cap-name strings) or
+ * NULL if no override is installed. Caller holds neg_state.lock. */
+static array_t *_own_caps_for(const process_t *proc)
+{
+    if (proc == NULL) return NULL;
+    char key[32]; _proc_key(proc, key, sizeof(key));
+    data_t *dat = NULL;
+    if (map_get(&neg_state.own_caps_by_proc, key, &dat) != 0 || dat == NULL)
+        return NULL;
+    array_t *arr = NULL;
+    if (data_object_ptr(dat, (ptr_t *)&arr) != 0) return NULL;
+    return arr;
+}
+
+/* Caller must hold neg_state.lock — these helpers are called from
+ * inside handle_invite's already-locked section, so re-locking would
+ * deadlock the non-recursive mutex. */
+static bool _has_own_cap_override_locked(const process_t *proc, const char *name,
+                                         bool *out_set)
+{
+    array_t *arr = _own_caps_for(proc);
+    bool found = false;
+    bool set = (arr != NULL);
+    if (arr != NULL && name != NULL)
+    {
+        for (size_t i = 0; i < array_size(arr); i++)
+        {
+            data_t *cap_dat = NULL;
+            if (array_get(arr, i, &cap_dat) != 0) continue;
+            char *cap_name = NULL;
+            if (data_string_ptr(cap_dat, &cap_name) != 0) continue;
+            if (cap_name && strcmp(cap_name, name) == 0) { found = true; break; }
+        }
+    }
+    if (out_set) *out_set = set;
+    return found;
+}
+
+static int _peer_level_override_locked(const process_t *proc, const uuid_t peer_uuid)
+{
+    if (proc == NULL) return -1;
+    char proc_key[32]; _proc_key(proc, proc_key, sizeof(proc_key));
+    char uuid_str[UUID_STRING_LEN + 1]; uuid_unparse_lower(peer_uuid, uuid_str);
+    char key[96]; snprintf(key, sizeof(key), "%s|%s", proc_key, uuid_str);
+
+    data_t *dat = NULL;
+    int level = -1;
+    if (map_get(&neg_state.peer_levels, key, &dat) == 0 && dat != NULL)
+        data_integer(dat, &level);
+    return level;
+}
+
+void negotiation_set_own_capabilities(const process_t *proc,
+                                      const char *const *cap_names,
+                                      size_t n_caps)
+{
+    _ensure_init();
+    char key[32]; _proc_key(proc, key, sizeof(key));
+    pthread_mutex_lock(&neg_state.lock);
+    if (cap_names == NULL || n_caps == 0)
+    {
+        map_remove(&neg_state.own_caps_by_proc, key);
+        pthread_mutex_unlock(&neg_state.lock);
+        return;
+    }
+    array_t *arr = NULL;
+    if (array_create(&arr) != 0 || arr == NULL)
+    {
+        pthread_mutex_unlock(&neg_state.lock);
+        return;
+    }
+    for (size_t i = 0; i < n_caps; i++)
+    {
+        if (cap_names[i] == NULL) continue;
+        size_t len = strlen(cap_names[i]);
+        char *dup = smrt_create(len + 1);
+        if (dup == NULL) continue;
+        memcpy(dup, cap_names[i], len + 1);
+        data_t *str_dat = string_data(dup, len + 1);
+        if (str_dat == NULL) { smrt_deref(dup); continue; }
+        array_append(arr, str_dat);
+    }
+    data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
+    map_set(&neg_state.own_caps_by_proc, key, arr_dat);
+    pthread_mutex_unlock(&neg_state.lock);
+}
+
+void negotiation_set_peer_level(const process_t *proc,
+                                const uuid_t peer_uuid,
+                                int level)
+{
+    _ensure_init();
+    char proc_key[32]; _proc_key(proc, proc_key, sizeof(proc_key));
+    char uuid_str[UUID_STRING_LEN + 1]; uuid_unparse_lower(peer_uuid, uuid_str);
+    char key[96]; snprintf(key, sizeof(key), "%s|%s", proc_key, uuid_str);
+    pthread_mutex_lock(&neg_state.lock);
+    map_set(&neg_state.peer_levels, key, integer_data(level));
+    pthread_mutex_unlock(&neg_state.lock);
+}
+
+void negotiation_clear_test_state(const process_t *proc)
+{
+    if (!neg_state.initialized) return;
+    char proc_key[32]; _proc_key(proc, proc_key, sizeof(proc_key));
+    pthread_mutex_lock(&neg_state.lock);
+    map_remove(&neg_state.own_caps_by_proc, proc_key);
+    /* Sweep peer_levels for any keys with our proc prefix. map_t doesn't
+     * expose a prefix-delete; iterate, collect matching keys, then
+     * remove. Test-only, so a linear sweep is fine. */
+    char prefix[40]; snprintf(prefix, sizeof(prefix), "%s|", proc_key);
+    size_t plen = strlen(prefix);
+    char *iter_key; data_t *iter_val;
+    char *to_remove[32] = {0}; size_t n_remove = 0;
+    map_entries_for_each(&neg_state.peer_levels, iter_key, iter_val)
+        if (n_remove < 32 && strncmp(iter_key, prefix, plen) == 0)
+            to_remove[n_remove++] = iter_key;
+    map_end_for_each
+    for (size_t i = 0; i < n_remove; i++)
+        map_remove(&neg_state.peer_levels, to_remove[i]);
+    pthread_mutex_unlock(&neg_state.lock);
+}
+
+void negotiation_reset_state(void)
+{
+    _ensure_init();
+    pthread_mutex_lock(&neg_state.lock);
+    job_queue_clear(&neg_state.task_stack);
+    map_free(&neg_state.proposed_tasks);
+    map_init(&neg_state.proposed_tasks);
+    map_free(&neg_state.my_tasks);
+    map_init(&neg_state.my_tasks);
+    map_free(&neg_state.confirmed);
+    map_init(&neg_state.confirmed);
+    array_free(&neg_state.status_pending);
+    array_init(&neg_state.status_pending);
+    map_free(&neg_state.own_caps_by_proc);
+    map_init(&neg_state.own_caps_by_proc);
+    map_free(&neg_state.peer_levels);
+    map_init(&neg_state.peer_levels);
+    pthread_mutex_unlock(&neg_state.lock);
 }
 
 /****************************
@@ -301,7 +480,7 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
         generic_msg_t invite = {0};
         invite.type = NET_MESSAGE;
         strncpy(invite.info.net_msg.process, "negotiation", PROC_NAME_LEN);
-        invite.info.net_msg.function = (char *)NEG_PROTO_ANNOUNCE;
+        invite.info.net_msg.function = NEG_PROTO_ANNOUNCE;
         invite.info.net_msg.encrypt = true;
         memcpy(&invite.info.net_msg.to_whom, &proc->protocol.peers[i],
                sizeof(public_identity_t));
@@ -411,12 +590,43 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
         }
     }
 
-    /* Check own capabilities */
-    capability_t *cap = NULL;
+    /* Check own capabilities. If a conformance harness has installed a
+     * per-process allowlist via negotiation_set_own_capabilities, that
+     * wins over the static capability_table; otherwise fall back to
+     * find_capability(). */
+    bool have_own_override = false;
+    bool capable = false;
     if (have_task && task.capability.name[0] != '\0')
-        cap = find_capability(task.capability.name);
+    {
+        capable = _has_own_cap_override_locked(proc, task.capability.name,
+                                               &have_own_override);
+        if (!have_own_override)
+            capable = (find_capability(task.capability.name) != NULL);
+    }
 
-    if (!have_task || cap != NULL)
+    /* Peer-level refusal (Python parity): if the inviter's level as we
+     * see it is 0 (lowest reputation tier), refuse even if we are
+     * capable. The harness installs levels via
+     * negotiation_set_peer_level; absent that, we treat level as
+     * "unknown" and skip the check (preserving prior behavior). */
+    int sender_level = _peer_level_override_locked(proc, nmsg->from_whom.uuid);
+    bool low_rep_refuse = (have_task && capable && sender_level == 0);
+
+    if (have_task && capable && low_rep_refuse)
+    {
+        log_info(proc->logger,
+                 "Negotiation: refusing %s — sender peer level 0\n",
+                 task_uuid_str);
+        generic_msg_t refuse = {0};
+        _build_reply(nmsg, NEG_PROTO_REFUSE, &refuse);
+        json_t *rj = _task_uuid_json(task_uuid_str);
+        if (rj) { net_msg_pack_json(&refuse.info.net_msg, rj); json_decref(rj); }
+        messaging_send("network", NET_MESSAGE, &refuse, false);
+        pthread_mutex_unlock(&neg_state.lock);
+        return true;
+    }
+
+    if (!have_task || capable)
     {
         /* We are capable — check for schedule conflicts */
         time_t duration_secs = (time_t)(task.duration.days * 86400L
@@ -986,22 +1196,73 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
  * sites) + JSON serialization + capability iteration + complex peer-loop msg-build
  * cascades.
  */
+int negotiation_get_task_stack_size(void)
+{
+    if (!neg_state.initialized) return -1;
+    pthread_mutex_lock(&neg_state.lock);
+    int n = job_queue_count(&neg_state.task_stack);
+    pthread_mutex_unlock(&neg_state.lock);
+    return n;
+}
+
+bool negotiation_has_confirmed_any(void)
+{
+    if (!neg_state.initialized) return false;
+    pthread_mutex_lock(&neg_state.lock);
+    bool any = map_size(&neg_state.confirmed) > 0;
+    pthread_mutex_unlock(&neg_state.lock);
+    return any;
+}
+
+bool negotiation_has_my_task_uuid(const uuid_t uuid)
+{
+    if (!neg_state.initialized) return false;
+    char key[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(uuid, key);
+    pthread_mutex_lock(&neg_state.lock);
+    data_t *dat = NULL;
+    bool found = (map_get(&neg_state.my_tasks, key, &dat) == 0 && dat != NULL);
+    pthread_mutex_unlock(&neg_state.lock);
+    return found;
+}
+
+int negotiation_get_task_flood_count(const uuid_t uuid)
+{
+    if (!neg_state.initialized) return 0;
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(uuid, task_uuid_str);
+    /* Mirror the key construction in handle_invite (neg_proc.c:529-530):
+     * "flood:<task-uuid>" stored on proposed_tasks. */
+    char flood_key[UUID_STRING_LEN + 8];
+    snprintf(flood_key, sizeof(flood_key), "flood:%s", task_uuid_str);
+    pthread_mutex_lock(&neg_state.lock);
+    data_t *flood_dat = NULL;
+    int count = 0;
+    if (map_get(&neg_state.proposed_tasks, flood_key, &flood_dat) == 0 && flood_dat)
+        data_integer(flood_dat, &count);
+    pthread_mutex_unlock(&neg_state.lock);
+    return count;
+}
+
+int negotiation_register_handlers(process_t *proc)
+{
+    if (proc == NULL) return -1;
+    process_register_handler(proc, NEG_PROTO_START,    (handler_ptr_t)handle_start_task);
+    process_register_handler(proc, NEG_PROTO_ANNOUNCE, (handler_ptr_t)handle_invite);
+    process_register_handler(proc, NEG_PROTO_RESPONSE, (handler_ptr_t)handle_haggle);
+    process_register_handler(proc, NEG_PROTO_ACCEPT,   (handler_ptr_t)handle_accept);
+    process_register_handler(proc, NEG_PROTO_REFUSE,   (handler_ptr_t)handle_refuse);
+    process_register_handler(proc, NEG_PROTO_STAT_REQ, (handler_ptr_t)handle_stat_req);
+    process_register_handler(proc, NEG_PROTO_STAT_RSP, (handler_ptr_t)handle_stat_resp);
+    process_register_handler(proc, NEG_PROTO_RESULT,   (handler_ptr_t)handle_results);
+    return 0;
+}
+
 int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();
-
-    /* Register protocol handlers */
-    process_register_handler(proc, (char *)NEG_PROTO_START,    (handler_ptr_t)handle_start_task);
-    process_register_handler(proc, (char *)NEG_PROTO_ANNOUNCE, (handler_ptr_t)handle_invite);
-    process_register_handler(proc, (char *)NEG_PROTO_RESPONSE, (handler_ptr_t)handle_haggle);
-    process_register_handler(proc, (char *)NEG_PROTO_ACCEPT,   (handler_ptr_t)handle_accept);
-    process_register_handler(proc, (char *)NEG_PROTO_REFUSE,   (handler_ptr_t)handle_refuse);
-    process_register_handler(proc, (char *)NEG_PROTO_STAT_REQ, (handler_ptr_t)handle_stat_req);
-    process_register_handler(proc, (char *)NEG_PROTO_STAT_RSP, (handler_ptr_t)handle_stat_resp);
-    process_register_handler(proc, (char *)NEG_PROTO_RESULT,   (handler_ptr_t)handle_results);
-
+    negotiation_register_handlers(proc);
     proc->protocol.phase = 1;
-
     return process_run(proc, queues, signal, logger);
 }
 DECLARE_PROCESS(negotiation, neg_proc, negotiation_run);

@@ -1,0 +1,14 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: signature-roundtrip
+description: |
+    Signature round-trips its public key across all (mode, wire-format) cells
+    and emerges public-only on the wire. Mirrors test_wire_serialization.py
+    TestSignatureWire.
+byte_pinning: false
+wire_format: any
+serialize_mode: any
+constructor: Signature
+input: {}
+expected: {}

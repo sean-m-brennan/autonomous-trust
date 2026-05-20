@@ -1,0 +1,699 @@
+/********************
+ *  Copyright 2026 Sean M. Brennan and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
+/** @file Reputation-protocol adapter (Phase F).
+ *
+ *  Drives `kind: scenario` for `protocol: reputation`. Each scenario
+ *  step's dispatch resets the file-scope rep_state, re-installs the
+ *  TARGET participant's fixtures (history_len, last_id, my_requests,
+ *  pre-granted requests), then runs the handler. This works around C's
+ *  shared rep_state design: only one participant's handler runs per
+ *  step, so the shared state only needs to be correct for that
+ *  participant at that moment.
+ *
+ *  Identities + task UUIDs are derived as UUIDv5 in namespace
+ *  00000000-0000-0000-0000-000000000aaa, matching the Python adapter
+ *  byte-for-byte (rep:<id> for participants, tx:<slug> for tasks).
+ */
+
+#include "reputation.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include <jansson.h>
+#include <uuid/uuid.h>
+
+#include "identity/identity.h"
+#include "reputation/reputation.h"
+#include "reputation/rep_proc_priv.h"
+#include "processes/processes.h"
+#include "structures/array.h"
+#include "structures/map.h"
+#include "utilities/message.h"
+#include "utilities/msg_types_priv.h"
+
+#include "../negative_runner.h"
+
+#include "../scenario_engine.h"
+
+typedef struct {
+    identity_t *full;
+    public_identity_t *pub;
+    process_t *proc;
+} rp_impl_t;
+
+/* Per-participant post-dispatch snapshot of rep_state. Each `_dispatch`
+ * runs against the dispatcher's freshly-installed state, then this
+ * snapshot is taken. expected_state checks read here — without
+ * snapshotting, the very next dispatch's reset+install clobbers the
+ * state we wanted to verify. */
+typedef struct {
+    char id[SCE_ID_LEN];
+    bool valid;
+    int chain_len;
+    int request_count;
+    int64_t last_id;
+} rp_snap_t;
+static rp_snap_t g_snaps[SCE_MAX_PARTICIPANTS];
+
+static sce_run_ctx_t *g_active_ctx = NULL;
+static json_t *g_fixtures = NULL;        /* borrowed; lifetime is the scenario */
+
+static rp_snap_t *_snap_find(const char *id)
+{
+    for (size_t i = 0; i < SCE_MAX_PARTICIPANTS; i++)
+        if (g_snaps[i].valid && strcmp(g_snaps[i].id, id) == 0)
+            return &g_snaps[i];
+    return NULL;
+}
+
+static rp_snap_t *_snap_get_or_make(const char *id)
+{
+    rp_snap_t *s = _snap_find(id);
+    if (s) return s;
+    for (size_t i = 0; i < SCE_MAX_PARTICIPANTS; i++)
+        if (!g_snaps[i].valid)
+        {
+            snprintf(g_snaps[i].id, SCE_ID_LEN, "%s", id);
+            g_snaps[i].valid = true;
+            return &g_snaps[i];
+        }
+    return NULL;
+}
+
+static const uuid_t REP_NS = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0xaa
+};
+
+static void _uuid5(const char *prefix, const char *name, uuid_t out)
+{
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s%s", prefix, name);
+    uuid_generate_sha1(out, REP_NS, buf, strlen(buf));
+}
+
+/* Resolve a generic_msg_t.to_whom uuid back to a participant id, or
+ * "broadcast" when zeroed (the C handler family stamps zero on
+ * group-bound messages — handle_nack's retry, etc.). */
+static bool _is_zero_uuid(const uuid_t u)
+{
+    for (size_t i = 0; i < sizeof(uuid_t); i++)
+        if (u[i] != 0) return false;
+    return true;
+}
+
+static const char *_resolve_to_id(const generic_msg_t *msg)
+{
+    if (msg->type != NET_MESSAGE) return "internal";
+    if (_is_zero_uuid(msg->info.net_msg.to_whom.uuid)) return "broadcast";
+    if (g_active_ctx == NULL) return "unknown";
+    for (size_t i = 0; i < g_active_ctx->participant_count; i++)
+    {
+        rp_impl_t *impl = (rp_impl_t *)g_active_ctx->participants[i].impl;
+        if (impl == NULL || impl->pub == NULL) continue;
+        if (uuid_compare(impl->pub->uuid, msg->info.net_msg.to_whom.uuid) == 0)
+            return g_active_ctx->participants[i].id;
+    }
+    return "unknown";
+}
+
+static int _send_hook(const char *key,
+                      const message_type_t type,
+                      generic_msg_t *msg,
+                      bool blocking)
+{
+    (void)key; (void)blocking;
+    if (g_active_ctx == NULL) return 0;
+    const char *to_id = _resolve_to_id(msg);
+    const char *function = (type == NET_MESSAGE && msg->info.net_msg.function != NULL)
+        ? msg->info.net_msg.function : "__internal__";
+    sce_capture(g_active_ctx, to_id, function);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Participant construction                                                   */
+/* ------------------------------------------------------------------------- */
+
+static int _make_identity(const char *id, size_t idx, identity_t **out)
+{
+    uuid_t uuid;
+    _uuid5("rep:", id, uuid);
+    char addr[ADDR_LEN + 1] = {0};
+    snprintf(addr, sizeof(addr), "10.0.60.%zu", idx + 1);
+    char fullname[NAME_LEN + 1] = {0};
+    snprintf(fullname, sizeof(fullname), "%s.rep", id);
+    return identity_create(&uuid, addr, fullname, id, "me", out);
+}
+
+static rp_impl_t *_build_participant_impl(const char *id, size_t idx)
+{
+    rp_impl_t *impl = calloc(1, sizeof(rp_impl_t));
+    if (impl == NULL) return NULL;
+    if (_make_identity(id, idx, &impl->full) != 0 || impl->full == NULL) goto fail;
+    if (identity_publish(impl->full, &impl->pub) != 0 || impl->pub == NULL) goto fail;
+    impl->proc = smrt_create(sizeof(process_t));
+    if (impl->proc == NULL) goto fail;
+    pthread_rwlock_init(&impl->proc->protocol.peers_rwlock, NULL);
+    strncpy(impl->proc->name, "reputation", PROC_NAME_LEN);
+    if (map_create(&impl->proc->protocol.handlers) != 0) goto fail;
+    impl->proc->protocol.phase = 1;
+    if (reputation_register_handlers(impl->proc) != 0) goto fail;
+    return impl;
+fail:
+    if (impl != NULL)
+    {
+        if (impl->proc != NULL)
+        {
+            if (impl->proc->protocol.handlers != NULL) map_free(impl->proc->protocol.handlers);
+            pthread_rwlock_destroy(&impl->proc->protocol.peers_rwlock);
+            smrt_deref(impl->proc);
+        }
+        if (impl->pub != NULL) smrt_deref(impl->pub);
+        if (impl->full != NULL) identity_free(impl->full);
+        free(impl);
+    }
+    return NULL;
+}
+
+static void _free_participant_impl(rp_impl_t *impl)
+{
+    if (impl == NULL) return;
+    if (impl->proc != NULL)
+    {
+        if (impl->proc->protocol.handlers != NULL) map_free(impl->proc->protocol.handlers);
+        pthread_rwlock_destroy(&impl->proc->protocol.peers_rwlock);
+        smrt_deref(impl->proc);
+    }
+    if (impl->pub != NULL) smrt_deref(impl->pub);
+    if (impl->full != NULL) identity_free(impl->full);
+    free(impl);
+}
+
+/* Pre-populate every participant's protocol.peers list with every other
+ * participant — handle_grant iterates protocol.peers when broadcasting
+ * the resulting transaction. */
+static void _link_peer_lists(sce_run_ctx_t *ctx)
+{
+    for (size_t i = 0; i < ctx->participant_count; i++)
+    {
+        rp_impl_t *impl_i = (rp_impl_t *)ctx->participants[i].impl;
+        if (impl_i == NULL || impl_i->proc == NULL) continue;
+        for (size_t j = 0; j < ctx->participant_count; j++)
+        {
+            if (i == j) continue;
+            rp_impl_t *impl_j = (rp_impl_t *)ctx->participants[j].impl;
+            if (impl_j == NULL || impl_j->pub == NULL) continue;
+            if (impl_i->proc->protocol.num_peers >= DEFAULT_MAX_PEERS) break;
+            memcpy(&impl_i->proc->protocol.peers[impl_i->proc->protocol.num_peers],
+                   impl_j->pub, sizeof(public_identity_t));
+            impl_i->proc->protocol.num_peers++;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Per-step state installation                                                */
+/* ------------------------------------------------------------------------- */
+
+/* Look up @p pid in participants and return its public uuid (or NULL). */
+static const uuid_t *_uuid_of(sce_run_ctx_t *ctx, const char *pid)
+{
+    sce_participant_t *p = sce_find_participant(ctx, pid);
+    if (p == NULL) return NULL;
+    rp_impl_t *impl = (rp_impl_t *)p->impl;
+    return (impl && impl->pub) ? (const uuid_t *)&impl->pub->uuid : NULL;
+}
+
+/* Reset rep_state and re-install the per-participant fixtures relevant
+ * to the dispatcher (target). Run BEFORE every handler dispatch so each
+ * step sees the right slice of state. */
+static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
+{
+    /* num_peers = participant_count - 1 (everyone except self) */
+    int num_peers = (int)ctx->participant_count - 1;
+    if (num_peers < 1) num_peers = 1;
+    reputation_reset_state(num_peers);
+
+    if (g_fixtures == NULL || target_id == NULL) return;
+
+    /* history_len: { "<pid>": N, ... } */
+    json_t *hl = json_object_get(g_fixtures, "history_len");
+    if (json_is_object(hl))
+    {
+        json_t *n_j = json_object_get(hl, target_id);
+        if (json_is_integer(n_j))
+            reputation_set_chain_len((int)json_integer_value(n_j));
+    }
+
+    /* last_id: { "<pid>": N, ... } */
+    json_t *li = json_object_get(g_fixtures, "last_id");
+    if (json_is_object(li))
+    {
+        json_t *id_j = json_object_get(li, target_id);
+        if (json_is_integer(id_j))
+            reputation_set_last_id((int64_t)json_integer_value(id_j));
+    }
+
+    /* requests: { "<pid>": [[id1, id2], ...] } — pre-stage granted Paxos
+     * rounds (so handle_transaction's paxos_has_granted_id check passes). */
+    json_t *reqs = json_object_get(g_fixtures, "requests");
+    if (json_is_object(reqs))
+    {
+        json_t *pair_arr = json_object_get(reqs, target_id);
+        if (json_is_array(pair_arr))
+        {
+            for (size_t i = 0; i < json_array_size(pair_arr); i++)
+            {
+                json_t *pair = json_array_get(pair_arr, i);
+                if (!json_is_array(pair) || json_array_size(pair) < 2) continue;
+                int64_t r_id1 = json_integer_value(json_array_get(pair, 0));
+                int64_t r_id2 = json_integer_value(json_array_get(pair, 1));
+                reputation_install_accepted(r_id1, r_id2);
+            }
+        }
+    }
+
+    /* my_requests: { "<pid>": [{id1, id2, task_id, score}, ...] } —
+     * pre-stage outstanding paxos rounds for proposers. */
+    json_t *myr = json_object_get(g_fixtures, "my_requests");
+    if (json_is_object(myr))
+    {
+        json_t *entries = json_object_get(myr, target_id);
+        if (json_is_array(entries))
+        {
+            const uuid_t *self_uuid = _uuid_of(ctx, target_id);
+            for (size_t i = 0; i < json_array_size(entries); i++)
+            {
+                json_t *e = json_array_get(entries, i);
+                if (!json_is_object(e)) continue;
+                int64_t e_id1 = json_integer_value(json_object_get(e, "id1"));
+                int64_t e_id2 = json_integer_value(json_object_get(e, "id2"));
+                double  score = 1.0;
+                json_t *s_j = json_object_get(e, "score");
+                if (json_is_real(s_j))    score = json_real_value(s_j);
+                else if (json_is_integer(s_j)) score = (double)json_integer_value(s_j);
+
+                const char *slug = "default";
+                json_t *t_j = json_object_get(e, "task_id");
+                if (json_is_string(t_j)) slug = json_string_value(t_j);
+                uuid_t task_uuid;
+                _uuid5("tx:", slug, task_uuid);
+
+                /* my_requests is keyed by proposer uuid in C; install
+                 * with self-as-proposer so handle_grant looks us up via
+                 * the grant's peer_uuid field, which we also stamp as
+                 * self. */
+                if (self_uuid)
+                    reputation_install_my_request(e_id1, e_id2, *self_uuid,
+                                                   score, task_uuid);
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Inbound construction                                                       */
+/* ------------------------------------------------------------------------- */
+
+static int _build_inbound(sce_run_ctx_t *ctx,
+                          const char *from_id,
+                          const char *to_id,
+                          const char *function,
+                          json_t *payload,
+                          generic_msg_t *out)
+{
+    sce_participant_t *sender = sce_find_participant(ctx, from_id);
+    if (sender == NULL)
+    {
+        snprintf(ctx->err, sizeof(ctx->err), "build_inbound: unknown from %s", from_id);
+        return -1;
+    }
+    rp_impl_t *sender_impl = (rp_impl_t *)sender->impl;
+    sce_participant_t *recipient = (to_id && strcmp(to_id, "broadcast") != 0)
+        ? sce_find_participant(ctx, to_id) : NULL;
+    rp_impl_t *recipient_impl = recipient ? (rp_impl_t *)recipient->impl : NULL;
+
+    /* Resolve the proposer field. Default to the sender; scenarios may
+     * override via payload.proposer = "<pid>". */
+    const char *proposer_id = from_id;
+    if (payload && json_is_object(payload))
+    {
+        json_t *p_j = json_object_get(payload, "proposer");
+        if (json_is_string(p_j)) proposer_id = json_string_value(p_j);
+    }
+    const uuid_t *proposer_uuid = _uuid_of(ctx, proposer_id);
+    char proposer_str[UUID_STRING_LEN + 1] = {0};
+    if (proposer_uuid) uuid_unparse_lower(*proposer_uuid, proposer_str);
+
+    int64_t id1 = 0, id2 = 0;
+    if (payload && json_is_object(payload))
+    {
+        json_t *j = json_object_get(payload, "id1");
+        if (json_is_integer(j)) id1 = json_integer_value(j);
+        j = json_object_get(payload, "id2");
+        if (json_is_integer(j)) id2 = json_integer_value(j);
+    }
+
+    json_t *body = NULL;
+    if (strcmp(function, REP_PROTO_REQUEST) == 0
+        || strcmp(function, REP_PROTO_NACK) == 0
+        || strcmp(function, REP_PROTO_BACKDATE) == 0
+        || strcmp(function, REP_PROTO_ACCEPTED) == 0)
+    {
+        body = json_object();
+        json_object_set_new(body, "id1", json_integer(id1));
+        json_object_set_new(body, "id2", json_integer(id2));
+        json_object_set_new(body, "peer_uuid", json_string(proposer_str));
+    }
+    else if (strcmp(function, REP_PROTO_GRANT) == 0)
+    {
+        body = json_object();
+        json_object_set_new(body, "id1", json_integer(id1));
+        json_object_set_new(body, "id2", json_integer(id2));
+        json_object_set_new(body, "peer_uuid", json_string(proposer_str));
+        json_object_set_new(body, "last_id", json_integer(0));
+        json_object_set_new(body, "chain_len", json_integer(0));
+    }
+    else if (strcmp(function, REP_PROTO_TX) == 0)
+    {
+        double score = 1.0;
+        const char *task_slug = NULL;
+        if (payload && json_is_object(payload))
+        {
+            json_t *s_j = json_object_get(payload, "score");
+            if (json_is_real(s_j))    score = json_real_value(s_j);
+            else if (json_is_integer(s_j)) score = (double)json_integer_value(s_j);
+            json_t *t_j = json_object_get(payload, "task_id");
+            if (json_is_string(t_j)) task_slug = json_string_value(t_j);
+        }
+        body = json_object();
+        json_object_set_new(body, "id1", json_integer(id1));
+        json_object_set_new(body, "id2", json_integer(id2));
+        json_object_set_new(body, "peer_uuid", json_string(proposer_str));
+        json_object_set_new(body, "score", json_real(score));
+        if (task_slug)
+        {
+            uuid_t task_uuid;
+            _uuid5("tx:", task_slug, task_uuid);
+            char task_str[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(task_uuid, task_str);
+            json_object_set_new(body, "task_uuid", json_string(task_str));
+        }
+    }
+    else if (strcmp(function, REP_PROTO_OUTDATED) == 0
+             || strcmp(function, REP_PROTO_UPDATE) == 0)
+    {
+        body = json_object();  /* empty payload */
+    }
+    else if (strcmp(function, REP_PROTO_REP_REQ) == 0)
+    {
+        /* C's `handle_rep_request` expects a `{peer_uuid,
+         * requesting_process}` object; Python's `handle_reputation_request`
+         * expects a `(ident, req_proc)` JSON list. See BUGS.md §P9 for
+         * the wire-format divergence. Each adapter builds its language's
+         * native form here so both handlers exercise without crashing. */
+        const char *target_pid = from_id;
+        const char *req_proc = "negotiation";
+        if (payload && json_is_object(payload))
+        {
+            json_t *t = json_object_get(payload, "target");
+            if (json_is_string(t)) target_pid = json_string_value(t);
+            json_t *p = json_object_get(payload, "proc");
+            if (json_is_string(p)) req_proc = json_string_value(p);
+        }
+        char target_uuid[UUID_STRING_LEN + 1] = {0};
+        sce_participant_t *target = sce_find_participant(ctx, target_pid);
+        if (target != NULL)
+        {
+            rp_impl_t *t_impl = (rp_impl_t *)target->impl;
+            if (t_impl && t_impl->pub)
+                uuid_unparse_lower(t_impl->pub->uuid, target_uuid);
+        }
+        body = json_object();
+        json_object_set_new(body, "peer_uuid", json_string(target_uuid));
+        json_object_set_new(body, "requesting_process", json_string(req_proc));
+    }
+    else
+    {
+        snprintf(ctx->err, sizeof(ctx->err),
+                 "build_inbound: unsupported function %s", function);
+        return -1;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->type = NET_MESSAGE;
+    strncpy(out->info.net_msg.process, "reputation", PROC_NAME_LEN);
+    out->info.net_msg.function = (char *)function;
+    out->info.net_msg.encrypt = false;
+    memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
+    if (recipient_impl)
+        memcpy(&out->info.net_msg.to_whom, recipient_impl->pub, sizeof(public_identity_t));
+
+    if (body)
+    {
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+    }
+    return 0;
+}
+
+/* Per-dispatch state setup wraps the engine's _build_and_deliver path.
+ * sce drives every dispatch through ctx->dispatch, so this is where we
+ * reset+install state for the target participant before its handler
+ * runs. */
+static int _dispatch(sce_run_ctx_t *ctx,
+                     sce_participant_t *target,
+                     generic_msg_t *inbound)
+{
+    _install_target_state(ctx, target->id);
+
+    rp_impl_t *impl = (rp_impl_t *)target->impl;
+    array_t *queues = NULL;
+    array_create(&queues);
+    run_message_handlers(impl->proc, queues, NET_MESSAGE, inbound);
+    array_free(queues);
+
+    /* Snapshot the dispatcher's resulting state. Subsequent dispatches
+     * reset rep_state, so we can't re-read it for expected_state checks
+     * later; the snapshot is the only durable record. */
+    rp_snap_t *s = _snap_get_or_make(target->id);
+    if (s)
+    {
+        s->chain_len     = reputation_get_chain_len();
+        s->request_count = reputation_get_request_count();
+        s->last_id       = reputation_get_last_id();
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* expected_state                                                              */
+/* ------------------------------------------------------------------------- */
+
+/* Validate scenario-level expected_state assertions on the LAST
+ * participant we dispatched to. The engine's stub _check_expected_state
+ * defers to per-protocol logic; for reputation we read from rep_state
+ * directly (since we reset+install per dispatch, the values reflect
+ * the most recent dispatcher's state). */
+static int _check_expected_state(sce_run_ctx_t *ctx)
+{
+    json_t *exp = json_object_get(ctx->case_data, "expected_state");
+    if (!json_is_object(exp)) return 0;
+
+    const char *pid;
+    json_t *checks;
+    json_object_foreach(exp, pid, checks) {
+        if (!json_is_object(checks)) continue;
+        rp_snap_t *snap = _snap_find(pid);
+        if (snap == NULL)
+        {
+            /* No dispatch ever ran with this pid as target — likely a
+             * scenario that asserts state on a participant who was
+             * always the sender, never the receiver. Skip silently
+             * since we have nothing to compare against. */
+            continue;
+        }
+
+        const char *key;
+        json_t *val;
+        json_object_foreach(checks, key, val) {
+            if (strcmp(key, "history_len") == 0)
+            {
+                int want = (int)json_integer_value(val);
+                if (snap->chain_len != want)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: history_len=%d, expected %d",
+                             pid, snap->chain_len, want);
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "requests_count") == 0)
+            {
+                int want = (int)json_integer_value(val);
+                if (snap->request_count != want)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: requests_count=%d, expected %d",
+                             pid, snap->request_count, want);
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "last_id_set") == 0)
+            {
+                /* Python's check is `self.process.last_id is not None`;
+                 * the C side uses int64_t initialized to 0 and only
+                 * advances on a granted ballot (paxos.c:123). > 0
+                 * therefore means "set". Scenarios pin ballot ids > 0
+                 * so this maps cleanly to Python's None semantics. */
+                bool want = json_is_true(val);
+                bool got = (snap->last_id > 0);
+                if (got != want)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: last_id_set=%s (value=%lld), expected %s",
+                             pid, got ? "true" : "false",
+                             (long long)snap->last_id,
+                             want ? "true" : "false");
+                    return -1;
+                }
+            }
+            else
+            {
+                /* Unknown key: error rather than silently skip. The
+                 * Python adapter does the same (`raise
+                 * AssertionError(f'{self.id}: unsupported expected_state
+                 * key {key!r}')`); without this, a scenario could pin
+                 * a key that Python enforces but C ignores, hiding a
+                 * real asymmetry behind a green C result. */
+                snprintf(ctx->err, sizeof(ctx->err),
+                         "%s: unsupported expected_state key %s", pid, key);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Adapter entry                                                              */
+/* ------------------------------------------------------------------------- */
+
+void at_reputation_run(const at_case_t *c, at_case_result_t *out)
+{
+    if (strcmp(c->kind, "negative") == 0)
+    {
+        at_neg_run_wire(c, out);
+        return;
+    }
+    if (strcmp(c->kind, "scenario") != 0)
+    {
+        char detail[160];
+        snprintf(detail, sizeof(detail),
+                 "C reputation adapter only handles kind:scenario|negative (got %s)", c->kind);
+        at_case_result_set_skip(out, detail);
+        return;
+    }
+
+    char err[256] = {0};
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    sce_run_ctx_t ctx;
+    sce_init(&ctx);
+    ctx.case_data = c->data;
+    ctx.build_inbound = _build_inbound;
+    ctx.dispatch = _dispatch;
+
+    g_fixtures = json_object_get(c->data, "fixtures");
+    memset(g_snaps, 0, sizeof(g_snaps));
+
+    json_t *parts = json_object_get(c->data, "participants");
+    if (!json_is_array(parts))
+    {
+        snprintf(err, sizeof(err), "scenario: participants array missing");
+        goto fail;
+    }
+    size_t n = json_array_size(parts);
+    if (n > SCE_MAX_PARTICIPANTS)
+    {
+        snprintf(err, sizeof(err), "scenario: too many participants (%zu)", n);
+        goto fail;
+    }
+    for (size_t i = 0; i < n; i++)
+    {
+        json_t *p = json_array_get(parts, i);
+        const char *id = json_string_value(json_object_get(p, "id"));
+        const char *role = json_string_value(json_object_get(p, "role"));
+        if (id == NULL || role == NULL)
+        {
+            snprintf(err, sizeof(err), "participants[%zu] missing id or role", i);
+            goto fail;
+        }
+        snprintf(ctx.participants[i].id, SCE_ID_LEN, "%s", id);
+        snprintf(ctx.participants[i].role, SCE_ID_LEN, "%s", role);
+        ctx.participants[i].impl = _build_participant_impl(id, i);
+        if (ctx.participants[i].impl == NULL)
+        {
+            snprintf(err, sizeof(err),
+                     "participants[%zu] (%s) impl build failed", i, id);
+            goto fail;
+        }
+        ctx.participant_count++;
+    }
+    _link_peer_lists(&ctx);
+
+    g_active_ctx = &ctx;
+    messaging_set_test_hook(_send_hook);
+    reputation_set_synchronous_dispatch(true);
+
+    int rc = sce_run(&ctx);
+
+    /* expected_state is run after the engine's normal finalize; the
+     * engine's _check_expected_state stub doesn't know our protocol,
+     * so we re-validate here. */
+    if (rc == 0) rc = _check_expected_state(&ctx);
+
+    messaging_set_test_hook(NULL);
+    g_active_ctx = NULL;
+    g_fixtures = NULL;
+    reputation_set_synchronous_dispatch(false);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    int duration_ms = (int)((t1.tv_sec - t0.tv_sec) * 1000
+                            + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+    if (rc == 0) at_case_result_set_pass(out, duration_ms);
+    else         at_case_result_set_fail(out, duration_ms, "AssertionError", ctx.err);
+
+    for (size_t i = 0; i < ctx.participant_count; i++)
+        _free_participant_impl((rp_impl_t *)ctx.participants[i].impl);
+    return;
+
+fail:
+    g_active_ctx = NULL;
+    g_fixtures = NULL;
+    messaging_set_test_hook(NULL);
+    reputation_set_synchronous_dispatch(false);
+    for (size_t i = 0; i < ctx.participant_count; i++)
+        _free_participant_impl((rp_impl_t *)ctx.participants[i].impl);
+    at_case_result_set_fail(out, 0, "AssertionError", err);
+}

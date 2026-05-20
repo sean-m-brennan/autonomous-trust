@@ -1,0 +1,39 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: history-diff-empty
+byte_pinning: false
+description: |
+    Exercises the `history_diff` (IdentityProtocol.diff) handler
+    on the empty-payload boundary — a defensive case for
+    BUGS.md §P10 (`handle_history_diff` formerly crashed on
+    empty `steps` because `_history.ingest_branch` did
+    `steps[-1]` without a length check).
+
+    Both Python's adapter (`obj = to_json_string([])`) and C's
+    generic _build_inbound deliver a parseable-or-empty payload
+    to the handler; with the P10 guard in place, both return
+    cleanly without modifying history.
+
+    Cross-language value: no-crash equivalence on the handler
+    entry point under the empty-diff edge case. Future scenarios
+    can exercise non-empty diffs by extending both adapters to
+    construct a list of LinkedSteps as inbound payload — not
+    needed for the drift-coverage goal here.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: history_diff
+    payload: {}
+    description: |
+        newcomer sends bg an empty history diff. bg's
+        handle_history_diff returns immediately (P10 guard);
+        no history merge attempted.

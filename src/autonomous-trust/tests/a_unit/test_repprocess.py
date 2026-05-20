@@ -148,6 +148,74 @@ class TestHandleRequest:
         result = rp.handle_request(queues, msg)
         assert result is False
 
+    def test_grant_advances_last_id(self):
+        """Regression for BUGS.md P6.
+
+        Prior bug: handle_request granted but never assigned self.last_id,
+        so a duplicate (id1, id2) replay re-passed the `last_id is None or
+        last_id < id1` guard and double-appended to self.requests. C side
+        always advanced (paxos.c:123). After fix, both languages advance
+        last_id to id1 immediately after the grant message is emitted; the
+        ack itself still carries the PRIOR last_id (captured before
+        update), matching paxos.c:114.
+        """
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        rp.protocol.peers.all = [peer]
+
+        net_q = queue.Queue()
+        queues = {CfgIds.network: net_q, CfgIds.reputation: queue.Queue()}
+
+        id1 = 100
+        id2 = 1  # len(history) + 1 == 1
+        msg = Message(CfgIds.reputation, ReputationProtocol.request,
+                      to_yaml_string((id1, id2, peer.uuid)),
+                      from_whom=peer)
+        rp.handle_request(queues, msg)
+        first = net_q.get_nowait()
+        assert first.function == ReputationProtocol.grant
+        assert rp.last_id == id1, (
+            f'last_id must advance to {id1} after grant; '
+            f'got {rp.last_id!r} (P6 regression)'
+        )
+
+    def test_replay_after_grant_is_nacked(self):
+        """Regression for BUGS.md P6: duplicate ask must NACK after grant.
+
+        With last_id correctly pinned by the first grant, the second
+        identical ask hits `last_id < id1` → False and falls through to the
+        nack branch. requests stays length 1 (no double-append). Mirrors
+        C's behavior in paxos_handle_request when id1 is NOT > last_id.
+        """
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        rp.protocol.peers.all = [peer]
+
+        net_q = queue.Queue()
+        queues = {CfgIds.network: net_q, CfgIds.reputation: queue.Queue()}
+
+        id1 = 100
+        id2 = 1
+        msg = Message(CfgIds.reputation, ReputationProtocol.request,
+                      to_yaml_string((id1, id2, peer.uuid)),
+                      from_whom=peer)
+        rp.handle_request(queues, msg)
+        first = net_q.get_nowait()
+        assert first.function == ReputationProtocol.grant
+
+        # Replay the SAME ask. Before P6 fix this re-granted and
+        # doubled requests; after fix it NACKs.
+        rp.handle_request(queues, msg)
+        second = net_q.get_nowait()
+        assert second.function == ReputationProtocol.nack, (
+            f'replayed ask must NACK after first grant, '
+            f'got {second.function!r} (P6 regression)'
+        )
+        assert len(rp.requests) == 1, (
+            'replayed ask must not double-append to requests; '
+            f'got len={len(rp.requests)} (P6 regression)'
+        )
+
 
 class TestHandleGrant:
     def test_wrong_function(self):
@@ -260,10 +328,14 @@ class TestForwardReputation:
         rp = _make_rep_process()
         from autonomous_trust.core.reputation.reputation import Reputation
         rep = Reputation(uuid4(), 0.9)
+        # MagicMock requestor auto-creates a .uuid distinct from rp.identity.uuid,
+        # so forward_reputation routes the rep_resp to the network queue.
         rp.requested_reps.append((rep, 'some_proc', MagicMock()))
-        queues = {'some_proc': queue.Queue()}
+        net_q = queue.Queue()
+        queues = {'some_proc': queue.Queue(), CfgIds.network: net_q}
         rp.forward_reputation(queues)
         assert len(rp.requested_reps) == 0
+        assert not net_q.empty()
 
 
 class TestContriteTitForTat:
@@ -586,11 +658,41 @@ class TestForwardReputationDeeper:
         from autonomous_trust.core.reputation.reputation import Reputation
         peer = _make_mock_peer()
         rep = Reputation(peer.uuid, 0.7)
+        # peer has its own uuid != rp.identity.uuid, so the rep_resp is
+        # routed via the network queue rather than the local proc queue.
         rp.requested_reps.append((rep, 'proc1', peer))
-        queues = {'proc1': queue.Queue()}
+        net_q = queue.Queue()
+        queues = {'proc1': queue.Queue(), CfgIds.network: net_q}
         rp.forward_reputation(queues)
         assert len(rp.requested_reps) == 0
-        assert not queues['proc1'].empty()
+        assert not net_q.empty()
+
+    def test_forward_local_when_requestor_is_none(self, setup_teardown):
+        """No requestor -> local routing onto the per-proc queue."""
+        rp = _make_rep_process()
+        from autonomous_trust.core.reputation.reputation import Reputation
+        rep = Reputation(uuid4(), 0.7)
+        rp.requested_reps.append((rep, 'proc1', None))
+        proc_q = queue.Queue()
+        queues = {'proc1': proc_q, CfgIds.network: queue.Queue()}
+        rp.forward_reputation(queues)
+        assert len(rp.requested_reps) == 0
+        assert not proc_q.empty()
+
+    def test_forward_local_when_requestor_is_self(self, setup_teardown):
+        """Loopback requestor (our own identity) -> local proc queue."""
+        rp = _make_rep_process()
+        from autonomous_trust.core.reputation.reputation import Reputation
+        rep = Reputation(uuid4(), 0.7)
+        # Forge a requestor whose uuid matches rp.identity.uuid.
+        self_requestor = MagicMock()
+        self_requestor.uuid = rp.identity.uuid
+        rp.requested_reps.append((rep, 'proc1', self_requestor))
+        proc_q = queue.Queue()
+        queues = {'proc1': proc_q, CfgIds.network: queue.Queue()}
+        rp.forward_reputation(queues)
+        assert len(rp.requested_reps) == 0
+        assert not proc_q.empty()
 
 
 class TestHandleGrantDeeper:
@@ -649,9 +751,9 @@ class TestHandleNackDeeper:
         id2 = 1
         idx = rp._paxos_id_index(id1, id2)
         score = TransactionScore(uuid4(), 0.8)
-        # handle_nack accesses self.requests[idx] which expects dict-like access
-        # but requests is a list; override with a dict for this test
-        rp.requests = {idx: [score]}
+        # handle_nack reads the score from my_requests (proposer-side state
+        # populated by _start_paxos), not the acceptor-side `requests` list.
+        rp.my_requests[idx] = TxCount(score, 0)
 
         msg = Message(CfgIds.reputation, ReputationProtocol.nack,
                       to_yaml_string((id1, id2, peer.uuid)),
@@ -660,6 +762,22 @@ class TestHandleNackDeeper:
         result = rp.handle_nack({CfgIds.network: queue.Queue()}, msg)
         assert result is True
         assert idx in rp.backoff
+
+    def test_nack_unknown_request_dropped(self):
+        """A nack for an idx not in my_requests is dropped without retry."""
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        id1 = 100
+        id2 = 1
+        idx = rp._paxos_id_index(id1, id2)
+        # do NOT populate my_requests — handle_nack should short-circuit
+
+        msg = Message(CfgIds.reputation, ReputationProtocol.nack,
+                      to_yaml_string((id1, id2, peer.uuid)),
+                      from_whom=peer)
+        result = rp.handle_nack({CfgIds.network: queue.Queue()}, msg)
+        assert result is True
+        assert idx not in rp.backoff
 
 
 class TestHandleUpdateMajority:
@@ -933,8 +1051,7 @@ class TestHandleNackDeeper2:
         id2 = 1
         idx = rp._paxos_id_index(id1, id2)
         score = TransactionScore(uuid4(), 0.8)
-        # requests must be a dict so handle_nack can index with idx
-        rp.requests = {idx: [score]}
+        rp.my_requests[idx] = TxCount(score, 0)
 
         msg = Message(CfgIds.reputation, ReputationProtocol.nack,
                       to_yaml_string((id1, id2, peer.uuid)),
@@ -952,7 +1069,7 @@ class TestHandleNackDeeper2:
         id2 = 1
         idx = rp._paxos_id_index(id1, id2)
         score = TransactionScore(uuid4(), 0.8)
-        rp.requests = {idx: [score]}
+        rp.my_requests[idx] = TxCount(score, 0)
         rp.backoff[idx] = 2.0  # pre-existing backoff
 
         msg = Message(CfgIds.reputation, ReputationProtocol.nack,
@@ -1144,7 +1261,7 @@ class TestForwardReputationFullException:
     """Cover Full exception in forward_reputation (lines 365-366)."""
 
     def test_forward_reputation_full_queue(self):
-        """Full exception when putting rep_resp onto a process queue."""
+        """Full exception when putting rep_resp onto a queue."""
         from autonomous_trust.core.reputation.reputation import Reputation
         rp = _make_rep_process()
         peer = _make_mock_peer()
@@ -1152,11 +1269,12 @@ class TestForwardReputationFullException:
         proc_name = 'some_proc'
         rp.requested_reps.append((rep, proc_name, peer))
 
-        full_q = MagicMock()
-        full_q.put = MagicMock(side_effect=Full)
-        # Should not raise; Full is caught inside forward_reputation
-        rp.forward_reputation({proc_name: full_q})
-        # requested_reps is emptied regardless (pop happens before put)
+        # Remote-uuid requestor -> network route. Make the network queue
+        # raise Full to exercise the except path.
+        full_net_q = MagicMock()
+        full_net_q.put = MagicMock(side_effect=Full)
+        rp.forward_reputation({proc_name: queue.Queue(), CfgIds.network: full_net_q})
+        # requested_reps is emptied regardless (pop happens before put).
         assert len(rp.requested_reps) == 0
 
     def test_forward_reputation_multiple_reps(self):
@@ -1164,12 +1282,13 @@ class TestForwardReputationFullException:
         from autonomous_trust.core.reputation.reputation import Reputation
         rp = _make_rep_process()
         proc_name = 'proc1'
-        q = queue.Queue()
+        net_q = queue.Queue()
         for i in range(3):
             peer = _make_mock_peer(nickname='p%d' % i, address='10.0.0.%d' % (i + 1))
             rep = Reputation(peer.uuid, 0.5 + i * 0.1)
             rp.requested_reps.append((rep, proc_name, peer))
 
-        rp.forward_reputation({proc_name: q})
+        # All three peers are remote (uuid != rp.identity.uuid) -> network.
+        rp.forward_reputation({proc_name: queue.Queue(), CfgIds.network: net_q})
         assert len(rp.requested_reps) == 0
-        assert q.qsize() == 3
+        assert net_q.qsize() == 3

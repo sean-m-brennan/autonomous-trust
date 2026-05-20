@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-"""Environmental data services for the civilian disaster-response demo.
+"""Environmental data services for the multi-agency disaster-response demo.
 
 Each concrete service exposes a distinct AT capability string so FEMA
 fusion and other consumers can discover and request specific streams

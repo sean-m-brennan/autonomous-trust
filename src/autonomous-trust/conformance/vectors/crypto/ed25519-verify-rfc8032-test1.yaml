@@ -1,0 +1,12 @@
+schema_version: "1"
+kind: crypto_vector
+protocol: network
+name: ed25519-verify-rfc8032-test1
+description: Verify RFC 8032 test 1's signature against its public key. Must accept.
+primitive: ed25519_verify
+input:
+  public_key: "0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+  message:    "0x"
+  signature:  "0xe5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+expected:
+  valid: true
