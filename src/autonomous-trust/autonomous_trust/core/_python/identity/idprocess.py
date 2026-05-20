@@ -18,10 +18,12 @@ import hmac
 import os
 import sys
 import time
+from datetime import datetime
 from queue import Empty, Full
 import threading
 from typing import Optional, Union
 
+from nacl.encoding import HexEncoder
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SignedMessage
 
@@ -126,6 +128,18 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.self_bootstrapped = False
         self.merging = False
         self.peer_potentials = {}
+        # Partition-recovery state — see doc/architecture/partition-recovery.md.
+        # All three maps are pure local memory; no wire egress, no
+        # configuration import.  They get reset when _merge_to_mesh adopts
+        # a remote group (the partition is resolved at that point).
+        #   _partition_probe_cooldown:   from_addr  -> last probe sent
+        #   _partition_response_cooldown: peer_uuid -> last response sent
+        #   _partition_recovery_in_progress: (their_group_uuid, started_at)
+        #     while non-None, suppress new probes until the timeout (15s)
+        #     elapses or `_merge_to_mesh` clears it.
+        self._partition_probe_cooldown: dict[str, datetime] = {}
+        self._partition_response_cooldown: dict[str, datetime] = {}
+        self._partition_recovery_in_progress: Optional[tuple[str, datetime]] = None
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
         self.protocol.register_handler(IdentityProtocol.accept, self.handle_acceptance)
         self.protocol.register_handler(IdentityProtocol.history, self.receive_history)
@@ -137,6 +151,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.caps_query, self.handle_caps_query)
         self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
         self.protocol.register_handler(IdentityProtocol.rank_update, self.handle_rank_update)
+        self.protocol.register_handler(IdentityProtocol.partition_signal, self.handle_partition_signal)
+        self.protocol.register_handler(IdentityProtocol.partition_probe, self.handle_partition_probe)
+        self.protocol.register_handler(IdentityProtocol.partition_response, self.handle_partition_response)
         self.lock = None
 
     @property
@@ -421,6 +438,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.logger.info('Merging self-bootstrap into mesh group %s' %
                              getattr(self.group, 'nickname', '?'))
             self._record_group(queues)
+            # Partition-recovery cleanup: this is the typical exit path
+            # for a successful partition-recovery probe → request_access
+            # → full_history round-trip (see
+            # doc/architecture/partition-recovery.md §5.5).
+            self._partition_recovery_in_progress = None
+            self._partition_probe_cooldown.clear()
             self._populate_peers_from_history(queues, list(unioned_peers.values()))
             # We were not a member of the new group; do NOT send a
             # history_diff here. Re-announce on the open channel so a BG
@@ -1096,6 +1119,281 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.report_exception(err, 'handle_rank_update')
         return True
 
+    # ------------------------------------------------------------------
+    # Partition recovery (doc/architecture/partition-recovery.md).
+    # ------------------------------------------------------------------
+
+    _PARTITION_PROBE_COOLDOWN_SEC = 10.0   # per from_addr (§5.2)
+    _PARTITION_RESPONSE_COOLDOWN_SEC = 30.0  # per probe-sender uuid (§5.3)
+    _PARTITION_RECOVERY_TIMEOUT_SEC = 15.0  # in-progress lockout (§5.4)
+
+    @staticmethod
+    def _partition_probe_canonical(group_uuid, group_size):
+        """Canonical byte form for probe signature input."""
+        return ('%s|%s' % (group_uuid, int(group_size))).encode('utf-8')
+
+    @staticmethod
+    def _partition_response_canonical(group_uuid, group_size, in_response_to):
+        """Canonical byte form for response signature input."""
+        return ('%s|%s|%s' % (group_uuid, int(group_size),
+                              in_response_to)).encode('utf-8')
+
+    def _partition_recovery_active(self):
+        """True iff a recovery is currently in flight and not yet timed out."""
+        if self._partition_recovery_in_progress is None:
+            return False
+        _, started_at = self._partition_recovery_in_progress
+        elapsed = (now() - started_at).total_seconds()
+        if elapsed >= self._PARTITION_RECOVERY_TIMEOUT_SEC:
+            self._partition_recovery_in_progress = None
+            return False
+        return True
+
+    def _select_partition_leader(self):
+        """Return one of our group members the probe sender can address
+        their request_access to.
+
+        Picks the most recently-admitted peer with peer_rank >= ours
+        (so newcomers don't get pinned as welcomer for the merging
+        peer; the welcoming-committee at the target still runs through
+        the normal voting flow). Falls back to self.identity when our
+        group is size-1 — the dod_mission coordinator case.
+        """
+        candidates = []
+        our_rank = getattr(self.identity, '_rank', 0)
+        for peer in self.peers.all:
+            if str(getattr(peer, 'uuid', '')) == str(self.identity.uuid):
+                continue
+            if getattr(peer, '_rank', 0) < our_rank:
+                continue
+            candidates.append(peer)
+        if not candidates:
+            return self.identity
+        # newest first — fall back to UUID order for determinism
+        candidates.sort(key=lambda p: (getattr(p, '_admitted_at', 0),
+                                       str(p.uuid)),
+                        reverse=True)
+        return candidates[0]
+
+    def handle_partition_signal(self, queues, message):
+        """Local-only IPC from NetProcess: a group message arrived from
+        ``from_addr`` whose address is not in our group. Emit a
+        ``partition_probe`` on unsecured multicast so any responder in
+        any group can identify itself, then decide whether to merge.
+
+        Rate-limited at one probe per ``from_addr`` per 10 s.
+        Suppressed while bootstrapping (``self.group is None`` or
+        ``self.choosing``) and while a recovery is already in flight.
+        See doc/architecture/partition-recovery.md §5.2.
+        """
+        if message.function != IdentityProtocol.partition_signal:
+            return False
+        if self.group is None or self.choosing:
+            return True
+        if self._partition_recovery_active():
+            return True
+        from_addr = message.obj
+        if not isinstance(from_addr, str) or not from_addr:
+            return True
+        cutoff = now()
+        last = self._partition_probe_cooldown.get(from_addr)
+        if (last is not None
+                and (cutoff - last).total_seconds()
+                < self._PARTITION_PROBE_COOLDOWN_SEC):
+            return True
+        self._partition_probe_cooldown[from_addr] = cutoff
+        try:
+            group_uuid = str(self.group.uuid)
+            group_size = len(list(self.group.addresses))
+            sig_bytes = self._partition_probe_canonical(group_uuid, group_size)
+            signed = self.identity.sign(sig_bytes)
+            payload = to_json_string({
+                'from_identity': self.identity.publish(),
+                'from_address': self.identity.address,
+                'my_group_uuid': group_uuid,
+                'my_group_size': group_size,
+                'signature': signed.signature.decode('ascii'),
+            })
+            probe = Message(self.name, IdentityProtocol.partition_probe,
+                            payload, to_whom=Network.broadcast,
+                            encrypt=False)
+            queues[CfgIds.network].put(probe, block=True,
+                                       timeout=self.q_cadence)
+            _probes.counter('peer.set', 'partition_probe_sent')
+            self.logger.debug(
+                'Partition probe broadcast (group=%s size=%d trigger=%s)' %
+                (self.group.nickname, group_size, from_addr))
+        except Full:
+            _probes.counter('peer.set', 'partition_probe_q_full')
+            self.logger.error('handle_partition_signal: Network queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_partition_signal')
+        return True
+
+    def handle_partition_probe(self, queues, message):
+        """Receive an unsecured-multicast probe from a peer that sees us
+        as cross-group. Verify the probe signature against the embedded
+        sender identity, then reply with a ``partition_response`` so the
+        sender can compare group sizes and decide whether to merge.
+
+        Rate-limited at one response per probing peer uuid per 30 s.
+        Skipped if we are still bootstrapping (no group yet). See
+        doc/architecture/partition-recovery.md §5.3.
+        """
+        if message.function != IdentityProtocol.partition_probe:
+            return False
+        if self.group is None:
+            return True
+        try:
+            payload = from_json_string(message.obj) if isinstance(
+                message.obj, (str, bytes)) else message.obj
+            if not isinstance(payload, dict):
+                _probes.counter('peer.set', 'partition_probe_bad_payload')
+                return True
+            sender_id = payload.get('from_identity')
+            group_uuid = payload.get('my_group_uuid')
+            group_size = payload.get('my_group_size')
+            sig_hex = payload.get('signature')
+            if (sender_id is None or group_uuid is None
+                    or group_size is None or sig_hex is None):
+                _probes.counter('peer.set', 'partition_probe_missing_fields')
+                return True
+            # sender_id arrived deserialized as an Identity (Configuration
+            # auto-deserialization in Message.__init__). Verify signature
+            # using the raw-bytes path that message.py:228-243 documents
+            # — Identity.verify's two-arg form double-encodes under nacl.
+            try:
+                sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
+                sender_id.signature.public.verify(
+                    self._partition_probe_canonical(group_uuid, group_size),
+                    sig_raw)
+            except (BadSignatureError, ValueError):
+                _probes.counter('peer.set', 'partition_probe_bad_sig')
+                return True
+            sender_uuid = str(sender_id.uuid)
+            # If the sender is already in our group, this is the
+            # graceful no-op case (their local view is stale); send a
+            # normal group_key_update and bail.
+            if any(str(getattr(p, 'uuid', '')) == sender_uuid
+                   for p in self.peers.all
+                   if str(getattr(p, 'address', '')) in
+                   list(self.group.addresses)):
+                # Existing code already handles group_key_update; just
+                # don't respond with a partition_response.
+                _probes.counter('peer.set', 'partition_probe_known_peer')
+                return True
+            cutoff = now()
+            last = self._partition_response_cooldown.get(sender_uuid)
+            if (last is not None
+                    and (cutoff - last).total_seconds()
+                    < self._PARTITION_RESPONSE_COOLDOWN_SEC):
+                return True
+            self._partition_response_cooldown[sender_uuid] = cutoff
+            # Build the response.
+            our_group_uuid = str(self.group.uuid)
+            our_group_size = len(list(self.group.addresses))
+            leader = self._select_partition_leader()
+            resp_sig_bytes = self._partition_response_canonical(
+                our_group_uuid, our_group_size, sender_uuid)
+            resp_signed = self.identity.sign(resp_sig_bytes)
+            resp_payload = to_json_string({
+                'from_identity': self.identity.publish(),
+                'from_address': self.identity.address,
+                'in_response_to': sender_uuid,
+                'my_group_uuid': our_group_uuid,
+                'my_group_size': our_group_size,
+                'my_group_leader': str(leader.uuid),
+                'my_group_leader_address': leader.address,
+                'signature': resp_signed.signature.decode('ascii'),
+            })
+            reply = Message(self.name, IdentityProtocol.partition_response,
+                            resp_payload, to_whom=Network.broadcast,
+                            encrypt=False)
+            queues[CfgIds.network].put(reply, block=True,
+                                       timeout=self.q_cadence)
+            _probes.counter('peer.set', 'partition_response_sent')
+            self.logger.debug(
+                'Partition response broadcast (to=%s our_group=%s/%d)' %
+                (sender_uuid, self.group.nickname, our_group_size))
+        except Full:
+            _probes.counter('peer.set', 'partition_response_q_full')
+            self.logger.error('handle_partition_probe: Network queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_partition_probe')
+        return True
+
+    def handle_partition_response(self, queues, message):
+        """Receive a probe response. If the responder's group is larger
+        (or equal-size with smaller uuid), initiate a normal
+        ``request_access`` toward their group leader's address — the
+        existing welcoming-committee flow then drives a ``full_history``
+        exchange, which feeds ``_merge_to_mesh`` and adopts the larger
+        group. See doc/architecture/partition-recovery.md §5.4.
+        """
+        if message.function != IdentityProtocol.partition_response:
+            return False
+        if self.group is None or self._partition_recovery_active():
+            return True
+        try:
+            payload = from_json_string(message.obj) if isinstance(
+                message.obj, (str, bytes)) else message.obj
+            if not isinstance(payload, dict):
+                return True
+            sender_id = payload.get('from_identity')
+            in_response_to = payload.get('in_response_to')
+            their_group_uuid = payload.get('my_group_uuid')
+            their_group_size = payload.get('my_group_size')
+            leader_uuid = payload.get('my_group_leader')
+            leader_address = payload.get('my_group_leader_address')
+            sig_hex = payload.get('signature')
+            if (sender_id is None or in_response_to is None
+                    or their_group_uuid is None or their_group_size is None
+                    or leader_address is None or sig_hex is None):
+                _probes.counter('peer.set', 'partition_response_missing_fields')
+                return True
+            if in_response_to != str(self.identity.uuid):
+                # Response to someone else's probe — multicast bleed-through.
+                return True
+            try:
+                sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
+                sender_id.signature.public.verify(
+                    self._partition_response_canonical(
+                        their_group_uuid, their_group_size, in_response_to),
+                    sig_raw)
+            except (BadSignatureError, ValueError):
+                _probes.counter('peer.set', 'partition_response_bad_sig')
+                return True
+            our_size = len(list(self.group.addresses))
+            theirs = int(their_group_size)
+            adopt = (theirs > our_size
+                     or (theirs == our_size
+                         and str(their_group_uuid) < str(self.group.uuid)))
+            if not adopt:
+                # They will reach the symmetric conclusion when they
+                # receive our probe — initiate from their side. No-op.
+                _probes.counter('peer.set', 'partition_response_we_win')
+                return True
+            self._partition_recovery_in_progress = (str(their_group_uuid),
+                                                    now())
+            # Re-broadcast request_access on the open channel. This is the
+            # same call announce_identity uses; the welcoming committee at
+            # the responder's group will admit us through the standard
+            # POA-voting flow, and the resulting full_history will drive
+            # _merge_to_mesh to adopt their group.
+            self._broadcast_request_access(queues)
+            _probes.counter('peer.set', 'partition_recovery_initiated')
+            self.logger.info(
+                'Partition recovery: adopting group %s (size=%d > our %d), '
+                'sent request_access toward leader %s@%s' %
+                (their_group_uuid, theirs, our_size,
+                 leader_uuid, leader_address))
+        except Full:
+            _probes.counter('peer.set', 'partition_request_access_q_full')
+            self.logger.error('handle_partition_response: Network queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_partition_response')
+        return True
+
     def handle_group_update(self, queues, message):
         """
         Receive a group update (addresses list only)
@@ -1142,6 +1440,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.logger.debug('Replace %s group with %s group' % (mine.nickname, theirs.nickname))
                 self.group = theirs
                 self._record_group(queues)
+                # Partition recovery completes here whenever the adopted
+                # group matches an in-flight recovery, OR opportunistically
+                # whenever any merge lands (we don't insist on UUID match —
+                # an unrelated merge that absorbs the same addresses is
+                # also a resolution).
+                self._partition_recovery_in_progress = None
+                self._partition_probe_cooldown.clear()
                 return True
             # We are the canonical winner — push our group to peers below us
             # in the hierarchy so they converge on it. Don't echo on every

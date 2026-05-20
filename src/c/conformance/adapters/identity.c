@@ -41,6 +41,7 @@
 #include <uuid/uuid.h>
 
 #include "identity/identity.h"
+#include "identity/identity_priv.h"   /* hexlify / public_identity_to_json */
 #include "identity/id_proc_priv.h"
 #include "network/net_message.h"
 #include "processes/processes.h"
@@ -316,6 +317,111 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_object_set_new(body, "approved", json_boolean(approved));
         net_msg_pack_json(&out->info.net_msg, body);
         json_decref(body);
+    }
+
+    /* partition_signal — local-only IPC payload is just the from_addr
+     * string. See doc/architecture/partition-recovery.md §5.1. */
+    if (strcmp(function, "partition_signal") == 0) {
+        const char *from_addr = "mock-addr:0";
+        if (json_is_object(payload)) {
+            json_t *fa = json_object_get(payload, "from_addr");
+            if (json_is_string(fa)) from_addr = json_string_value(fa);
+        }
+        json_t *body = json_string(from_addr);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+    }
+
+    /* partition_probe — cross-group probe, signed JSON payload. */
+    if (strcmp(function, "group_partition_probe") == 0
+        && json_is_object(payload)) {
+        const char *group_uuid = "00000000-0000-0000-0000-000000000000";
+        int group_size = 1;
+        json_t *g = json_object_get(payload, "group_uuid");
+        if (json_is_string(g)) group_uuid = json_string_value(g);
+        json_t *sz = json_object_get(payload, "group_size");
+        if (json_is_integer(sz)) group_size = (int)json_integer_value(sz);
+
+        char canon[UUID_STRING_LEN + 32];
+        int clen = snprintf(canon, sizeof(canon), "%s|%d",
+                            group_uuid, group_size);
+        unsigned char sig[crypto_sign_BYTES];
+        if (clen > 0 && (size_t)clen < sizeof(canon)
+            && sender_impl->full != NULL) {
+            crypto_sign_detached(sig, NULL, (const unsigned char *)canon,
+                                 (size_t)clen,
+                                 sender_impl->full->signature.private);
+            char sig_hex[crypto_sign_BYTES * 2 + 1];
+            hexlify(sig, crypto_sign_BYTES, (unsigned char *)sig_hex);
+            json_t *from_id_json = NULL;
+            public_identity_to_json(sender_impl->pub, &from_id_json);
+            json_t *body = json_object();
+            if (from_id_json != NULL)
+                json_object_set_new(body, "from_identity", from_id_json);
+            json_object_set_new(body, "from_address",
+                                json_string(sender_impl->pub->address));
+            json_object_set_new(body, "my_group_uuid",
+                                json_string(group_uuid));
+            json_object_set_new(body, "my_group_size",
+                                json_integer(group_size));
+            json_object_set_new(body, "signature", json_string(sig_hex));
+            net_msg_pack_json(&out->info.net_msg, body);
+            json_decref(body);
+        }
+    }
+
+    /* partition_response — same shape + in_response_to + leader info. */
+    if (strcmp(function, "group_partition_response") == 0
+        && json_is_object(payload)) {
+        const char *group_uuid = "00000000-0000-0000-0000-000000000000";
+        int group_size = 1;
+        const char *in_resp = "00000000-0000-0000-0000-000000000000";
+        const char *leader_uuid = group_uuid;
+        const char *leader_addr = sender_impl->pub != NULL
+            ? sender_impl->pub->address : "";
+        json_t *g = json_object_get(payload, "group_uuid");
+        if (json_is_string(g)) group_uuid = json_string_value(g);
+        json_t *sz = json_object_get(payload, "group_size");
+        if (json_is_integer(sz)) group_size = (int)json_integer_value(sz);
+        json_t *ir = json_object_get(payload, "in_response_to");
+        if (json_is_string(ir)) in_resp = json_string_value(ir);
+        json_t *lu = json_object_get(payload, "leader_uuid");
+        if (json_is_string(lu)) leader_uuid = json_string_value(lu);
+        json_t *la = json_object_get(payload, "leader_address");
+        if (json_is_string(la)) leader_addr = json_string_value(la);
+
+        char canon[UUID_STRING_LEN * 2 + 64];
+        int clen = snprintf(canon, sizeof(canon), "%s|%d|%s",
+                            group_uuid, group_size, in_resp);
+        unsigned char sig[crypto_sign_BYTES];
+        if (clen > 0 && (size_t)clen < sizeof(canon)
+            && sender_impl->full != NULL) {
+            crypto_sign_detached(sig, NULL, (const unsigned char *)canon,
+                                 (size_t)clen,
+                                 sender_impl->full->signature.private);
+            char sig_hex[crypto_sign_BYTES * 2 + 1];
+            hexlify(sig, crypto_sign_BYTES, (unsigned char *)sig_hex);
+            json_t *from_id_json = NULL;
+            public_identity_to_json(sender_impl->pub, &from_id_json);
+            json_t *body = json_object();
+            if (from_id_json != NULL)
+                json_object_set_new(body, "from_identity", from_id_json);
+            json_object_set_new(body, "from_address",
+                                json_string(sender_impl->pub->address));
+            json_object_set_new(body, "in_response_to",
+                                json_string(in_resp));
+            json_object_set_new(body, "my_group_uuid",
+                                json_string(group_uuid));
+            json_object_set_new(body, "my_group_size",
+                                json_integer(group_size));
+            json_object_set_new(body, "my_group_leader",
+                                json_string(leader_uuid));
+            json_object_set_new(body, "my_group_leader_address",
+                                json_string(leader_addr));
+            json_object_set_new(body, "signature", json_string(sig_hex));
+            net_msg_pack_json(&out->info.net_msg, body);
+            json_decref(body);
+        }
     }
 
     return 0;
