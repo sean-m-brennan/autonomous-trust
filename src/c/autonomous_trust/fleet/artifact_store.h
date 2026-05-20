@@ -49,6 +49,18 @@ typedef struct {
 */
 int artifact_store_init(const char *data_dir);
 
+/** Advisory existence check for a complete artifact.
+ *
+ *  Returns true iff the "complete" marker for @p hash_hex exists at the
+ *  moment of the call. The result is a hint, NOT a precondition for
+ *  subsequent I/O. Callers MUST NOT use this as a guard around an
+ *  `open()` / `fopen()` / `read_chunk` — that's a TOCTOU race. Treat
+ *  every open as fallible and handle `ENOENT` (or `read_chunk != 0`)
+ *  on the I/O path itself.
+ *
+ *  Legitimate uses: inventory / advertisement / "do we already have it,
+ *  don't redownload" hints where the consequence of a stale answer is
+ *  redoing work, not a crash. */
 /*@
   requires hash_hex != \null && \valid_read(hash_hex);
   assigns \nothing;
@@ -92,6 +104,13 @@ int artifact_store_save_chunk(const char *hash_hex, int chunk_index,
 int artifact_store_read_chunk(const char *hash_hex, int chunk_index,
                               uint8_t *buf, size_t buflen, size_t *out_len);
 
+/** Advisory existence check for one chunk of an artifact.
+ *
+ *  Same TOCTOU caveat as `artifact_store_has`: the result is a hint, not
+ *  a precondition for opening the chunk. Used in chunk-by-chunk download
+ *  loops to skip already-present chunks, where a stale "true" answer
+ *  costs at most one extra request. Callers MUST handle the missing-file
+ *  case on the open/read path itself. */
 /*@
   requires hash_hex != \null && \valid_read(hash_hex);
   requires chunk_index >= 0;
@@ -115,6 +134,16 @@ int artifact_store_chunk_count(const char *hash_hex);
 */
 int artifact_store_verify(const char *hash_hex, const uint8_t *expected_hash);
 
+/** Build the on-disk path for an artifact's directory.
+ *
+ *  Pure string formatting — does NOT stat the filesystem. Returns 0 on
+ *  success (path written to @p path_buf) or -1 if @p buflen is too
+ *  small. The path is valid syntax; whether the file exists at the
+ *  moment of use is the caller's open() problem, not this function's.
+ *
+ *  This replaces an earlier signature that did `if (!has(...)) return
+ *  -1` first — that was a TOCTOU vector (file could disappear between
+ *  `has` and the caller's open). */
 /*@
   requires hash_hex != \null && \valid_read(hash_hex);
   requires \valid(path_buf + (0 .. buflen - 1));

@@ -8,7 +8,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 # ******************
 
-"""Narration script for the civilian disaster-response demo.
+"""Narration script for the multi-agency disaster-response demo.
 
 Each block is a NarrationBlock (from inspector.dashboard.narration) keyed
 to a scenario-second timestamp. The dashboard shows at most one block

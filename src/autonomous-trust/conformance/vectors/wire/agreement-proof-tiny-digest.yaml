@@ -1,0 +1,19 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: agreement-proof-tiny-digest
+description: |
+    AgreementProof with a 1-byte digest. Boundary case for the base64
+    encoder (single-byte input produces 2-char output + double-padding).
+    Catches off-by-one in either side's base64 length math.
+byte_pinning: true
+wire_format: json
+serialize_mode: proto
+constructor: AgreementProof
+input:
+  uuid: "33333333-4444-5555-6666-777777777777"
+  digest: "0x7a"
+  approval: false
+  nonce: null
+expected:
+  json_wire: testdata/wire/agreement-proof-tiny-digest/expected.json

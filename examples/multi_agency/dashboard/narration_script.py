@@ -1,5 +1,5 @@
 """
-Narration script for the civilian disaster response demo.
+Narration script for the multi-agency disaster response demo.
 
 Each block appears as a semi-transparent overlay at the bottom of the
 dashboard during presentation mode.  All trust decisions are attributed
@@ -9,7 +9,7 @@ to the autonomous network — never to a human operator.
 from autonomous_trust.inspector.dashboard.narration import NarrationBlock
 
 
-CIVILIAN_NARRATION = [
+MULTI_AGENCY_NARRATION = [
     # Phase 0: Formation (T+0:00 - T+1:00)
     NarrationBlock(
         t_start=0,

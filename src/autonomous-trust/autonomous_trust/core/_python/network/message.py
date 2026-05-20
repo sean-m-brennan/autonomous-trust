@@ -29,6 +29,25 @@ from .. import _probes
 logger = logging.getLogger(__name__)
 
 
+def _sig_to_hex_str(sig):
+    """Render the signature stored on a Message as the 128-char wire hex.
+
+    `Identity.sign` uses `encoder=HexEncoder`, so `Message.signature` is
+    already ASCII hex (128 bytes). Older code re-applied
+    `HexEncoder.encode` here, double-encoding the wire form to 256 chars
+    and breaking the parse-side verification. Pass it through unchanged.
+    Accepts a raw 64-byte signature too, for callers that bypass
+    `Identity.sign`.
+    """
+    if isinstance(sig, bytes):
+        if len(sig) == 64:
+            return HexEncoder.encode(sig).decode('ascii')
+        return sig.decode('ascii')
+    if isinstance(sig, str):
+        return sig
+    return HexEncoder.encode(bytes(sig)).decode('ascii')
+
+
 class Message(object):
     """
     Wraps message data for IPC use, not for line transmission
@@ -85,11 +104,15 @@ class Message(object):
                 except Exception:
                     pass  # leave obj as string if deserialization fails
 
-        # Sign message content if sender has a private signing key
+        # Sign message content if sender has a private signing key.
+        # NB: Identity.sign uses encoder=HexEncoder, so signed.signature is
+        # the ASCII-hex form (128 bytes) — NOT raw 64-byte Ed25519 output.
+        # The wire serializers and parse() account for this; do not call
+        # HexEncoder.encode again on self.signature or it will double-encode.
         if from_whom is not None and isinstance(from_whom, Identity):
             try:
                 signed = from_whom.sign(self._content_str())
-                self.signature = signed.signature  # raw signature bytes
+                self.signature = signed.signature  # ASCII-hex (128 bytes)
                 self.verified = True  # we just signed it ourselves
             except (RuntimeError, AttributeError):
                 pass  # public-only identity or mock — leave unsigned
@@ -111,8 +134,7 @@ class Message(object):
     def __str__(self):
         content = self._content_str()
         if self.signature is not None:
-            sig_hex = HexEncoder.encode(self.signature).decode('ascii')
-            return content + '|' + sig_hex
+            return content + '|' + _sig_to_hex_str(self.signature)
         return content
 
     def __bytes__(self):
@@ -152,7 +174,7 @@ class Message(object):
                 pass
 
         if self.signature is not None:
-            wire['signature'] = HexEncoder.encode(self.signature).decode('ascii')
+            wire['signature'] = _sig_to_hex_str(self.signature)
 
         return json.dumps(wire, separators=(',', ':')).encode(Network.encoding)
 
@@ -161,6 +183,24 @@ class Message(object):
         from ..identity import Identity
         if validate and sender is not None and not isinstance(sender, Identity):
             raise RuntimeError('Sender must be an Identity')
+        # Envelope-level size cap (parser-side defense-in-depth). The TCP
+        # transport already caps inbound bytes at NET_MSG_MAX_DATA, but
+        # parse() is also called on in-process / alternate-transport
+        # bytes; mirroring the cap here means oversized envelopes never
+        # reach json.loads regardless of how they arrived. Matches C's
+        # net_message_from_wire size check (net_message.c). Measured in
+        # bytes — for str inputs we use len(str) which equals byte
+        # length for ASCII/UTF-8 envelopes (the only wire shape AT
+        # produces). Reject reason surfaces as ValueError so the
+        # conformance negative_runner classifies it as
+        # payload_oversized.
+        wire_len = (len(raw_msg) if isinstance(raw_msg, (bytes, bytearray))
+                    else len(raw_msg.encode(Network.encoding)))
+        if wire_len > Network.max_wire_bytes:
+            raise ValueError(
+                f'wire envelope exceeds size cap '
+                f'({wire_len} > {Network.max_wire_bytes} bytes)'
+            )
         if isinstance(raw_msg, bytes):
             raw_msg = raw_msg.decode(Network.encoding)
 
@@ -185,13 +225,21 @@ class Message(object):
                               trace_id=wire_trace)
                 msg.verified = False
 
-                # Verify signature if present
+                # Verify signature if present. Bypass Identity.verify's
+                # two-arg path here: it forwards encoder=HexEncoder to
+                # PyNaCl, but PyNaCl only applies that encoder to the
+                # message arg (not the signature), so any raw signature
+                # is rejected with "must be exactly 64 bytes long". Decode
+                # the wire hex once ourselves and hand the 64-byte
+                # signature straight to VerifyKey.verify with no encoder.
                 sig_hex = wire.get('signature')
                 if sig_hex and sender is not None and isinstance(sender, Identity):
                     try:
-                        sig_bytes = HexEncoder.decode(sig_hex.encode('ascii'))
+                        sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
                         content = '|'.join([process, function, obj_str])
-                        sender.verify(content.encode(Network.encoding), sig_bytes)
+                        sender.signature.public.verify(
+                            content.encode(Network.encoding), sig_raw,
+                        )
                         msg.verified = True
                     except (BadSignatureError, Exception) as e:
                         logger.warning(f"Message signature verification failed from {sender}: {e}")
@@ -220,9 +268,12 @@ class Message(object):
 
         if sig_hex and sender is not None and isinstance(sender, Identity):
             try:
-                sig_bytes = HexEncoder.decode(sig_hex.encode('ascii'))
+                # Same direct-verify path as the JSON branch above.
+                sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
                 content = '|'.join([process, function, obj_str])
-                sender.verify(content.encode(Network.encoding), sig_bytes)
+                sender.signature.public.verify(
+                    content.encode(Network.encoding), sig_raw,
+                )
                 msg.verified = True
             except (BadSignatureError, Exception) as e:
                 logger.warning(f"Message signature verification failed from {sender}: {e}")

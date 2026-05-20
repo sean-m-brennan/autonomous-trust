@@ -8,7 +8,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 # ******************
 
-"""Verification suite for the civilian disaster-response demo.
+"""Verification suite for the multi-agency disaster-response demo.
 
 Covers every functional checkpoint in demo-implementation-plan.md
 §Verification that's exercisable without a live K8s cluster:
@@ -289,11 +289,18 @@ class TestComposeAndK8sGeneration:
             generate_k8s_manifests,
         )
         files = generate_k8s_manifests(DisasterResponseScenario())
-        # Per-agency + scenario config + namespace
+        # Per-agency + scenario config + namespace + inspector
         expected = {"noaa.yaml", "usgs.yaml", "fema.yaml", "epa.yaml",
-                    "scenario-config.yaml", "namespace.yaml"}
+                    "scenario-config.yaml", "namespace.yaml",
+                    "inspector.yaml"}
         assert set(files.keys()) == expected
         assert "disaster-response-scenario" in files["scenario-config.yaml"]
+        # Inspector manifest must carry both Deployment and NodePort Service.
+        ins = files["inspector.yaml"]
+        assert "kind: Deployment" in ins
+        assert "kind: Service" in ins
+        assert "type: NodePort" in ins
+        assert "name: multi-agency-inspector" in ins
 
     def test_compose_scenario_export_is_json(self):
         # The compose generator writes a scenario.json the dashboard reads;

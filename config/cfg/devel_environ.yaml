@@ -38,3 +38,11 @@ dependencies:
   - libtool
   - pkg-config
   - libexpat
+  - testcontainers
+  - jsonschema
+  - ruamel.yaml
+  - playwright
+  - pyee
+  - jcs
+  - pip:
+      - mermaid-cli

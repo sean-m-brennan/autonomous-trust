@@ -1,0 +1,63 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: broadcast-fanout
+byte_pinning: false
+description: |
+    Unencrypted broadcast fan-out. A signs+serializes an identity
+    request_access Message addressed to the broadcast target; both B and C
+    ingest the same wire bytes and each re-parses with A as the known
+    sender. The scenario asserts that both receivers produce the same
+    (process, function, verified) tuple from the same input, in both
+    languages.
+
+    Distinct from the peer- and group-encrypted scenarios: this case has
+    NO encryption layer — broadcast messages are open and rely on the
+    detached Ed25519 signature alone for authenticity. Fan-out adds a
+    determinism check: parse() must be a pure function of (bytes, sender)
+    and produce identical observables for every receiver.
+
+    Production-code analogue:
+      Python: NetProcess sends `bytes(message)` to `send_any`; receivers
+              run `_msg_to_queue(raw_msg, from_addr, ..., validate=False)`
+              which calls `Message.parse(raw_msg, from_whom)`.
+      C:      handle_inbound_broadcast → net_message_from_wire(plain,
+              plain_len, NULL_or_peer_lookup).
+
+    Note: Production receivers may not always know the sender's Identity
+    at parse time (Python skips verification when sender is None; C can
+    still verify using the from_*_hex fields baked into the wire). To
+    keep the cross-language assertion semantically equal, the adapter
+    feeds A as sender in both languages; the production "unknown sender"
+    asymmetry is its own concern (deferred).
+
+participants:
+  - id: a
+    role: sender
+  - id: b
+    role: receiver
+  - id: c
+    role: receiver
+
+fixtures:
+  obj_json: "{}"
+
+steps:
+  - id: 1
+    from: a
+    to: broadcast
+    function: request_access
+    description: |
+        A signs+serializes the broadcast Message once; the adapter delivers
+        the same wire bytes to B and to C, each of which independently
+        re-parses with A as the known sender.
+
+expected_state:
+  b:
+    routed_process: identity
+    routed_function: request_access
+    verified: true
+  c:
+    routed_process: identity
+    routed_function: request_access
+    verified: true

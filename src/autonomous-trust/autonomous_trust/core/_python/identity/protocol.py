@@ -70,6 +70,12 @@ class IdentityProtocol(Protocol):
     # messages flow via reliable group/TCP, not UDP broadcast.
     caps_query = 'peer_caps_query'  # msg.obj <- '' (sender just asks)
     caps_response = 'peer_caps_response'  # msg.obj <- caps list (json)
+    # Local-only IPC (no wire egress). ReputationProcess emits these to
+    # CfgIds.identity when a peer's reputation crosses a tier boundary
+    # so IdentityProcess can bump the AgreementVoter rank on its local
+    # peer mirror; the next POA vote tally then weighs the elevated rank.
+    # See BUGS.md §P2.
+    rank_update = 'rank_update'  # msg.obj <- (peer_uuid_str, new_rank_int)
 
 
 if __name__ == '__main__':

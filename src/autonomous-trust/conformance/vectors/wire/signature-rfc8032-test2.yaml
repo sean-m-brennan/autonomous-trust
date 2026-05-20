@@ -1,0 +1,17 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: signature-rfc8032-test2
+description: |
+    RFC 8032 §7.1 test vector 2 seed.  Two independent RFC-derived pins
+    (this plus signature-rfc8032-test1) catch the regression where one
+    side stubs out the keypair derivation and always returns the test1
+    value — that stub would pass test1 but fail this case.
+byte_pinning: true
+wire_format: json
+serialize_mode: proto
+constructor: Signature
+input:
+  seed_hex: "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+expected:
+  json_wire: testdata/wire/signature-rfc8032-test2/expected.json

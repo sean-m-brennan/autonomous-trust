@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: spawn-task-fanout
+byte_pinning: false
+description: |
+    Exercises the `spawn task` (NegotiationProtocol.start) handler.
+    Locally-spawned tasks are delivered to NegotiationProcess via the
+    main → negotiation queue with function:'spawn task'. The handler
+    registers the task in `my_tasks` and fan-outs `invitation`
+    messages to every peer whose capabilities include the task's
+    capability.
+
+    Setup: alice has a peer_capabilities map pointing bob at
+    data_fetch. When alice's start_task runs, the task is added to
+    alice.my_tasks and an invitation gets emitted to bob.
+
+    Cross-language pin: alice.has_my_task evaluates to true after
+    the handler runs in BOTH languages — the symmetric observable
+    via `has_my_task: <slug>` resolves the slug to the same uuid in
+    both adapters and looks it up in the respective my_tasks store.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: spawn task
+    payload:
+      capability: data_fetch
+      task_id: t-spawn
+    description: |
+        alice spawns the task locally. start_task adds it to
+        alice.my_tasks and fan-outs invitations to peers matching
+        data_fetch (i.e. bob).
+
+expected_state:
+  alice:
+    has_my_task: t-spawn

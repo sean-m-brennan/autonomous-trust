@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-accept
+byte_pinning: false
+description: |
+    Happy path. alice (requestor) invites bob (worker) to perform a
+    `data_fetch` task. bob has the capability, his peer level is mid-tier
+    (default), and the default TaskParameters are acceptable, so
+    handle_invite emits an `ack` accepting the task.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t1
+    description: alice asks bob to do a data_fetch.
+
+  - id: 2
+    from: bob
+    to: alice
+    function: ack
+    in_response_to: 1
+    payload:
+      task_id: t1
+    description: |
+        bob's handle_invite finds data_fetch in own capabilities, peer level
+        is non-zero, parameters acceptable -> ack.

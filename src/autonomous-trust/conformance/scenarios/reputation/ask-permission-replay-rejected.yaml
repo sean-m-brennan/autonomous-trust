@@ -1,0 +1,63 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: ask-permission-replay-rejected
+byte_pinning: false
+description: |
+    Reputation replay-handling probe — confirms Python's P6 fix is
+    consistent with the C side's long-standing behavior in
+    `paxos_handle_request` (src/c/autonomous_trust/algorithms/paxos.c:117-126).
+
+    Background: AT's Paxos round-1 acceptor pins `last_id = id1` on a
+    successful grant. C did this all along; Python's `handle_request`
+    forgot to update `self.last_id` after granting, so a duplicate
+    `(id1, id2)` ask re-passed the `last_id is None or last_id < id1`
+    guard and double-granted. Documented as BUGS.md P6 and fixed
+    2026-05-11 (`autonomous_trust/.../reputation/repprocess.py`).
+
+    This scenario authors that fix at the conformance gate: alice asks
+    bob with (id1=1000, id2=1) and `repeat: 2` (delivered twice by the
+    universal scenario engine's replay grammar). The first ask grants
+    and advances bob's `last_id` to 1000; the second hits the
+    `id1 > last_id` strict-inequality guard, fails, and falls through
+    to the nack branch. Result: bob's grant counter stays at 1.
+
+    Cross-language wiring:
+      - Python `requests_count`: `len(self.process.requests)` — the
+        accepted-ballot tuple list. After first grant: 1; second ask
+        nacks (no append). Total: 1.
+      - C `request_count`: `array_size(rep_state.paxos.granted_ids)`.
+        After first grant: 1; second ask returns PAXOS_NACK. Total: 1.
+
+    First scenario in the corpus to exercise the universal scenario
+    engine's `repeat: N` field — the agreement adapter pioneered the
+    grammar; this scenario validates that the generic engine path
+    (used by reputation, negotiation, identity, network) honors it
+    correctly in both Python and C harnesses.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: ask permission
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+    repeat: 2
+    description: |
+        alice's `ask permission` is delivered to bob twice. With P6
+        fixed, only the first delivery grants and grows
+        `bob.requests` / `bob.paxos.granted_ids` by one; the second
+        is a NACK and leaves the count untouched.
+
+expected_state:
+  bob:
+    requests_count: 1
+    last_id_set: true

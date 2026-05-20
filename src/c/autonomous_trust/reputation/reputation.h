@@ -33,21 +33,35 @@
 #include "autonomous_trust/algorithms/paxos.h"
 
 /****************************
- * Protocol constants (must match Python ReputationProtocol)
+ * Protocol constants — must match the Python ReputationProtocol enum
+ * (src/autonomous-trust/.../reputation/protocol.py) verbatim so a
+ * Python node and a C node can interoperate. The conformance corpus
+ * uses these strings as the `function` field on every reputation
+ * scenario step. Changing any of these is a wire-protocol break.
+ *
+ * Declared as writable char arrays (not `#define` string literals) so
+ * `net_msg.function = REP_PROTO_X` is type-correct under
+ * `-Wwrite-strings` without the `(char *)` cast that used to obscure
+ * the const violation. Definitions live in `rep_proc.c`.
+ *
+ * Note on string literals: `REP_PROTO_REP_REQ` etc. matches Python's
+ * `ReputationProtocol.rep_req` verbatim; do NOT tidy
+ * `"request reputation"` back to "reputation request" — breaks
+ * Python↔C interop. See BUGS.md §P9.
  ****************************/
 
-#define REP_PROTO_REQUEST  "request permission"
-#define REP_PROTO_GRANT    "grant permission"
-#define REP_PROTO_NACK     "nack"
-#define REP_PROTO_BACKDATE "backdate"
-#define REP_PROTO_TX       "transaction"
-#define REP_PROTO_ACCEPTED "accepted"
-#define REP_PROTO_OUTDATED "outdated"
-#define REP_PROTO_UPDATE   "update"
-#define REP_PROTO_REP_REQ  "reputation request"
-#define REP_PROTO_REP_RESP "reputation response"
-#define REP_PROTO_LOCAL_QUERY  "local_rep_query"    /* Local IPC: query a peer's score */
-#define REP_PROTO_LOCAL_RESP   "local_rep_response"  /* Local IPC: reply with score */
+extern char REP_PROTO_REQUEST[];
+extern char REP_PROTO_GRANT[];
+extern char REP_PROTO_NACK[];
+extern char REP_PROTO_BACKDATE[];
+extern char REP_PROTO_TX[];
+extern char REP_PROTO_ACCEPTED[];
+extern char REP_PROTO_OUTDATED[];
+extern char REP_PROTO_UPDATE[];
+extern char REP_PROTO_REP_REQ[];
+extern char REP_PROTO_REP_RESP[];
+extern char REP_PROTO_LOCAL_QUERY[];
+extern char REP_PROTO_LOCAL_RESP[];
 
 /****************************
  * Transaction score (pending Paxos request)

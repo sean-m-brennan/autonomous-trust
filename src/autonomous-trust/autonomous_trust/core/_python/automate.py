@@ -158,7 +158,7 @@ class AutonomousTrust(Protocol):
         # Reputation. Populated alongside latest_reputation when a
         # rep_resp arrives. The non-pair dict above is keyed by subject
         # only and gets overwritten on every response, losing observer
-        # info; consumers that want a peer-to-peer matrix (the civilian
+        # info; consumers that want a peer-to-peer matrix (the multi-agency
         # demo's trust graph, for one) read from the pair dict.
         self.latest_reputation_pairs: dict[tuple[str, str], Any] = {}
         self.unhandled_messages: list[Message] = []

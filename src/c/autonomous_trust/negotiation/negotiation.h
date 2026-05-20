@@ -33,18 +33,21 @@
 #include "utilities/exception.h"
 
 /****************************
- * Protocol constants (must match Python NegotiationProtocol)
+ * Protocol constants (must match Python NegotiationProtocol).
+ * Writable char arrays — definitions in `neg_proc.c`. Lets call
+ * sites assign to `net_msg.function` (typed `char *`) without a
+ * `(char *)` cast under `-Wwrite-strings`.
  ****************************/
 
-#define NEG_PROTO_START    "spawn task"
-#define NEG_PROTO_ANNOUNCE "invitation"
-#define NEG_PROTO_RESPONSE "haggle"
-#define NEG_PROTO_ACCEPT   "ack"
-#define NEG_PROTO_REFUSE   "nack"
-#define NEG_PROTO_STAT_REQ "status request"
-#define NEG_PROTO_STAT_RSP "status response"
-#define NEG_PROTO_RESULT   "report results"
-#define NEG_PROTO_CANCEL   "cancel"
+extern char NEG_PROTO_START[];
+extern char NEG_PROTO_ANNOUNCE[];
+extern char NEG_PROTO_RESPONSE[];
+extern char NEG_PROTO_ACCEPT[];
+extern char NEG_PROTO_REFUSE[];
+extern char NEG_PROTO_STAT_REQ[];
+extern char NEG_PROTO_STAT_RSP[];
+extern char NEG_PROTO_RESULT[];
+extern char NEG_PROTO_CANCEL[];
 
 /****************************
  * Negotiation status

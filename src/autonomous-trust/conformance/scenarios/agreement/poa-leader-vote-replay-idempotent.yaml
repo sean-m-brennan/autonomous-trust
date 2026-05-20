@@ -1,0 +1,68 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: poa-leader-vote-replay-idempotent
+byte_pinning: false
+description: |
+    Replay-idempotency probe — first scenario to use the new `repeat: N`
+    step grammar. The leader (bob, rank 5) votes TRUE on blob-x with
+    repeat: 2. POA's _accumulate_votes collapses tallies by rank via
+    dict(votes) on the Python side and by max-rank scan on the C side;
+    both must produce outcome=true regardless of how many times the
+    leader's vote is replayed.
+
+    Why this is a meaningful replay test: the verify() / agreement_verify()
+    path itself does NOT dedup — it appends to the per-blob vote list
+    unconditionally. Idempotency emerges at the accumulate-vote step,
+    where same-rank entries collapse to one. This scenario pins that
+    emergent property: doubling the leader's vote must NOT change the
+    outcome. If a future refactor switches accumulate from dict-collapse
+    to list-iteration (e.g. multiplying approvals by entry count), this
+    scenario fails immediately.
+
+    Setup:
+      voters: alice (rank 0), bob (rank 5, leader)
+      myself: bob (so myself != blob.originator, no finalize short-circuit)
+      blob.originator: alice
+      bob votes approval=true, repeat=2.
+
+    Expected: outcome=true (leader voted yes; double-counting is
+    naturally idempotent via dict(votes) folding by rank).
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: authority
+  threshold_rank: 0
+  ranks:
+    alice: 0
+    bob: 5
+  myself: bob
+  blobs:
+    blob-x:
+      originator: alice
+      payload: "leader-vote-replay-payload"
+
+steps:
+  - id: 1
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    repeat: 2
+    description: |
+        Bob (rank 5, leader) approves blob-x. The step is delivered
+        twice; the impl's accumulate-vote layer must collapse the
+        two entries so the outcome stays the same as a single-vote
+        run.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: true

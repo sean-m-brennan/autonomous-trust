@@ -1,0 +1,40 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: request-granted
+byte_pinning: false
+description: |
+    Paxos round-1 happy path. alice (proposer) sends request to bob.
+    bob's history is empty (len = 0), so id2=1 matches len+1.
+    bob's last_id is None, so id1 > last_id trivially.
+    bob emits a `permission granted` (grant) ACK back to alice.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: ask permission
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+
+  - id: 2
+    from: bob
+    to: alice
+    function: permission granted
+    in_response_to: 1
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+
+expected_state:
+  bob:
+    requests_count: 1

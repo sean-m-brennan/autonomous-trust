@@ -228,15 +228,21 @@ DEFINE_TEST(test_verify_valid)
     /* Before verify, has should be false */
     ck_assert(!artifact_store_has(hash_hex));
 
+    /* get_path is pure string formatting after the TOCTOU fix — it
+     * must succeed regardless of whether the artifact is complete. */
+    char pre_path[512];
+    ck_assert_ret_ok(artifact_store_get_path(hash_hex, pre_path, sizeof(pre_path)));
+
     /* Verify should succeed */
     ck_assert_ret_ok(artifact_store_verify(hash_hex, expected_hash));
 
     /* After verify, has should be true */
     ck_assert(artifact_store_has(hash_hex));
 
-    /* get_path should succeed */
+    /* get_path still succeeds, and produces the same path bytes as before. */
     char path_buf[512];
     ck_assert_ret_ok(artifact_store_get_path(hash_hex, path_buf, sizeof(path_buf)));
+    ck_assert_str_eq(pre_path, path_buf);
 
     teardown_test_dir();
 }

@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-"""Civilian disaster-response scenario.
+"""Multi-agency disaster-response scenario.
 
 Implements the HighTrust whitepaper's multi-agency (NOAA / USGS / FEMA /
 EPA) federal data-sharing demo. 10 peers run across Minikube; one NOAA
@@ -84,7 +84,7 @@ _PNW_CENTER_LON = -122.50
 
 
 class DisasterResponseScenario(Scenario):
-    """HighTrust civilian demo: multi-agency disaster response.
+    """HighTrust multi-agency demo: disaster response.
 
     Ten peers across four federal agencies discover each other, exchange
     environmental data through the AT negotiation protocol, and autonomously

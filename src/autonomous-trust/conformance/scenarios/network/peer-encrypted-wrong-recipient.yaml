@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: peer-encrypted-wrong-recipient
+byte_pinning: false
+description: |
+    Crypto-rejection probe — wrong recipient identity. A encrypts a
+    signed envelope for B's public key. C — a third deterministic
+    identity who is NOT the intended recipient — tries to decrypt
+    with C's own private key and A's public key. The Box shared
+    secret `Box(C_priv, A_pub)` differs from `Box(A_priv, B_pub)`, so
+    libsodium MAC-rejects.
+
+    Threat model: an eavesdropper captures the peer-encrypted wire
+    envelope. They hold A's public key (it's broadcast routinely)
+    and their own keypair, but not B's secret. Curve25519's
+    asymmetric design ensures only B can recover the shared secret;
+    C cannot, even given full visibility into both A's public key
+    and the ciphertext.
+
+    Both adapters: Python catches CryptoError; C's identity_decrypt
+    returns non-zero. The
+    `expected_state.c.decrypt_failed: true` assertion enforces both
+    sides agree.
+
+participants:
+  - id: a
+    role: sender
+  - id: b
+    role: receiver
+  - id: c
+    role: eavesdropper
+
+fixtures:
+  nonce_hex: "0x202122232425262728292a2b2c2d2e2f3031323334353637"
+  obj_json: "{}"
+
+steps:
+  - id: 1
+    from: a
+    to: b
+    function: request_access
+    description: |
+        A signs+serializes, encrypts to B with the fixture nonce. C
+        attempts to decrypt with C's own keypair against A's public
+        key. The Box shared secret differs; decryption rejects.
+
+expected_state:
+  c:
+    decrypt_failed: true

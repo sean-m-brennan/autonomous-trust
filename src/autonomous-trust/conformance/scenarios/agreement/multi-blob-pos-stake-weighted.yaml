@@ -1,0 +1,91 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: multi-blob-pos-stake-weighted
+byte_pinning: false
+description: |
+    Second agreement state-machine scenario: POS variant. Three voters
+    with declared stakes accumulate votes against two concurrent blobs.
+    POS semantics: yea/nay tally is stake-weighted; finalize returns true
+    iff aggregate yea-stake > aggregate nay-stake.
+
+    Mirrors the design of `multi-blob-poa-leader-decides` but exercises
+    `impl: stake`. Confirms that the stake-callback path (`_get_stake`
+    on the Python side, `_harness_get_stake` on the C side) reads the
+    correct per-voter stake during finalize, and that votes for blob-p
+    don't bleed into blob-q's tally.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+  - id: charlie
+    role: voter
+
+fixtures:
+  impl: stake
+  # POS sums yea-stake and nay-stake per blob; finalize returns true
+  # iff yea > nay. Stakes are uniform across blobs (per-voter, not
+  # per-blob).
+  stakes:
+    alice: 10
+    bob: 3
+    charlie: 5
+  myself: alice
+  blobs:
+    blob-p:
+      originator: bob
+      payload: "p-payload"
+    blob-q:
+      originator: charlie
+      payload: "q-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-p
+      approval: true
+    description: alice (stake 10) approves blob-p → yea+=10.
+  - id: 2
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-p
+      approval: false
+    description: bob (stake 3) rejects blob-p → nay+=3. Net for blob-p, 10>3 → true.
+  - id: 3
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-q
+      approval: true
+    description: bob (stake 3) approves blob-q → yea+=3.
+  - id: 4
+    from: charlie
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-q
+      approval: true
+    description: charlie (stake 5) approves blob-q → yea+=5.
+  - id: 5
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-q
+      approval: false
+    description: alice (stake 10) rejects blob-q → nay+=10. Net for blob-q, 8<10 → false.
+
+expected_state:
+  agreement:
+    blob-p:
+      outcome: true
+    blob-q:
+      outcome: false

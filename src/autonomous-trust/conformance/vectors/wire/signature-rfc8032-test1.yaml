@@ -1,0 +1,18 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: signature-rfc8032-test1
+description: |
+    Signature from RFC 8032 §7.1 test vector 1 seed.  Pairs with the
+    crypto_vector `ed25519-rfc8032-test1` (which exercises raw libsodium
+    against the same vector) — together they cross-check that the
+    Signature serializer agrees with both the upstream RFC and the
+    underlying crypto primitive.
+byte_pinning: true
+wire_format: json
+serialize_mode: proto
+constructor: Signature
+input:
+  seed_hex: "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+expected:
+  json_wire: testdata/wire/signature-rfc8032-test1/expected.json

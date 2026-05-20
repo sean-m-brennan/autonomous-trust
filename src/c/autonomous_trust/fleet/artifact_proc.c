@@ -33,6 +33,15 @@
 #define EARTIFACT 270
 DEFINE_ERROR(EARTIFACT, "Artifact transfer error");
 
+/* Protocol-string definitions (declared `extern char[]` in
+ * artifact_proc.h). */
+char ARTIFACT_PROTO_REQUEST[]   = "artifact request";
+char ARTIFACT_PROTO_MANIFEST[]  = "artifact manifest";
+char ARTIFACT_PROTO_CHUNK_REQ[] = "artifact chunk request";
+char ARTIFACT_PROTO_CHUNK[]     = "artifact chunk";
+char ARTIFACT_PROTO_COMPLETE[]  = "artifact complete";
+char ARTIFACT_PROTO_READY[]     = "artifact ready";
+
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -523,9 +532,18 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         json_object_set_new(comp, "verified", json_boolean(verify_ok));
         send_to_peer(proc, ARTIFACT_PROTO_COMPLETE, comp, &nmsg->from_whom);
 
-        /* Send ARTIFACT_PROTO_READY to fleet process internally */
+        /* Send ARTIFACT_PROTO_READY to fleet process internally. The
+         * path is pure string formatting — the eventual recipient must
+         * still open() and handle ENOENT (TOCTOU window = message
+         * latency). */
         char path_buf[256];
-        artifact_store_get_path(hash_hex, path_buf, sizeof(path_buf));
+        if (artifact_store_get_path(hash_hex, path_buf, sizeof(path_buf)) != 0)
+        {
+            log_error(proc->logger,
+                      "Artifact: get_path failed for %s, skipping ready notice\n",
+                      hash_hex);
+            return false;
+        }
 
         json_t *ready = json_object();
         if (!ready)
@@ -541,7 +559,7 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         ready_msg.type = NET_MESSAGE;
         net_msg_t *rnmsg = &ready_msg.info.net_msg;
         snprintf(rnmsg->process, sizeof(rnmsg->process), "%s", notify_target);
-        rnmsg->function = (char *)ARTIFACT_PROTO_READY;
+        rnmsg->function = ARTIFACT_PROTO_READY;
         snprintf(rnmsg->return_to, sizeof(rnmsg->return_to), "%s", "artifact");
 
         if (net_msg_pack_json(rnmsg, ready) == 0)
@@ -650,11 +668,11 @@ int artifact_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
     }
 
     /* Register protocol handlers */
-    process_register_handler(proc, (char *)ARTIFACT_PROTO_REQUEST,   (handler_ptr_t)handle_artifact_request);
-    process_register_handler(proc, (char *)ARTIFACT_PROTO_MANIFEST,  (handler_ptr_t)handle_artifact_manifest);
-    process_register_handler(proc, (char *)ARTIFACT_PROTO_CHUNK_REQ, (handler_ptr_t)handle_chunk_request);
-    process_register_handler(proc, (char *)ARTIFACT_PROTO_CHUNK,     (handler_ptr_t)handle_chunk_response);
-    process_register_handler(proc, (char *)ARTIFACT_PROTO_COMPLETE,  (handler_ptr_t)handle_artifact_complete);
+    process_register_handler(proc, ARTIFACT_PROTO_REQUEST,   (handler_ptr_t)handle_artifact_request);
+    process_register_handler(proc, ARTIFACT_PROTO_MANIFEST,  (handler_ptr_t)handle_artifact_manifest);
+    process_register_handler(proc, ARTIFACT_PROTO_CHUNK_REQ, (handler_ptr_t)handle_chunk_request);
+    process_register_handler(proc, ARTIFACT_PROTO_CHUNK,     (handler_ptr_t)handle_chunk_response);
+    process_register_handler(proc, ARTIFACT_PROTO_COMPLETE,  (handler_ptr_t)handle_artifact_complete);
 
     proc->protocol.phase = 1;
     return process_run(proc, queues, signal, logger);

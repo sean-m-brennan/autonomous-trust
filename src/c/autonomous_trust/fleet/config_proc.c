@@ -38,6 +38,15 @@
 #define ECONFIG 290
 DEFINE_ERROR(ECONFIG, "Config distribution error");
 
+/* Protocol-string definitions (declared `extern char[]` in
+ * config_proc.h). Writable arrays for direct `char *` assignment. */
+char CONFIG_PROTO_PROPOSE[]    = "config proposal";
+char CONFIG_PROTO_VOTE_REQ[]   = "config vote request";
+char CONFIG_PROTO_VOTE_GRANT[] = "config vote grant";
+char CONFIG_PROTO_VOTE_NACK[]  = "config vote nack";
+char CONFIG_PROTO_ACCEPTED[]   = "config accepted";
+char CONFIG_PROTO_READY[]      = "config ready";
+
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -171,6 +180,10 @@ static bool handle_config_propose(const process_t *proc, directory_t *queues, ge
     paxos_next_ids(&config_state.vote_paxos, &id1, &id2);
 
     json_t *req_json = json_object();
+    if (req_json == NULL) {
+        log_error(proc->logger, "Config: json_object OOM (vote_req)\n");
+        return true;
+    }
     json_object_set_new(req_json, "id1", json_integer(id1));
     json_object_set_new(req_json, "id2", json_integer(id2));
     json_object_set_new(req_json, "proposal_uuid", json_string(prop_uuid_str));
@@ -236,6 +249,10 @@ static bool handle_config_vote_request(const process_t *proc, directory_t *queue
     {
         /* Build grant payload */
         json_t *grant_json = json_object();
+        if (grant_json == NULL) {
+            log_error(proc->logger, "Config: json_object OOM (vote_grant)\n");
+            return true;
+        }
         json_object_set_new(grant_json, "id1", json_integer(id1));
         json_object_set_new(grant_json, "id2", json_integer(id2));
         json_object_set_new(grant_json, "proposal_uuid", json_string(prop_uuid_str));
@@ -251,6 +268,10 @@ static bool handle_config_vote_request(const process_t *proc, directory_t *queue
     {
         /* NACK */
         json_t *nack_json = json_object();
+        if (nack_json == NULL) {
+            log_error(proc->logger, "Config: json_object OOM (vote_nack)\n");
+            return true;
+        }
         json_object_set_new(nack_json, "id1", json_integer(id1));
         json_object_set_new(nack_json, "id2", json_integer(id2));
         json_object_set_new(nack_json, "proposal_uuid", json_string(prop_uuid_str));
@@ -313,6 +334,10 @@ static bool handle_config_vote_grant(const process_t *proc, directory_t *queues,
     {
         /* Broadcast CONFIG_PROTO_ACCEPTED to all peers */
         json_t *acc_json = json_object();
+        if (acc_json == NULL) {
+            log_error(proc->logger, "Config: json_object OOM (accepted)\n");
+            return true;
+        }
         json_object_set_new(acc_json, "id1", json_integer(id1));
         json_object_set_new(acc_json, "id2", json_integer(id2));
         json_object_set_new(acc_json, "proposal_uuid", json_string(prop_uuid_str));
@@ -449,6 +474,10 @@ static bool handle_config_accepted(const process_t *proc, directory_t *queues, g
 
             /* Send artifact request to the peer who sent us the acceptance */
             json_t *fetch_req = json_object();
+            if (fetch_req == NULL) {
+                log_error(proc->logger, "Config: json_object OOM (fetch_req)\n");
+                return true;
+            }
             json_object_set_new(fetch_req, "hash", json_string(artifact_hash_hex));
             json_object_set_new(fetch_req, "notify_process", json_string("config"));
 
@@ -456,7 +485,7 @@ static bool handle_config_accepted(const process_t *proc, directory_t *queues, g
             artifact_msg.type = NET_MESSAGE;
             net_msg_t *anmsg = &artifact_msg.info.net_msg;
             strncpy(anmsg->process, "artifact", PROC_NAME_LEN);
-            anmsg->function = (char *)ARTIFACT_PROTO_REQUEST;
+            anmsg->function = ARTIFACT_PROTO_REQUEST;
             memcpy(&anmsg->to_whom, &nmsg->from_whom, sizeof(public_identity_t));
             anmsg->encrypt = true;
             strncpy(anmsg->return_to, "artifact", PROC_NAME_LEN);
@@ -631,6 +660,11 @@ static bool handle_config_artifact_ready(const process_t *proc, directory_t *que
 
     /* Send CONFIG_READY to update_proc */
     json_t *ready_json = json_object();
+    if (ready_json == NULL) {
+        log_error(proc->logger, "Config: json_object OOM (config_ready)\n");
+        json_decref(payload);
+        return true;
+    }
     json_object_set_new(ready_json, "config_name", json_string(config_name));
     json_object_set_new(ready_json, "hash", json_string(hash_hex));
     json_object_set_new(ready_json, "version", json_string(version));
@@ -639,7 +673,7 @@ static bool handle_config_artifact_ready(const process_t *proc, directory_t *que
     ready_msg.type = NET_MESSAGE;
     net_msg_t *rnmsg = &ready_msg.info.net_msg;
     strncpy(rnmsg->process, "update", PROC_NAME_LEN);
-    rnmsg->function = (char *)CONFIG_PROTO_READY;
+    rnmsg->function = CONFIG_PROTO_READY;
     rnmsg->encrypt = false;
     strncpy(rnmsg->return_to, "config", PROC_NAME_LEN);
     net_msg_pack_json(rnmsg, ready_json);
@@ -681,12 +715,12 @@ int config_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
     }
 
     /* Register protocol handlers */
-    process_register_handler(proc, (char *)CONFIG_PROTO_PROPOSE,    (handler_ptr_t)handle_config_propose);
-    process_register_handler(proc, (char *)CONFIG_PROTO_VOTE_REQ,   (handler_ptr_t)handle_config_vote_request);
-    process_register_handler(proc, (char *)CONFIG_PROTO_VOTE_GRANT, (handler_ptr_t)handle_config_vote_grant);
-    process_register_handler(proc, (char *)CONFIG_PROTO_VOTE_NACK,  (handler_ptr_t)handle_config_vote_nack);
-    process_register_handler(proc, (char *)CONFIG_PROTO_ACCEPTED,   (handler_ptr_t)handle_config_accepted);
-    process_register_handler(proc, (char *)ARTIFACT_PROTO_READY,    (handler_ptr_t)handle_config_artifact_ready);
+    process_register_handler(proc, CONFIG_PROTO_PROPOSE,    (handler_ptr_t)handle_config_propose);
+    process_register_handler(proc, CONFIG_PROTO_VOTE_REQ,   (handler_ptr_t)handle_config_vote_request);
+    process_register_handler(proc, CONFIG_PROTO_VOTE_GRANT, (handler_ptr_t)handle_config_vote_grant);
+    process_register_handler(proc, CONFIG_PROTO_VOTE_NACK,  (handler_ptr_t)handle_config_vote_nack);
+    process_register_handler(proc, CONFIG_PROTO_ACCEPTED,   (handler_ptr_t)handle_config_accepted);
+    process_register_handler(proc, ARTIFACT_PROTO_READY,    (handler_ptr_t)handle_config_artifact_ready);
 
     proc->protocol.phase = 1;
 

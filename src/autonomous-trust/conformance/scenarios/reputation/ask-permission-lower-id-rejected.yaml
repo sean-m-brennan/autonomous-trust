@@ -1,0 +1,83 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: ask-permission-lower-id-rejected
+byte_pinning: false
+description: |
+    Direct probe of P6 — Paxos acceptor must advance `last_id` on
+    grant — by exercising the `id1 < last_id` branch of the strict
+    inequality guard. Complements `ask-permission-replay-rejected`
+    (which exercises `id1 == last_id` via `repeat: 2`).
+
+    Background: Python's `ReputationProcess.handle_request` once
+    forgot to update `self.last_id` after granting; with the bug,
+    `last_id` stayed `None` and ANY subsequent ask passed the
+    `last_id is None or last_id < id1` guard. Fix landed 2026-05-11
+    (BUGS.md §P6); regression in
+    `tests/a_unit/test_repprocess.py::TestHandleRequest`. C's
+    `paxos_handle_request` advanced `inst->last_id = id1` all along
+    (`src/c/autonomous_trust/algorithms/paxos.c:123`).
+
+    Scenario shape: alice asks bob with (id1=1000, id2=1) — grants
+    and advances bob's acceptor `last_id` to 1000 — then asks again
+    with (id1=999, id2=1). Under the fixed code, `999 > 1000` is
+    False and bob NACKs. Under the bug, `last_id` would still be
+    None/0 and bob would grant again, growing `requests` /
+    `granted_ids` to 2.
+
+    Discrimination vs. `ask-permission-replay-rejected`:
+      - replay-rejected uses `repeat: 2` (same id1) — exercises the
+        `id1 == last_id` False branch of `last_id < id1`.
+      - this scenario uses distinct ids 1000 → 999 — exercises the
+        `id1 < last_id` False branch.
+      Together they pin both halves of the strict inequality. Both
+      also assert `last_id_set: true` to directly check the field
+      P6 forgot to update.
+
+    Cross-language wiring:
+      - Python `requests_count`: `len(self.process.requests)` —
+        after first grant: 1; second ask nacks (no append). Total: 1.
+      - C `request_count`: `array_size(rep_state.paxos.granted_ids)`
+        — after first grant: 1; second ask returns PAXOS_NACK
+        without appending. Total: 1.
+      - `last_id_set`: Python `self.process.last_id is not None`;
+        C `reputation_get_last_id() > 0`. Both true after the
+        first grant advances the acceptor state.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: ask permission
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+    description: |
+        First ballot (id1=1000). bob grants and advances his
+        acceptor state to last_id=1000; granted_ids/requests grow
+        by one.
+  - id: 2
+    from: alice
+    to: bob
+    function: ask permission
+    payload:
+      id1: 999
+      id2: 1
+      proposer: alice
+    description: |
+        Lower-id ballot (id1=999) after the grant. With P6 fixed,
+        `999 > 1000` is False and bob NACKs without appending. With
+        the original bug, last_id would still be None/0 and bob
+        would grant again — discriminated by requests_count.
+
+expected_state:
+  bob:
+    requests_count: 1
+    last_id_set: true

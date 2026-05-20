@@ -36,6 +36,7 @@
 
 #include "net_transport_priv.h"
 #include "utilities/exception.h"
+#include "utilities/socket_helpers.h"
 #include "network/network.h"
 
 /* Whether to use mcast for the bcast channel vs. IPv4 broadcast. Matches
@@ -51,9 +52,7 @@ static int udp_send(int sock, const uint8_t *msg, size_t msg_len,
 {
     /* Bounded send timeout so a stalled NIC / full kernel buffer cannot
      * wedge the sender. */
-    struct timeval sndto = { .tv_sec = 1, .tv_usec = 0 };
-    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &sndto, sizeof(sndto)) != 0)
-        log_warn(logger, "UDP: failed to set SO_SNDTIMEO: %s\n", strerror(errno));
+    (void)at_set_sndtimeo(sock, 1000, logger);
 
     size_t send_len = msg_len;
     if (send_len > (size_t)UDP_PACKET_SIZE) {
@@ -69,16 +68,16 @@ static int udp_send(int sock, const uint8_t *msg, size_t msg_len,
         addr.sin6_port = htons(port);
         if (inet_pton(AF_INET6, host, &addr.sin6_addr) <= 0)
             return EXCEPTION(EINVAL);
-        sent = sendto(sock, msg, send_len, 0,
-                      (struct sockaddr *)&addr, sizeof(addr));
+        sent = at_sendto_eintr(sock, msg, send_len, 0,
+                               (struct sockaddr *)&addr, sizeof(addr));
     } else {
         struct sockaddr_in addr = {0};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
         if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0)
             return EXCEPTION(EINVAL);
-        sent = sendto(sock, msg, send_len, 0,
-                      (struct sockaddr *)&addr, sizeof(addr));
+        sent = at_sendto_eintr(sock, msg, send_len, 0,
+                               (struct sockaddr *)&addr, sizeof(addr));
     }
     if (sent <= 0)
         return EXCEPTION(ENET_SEND);
@@ -254,12 +253,7 @@ static int udp_recv(net_transport_ctx_t *ctx, net_channel_t channel,
     if (sock < 0)
         return -1;
 
-    struct timeval tv = {
-        .tv_sec  = timeout_ms / 1000,
-        .tv_usec = (timeout_ms % 1000) * 1000,
-    };
-    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
-        log_warn(ctx->logger, "UDP: SO_RCVTIMEO failed: %s\n", strerror(errno));
+    (void)at_set_rcvtimeo(sock, timeout_ms, ctx->logger);
 
     uint8_t *buf = malloc(UDP_PACKET_SIZE);
     if (buf == NULL)
@@ -269,15 +263,15 @@ static int udp_recv(net_transport_ctx_t *ctx, net_channel_t channel,
     if (ctx->ipv6) {
         struct sockaddr_in6 sender = {0};
         socklen_t slen = sizeof(sender);
-        nbytes = recvfrom(sock, buf, UDP_PACKET_SIZE, 0,
-                          (struct sockaddr *)&sender, &slen);
+        nbytes = at_recvfrom_eintr(sock, buf, UDP_PACKET_SIZE, 0,
+                                   (struct sockaddr *)&sender, &slen);
         if (nbytes > 0 && peer_addr_out != NULL)
             inet_ntop(AF_INET6, &sender.sin6_addr, peer_addr_out, peer_addr_len);
     } else {
         struct sockaddr_in sender = {0};
         socklen_t slen = sizeof(sender);
-        nbytes = recvfrom(sock, buf, UDP_PACKET_SIZE, 0,
-                          (struct sockaddr *)&sender, &slen);
+        nbytes = at_recvfrom_eintr(sock, buf, UDP_PACKET_SIZE, 0,
+                                   (struct sockaddr *)&sender, &slen);
         if (nbytes > 0 && peer_addr_out != NULL)
             inet_ntop(AF_INET, &sender.sin_addr, peer_addr_out, peer_addr_len);
     }

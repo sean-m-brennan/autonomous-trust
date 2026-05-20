@@ -1,0 +1,23 @@
+schema_version: "1"
+kind: agreement_vector
+protocol: agreement
+name: agreement-poa-leader-approves
+description: |
+    POA: leader (highest rank among voters) approves; finalize returns True.
+    Lower-ranked voters' approval is irrelevant under POA — the leader's
+    vote is the decisive one.
+impl: authority
+voters:
+  - id: alice
+    rank: 0
+  - id: bob
+    rank: 5
+myself: alice
+blob:
+  originator: bob
+  uuid: candidate-1
+votes:
+  - by: bob
+    approval: true
+expected:
+  outcome: true

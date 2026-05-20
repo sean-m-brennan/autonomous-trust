@@ -1,0 +1,11 @@
+schema_version: "1"
+kind: crypto_vector
+protocol: network
+name: ed25519-rfc8032-test2
+description: RFC 8032 §7.1 test vector 2 - 1-byte message.
+primitive: ed25519_sign
+input:
+  key_seed: "0x4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+  message:  "0x72"
+expected:
+  signature: "0x92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"

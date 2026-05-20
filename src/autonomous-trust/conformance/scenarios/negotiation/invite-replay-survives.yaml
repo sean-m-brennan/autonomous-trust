@@ -1,0 +1,67 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-replay-survives
+byte_pinning: false
+description: |
+    Negotiation replay-handling probe — alice's `invitation` is
+    delivered to bob twice via the universal scenario engine's
+    `repeat: N` grammar. Goal: confirm bob's handle_invite path
+    survives a duplicate delivery without crashing, and that the
+    end-state still shows the task admitted (task_in_stack: true).
+
+    Both implementations track per-task flood counts —
+    Python: `proposed_tasks[task.uuid].count` in
+    `autonomous_trust/.../negotiation/negprocess.py:122-125`;
+    C: `flood:<uuid>` key in `proposed_tasks` map at
+    `src/c/autonomous_trust/negotiation/neg_proc.c:529-540`.
+    Both gate flood-refusal at count > 5, so `repeat: 2` stays
+    well below threshold; both impls accept the invitation each
+    time and the task ends up in bob's task_stack.
+
+    Limitations of this scenario as a strict idempotency probe:
+      - The Python adapter's _check_expected_state for
+        `task_in_stack` is boolean ("stack non-empty"); it does
+        NOT count entries, so a hypothetical double-push of the
+        same task isn't caught here.
+      - The C scenario_engine has no expected_state hook for
+        negotiation (its check is a no-op stub), so the C side
+        validates only that the second delivery didn't abort.
+    Both gaps are acceptable for an initial breadth-of-replay
+    probe; tightening either requires adapter work.
+
+    What this scenario IS valid for: it confirms the universal
+    `repeat: N` engine path dispatches negotiation envelopes
+    cleanly in both languages, alongside reputation
+    (ask-permission-replay-rejected) and identity
+    (request-access-replay-idempotent).
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-replay
+    repeat: 2
+    description: |
+        alice invites bob to perform data_fetch — the same
+        invitation envelope is delivered to bob twice. bob's
+        handle_invite increments the per-task flood counter on
+        each delivery; both stay under the threshold of 5, so
+        no demote and no refusal. The task ends up admitted.
+
+expected_state:
+  bob:
+    task_in_stack: true

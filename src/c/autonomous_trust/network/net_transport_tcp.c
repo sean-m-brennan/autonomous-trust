@@ -40,6 +40,7 @@
 
 #include "net_transport_priv.h"
 #include "utilities/exception.h"
+#include "utilities/socket_helpers.h"
 #include "network/net_message.h"
 
 /* ---------- Low-level send/recv helpers ---------- */
@@ -49,12 +50,11 @@ static int send_all(int sock, const void *buf, size_t len)
     const uint8_t *p = (const uint8_t *)buf;
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = send(sock, p + sent, len - sent, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
+        ssize_t n = at_send_eintr(sock, p + sent, len - sent, 0);
+        if (n < 0)
             return -1;
-        }
-        if (n == 0) return -1; /* peer closed */
+        if (n == 0)
+            return -1; /* peer closed */
         sent += (size_t)n;
     }
     return 0;
@@ -110,13 +110,8 @@ static int tcp_send_to(const uint8_t *msg, size_t msg_len,
         size_t chunk = msg_len - total_sent;
         if (chunk > (size_t)TCP_CHUNK_SIZE)
             chunk = TCP_CHUNK_SIZE;
-        ssize_t sent = send(sock, msg + total_sent, chunk, 0);
-        if (sent < 0) {
-            if (errno == EINTR) continue;
-            close(sock);
-            return EXCEPTION(ENET_SEND);
-        }
-        if (sent == 0) {
+        ssize_t sent = at_send_eintr(sock, msg + total_sent, chunk, 0);
+        if (sent <= 0) {
             close(sock);
             return EXCEPTION(ENET_SEND);
         }
@@ -160,7 +155,7 @@ static int tcp_accept_and_read(int listen_sock, uint8_t **buf_out, size_t *buf_l
     int si = 0;
     while (si < 31) {
         char c;
-        ssize_t n = recv(client, &c, 1, 0);
+        ssize_t n = at_recv_eintr(client, &c, 1, 0);
         if (n <= 0) {
             close(client);
             return EXCEPTION(ENET_RECV);
@@ -186,7 +181,7 @@ static int tcp_accept_and_read(int listen_sock, uint8_t **buf_out, size_t *buf_l
         size_t chunk = data_size - total;
         if (chunk > (size_t)TCP_CHUNK_SIZE)
             chunk = TCP_CHUNK_SIZE;
-        ssize_t n = recv(client, data + total, chunk, 0);
+        ssize_t n = at_recv_eintr(client, data + total, chunk, 0);
         if (n <= 0) {
             free(data);
             close(client);
@@ -304,12 +299,7 @@ static int tcp_recv(net_transport_ctx_t *ctx, net_channel_t channel,
     if (sock < 0)
         return ENOMSG;  /* no socket for this channel on TCP — treat as empty */
 
-    struct timeval tv = {
-        .tv_sec  = timeout_ms / 1000,
-        .tv_usec = (timeout_ms % 1000) * 1000,
-    };
-    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
-        log_warn(ctx->logger, "TCP: SO_RCVTIMEO failed: %s\n", strerror(errno));
+    (void)at_set_rcvtimeo(sock, timeout_ms, ctx->logger);
 
     return tcp_accept_and_read(sock, out_buf, out_len,
                                peer_addr_out, peer_addr_len, ctx->ipv6);

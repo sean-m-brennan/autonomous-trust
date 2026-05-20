@@ -1,0 +1,22 @@
+schema_version: "1"
+kind: negative
+protocol: reputation
+name: ask-permission-tampered-payload
+description: |
+    Flip one byte of the base64 `data` field on alice's reputation
+    `ask permission` request. Envelope still decodes (base64
+    alphabet preserved) but the decoded payload differs from what
+    alice signed, so signature verification must fail. Companion to
+    ask-permission-bad-sig; corrupts the payload while leaving the
+    signature intact, landing at the same reason_class.
+
+based_on: scenarios/reputation/request-granted.yaml
+
+mutation:
+  step_id: 1
+  op: flip_byte
+  target: payload
+  index: 0
+
+expected:
+  reason_class: signature_verification_failed

@@ -1,0 +1,99 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pos-vote-replay-tight-margin-flips
+byte_pinning: false
+description: |
+    POS replay-handling probe (tight margin). Companion to
+    `pos-vote-replay-outcome-invariant`. That case picked a wide
+    stake margin where neither impl's outcome could change under
+    vote-replay; this case picks a TIGHT margin where the outcome
+    DOES flip — and BOTH implementations flip it the same way,
+    because neither dedups votes by voter when accumulating stake.
+
+    Setup:
+      voters: alice (stake 10), bob (stake 6)
+      myself: bob (so myself != blob.originator, no short-circuit)
+      blob.originator: alice
+      Votes: alice YES, bob NO with repeat: 2
+
+    Counting walk-through:
+      Python `AgreementByStake._count_vote`
+      (`autonomous_trust/.../algorithms/stake.py:35-40`) adds
+      voter's stake to `yea` or `nay` per call. `_accumulate_votes`
+      returns `self.yea > self.nay`.
+      C `_stake_count_vote` (`src/c/autonomous_trust/algorithms/
+      agreement.c:208-222`) and `_stake_accumulate` are byte-equal
+      in semantics.
+
+      Single delivery (hypothetical):
+        approvals iterated: [(alice, yes, +10), (bob, no, +6)]
+        → yea=10, nay=6 → 10 > 6 → outcome: TRUE
+
+      Replay (repeat: 2 on bob's nay):
+        approvals iterated: [(alice, yes, +10), (bob, no, +6),
+                             (bob, no, +6)]
+        → yea=10, nay=12 → 10 > 12 → outcome: FALSE
+
+    What this scenario documents at the conformance gate:
+      - POS is NOT replay-resistant: a single replayed nay-vote at a
+        tight stake margin flips the outcome.
+      - Both impls flip it the SAME way (no asymmetry).
+      - If a future hardening adds dedup-by-voter on the count
+        path, this scenario's expected outcome flips back to TRUE
+        (and the YAML's expected_state needs to follow). The
+        scenario then becomes a regression pin in the opposite
+        direction — "dedup is in place; replay no longer flips."
+
+    Pairs with `pos-vote-replay-outcome-invariant`:
+      - The wide-margin case proves outcome doesn't change when
+        the margin is wide enough.
+      - This case proves outcome DOES change when the margin is
+        tight enough.
+      Together they pin the full set of replay behaviors POS
+      exhibits today.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: stake
+  stakes:
+    alice: 10
+    bob: 6
+  myself: bob
+  blobs:
+    blob-x:
+      originator: alice
+      payload: "tight-margin-replay-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: alice (stake 10) approves blob-x.
+
+  - id: 2
+    from: bob
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: false
+    repeat: 2
+    description: |
+        bob (stake 6) rejects blob-x — delivered TWICE. Neither impl
+        dedups; nay accumulates 6+6=12. Yea=10 < 12 → outcome flips
+        from the single-delivery TRUE to FALSE.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: false

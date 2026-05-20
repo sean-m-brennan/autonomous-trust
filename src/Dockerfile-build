@@ -51,7 +51,7 @@ RUN apt update -y && apt install -y curl build-essential && apt clean
 
 RUN conda update -y -n base conda
 RUN conda config --add channels conda-forge
-RUN conda install -y -n base python=3.10 conda-build conda-verify pip python-build maturin mercurial
+RUN conda install -y -n base python=3.13 conda-build conda-verify pip python-build maturin mercurial
 
 WORKDIR /build/src
 ENV TEMPDIR=/build

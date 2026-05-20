@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://autonomous-trust/conformance/schema/scenario.schema.json",
+  "title": "AT Conformance Scenario (kind: scenario)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "protocol", "name", "participants", "steps"],
+  "properties": {
+    "schema_version": {"type": "string", "enum": ["1"]},
+    "kind": {"const": "scenario"},
+    "protocol": {"type": "string", "enum": ["identity", "reputation", "negotiation", "network", "agreement"]},
+    "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "description": {"type": "string"},
+    "byte_pinning": {
+      "type": "boolean",
+      "default": false,
+      "description": "When false, wire_bytes/signature pins are advisory and only structural/semantic equivalence is checked."
+    },
+    "participants": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "role"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$"},
+          "role": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "fixtures": {
+      "type": "object",
+      "description": "Free-form fixture bag. Conventional sub-keys: keys, group, groups, nonces, payloads.",
+      "additionalProperties": true
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "from", "to", "function"],
+        "properties": {
+          "id": {"type": "integer", "minimum": 1},
+          "from": {"type": "string"},
+          "to": {"type": "string", "description": "participant id or the literal 'broadcast'"},
+          "function": {"type": "string", "minLength": 1},
+          "in_response_to": {"type": "integer", "minimum": 1},
+          "payload": {"type": "object"},
+          "wire_bytes": {"type": "string"},
+          "signature": {"type": "string"},
+          "no_propagate": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true on an assertion step (in_response_to set), the engine verifies the captured outbound exists in the parent step's outbox but does NOT deliver it to the recipient. Useful when the recipient's handler depends on state outside the scenario's control or hits a known production bug."
+          },
+          "repeat": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1,
+            "description": "Deliver this source step's message N times. Used to test replay/idempotency: a handler that correctly dedups (by message id, ballot tuple, or natural dict-collapse) produces the same observable state after N deliveries as after 1. Only meaningful on source steps; ignored on steps with in_response_to."
+          },
+          "description": {"type": "string"}
+        }
+      }
+    },
+    "expected_state": {
+      "type": "object",
+      "description": "Per-participant or per-group observable state to assert at scenario end. Free-form; adapters interpret.",
+      "additionalProperties": true
+    }
+  }
+}

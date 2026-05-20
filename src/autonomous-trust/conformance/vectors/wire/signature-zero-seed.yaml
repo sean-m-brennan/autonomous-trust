@@ -1,0 +1,19 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: signature-zero-seed
+description: |
+    Signature derived from the all-zero 32-byte seed.  Both implementations
+    must derive the same Ed25519 public key (libsodium / PyNaCl over the
+    same seed) and emit it through the protobuf-JSON envelope as a single
+    base64-encoded ASCII-hex string under field name "hexSeed".  This pins
+    the wire shape, the key derivation, AND the seed -> hex -> base64
+    encoding chain end-to-end.
+byte_pinning: true
+wire_format: json
+serialize_mode: proto
+constructor: Signature
+input:
+  seed_hex: "0000000000000000000000000000000000000000000000000000000000000000"
+expected:
+  json_wire: testdata/wire/signature-zero-seed/expected.json

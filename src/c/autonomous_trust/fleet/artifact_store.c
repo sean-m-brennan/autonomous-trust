@@ -295,8 +295,11 @@ int artifact_store_verify(const char *hash_hex, const uint8_t *expected_hash)
 /* Frama-C: skipped — [solver-timeout] chained path_join preconditions */
 int artifact_store_get_path(const char *hash_hex, char *path_buf, size_t buflen)
 {
-    if (!artifact_store_has(hash_hex))
-        return -1;
+    /* Pure string formatting — does NOT stat the filesystem. The prior
+     * `if (!artifact_store_has(...)) return -1` was a TOCTOU vector:
+     * the file could be unlinked between the `has` check and the
+     * caller's open. Callers must always be prepared to handle
+     * ENOENT (or equivalent) on the path returned here. */
     return build_artifact_dir(hash_hex, path_buf, buflen);
 }
 

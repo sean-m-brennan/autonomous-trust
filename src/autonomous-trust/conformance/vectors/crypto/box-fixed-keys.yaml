@@ -1,0 +1,17 @@
+schema_version: "1"
+kind: crypto_vector
+protocol: network
+name: box-fixed-keys
+description: |
+    NaCl Box (Curve25519-XSalsa20-Poly1305) authenticated encryption with
+    deterministic sender/recipient keys (zero-seed sender, seed-=1 recipient)
+    and a fixed nonce. Pins libsodium ↔ PyNaCl box parity.
+    Plaintext is the ASCII string "box hello".
+primitive: nacl_box
+input:
+  sender_private_key:    "0x0000000000000000000000000000000000000000000000000000000000000000"
+  recipient_public_key:  "0xfd3384e132ad02a56c78f45547ee40038dc79002b90d29ed90e08eee762ae715"
+  nonce:                 "0x101112131415161718191a1b1c1d1e1f2021222324252627"
+  plaintext:             "0x626f782068656c6c6f"
+expected:
+  ciphertext:            "0x42fd02cca8af35d26002f3543c8b2614c5edcf4aab4de7afae"

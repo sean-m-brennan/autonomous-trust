@@ -60,9 +60,9 @@ class SimulationControls(DashComponent):
                            )
         def handle_buttons(_back, _slow, _pause, _reset, _fast, _forward):
             if 'skip-back-btn' == ctx.triggered_id:
-                self.sim.tick -= self.skip
-                if self.sim.tick < 1:
-                    self.sim.tick = 0
+                self.sim.frame_idx -= self.skip
+                if self.sim.frame_idx < 1:
+                    self.sim.frame_idx = 0
                 self.map.trim_traces(self.skip)
                 logger.debug('Simulation: skip back')
             elif 'slow-btn' == ctx.triggered_id:
@@ -84,9 +84,9 @@ class SimulationControls(DashComponent):
                     self.sim.cadence = 20
                 logger.debug('Simulation: fast')
             elif 'skip-for-btn' == ctx.triggered_id:
-                self.sim.tick += self.skip
-                if self.sim.tick > self.sim.resolution:
-                    self.sim.tick = self.sim.resolution
+                self.sim.frame_idx += self.skip
+                if self.sim.frame_idx > self.sim.resolution:
+                    self.sim.frame_idx = self.sim.resolution
                 logger.debug('Simulation: skip forward')
             if self.sim.paused:
                 pause_txt = self.play_txt
