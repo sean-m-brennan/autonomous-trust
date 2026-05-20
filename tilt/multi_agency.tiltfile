@@ -106,7 +106,7 @@ docker_build(
 docker_build(
     "autonomous-trust-disaster",
     repo_root,
-    dockerfile=repo_root + "/src/autonomous-trust-evaluation/Dockerfile-disaster",
+    dockerfile=repo_root + "/src/autonomous-trust-evaluation/Dockerfile",
     network="host",
     build_args=build_args,
 )
@@ -114,7 +114,7 @@ docker_build(
 docker_build(
     "autonomous-trust-inspector",
     repo_root,
-    dockerfile=repo_root + "/src/autonomous-trust-inspector/Dockerfile-multi-agency",
+    dockerfile=repo_root + "/src/autonomous-trust-inspector/Dockerfile",
     network="host",
     build_args=build_args,
 )

@@ -141,6 +141,40 @@ DEFINE_TEST(test_datetime_isoformat)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_timedelta_normalize_long)
+{
+    timedelta_t td;
+
+    /* Python parity: timedelta(microseconds=-1) → (-1, 86399, 999999000ns) */
+    ck_assert_ret_ok(timedelta_normalize_long(0, 0, -1000, &td));
+    ck_assert_int_eq(td.days, -1);
+    ck_assert_uint_eq(td.seconds, 86399u);
+    ck_assert_uint_eq(td.nsecs, 999999000u);
+
+    /* Already-normalized input passes through. */
+    ck_assert_ret_ok(timedelta_normalize_long(3, 7200, 500000000, &td));
+    ck_assert_int_eq(td.days, 3);
+    ck_assert_uint_eq(td.seconds, 7200u);
+    ck_assert_uint_eq(td.nsecs, 500000000u);
+
+    /* Seconds overflow carries to days. */
+    ck_assert_ret_ok(timedelta_normalize_long(0, 86401, 0, &td));
+    ck_assert_int_eq(td.days, 1);
+    ck_assert_uint_eq(td.seconds, 1u);
+    ck_assert_uint_eq(td.nsecs, 0u);
+
+    /* Multi-step nanosecond underflow. */
+    ck_assert_ret_ok(timedelta_normalize_long(0, 0, -1, &td));
+    ck_assert_int_eq(td.days, -1);
+    ck_assert_uint_eq(td.seconds, 86399u);
+    ck_assert_uint_eq(td.nsecs, 999999999u);
+
+    /* NULL out rejected. */
+    ck_assert(timedelta_normalize_long(0, 0, 0, NULL) != 0);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(DateTime, test_datetime_now, test_datetime_from_time,
           test_datetime_strftime, test_datetime_strftime_resolution,
-          test_timedelta_roundtrip, test_datetime_isoformat)
+          test_timedelta_roundtrip, test_datetime_isoformat,
+          test_timedelta_normalize_long)

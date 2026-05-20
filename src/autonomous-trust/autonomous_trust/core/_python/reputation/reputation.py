@@ -47,7 +47,12 @@ class Transaction(Configuration):
         if self.p1_id is None:
             self.p1_id = peer_id
             self.p1_score = score
-        elif self.p2_id is None:
+        elif self.p2_id is None and peer_id != self.p1_id:
+            # A Transaction is intrinsically bilateral; the same peer cannot
+            # occupy both slots. Without this guard a duplicate `committed`
+            # broadcast for the same paxos round would set p2 = p1, producing
+            # a self-transaction that CTFT's `p1==peer && p2==self` check
+            # silently rejects.
             self.p2_id = peer_id
             self.p2_score = score
 
@@ -83,6 +88,11 @@ class TransactionHistory(Mapping):
         tx = self._task_mapping[task_id]
         if len(tx) == 2:
             return  # ignore duplicates
+        if peer_id == tx.p1_id:
+            # Skip before `_map_peers` so we don't re-append the same tx to
+            # `_peer_mapping[p1_id]` (which would inflate by_peer() results
+            # and skew downstream peer-tx counts).
+            return
         tx.add(peer_id, score)
         self._map_peers(tx)
         if len(tx) > 1:

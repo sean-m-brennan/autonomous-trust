@@ -3,7 +3,6 @@ channels:
   - conda-forge
 dependencies:
   - python==3.13.*
-  - pip
   - icontract
   - psutil
   - pynacl
@@ -45,6 +44,7 @@ dependencies:
   - websockets
   - pydantic
   - pyyaml
+  - pip
   - pip:
       #- mediapipe
       #- parrot-olympe # uses an old version of protobuf

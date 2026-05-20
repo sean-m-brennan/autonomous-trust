@@ -94,6 +94,10 @@ Deployment modes (pick one):
   --record <FILE>            Inspector only (no cluster); run the scripted
                              scenario and capture events to FILE.json on
                              Ctrl-C. Output is consumable by --playback.
+  --teardown                 Run \`tilt down\` against the multi-agency
+                             stack + host-side process reaping, then
+                             exit.  Use when a previous run left state
+                             behind.
 
 Options:
   --namespace NS             K8s namespace (default: $NAMESPACE)
@@ -119,6 +123,7 @@ while [[ $# -gt 0 ]]; do
         --tilt)         BACKEND_MODE="tilt";    shift;;
         --compose)      BACKEND_MODE="compose"; shift;;
         --k8s)          BACKEND_MODE="k8s";     shift;;
+        --teardown)     BACKEND_MODE="teardown"; shift;;
         --playback)     BACKEND_MODE="playback"; PLAYBACK_FILE="$2"; shift 2;;
         --record)       BACKEND_MODE="record";   RECORD_FILE="$2";   shift 2;;
         --namespace)    NAMESPACE="$2";          shift 2;;
@@ -176,7 +181,7 @@ fi
 # Skipped in tilt mode — the multi_agency.tiltfile owns regeneration via a
 # local_resource and re-runs it whenever the scenario sources change.
 
-if [[ "$BACKEND_MODE" != "tilt" ]]; then
+if [[ "$BACKEND_MODE" != "tilt" && "$BACKEND_MODE" != "teardown" ]]; then
     echo "=== Generating manifests under $DEPLOY_DIR ==="
     python3 -m autonomous_trust.evaluation.scenarios.disaster_response_compose \
         --out "$DEPLOY_DIR" \
@@ -291,6 +296,22 @@ cleanup_inspector_procs() {
 # this trap catches the residual.
 trap 'cleanup_inspector_procs' EXIT
 
+# Make sure a local Kubernetes cluster is up before any backend that
+# needs one (tilt, k8s).  Requires minikube on PATH; starts it if it
+# isn't already running.  Exits 1 if minikube isn't installed so the
+# caller doesn't proceed into a "no kube context" failure further down.
+ensure_minikube_running() {
+    if ! command -v minikube &>/dev/null; then
+        echo "minikube not installed; see https://minikube.sigs.k8s.io/docs/start/" >&2
+        echo "(or rerun with --compose for the docker-compose backend)" >&2
+        exit 1
+    fi
+    if ! minikube status &>/dev/null; then
+        echo "=== Starting Minikube ==="
+        minikube start
+    fi
+}
+
 # Switch to the cluster's docker daemon if we're targeting minikube, so
 # subsequent `docker build` lands where pods can pull from. No-op (and
 # silent) on other contexts; callers must accept that ImagePullBackOff
@@ -348,6 +369,11 @@ case "$BACKEND_MODE" in
         command -v kubectl &>/dev/null \
             || { echo "kubectl not found (Tilt needs a working kube context)" >&2; exit 1; }
 
+        # Tilt needs a live kube context; bring up minikube if it isn't
+        # already running so the user doesn't hit "no configuration has
+        # been provided" inside the Tiltfile.
+        ensure_minikube_running
+
         # Preflight image build: make `docker rmi <imgs> && relaunch`
         # produce a fresh build regardless of Tilt's own caching. We
         # build into the cluster's daemon (minikube docker-env) so pods
@@ -371,13 +397,18 @@ case "$BACKEND_MODE" in
         TILT_PID=$!
 
         # Trap before the wait so any failure during readiness still
-        # tears the cluster state down.
-        trap 'echo; echo "Stopping Tilt..."; \
-              kill $TILT_PID 2>/dev/null || true; \
+        # tears the cluster state down.  Split traps: EXIT does the
+        # actual cleanup; INT/TERM just call `exit` so Ctrl-C
+        # interrupts the wait_for_inspector_http loop below (its
+        # `sleep 1` is interruptible, but without an explicit exit
+        # bash resumes the script and the loop keeps polling for the
+        # full timeout).
+        trap 'kill $TILT_PID 2>/dev/null || true; \
               wait $TILT_PID 2>/dev/null || true; \
               tilt down -- --variant=multi-agency --namespace="$NAMESPACE" \
-                  --log-level="$LOG_LEVEL" &>>"$TILT_LOG" || true' \
-            INT TERM EXIT
+                  --log-level="$LOG_LEVEL" &>>"$TILT_LOG" || true' EXIT
+        trap 'echo; echo "Stopping Tilt..."; exit 130' INT
+        trap 'echo; echo "Stopping Tilt..."; exit 143' TERM
 
         # Open the Tilt control UI as soon as it's serving so the user
         # can watch image builds + pod rollout progress while the
@@ -454,8 +485,15 @@ case "$BACKEND_MODE" in
         echo ""
         echo "--- Running. Ctrl-C to stop ---"
         echo "Inspector logs: docker logs -f multi-agency-inspector"
-        trap 'echo; echo "Stopping..."; \
-              (cd "$DEPLOY_DIR" && docker compose down)' INT TERM
+        # EXIT handles teardown; INT/TERM just exit so Ctrl-C
+        # propagates immediately instead of being absorbed by the
+        # signal handler and the surrounding loop.  Chain the global
+        # `cleanup_inspector_procs` so we don't lose host-side
+        # process reaping by overriding the EXIT trap.
+        trap '(cd "$DEPLOY_DIR" && docker compose down) || true; \
+              cleanup_inspector_procs' EXIT
+        trap 'echo; echo "Stopping..."; exit 130' INT
+        trap 'echo; echo "Stopping..."; exit 143' TERM
         # Keep the script in the foreground so the trap fires on Ctrl-C.
         # Poll the compose stack; exits naturally if all containers stop.
         while (cd "$DEPLOY_DIR" && docker compose ps --services --filter \
@@ -467,14 +505,7 @@ case "$BACKEND_MODE" in
     k8s)
         command -v kubectl &>/dev/null \
             || { echo "kubectl not found"; exit 1; }
-        if ! command -v minikube &>/dev/null; then
-            echo "minikube not installed; see https://minikube.sigs.k8s.io/docs/start/" >&2
-            exit 1
-        fi
-        if ! minikube status &>/dev/null; then
-            echo "=== Starting Minikube ==="
-            minikube start
-        fi
+        ensure_minikube_running
         echo "=== Applying manifests to $NAMESPACE ==="
         kubectl apply -f "$DEPLOY_DIR/kubernetes/namespace.yaml"
         kubectl apply -f "$DEPLOY_DIR/kubernetes/scenario-config.yaml"
@@ -527,14 +558,38 @@ case "$BACKEND_MODE" in
         echo ""
         echo "--- Running. Ctrl-C to tear down ---"
         echo "Inspector logs: kubectl logs -n $NAMESPACE -f deployment/multi-agency-inspector"
-        trap 'echo; echo "Stopping..."; \
-              kubectl delete namespace "$NAMESPACE" --ignore-not-found' INT TERM
+        # EXIT does the namespace teardown; INT/TERM just exit so
+        # Ctrl-C breaks out of the polling loop below immediately.
+        # Chain `cleanup_inspector_procs` so the global EXIT
+        # trap's host-side reaping isn't lost when we override.
+        trap 'kubectl delete namespace "$NAMESPACE" --ignore-not-found || true; \
+              cleanup_inspector_procs' EXIT
+        trap 'echo; echo "Stopping..."; exit 130' INT
+        trap 'echo; echo "Stopping..."; exit 143' TERM
         # Hold the script open until the namespace goes away (Ctrl-C
         # path) or the inspector deployment scales to zero.
         while kubectl get deployment multi-agency-inspector \
                 -n "$NAMESPACE" &>/dev/null; do
             sleep 5
         done
+        ;;
+
+    teardown)
+        # Best-effort cleanup for a stuck or abandoned run.  Idempotent:
+        # missing tilt, missing namespace, and missing host-side procs
+        # are all fine and silently ignored.
+        if command -v tilt &>/dev/null; then
+            echo "=== tilt down (multi-agency / $NAMESPACE) ==="
+            tilt down -- \
+                --variant=multi-agency \
+                --namespace="$NAMESPACE" \
+                --log-level="$LOG_LEVEL" || true
+        else
+            echo "tilt not on PATH; skipping 'tilt down'"
+        fi
+        echo "=== Reaping host-side inspector processes ==="
+        cleanup_inspector_procs
+        echo "Teardown complete."
         ;;
 
     *)

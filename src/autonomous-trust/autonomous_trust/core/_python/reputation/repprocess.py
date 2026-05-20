@@ -80,6 +80,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(ReputationProtocol.backdate, self.handle_backdate)
         self.protocol.register_handler(ReputationProtocol.transaction, self.handle_transaction)
         self.protocol.register_handler(ReputationProtocol.accepted, self.handle_accepted)
+        self.protocol.register_handler(ReputationProtocol.committed, self.handle_committed)
         self.protocol.register_handler(ReputationProtocol.outdated, self.handle_outdated)
         self.protocol.register_handler(ReputationProtocol.update, self.handle_update)
         self.protocol.register_handler(ReputationProtocol.rep_req, self.handle_reputation_request)
@@ -102,6 +103,15 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # spawned threads, drained by the main `process` loop where
         # `queues` is in scope. Same pattern as `requested_reps`.
         self.pending_ranks: list = []
+        # Paxos rounds already committed locally — prevents
+        # handle_accepted from re-firing its commit block on every
+        # late ACCEPTED that arrives after majority is reached.
+        # Without this, each round triggers `len(peers.all)-majority+1`
+        # redundant commit broadcasts, and duplicate broadcasts
+        # corrupt the resulting Transaction (p1 and p2 both end up
+        # holding the proposer's uuid because TransactionHistory.update
+        # doesn't dedup by peer_id).
+        self.committed_paxos_rounds: set = set()
 
     @property
     def peers(self):
@@ -129,7 +139,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                             # paxos.c:114 (before the update at :123).
                             ack = ((id1, id2, peer_id), (self.last_id, len(self.history)), self.last_value)
                             msg = Message(self.name, ReputationProtocol.grant,
-                                          to_json_string(ack), message.from_whom)
+                                          to_json_string(ack), message.from_whom,
+                                          from_whom=self.identity)
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                             self.logger.debug('Request granted')
                             # Pin the ballot — second-grant guard. Without
@@ -142,11 +153,15 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                             # asymmetry tracked as BUGS.md P6.
                             self.last_id = id1
                         else:
-                            msg = Message(self.name, ReputationProtocol.backdate, message.obj, message.from_whom)
+                            msg = Message(self.name, ReputationProtocol.backdate,
+                                          message.obj, message.from_whom,
+                                          from_whom=self.identity)
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                             self.logger.debug('Request backdated')
                     else:
-                        msg = Message(self.name, ReputationProtocol.nack, message.obj, message.from_whom)
+                        msg = Message(self.name, ReputationProtocol.nack,
+                                      message.obj, message.from_whom,
+                                      from_whom=self.identity)
                         queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                         self.logger.debug('Request refused')
                 except Full:
@@ -193,7 +208,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if self.my_requests[idx].count >= len(self.peers.all) // 2:
                 try:
                     score = (id1, id2, peer_id), self.my_requests[idx].score
-                    msg = Message(self.name, ReputationProtocol.transaction, to_json_string(score), self.group)
+                    msg = Message(self.name, ReputationProtocol.transaction,
+                                  to_json_string(score), self.group,
+                                  from_whom=self.identity)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                     self.logger.debug('Submit transaction score')
                     if idx in self.backoff:
@@ -235,7 +252,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def _request_update(self, queues, n=3):
         self.num_updates = n
         for peer in self.peers.find_top_n(n):
-            msg = Message(self.name, ReputationProtocol.outdated, str(len(self.history)), peer)
+            msg = Message(self.name, ReputationProtocol.outdated,
+                          str(len(self.history)), peer,
+                          from_whom=self.identity)
             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
 
     def handle_backdate(self, queues, message):
@@ -253,7 +272,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         idx = self._paxos_id_index(id1, id2)
         pax_id = (id1, id2, self.identity.uuid)
         self.my_requests[idx] = TxCount(score, 0)
-        pax_msg = Message(self.name, ReputationProtocol.request, to_json_string(pax_id), self.group)
+        pax_msg = Message(self.name, ReputationProtocol.request,
+                          to_json_string(pax_id), self.group,
+                          from_whom=self.identity)
         queues[CfgIds.network].put(pax_msg, block=True, timeout=self.q_cadence)
         self.proposals[idx] = score
         self.logger.debug('Start a Paxos round')
@@ -272,7 +293,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self.proposals[idx] = score
                 self.logger.debug("Tx to proposals ")
             msg = Message(self.name, ReputationProtocol.accepted,
-                          to_json_string((id1, id2, peer_id)), message.from_whom)
+                          to_json_string((id1, id2, peer_id)),
+                          message.from_whom, from_whom=self.identity)
             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
             return True
         return False
@@ -280,14 +302,26 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def forward_transaction(self, queues, message):
         if isinstance(message, TransactionScore):
             try:
-                self.history.update(message.task_id, self.identity.uuid, message.score)
+                # Don't write to history here.  The C twin
+                # _forward_transaction (rep_proc.c:1081-1102) only
+                # stages the score in my_requests and kicks off Paxos
+                # — history is updated solely from handle_accepted
+                # when the round commits.  The previous Python
+                # behaviour wrote (task_id, self_uuid, self_score)
+                # immediately, then handle_accepted re-wrote the same
+                # tuple on the proposer's own round, filling both
+                # p1=self and p2=self.  Any subsequent peer
+                # submission for the same task_id was then silently
+                # dropped by TransactionHistory.update (len(tx)==2),
+                # so the proposer's local history could never record
+                # a bilateral transaction with another peer.
                 self._start_paxos(queues, message)
             except Full:
                 self.logger.error('handle_transaction: Network queue full')
             return True
         return False
 
-    def handle_accepted(self, _, message):
+    def handle_accepted(self, queues, message):
         if message.function == ReputationProtocol.accepted:
             id1, id2, peer_id = from_json_string(message.obj)
             idx = self._paxos_id_index(id1, id2)
@@ -301,8 +335,82 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     return True  # drop unverified acceptance
                 self.acceptances[score.task_id].append(message.from_whom)
             if len(self.acceptances[score.task_id]) > len(self.peers.all) // 2:
+                # Idempotency guard: every ACCEPTED that arrives
+                # after the majority threshold has been crossed would
+                # otherwise re-fire the commit-and-broadcast block.
+                # That fanned out ~N-majority extra `committed`
+                # broadcasts per round, and duplicate broadcasts
+                # corrupt the resulting Transaction (p1 and p2 both
+                # end up = proposer because TransactionHistory.update
+                # doesn't dedup by peer_id) — making the txs look
+                # bilateral on paper but actually single-peer, which
+                # CTFT's `p1==peer && p2==self` check then rejects.
+                if idx in self.committed_paxos_rounds:
+                    return True
+                self.committed_paxos_rounds.add(idx)
+                # The proposer writes their own entry here.  The
+                # `committed` broadcast below makes the acceptors do
+                # the same on their end, so the resulting
+                # Transaction has both p1 and p2 filled across all
+                # peers' histories (see ReputationProtocol.committed
+                # for the rationale).
                 self.history.update(score.task_id, peer_id, score.score)
-                self.logger.debug('Transaction committed')
+                # Bumped to info to make demo debugging tractable —
+                # without a commit log, "no movement on reputations"
+                # is indistinguishable from "no paxos commits".
+                self.logger.info(
+                    'Transaction committed: task=%s peer=%s score=%.2f '
+                    '(history now %d txs, %d task_maps)',
+                    str(getattr(score, "task_id", ""))[:8],
+                    str(peer_id)[:8], score.score,
+                    len(self.history),
+                    len(self.history._task_mapping))
+                try:
+                    # Pass task_id and peer_id through unchanged —
+                    # ConfigJSONEncoder round-trips UUID objects with
+                    # a __type__ tag, so handle_committed receives
+                    # the same types we put in.  Stringifying here
+                    # would break that round-trip.
+                    commit_msg = Message(
+                        self.name, ReputationProtocol.committed,
+                        to_json_string(
+                            (score.task_id, peer_id, score.score)),
+                        self.group, from_whom=self.identity)
+                    queues[CfgIds.network].put(
+                        commit_msg, block=True, timeout=self.q_cadence)
+                except Full:
+                    self.logger.error(
+                        'handle_accepted: Network queue full broadcasting commit')
+            return True
+        return False
+
+    def handle_committed(self, _, message):
+        """Phase 3 — receive a committed-transaction broadcast from
+        a proposer that just reached majority acceptance.  Write
+        (task_id, peer_id, score) to local history.
+
+        The proposer's own broadcast bounces back to itself; we skip
+        the self-update because handle_accepted already wrote the
+        entry locally.  TransactionHistory.update is idempotent
+        against a second arrival (the len(tx)==2 guard), so
+        duplicate or out-of-order committed messages from network
+        retries are safe."""
+        if message.function == ReputationProtocol.committed:
+            try:
+                task_id, peer_id, score = from_json_string(message.obj)
+            except Exception:
+                self.logger.warning(
+                    'handle_committed: malformed payload %r', message.obj)
+                return True
+            if str(peer_id) == str(self.identity.uuid):
+                return True
+            self.history.update(task_id, peer_id, float(score))
+            self.logger.info(
+                'Recorded committed tx from %s: task=%s score=%.2f '
+                '(history now %d txs, %d task_maps)',
+                str(peer_id)[:8], str(task_id)[:8], float(score),
+                len(self.history),
+                len(self.history._task_mapping))
             return True
         return False
 
@@ -314,7 +422,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     length = length.decode(encoding)
                 index = int(length)
                 chain = to_json_string(self.history.era(index))
-                msg = Message(self.name, ReputationProtocol.update, chain, message.from_whom)
+                msg = Message(self.name, ReputationProtocol.update, chain,
+                              message.from_whom, from_whom=self.identity)
                 queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                 self.logger.debug('Sent update')
             except Full:
@@ -349,28 +458,59 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         return False
 
     def _pure_reputation(self, peer):
-        total = 0
-        count = 0.0
-        for tx in self.history.by_peer(peer.uuid):
-            if tx.p1_id == peer.uuid and tx.p2_id in self.reputations:
-                total += tx.p2_score * self.reputations[tx.p2_id]
-                count += 1
-            elif tx.p2_id == peer.uuid and tx.p1_id in self.reputations:
-                total += tx.p1_score * self.reputations[tx.p1_id]
-                count += 1
-        return total / count if count > 0 else 0.0
+        # Mirror reputation.c:412-457: counterparty's-score weighted
+        # by counterparty's-reputation, default 0.5 on no-history
+        # OR no-valid-tx (returning 0.0 would route the peer back
+        # into CTFT mode on the next compute, the very condition we
+        # supposedly graduated from).  Counterparties absent from
+        # ``self.reputations`` use a 0.5 fallback rather than being
+        # silently skipped (skipping made the result sensitive to
+        # whether the local reputations dict had caught up to the
+        # history chain).
+        peer_uuid = peer.uuid
+        try:
+            txs = list(self.history.by_peer(peer_uuid))
+        except KeyError:
+            return 0.5
+        total = 0.0
+        valid = 0
+        for tx in txs:
+            if tx.p1_id is None or tx.p2_id is None:
+                continue
+            if tx.p1_id == peer_uuid:
+                counterparty_id = tx.p2_id
+                counterparty_score = tx.p2_score
+            elif tx.p2_id == peer_uuid:
+                counterparty_id = tx.p1_id
+                counterparty_score = tx.p1_score
+            else:
+                continue
+            cp_rep = self.reputations[counterparty_id] \
+                if counterparty_id in self.reputations else 0.5
+            total += counterparty_score * cp_rep
+            valid += 1
+        if valid == 0:
+            return 0.5
+        return total / valid
 
     def _contrite_tit_for_tat(self, peer):
+        # peer_score is the score the PEER submitted in a bilateral
+        # transaction; my_score is the score WE submitted. p1_score
+        # belongs to whoever is p1, p2_score to p2 — so the side that
+        # matches `peer.uuid` is the one whose score is "peer_score".
+        # An earlier revision had these indices swapped relative to
+        # the C twin (reputation.c:499-507), inverting the
+        # peer-defected vs. self-defected branches.
         peer_scores = []
         my_scores = []
         try:
             for tx in self.history.by_peer(peer.uuid):
                 if tx.p1_id == peer.uuid and tx.p2_id == self.identity.uuid:
-                    peer_scores.append(tx.p2_score)
-                    my_scores.append(tx.p1_score)
-                elif tx.p2_id == peer.uuid and tx.p1_id == self.identity.uuid:
                     peer_scores.append(tx.p1_score)
                     my_scores.append(tx.p2_score)
+                elif tx.p2_id == peer.uuid and tx.p1_id == self.identity.uuid:
+                    peer_scores.append(tx.p2_score)
+                    my_scores.append(tx.p1_score)
         except KeyError:
             self.logger.debug('No transaction history for peer %s' % peer.uuid)
         if len(peer_scores) < 1 or len(my_scores) < 1:  # not enough info
@@ -436,7 +576,24 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self.logger.debug('Cooperation mode')
                 rep_score = self._pure_reputation(peer)
             else:
-                self.logger.debug('Tit-for-tat mode')
+                # Debug aid: how much bilateral history does this peer
+                # actually have on this node?  CTFT returns 0.49 when
+                # n<1, so the count below tells you whether you're
+                # stuck at the no-history default or actually
+                # computing against real data.
+                try:
+                    n_bilateral = sum(
+                        1 for tx in self.history.by_peer(peer_uuid)
+                        if ((tx.p1_id == peer_uuid
+                             and tx.p2_id == self.identity.uuid)
+                            or (tx.p2_id == peer_uuid
+                                and tx.p1_id == self.identity.uuid)))
+                except (KeyError, AttributeError):
+                    n_bilateral = 0
+                self.logger.info(
+                    'Tit-for-tat mode for %s: %d bilateral txs in '
+                    'local history (previous=%.2f)',
+                    str(peer_uuid)[:8], n_bilateral, previous)
                 rep_score = self._contrite_tit_for_tat(peer)
             self.reputations.update(peer_uuid, rep_score)
             try:

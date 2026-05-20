@@ -699,16 +699,38 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 'Announced self to %d bundled peers' % sent)
 
     def _add_peer(self, queues, identity, amnesia=False):
-        # TODO: Use 'amnesia' parameter — when True, treat this peer as if
-        # we have no prior history with them (e.g. after a partition heal).
+        # The `amnesia` parameter is currently a structural placeholder.
+        # All callers either pass the default (`False`) or are guarded
+        # by `if not amnesia` above. The actual amnesia recovery flow
+        # — registering caps for late-arriving announces and querying
+        # peers directly when announces are lost — lives in
+        # `welcoming_committee` (amnesia branch, line ~566) and
+        # `handle_confirm_peer` (caps_query path, line ~860). See the
+        # late-joiner-caps four-layer defense pattern for context.
+        # The parameter is retained so future per-callsite recovery
+        # policy can plug in here without changing the signature.
         level = self.peers.mid_level
         if self.group is not None:
-            # TODO: Consider delaying group update until after peer is fully
-            # validated, to avoid exposing group key to unconfirmed peers.
+            # DEFERRED DESIGN: delaying group-update vs. exposing group
+            # key. Current behavior adds the new peer's address and
+            # publishes the group BEFORE the peer is fully validated by
+            # the welcoming-committee vote. This trades a brief window
+            # of premature group-key visibility for simpler ordering —
+            # if the peer is later rejected, group_remove cleans up.
+            # Tightening this requires a multi-phase admission protocol
+            # (provisional vs. confirmed group membership) that both
+            # the Python and C implementations would need to agree on.
             self.group.add_address(identity.uuid, identity.address)
             self._record_group(queues)
-            # TODO: Consider using the new peer's group key instead of ours
-            # when the new peer comes from a larger/older group.
+            # DEFERRED DESIGN: adopting the new peer's group key when
+            # they come from an older/larger group (group-merge
+            # protocol). Today we always retain our own group identity
+            # and add the joiner's address to it. Inverting this would
+            # require: (a) a comparable size/age signal on Group, (b)
+            # a peer-key handover handshake, (c) C-side parity. Tracked
+            # alongside the broader group-merge discussion in
+            # divergence.md context (see also the M2 / late-history
+            # paths that already merge histories without merging keys).
             self._update_group(queues, self.group, level)
         self._history.insert_peer(identity, level)
         with self.lock:
@@ -722,8 +744,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     del self.peer_potentials[identity.uuid]
                 except KeyError:
                     pass  # race condition: another thread may have deleted it
-        # TODO: Review whether these capability broadcasts are redundant
-        # with self.update() — they may cause duplicate processing downstream.
+        # Intentional redundancy: these explicit puts back up the fan-put
+        # that `_record_peers` performs via `update()`, which has been
+        # observed to silently drop entries under main-proc queue
+        # contention. The same pattern + a longer 1s timeout appears in
+        # `handle_caps_response` (~line 970), with the full rationale.
+        # Removing either side risks dropped capability updates downstream.
         queues[CfgIds.main].put(self.peer_capabilities, block=True, timeout=self.q_cadence)
         queues[CfgIds.negotiation].put(self.peer_capabilities, block=True, timeout=self.q_cadence)
 
@@ -759,9 +785,22 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.propose:
             self.logger.debug('Received peer proposal')
-            # TODO: Check border_guard_mode — when True, this node acts as a
-            # gatekeeper and should apply stricter validation before processing
-            # proposals. When False, defer to other peers' judgment.
+            # DEFERRED DESIGN: should non-border-guards vote on
+            # proposals? `welcoming_committee` only emits `propose`
+            # when `self.border_guard_mode` is True (line ~587), but
+            # any peer in phase 3 that receives the broadcast
+            # currently votes. Two viable policies:
+            #   A. Current: everyone in phase 3 votes — wider quorum,
+            #      but a non-border-guard's view of the candidate is
+            #      necessarily shallower (no welcoming-committee
+            #      validation context).
+            #   B. Border-guards-only: gate this branch on
+            #      `if self.border_guard_mode:` to mirror the emit
+            #      side. Tighter security model, smaller quorum.
+            # Policy B requires C-side parity — the C implementation
+            # has no `border_guard_mode` concept yet (greppable: no
+            # matches in src/c/autonomous_trust/identity/). Land
+            # cross-impl before changing the Python behavior.
             blob = message.obj  # from self.welcoming_committee()
             if isinstance(blob, str):
                 blob = Configuration.from_string(blob)

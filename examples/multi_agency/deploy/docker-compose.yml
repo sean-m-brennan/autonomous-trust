@@ -61,8 +61,6 @@ services:
     ports:
       - "8050:8050"
       - "8000:8000"
-    volumes:
-      - ../configs/coordinator/:/app/config/coordinator/etc/at/:ro
     networks:
       demo-net:
         ipv4_address: 172.29.0.3
@@ -77,8 +75,6 @@ services:
       AUTONOMOUS_TRUST_ARGS: "noaa-sensor-1 --log-level debug"
       AUTONOMOUS_TRUST_ROOT: "/app/config/noaa-sensor-1"
       AT_AGENCY: NOAA
-    volumes:
-      - ../configs/noaa-sensor-1/:/app/config/noaa-sensor-1/etc/at/:ro
     networks:
       demo-net:
         ipv4_address: 172.29.0.10
@@ -92,8 +88,6 @@ services:
       AUTONOMOUS_TRUST_ARGS: "noaa-sensor-2 --log-level debug"
       AUTONOMOUS_TRUST_ROOT: "/app/config/noaa-sensor-2"
       AT_AGENCY: NOAA
-    volumes:
-      - ../configs/noaa-sensor-2/:/app/config/noaa-sensor-2/etc/at/:ro
     networks:
       demo-net:
         ipv4_address: 172.29.0.11
@@ -108,8 +102,6 @@ services:
       AUTONOMOUS_TRUST_ROOT: "/app/config/noaa-sensor-3"
       AT_AGENCY: NOAA
       AT_COMPROMISED: "true"
-    volumes:
-      - ../configs/noaa-sensor-3/:/app/config/noaa-sensor-3/etc/at/:ro
     networks:
       demo-net:
         ipv4_address: 172.29.0.12
@@ -124,8 +116,6 @@ services:
       AUTONOMOUS_TRUST_ARGS: "usgs-monitor-1 --log-level debug"
       AUTONOMOUS_TRUST_ROOT: "/app/config/usgs-monitor-1"
       AT_AGENCY: USGS
-    volumes:
-      - ../configs/usgs-monitor-1/:/app/config/usgs-monitor-1/etc/at/:ro
     networks:
       demo-net:
         ipv4_address: 172.29.0.13
@@ -139,8 +129,6 @@ services:
       AUTONOMOUS_TRUST_ARGS: "usgs-monitor-2 --log-level debug"
       AUTONOMOUS_TRUST_ROOT: "/app/config/usgs-monitor-2"
       AT_AGENCY: USGS
-    volumes:
-      - ../configs/usgs-monitor-2/:/app/config/usgs-monitor-2/etc/at/:ro
     networks:
       demo-net:
         ipv4_address: 172.29.0.14
@@ -155,8 +143,6 @@ services:
       AUTONOMOUS_TRUST_ARGS: "fema-field-1 --log-level debug"
       AUTONOMOUS_TRUST_ROOT: "/app/config/fema-field-1"
       AT_AGENCY: FEMA
-    volumes:
-      - ../configs/fema-field-1/:/app/config/fema-field-1/etc/at/:ro
     networks:
       demo-net:
         ipv4_address: 172.29.0.15
@@ -170,8 +156,6 @@ services:
       AUTONOMOUS_TRUST_ARGS: "fema-field-2 --log-level debug"
       AUTONOMOUS_TRUST_ROOT: "/app/config/fema-field-2"
       AT_AGENCY: FEMA
-    volumes:
-      - ../configs/fema-field-2/:/app/config/fema-field-2/etc/at/:ro
     networks:
       demo-net:
         ipv4_address: 172.29.0.16
@@ -185,8 +169,6 @@ services:
       AUTONOMOUS_TRUST_ARGS: "fema-fusion --log-level debug"
       AUTONOMOUS_TRUST_ROOT: "/app/config/fema-fusion"
       AT_AGENCY: FEMA
-    volumes:
-      - ../configs/fema-fusion/:/app/config/fema-fusion/etc/at/:ro
     networks:
       demo-net:
         ipv4_address: 172.29.0.17
@@ -204,8 +186,6 @@ services:
       AUTONOMOUS_TRUST_ROOT: "/app/config/epa-monitor-1"
       AT_AGENCY: EPA
       AT_JOIN_DELAY_SEC: "360"
-    volumes:
-      - ../configs/epa-monitor-1/:/app/config/epa-monitor-1/etc/at/:ro
     networks:
       demo-net:
         ipv4_address: 172.29.0.18
