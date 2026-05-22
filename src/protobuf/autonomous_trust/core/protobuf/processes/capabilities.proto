@@ -24,6 +24,16 @@ message Capability {
   string category = 1;
   string name = 2;
   structures.DataMap arg_types = 3;
+  // Trust-tier metadata (see doc/architecture/trust-tiers.md §4).
+  // required_tier: minimum peer._tier needed to invoke this capability.
+  //                Default 0 ("any admitted peer can invoke").
+  // transaction_weight: multiplier applied in _pure_reputation to TSs
+  //                produced by tasks using this capability. Default 1 —
+  //                because proto3 cannot distinguish "not set" from 0,
+  //                consumers MUST treat 0 as 1 (sentinel for backwards
+  //                compatibility with peers that don't carry the field).
+  int32 required_tier = 4;
+  int32 transaction_weight = 5;
 }
 
 message PeerCapabilities {

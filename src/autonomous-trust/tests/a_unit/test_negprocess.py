@@ -57,6 +57,13 @@ def _make_neg_process():
     }
     subsystems = ProcessTracker()
     np = NegotiationProcess(configs, subsystems, log_q, suppress_log=True)
+    # handle_invite's tier gate looks up the sender via
+    # self.peers.find_by_uuid(...). By default the mock returns a
+    # MagicMock for everything, which breaks the `sender_tier <
+    # required_tier` comparison. Default to None so the test peers
+    # are treated as unknown (tier 0) unless a test explicitly sets
+    # a sender record.
+    np.protocol.peers.find_by_uuid = MagicMock(return_value=None)
     return np
 
 
@@ -935,3 +942,151 @@ class TestHandleResultsComplete:
         result = np.handle_results({CfgIds.main: main_q}, msg)
         assert result is True
         assert main_q.empty()  # 3 results tracked, need 4 → not forwarded
+
+
+class TestHandleTierLost:
+    """Cover handle_tier_lost (trust-tiers.md §7.2)."""
+
+    def test_wrong_function_returns_false(self):
+        np = _make_neg_process()
+        msg = Message(CfgIds.negotiation, 'wrong', '["x", 0]')
+        result = np.handle_tier_lost({}, msg)
+        assert result is False
+
+    def test_bad_payload_logs_and_returns_true(self):
+        np = _make_neg_process()
+        # Single-element JSON list (insufficient fields)
+        from autonomous_trust.core.identity.protocol import IdentityProtocol
+        msg = Message(CfgIds.negotiation, IdentityProtocol.tier_lost,
+                      '["only-one"]')
+        result = np.handle_tier_lost({}, msg)
+        assert result is True
+
+    def test_bad_uuid_logs_and_returns_true(self):
+        np = _make_neg_process()
+        from autonomous_trust.core.identity.protocol import IdentityProtocol
+        msg = Message(CfgIds.negotiation, IdentityProtocol.tier_lost,
+                      '["not-a-uuid", 1]')
+        result = np.handle_tier_lost({}, msg)
+        assert result is True
+
+    def test_cancels_worker_side_job_from_demoted_requestor(self):
+        """A scheduled job whose requestor was demoted is dropped from task_stack."""
+        np = _make_neg_process()
+        # Requestor whose tier just dropped to 1
+        demoted = _make_mock_peer(nickname='demoted')
+        # Capability requires tier 3 — demotion to 1 should cancel
+        cap = Capability('high-tier-cap', required_tier=3)
+        tp = TaskParameters(cap, when=datetime(2025, 1, 1, tzinfo=UTC))
+        task = Task(tp, demoted)
+        np._add_task(task)
+        assert len(np.task_stack) == 1
+
+        # Also schedule a benign job from a different requestor that
+        # must NOT be cancelled.
+        other = _make_mock_peer(nickname='other')
+        tp2 = TaskParameters(cap, when=datetime(2025, 1, 2, tzinfo=UTC))
+        keep_task = Task(tp2, other)
+        np._add_task(keep_task)
+
+        from autonomous_trust.core.identity.protocol import IdentityProtocol
+        payload = '["%s", 1]' % str(demoted.uuid)
+        msg = Message(CfgIds.negotiation, IdentityProtocol.tier_lost, payload)
+        result = np.handle_tier_lost({CfgIds.main: queue.Queue()}, msg)
+        assert result is True
+        assert len(np.task_stack) == 1
+        # The remaining job is the "keep" one
+        remaining = np.task_stack._heap[0][2].task
+        assert remaining.uuid == keep_task.uuid
+
+    def test_keeps_worker_side_job_when_required_tier_still_met(self):
+        """A scheduled job whose requestor's new tier still meets required_tier is kept."""
+        np = _make_neg_process()
+        demoted = _make_mock_peer(nickname='demoted')
+        cap = Capability('mid-tier-cap', required_tier=1)
+        tp = TaskParameters(cap, when=datetime(2025, 1, 1, tzinfo=UTC))
+        task = Task(tp, demoted)
+        np._add_task(task)
+
+        from autonomous_trust.core.identity.protocol import IdentityProtocol
+        # Demote to tier 2: still >= required_tier 1, so keep.
+        payload = '["%s", 2]' % str(demoted.uuid)
+        msg = Message(CfgIds.negotiation, IdentityProtocol.tier_lost, payload)
+        np.handle_tier_lost({CfgIds.main: queue.Queue()}, msg)
+        assert len(np.task_stack) == 1
+
+    def test_drops_demoted_peer_from_my_tasks_tracker(self):
+        """A requestor-side tracker drops the demoted participant when capability tier > new tier."""
+        np = _make_neg_process()
+        demoted = _make_mock_peer(nickname='demoted')
+        cap = Capability('high-cap', required_tier=3)
+        tp = TaskParameters(cap, when=datetime(2025, 1, 1, tzinfo=UTC))
+        # Two-participant task; I'm the requestor.
+        me = MagicMock(spec=Identity)
+        me.uuid = uuid4()
+        task = Task(tp, me, size=2)
+        tracker = TaskTracker(task)
+        other = _make_mock_peer(nickname='other')
+        tracker.results[demoted.uuid] = None
+        tracker.results[other.uuid] = None
+        np.my_tasks[task.uuid] = tracker
+
+        from autonomous_trust.core.identity.protocol import IdentityProtocol
+        payload = '["%s", 1]' % str(demoted.uuid)
+        msg = Message(CfgIds.negotiation, IdentityProtocol.tier_lost, payload)
+        main_q = queue.Queue()
+        result = np.handle_tier_lost({CfgIds.main: main_q}, msg)
+        assert result is True
+        # Demoted peer dropped, tracker still has the other peer
+        assert demoted.uuid not in tracker.results
+        assert other.uuid in tracker.results
+        # Task not cancelled (tracker still has participants)
+        assert task.uuid in np.my_tasks
+        assert main_q.empty()
+
+    def test_emits_cancelled_result_when_tracker_emptied(self):
+        """If dropping demoted peer empties the tracker, emit Status.cancelled and remove entry."""
+        np = _make_neg_process()
+        demoted = _make_mock_peer(nickname='demoted')
+        cap = Capability('high-cap', required_tier=3)
+        tp = TaskParameters(cap, when=datetime(2025, 1, 1, tzinfo=UTC))
+        me = MagicMock(spec=Identity)
+        me.uuid = uuid4()
+        task = Task(tp, me, size=1)
+        tracker = TaskTracker(task)
+        tracker.results[demoted.uuid] = None
+        np.my_tasks[task.uuid] = tracker
+
+        from autonomous_trust.core.identity.protocol import IdentityProtocol
+        payload = '["%s", 1]' % str(demoted.uuid)
+        msg = Message(CfgIds.negotiation, IdentityProtocol.tier_lost, payload)
+        main_q = queue.Queue()
+        np.handle_tier_lost({CfgIds.main: main_q}, msg)
+        assert task.uuid not in np.my_tasks
+        assert not main_q.empty()
+        cancelled = main_q.get_nowait()
+        assert isinstance(cancelled, TaskResult)
+        assert cancelled.result == Status.cancelled
+
+    def test_no_op_when_tier_still_meets_required(self):
+        """Demotion to a tier that still meets the capability tier leaves my_tasks intact."""
+        np = _make_neg_process()
+        demoted = _make_mock_peer(nickname='demoted')
+        cap = Capability('mid-cap', required_tier=1)
+        tp = TaskParameters(cap, when=datetime(2025, 1, 1, tzinfo=UTC))
+        me = MagicMock(spec=Identity)
+        me.uuid = uuid4()
+        task = Task(tp, me)
+        tracker = TaskTracker(task)
+        tracker.results[demoted.uuid] = None
+        np.my_tasks[task.uuid] = tracker
+
+        from autonomous_trust.core.identity.protocol import IdentityProtocol
+        # Demoted to tier 2 — still ≥ required 1
+        payload = '["%s", 2]' % str(demoted.uuid)
+        msg = Message(CfgIds.negotiation, IdentityProtocol.tier_lost, payload)
+        main_q = queue.Queue()
+        np.handle_tier_lost({CfgIds.main: main_q}, msg)
+        assert task.uuid in np.my_tasks
+        assert demoted.uuid in tracker.results
+        assert main_q.empty()

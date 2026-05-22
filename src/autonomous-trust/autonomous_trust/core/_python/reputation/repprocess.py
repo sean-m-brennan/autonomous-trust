@@ -18,6 +18,7 @@ import os
 import threading
 import time
 import traceback
+from collections import OrderedDict
 from queue import Empty, Full
 from uuid import UUID
 from dataclasses import dataclass
@@ -44,16 +45,52 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     backoff_mult = 1.5
     backoff_max = 90
     expiration = 300
-    # Reputation-tied rank elevation (BUGS.md §P2). Each tier is
-    # (score_floor, rank); scores below the lowest floor map to rank 0.
-    # Sorted ascending so _rank_tier can iterate and pick the highest
+    # Reputation-derived trust-tier elevation. Each entry is
+    # (score_floor, tier); scores below the lowest floor map to tier 0.
+    # Sorted ascending so _trust_tier can iterate and pick the highest
     # matching tier. Tunable, but keep monotonically increasing.
-    RANK_TIERS = (
+    #
+    # NOTE: trust tier is distinct from network rank (peer._rank) —
+    # rank is topology / one-hop reachability, populated from
+    # identity.json. See doc/architecture/trust-tiers.md §1 for the
+    # disambiguation.
+    TIER_FLOORS = (
         (0.50, 1),
         (0.65, 2),
         (0.80, 3),
         (0.90, 4),
     )
+
+    # Hysteresis band for the CTFT ↔ pure-reputation dispatch in
+    # _compute_reputation. A single 0.5 threshold made peers hovering
+    # near 0.5 flip scoring functions every tick (CTFT's 0.51 →
+    # pure_reputation's 0.4 → CTFT's 0.51 → …), surfacing as a
+    # 0.9 ↔ 0.4 oscillation on the dashboard. Widening the switch
+    # band so a peer must clear COOP_ENTER to graduate and fall below
+    # COOP_EXIT to fall back removes the chatter without altering
+    # either scoring function.
+    COOP_ENTER = 0.55
+    COOP_EXIT = 0.45
+
+    # EMA half-life (in committed bilateral txs) for the dashboard
+    # consensus-reputation channel.  Smaller → faster crash on a peer
+    # that starts producing bad scores, slower rebuild for the rest.
+    # 20 txs gives α ≈ 0.034 — a hacked peer falls visibly within
+    # a few seconds of demo time while honest peers recover gradually.
+    CONSENSUS_EMA_HALF_LIFE = 20
+
+    # Cap on the dedup set for committed paxos rounds (see
+    # `self.committed_paxos_rounds` below). FIFO eviction, paired
+    # with TransactionHistory's bounded chain so neither structure
+    # grows without limit. Sized for ~2 min of in-flight protection
+    # at the demo's sustained ~16 paxos commits/sec — small caps
+    # let late ACCEPTEDs bypass the dedup, triggering redundant
+    # commit re-broadcasts that fan out to every peer. The
+    # tombstone in TransactionHistory makes those re-broadcasts
+    # cheap no-ops on receivers, but the network/dispatch cost is
+    # still real; 2000 eliminates the spurious traffic entirely
+    # without measurably growing memory.
+    COMMITTED_ROUNDS_CAP = 2000
 
     # When True, _spawn replaces threading.Thread().start() with a direct,
     # synchronous call. The conformance harness sets this so scenario steps
@@ -84,6 +121,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(ReputationProtocol.outdated, self.handle_outdated)
         self.protocol.register_handler(ReputationProtocol.update, self.handle_update)
         self.protocol.register_handler(ReputationProtocol.rep_req, self.handle_reputation_request)
+        self.protocol.register_handler(
+            ReputationProtocol.consensus_rep_req,
+            self.handle_consensus_reputation_request)
         self.history = TransactionHistory()
         self.my_requests: dict[tuple[int, int], TxCount] = {}
         self.requests: list[tuple[int, int]] = []
@@ -96,13 +136,23 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.requested_reps = []
         self.updates = {}
         self.num_updates = 3
-        # Last published rank per peer uuid-string. Suppresses redundant
-        # rank_update IPC when the tier hasn't changed (BUGS.md §P2).
-        self.peer_ranks: dict[str, int] = {}
+        # Last published trust tier per peer uuid-string. Suppresses
+        # redundant tier_update IPC when the tier hasn't changed.
+        self.peer_tiers: dict[str, int] = {}
+        # Per-task transaction_weight cache (task_id_str -> int). Populated
+        # when a TransactionScore enters the system (locally submitted via
+        # _start_paxos, or arriving via handle_transaction). Read by
+        # _pure_reputation / _consensus_reputation to weight each
+        # transaction's contribution by its capability's transaction_weight.
+        # See doc/architecture/trust-tiers.md §5. Default 1 when the task's
+        # capability is unknown locally (legacy, or peer late-joiner that
+        # only saw the committed broadcast). Bounded by tying eviction to
+        # the TransactionHistory chain (see _evict_task_weight below).
+        self.task_weights: dict[str, int] = {}
         # (peer_uuid, score) pairs produced by _compute_reputation in
         # spawned threads, drained by the main `process` loop where
         # `queues` is in scope. Same pattern as `requested_reps`.
-        self.pending_ranks: list = []
+        self.pending_tiers: list = []
         # Paxos rounds already committed locally — prevents
         # handle_accepted from re-firing its commit block on every
         # late ACCEPTED that arrives after majority is reached.
@@ -111,7 +161,17 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # corrupt the resulting Transaction (p1 and p2 both end up
         # holding the proposer's uuid because TransactionHistory.update
         # doesn't dedup by peer_id).
-        self.committed_paxos_rounds: set = set()
+        #
+        # OrderedDict (used as an ordered set; values are ignored)
+        # so we can FIFO-evict at COMMITTED_ROUNDS_CAP — the
+        # underlying set was append-only and grew without bound. The
+        # dedup only needs to outlive in-flight ACCEPTED reorder,
+        # which is well under the cap.
+        self.committed_paxos_rounds: 'OrderedDict[tuple, None]' = OrderedDict()
+        # Per-peer latch for the CTFT/pure-reputation dispatch.
+        # False = CTFT, True = pure. Combined with COOP_ENTER /
+        # COOP_EXIT to give the mode switch hysteresis.
+        self._coop_mode: dict[UUID, bool] = {}
 
     @property
     def peers(self):
@@ -266,6 +326,44 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return True
         return False
 
+    # Bound on self.task_weights — twice the TransactionHistory chain
+    # cap, so a freshly-submitted task is unlikely to need a weight
+    # that's already been evicted. Tied to DEFAULT_MAX_CHAIN_LEN via
+    # default; tunable via AT_TX_HISTORY_CAP picks the same factor.
+    _TASK_WEIGHTS_CAP = 2 * TransactionHistory.DEFAULT_MAX_CHAIN_LEN
+
+    def _resolve_tx_weight(self, score: TransactionScore) -> int:
+        """Map a TS's capability_name to its transaction_weight, with a
+        graceful default. The lookup goes through the local Capabilities
+        registry (self.protocol.capabilities); peers that don't have
+        the capability registered locally treat the weight as 1.
+        Returns at least 1 (the 0-sentinel from proto3 is normalised to
+        1 in Capability.sync_from_message; this is a defence in depth).
+        """
+        cap_name = getattr(score, 'capability_name', None)
+        if not cap_name:
+            return 1
+        try:
+            cap = self.protocol.capabilities[cap_name]
+        except (KeyError, AttributeError, TypeError):
+            return 1
+        w = getattr(cap, 'transaction_weight', 1) or 1
+        return max(1, int(w))
+
+    def _record_task_weight(self, task_id, weight: int) -> None:
+        """Insert into self.task_weights with FIFO eviction at the cap.
+        Insertion order is preserved by dict semantics (Py 3.7+), so
+        the oldest entry is `next(iter(...))` when over cap."""
+        key = str(task_id)
+        # If the key already exists, refresh insertion order by
+        # popping-then-inserting so a recent update isn't immediately
+        # evicted by an unrelated insert.
+        if key in self.task_weights:
+            del self.task_weights[key]
+        self.task_weights[key] = int(weight)
+        while len(self.task_weights) > self._TASK_WEIGHTS_CAP:
+            self.task_weights.pop(next(iter(self.task_weights)))
+
     def _start_paxos(self, queues, score: TransactionScore):
         id1 = int(now().timestamp() * 1000)
         id2 = len(self.history) + 1
@@ -277,6 +375,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                           from_whom=self.identity)
         queues[CfgIds.network].put(pax_msg, block=True, timeout=self.q_cadence)
         self.proposals[idx] = score
+        # Cache the weight for this task so _pure_reputation can later
+        # aggregate it correctly (Slice 3 / trust-tiers.md §5).
+        self._record_task_weight(score.task_id, self._resolve_tx_weight(score))
         self.logger.debug('Start a Paxos round')
 
     def handle_transaction(self, queues, message):
@@ -292,6 +393,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if idx not in self.proposals:
                 self.proposals[idx] = score
                 self.logger.debug("Tx to proposals ")
+            # Cache the weight for this task — incoming TS payload carries
+            # capability_name (Slice 1). Receivers that don't register the
+            # capability locally fall back to weight 1.
+            if hasattr(score, 'task_id'):
+                self._record_task_weight(score.task_id, self._resolve_tx_weight(score))
             msg = Message(self.name, ReputationProtocol.accepted,
                           to_json_string((id1, id2, peer_id)),
                           message.from_whom, from_whom=self.identity)
@@ -347,7 +453,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # CTFT's `p1==peer && p2==self` check then rejects.
                 if idx in self.committed_paxos_rounds:
                     return True
-                self.committed_paxos_rounds.add(idx)
+                self.committed_paxos_rounds[idx] = None
+                while (len(self.committed_paxos_rounds)
+                        > self.COMMITTED_ROUNDS_CAP):
+                    self.committed_paxos_rounds.popitem(last=False)
                 # The proposer writes their own entry here.  The
                 # `committed` broadcast below makes the acceptors do
                 # the same on their end, so the resulting
@@ -458,22 +567,27 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         return False
 
     def _pure_reputation(self, peer):
-        # Mirror reputation.c:412-457: counterparty's-score weighted
-        # by counterparty's-reputation, default 0.5 on no-history
-        # OR no-valid-tx (returning 0.0 would route the peer back
-        # into CTFT mode on the next compute, the very condition we
-        # supposedly graduated from).  Counterparties absent from
-        # ``self.reputations`` use a 0.5 fallback rather than being
-        # silently skipped (skipping made the result sensitive to
-        # whether the local reputations dict had caught up to the
-        # history chain).
-        peer_uuid = peer.uuid
+        # Counterparty's-score weighted by counterparty's-reputation
+        # AND by the originating capability's transaction_weight
+        # (doc/architecture/trust-tiers.md §5). Default 0.5 on
+        # no-history OR no-valid-tx (returning 0.0 would route the
+        # peer back into CTFT mode on the next compute, the very
+        # condition we supposedly graduated from). Counterparties
+        # absent from self.reputations use a 0.5 fallback rather
+        # than being silently skipped (skipping made the result
+        # sensitive to whether the local reputations dict had caught
+        # up to the history chain).
+        # `peer` may be a Peer object (production sender path), a
+        # raw UUID, or a uuid string (rep_req wire path — the
+        # canonical object form's `peer_uuid` field is a string,
+        # and Identity.uuid is also a string in this codebase).
+        peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
         try:
             txs = list(self.history.by_peer(peer_uuid))
         except KeyError:
             return 0.5
         total = 0.0
-        valid = 0
+        total_weight = 0
         for tx in txs:
             if tx.p1_id is None or tx.p2_id is None:
                 continue
@@ -487,11 +601,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 continue
             cp_rep = self.reputations[counterparty_id] \
                 if counterparty_id in self.reputations else 0.5
-            total += counterparty_score * cp_rep
-            valid += 1
-        if valid == 0:
+            w = self.task_weights.get(str(tx.task_id), 1)
+            total += counterparty_score * cp_rep * w
+            total_weight += w
+        if total_weight == 0:
             return 0.5
-        return total / valid
+        return total / total_weight
 
     def _contrite_tit_for_tat(self, peer):
         # peer_score is the score the PEER submitted in a bilateral
@@ -501,18 +616,21 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # An earlier revision had these indices swapped relative to
         # the C twin (reputation.c:499-507), inverting the
         # peer-defected vs. self-defected branches.
+        # `peer` may be a Peer object, a UUID, or a uuid string
+        # (see _pure_reputation comment).
+        peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
         peer_scores = []
         my_scores = []
         try:
-            for tx in self.history.by_peer(peer.uuid):
-                if tx.p1_id == peer.uuid and tx.p2_id == self.identity.uuid:
+            for tx in self.history.by_peer(peer_uuid):
+                if tx.p1_id == peer_uuid and tx.p2_id == self.identity.uuid:
                     peer_scores.append(tx.p1_score)
                     my_scores.append(tx.p2_score)
-                elif tx.p2_id == peer.uuid and tx.p1_id == self.identity.uuid:
+                elif tx.p2_id == peer_uuid and tx.p1_id == self.identity.uuid:
                     peer_scores.append(tx.p2_score)
                     my_scores.append(tx.p1_score)
         except KeyError:
-            self.logger.debug('No transaction history for peer %s' % peer.uuid)
+            self.logger.debug('No transaction history for peer %s' % peer_uuid)
         if len(peer_scores) < 1 or len(my_scores) < 1:  # not enough info
             return 0.49
         peer_standing = sum(peer_scores) / len(peer_scores)
@@ -528,51 +646,81 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # TODO can we use the transaction memory to do better than CTFT before reputation kicks in?
 
     @classmethod
-    def _rank_tier(cls, score: float) -> int:
-        """Map a reputation score to its rank tier.
+    def _trust_tier(cls, score: float) -> int:
+        """Map a reputation score to its trust tier.
 
-        Walks RANK_TIERS top-down, returning the highest tier whose
+        Walks TIER_FLOORS top-down, returning the highest tier whose
         floor is met. Scores below the lowest floor map to 0.
         """
-        for floor, rank in reversed(cls.RANK_TIERS):
+        for floor, tier in reversed(cls.TIER_FLOORS):
             if score >= floor:
-                return rank
+                return tier
         return 0
 
-    def _publish_rank_change(self, queues, peer_uuid, score):
-        """Notify IdentityProcess of a tier crossing (BUGS.md §P2).
+    def _publish_tier_change(self, queues, peer_uuid, score):
+        """Notify IdentityProcess of a trust-tier crossing.
 
         Suppressed if the tier hasn't changed from the last publication
-        for this peer. Local IPC only — message goes on the identity
-        queue with `IdentityProtocol.rank_update`.
+        for this peer. Local IPC only — tier_update goes on the
+        identity queue; on demotion, an additional tier_lost goes on
+        the negotiation queue so in-flight tasks whose
+        capability.required_tier now exceeds the peer's new tier can
+        be cancelled. See doc/architecture/trust-tiers.md §7.2.
         """
         try:
-            new_rank = self._rank_tier(score)
+            new_tier = self._trust_tier(score)
             key = str(peer_uuid)
-            if self.peer_ranks.get(key) == new_rank:
+            old_tier = self.peer_tiers.get(key)
+            if old_tier == new_tier:
                 return
-            self.peer_ranks[key] = new_rank
-            payload = to_json_string((key, new_rank))
+            # Capture demotion before storing the new tier so
+            # NegotiationProcess sees a coherent "old → new" event.
+            is_demotion = (old_tier is not None and new_tier < old_tier)
+            self.peer_tiers[key] = new_tier
+            payload = to_json_string((key, new_tier))
             # Local IPC: no to_whom (the consumer is the local
             # IdentityProcess reading its own queue; no network egress).
-            msg = Message(CfgIds.identity, IdentityProtocol.rank_update,
+            msg = Message(CfgIds.identity, IdentityProtocol.tier_update,
                           payload, to_whom=None, from_whom=self.identity)
             queues[CfgIds.identity].put(msg, block=True, timeout=self.q_cadence)
-            self.logger.debug('Published rank_update for %s: %d (score=%.3f)' %
-                              (key, new_rank, score))
+            self.logger.debug('Published tier_update for %s: %d (score=%.3f)' %
+                              (key, new_tier, score))
+            if is_demotion:
+                lost_msg = Message(CfgIds.negotiation, IdentityProtocol.tier_lost,
+                                   payload, to_whom=None, from_whom=self.identity)
+                try:
+                    queues[CfgIds.negotiation].put(
+                        lost_msg, block=True, timeout=self.q_cadence)
+                    self.logger.info(
+                        'Published tier_lost for %s: %d -> %d',
+                        key, old_tier, new_tier)
+                except Full:
+                    self.logger.error(
+                        '_publish_tier_change: negotiation queue full')
         except Full:
-            self.logger.error('_publish_rank_change: identity queue full')
+            self.logger.error('_publish_tier_change: identity queue full')
         except Exception as err:
-            self.logger.warning('_publish_rank_change failed: %s' % err)
+            self.logger.warning('_publish_tier_change failed: %s' % err)
 
     def _compute_reputation(self, peer, req_proc, requestor):
         _probes.counter('rep.compute', 'enter')
         try:
-            peer_uuid = peer if isinstance(peer, UUID) else peer.uuid
+            # peer may be a Peer/Identity object (production), a UUID,
+            # or a uuid string (rep_req wire path). Identity.uuid is a
+            # string in this codebase, so the legacy `peer.uuid` branch
+            # below also returns a string — `peer_uuid` is the same
+            # type as the keys in self.reputations / self._coop_mode.
+            peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
             previous = 0.0
             if peer_uuid in self.reputations:
                 previous = self.reputations[peer_uuid]
-            if previous > 0.5:
+            in_coop = self._coop_mode.get(peer_uuid, False)
+            if in_coop:
+                use_pure = previous > self.COOP_EXIT
+            else:
+                use_pure = previous > self.COOP_ENTER
+            self._coop_mode[peer_uuid] = use_pure
+            if use_pure:
                 self.logger.debug('Cooperation mode')
                 rep_score = self._pure_reputation(peer)
             else:
@@ -601,16 +749,111 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                                                       CfgIds.reputation + Configuration.file_ext))
             except (OSError, IOError) as e:
                 self.logger.warning('Could not persist reputations: %s' % e)
-            # Queue a rank-update for IdentityProcess; drained by the
+            # Queue a tier-update for IdentityProcess; drained by the
             # process loop alongside forward_reputation. The spawned
             # _compute_reputation thread doesn't have access to queues
             # so it can't put directly.
-            self.pending_ranks.append((peer_uuid, rep_score))
+            self.pending_tiers.append((peer_uuid, rep_score))
             self.requested_reps.append((Reputation(peer_uuid, rep_score), req_proc, requestor))
             _probes.counter('rep.compute', 'queued')
         except Exception as e:
             _probes.counter('rep.compute', 'exception', type(e).__name__)
             self.logger.warning('_compute_reputation failed: %s' % e)
+
+    def _consensus_reputation(self, peer_uuid):
+        """Deterministic reputation score over the consensus tx chain.
+
+        Walks committed bilateral transactions involving the peer in
+        chain order and folds each counterparty-side score into an
+        exponentially-weighted moving average.  Pure function of
+        ``self.history`` and ``peer_uuid`` — no dependence on
+        ``self.identity``, ``self.reputations``, or any per-node
+        latch — so every node with the same chain state arrives at
+        the same number.  Intended for the inspector dashboard;
+        ``rep_req`` callers continue to get the identity-dependent
+        CTFT / _pure_reputation score from ``_compute_reputation``.
+
+        The counterparty side is used (mirroring _pure_reputation's
+        extraction) so the value reflects "what the network observed
+        about this peer", not "what this peer self-reported".
+        """
+        try:
+            txs = list(self.history.by_peer(peer_uuid))
+        except KeyError:
+            return 0.5
+        alpha = 1.0 - 0.5 ** (1.0 / float(self.CONSENSUS_EMA_HALF_LIFE))
+        ema = None
+        # Sort by chain index (when present) so we get true commit
+        # order even if by_peer's insertion order ever drifts from
+        # the chain — e.g. catchup() replaying out of order.
+        ordered = sorted(
+            txs,
+            key=lambda t: (t.index if t.index is not None else 0))
+        for tx in ordered:
+            if tx.p1_id is None or tx.p2_id is None:
+                continue
+            if tx.p1_id == peer_uuid:
+                cp_score = tx.p2_score
+            elif tx.p2_id == peer_uuid:
+                cp_score = tx.p1_score
+            else:
+                continue
+            if cp_score is None:
+                continue
+            # Apply the capability's transaction_weight by running the
+            # EMA update `w` times — a tier-w transaction moves the
+            # EMA exactly as far as w tier-1 transactions would. This
+            # keeps the EMA's [0,1] range intact and avoids weighting
+            # asymmetries that a single alpha*w step would introduce
+            # for w > 1 (could push the next value above 1).
+            w = self.task_weights.get(str(tx.task_id), 1)
+            for _ in range(max(1, int(w))):
+                if ema is None:
+                    ema = float(cp_score)
+                else:
+                    ema = alpha * float(cp_score) + (1.0 - alpha) * ema
+        return 0.5 if ema is None else ema
+
+    def _compute_consensus_reputation(self, peer, req_proc, requestor):
+        _probes.counter('rep.consensus', 'enter')
+        try:
+            # See _compute_reputation for the peer-type contract.
+            peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
+            rep_score = self._consensus_reputation(peer_uuid)
+            # Deliberately not writing self.reputations[peer_uuid] —
+            # that dict feeds _compute_reputation's mode selection
+            # and _pure_reputation's counterparty weighting, so
+            # overwriting it with the consensus value would corrupt
+            # the local trust path for any rep_req caller.
+            self.requested_reps.append(
+                (Reputation(peer_uuid, rep_score), req_proc, requestor))
+            _probes.counter('rep.consensus', 'queued')
+        except Exception as e:
+            _probes.counter('rep.consensus', 'exception', type(e).__name__)
+            self.logger.warning(
+                '_compute_consensus_reputation failed: %s' % e)
+
+    def handle_consensus_reputation_request(self, _, message):
+        if message.function != ReputationProtocol.consensus_rep_req:
+            return False
+        if isinstance(message.obj, str):
+            parsed = from_json_string(message.obj)
+        else:
+            parsed = message.obj
+        if isinstance(parsed, dict):
+            ident = parsed.get('peer_uuid')
+            req_proc = parsed.get('requesting_process')
+        elif isinstance(parsed, (list, tuple)) and len(parsed) >= 2:
+            ident, req_proc = parsed[0], parsed[1]
+        else:
+            self.logger.error(
+                'handle_consensus_reputation_request: unsupported '
+                'payload shape %r' % type(parsed).__name__)
+            return True
+        requestor = message.from_whom
+        self._spawn(self._compute_consensus_reputation,
+                    args=(ident, req_proc, requestor))
+        return True
 
     def handle_reputation_request(self, _, message):
         if message.function == ReputationProtocol.rep_req:
@@ -731,10 +974,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                                 self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
                 _probes.counter('proc.reputation', 'iter_drained', str(drained))
                 self.forward_reputation(queues)
-                # Drain rank updates queued by _compute_reputation.
-                while self.pending_ranks:
-                    peer_uuid, rep_score = self.pending_ranks.pop(0)
-                    self._publish_rank_change(queues, peer_uuid, rep_score)
+                # Drain tier updates queued by _compute_reputation.
+                while self.pending_tiers:
+                    peer_uuid, rep_score = self.pending_tiers.pop(0)
+                    self._publish_tier_change(queues, peer_uuid, rep_score)
 
                 present = now().timestamp()
                 for req in list(self.requests):

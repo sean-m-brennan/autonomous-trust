@@ -312,6 +312,7 @@ cleanup:
 #define HARNESS_MAX_BLOBS  8
 
 static int _build_voters_from_participants(json_t *parts, json_t *ranks,
+                                           json_t *tiers,
                                            agreement_voter_t *out_voters,
                                            size_t *out_count,
                                            char *err, size_t err_len) {
@@ -341,6 +342,14 @@ static int _build_voters_from_participants(json_t *parts, json_t *ranks,
             if (json_is_integer(r)) rank = (int)json_integer_value(r);
         }
         out_voters[i].rank = rank;
+        /* Trust tier — drives AgreementByTrust (PoT). 0 by default;
+         * unused by PoA/PoS/PoW. */
+        int tier = 0;
+        if (json_is_object(tiers)) {
+            json_t *t = json_object_get(tiers, id);
+            if (json_is_integer(t)) tier = (int)json_integer_value(t);
+        }
+        out_voters[i].tier = tier;
     }
     *out_count = n;
     return 0;
@@ -376,8 +385,9 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
         return -1;
     }
     json_t *ranks_j = json_object_get(fixtures_j, "ranks");
+    json_t *tiers_j = json_object_get(fixtures_j, "tiers");
 
-    if (_build_voters_from_participants(parts_j, ranks_j,
+    if (_build_voters_from_participants(parts_j, ranks_j, tiers_j,
                                         voters, &voter_count,
                                         err, err_len) != 0) {
         return -1;
@@ -419,6 +429,17 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
         if (agreement_by_authority_create(me, others, other_count, threshold, &proto) != 0
             || proto == NULL) {
             snprintf(err, err_len, "scenario: authority_create failed");
+            goto cleanup;
+        }
+    } else if (strcmp(impl, "trust") == 0) {
+        /* PoT: parallel to authority but gates on voter.tier. The
+         * `tiers` fixture (peer_id -> int) was already folded into
+         * voters[].tier above via _build_voters_from_participants. */
+        json_t *thr_j = json_object_get(fixtures_j, "threshold_tier");
+        int threshold = json_is_integer(thr_j) ? (int)json_integer_value(thr_j) : 0;
+        if (agreement_by_trust_create(me, others, other_count, threshold, &proto) != 0
+            || proto == NULL) {
+            snprintf(err, err_len, "scenario: trust_create failed");
             goto cleanup;
         }
     } else if (strcmp(impl, "stake") == 0) {

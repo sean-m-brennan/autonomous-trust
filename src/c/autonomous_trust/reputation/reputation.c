@@ -43,9 +43,172 @@ int tx_history_create(tx_history_t **hist)
 int tx_history_init(tx_history_t *hist)
 {
     hist->chain_len = 0;
+    hist->evicted_ring_head = 0;
+    hist->evicted_ring_len = 0;
     int err = map_init(&hist->task_map);
     if (err != 0) return err;
-    return map_init(&hist->peer_map);
+    err = map_init(&hist->peer_map);
+    if (err != 0) return err;
+    return map_init(&hist->evicted_set);
+}
+
+/* Evict chain[0] FIFO-style: drop its task_map entry, scrub
+ * slot-0 references from peer_map (decrementing every other
+ * slot index by 1 to track the memmove), then shift the chain
+ * down and renumber tx->index across the remainder. O(N) per
+ * eviction; with N=200, ~3 µs on modern hardware.
+ *
+ * Mirrors TransactionHistory._evict_oldest in
+ * src/autonomous-trust/.../reputation/reputation.py — keep
+ * semantics aligned (FIFO, full task_map + peer_map cleanup).
+ */
+/* Frama-C: skipped — [solver-timeout] memmove + map iteration */
+static void tx_history_evict_oldest(tx_history_t *hist)
+{
+    if (hist->chain_len <= 0)
+        return;
+
+    /* Stash the evicted tx's identifiers before we shift over it. */
+    transaction_t evicted = hist->chain[0];
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(evicted.task_uuid, task_str);
+
+    /* 1. Drop evicted's task_map entry. */
+    map_remove(&hist->task_map, task_str);
+
+    /* 1a. Push the evicted task_uuid onto the tombstone ring. If the
+     * ring is full, the displaced key must first be removed from
+     * the evicted_set so it doesn't outlive its slot. Mirrors
+     * Python's _evicted_task_ids OrderedDict pop. */
+    if (hist->evicted_ring_len == MAX_CHAIN_LEN)
+    {
+        map_remove(&hist->evicted_set,
+                   hist->evicted_ring[hist->evicted_ring_head]);
+    }
+    else
+    {
+        hist->evicted_ring_len++;
+    }
+    snprintf(hist->evicted_ring[hist->evicted_ring_head],
+             sizeof(hist->evicted_ring[0]), "%s", task_str);
+    map_set(&hist->evicted_set,
+            hist->evicted_ring[hist->evicted_ring_head],
+            integer_data(1));
+    hist->evicted_ring_head =
+        (hist->evicted_ring_head + 1) % MAX_CHAIN_LEN;
+
+    /* 2. Decrement every other task_map value by 1 to follow the
+     *    memmove of the chain. */
+    map_key_t tkey = NULL;
+    data_t *tval = NULL;
+    map_entries_for_each(&hist->task_map, tkey, tval)
+    {
+        int ival = 0;
+        data_integer(tval, &ival);
+        /* Replace with a new integer_data; map_set takes ownership
+         * via the smart-pointer layer. */
+        map_set(&hist->task_map, tkey, integer_data(ival - 1));
+    }
+    map_end_for_each
+
+    /* 3. peer_map cleanup. For each peer that the evicted tx
+     *    referenced (and we don't know all peers without scanning),
+     *    the slot-0 reference must be removed. Easier and safer:
+     *    walk every peer_map entry, remove slot-0 from its array
+     *    (if present), decrement the rest. Drop empty arrays.
+     *
+     *    O(num_peers * avg_per_peer) per eviction. With N=200 and
+     *    a handful of peers this is microseconds. */
+    array_t *peer_keys = map_keys(&hist->peer_map);
+    array_t empty_peers;
+    array_init(&empty_peers);
+    for (size_t pi = 0; pi < array_size(peer_keys); pi++)
+    {
+        data_t *kdat = NULL;
+        if (array_get(peer_keys, (int)pi, &kdat) != 0)
+            continue;
+        char *pkey = NULL;
+        if (data_string_ptr(kdat, &pkey) != 0 || pkey == NULL)
+            continue;
+        data_t *pval = NULL;
+        if (map_get(&hist->peer_map, pkey, &pval) != 0 || pval == NULL)
+            continue;
+        void *arr_ptr = NULL;
+        data_object_ptr(pval, &arr_ptr);
+        array_t *arr = (array_t *)arr_ptr;
+        if (arr == NULL)
+            continue;
+
+        /* Rewrite the array in-place: skip any slot-0 entries
+         * (evicted ones; may legitimately appear more than once
+         * because tx_history_update calls _map_peers on both the
+         * p1-only and the completed states for the p1 side),
+         * decrement everything else. */
+        size_t write_idx = 0;
+        size_t arr_n = array_size(arr);
+        for (size_t ri = 0; ri < arr_n; ri++)
+        {
+            data_t *idat = NULL;
+            if (array_get(arr, (int)ri, &idat) != 0)
+                continue;
+            int ival = 0;
+            data_integer(idat, &ival);
+            if (ival <= 0)
+                continue;  /* evicted */
+            array_set(arr, (int)write_idx,
+                      integer_data(ival - 1));
+            write_idx++;
+        }
+        /* Trim any stale tail. array_set doesn't shrink; pop until
+         * size == write_idx. */
+        while (array_size(arr) > write_idx)
+        {
+            data_t *tail = NULL;
+            if (array_get(arr, (int)(array_size(arr) - 1), &tail) == 0
+                && tail != NULL)
+                array_remove(arr, tail);
+            else
+                break;
+        }
+        if (array_size(arr) == 0)
+        {
+            /* Defer the map_remove — modifying the map while we're
+             * iterating via map_keys is unsafe. */
+            data_t *marker = string_data(pkey, strlen(pkey));
+            array_append(&empty_peers, marker);
+        }
+    }
+    for (size_t ei = 0; ei < array_size(&empty_peers); ei++)
+    {
+        data_t *kdat = NULL;
+        if (array_get(&empty_peers, (int)ei, &kdat) != 0)
+            continue;
+        char *pkey = NULL;
+        if (data_string_ptr(kdat, &pkey) == 0 && pkey != NULL)
+        {
+            data_t *pval = NULL;
+            if (map_get(&hist->peer_map, pkey, &pval) == 0
+                && pval != NULL)
+            {
+                void *arr_ptr = NULL;
+                data_object_ptr(pval, &arr_ptr);
+                if (arr_ptr != NULL)
+                {
+                    array_free((array_t *)arr_ptr);
+                    smrt_deref(arr_ptr);
+                }
+            }
+            map_remove(&hist->peer_map, pkey);
+        }
+    }
+    array_free(&empty_peers);
+
+    /* 4. Memmove the chain down, renumber tx->index in the remainder. */
+    memmove(&hist->chain[0], &hist->chain[1],
+            (size_t)(hist->chain_len - 1) * sizeof(transaction_t));
+    hist->chain_len--;
+    for (int i = 0; i < hist->chain_len; i++)
+        hist->chain[i].index = i;
 }
 
 void tx_history_destroy(tx_history_t *hist)
@@ -81,9 +244,25 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
 
     if (idx < 0)
     {
-        /* Create new transaction */
+        /* Tombstone check: refuse to reanimate a task we already
+         * committed and rolled out of the chain. Without this,
+         * late `committed` broadcasts (common when handle_accepted's
+         * dedup window is exceeded) would build a half-completed
+         * Transaction in task_map that the counterparty's late
+         * `committed` would complete and re-insert at the head of
+         * the chain. Mirrors Python's _evicted_task_ids guard in
+         * TransactionHistory.update. */
+        data_t *tombstoned = NULL;
+        if (map_get((map_t *)&hist->evicted_set, task_str, &tombstoned) == 0)
+            return 0;
+
+        /* Create new transaction. Evict the oldest entry when the
+         * cap is reached so the chain stays bounded. Eviction shifts
+         * all surviving slot indices down by 1, so any previously-
+         * looked-up idx values (none in this branch — we're in the
+         * "no existing tx for this task" arm) would be stale. */
         if (hist->chain_len >= MAX_CHAIN_LEN)
-            return EXCEPTION(EREP_CHAIN_FULL);
+            tx_history_evict_oldest(hist);
 
         idx = hist->chain_len;
         transaction_t *tx = &hist->chain[idx];
@@ -268,7 +447,10 @@ void tx_history_free(tx_history_t *hist)
     }
     map_end_for_each
     map_free(&hist->peer_map);
+    map_free(&hist->evicted_set);
     hist->chain_len = 0;
+    hist->evicted_ring_head = 0;
+    hist->evicted_ring_len = 0;
 }
 
 /****************************
@@ -328,7 +510,7 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
             continue;
 
         if (hist->chain_len >= MAX_CHAIN_LEN)
-            return EXCEPTION(EREP_CHAIN_FULL);
+            tx_history_evict_oldest(hist);
 
         transaction_t *tx = &hist->chain[hist->chain_len];
         memset(tx, 0, sizeof(transaction_t));
@@ -428,7 +610,8 @@ void reputations_free(reputations_t *reps)
  *   Return sum / count
  */
 double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
-                       const uuid_t peer_uuid)
+                       const uuid_t peer_uuid,
+                       const map_t *task_weights)
 {
     transaction_t txns[MAX_CHAIN_LEN];
     int count = 0;
@@ -438,7 +621,7 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
         return 0.5;  /* Default neutral reputation */
 
     double sum = 0.0;
-    int valid = 0;
+    int total_weight = 0;
 
     for (int i = 0; i < count; i++)
     {
@@ -465,14 +648,31 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
         double cp_rep = 0.5;
         reputations_get(reps, counterparty, &cp_rep);
 
-        sum += counterparty_score * cp_rep;
-        valid++;
+        /* Per-task transaction_weight from the cache. Lookup failure
+         * → 1 (the conservative tier-0 default). NULL map → 1. */
+        int w = 1;
+        if (task_weights != NULL)
+        {
+            char tk[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(tx->task_uuid, tk);
+            data_t *w_dat = NULL;
+            if (map_get((map_t *)task_weights, tk, &w_dat) == 0
+                && w_dat != NULL)
+            {
+                int wv = 0;
+                if (data_integer(w_dat, &wv) == 0 && wv > 0)
+                    w = wv;
+            }
+        }
+
+        sum += counterparty_score * cp_rep * (double)w;
+        total_weight += w;
     }
 
-    if (valid == 0)
+    if (total_weight == 0)
         return 0.5;
 
-    return sum / (double)valid;
+    return sum / (double)total_weight;
 }
 
 /**
@@ -553,15 +753,90 @@ double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *re
  * - Else: use game-theoretic tit-for-tat
  */
 double reputation_compute(const tx_history_t *hist, const reputations_t *reps,
-                          const uuid_t self_uuid, const uuid_t peer_uuid)
+                          const uuid_t self_uuid, const uuid_t peer_uuid,
+                          const map_t *task_weights)
 {
     double current_score = 0.5;
     reputations_get(reps, peer_uuid, &current_score);
 
     if (current_score > 0.5)
-        return reputation_pure(hist, reps, peer_uuid);
+        return reputation_pure(hist, reps, peer_uuid, task_weights);
     else
         return reputation_contrite_tft(hist, reps, self_uuid, peer_uuid);
+}
+
+/**
+ * Consensus reputation — ports repprocess.py:_consensus_reputation.
+ *
+ * EMA over the counterparty-side score of every committed bilateral tx
+ * involving @p peer_uuid, walked in chain order. Pure function of
+ * @p hist — no self identity, no current reputations, no per-peer
+ * latch — so every node with the same chain arrives at the same value.
+ * Drives the dashboard's consensus_rep_req channel.
+ *
+ *   - No history or no bilateral txs → 0.5 (neutral)
+ *   - First tx                       → ema = counterparty_score
+ *   - Subsequent txs                 → ema = α·x + (1-α)·ema,
+ *                                      α = 1 - 0.5^(1/HALF_LIFE)
+ */
+double reputation_consensus(const tx_history_t *hist, const uuid_t peer_uuid,
+                            const map_t *task_weights)
+{
+    transaction_t txns[MAX_CHAIN_LEN];
+    int count = 0;
+    tx_history_by_peer(hist, peer_uuid, txns, &count, MAX_CHAIN_LEN);
+    if (count == 0)
+        return 0.5;
+
+    const double alpha = 1.0 - pow(0.5, 1.0 / (double)CONSENSUS_EMA_HALF_LIFE);
+    double ema = 0.0;
+    bool seeded = false;
+
+    /* tx_history_by_peer fills the array in insertion order, which is
+     * chain order in steady state. We deliberately don't sort by
+     * transaction_t.index here: the Python twin sorts as a defensive
+     * measure for catchup() replays, but the C tx_history insertion
+     * path always appends, so insertion order is chain order. */
+    for (int i = 0; i < count; i++)
+    {
+        const transaction_t *tx = &txns[i];
+        if (!tx->p1_set || !tx->p2_set)
+            continue;
+        double cp_score;
+        if (uuid_compare(tx->p1_uuid, peer_uuid) == 0)
+            cp_score = tx->p2_score;
+        else if (uuid_compare(tx->p2_uuid, peer_uuid) == 0)
+            cp_score = tx->p1_score;
+        else
+            continue;
+        /* Per-task transaction_weight: a tier-w transaction moves the
+         * EMA exactly as far as w tier-1 transactions would. Mirrors
+         * Python's _consensus_reputation inner `for _ in range(w)`. */
+        int w = 1;
+        if (task_weights != NULL)
+        {
+            char tk[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(tx->task_uuid, tk);
+            data_t *w_dat = NULL;
+            if (map_get((map_t *)task_weights, tk, &w_dat) == 0
+                && w_dat != NULL)
+            {
+                int wv = 0;
+                if (data_integer(w_dat, &wv) == 0 && wv > 0)
+                    w = wv;
+            }
+        }
+        for (int k = 0; k < w; k++)
+        {
+            if (!seeded) {
+                ema = cp_score;
+                seeded = true;
+            } else {
+                ema = alpha * cp_score + (1.0 - alpha) * ema;
+            }
+        }
+    }
+    return seeded ? ema : 0.5;
 }
 
 /* paxos_id_index is now provided by algorithms/paxos.c */

@@ -41,6 +41,7 @@ from uuid import UUID, uuid5
 from autonomous_trust.core.algorithms.agreement import AgreementProof, AgreementVoter
 from autonomous_trust.core.algorithms.authority import AgreementByAuthority
 from autonomous_trust.core.algorithms.stake import AgreementByStake
+from autonomous_trust.core.algorithms.trust import AgreementByTrust
 from autonomous_trust.core.algorithms.work import AgreementByWork
 from autonomous_trust.core.identity import Identity
 from autonomous_trust.core.identity.encrypt import Encryptor
@@ -91,6 +92,15 @@ class _StakeImpl(AgreementByStake):
 
 class _AuthorityImpl(AgreementByAuthority):
     """Concrete AgreementByAuthority for the harness (override _pre_verify only)."""
+
+    def _pre_verify(self, blob, proof, sig) -> bool:  # noqa: ARG002
+        return True
+
+
+class _TrustImpl(AgreementByTrust):
+    """Concrete AgreementByTrust for the harness (override _pre_verify only).
+    Mirrors _AuthorityImpl shape — PoT is the trust-tier parallel to PoA.
+    """
 
     def _pre_verify(self, blob, proof, sig) -> bool:  # noqa: ARG002
         return True
@@ -189,17 +199,23 @@ class AgreementAdapter:
         participants = spec['participants']
 
         ranks = fixtures.get('ranks', {}) or {}
+        # Trust-tier fixture, mirrors `ranks` shape: voter_id -> int.
+        # Defaulted to 0 per voter when absent. Drives PoT
+        # (AgreementByTrust); unused for PoA/POS/POW.
+        tiers = fixtures.get('tiers', {}) or {}
         impl_name = fixtures.get('impl', 'authority')
         myself_id = fixtures.get('myself')
         if myself_id is None:
             raise AssertionError("fixtures.myself is required")
         threshold = int(fixtures.get('threshold_rank', 0))
+        threshold_tier = int(fixtures.get('threshold_tier', 0))
 
-        # Build voters with deterministic seeds + ranks from the fixture.
+        # Build voters with deterministic seeds + ranks/tiers from the fixture.
         identities: dict[str, Identity] = {}
         for idx, spec_p in enumerate(participants):
             pid = spec_p['id']
             rank = int(ranks.get(pid, 0))
+            tier = int(tiers.get(pid, 0))
             uuid = uuid5(_NS, f'agreement:{pid}')
             sig_seed = _stretch(pid, b'sig')
             enc_seed = _stretch(pid, b'enc')
@@ -207,7 +223,7 @@ class AgreementAdapter:
                 uuid, f'10.0.42.{idx + 1}', f'{pid}.agree', pid,
                 Signature(sig_seed, public_only=False),
                 Encryptor(enc_seed, public_only=False),
-                'me', False, rank, 'authority',
+                'me', False, rank, 'authority', _tier=tier,
             )
 
         if myself_id not in identities:
@@ -217,6 +233,8 @@ class AgreementAdapter:
 
         if impl_name == 'authority':
             protocol = _AuthorityImpl(myself, peers, threshold_rank=threshold)
+        elif impl_name == 'trust':
+            protocol = _TrustImpl(myself, peers, threshold_tier=threshold_tier)
         elif impl_name == 'stake':
             stakes = self._resolve_stakes(fixtures.get('stakes', {}) or {}, identities)
             protocol = _StakeImpl(myself, peers, stakes)

@@ -75,6 +75,8 @@ int capability_sync_out(capability_t *capability, AutonomousTrust__Core__Protobu
         AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA_MAP__INIT;
     memcpy(proto->arg_types, &tmp, sizeof(tmp));
     map_sync_out(&capability->arguments, proto->arg_types);
+    proto->required_tier = capability->required_tier;
+    proto->transaction_weight = capability->transaction_weight;
     return 0;
 }
 
@@ -94,6 +96,11 @@ int capability_sync_in(AutonomousTrust__Core__Protobuf__Processes__Capability *p
 {
     strncpy(capability->name, proto->name, CAP_NAMELEN);
     map_sync_in(proto->arg_types, &capability->arguments);
+    capability->required_tier = proto->required_tier;
+    /* proto3 default 0 means "not set"; treat as weight 1 so peers
+     * without the field on the wire interoperate. */
+    capability->transaction_weight =
+        proto->transaction_weight > 0 ? proto->transaction_weight : 1;
     return 0;
 }
 
@@ -238,6 +245,12 @@ static int capability_to_json_obj(const capability_t *cap, json_t **obj_ptr)
     if (json_object_set_new(obj, "name", json_string(cap->name)) != 0)
         return EXCEPTION(EJSN_OBJ_SET);
 
+    /* Trust-tier metadata — mirrors Python Capability.to_dict (which
+     * now emits required_tier + transaction_weight). Both fields are
+     * always written; readers tolerate absence via 0 defaults. */
+    json_object_set_new(obj, "required_tier", json_integer(cap->required_tier));
+    json_object_set_new(obj, "transaction_weight", json_integer(cap->transaction_weight));
+
     /* Serialize arguments map as { arg_name: type_string, ... } */
     json_t *args = json_object();
     if (map_size((map_t *)&cap->arguments) > 0) {
@@ -262,6 +275,16 @@ static int capability_from_json_obj(const json_t *obj, capability_t *cap)
         return -1;
     strncpy(cap->name, name, CAP_NAMELEN);
     cap->local = false;
+
+    /* Trust-tier metadata: optional in JSON (absent → 0 / 1 defaults
+     * via the 0 → 1 sentinel on transaction_weight). */
+    json_t *rt = json_object_get(obj, "required_tier");
+    cap->required_tier = (rt != NULL && json_is_integer(rt))
+        ? (int)json_integer_value(rt) : 0;
+    json_t *tw = json_object_get(obj, "transaction_weight");
+    int w = (tw != NULL && json_is_integer(tw))
+        ? (int)json_integer_value(tw) : 0;
+    cap->transaction_weight = w > 0 ? w : 1;
 
     map_init(&cap->arguments);
     json_t *args = json_object_get(obj, "arguments");
@@ -408,6 +431,11 @@ int build_local_capabilities(const char *my_uuid, array_t **caps_out)
         map_init(&cap->arguments);
         cap->local = true;
         cap->function = NULL;  /* don't expose function pointer */
+        cap->required_tier = src->required_tier;
+        /* weight 0 in capability_table means "use default 1" — same
+         * sentinel as the proto wire form. */
+        cap->transaction_weight = src->transaction_weight > 0
+            ? src->transaction_weight : 1;
         data_t *cap_dat = object_ptr_data(cap, sizeof(capability_t));
         array_append(*caps_out, cap_dat);
     }

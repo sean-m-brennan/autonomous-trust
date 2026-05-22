@@ -71,15 +71,17 @@ void identity_set_own_capabilities(const process_t *proc,
  *  `peer_caps_count` expected_state key. */
 int identity_get_peer_caps_count(const uuid_t uuid);
 
-/** Return the reputation-derived rank tier last published for @p uuid via
- *  the ID_RANK local-IPC handler (handle_rank_update). Returns 0 if no
- *  entry exists. The map is populated by ReputationProcess crossing a
- *  RANK_TIERS boundary. Mirrors Python's per-peer `peer._rank` field
- *  consulted by AgreementByAuthority voter weighting (BUGS.md §P2). */
-int identity_get_peer_rank(const uuid_t uuid);
+/** Return the reputation-derived trust tier last published for @p uuid
+ *  via the ID_TIER local-IPC handler (handle_tier_update). Returns 0 if
+ *  no entry exists. The map is populated by ReputationProcess crossing
+ *  a TIER_FLOORS boundary. Mirrors Python's per-peer `peer._tier`
+ *  field consulted by negotiation's capability tier-gate. Distinct
+ *  from topology rank (identity_t::rank); see
+ *  doc/architecture/trust-tiers.md §1. */
+int identity_get_peer_tier(const uuid_t uuid);
 
-/** Return the rank last applied to the local identity via ID_RANK. */
-int identity_get_self_rank(void);
+/** Return the trust tier last applied to the local identity via ID_TIER. */
+int identity_get_self_tier(void);
 
 /** Read the current partition-recovery target group uuid (string) into
  *  @p out. Returns the number of bytes written (excluding the trailing

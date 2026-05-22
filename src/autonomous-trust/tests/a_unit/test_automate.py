@@ -82,8 +82,14 @@ class TestAutonomousTrustInit:
 
     def test_add_worker(self, setup_teardown):
         at = AutonomousTrust(multiproc=False, logfile=Configuration.log_stdout)
+        baseline = len(at._additional_workers)
         at.add_worker(MagicMock, ['dep1'])
-        assert len(at._additional_workers) == 1
+        # `baseline` covers AT-core pre-registered workers (e.g. the
+        # BootstrapWorker added in __init__ when AT_BOOTSTRAP_DISABLED
+        # is unset); the assertion is `+1` rather than `==1` so future
+        # core workers don't break this test.
+        assert len(at._additional_workers) == baseline + 1
+        assert at._additional_workers[-1][0] is MagicMock
 
 
 class TestTaskingTick:
@@ -122,7 +128,12 @@ class TestAutonomousAbility:
                              logfile=Configuration.log_stdout)
         queues = {}
         at.autonomous_ability(queues)
-        assert len(at.capabilities.to_list()) == 0
+        # Slice 4a (bootstrap corpus) auto-registers three at.*
+        # capabilities at __init__ unless AT_BOOTSTRAP_DISABLED is
+        # set; with testing=False no further test caps are added.
+        assert sorted(at.capabilities.to_list()) == sorted([
+            'at.handshake', 'at.time-attest', 'at.echo-challenge',
+        ])
 
 
 class TestFailedTaskCb:

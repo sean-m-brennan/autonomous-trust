@@ -120,6 +120,87 @@ class TestTransactionHistory:
         assert len(th) == 1
         assert th[tid] is tx
 
+    def test_eviction_caps_chain_length(self):
+        # Lockstep with the C twin's test_tx_history_eviction in
+        # src/c/test/reputation2_test.c — both confirm FIFO eviction
+        # at max_chain_len so divergence fails one language's tests
+        # immediately. shared is always the p2 (second update) so we
+        # avoid the long-standing _map_peers double-append for the
+        # p1 side; this test is about eviction, not the bilateral
+        # mapping quirk.
+        cap = 3
+        th = TransactionHistory(max_chain_len=cap)
+        shared = uuid4()
+        tids = []
+        for _ in range(cap + 2):
+            tid = uuid4()
+            tids.append(tid)
+            th.update(tid, uuid4(), 0.7)
+            th.update(tid, shared, 0.3)
+        assert len(th) == cap
+        # Oldest 2 task_ids were evicted from the task map.
+        for tid in tids[:2]:
+            assert tid not in th
+        # Most recent are present.
+        for tid in tids[-cap:]:
+            assert tid in th
+        # by_peer for the shared p2 peer is bounded by the residency
+        # window, not by the total number of inserts.
+        assert len(th.by_peer(shared)) == cap
+
+    def test_eviction_keeps_tx_index_monotonic(self):
+        th = TransactionHistory(max_chain_len=3)
+        for i in range(5):
+            tid = uuid4()
+            th.update(tid, uuid4(), 0.5)
+            th.update(tid, uuid4(), 0.6)
+        # Indices in the resident chain should be 2, 3, 4 — preserved
+        # across evictions so era() and catchup() remain coherent.
+        assert [tx.index for tx in th._chain] == [2, 3, 4]
+        assert th._first_index == 2
+        assert th._next_index == 5
+        # era() takes absolute indices and clips below the window.
+        assert len(th.era(0)) == 3
+        assert len(th.era(3)) == 2
+
+    def test_env_var_overrides_default_cap(self, monkeypatch):
+        monkeypatch.setenv('AT_TX_HISTORY_CAP', '7')
+        th = TransactionHistory()
+        assert th.max_chain_len == 7
+
+    def test_constructor_arg_beats_env(self, monkeypatch):
+        monkeypatch.setenv('AT_TX_HISTORY_CAP', '7')
+        th = TransactionHistory(max_chain_len=11)
+        assert th.max_chain_len == 11
+
+    def test_evicted_task_does_not_reanimate(self):
+        # Late `committed` broadcasts arrive at every peer's
+        # handle_committed, which calls history.update without
+        # knowing whether the task was already rolled out. Once a
+        # task_id has been evicted, update() must refuse to re-add
+        # it — otherwise a half-completed Transaction lingers in
+        # _task_mapping and any counterparty-side late broadcast
+        # would complete it and re-insert it at the head of the
+        # chain. See TransactionHistory class docstring.
+        cap = 3
+        th = TransactionHistory(max_chain_len=cap)
+        first_tid = uuid4()
+        # Fill the chain past cap so first_tid is evicted.
+        for i in range(cap + 2):
+            tid = first_tid if i == 0 else uuid4()
+            th.update(tid, uuid4(), 0.7)
+            th.update(tid, uuid4(), 0.3)
+        assert first_tid in th._evicted_task_ids
+        # Late "committed" for the evicted task — both sides.
+        evicted_p1, evicted_p2 = uuid4(), uuid4()
+        th.update(first_tid, evicted_p1, 0.7)
+        th.update(first_tid, evicted_p2, 0.3)
+        # The chain length must not exceed cap, the evicted task
+        # must not be re-added, and _task_mapping must not be
+        # poisoned with a half-completed orphan.
+        assert len(th) == cap
+        assert first_tid not in th._task_mapping
+
 
 class TestReputation:
     def test_init(self):
@@ -165,13 +246,18 @@ class TestReputations:
 def _stub_proc(self_uuid, reputations=None):
     """Build the minimal SimpleNamespace that _contrite_tit_for_tat /
     _pure_reputation read off ``self``: history, identity, reputations,
-    logger.  Constructing a real ReputationProcess pulls in queues,
-    keys, and a temp config dir we don't need here."""
+    logger, task_weights.  Constructing a real ReputationProcess pulls
+    in queues, keys, and a temp config dir we don't need here."""
     stub = SimpleNamespace()
     stub.history = TransactionHistory()
     stub.identity = SimpleNamespace(uuid=self_uuid)
     stub.reputations = reputations or Reputations()
     stub.logger = SimpleNamespace(debug=lambda *a, **k: None)
+    # _pure_reputation weights each TS by the originating capability's
+    # transaction_weight, looked up via self.task_weights[task_id]
+    # (doc/architecture/trust-tiers.md §5). Default per-task weight 1
+    # mirrors the production fallback when the cache is empty.
+    stub.task_weights = {}
     return stub
 
 

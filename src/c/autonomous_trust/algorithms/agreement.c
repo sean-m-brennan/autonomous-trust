@@ -236,6 +236,75 @@ static bool _authority_accumulate(agreement_protocol_t *proto, int *ranks, bool 
     return false;
 }
 
+/* Trust (PoT) implementation — parallel to authority but reads
+ * voter.tier instead of voter.rank. See doc/architecture/trust-tiers.md §10. */
+
+static bool _trust_pre_verify(agreement_protocol_t *proto, merkle_blob_t *blob,
+                              agreement_proof_t *proof, const uint8_t *sig, size_t sig_len)
+{
+    (void)proto; (void)blob; (void)proof; (void)sig; (void)sig_len;
+    return true;
+}
+
+static void _trust_prep_vote(agreement_protocol_t *proto)
+{
+    (void)proto;
+}
+
+/* Derive the effective threshold tier. Mirrors
+ * _authority_effective_threshold exactly but on the tier axis. */
+static int _trust_effective_threshold(const agreement_protocol_t *proto)
+{
+    if (proto->state.trust.threshold_tier >= 0)
+        return proto->state.trust.threshold_tier;
+    int n = proto->voter_count;
+    if (n <= 0)
+        return 0;
+    int *tiers = (int *)malloc(sizeof(int) * (size_t)n);
+    if (tiers == NULL)
+        return 0;
+    for (int i = 0; i < n; i++)
+        tiers[i] = proto->voters[i].tier;
+    qsort(tiers, (size_t)n, sizeof(int), _int_desc_cmp);
+    int cutoff_idx = (n / 3 > 1) ? (n / 3) : 1;
+    int result = tiers[cutoff_idx - 1];
+    free(tiers);
+    return result;
+}
+
+/* PoT _count_vote: emits (tier, approval) into the (ranks[], approvals[])
+ * channel — the channel naming is `ranks` for historical reasons but
+ * just carries whatever discriminator the impl uses. _trust_accumulate
+ * reads voters[*].tier the same way _authority_accumulate reads .rank,
+ * so the channel staying named `ranks` is harmless. */
+static void _trust_count_vote(agreement_protocol_t *proto, merkle_blob_t *blob,
+                              agreement_proof_t *proof, agreement_voter_t *voter,
+                              int *rank_out, bool *approval_out)
+{
+    (void)blob;
+    *rank_out = voter->tier;
+    if (voter->tier >= _trust_effective_threshold(proto))
+        *approval_out = proof->approval;
+    else
+        *approval_out = false;
+}
+
+static bool _trust_accumulate(agreement_protocol_t *proto, int *ranks, bool *approvals, int count)
+{
+    int leader_tier = -1;
+    for (int i = 0; i < proto->voter_count; i++)
+    {
+        if (proto->voters[i].tier > leader_tier)
+            leader_tier = proto->voters[i].tier;
+    }
+    for (int i = 0; i < count; i++)
+    {
+        if (ranks[i] == leader_tier)
+            return approvals[i];
+    }
+    return false;
+}
+
 /* Stake implementation */
 
 static bool _stake_pre_verify(agreement_protocol_t *proto, merkle_blob_t *blob,
@@ -361,6 +430,22 @@ int agreement_by_authority_create(agreement_voter_t *myself,
     (*proto)->prep_vote = _authority_prep_vote;
     (*proto)->count_vote = _authority_count_vote;
     (*proto)->accumulate_votes = _authority_accumulate;
+    return 0;
+}
+
+int agreement_by_trust_create(agreement_voter_t *myself,
+                              agreement_voter_t *others, int other_count,
+                              int threshold_tier,
+                              agreement_protocol_t **proto)
+{
+    int err = agreement_protocol_create(myself, others, other_count, AGREEMENT_TRUST, proto);
+    if (err != 0)
+        return err;
+    (*proto)->state.trust.threshold_tier = threshold_tier;
+    (*proto)->pre_verify = _trust_pre_verify;
+    (*proto)->prep_vote = _trust_prep_vote;
+    (*proto)->count_vote = _trust_count_vote;
+    (*proto)->accumulate_votes = _trust_accumulate;
     return 0;
 }
 

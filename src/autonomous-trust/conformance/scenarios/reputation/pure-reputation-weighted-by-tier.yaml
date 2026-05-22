@@ -1,0 +1,98 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: pure-reputation-weighted-by-tier
+byte_pinning: false
+description: |
+    Pins the weighted-pure aggregator math (doc/architecture/trust-tiers.md
+    §5.3). bob's local history holds two bilateral transactions between
+    `subject` and `counterparty`:
+
+        task t-w1 (weight 1): counterparty scored at 0.4
+        task t-w4 (weight 4): counterparty scored at 0.9
+
+    With counterparty's reputation = 1.0 and subject's previous
+    reputation = 0.6 (> COOP_ENTER = 0.55 → pure mode), the weighted
+    aggregator computes:
+
+        (0.4 * 1.0 * 1) + (0.9 * 1.0 * 4) = 4.0
+        total_weight = 1 + 4 = 5
+        score = 4.0 / 5 = 0.8
+
+    Without weighting (or if weights silently default to 1) the result
+    would be (0.4 + 0.9) / 2 = 0.65 — a 0.15 differential that the
+    expected_state tolerance (1e-3) catches. Pins both adapters in
+    lockstep: Python's repprocess._pure_reputation and C's
+    reputation_pure with task_weights threaded through.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: subject
+    role: subject
+  - id: counterparty
+    role: subject
+
+fixtures:
+  tx_history:
+    bob:
+      - task_id: t-w1
+        p1: subject
+        p1_score: 0.0
+        p2: counterparty
+        p2_score: 0.4
+      - task_id: t-w4
+        p1: subject
+        p1_score: 0.0
+        p2: counterparty
+        p2_score: 0.9
+
+  reputations:
+    bob:
+      # Counterparty reputation drives the cp_rep multiplier in
+      # _pure_reputation; pinning it to 1.0 isolates the weight effect.
+      counterparty: 1.0
+      # subject.previous > COOP_ENTER (0.55) means _compute_reputation
+      # takes the pure-mode branch. Hysteresis-aware: with coop_mode
+      # latched false, the gate is COOP_ENTER; with it true, COOP_EXIT.
+      # We pin coop_mode below for clarity.
+      subject: 0.6
+
+  task_weights:
+    bob:
+      t-w1: 1
+      t-w4: 4
+
+  coop_mode:
+    bob:
+      # Force pure-mode regardless of which side of the hysteresis band
+      # the previous score sits on. Without this, a future tweak to
+      # COOP_ENTER could flip the branch and the test would drift
+      # silently into CTFT mode.
+      subject: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: subject
+      proc: negotiation
+    description: |
+        alice asks bob for subject's reputation. bob's
+        handle_reputation_request spawns _compute_reputation
+        synchronously (sync_dispatch on); the pure-mode branch runs
+        with the pre-staged tx_history + task_weights and writes
+        the weighted score into bob.reputations[subject_uuid].
+
+expected_state:
+  bob:
+    # Pinned to 0.8 — the weighted aggregator result. A 0.65 result
+    # (unweighted) would fail this assertion by 0.15, well beyond the
+    # 1e-3 tolerance, catching any future regression in either
+    # adapter's weight handling.
+    reputation_of:
+      subject: 0.8

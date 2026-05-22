@@ -245,8 +245,15 @@ class NegotiationAdapter:
         spec_participants = case.data['participants']
         fixtures = case.data.get('fixtures', {}) or {}
         cap_fix: dict[str, list[str]] = fixtures.get('capabilities', {}) or {}
-        # Levels: peer-id -> level integer (0 = lowest reputation, 1 = mid).
-        level_fix: dict[str, int] = fixtures.get('peer_levels', {}) or {}
+        # Trust tiers (peer-id -> int). The harness sets `peer._tier`
+        # directly on each Identity object; production reads the same
+        # attribute in handle_invite's tier-gate. Replaces the prior
+        # hierarchy-bucket fixture.
+        tier_fix: dict[str, int] = fixtures.get('peer_tiers', {}) or {}
+        # required_tier per capability name (cap-name -> int). Applied
+        # to each participant's own_caps; handle_invite refuses an
+        # invite when sender's _tier is below this.
+        cap_tier_fix: dict[str, int] = fixtures.get('capability_tiers', {}) or {}
 
         identities: dict[str, Identity] = {}
         for idx, spec in enumerate(spec_participants):
@@ -269,15 +276,16 @@ class NegotiationAdapter:
             identity = identities[pid]
 
             # Each participant's peers list contains every OTHER participant.
+            # Apply peer_tiers fixture by setting _tier directly on the
+            # identity object before adding; handle_invite reads
+            # peer._tier via Peers.find_by_uuid.
             peers = Peers()
             for other_pid, other_id in identities.items():
                 if other_pid == pid:
                     continue
-                level = level_fix.get(other_pid)
-                if level is None:
-                    peers.add(other_id)
-                else:
-                    peers.add(other_id, level=level)
+                if other_pid in tier_fix:
+                    other_id._tier = tier_fix[other_pid]
+                peers.add(other_id)
 
             # peer_capabilities: which peers can do what. Each YAML capability
             # mapping {peer_id: [cap_name, ...]} populates the requester's view.
@@ -288,10 +296,13 @@ class NegotiationAdapter:
                 pcap.register(str(identities[peer_pid].uuid), caps)
 
             # Local capabilities: what THIS participant can do (drives
-            # invitation accept/refuse).
+            # invitation accept/refuse). Apply capability_tiers fixture
+            # by passing required_tier to register_ability.
             own_caps = Capabilities()
             for own_cap in cap_fix.get(pid, []):
-                own_caps.register_ability(own_cap, None, [], {})
+                own_caps.register_ability(
+                    own_cap, None, [], {},
+                    required_tier=cap_tier_fix.get(own_cap, 0))
 
             participant = self._build_one(pid, role, identity, peers, pcap, own_caps)
             handles[pid] = ParticipantHandle(
@@ -394,7 +405,19 @@ class NegotiationAdapter:
             task = Task(params, sender_identity, uuid=task_uuid)
             obj = task
         elif function in ('invitation', 'haggle', 'ack', 'nack', 'status request'):
-            requestor = recipient if function == 'invitation' else sender_identity
+            # `Task.requestor` is the original inviter. The requestor
+            # initiates 'invitation' and 'status request' (alice→bob),
+            # so the requestor is the sender. The worker initiates
+            # 'haggle' / 'ack' / 'nack' (bob→alice), so the requestor
+            # is the recipient. Existing handle_invite / handle_accept
+            # never read task.requestor, so the prior assignment was
+            # latently wrong — handle_tier_lost, however, walks
+            # task_stack matching task.requestor.uuid against the
+            # demoted peer, and gets the wrong answer unless the
+            # requestor is the original inviter; forward_status
+            # similarly routes by task.requestor.
+            requestor_is_sender = function in ('invitation', 'status request')
+            requestor = sender_identity if requestor_is_sender else recipient
             task = Task(params, requestor, uuid=task_uuid)
             obj = task
         elif function == 'status response':
@@ -407,6 +430,19 @@ class NegotiationAdapter:
             requestor = recipient or sender_identity
             base_task = Task(params, requestor, uuid=task_uuid)
             obj = TaskResult(task=base_task, result=payload.get('result'))
+        elif function == 'tier_lost':
+            # Local IPC from ReputationProcess: payload describes the
+            # affected peer and its new tier. handle_tier_lost reads
+            # `[peer_uuid_str, new_tier_int]`; see
+            # doc/architecture/trust-tiers.md §7.2.
+            peer_slug = payload.get('peer')
+            if peer_slug not in participants:
+                raise AssertionError(
+                    f'tier_lost: unknown peer slug {peer_slug!r}'
+                )
+            affected = participants[peer_slug].impl.identity
+            new_tier = int(payload.get('new_tier', 0))
+            obj = [str(affected.uuid), new_tier]
         else:
             raise AssertionError(f'unsupported negotiation function {function!r}')
 

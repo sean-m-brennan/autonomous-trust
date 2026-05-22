@@ -150,7 +150,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.update, self.handle_group_update)
         self.protocol.register_handler(IdentityProtocol.caps_query, self.handle_caps_query)
         self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
-        self.protocol.register_handler(IdentityProtocol.rank_update, self.handle_rank_update)
+        self.protocol.register_handler(IdentityProtocol.tier_update, self.handle_tier_update)
         self.protocol.register_handler(IdentityProtocol.partition_signal, self.handle_partition_signal)
         self.protocol.register_handler(IdentityProtocol.partition_probe, self.handle_partition_probe)
         self.protocol.register_handler(IdentityProtocol.partition_response, self.handle_partition_response)
@@ -1079,24 +1079,24 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return True
         return False
 
-    def handle_rank_update(self, _, message):
-        """Apply a reputation-derived rank to a peer (or self).
+    def handle_tier_update(self, _, message):
+        """Apply a reputation-derived trust tier to a peer (or self).
 
-        Local-only IPC from ReputationProcess (BUGS.md §P2). Mutating
-        `peer._rank` in `self.peers.all` is visible to AgreementByAuthority
-        because IdentityByAuthority shares this list as its voter set.
-        Self-rank bump updates `self.identity` so subsequent
-        `Identity.publish()` broadcasts carry the elevated rank.
+        Local-only IPC from ReputationProcess. Mutates `peer._tier`
+        (the runtime, local-view trust attribute) — distinct from
+        `peer._rank` (topology, populated from identity.json). The
+        next negotiation tier-gate sees the elevated `_tier` via the
+        local peer mirror.
         """
-        if message.function != IdentityProtocol.rank_update:
+        if message.function != IdentityProtocol.tier_update:
             return False
         try:
             payload = from_json_string(message.obj) if isinstance(
                 message.obj, (str, bytes)) else message.obj
             if not (isinstance(payload, (list, tuple)) and len(payload) >= 2):
-                self.logger.warning('handle_rank_update: bad payload %r' % payload)
+                self.logger.warning('handle_tier_update: bad payload %r' % payload)
                 return True
-            peer_uuid_str, new_rank = str(payload[0]), int(payload[1])
+            peer_uuid_str, new_tier = str(payload[0]), int(payload[1])
             target = None
             if str(self.identity.uuid) == peer_uuid_str:
                 target = self.identity
@@ -1106,17 +1106,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         target = peer
                         break
             if target is None:
-                # Rank update arrived before we have the peer's identity.
+                # Tier update arrived before we have the peer's identity.
                 # Drop quietly — the next reputation cycle will retry.
                 return True
-            old = getattr(target, '_rank', 0)
-            if old != new_rank:
-                target._rank = new_rank
-                self.logger.debug('Rank update for %s: %d -> %d' %
+            old = getattr(target, '_tier', 0)
+            if old != new_tier:
+                target._tier = new_tier
+                self.logger.debug('Tier update for %s: %d -> %d' %
                                   (getattr(target, 'nickname', peer_uuid_str),
-                                   old, new_rank))
+                                   old, new_tier))
         except Exception as err:
-            self.report_exception(err, 'handle_rank_update')
+            self.report_exception(err, 'handle_tier_update')
         return True
 
     # ------------------------------------------------------------------

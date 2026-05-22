@@ -24,6 +24,9 @@ from autonomous_trust.core.structures.merkle import SimplestBlob
 
 
 class ConcreteVoter(AgreementVoter):
+    def __init__(self, _uuid, _rank, _tier=0):
+        super().__init__(_uuid, _rank, _tier=_tier)
+
     def verify(self, *args, **kwargs):
         # Accept both legacy (proof, sig) and SignedMessage-style (smessage)
         # call conventions; AgreementProtocol.finalize was updated to pass
@@ -297,3 +300,92 @@ class TestAuthorityAccumulateLeaderAbstains:
         proto = self._build_protocol([5, 0])
         assert proto._accumulate_votes([(5, True), (0, False)]) is True
         assert proto._accumulate_votes([(5, False), (0, True)]) is False
+
+
+class TestAgreementByTrust:
+    """PoT mirrors PoA in shape but reads voter.tier. These tests pin
+    the contract from the PoA side translated to trust tiers.
+    See doc/architecture/trust-tiers.md §10."""
+
+    def _build_protocol(self, voter_tiers, threshold_tier=None):
+        from autonomous_trust.core.algorithms.trust import AgreementByTrust
+
+        class _Probe(AgreementByTrust):
+            def _pre_verify(self, blob, proof, sig):
+                return True
+
+        voters = []
+        for tier in voter_tiers:
+            voters.append(ConcreteVoter(uuid4(), 0, _tier=tier))
+        if not voters:
+            raise ValueError("need at least one voter")
+        return _Probe(voters[0], voters[1:], threshold_tier=threshold_tier)
+
+    def test_voter_tier_property(self):
+        v = ConcreteVoter(uuid4(), 1, _tier=3)
+        assert v.tier == 3
+        # default
+        v2 = ConcreteVoter(uuid4(), 1)
+        assert v2.tier == 0
+
+    def test_explicit_threshold_wins(self):
+        proto = self._build_protocol([4, 2, 1], threshold_tier=5)
+        assert proto.threshold_tier == 5
+
+    def test_derived_threshold_top_third(self):
+        # 6 voters, top 1/3 = 2 -> cutoff_idx = 1 -> second-highest tier
+        proto = self._build_protocol([4, 4, 3, 2, 1, 0])
+        assert proto.threshold_tier == 4
+
+    def test_count_vote_below_threshold_forces_false(self):
+        proto = self._build_protocol([2, 1], threshold_tier=3)
+        # Look up the tier-2 voter regardless of ordering inside
+        # protocol.voters (AgreementProtocol stores others + [myself]).
+        voter = next(v for v in proto.voters if v.tier == 2)
+        proof = MagicMock(approval=True)
+        result = proto._count_vote(MagicMock(), proof, voter)
+        # Below threshold (2 < 3): forced to False
+        assert result == (2, False)
+
+    def test_count_vote_at_or_above_threshold_keeps_approval(self):
+        proto = self._build_protocol([3, 1], threshold_tier=3)
+        voter = next(v for v in proto.voters if v.tier == 3)
+        proof_yes = MagicMock(approval=True)
+        proof_no = MagicMock(approval=False)
+        assert proto._count_vote(MagicMock(), proof_yes, voter) == (3, True)
+        assert proto._count_vote(MagicMock(), proof_no, voter) == (3, False)
+
+    def test_accumulate_leader_decides(self):
+        proto = self._build_protocol([4, 2])
+        # Leader (tier 4) approves; lower-tier voter rejects → True
+        assert proto._accumulate_votes([(4, True), (2, False)]) is True
+        # Leader rejects → False regardless of others
+        assert proto._accumulate_votes([(4, False), (2, True)]) is False
+
+    def test_accumulate_leader_absent_returns_false(self):
+        # Mirrors PoA's leader-abstain regression coverage: when the
+        # highest-tier voter didn't cast, finalize must return False
+        # (not raise KeyError).
+        proto = self._build_protocol([4, 2])
+        assert proto._accumulate_votes([(2, True)]) is False
+
+    def test_accumulate_no_votes_returns_false(self):
+        proto = self._build_protocol([4, 2])
+        assert proto._accumulate_votes([]) is False
+
+    def test_finalize_originator_short_circuits(self):
+        # AgreementProtocol.finalize returns True without consulting
+        # _count_vote when blob.originator == myself.uuid.
+        from autonomous_trust.core.algorithms.trust import AgreementByTrust
+
+        class _Probe(AgreementByTrust):
+            def _pre_verify(self, blob, proof, sig):
+                return True
+
+        me = ConcreteVoter(uuid4(), 0, _tier=1)
+        other = ConcreteVoter(uuid4(), 0, _tier=4)
+        proto = _Probe(me, [other], threshold_tier=3)
+        blob = ConcreteBlob(me.uuid)
+        # Even though me's tier (1) is below threshold (3), originator
+        # short-circuit wins.
+        assert proto.finalize(blob) is True

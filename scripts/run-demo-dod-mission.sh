@@ -163,16 +163,31 @@ done
 command -v docker >/dev/null 2>&1 || { err "docker not found"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { err "python3 not found"; exit 1; }
 
+# Build-arg plumbing for proxy-fronted sandboxes.  When the host runs
+# behind an HTTPS proxy with a custom CA (typical for development
+# sandboxes that route outbound traffic through host.docker.internal),
+# Dockerfile-devel needs http_proxy/https_proxy + CERT_CONTENT so conda
+# and apt can reach the upstream mirrors.  All of this is no-op when
+# the corresponding env vars are unset.
+build_args=()
+[[ -n "${http_proxy:-}" ]]   && build_args+=("--build-arg" "http_proxy=${http_proxy}")
+[[ -n "${https_proxy:-}" ]]  && build_args+=("--build-arg" "https_proxy=${https_proxy}")
+[[ -n "${no_proxy:-}" ]]     && build_args+=("--build-arg" "no_proxy=${no_proxy}")
+proxy_ca="/usr/local/share/ca-certificates/proxy-ca.crt"
+if [[ -r "$proxy_ca" ]]; then
+    build_args+=("--build-arg" "CERT_CONTENT=$(cat "$proxy_ca")")
+fi
+
 # Image chain — build any that are missing in the host docker daemon.
 ensure_demo_images() {
     if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
         log "Building base image: $BASE_IMAGE ..."
-        docker build --network host -t "$BASE_IMAGE" \
+        docker build --network host "${build_args[@]}" -t "$BASE_IMAGE" \
             -f "$here/src/autonomous-trust/Dockerfile-devel" "$here"
     fi
     if ! docker image inspect "$FULL_IMAGE" >/dev/null 2>&1; then
         log "Building full stack image: $FULL_IMAGE ..."
-        docker build --network host -t "$FULL_IMAGE" \
+        docker build --network host "${build_args[@]}" -t "$FULL_IMAGE" \
             -f "$here/src/Dockerfile-devel" "$here"
     fi
     # The demo image is the thin COPY layer on top of the full-devel
@@ -184,7 +199,7 @@ ensure_demo_images() {
     if (( REBUILD == 1 )) \
             || ! docker image inspect "$DEMO_IMAGE" >/dev/null 2>&1; then
         log "Building DoD mission demo image: $DEMO_IMAGE ..."
-        docker build --network host -t "$DEMO_IMAGE" \
+        docker build --network host "${build_args[@]}" -t "$DEMO_IMAGE" \
             -f "$DEPLOY_DIR/Dockerfile" "$here"
     fi
 }

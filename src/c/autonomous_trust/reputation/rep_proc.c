@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "processes/processes.h"
+#include "processes/capabilities.h"
 #include "reputation/reputation.h"
 #include "algorithms/paxos.h"
 #include "structures/map.h"
@@ -37,39 +38,44 @@
 DEFINE_ERROR(EREP_PAXOS, "Paxos consensus error");
 
 /****************************
- * Reputation-tied rank elevation — mirrors Python ReputationProcess
- * RANK_TIERS / _rank_tier / _publish_rank_change (repprocess.py:51-56,
- * 391-426). Each tier is (score_floor, rank). Walks top-down so the
- * highest matching floor wins; scores below the lowest map to 0.
+ * Reputation-derived trust-tier elevation — mirrors Python
+ * ReputationProcess TIER_FLOORS / _trust_tier / _publish_tier_change
+ * (repprocess.py:52-57, 583-619). Each entry is (score_floor, tier).
+ * Walks top-down so the highest matching floor wins; scores below
+ * the lowest map to 0.
  *
- * Keep monotonically increasing in floor and rank to preserve the
+ * Keep monotonically increasing in floor and tier to preserve the
  * walk-from-top invariant. Any change here must land in Python's
- * RANK_TIERS at the same time.
+ * TIER_FLOORS at the same time.
+ *
+ * NOTE: trust tier is distinct from network rank (peer->rank) — rank
+ * is topology / one-hop reachability, populated from identity.json.
+ * See doc/architecture/trust-tiers.md §1 for the disambiguation.
  ****************************/
 
-typedef struct { double floor; int rank; } rank_tier_t;
-static const rank_tier_t RANK_TIERS[] = {
+typedef struct { double floor; int tier; } tier_floor_t;
+static const tier_floor_t TIER_FLOORS[] = {
     {0.50, 1},
     {0.65, 2},
     {0.80, 3},
     {0.90, 4},
 };
-#define NUM_RANK_TIERS (sizeof(RANK_TIERS) / sizeof(RANK_TIERS[0]))
+#define NUM_TIER_FLOORS (sizeof(TIER_FLOORS) / sizeof(TIER_FLOORS[0]))
 
-static int _rank_tier(double score)
+static int _trust_tier(double score)
 {
-    for (int i = (int)NUM_RANK_TIERS - 1; i >= 0; i--) {
-        if (score >= RANK_TIERS[i].floor)
-            return RANK_TIERS[i].rank;
+    for (int i = (int)NUM_TIER_FLOORS - 1; i >= 0; i--) {
+        if (score >= TIER_FLOORS[i].floor)
+            return TIER_FLOORS[i].tier;
     }
     return 0;
 }
 
 /* Forward declaration — definition follows _ensure_init/state struct.
- * Emits a local-IPC rank_update to the identity process queue iff the
- * peer's tier has changed since the last publication. Mirrors Python's
- * `_publish_rank_change` in repprocess.py:402-426. */
-static void _publish_rank_change(const uuid_t peer_uuid, double score);
+ * Emits a local-IPC tier_update to the identity process queue iff the
+ * peer's trust tier has changed since the last publication. Mirrors
+ * Python's `_publish_tier_change` in repprocess.py:595-619. */
+static void _publish_tier_change(const uuid_t peer_uuid, double score);
 
 /****************************
  * Protocol-string definitions (declared `extern char[]` in
@@ -89,14 +95,22 @@ char REP_PROTO_OUTDATED[]    = "update needed";
 char REP_PROTO_UPDATE[]      = "latest update";
 char REP_PROTO_REP_REQ[]     = "request reputation";
 char REP_PROTO_REP_RESP[]    = "reputation response";
+char REP_PROTO_CONSENSUS_REP_REQ[] = "request consensus reputation";
 char REP_PROTO_LOCAL_QUERY[] = "local_rep_query";
 char REP_PROTO_LOCAL_RESP[]  = "local_rep_response";
 
-/* Local-IPC `function` field for the rank_update message reputation
- * emits to identity (BUGS.md §P2). Writable buffer so the assignment
- * to `nmsg->function` (typed `char *`) compiles under -Wwrite-strings.
- * Value must match Python IdentityProtocol.rank_update verbatim. */
-static char ID_RANK_FUNC[] = "rank_update";
+/* Local-IPC `function` field for the tier_update message reputation
+ * emits to identity. Writable buffer so the assignment to
+ * `nmsg->function` (typed `char *`) compiles under -Wwrite-strings.
+ * Value must match Python IdentityProtocol.tier_update verbatim. */
+static char ID_TIER_FUNC[] = "tier_update";
+/* Local-IPC function field for the tier_lost message reputation emits
+ * to negotiation when a peer's tier drops. Mirrors Python
+ * IdentityProtocol.tier_lost verbatim. See doc/architecture/
+ * trust-tiers.md §7.2 — negotiation's handle_tier_lost cancels any
+ * in-flight tasks whose capability.required_tier exceeds the new tier.
+ */
+static char NEG_TIER_LOST_FUNC[] = "tier_lost";
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -119,18 +133,45 @@ static struct {
      * sync dispatch). Production must leave this false; default 0
      * preserves existing behavior. */
     bool synchronous_dispatch;
-    /* Last published rank per peer uuid-string. Suppresses redundant
-     * rank_update IPC when the tier hasn't changed. Mirrors Python's
-     * self.peer_ranks in repprocess.py:100. */
-    map_t peer_ranks;
+    /* Last published trust tier per peer uuid-string. Suppresses
+     * redundant tier_update IPC when the tier hasn't changed.
+     * Mirrors Python's self.peer_tiers in repprocess.py. */
+    map_t peer_tiers;
     /* Paxos rounds already committed locally. Keyed by paxos_id_index
      * (id1,id2), value is integer_data(1) — used as a set. Prevents
      * handle_accepted from re-firing its commit block on every late
      * ACCEPTED that arrives after majority is crossed; without this,
      * the same proposer would broadcast `committed` once per peer above
      * majority, and duplicate broadcasts corrupt the bilateral
-     * Transaction (tx_history_update would set p2 = p1 = proposer). */
+     * Transaction (tx_history_update would set p2 = p1 = proposer).
+     *
+     * Capped at COMMITTED_ROUNDS_CAP (FIFO). The ring buffer tracks
+     * insertion order so we can evict the oldest key when full.
+     * Without this, the map grew without bound during long runs.
+     * Mirrors Python's OrderedDict-based ordered set in
+     * ReputationProcess.committed_paxos_rounds. */
     map_t committed_paxos_rounds;
+    char committed_paxos_ring[COMMITTED_ROUNDS_CAP][64];
+    int  committed_paxos_ring_head;  /* next slot to overwrite */
+    int  committed_paxos_ring_len;   /* up to COMMITTED_ROUNDS_CAP */
+    /* Per-peer latch for the CTFT/pure-reputation dispatch in
+     * handle_rep_request. uuid_str -> integer_data(0|1). Combined
+     * with COOP_ENTER/COOP_EXIT to give the mode switch hysteresis;
+     * mirrors Python's self._coop_mode in repprocess.py. */
+    map_t coop_mode;
+    /* Per-task transaction_weight cache (task_uuid_str -> int).
+     * Populated at proposer time (handle_grant before broadcasting
+     * REP_PROTO_TX) and at receiver time (handle_transaction) so both
+     * sides agree on the weight for any given task. Consumed by
+     * reputation_pure / reputation_consensus to apply the
+     * Capability.transaction_weight multiplier from
+     * doc/architecture/trust-tiers.md §5. FIFO-bounded at
+     * 2 * MAX_CHAIN_LEN entries; ring tracks insertion order so the
+     * oldest is evictable. Mirrors Python's self.task_weights. */
+    map_t task_weights;
+    char  task_weights_ring[2 * MAX_CHAIN_LEN][UUID_STRING_LEN + 1];
+    int   task_weights_ring_head;
+    int   task_weights_ring_len;
 } rep_state;
 
 static void _ensure_init(void)
@@ -142,8 +183,14 @@ static void _ensure_init(void)
         map_init(&rep_state.my_requests);
         map_init(&rep_state.updates);
         array_init(&rep_state.requested_reps);
-        map_init(&rep_state.peer_ranks);
+        map_init(&rep_state.peer_tiers);
         map_init(&rep_state.committed_paxos_rounds);
+        rep_state.committed_paxos_ring_head = 0;
+        rep_state.committed_paxos_ring_len = 0;
+        map_init(&rep_state.coop_mode);
+        map_init(&rep_state.task_weights);
+        rep_state.task_weights_ring_head = 0;
+        rep_state.task_weights_ring_len = 0;
         /* paxos_init is called in reputation_run after num_peers is known */
         rep_state.num_peers = 0;
         pthread_mutex_init(&rep_state.lock, NULL);
@@ -151,51 +198,161 @@ static void _ensure_init(void)
     }
 }
 
-static void _publish_rank_change(const uuid_t peer_uuid, double score)
+/* Look up the transaction_weight for a capability by name. Mirrors
+ * Python's _resolve_tx_weight: empty name → 1, unknown cap → 1,
+ * otherwise the cap's transaction_weight (clamped to ≥1 because
+ * proto3's 0-sentinel normalises to 1 in sync_from_message). */
+static int _resolve_tx_weight(const char *cap_name)
 {
-    int new_rank = _rank_tier(score);
+    if (cap_name == NULL || cap_name[0] == '\0')
+        return 1;
+    capability_t *cap = find_capability(cap_name);
+    if (cap == NULL)
+        return 1;
+    int w = cap->transaction_weight;
+    return w > 0 ? w : 1;
+}
+
+/* Insert into rep_state.task_weights with FIFO eviction at the cap.
+ * Caller must hold rep_state.lock. Refreshes order on re-insert so a
+ * recent update isn't immediately evicted by an unrelated insert —
+ * matches Python's _record_task_weight (pop-then-insert).
+ *
+ * Key type is `char *` (no const view) because that is what the
+ * project's map_t API expects; the helper copies the key into the
+ * map's internal storage and the ring buffer, so the caller's
+ * buffer lifetime is not extended beyond this call. */
+static void _record_task_weight_locked(char *task_uuid_str, int weight)
+{
+    if (task_uuid_str == NULL || task_uuid_str[0] == '\0') return;
+    /* If present, drop the existing entry from both map AND ring so
+     * the re-insert puts it at the tail. */
+    data_t *existing = NULL;
+    if (map_get(&rep_state.task_weights, task_uuid_str, &existing) == 0
+        && existing != NULL)
+    {
+        map_remove(&rep_state.task_weights, task_uuid_str);
+        /* Best-effort ring compaction: walk and remove matching slot.
+         * O(N) but N <= 2*MAX_CHAIN_LEN, and refresh hits are rare. */
+        for (int i = 0; i < rep_state.task_weights_ring_len; i++)
+        {
+            int slot = (rep_state.task_weights_ring_head
+                        - rep_state.task_weights_ring_len + i
+                        + (int)(sizeof(rep_state.task_weights_ring)
+                                / sizeof(rep_state.task_weights_ring[0])))
+                       % (int)(sizeof(rep_state.task_weights_ring)
+                               / sizeof(rep_state.task_weights_ring[0]));
+            if (strncmp(rep_state.task_weights_ring[slot],
+                        task_uuid_str, UUID_STRING_LEN) == 0)
+            {
+                rep_state.task_weights_ring[slot][0] = '\0';
+                break;
+            }
+        }
+    }
+
+    /* Insert new entry. */
+    data_t *w_dat = integer_data(weight > 0 ? weight : 1);
+    if (w_dat == NULL) return;
+    map_set(&rep_state.task_weights, task_uuid_str, w_dat);
+
+    int cap = (int)(sizeof(rep_state.task_weights_ring)
+                    / sizeof(rep_state.task_weights_ring[0]));
+    if (rep_state.task_weights_ring_len >= cap)
+    {
+        /* Evict oldest non-empty slot. */
+        int evict_slot = (rep_state.task_weights_ring_head + 1) % cap;
+        while (rep_state.task_weights_ring[evict_slot][0] == '\0'
+               && evict_slot != rep_state.task_weights_ring_head)
+        {
+            evict_slot = (evict_slot + 1) % cap;
+        }
+        if (rep_state.task_weights_ring[evict_slot][0] != '\0')
+        {
+            map_remove(&rep_state.task_weights,
+                       rep_state.task_weights_ring[evict_slot]);
+            rep_state.task_weights_ring[evict_slot][0] = '\0';
+        }
+    }
+    else
+    {
+        rep_state.task_weights_ring_len++;
+    }
+    rep_state.task_weights_ring_head =
+        (rep_state.task_weights_ring_head + 1) % cap;
+    strncpy(rep_state.task_weights_ring[rep_state.task_weights_ring_head],
+            task_uuid_str, UUID_STRING_LEN);
+    rep_state.task_weights_ring[rep_state.task_weights_ring_head][UUID_STRING_LEN] = '\0';
+}
+
+static void _publish_tier_change(const uuid_t peer_uuid, double score)
+{
+    int new_tier = _trust_tier(score);
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(peer_uuid, uuid_str);
 
     /* Dedup: skip if the tier hasn't changed from the last publication
-     * for this peer. Mirrors Python's `self.peer_ranks.get(key) == new_rank`
-     * guard in repprocess.py:412. */
+     * for this peer. Mirrors Python's `self.peer_tiers.get(key) == new_tier`
+     * guard in repprocess.py. */
     pthread_mutex_lock(&rep_state.lock);
     int prior = -1;
     data_t *prior_dat = NULL;
-    if (map_get(&rep_state.peer_ranks, uuid_str, &prior_dat) == 0 &&
+    if (map_get(&rep_state.peer_tiers, uuid_str, &prior_dat) == 0 &&
         prior_dat != NULL) {
         data_integer(prior_dat, &prior);
     }
-    if (prior == new_rank) {
+    if (prior == new_tier) {
         pthread_mutex_unlock(&rep_state.lock);
         return;
     }
-    data_t *rank_dat = integer_data(new_rank);
-    if (rank_dat != NULL)
-        map_set(&rep_state.peer_ranks, uuid_str, rank_dat);
+    /* Capture demotion BEFORE we overwrite the cache so the
+     * subsequent tier_lost emission sees a coherent old→new step.
+     * Tier 0 is the floor — prior == -1 means "never published",
+     * not a demotion. Mirrors Python's
+     * `is_demotion = (old_tier is not None and new_tier < old_tier)`
+     * in repprocess.py. */
+    bool is_demotion = (prior >= 0 && new_tier < prior);
+    data_t *tier_dat = integer_data(new_tier);
+    if (tier_dat != NULL)
+        map_set(&rep_state.peer_tiers, uuid_str, tier_dat);
     pthread_mutex_unlock(&rep_state.lock);
 
-    /* Build the rank_update payload — a 2-element JSON array
-     * [uuid_str, rank_int] matching Python's
-     * `to_json_string((key, new_rank))` in repprocess.py:415. */
+    /* Build the tier_update payload — a 2-element JSON array
+     * [uuid_str, tier_int] matching Python's
+     * `to_json_string((key, new_tier))` in repprocess.py. */
     json_t *arr = json_array();
     if (arr == NULL) return;
     json_array_append_new(arr, json_string(uuid_str));
-    json_array_append_new(arr, json_integer(new_rank));
+    json_array_append_new(arr, json_integer(new_tier));
 
     generic_msg_t ipc = {0};
     ipc.type = NET_MESSAGE;
     strncpy(ipc.info.net_msg.process, "identity", PROC_NAME_LEN);
-    ipc.info.net_msg.function = ID_RANK_FUNC;
+    ipc.info.net_msg.function = ID_TIER_FUNC;
     ipc.info.net_msg.encrypt = false;  /* local IPC, no wire egress */
     strncpy(ipc.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
     net_msg_pack_json(&ipc.info.net_msg, arr);
-    json_decref(arr);
 
     /* messaging_send keys by process name; "identity" routes to the
      * IdentityProcess queue directly, bypassing the network process. */
     messaging_send("identity", NET_MESSAGE, &ipc, false);
+
+    /* On demotion, also publish tier_lost to negotiation. The
+     * payload is identical (uuid_str, new_tier); the receiver is
+     * negotiation's handle_tier_lost, which cancels any in-flight
+     * tasks the demoted peer can no longer authorize. */
+    if (is_demotion) {
+        generic_msg_t ipc_neg = {0};
+        ipc_neg.type = NET_MESSAGE;
+        strncpy(ipc_neg.info.net_msg.process, "negotiation", PROC_NAME_LEN);
+        ipc_neg.info.net_msg.function = NEG_TIER_LOST_FUNC;
+        ipc_neg.info.net_msg.encrypt = false;
+        strncpy(ipc_neg.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+        net_msg_pack_json(&ipc_neg.info.net_msg, arr);
+        messaging_send("negotiation", NET_MESSAGE, &ipc_neg, false);
+    }
+
+    json_decref(arr);
 }
 
 /****************************
@@ -386,10 +543,21 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
     int count = paxos_record_grant(&rep_state.paxos, id1, id2, tx_score);
     bool send_tx = (count >= PAXOS_MAJORITY(rep_state.num_peers));
 
-    /* Capture task_uuid before potential removal */
+    /* Capture task_uuid + capability_name before potential removal.
+     * The proposer caches its own weight here so reputation_pure (and
+     * its EMA twin) on this side use the same weight as the
+     * receivers, who will cache via handle_transaction below. */
     char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    char cap_name_local[CAP_NAMELEN + 1] = {0};
     if (send_tx && tx != NULL)
+    {
         uuid_unparse_lower(tx->task_uuid, task_uuid_str);
+        strncpy(cap_name_local, tx->capability_name, CAP_NAMELEN);
+        cap_name_local[CAP_NAMELEN] = '\0';
+        if (task_uuid_str[0] != '\0')
+            _record_task_weight_locked(task_uuid_str,
+                                       _resolve_tx_weight(cap_name_local));
+    }
 
     if (send_tx)
     {
@@ -414,6 +582,9 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
         json_object_set_new(tx_json, "score", json_real(tx_score));
         if (task_uuid_str[0] != '\0')
             json_object_set_new(tx_json, "task_uuid", json_string(task_uuid_str));
+        if (cap_name_local[0] != '\0')
+            json_object_set_new(tx_json, "capability_name",
+                                json_string(cap_name_local));
 
         log_debug(proc->logger, "Reputation: Submit transaction score\n");
 
@@ -591,6 +762,8 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     double score = json_real_value(j_score);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
     const char *task_uuid_str = json_string_value(json_object_get(payload, "task_uuid"));
+    const char *cap_name = json_string_value(
+        json_object_get(payload, "capability_name"));
 
     if (!paxos_has_granted_id(&rep_state.paxos, (int)id2))
     {
@@ -601,6 +774,22 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
 
     /* Record the grant (score) in the paxos proposals for later acceptance tracking */
     paxos_record_grant(&rep_state.paxos, id1, id2, score);
+
+    /* Cache the per-task transaction_weight so reputation_pure /
+     * reputation_consensus can apply it when this transaction lands
+     * in the chain. Mirrors Python handle_transaction's
+     * _record_task_weight call. If the local registry doesn't know
+     * the capability, weight falls back to 1. */
+    if (task_uuid_str != NULL && task_uuid_str[0] != '\0')
+    {
+        char task_uuid_buf[UUID_STRING_LEN + 1];
+        strncpy(task_uuid_buf, task_uuid_str, UUID_STRING_LEN);
+        task_uuid_buf[UUID_STRING_LEN] = '\0';
+        pthread_mutex_lock(&rep_state.lock);
+        _record_task_weight_locked(task_uuid_buf, _resolve_tx_weight(cap_name));
+        pthread_mutex_unlock(&rep_state.lock);
+    }
+
     json_decref(payload);
 
     /* Send ACCEPTED back */
@@ -705,6 +894,33 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
         }
         data_t *mark = integer_data(1);
         map_set(&rep_state.committed_paxos_rounds, paxos_key, mark);
+        /* FIFO ring: if we're at cap, the head slot already holds the
+         * oldest key — drop it from the map before overwriting the
+         * slot. ring_len caps at COMMITTED_ROUNDS_CAP; once steady
+         * state, head wraps and each insert evicts one. Mirrors
+         * Python's OrderedDict.popitem(last=False) loop in
+         * repprocess.handle_accepted. */
+        if (rep_state.committed_paxos_ring_len == COMMITTED_ROUNDS_CAP)
+        {
+            map_remove(&rep_state.committed_paxos_rounds,
+                       rep_state.committed_paxos_ring[
+                           rep_state.committed_paxos_ring_head]);
+        }
+        else
+        {
+            rep_state.committed_paxos_ring_len++;
+        }
+        /* snprintf rather than strncpy to silence -Wstringop-truncation
+         * while still guaranteeing NUL termination. paxos_key is a
+         * compact decimal string well under 64 bytes; truncation
+         * cannot happen in practice. */
+        snprintf(rep_state.committed_paxos_ring[
+                     rep_state.committed_paxos_ring_head],
+                 sizeof(rep_state.committed_paxos_ring[0]),
+                 "%s", paxos_key);
+        rep_state.committed_paxos_ring_head =
+            (rep_state.committed_paxos_ring_head + 1)
+            % COMMITTED_ROUNDS_CAP;
 
         /* Parse UUIDs and commit to history */
         uuid_t peer_uuid;
@@ -1005,6 +1221,90 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
 }
 
 /****************************
+ * Handler: handle_consensus_rep_request (consensus reputation request)
+ *
+ * Replies with reputation_consensus(history, peer_uuid) — a
+ * deterministic, history-only EMA score every node arrives at
+ * identically given the same chain state. Backs the inspector
+ * dashboard. Deliberately skips reputations_update and the rank
+ * publish: that dict feeds the rep_req path's mode selection and
+ * pure-reputation weighting, so overwriting it with the consensus
+ * value would corrupt the local trust path for any rep_req caller.
+ * Mirrors Python's handle_consensus_reputation_request.
+ ****************************/
+
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
+static bool handle_consensus_rep_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    log_debug(proc->logger, "Reputation: consensus rep request from %s\n",
+              nmsg->from_whom.fullname);
+    probes_counter("rep.consensus", "enter", NULL);
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_error(proc->logger,
+                  "Reputation: handle_consensus_rep_request: failed to unpack JSON\n");
+        probes_counter("rep.consensus", "exception", "unpack_failed");
+        return false;
+    }
+
+    json_t *j_peer_uuid = json_object_get(payload, "peer_uuid");
+    json_t *j_req_proc  = json_object_get(payload, "requesting_process");
+    if (!j_peer_uuid || !j_req_proc)
+    {
+        json_decref(payload);
+        log_error(proc->logger,
+                  "Reputation: handle_consensus_rep_request: missing JSON fields\n");
+        return false;
+    }
+    const char *peer_uuid_str = json_string_value(j_peer_uuid);
+    const char *req_proc_str  = json_string_value(j_req_proc);
+
+    uuid_t peer_uuid;
+    double score = 0.5;
+    if (uuid_parse(peer_uuid_str, peer_uuid) == 0)
+    {
+        pthread_mutex_lock(&rep_state.lock);
+        score = reputation_consensus(&rep_state.history, peer_uuid,
+                                     &rep_state.task_weights);
+        pthread_mutex_unlock(&rep_state.lock);
+        probes_counter("rep.consensus", "queued", NULL);
+    }
+
+    json_t *resp_json = json_object();
+    if (resp_json == NULL) {
+        log_error(proc->logger, "Reputation: json_object OOM (consensus rep_resp)\n");
+        json_decref(payload);
+        return true;
+    }
+    json_object_set_new(resp_json, "peer_uuid", json_string(peer_uuid_str));
+    json_object_set_new(resp_json, "score", json_real(score));
+    json_object_set_new(resp_json, "requesting_process", json_string(req_proc_str));
+    json_decref(payload);
+
+    generic_msg_t resp = {0};
+    resp.type = NET_MESSAGE;
+    strncpy(resp.info.net_msg.process, "reputation", PROC_NAME_LEN);
+    resp.info.net_msg.function = REP_PROTO_REP_RESP;
+    resp.info.net_msg.encrypt = true;
+    memcpy(&resp.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
+    strncpy(resp.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    net_msg_pack_json(&resp.info.net_msg, resp_json);
+    json_decref(resp_json);
+
+    messaging_send("network", NET_MESSAGE, &resp, false);
+    return true;
+}
+
+/****************************
  * Handler: handle_rep_request (reputation request)
  * Compute reputation for a peer and respond.
  ****************************/
@@ -1057,19 +1357,53 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
         /* Use a dummy self uuid (zero) for now — process doesn't carry self identity */
         uuid_t self_uuid;
         uuid_clear(self_uuid);
-        score = reputation_compute(&rep_state.history, &rep_state.reputations,
-                                   self_uuid, peer_uuid);
+
+        /* Hysteresis: switch to pure mode only after the previous score
+         * crosses COOP_ENTER; fall back to CTFT only after it drops
+         * below COOP_EXIT. Mirrors Python's self._coop_mode latch in
+         * repprocess.py. A single 0.5 gate caused peers hovering near
+         * 0.5 to flip scoring functions every tick (CTFT's 0.51 →
+         * pure_reputation's 0.4 → CTFT's 0.51 → …). reputation_compute
+         * remains a single-gate pure function (used by unit tests);
+         * the hysteresis lives here, at the protocol boundary, where
+         * the per-peer state is available. */
+        double current_score = 0.0;
+        reputations_get(&rep_state.reputations, peer_uuid, &current_score);
+
+        char coop_key[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(peer_uuid, coop_key);
+        int in_coop = 0;
+        data_t *mode_dat = NULL;
+        if (map_get(&rep_state.coop_mode, coop_key, &mode_dat) == 0 &&
+            mode_dat != NULL) {
+            data_integer(mode_dat, &in_coop);
+        }
+        bool use_pure = in_coop
+            ? (current_score > COOP_EXIT)
+            : (current_score > COOP_ENTER);
+        map_set(&rep_state.coop_mode, coop_key,
+                integer_data(use_pure ? 1 : 0));
+
+        if (use_pure) {
+            score = reputation_pure(&rep_state.history,
+                                    &rep_state.reputations, peer_uuid,
+                                    &rep_state.task_weights);
+        } else {
+            score = reputation_contrite_tft(&rep_state.history,
+                                            &rep_state.reputations,
+                                            self_uuid, peer_uuid);
+        }
         reputations_update(&rep_state.reputations, peer_uuid, score);
         pthread_mutex_unlock(&rep_state.lock);
     }
 
-    /* Publish a rank_update IPC to identity if the score crossed a tier.
-     * Mirrors Python's _publish_rank_change drain in repprocess.py:577-580.
+    /* Publish a tier_update IPC to identity if the score crossed a tier.
+     * Mirrors Python's _publish_tier_change drain in repprocess.py.
      * Done inline here (rather than queued) because handle_rep_request
      * already holds the send context; Python uses a queue because its
      * _compute_reputation runs in a spawned thread without queue access. */
     if (have_uuid) {
-        _publish_rank_change(peer_uuid, score);
+        _publish_tier_change(peer_uuid, score);
         probes_counter("rep.compute", "queued", NULL);
     }
 
@@ -1296,6 +1630,8 @@ int reputation_register_handlers(process_t *proc)
     process_register_handler(proc, REP_PROTO_UPDATE,    (handler_ptr_t)handle_update);
     process_register_handler(proc, REP_PROTO_REP_REQ,   (handler_ptr_t)handle_rep_request);
     process_register_handler(proc, REP_PROTO_REP_RESP,  (handler_ptr_t)handle_rep_response);
+    process_register_handler(proc, REP_PROTO_CONSENSUS_REP_REQ,
+                             (handler_ptr_t)handle_consensus_rep_request);
     process_register_handler(proc, REP_PROTO_LOCAL_QUERY, (handler_ptr_t)handle_local_rep_query);
     return 0;
 }
@@ -1332,13 +1668,32 @@ void reputation_reset_state(int num_peers)
      * member (never malloc'd). tx_history_free clears contents only. */
     tx_history_free(&rep_state.history);
     tx_history_init(&rep_state.history);
-    map_free(&rep_state.peer_ranks);
-    map_init(&rep_state.peer_ranks);
+    map_free(&rep_state.peer_tiers);
+    map_init(&rep_state.peer_tiers);
     map_free(&rep_state.committed_paxos_rounds);
     map_init(&rep_state.committed_paxos_rounds);
+    rep_state.committed_paxos_ring_head = 0;
+    rep_state.committed_paxos_ring_len = 0;
+    map_free(&rep_state.coop_mode);
+    map_init(&rep_state.coop_mode);
+    map_free(&rep_state.task_weights);
+    map_init(&rep_state.task_weights);
+    rep_state.task_weights_ring_head = 0;
+    rep_state.task_weights_ring_len = 0;
+    memset(rep_state.task_weights_ring, 0, sizeof(rep_state.task_weights_ring));
     rep_state.num_peers = num_peers;
     paxos_init(&rep_state.paxos, num_peers, NULL);
     rep_state.synchronous_dispatch = was_sync;
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+void reputation_install_task_weight(const uuid_t task_uuid, int weight)
+{
+    _ensure_init();
+    char task_str[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(task_uuid, task_str);
+    pthread_mutex_lock(&rep_state.lock);
+    _record_task_weight_locked(task_str, weight);
     pthread_mutex_unlock(&rep_state.lock);
 }
 
@@ -1429,6 +1784,44 @@ int64_t reputation_get_last_id(void)
     int64_t id = rep_state.paxos.last_id;
     pthread_mutex_unlock(&rep_state.lock);
     return id;
+}
+
+void reputation_install_tx_pair(const uuid_t task_uuid,
+                                const uuid_t p1_uuid, double p1_score,
+                                const uuid_t p2_uuid, double p2_score)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    tx_history_update(&rep_state.history, task_uuid, p1_uuid, p1_score);
+    tx_history_update(&rep_state.history, task_uuid, p2_uuid, p2_score);
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+void reputation_install_peer_reputation(const uuid_t peer_uuid, double score)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    reputations_update(&rep_state.reputations, peer_uuid, score);
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+void reputation_install_coop_mode(const uuid_t peer_uuid, bool in_coop)
+{
+    _ensure_init();
+    char key[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(peer_uuid, key);
+    pthread_mutex_lock(&rep_state.lock);
+    map_set(&rep_state.coop_mode, key, integer_data(in_coop ? 1 : 0));
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out)
+{
+    if (!rep_state.initialized || out == NULL) return -1;
+    pthread_mutex_lock(&rep_state.lock);
+    int rc = reputations_get(&rep_state.reputations, peer_uuid, out);
+    pthread_mutex_unlock(&rep_state.lock);
+    return rc == 0 ? 0 : -1;
 }
 
 /* Frama-C: skipped — [solver-timeout] state-cascade through paxos_init +
