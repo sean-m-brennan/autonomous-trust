@@ -1,0 +1,79 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: tier-loss-cancels-running-task
+byte_pinning: false
+description: |
+    Tier-down task cancellation: alice's tier qualifies her (3 == required)
+    for data_share, so step 1's invitation is accepted by bob and the task
+    lands on bob.task_stack. Step 2 is a local-IPC `tier_lost` event
+    (delivered to bob's negotiation queue from ReputationProcess) reporting
+    alice demoted to tier 1. handle_tier_lost walks bob.task_stack, finds
+    the queued job whose requestor is alice and whose capability requires
+    tier 3 > new_tier 1, and drops it.
+
+    Pin for doc/architecture/trust-tiers.md §7.2. The negative
+    `task_in_stack: false` assertion catches the failure mode where
+    handle_tier_lost is wired but the iteration / requestor-uuid match is
+    wrong and the cancelled job stays scheduled.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_share]
+  capability_tiers:
+    data_share: 3
+  peer_tiers:
+    alice: 3
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_share
+      task_id: t-tier-loss
+    description: |
+        alice (tier 3) invites bob to perform data_share (required_tier
+        3). bob's handle_invite passes the tier gate, runs _add_task to
+        push a Job onto task_stack, and emits an ack.
+
+  - id: 2
+    from: bob
+    to: alice
+    function: ack
+    in_response_to: 1
+    payload:
+      task_id: t-tier-loss
+    description: |
+        bob acknowledges acceptance. After this, bob.task_stack
+        contains the Job; bob.confirmed has the task uuid (set by
+        alice's handle_accept on receipt of this ack).
+
+  - id: 3
+    from: alice
+    to: bob
+    function: tier_lost
+    payload:
+      peer: alice
+      new_tier: 1
+    description: |
+        ReputationProcess publishes a tier_lost IPC for alice's
+        demotion (tier 3 -> 1) onto bob's negotiation queue. The
+        adapter's _build_inbound sends this with from=alice and
+        to=bob; from the handler's point of view the sender is
+        irrelevant — the payload `[alice_uuid, 1]` is what's
+        consumed. handle_tier_lost walks task_stack, matches the
+        Job whose task.requestor.uuid == alice and
+        task.capability.required_tier (3) > new_tier (1), and drops
+        it.
+
+expected_state:
+  bob:
+    task_in_stack: false

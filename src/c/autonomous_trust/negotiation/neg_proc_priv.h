@@ -51,17 +51,31 @@ void negotiation_set_own_capabilities(const process_t *proc,
                                       const char *const *cap_names,
                                       size_t n_caps);
 
-/** Set the peer-level for a specific peer as seen by @p proc.
+/** Set the reputation-derived trust tier for a specific peer as seen
+ *  by @p proc.
  *
- *  Production code derives peer levels from the richer `peers_t`
- *  hierarchy that lives in configuration; the harness can't easily
- *  populate that on a stripped-down test process_t. Instead, store an
- *  override level keyed by (proc, peer_uuid). handle_invite consults
- *  this before falling back to "level unknown" (which preserves the
- *  pre-test acceptance behavior). */
-void negotiation_set_peer_level(const process_t *proc,
-                                const uuid_t peer_uuid,
-                                int level);
+ *  Production code reads peer trust tiers via identity_get_peer_tier
+ *  from the reputation-driven map populated by handle_tier_update;
+ *  the harness can't easily wire that without going through paxos,
+ *  so this hook installs an override keyed by (proc, peer_uuid).
+ *  handle_invite consults this before falling back to
+ *  identity_get_peer_tier, then to 0 if neither is populated. */
+void negotiation_set_peer_tier(const process_t *proc,
+                               const uuid_t peer_uuid,
+                               int tier);
+
+/** Set the required_tier on a named capability as seen by @p proc.
+ *
+ *  Production code reads required_tier from the Capability registered
+ *  via find_capability(name). Conformance scenarios that exercise the
+ *  trust-tier gate need to vary required_tier per scenario without
+ *  modifying the static capability_table — this hook installs an
+ *  override keyed by (proc, cap_name). handle_invite consults this
+ *  before falling back to find_capability(name)->required_tier, then
+ *  to 0 if neither is populated. */
+void negotiation_set_capability_required_tier(const process_t *proc,
+                                              const char *cap_name,
+                                              int required_tier);
 
 /** Reset all conformance-only per-process overrides for @p proc.
  *  Idempotent. The harness calls this between scenarios. */

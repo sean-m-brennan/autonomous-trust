@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-refuse-below-required-tier
+byte_pinning: false
+description: |
+    Trust-tier refusal at a non-zero band: alice's tier (2) is above
+    zero but below the data_share capability's required_tier (3), so
+    bob's handle_invite tier-gate refuses. Distinguishes the new
+    threshold-comparison semantics from the prior "tier 0 only"
+    behavior — proves the gate scales with required_tier, not just at
+    the floor. Pin for doc/architecture/trust-tiers.md §7.1.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_share]
+  capability_tiers:
+    data_share: 3
+  peer_tiers:
+    alice: 2
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_share
+      task_id: t-mid-tier-refuse
+
+  - id: 2
+    from: bob
+    to: alice
+    function: nack
+    in_response_to: 1
+    payload:
+      task_id: t-mid-tier-refuse

@@ -86,6 +86,11 @@ class _Participant:
         self.process = process
         self.queues = queues
         self.outbox_buffer: list[Any] = []
+        # Populated by ReputationAdapter._build_participants after all
+        # participants exist; _check_expected_state[reputation_of] uses
+        # it to resolve pid -> Identity.uuid for self.process.reputations
+        # lookups.
+        self._all_participants: dict[str, '_Participant'] = {}
 
     def drain_outbox(self) -> list[CapturedMessage]:
         captured: list[CapturedMessage] = []
@@ -95,6 +100,7 @@ class _Participant:
         return captured
 
     def _check_expected_state(self, asserts: dict[str, Any]) -> None:
+        participants = self._all_participants
         for key, expected in asserts.items():
             if key == 'history_len':
                 actual = len(self.process.history)
@@ -114,6 +120,35 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: requests_count={actual}, expected {expected}'
                     )
+            elif key == 'reputation_of':
+                # `expected` is { "<other_pid>": float } — compare
+                # self.process.reputations[uuid_of(other)] with 1e-3
+                # tolerance (C twin uses the same). Catches weighted-pure
+                # / CTFT math regressions.
+                if not isinstance(expected, dict):
+                    raise AssertionError(
+                        f'{self.id}: reputation_of must be a mapping, got '
+                        f'{type(expected).__name__}'
+                    )
+                for other_pid, want in expected.items():
+                    other = participants.get(other_pid)
+                    if other is None:
+                        raise AssertionError(
+                            f'{self.id}.reputation_of: unknown participant '
+                            f'{other_pid!r}'
+                        )
+                    other_uuid = other.identity.uuid
+                    if other_uuid not in self.process.reputations:
+                        raise AssertionError(
+                            f'{self.id}.reputation_of[{other_pid}]: not present '
+                            f'(expected {want!r})'
+                        )
+                    got = self.process.reputations[other_uuid]
+                    if abs(got - float(want)) > 1e-3:
+                        raise AssertionError(
+                            f'{self.id}.reputation_of[{other_pid}]={got:.4f}, '
+                            f'expected {float(want):.4f}'
+                        )
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
 
@@ -201,6 +236,24 @@ class ReputationAdapter:
         # entry: {id1, id2, task_id, score}. Required by handle_nack
         # / handle_grant to recognize the round and look up the score.
         preset_my_requests: dict[str, list[dict[str, Any]]] = fixtures.get('my_requests', {}) or {}
+        # tx_history pre-stages bilateral Transactions in self.process.history.
+        # { pid -> [ {task_id, p1, p1_score, p2, p2_score}, ... ] }. p1/p2
+        # reference other participant ids; the adapter resolves them to
+        # UUIDv5(rep:<pid>). Required by reputation_pure / _contrite_tft
+        # to score against committed bilateral txs.
+        preset_tx_history: dict[str, list[dict[str, Any]]] = fixtures.get('tx_history', {}) or {}
+        # reputations pre-stages self.process.reputations. { pid -> { other_pid -> float } }.
+        # Used to pin the counterparty's reputation (consumed by reputation_pure)
+        # and the subject peer's `previous` value (consumed by _compute_reputation's
+        # coop-mode latch).
+        preset_reputations: dict[str, dict[str, float]] = fixtures.get('reputations', {}) or {}
+        # task_weights pre-stages self.process.task_weights. { pid -> { task_slug -> int } }.
+        # Mirrors how the C twin stages weights via reputation_install_task_weight.
+        preset_task_weights: dict[str, dict[str, int]] = fixtures.get('task_weights', {}) or {}
+        # coop_mode pre-stages self.process._coop_mode. { pid -> { other_pid -> bool } }.
+        # Hysteresis latch read by _compute_reputation; combined with `reputations`,
+        # pins which branch (pure vs. CTFT) runs.
+        preset_coop_mode: dict[str, dict[str, bool]] = fixtures.get('coop_mode', {}) or {}
 
         identities: dict[str, Identity] = {}
         for idx, spec in enumerate(spec_participants):
@@ -270,10 +323,52 @@ class ReputationAdapter:
                 # handle_accepted can look up the score by idx.
                 participant.process.proposals[idx] = score
 
+            # tx_history: each entry installs a bilateral Transaction via
+            # two history.update calls (matching how handle_committed
+            # builds bilateral history in production). p1/p2 reference
+            # participant ids; missing ids on either side are skipped.
+            for entry in preset_tx_history.get(pid, []):
+                slug = entry.get('task_id')
+                p1_id = entry.get('p1')
+                p2_id = entry.get('p2')
+                if slug is None or p1_id not in identities or p2_id not in identities:
+                    continue
+                task_uuid = uuid5(_NS, f'tx:{slug}')
+                participant.process.history.update(
+                    task_uuid, identities[p1_id].uuid,
+                    float(entry.get('p1_score', 0.0)))
+                participant.process.history.update(
+                    task_uuid, identities[p2_id].uuid,
+                    float(entry.get('p2_score', 0.0)))
+
+            for other_pid, score in preset_reputations.get(pid, {}).items():
+                if other_pid not in identities:
+                    continue
+                participant.process.reputations.update(
+                    identities[other_pid].uuid, float(score))
+
+            for slug, weight in preset_task_weights.get(pid, {}).items():
+                participant.process.task_weights[
+                    str(uuid5(_NS, f'tx:{slug}'))
+                ] = int(weight)
+
+            for other_pid, in_coop in preset_coop_mode.get(pid, {}).items():
+                if other_pid not in identities:
+                    continue
+                participant.process._coop_mode[
+                    identities[other_pid].uuid
+                ] = bool(in_coop)
+
             handles[pid] = ParticipantHandle(
                 id=pid, role=role, impl=participant,
                 dispatch=lambda msg, p=participant: self._dispatch(p, msg),
             )
+        # Cross-wire each participant impl with the full table so
+        # _check_expected_state[reputation_of] can resolve other_pid ->
+        # Identity.uuid without touching the engine.
+        impls = {pid: h.impl for pid, h in handles.items()}
+        for impl in impls.values():
+            impl._all_participants = impls
         return handles
 
     def _build_one(self, pid: str, role: str, identity: Identity,
@@ -400,12 +495,15 @@ class ReputationAdapter:
             obj = str(payload.get('length', 0))
         elif function == ReputationProtocol.update:
             obj = to_json_string([])  # empty chain by default
-        elif function == ReputationProtocol.rep_req:
+        elif function in (ReputationProtocol.rep_req,
+                          ReputationProtocol.consensus_rep_req):
             # Canonical wire form (BUGS.md §P9B): JSON object with named
             # fields, matching C's `handle_rep_request`. Python's
             # `handle_reputation_request` now accepts both the object form
             # and the legacy tuple form, so both languages parse the same
-            # bytes — wire interop is restored.
+            # bytes — wire interop is restored. consensus_rep_req takes
+            # the identical payload (peer_uuid + requesting_process); the
+            # op name alone selects the consensus computation path.
             target_pid = payload.get('target', from_id)
             if target_pid in participants:
                 target_uuid = str(participants[target_pid].impl.identity.uuid)
