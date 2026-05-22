@@ -27,6 +27,7 @@
 #include "utilities/exception.h"
 #include "network/net_message.h"
 #include "negotiation/neg_proc_priv.h"
+#include "identity/id_proc_priv.h"  /* identity_get_peer_tier */
 
 DEFINE_ERROR(ENEG_NOPEERS, "No capable peers available");
 
@@ -41,6 +42,12 @@ char NEG_PROTO_STAT_REQ[] = "status request";
 char NEG_PROTO_STAT_RSP[] = "status response";
 char NEG_PROTO_RESULT[]   = "report results";
 char NEG_PROTO_CANCEL[]   = "cancel";
+/* Local-IPC function name for the tier_lost message. Mirrors Python
+ * IdentityProtocol.tier_lost verbatim; reputation publishes this
+ * onto the negotiation queue when a peer's tier drops, and
+ * handle_tier_lost cancels in-flight tasks the peer can no longer
+ * authorize. See doc/architecture/trust-tiers.md §7.2. */
+static char ID_TIER_LOST[] = "tier_lost";
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -77,17 +84,20 @@ static struct {
      * pointer cast to a string (printed as "%p") so it doesn't collide
      * with the uuid-string keys used elsewhere in this state struct.
      *
-     * own_caps_by_proc:  process_t* (as %p)        -> array_t* of dup'd cap-name strings
-     * peer_levels:       "{proc}|{peer_uuid_str}"  -> int* (level)
+     * own_caps_by_proc:    process_t* (as %p)        -> array_t* of dup'd cap-name strings
+     * peer_tiers:          "{proc}|{peer_uuid_str}"  -> int* (trust tier)
+     * cap_required_tiers:  "{proc}|{cap_name}"       -> int* (required_tier)
      *
-     * Populated by negotiation_set_own_capabilities and
-     * negotiation_set_peer_level; cleared via
+     * Populated by negotiation_set_own_capabilities,
+     * negotiation_set_peer_tier, and
+     * negotiation_set_capability_required_tier; cleared via
      * negotiation_clear_test_state. Production code MUST NOT touch
      * these and they are silently ignored when handle_invite finds no
-     * entry, so the static capability_table fallback still drives
-     * non-test paths. */
+     * entry, so the static capability_table + identity_get_peer_tier
+     * fallback drives non-test paths. */
     map_t own_caps_by_proc;
-    map_t peer_levels;
+    map_t peer_tiers;
+    map_t cap_required_tiers;
 } neg_state;
 
 static void _ensure_init(void)
@@ -103,7 +113,8 @@ static void _ensure_init(void)
         neg_state.max_concurrency = 4;
         pthread_mutex_init(&neg_state.lock, NULL);
         map_init(&neg_state.own_caps_by_proc);
-        map_init(&neg_state.peer_levels);
+        map_init(&neg_state.peer_tiers);
+        map_init(&neg_state.cap_required_tiers);
         neg_state.initialized = true;
     }
 }
@@ -154,7 +165,7 @@ static bool _has_own_cap_override_locked(const process_t *proc, const char *name
     return found;
 }
 
-static int _peer_level_override_locked(const process_t *proc, const uuid_t peer_uuid)
+static int _peer_tier_override_locked(const process_t *proc, const uuid_t peer_uuid)
 {
     if (proc == NULL) return -1;
     char proc_key[32]; _proc_key(proc, proc_key, sizeof(proc_key));
@@ -162,10 +173,26 @@ static int _peer_level_override_locked(const process_t *proc, const uuid_t peer_
     char key[96]; snprintf(key, sizeof(key), "%s|%s", proc_key, uuid_str);
 
     data_t *dat = NULL;
-    int level = -1;
-    if (map_get(&neg_state.peer_levels, key, &dat) == 0 && dat != NULL)
-        data_integer(dat, &level);
-    return level;
+    int tier = -1;
+    if (map_get(&neg_state.peer_tiers, key, &dat) == 0 && dat != NULL)
+        data_integer(dat, &tier);
+    return tier;
+}
+
+/* Per-process capability required_tier override (test fixture). Returns
+ * -1 if no override is installed; callers fall back to
+ * find_capability(name)->required_tier or 0. Caller holds neg_state.lock. */
+static int _cap_required_tier_override_locked(const process_t *proc, const char *cap_name)
+{
+    if (proc == NULL || cap_name == NULL) return -1;
+    char proc_key[32]; _proc_key(proc, proc_key, sizeof(proc_key));
+    char key[32 + 1 + CAP_NAMELEN + 1];
+    snprintf(key, sizeof(key), "%s|%s", proc_key, cap_name);
+    data_t *dat = NULL;
+    int rt = -1;
+    if (map_get(&neg_state.cap_required_tiers, key, &dat) == 0 && dat != NULL)
+        data_integer(dat, &rt);
+    return rt;
 }
 
 void negotiation_set_own_capabilities(const process_t *proc,
@@ -203,16 +230,30 @@ void negotiation_set_own_capabilities(const process_t *proc,
     pthread_mutex_unlock(&neg_state.lock);
 }
 
-void negotiation_set_peer_level(const process_t *proc,
-                                const uuid_t peer_uuid,
-                                int level)
+void negotiation_set_peer_tier(const process_t *proc,
+                               const uuid_t peer_uuid,
+                               int tier)
 {
     _ensure_init();
     char proc_key[32]; _proc_key(proc, proc_key, sizeof(proc_key));
     char uuid_str[UUID_STRING_LEN + 1]; uuid_unparse_lower(peer_uuid, uuid_str);
     char key[96]; snprintf(key, sizeof(key), "%s|%s", proc_key, uuid_str);
     pthread_mutex_lock(&neg_state.lock);
-    map_set(&neg_state.peer_levels, key, integer_data(level));
+    map_set(&neg_state.peer_tiers, key, integer_data(tier));
+    pthread_mutex_unlock(&neg_state.lock);
+}
+
+void negotiation_set_capability_required_tier(const process_t *proc,
+                                              const char *cap_name,
+                                              int required_tier)
+{
+    _ensure_init();
+    if (cap_name == NULL) return;
+    char proc_key[32]; _proc_key(proc, proc_key, sizeof(proc_key));
+    char key[32 + 1 + CAP_NAMELEN + 1];
+    snprintf(key, sizeof(key), "%s|%s", proc_key, cap_name);
+    pthread_mutex_lock(&neg_state.lock);
+    map_set(&neg_state.cap_required_tiers, key, integer_data(required_tier));
     pthread_mutex_unlock(&neg_state.lock);
 }
 
@@ -222,19 +263,26 @@ void negotiation_clear_test_state(const process_t *proc)
     char proc_key[32]; _proc_key(proc, proc_key, sizeof(proc_key));
     pthread_mutex_lock(&neg_state.lock);
     map_remove(&neg_state.own_caps_by_proc, proc_key);
-    /* Sweep peer_levels for any keys with our proc prefix. map_t doesn't
-     * expose a prefix-delete; iterate, collect matching keys, then
-     * remove. Test-only, so a linear sweep is fine. */
+    /* Sweep peer_tiers + cap_required_tiers for any keys with our proc
+     * prefix. map_t doesn't expose a prefix-delete; iterate, collect
+     * matching keys, then remove. Test-only, so linear sweeps are fine. */
     char prefix[40]; snprintf(prefix, sizeof(prefix), "%s|", proc_key);
     size_t plen = strlen(prefix);
     char *iter_key; data_t *iter_val;
     char *to_remove[32] = {0}; size_t n_remove = 0;
-    map_entries_for_each(&neg_state.peer_levels, iter_key, iter_val)
+    map_entries_for_each(&neg_state.peer_tiers, iter_key, iter_val)
         if (n_remove < 32 && strncmp(iter_key, prefix, plen) == 0)
             to_remove[n_remove++] = iter_key;
     map_end_for_each
     for (size_t i = 0; i < n_remove; i++)
-        map_remove(&neg_state.peer_levels, to_remove[i]);
+        map_remove(&neg_state.peer_tiers, to_remove[i]);
+    n_remove = 0;
+    map_entries_for_each(&neg_state.cap_required_tiers, iter_key, iter_val)
+        if (n_remove < 32 && strncmp(iter_key, prefix, plen) == 0)
+            to_remove[n_remove++] = iter_key;
+    map_end_for_each
+    for (size_t i = 0; i < n_remove; i++)
+        map_remove(&neg_state.cap_required_tiers, to_remove[i]);
     pthread_mutex_unlock(&neg_state.lock);
 }
 
@@ -255,8 +303,10 @@ void negotiation_reset_state(void)
     array_init(&neg_state.status_pending);
     map_free(&neg_state.own_caps_by_proc);
     map_init(&neg_state.own_caps_by_proc);
-    map_free(&neg_state.peer_levels);
-    map_init(&neg_state.peer_levels);
+    map_free(&neg_state.peer_tiers);
+    map_init(&neg_state.peer_tiers);
+    map_free(&neg_state.cap_required_tiers);
+    map_init(&neg_state.cap_required_tiers);
     pthread_mutex_unlock(&neg_state.lock);
 }
 
@@ -633,19 +683,31 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
             capable = (find_capability(task.capability.name) != NULL);
     }
 
-    /* Peer-level refusal (Python parity): if the inviter's level as we
-     * see it is 0 (lowest reputation tier), refuse even if we are
-     * capable. The harness installs levels via
-     * negotiation_set_peer_level; absent that, we treat level as
-     * "unknown" and skip the check (preserving prior behavior). */
-    int sender_level = _peer_level_override_locked(proc, nmsg->from_whom.uuid);
-    bool low_rep_refuse = (have_task && capable && sender_level == 0);
+    /* Trust-tier gate (Python parity, doc/architecture/trust-tiers.md §7.1):
+     * refuse if the inviter's reputation-derived trust tier is below the
+     * capability's required_tier. Both are read from test overrides if
+     * installed, else from production paths (identity_get_peer_tier /
+     * find_capability + the capability_t fields added in Slice 1). */
+    int sender_tier = _peer_tier_override_locked(proc, nmsg->from_whom.uuid);
+    if (sender_tier < 0)
+        sender_tier = identity_get_peer_tier(nmsg->from_whom.uuid);
+    int required_tier = -1;
+    if (have_task && task.capability.name[0] != '\0')
+    {
+        required_tier = _cap_required_tier_override_locked(proc, task.capability.name);
+        if (required_tier < 0) {
+            capability_t *own_cap = find_capability(task.capability.name);
+            required_tier = (own_cap != NULL) ? own_cap->required_tier : 0;
+        }
+    }
+    bool tier_refuse = (have_task && capable && required_tier > 0
+                        && sender_tier < required_tier);
 
-    if (have_task && capable && low_rep_refuse)
+    if (tier_refuse)
     {
         log_info(proc->logger,
-                 "Negotiation: refusing %s — sender peer level 0\n",
-                 task_uuid_str);
+                 "Negotiation: refusing %s — sender tier %d < required %d\n",
+                 task_uuid_str, sender_tier, required_tier);
         generic_msg_t refuse = {0};
         _build_reply(nmsg, NEG_PROTO_REFUSE, &refuse);
         json_t *rj = _task_uuid_json(task_uuid_str);
@@ -1384,6 +1446,214 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
 }
 
 /****************************
+ * Handler: handle_tier_lost (tier_lost) — local IPC from reputation
+ *
+ * Cancel in-flight tasks the affected peer is no longer authorized
+ * to participate in. Mirrors Python's
+ * NegotiationProcess.handle_tier_lost (negprocess.py); see
+ * doc/architecture/trust-tiers.md §7.2.
+ *
+ * Walks two surfaces:
+ * - task_stack (worker side): jobs scheduled to execute on the
+ *   demoted peer's behalf. Cancelled in place if
+ *   capability.required_tier > new_tier.
+ * - my_tasks   (requestor side): trackers for tasks I've requested
+ *   from peers. The C task_tracker_t does not carry the source
+ *   capability, so we look the task back up via proposed_tasks (keyed
+ *   by uuid_str). For locally-spawned tasks the lookup succeeds; for
+ *   foreign tasks (impossible in current C flows, but the python side
+ *   handles it via the tracker's own .capability) we skip — better
+ *   to keep the tracker than over-aggressively drop a participant
+ *   based on guessed metadata.
+ ****************************/
+
+/* Frama-C: skipped —
+ * handle_tier_lost: JSON unpack + map iteration + compaction;
+ * exceeds solver budget like other handlers in this file.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
+static bool handle_tier_lost(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    /* Payload is a 2-element JSON array [uuid_str, new_tier] —
+     * matches _publish_tier_change's tier_lost emission and Python
+     * repprocess.py's to_json_string((key, new_tier)). */
+    json_t *payload = NULL;
+    if (nmsg->obj == NULL || nmsg->len == 0 ||
+        net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_warn(proc->logger, "Negotiation: handle_tier_lost: no payload\n");
+        return true;
+    }
+    if (!json_is_array(payload) || json_array_size(payload) < 2)
+    {
+        log_warn(proc->logger, "Negotiation: handle_tier_lost: bad payload shape\n");
+        json_decref(payload);
+        return true;
+    }
+    json_t *j_uuid = json_array_get(payload, 0);
+    json_t *j_tier = json_array_get(payload, 1);
+    if (!json_is_string(j_uuid) || !json_is_integer(j_tier))
+    {
+        log_warn(proc->logger, "Negotiation: handle_tier_lost: bad field types\n");
+        json_decref(payload);
+        return true;
+    }
+    const char *peer_uuid_in = json_string_value(j_uuid);
+    int new_tier = (int)json_integer_value(j_tier);
+
+    char peer_uuid_str[UUID_STRING_LEN + 1] = {0};
+    strncpy(peer_uuid_str, peer_uuid_in, UUID_STRING_LEN);
+    uuid_t target_uuid;
+    if (uuid_parse(peer_uuid_str, target_uuid) != 0)
+    {
+        log_warn(proc->logger,
+                 "Negotiation: handle_tier_lost: bad uuid %s\n", peer_uuid_str);
+        json_decref(payload);
+        return true;
+    }
+
+    int cancelled = 0;
+    pthread_mutex_lock(&neg_state.lock);
+
+    /* Worker side: compact task_stack in place, dropping jobs whose
+     * requestor matches the demoted peer AND whose capability's
+     * required_tier no longer fits. required_tier is read from the
+     * conformance per-process override (if installed) or
+     * find_capability() — same source as handle_invite's gate. */
+    job_queue_t *q = &neg_state.task_stack;
+    int write_idx = 0;
+    for (int read_idx = 0; read_idx < q->count; read_idx++)
+    {
+        job_t *job = &q->jobs[read_idx];
+        int required_tier = _cap_required_tier_override_locked(
+            proc, job->task.capability.name);
+        if (required_tier < 0)
+        {
+            capability_t *own = find_capability(job->task.capability.name);
+            required_tier = (own != NULL)
+                ? own->required_tier
+                : job->task.capability.required_tier;
+        }
+        bool peer_match = (uuid_compare(job->task.requestor_uuid, target_uuid) == 0);
+        if (peer_match && required_tier > new_tier)
+        {
+            char tuuid[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(job->task.uuid, tuuid);
+            log_info(proc->logger,
+                     "Negotiation: cancelling task %s — requestor %s tier %d < required %d\n",
+                     tuuid, peer_uuid_str, new_tier, required_tier);
+            cancelled++;
+            continue;  /* skip writing this job */
+        }
+        if (write_idx != read_idx)
+            memmove(&q->jobs[write_idx], &q->jobs[read_idx], sizeof(job_t));
+        write_idx++;
+    }
+    q->count = write_idx;
+
+    /* Requestor side: walk my_tasks, drop the demoted peer from any
+     * tracker whose source task has required_tier > new_tier. Use
+     * proposed_tasks (keyed by task_uuid_str) to fetch the original
+     * task_t for the capability lookup — task_tracker_t doesn't
+     * carry the capability directly. */
+    map_t *mt = &neg_state.my_tasks;
+    array_t *keys = map_keys(mt);
+    if (keys != NULL)
+    {
+        size_t nkeys = array_size(keys);
+        for (size_t i = 0; i < nkeys; i++)
+        {
+            data_t *k_dat = NULL;
+            if (array_get(keys, i, &k_dat) != 0 || k_dat == NULL) continue;
+            char *task_uuid_str = NULL;
+            if (data_string_ptr(k_dat, &task_uuid_str) != 0 || task_uuid_str == NULL)
+                continue;
+
+            data_t *trk_dat = NULL;
+            task_tracker_t *tracker = NULL;
+            if (map_get(mt, task_uuid_str, &trk_dat) != 0 || trk_dat == NULL)
+                continue;
+            if (data_object_ptr(trk_dat, (ptr_t *)&tracker) != 0 || tracker == NULL)
+                continue;
+
+            /* Fetch the original task to get its capability. If the
+             * task is foreign (not in our proposed_tasks), we don't
+             * know the required_tier locally — skip rather than
+             * guess. Mirrors the conservative branch in
+             * negprocess.py:handle_tier_lost.my_tasks. */
+            data_t *task_dat = NULL;
+            task_t *orig_task = NULL;
+            if (map_get(&neg_state.proposed_tasks, task_uuid_str, &task_dat) != 0
+                || task_dat == NULL)
+                continue;
+            if (data_object_ptr(task_dat, (ptr_t *)&orig_task) != 0 || orig_task == NULL)
+                continue;
+
+            int required_tier = _cap_required_tier_override_locked(
+                proc, orig_task->capability.name);
+            if (required_tier < 0)
+            {
+                capability_t *own = find_capability(orig_task->capability.name);
+                required_tier = (own != NULL)
+                    ? own->required_tier
+                    : orig_task->capability.required_tier;
+            }
+            if (required_tier <= new_tier)
+                continue;  /* still authorised */
+
+            /* Drop the demoted peer if present. tracker->results keys
+             * are uuid-strings (uuid_unparse_lower form). */
+            if (map_get(&tracker->results, peer_uuid_str, &k_dat) == 0)
+            {
+                map_remove(&tracker->results, peer_uuid_str);
+                cancelled++;
+                log_info(proc->logger,
+                         "Negotiation: dropped %s from task %s — tier %d < required %d\n",
+                         peer_uuid_str, task_uuid_str, new_tier, required_tier);
+            }
+            /* If the tracker is now empty, treat the task as fully
+             * cancelled: forward a TASK_RESULT with empty payload
+             * (the requestor's main process disambiguates by uuid)
+             * and remove the tracker. */
+            if (tracker->expected > 0
+                && map_size(&tracker->results) == 0)
+            {
+                generic_msg_t cancel_msg;
+                memset(&cancel_msg, 0, sizeof(cancel_msg));
+                cancel_msg.type = TASK_RESULT;
+                uuid_copy(cancel_msg.info.task_result.task_uuid, orig_task->uuid);
+                uuid_copy(cancel_msg.info.task_result.requestor_uuid,
+                          orig_task->requestor_uuid);
+                cancel_msg.info.task_result.result_data = NULL;
+                cancel_msg.info.task_result.result_len  = 0;
+                messaging_send("main", TASK_RESULT, &cancel_msg, false);
+
+                map_remove(mt, task_uuid_str);
+                task_tracker_free(tracker);
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&neg_state.lock);
+
+    if (cancelled > 0)
+        log_info(proc->logger,
+                 "Negotiation: tier_lost on %s -> %d: %d task(s)/peer(s) cancelled\n",
+                 peer_uuid_str, new_tier, cancelled);
+
+    json_decref(payload);
+    return true;
+}
+
+/****************************
  * Negotiation process main entry
  ****************************/
 
@@ -1451,6 +1721,11 @@ int negotiation_register_handlers(process_t *proc)
     process_register_handler(proc, NEG_PROTO_STAT_REQ, (handler_ptr_t)handle_stat_req);
     process_register_handler(proc, NEG_PROTO_STAT_RSP, (handler_ptr_t)handle_stat_resp);
     process_register_handler(proc, NEG_PROTO_RESULT,   (handler_ptr_t)handle_results);
+    /* Tier-down task cancellation (trust-tiers.md §7.2). Local IPC
+     * from ReputationProcess on demotion; not a wire-facing
+     * protocol message but registered the same way so the protocol
+     * dispatch table routes it. */
+    process_register_handler(proc, ID_TIER_LOST,      (handler_ptr_t)handle_tier_lost);
     return 0;
 }
 

@@ -64,3 +64,10 @@ class ReputationProtocol(Protocol):
     update = 'latest update'
     rep_req = 'request reputation'
     rep_resp = 'reputation response'
+    # History-only reputation score for observer/dashboard use:
+    # deterministic EMA over committed bilateral txs (see
+    # ReputationProcess._consensus_reputation). Distinct request op
+    # so peer-side callers keep their identity-dependent CTFT scoring
+    # via rep_req; the reply reuses rep_resp so automate.py's
+    # latest_reputation dispatch consumes it unchanged.
+    consensus_rep_req = 'request consensus reputation'

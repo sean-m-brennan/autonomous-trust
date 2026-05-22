@@ -91,6 +91,40 @@ int reputation_get_request_count(void);
  *  sets last_id to id1, which scenarios pin > 0). */
 int64_t reputation_get_last_id(void);
 
+/** Pre-install a transaction_weight in rep_state.task_weights for
+ *  @p task_uuid. The conformance harness calls this so scenarios can
+ *  pin per-task weights without driving the full
+ *  Capability-registration → handle_grant → handle_transaction wire
+ *  flow. Production code MUST NOT call this. Mirrors the existing
+ *  install_my_request / install_accepted test hooks. */
+void reputation_install_task_weight(const uuid_t task_uuid, int weight);
+
+/** Pre-install a bilateral Transaction (@p task_uuid) in
+ *  rep_state.history: p1_uuid scored at @p p1_score, p2_uuid at
+ *  @p p2_score. Drives `tx_history_update` twice under the same task
+ *  so both `_peer_mapping` entries get populated, matching how
+ *  handle_committed builds bilateral history. Conformance hook only. */
+void reputation_install_tx_pair(const uuid_t task_uuid,
+                                const uuid_t p1_uuid, double p1_score,
+                                const uuid_t p2_uuid, double p2_score);
+
+/** Pre-install a peer's reputation in rep_state.reputations.
+ *  Conformance scenarios use this to set the counterparty's reputation
+ *  (consumed by reputation_pure) and the subject peer's `previous`
+ *  reputation (consumed by _compute_reputation's coop-mode latch). */
+void reputation_install_peer_reputation(const uuid_t peer_uuid, double score);
+
+/** Pre-install the coop-mode latch entry for @p peer_uuid. When @p
+ *  in_coop is true, the next compute uses COOP_EXIT (0.45) as the
+ *  pure-vs-CTFT gate; when false, COOP_ENTER (0.55). Mirrors Python's
+ *  self._coop_mode dict (keyed by peer uuid). */
+void reputation_install_coop_mode(const uuid_t peer_uuid, bool in_coop);
+
+/** Read a peer's reputation from rep_state.reputations for
+ *  expected_state assertions. Returns 0 on success (writing to @p out),
+ *  -1 if uninitialized or @p peer_uuid is absent. */
+int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out);
+
 #define EREP_PAXOS 253
 DECLARE_ERROR(EREP_PAXOS, "Paxos consensus error");
 

@@ -63,12 +63,23 @@ typedef struct {
  * snapshot is taken. expected_state checks read here — without
  * snapshotting, the very next dispatch's reset+install clobbers the
  * state we wanted to verify. */
+/* Per-peer reputation snapshot. Holds rep_state.reputations[uuid_of(pid)]
+ * for every other known participant after the dispatcher's handler ran.
+ * One slot per participant; absent entries (uuid not in rep_state.reputations)
+ * keep `has_value=false`. */
+typedef struct {
+    char id[SCE_ID_LEN];
+    bool has_value;
+    double value;
+} rp_peer_rep_t;
+
 typedef struct {
     char id[SCE_ID_LEN];
     bool valid;
     int chain_len;
     int request_count;
     int64_t last_id;
+    rp_peer_rep_t peer_reps[SCE_MAX_PARTICIPANTS];
 } rp_snap_t;
 static rp_snap_t g_snaps[SCE_MAX_PARTICIPANTS];
 
@@ -327,6 +338,112 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
             }
         }
     }
+
+    /* tx_history: { "<pid>": [{task_id, p1, p1_score, p2, p2_score}, ...] }
+     * — pre-stage bilateral Transactions in rep_state.history so
+     * reputation_pure / _contrite_tft can score against them. p1/p2 are
+     * participant ids resolved to their UUIDv5. Mirrors Python's
+     * tx_history fixture in reputation.py. */
+    json_t *txh = json_object_get(g_fixtures, "tx_history");
+    if (json_is_object(txh))
+    {
+        json_t *entries = json_object_get(txh, target_id);
+        if (json_is_array(entries))
+        {
+            for (size_t i = 0; i < json_array_size(entries); i++)
+            {
+                json_t *e = json_array_get(entries, i);
+                if (!json_is_object(e)) continue;
+
+                const char *slug = json_string_value(json_object_get(e, "task_id"));
+                const char *p1_id = json_string_value(json_object_get(e, "p1"));
+                const char *p2_id = json_string_value(json_object_get(e, "p2"));
+                if (slug == NULL || p1_id == NULL || p2_id == NULL) continue;
+                json_t *p1s_j = json_object_get(e, "p1_score");
+                json_t *p2s_j = json_object_get(e, "p2_score");
+                double p1_score = json_is_real(p1s_j) ? json_real_value(p1s_j)
+                    : json_is_integer(p1s_j) ? (double)json_integer_value(p1s_j) : 0.0;
+                double p2_score = json_is_real(p2s_j) ? json_real_value(p2s_j)
+                    : json_is_integer(p2s_j) ? (double)json_integer_value(p2s_j) : 0.0;
+
+                uuid_t task_uuid;
+                _uuid5("tx:", slug, task_uuid);
+                const uuid_t *p1_uuid = _uuid_of(ctx, p1_id);
+                const uuid_t *p2_uuid = _uuid_of(ctx, p2_id);
+                if (p1_uuid && p2_uuid)
+                    reputation_install_tx_pair(task_uuid,
+                                               *p1_uuid, p1_score,
+                                               *p2_uuid, p2_score);
+            }
+        }
+    }
+
+    /* reputations: { "<pid>": { "<other_pid>": float, ... } } — pre-stage
+     * rep_state.reputations so _compute_reputation's coop-mode latch sees
+     * the right `previous` value and reputation_pure's counterparty
+     * lookup succeeds. */
+    json_t *rps = json_object_get(g_fixtures, "reputations");
+    if (json_is_object(rps))
+    {
+        json_t *table = json_object_get(rps, target_id);
+        if (json_is_object(table))
+        {
+            const char *other_id;
+            json_t *score_j;
+            json_object_foreach(table, other_id, score_j)
+            {
+                double v = json_is_real(score_j) ? json_real_value(score_j)
+                    : json_is_integer(score_j) ? (double)json_integer_value(score_j) : 0.0;
+                const uuid_t *u = _uuid_of(ctx, other_id);
+                if (u)
+                    reputation_install_peer_reputation(*u, v);
+            }
+        }
+    }
+
+    /* task_weights: { "<pid>": { "<task_slug>": int, ... } } — pre-stage
+     * rep_state.task_weights so reputation_pure weights each tx by the
+     * cached transaction_weight. */
+    json_t *tws = json_object_get(g_fixtures, "task_weights");
+    if (json_is_object(tws))
+    {
+        json_t *table = json_object_get(tws, target_id);
+        if (json_is_object(table))
+        {
+            const char *slug;
+            json_t *w_j;
+            json_object_foreach(table, slug, w_j)
+            {
+                int w = json_is_integer(w_j) ? (int)json_integer_value(w_j) : 1;
+                uuid_t task_uuid;
+                _uuid5("tx:", slug, task_uuid);
+                reputation_install_task_weight(task_uuid, w);
+            }
+        }
+    }
+
+    /* coop_mode: { "<pid>": { "<other_pid>": bool, ... } } — pre-stage
+     * rep_state.coop_mode (keyed by peer uuid). Mirrors Python's
+     * self._coop_mode latch. Combined with `reputations[other] = X`,
+     * controls whether _compute_reputation picks the pure or CTFT
+     * branch via hysteresis. */
+    json_t *cm = json_object_get(g_fixtures, "coop_mode");
+    if (json_is_object(cm))
+    {
+        json_t *table = json_object_get(cm, target_id);
+        if (json_is_object(table))
+        {
+            const char *other_id;
+            json_t *flag;
+            json_object_foreach(table, other_id, flag)
+            {
+                bool b = json_is_true(flag);
+                const uuid_t *u = _uuid_of(ctx, other_id);
+                if (u)
+                    reputation_install_coop_mode(*u, b);
+            }
+        }
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -449,13 +566,16 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     {
         body = json_object();  /* empty payload */
     }
-    else if (strcmp(function, REP_PROTO_REP_REQ) == 0)
+    else if (strcmp(function, REP_PROTO_REP_REQ) == 0
+             || strcmp(function, REP_PROTO_CONSENSUS_REP_REQ) == 0)
     {
         /* C's `handle_rep_request` expects a `{peer_uuid,
          * requesting_process}` object; Python's `handle_reputation_request`
          * expects a `(ident, req_proc)` JSON list. See BUGS.md §P9 for
          * the wire-format divergence. Each adapter builds its language's
-         * native form here so both handlers exercise without crashing. */
+         * native form here so both handlers exercise without crashing.
+         * consensus_rep_req shares the same payload shape; the op name
+         * dispatches to the consensus computation on either side. */
         const char *target_pid = from_id;
         const char *req_proc = "negotiation";
         if (payload && json_is_object(payload))
@@ -526,6 +646,23 @@ static int _dispatch(sce_run_ctx_t *ctx,
         s->chain_len     = reputation_get_chain_len();
         s->request_count = reputation_get_request_count();
         s->last_id       = reputation_get_last_id();
+        /* Record this dispatcher's view of every other participant's
+         * reputation, so `expected_state[pid].reputation_of[other]`
+         * can be checked after the next step resets rep_state. */
+        for (size_t i = 0; i < ctx->participant_count && i < SCE_MAX_PARTICIPANTS; i++)
+        {
+            const char *other_id = ctx->participants[i].id;
+            snprintf(s->peer_reps[i].id, SCE_ID_LEN, "%s", other_id);
+            s->peer_reps[i].has_value = false;
+            const uuid_t *u = _uuid_of(ctx, other_id);
+            if (u == NULL) continue;
+            double v = 0.0;
+            if (reputation_get_peer_reputation(*u, &v) == 0)
+            {
+                s->peer_reps[i].has_value = true;
+                s->peer_reps[i].value = v;
+            }
+        }
     }
     return 0;
 }
@@ -600,6 +737,46 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                              (long long)snap->last_id,
                              want ? "true" : "false");
                     return -1;
+                }
+            }
+            else if (strcmp(key, "reputation_of") == 0)
+            {
+                /* reputation_of: { "<other_pid>": float_with_tolerance }
+                 * — compare snapshotted rep_state.reputations[pid_of(other)]
+                 * against the expected value with a small absolute
+                 * tolerance (1e-3). Catches weighted-pure / CTFT math
+                 * regressions in either direction. */
+                if (!json_is_object(val)) continue;
+                const char *other;
+                json_t *want_j;
+                json_object_foreach(val, other, want_j)
+                {
+                    double want = json_is_real(want_j) ? json_real_value(want_j)
+                        : json_is_integer(want_j) ? (double)json_integer_value(want_j) : 0.0;
+                    rp_peer_rep_t *pr = NULL;
+                    for (size_t i = 0; i < SCE_MAX_PARTICIPANTS; i++)
+                        if (snap->peer_reps[i].id[0] != '\0' &&
+                            strcmp(snap->peer_reps[i].id, other) == 0)
+                        {
+                            pr = &snap->peer_reps[i];
+                            break;
+                        }
+                    if (pr == NULL || !pr->has_value)
+                    {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s.reputation_of[%s]: not present (expected %.4f)",
+                                 pid, other, want);
+                        return -1;
+                    }
+                    double diff = pr->value - want;
+                    if (diff < 0) diff = -diff;
+                    if (diff > 1e-3)
+                    {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s.reputation_of[%s]=%.4f, expected %.4f",
+                                 pid, other, pr->value, want);
+                        return -1;
+                    }
                 }
             }
             else

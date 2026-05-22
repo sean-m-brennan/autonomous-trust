@@ -44,6 +44,7 @@ from .config import Configuration, to_json_string, ConfigMap
 from .config.discover import get_cfg_type, load_configs
 from .processes import Process, LogLevel, ProcessTracker
 from .identity import Peers
+from .bootstrap_capabilities import register_bootstrap_capabilities
 from .capabilities import Capabilities, Capability, PeerCapabilities
 from .system import CfgIds, PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
 from .protocol import Protocol
@@ -143,9 +144,25 @@ class AutonomousTrust(Protocol):
 
         self.process_names: list[str] = []
         self.capabilities: Capabilities = Capabilities()
+        # AT-core bootstrap corpus: register at.handshake /
+        # at.time-attest / at.echo-challenge unless explicitly
+        # disabled (AT_BOOTSTRAP_DISABLED=1). These are tier-0,
+        # weight-1 — the baby-steps signal documented in
+        # doc/architecture/trust-tiers.md §6.
+        if not os.environ.get('AT_BOOTSTRAP_DISABLED'):
+            register_bootstrap_capabilities(self.capabilities)
         self._output: QueueType = self.queue_type()  # subsystem logging
         self._subsystems: ProcessTracker = ProcessTracker()
         self._additional_workers: list[tuple[type[Process], list[str], dict[str, Any]]] = []
+        # Register the BootstrapWorker alongside the bootstrap caps. It
+        # rides the normal add_worker / additional_procs lifecycle (so
+        # signal/quit teardown is uniform with everything else) but
+        # honors AT_BOOTSTRAP_DISABLED both at registration time (here)
+        # and at process-entry time (in bootstrap_worker.process), so a
+        # late env change still suppresses the work.
+        if not os.environ.get('AT_BOOTSTRAP_DISABLED'):
+            from .bootstrap_worker import BootstrapWorker
+            self._additional_workers.append((BootstrapWorker, None, {}))
         self._my_queue: QueueType = self.queue_type()
         self.testing: bool = testing
         self.silent = silent

@@ -24,7 +24,6 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import queue
@@ -43,6 +42,7 @@ from autonomous_trust.core.config.generate import (
     generate_identity, generate_worker_config,
 )
 from autonomous_trust.core.system import now, queue_cadence
+from autonomous_trust.evaluation.scenarios.recording import EventRecorder
 
 try:
     from autonomous_trust.inspector.peer.daq import Cohort, CohortTracker
@@ -253,6 +253,7 @@ sys.path.insert(0, str(_HERE))
 from scenario import DoDMissionScenario  # noqa: E402
 from dashboard.dod_app import build_dashboard  # noqa: E402
 from dashboard import live_server  # noqa: E402
+from dashboard.narration_script import DOD_NARRATION  # noqa: E402
 sys.path.insert(0, str(_HERE / "tasks"))
 from validation import (  # noqa: E402
     POSITION_VALIDATOR_X, POSITION_VALIDATOR_Y, ELECTRONIC_NOISE_VALIDATOR,
@@ -260,6 +261,21 @@ from validation import (  # noqa: E402
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _ts_keep(batch_id: str, denom: int) -> bool:
+    """Deterministic per-batch decimation for TS submission.
+
+    MUST stay in lockstep with
+    examples/dod_mission/participant.py:_ts_keep — both sides call
+    it on the same batch_id and AT_TS_DECIMATION, so they agree on
+    which batches form bilateral Transactions
+    (reputation.py:209 requires both p1 and p2 before a
+    Transaction enters the chain).
+    """
+    if denom <= 1:
+        return True
+    return int(batch_id.replace('-', '')[:8], 16) % denom == 0
 
 
 def _reading_from_dict(d: dict) -> Reading:
@@ -294,12 +310,24 @@ class DoDMissionCoordinator(AutonomousTrust):
                  **kwargs):
         self.scenario = scenario
         self._record_path = record_path
+        self._event_recorder: EventRecorder | None = (
+            EventRecorder() if record_path else None)
         self._compromise_mode = compromise_mode
         self._dashboard_port = dashboard_port
         self._reputation_cache: dict[str, float] = {}
         self._anomaly_log: list[dict] = []
         self._tick_count = 0
-        self._latest_state: dict = {"reputations": {}, "tick": 0, "phase": None}
+        self._latest_state: dict = {
+            "reputations": {},
+            # Parallel to `reputations`: nickname -> peer._tier int. Fed
+            # by _push_dashboard_update from self.peers.all. The
+            # reputations panel renders these alongside the score; see
+            # dashboard/live_server.py:_render_reputations.
+            "tiers": {},
+            "tick": 0, "phase": None,
+        }
+        # nickname -> tier int (so _render_reputations can show both)
+        self._tier_cache: dict[str, int] = {}
         self.data_queue: queue.Queue = queue.Queue()
         # Per-batch state for sender-scoring.  batch_id (uuid str) →
         # {'submitted': bool, 'anomalous': bool, 'first_tick': int}.
@@ -312,6 +340,17 @@ class DoDMissionCoordinator(AutonomousTrust):
         # 500ms cadence, 4 ticks = 2 seconds — well over the
         # generator's 1 Hz emit interval.
         self._batch_settle_ticks = 4
+        # Deterministic per-batch decimation for TS submission.
+        # MUST match the sender's filter in
+        # examples/dod_mission/participant.py:_ts_keep so both
+        # sides pick the same batches — otherwise bilateral
+        # pairing never forms (reputation.py:209 requires both
+        # p1 and p2 before a Transaction enters the chain).
+        # Default 30: ~1/30 of batches scored, cutting paxos
+        # traffic ~30x from the original per-batch cadence while
+        # keeping CTFT fed.
+        self._ts_decimation = int(
+            os.environ.get("AT_TS_DECIMATION", "30"))
 
         # Validators run inline on the coordinator; in a full deployment
         # these would also run on dedicated fusion peers (squad-intel,
@@ -327,6 +366,15 @@ class DoDMissionCoordinator(AutonomousTrust):
         # rotating logfile under /var/at/, which makes the demo
         # essentially un-debuggable from `docker compose logs`.
         super().__init__(silent=False, **kwargs)
+
+        # Register the DoD trust-ladder caps (metadata only — function=None)
+        # so the reputation process's _resolve_tx_weight finds the right
+        # transaction_weight when scoring batches tagged with
+        # capability_name="dod.sensor-report". Must run BEFORE _configure
+        # / subprocess fork so the workers inherit the populated
+        # Capabilities. See examples/dod_mission/trust_ladder.yaml.
+        from .trust_ladder import register_trust_ladder  # local import
+        self._trust_ladder = register_trust_ladder(self.capabilities)
 
         if HAS_INSPECTOR:
             self._cohort = Cohort(self.queue_pool)
@@ -373,6 +421,7 @@ class DoDMissionCoordinator(AutonomousTrust):
             chart_keys=["target_x_chart", "noise_chart"],
             state_provider=lambda: self._latest_state,
             port=self._dashboard_port,
+            narration_script=DOD_NARRATION,
         )
         logger.info("Dashboard serving on :%d", self._dashboard_port)
 
@@ -498,15 +547,15 @@ class DoDMissionCoordinator(AutonomousTrust):
 
     def cleanup(self):
         """Flush the event log to disk on shutdown."""
-        if self._record_path and self._anomaly_log:
+        if self._event_recorder is not None and self._record_path:
             try:
-                with open(self._record_path, "a") as f:
-                    for record in self._anomaly_log:
-                        f.write(json.dumps(record) + "\n")
-                logger.info("Flushed %d anomaly records to %s",
-                            len(self._anomaly_log), self._record_path)
+                self._event_recorder.save(
+                    self._record_path, scenario=self.scenario)
+                logger.info("Recorded %d events to %s",
+                            len(self._event_recorder.events),
+                            self._record_path)
             except Exception:
-                logger.exception("Failed to flush anomaly log")
+                logger.exception("Failed to save recording")
         logger.info("DoD mission coordinator shutting down")
 
     # -- internal -------------------------------------------------------
@@ -517,30 +566,31 @@ class DoDMissionCoordinator(AutonomousTrust):
             self._panels["event_log"].add_from_scenario_event(event)
         except Exception:
             logger.exception("Failed to forward scenario event to dashboard")
-        if not self._record_path:
-            return
-        try:
-            with open(self._record_path, "a") as f:
-                f.write(json.dumps(event.to_dict()) + "\n")
-        except Exception:
-            logger.exception("Failed to append scenario event")
+        if self._event_recorder is not None:
+            self._event_recorder.record(event)
 
     def _query_reputations(self, queues):
-        """Send rep_req for every known peer, then drain whatever
-        ``self.latest_reputation`` has accumulated since last call.
+        """Send consensus_rep_req for every known peer, then drain
+        whatever ``self.latest_reputation`` has accumulated since
+        last call.
 
-        ``query_reputation`` does not exist on AutonomousTrust; the
-        framework path is message-based — see
-        ``examples/mission/coordinator/coordinator.py``.  The previous
-        implementation called ``self.query_reputation(peer)`` and
-        iterated ``self.peers`` directly (not ``self.peers.all``);
-        both errors were swallowed by the bare ``except Exception``,
-        so reputations never reached the timeline.
+        Uses ``consensus_rep_req`` rather than ``rep_req`` so the
+        dashboard reflects a deterministic, history-only score
+        derived from the consensus tx chain (see
+        ``ReputationProcess._consensus_reputation``) instead of the
+        coordinator's local CTFT/pure score.  The coordinator is an
+        observer — it never submits TransactionScores — so the
+        CTFT branch always returned 0.49 for peers it has no
+        bilateral history with, and oscillated between regimes for
+        the few it did.  The consensus path produces the same
+        number on every node (the same view a participating peer
+        would compute), which is what the inspector should display.
         """
         try:
             for peer in self.peers.all:
                 query = Message(
-                    CfgIds.reputation, ReputationProtocol.rep_req,
+                    CfgIds.reputation,
+                    ReputationProtocol.consensus_rep_req,
                     to_yaml_string((peer, self.proc_name)),
                     self.identity,
                 )
@@ -576,6 +626,10 @@ class DoDMissionCoordinator(AutonomousTrust):
             name = getattr(peer, "nickname", None) or str(peer_id_str)
             self._reputation_cache[name] = float(score)
             self._feed_timeline(name, float(score))
+            # Stash the peer's trust tier alongside the score so the
+            # dashboard reputations panel can show both. tier defaults
+            # to 0 if the peer object isn't fully resolved yet.
+            self._tier_cache[name] = int(getattr(peer, "_tier", 0))
 
     def _feed_timeline(self, peer_name: str, score: float) -> None:
         # AutonomousTrust sets ``tasking_start`` once init_tasking runs;
@@ -590,9 +644,17 @@ class DoDMissionCoordinator(AutonomousTrust):
             self._panels, t_seconds=t, peer_name=peer_name, score=score)
 
     def _push_dashboard_update(self):
+        # Scenario seconds since tasking_start — falls back to tick-derived
+        # estimate (AT runs at ~500ms cadence) until tasking_start is set.
+        try:
+            t_seconds = (now() - self.tasking_start).total_seconds()
+        except Exception:
+            t_seconds = self._tick_count * 0.5
         self._latest_state = {
             "reputations": dict(self._reputation_cache),
+            "tiers": dict(self._tier_cache),
             "tick": self._tick_count,
+            "t_seconds": t_seconds,
             "phase": (self.scenario.current_phase.name
                       if self.scenario.current_phase else None),
         }
@@ -653,9 +715,14 @@ class DoDMissionCoordinator(AutonomousTrust):
             if result.is_anomalous:
                 anomalous_this_reading = True
                 t_sec = result.timestamp.total_seconds()
+                # Type is "COMPROMISE_DETECT" (a PhaseEvent enum name) so the
+                # record survives PlaybackEngine.load_recorded's PhaseEvent
+                # filter and replays in the event log; data.source pins it
+                # as a validator hit (vs. a scripted scenario detect) for
+                # any tool that wants to split them.
                 record = {
                     "t": t_sec,
-                    "type": "ANOMALY_DETECT",
+                    "type": "COMPROMISE_DETECT",
                     "peer": result.peer_name,
                     "data_type": result.data_type,
                     "deviation": result.deviation,
@@ -665,8 +732,11 @@ class DoDMissionCoordinator(AutonomousTrust):
                         f"{result.peer_name} {result.data_type} "
                         f"deviation {result.deviation:.1f} > {result.threshold:.1f}"
                     ),
+                    "data": {"source": "validator"},
                 }
                 self._anomaly_log.append(record)
+                if self._event_recorder is not None:
+                    self._event_recorder.record(record)
                 logger.warning(
                     "ANOMALY: %s reported %s=%.2f, consensus=%.2f (dev %.1f > %.1f)",
                     result.peer_name, result.data_type,
@@ -693,6 +763,16 @@ class DoDMissionCoordinator(AutonomousTrust):
         (first sighting >= self._batch_settle_ticks ago) and not yet
         been submitted.  0.8 for a clean batch, 0.3 for one with any
         anomaly — pinned to automate.py:473 (ZKP verify pass/fail).
+
+        Batches are decimated by _ts_keep on batch_id; the sender
+        side (participant.py) applies the same filter so both sides
+        agree on which batches form bilateral Transactions.
+        Anomalies on non-selected batches don't drop reputation
+        directly — but since compromise is sustained, the next
+        selected batch from the same peer will also fire ANOMALY
+        and drive the score down (latency ~AT_TS_DECIMATION batches).
+        Filtered-out batches are marked submitted so they get
+        reaped on the next pass.
         """
         # Iterate over a snapshot so we can mutate _batch_state.
         for batch_id, state in list(self._batch_state.items()):
@@ -706,8 +786,18 @@ class DoDMissionCoordinator(AutonomousTrust):
             if (self._tick_count - state["first_tick"]
                     < self._batch_settle_ticks):
                 continue
-            score = 0.3 if state["anomalous"] else 0.8
-            ts = TransactionScore(task_id=batch_id, score=score)
+            if not _ts_keep(batch_id, self._ts_decimation):
+                state["submitted"] = True
+                continue
+            is_anomaly = bool(state["anomalous"])
+            score = 0.3 if is_anomaly else 0.8
+            # Tag the TS with the DoD ladder cap name so the
+            # reputation process's _resolve_tx_weight picks up the
+            # configured transaction_weight (4×) — see
+            # examples/dod_mission/trust_ladder.yaml and
+            # dod-demo-implementation-plan.md §Phase 6 / scope #3.
+            ts = TransactionScore(task_id=batch_id, score=score,
+                                  capability_name="dod.sensor-report")
             try:
                 queues[CfgIds.reputation].put(
                     ts, block=True, timeout=queue_cadence)

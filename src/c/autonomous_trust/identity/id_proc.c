@@ -62,9 +62,9 @@ static char ID_UPDATE[]      = "group_key_update";
 static char ID_CAPS_QUERY[]  = "peer_caps_query";
 static char ID_CAPS_RESPONSE[] = "peer_caps_response";
 /* Local-only IPC from ReputationProcess (no wire egress). Payload is a
- * 2-element JSON array `[peer_uuid_str, new_rank_int]`. Mirrors
- * Python IdentityProtocol.rank_update (idprocess.py:139 / protocol.py:78). */
-static char ID_RANK[]        = "rank_update";
+ * 2-element JSON array `[peer_uuid_str, new_tier_int]`. Mirrors
+ * Python IdentityProtocol.tier_update. */
+static char ID_TIER[]        = "tier_update";
 /* Group partition recovery (doc/architecture/partition-recovery.md).
  *   ID_PARTITION_SIGNAL: local-only IPC from NetProcess when group-channel
  *                        traffic is rejected (no wire egress). Payload is
@@ -114,18 +114,18 @@ static struct {
      * lowercased uuid string; values are array_t* of cap-name strings.
      * Conformance assertion surface via identity_get_peer_caps_count. */
     map_t peer_caps_map;
-    /* Reputation-derived per-peer rank tier. Keyed by lowercased uuid
-     * string; values are int data. Written by handle_rank_update on
+    /* Reputation-derived per-peer trust tier. Keyed by lowercased uuid
+     * string; values are int data. Written by handle_tier_update on
      * local IPC from ReputationProcess. Mirrors Python's per-peer
-     * `peer._rank` mutation in idprocess.py:1052. Future history-
-     * construction code should consult this map (via
-     * `identity_get_peer_rank`) instead of defaulting voter.rank to 0
-     * in history.c:487,506,525. */
-    map_t peer_ranks;
-    /* Self-rank mirror updated when handle_rank_update's payload
+     * `peer._tier` mutation in idprocess.py. Distinct from topology
+     * rank (agreement_voter_t::rank / identity_t::rank) which is
+     * loaded statically from identity.json — see
+     * doc/architecture/trust-tiers.md §1 for the disambiguation. */
+    map_t peer_tiers;
+    /* Self trust-tier mirror updated when handle_tier_update's payload
      * targets the local identity uuid. Default 0; reads are unlocked
      * since the field is a single int and writes are mutex-guarded. */
-    int self_rank;
+    int self_tier;
     /* Per-process identity history (Python's `self._history`). Lazy-
      * initialized by _ensure_history(proc) the first time a path needs
      * the local DAG — _peer_accepted's `steps` slot in the wire
@@ -163,12 +163,12 @@ static void _ensure_id_init(void)
         map_init(&id_state.vote_collection);
         map_init(&id_state.own_caps_by_proc);
         map_init(&id_state.peer_caps_map);
-        map_init(&id_state.peer_ranks);
+        map_init(&id_state.peer_tiers);
         map_init(&id_state.partition_probe_cooldown);
         map_init(&id_state.partition_response_cooldown);
         id_state.partition_recovery_target[0] = '\0';
         id_state.partition_recovery_started_us = 0;
-        id_state.self_rank = 0;
+        id_state.self_tier = 0;
         id_state.choosing_group = false;
         id_state.self_bootstrapped = false;
         id_state.merging = false;
@@ -1617,15 +1617,15 @@ void identity_reset_state(void)
     map_init(&id_state.own_caps_by_proc);
     map_free(&id_state.peer_caps_map);
     map_init(&id_state.peer_caps_map);
-    map_free(&id_state.peer_ranks);
-    map_init(&id_state.peer_ranks);
+    map_free(&id_state.peer_tiers);
+    map_init(&id_state.peer_tiers);
     map_free(&id_state.partition_probe_cooldown);
     map_init(&id_state.partition_probe_cooldown);
     map_free(&id_state.partition_response_cooldown);
     map_init(&id_state.partition_response_cooldown);
     id_state.partition_recovery_target[0] = '\0';
     id_state.partition_recovery_started_us = 0;
-    id_state.self_rank = 0;
+    id_state.self_tier = 0;
     id_state.choosing_group = false;
     id_state.self_bootstrapped = false;
     id_state.merging = false;
@@ -2137,12 +2137,12 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
 }
 
 /****************************
- * Handler: rank_update (rank_update)
- * Local-only IPC from ReputationProcess (BUGS.md §P2). Payload is a
- * 2-element JSON array `[peer_uuid_str, new_rank_int]`. Mirrors
- * Python's handle_rank_update (idprocess.py:1020-1058). Updates the
- * peer_ranks map (or self_rank if the payload targets us); the next
- * history-construction call should consult these for voter rank.
+ * Handler: tier_update
+ * Local-only IPC from ReputationProcess. Payload is a 2-element JSON
+ * array `[peer_uuid_str, new_tier_int]`. Mirrors Python's
+ * handle_tier_update (idprocess.py). Updates the peer_tiers map (or
+ * self_tier if the payload targets us); negotiation's tier-gate then
+ * consults these for capability access decisions.
  ****************************/
 
 /*@
@@ -2151,7 +2151,7 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
   requires \valid(msg);
   requires proc->logger == \null || \valid(proc->logger);
 */
-static bool handle_rank_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+static bool handle_tier_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -2159,27 +2159,27 @@ static bool handle_rank_update(const process_t *proc, directory_t *queues, gener
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
     {
-        log_warn(proc->logger, "Identity: handle_rank_update: no JSON payload\n");
+        log_warn(proc->logger, "Identity: handle_tier_update: no JSON payload\n");
         return true;
     }
     if (!json_is_array(payload) || json_array_size(payload) < 2)
     {
         json_decref(payload);
-        log_warn(proc->logger, "Identity: handle_rank_update: bad payload shape\n");
+        log_warn(proc->logger, "Identity: handle_tier_update: bad payload shape\n");
         return true;
     }
     const char *peer_uuid_str = json_string_value(json_array_get(payload, 0));
-    json_t *j_rank = json_array_get(payload, 1);
-    if (peer_uuid_str == NULL || !json_is_integer(j_rank))
+    json_t *j_tier = json_array_get(payload, 1);
+    if (peer_uuid_str == NULL || !json_is_integer(j_tier))
     {
         json_decref(payload);
-        log_warn(proc->logger, "Identity: handle_rank_update: bad field types\n");
+        log_warn(proc->logger, "Identity: handle_tier_update: bad field types\n");
         return true;
     }
-    int new_rank = (int)json_integer_value(j_rank);
+    int new_tier = (int)json_integer_value(j_tier);
 
     /* Detect self-target by comparing against our own identity uuid from
-     * proc->configs["identity"]. Mirrors Python idprocess.py:1039. */
+     * proc->configs["identity"]. Mirrors Python idprocess.py. */
     bool is_self = false;
     char self_str[UUID_STRING_LEN + 1] = {0};
     data_t *id_dat = NULL;
@@ -2207,39 +2207,39 @@ static bool handle_rank_update(const process_t *proc, directory_t *queues, gener
 
     pthread_mutex_lock(&id_state.lock);
     if (is_self) {
-        id_state.self_rank = new_rank;
+        id_state.self_tier = new_tier;
     } else {
-        data_t *rank_dat = integer_data(new_rank);
-        if (rank_dat != NULL)
-            map_set(&id_state.peer_ranks, key_buf, rank_dat);
+        data_t *tier_dat = integer_data(new_tier);
+        if (tier_dat != NULL)
+            map_set(&id_state.peer_tiers, key_buf, tier_dat);
     }
     pthread_mutex_unlock(&id_state.lock);
 
-    log_debug(proc->logger, "Identity: rank update for %s -> %d%s\n",
-              key_buf, new_rank, is_self ? " (self)" : "");
+    log_debug(proc->logger, "Identity: tier update for %s -> %d%s\n",
+              key_buf, new_tier, is_self ? " (self)" : "");
     json_decref(payload);
     return true;
 }
 
-int identity_get_peer_rank(const uuid_t uuid)
+int identity_get_peer_tier(const uuid_t uuid)
 {
     if (!id_state.initialized) return 0;
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(uuid, uuid_str);
     pthread_mutex_lock(&id_state.lock);
-    int rank = 0;
+    int tier = 0;
     data_t *dat = NULL;
-    if (map_get(&id_state.peer_ranks, uuid_str, &dat) == 0 && dat != NULL)
-        data_integer(dat, &rank);
+    if (map_get(&id_state.peer_tiers, uuid_str, &dat) == 0 && dat != NULL)
+        data_integer(dat, &tier);
     pthread_mutex_unlock(&id_state.lock);
-    return rank;
+    return tier;
 }
 
-int identity_get_self_rank(void)
+int identity_get_self_tier(void)
 {
     if (!id_state.initialized) return 0;
     pthread_mutex_lock(&id_state.lock);
-    int r = id_state.self_rank;
+    int r = id_state.self_tier;
     pthread_mutex_unlock(&id_state.lock);
     return r;
 }
@@ -2922,7 +2922,7 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_UPDATE,   (handler_ptr_t)handle_group_update);
     process_register_handler(proc, ID_CAPS_QUERY,    (handler_ptr_t)handle_caps_query);
     process_register_handler(proc, ID_CAPS_RESPONSE, (handler_ptr_t)handle_caps_response);
-    process_register_handler(proc, ID_RANK,          (handler_ptr_t)handle_rank_update);
+    process_register_handler(proc, ID_TIER,          (handler_ptr_t)handle_tier_update);
     process_register_handler(proc, ID_PARTITION_SIGNAL,
                              (handler_ptr_t)handle_partition_signal);
     process_register_handler(proc, ID_PARTITION_PROBE,

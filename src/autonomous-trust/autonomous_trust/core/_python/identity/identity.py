@@ -36,9 +36,9 @@ class Identity(InitializableConfig, AgreementVoter):
     enc = encoding
 
     def __init__(self, _uuid, address, _fullname, _nickname, _signature, _encryptor, petname='',
-                 _public_only=True, _rank=0, _block_impl=agreement_impl):
+                 _public_only=True, _rank=0, _block_impl=agreement_impl, _tier=0):
         Configuration.__init__(self, identity_pb2.Identity)
-        AgreementVoter.__init__(self, str(_uuid), _rank)
+        AgreementVoter.__init__(self, str(_uuid), _rank, _tier=_tier)
         self.address = address  # corresponds to one address in Network config
         self._fullname = _fullname
         self._nickname = _nickname
@@ -47,6 +47,17 @@ class Identity(InitializableConfig, AgreementVoter):
         self.petname = petname
         self._public_only = _public_only
         self._block_impl = _block_impl
+        # Reputation-derived trust tier (0..4) is stored on the base
+        # AgreementVoter via the __init__ call above (so PoT can read
+        # voter.tier directly). The protobuf wire form
+        # (identity_pb2.Identity) does NOT encode `_tier` — trust is
+        # others' opinion of a peer, not the peer's own claim — so over
+        # the network this attribute is always 0 on receive and
+        # populated locally via IdentityProcess.handle_tier_update.
+        # The constructor accepts `_tier` so JSON roundtrips used for
+        # IPC (Message.obj auto-deserialize) don't trip on the
+        # serialized attribute. Distinct from `_rank` (network
+        # topology); see doc/architecture/trust-tiers.md §1.
 
     def __eq__(self, other):
         return self.__class__.__name__ == other.__class__.__name__ and self.uuid == other.uuid and \
