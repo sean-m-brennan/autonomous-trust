@@ -10,6 +10,7 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Identity Protocol](identity-protocol.md) -- Peer discovery, voting, and group formation
 - [Task Negotiation](negotiation.md) -- Distributed task lifecycle
 - [Reputation Consensus](reputation.md) -- Paxos-based reputation scoring
+- [Trust Tiers](trust-tiers.md) -- Tiered capabilities, weighted transactions, bootstrap corpus, tier-gated access (design)
 - [Node Lifecycle](node-lifecycle.md) -- Startup phases and state transitions
 - [Integration Testing](integration-testing.md) -- Metrics collection and scenario verification
 - [Adversarial Testing](adversarial-testing.md) -- Security validation via attack scenarios and CALDERA orchestration

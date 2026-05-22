@@ -36,7 +36,7 @@ class TestCapability:
     def test_to_dict(self):
         cap = Capability('task1')
         d = cap.to_dict()
-        assert d == {'name': 'task1'}
+        assert d == {'name': 'task1', 'required_tier': 0, 'transaction_weight': 1}
 
     def test_execute(self):
         func = MagicMock(return_value=42)
