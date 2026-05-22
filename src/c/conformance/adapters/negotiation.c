@@ -226,17 +226,17 @@ static void _apply_fixtures(sce_run_ctx_t *ctx)
         }
     }
 
-    /* peer_levels: { "<participant>": <int>, ... }. The Python adapter
-     * sets the named participant's level *as seen by every other
-     * participant*. Mirror that. */
-    json_t *plev = json_object_get(fixtures, "peer_levels");
-    if (json_is_object(plev))
+    /* peer_tiers: { "<participant>": <int>, ... }. Sets the named
+     * participant's trust tier *as seen by every other participant*.
+     * Mirrors the Python adapter's `peer_tiers` handling. */
+    json_t *pt = json_object_get(fixtures, "peer_tiers");
+    if (json_is_object(pt))
     {
         const char *pid;
-        json_t *lvl_j;
-        json_object_foreach(plev, pid, lvl_j) {
-            if (!json_is_integer(lvl_j)) continue;
-            int lvl = (int)json_integer_value(lvl_j);
+        json_t *tier_j;
+        json_object_foreach(pt, pid, tier_j) {
+            if (!json_is_integer(tier_j)) continue;
+            int t = (int)json_integer_value(tier_j);
             sce_participant_t *target = sce_find_participant(ctx, pid);
             if (target == NULL) continue;
             np_impl_t *target_impl = (np_impl_t *)target->impl;
@@ -246,7 +246,29 @@ static void _apply_fixtures(sce_run_ctx_t *ctx)
                 if (strcmp(ctx->participants[i].id, pid) == 0) continue;
                 np_impl_t *other = (np_impl_t *)ctx->participants[i].impl;
                 if (other == NULL || other->proc == NULL) continue;
-                negotiation_set_peer_level(other->proc, target_impl->pub->uuid, lvl);
+                negotiation_set_peer_tier(other->proc, target_impl->pub->uuid, t);
+            }
+        }
+    }
+
+    /* capability_tiers: { "<cap_name>": <required_tier_int>, ... }.
+     * Sets the required_tier on a named capability on every
+     * participant's process. The tier-gate in handle_invite then
+     * refuses invites for that capability when the sender's tier is
+     * below this threshold. */
+    json_t *ct = json_object_get(fixtures, "capability_tiers");
+    if (json_is_object(ct))
+    {
+        const char *cap_name;
+        json_t *tier_j;
+        json_object_foreach(ct, cap_name, tier_j) {
+            if (!json_is_integer(tier_j)) continue;
+            int t = (int)json_integer_value(tier_j);
+            for (size_t i = 0; i < ctx->participant_count; i++)
+            {
+                np_impl_t *impl = (np_impl_t *)ctx->participants[i].impl;
+                if (impl == NULL || impl->proc == NULL) continue;
+                negotiation_set_capability_required_tier(impl->proc, cap_name, t);
             }
         }
     }
@@ -321,15 +343,20 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     uuid_t task_uuid;
     _uuid5("task:", slug, task_uuid);
 
-    /* Requestor: for `invitation` it's the recipient (the inviter
-     * issuing the request — mirrors the Python adapter where the
-     * recipient is the requestor for the invite path). For every other
-     * function the sender is the requestor. */
+    /* Requestor: the original inviter, which initiates 'invitation'
+     * and 'status request' (alice→bob); the worker initiates the
+     * replies ack/nack/haggle and the report ('report results') —
+     * the requestor on those is therefore the recipient. Mirrors
+     * the Python adapter's `_build_inbound` after the 2026-05-22
+     * fix (see trust-tiers.md slice 5 notes). */
+    bool requestor_is_sender = (strcmp(function, "invitation") == 0
+                                || strcmp(function, "status request") == 0
+                                || strcmp(function, "spawn task") == 0);
     const uuid_t *requestor_uuid;
-    if (strcmp(function, "invitation") == 0 && recipient_impl)
-        requestor_uuid = (const uuid_t *)&recipient_impl->pub->uuid;
-    else
+    if (requestor_is_sender || recipient_impl == NULL)
         requestor_uuid = (const uuid_t *)&sender_impl->pub->uuid;
+    else
+        requestor_uuid = (const uuid_t *)&recipient_impl->pub->uuid;
 
     /* Build the JSON payload appropriate to each handler. */
     json_t *body = NULL;
@@ -365,6 +392,45 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     else if (strcmp(function, "report results") == 0)
     {
         body = _build_task_json(payload, task_uuid, *requestor_uuid, false);
+    }
+    else if (strcmp(function, "tier_lost") == 0)
+    {
+        /* Local-IPC tier_lost payload: 2-element array
+         * [peer_uuid_str, new_tier_int]. Mirrors Python's
+         * to_json_string((key, new_tier)) in repprocess.py and the
+         * conformance adapter (`tier_lost` branch in negotiation.py).
+         * Payload fields: `peer` is the slug of the affected peer
+         * (resolved via sce_find_participant); `new_tier` is the
+         * peer's post-demotion tier. */
+        const char *peer_slug = NULL;
+        int new_tier = 0;
+        if (payload && json_is_object(payload))
+        {
+            json_t *p_j = json_object_get(payload, "peer");
+            if (json_is_string(p_j)) peer_slug = json_string_value(p_j);
+            json_t *t_j = json_object_get(payload, "new_tier");
+            if (json_is_integer(t_j)) new_tier = (int)json_integer_value(t_j);
+        }
+        if (peer_slug == NULL)
+        {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: tier_lost missing peer slug");
+            return -1;
+        }
+        sce_participant_t *affected = sce_find_participant(ctx, peer_slug);
+        if (affected == NULL)
+        {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: tier_lost unknown peer %s", peer_slug);
+            return -1;
+        }
+        np_impl_t *affected_impl = (np_impl_t *)affected->impl;
+        char uuid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(affected_impl->pub->uuid, uuid_str);
+        body = json_array();
+        if (body == NULL) return -1;
+        json_array_append_new(body, json_string(uuid_str));
+        json_array_append_new(body, json_integer(new_tier));
     }
     else
     {

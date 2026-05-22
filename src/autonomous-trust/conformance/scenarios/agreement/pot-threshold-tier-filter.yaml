@@ -1,0 +1,62 @@
+schema_version: "1"
+kind: scenario
+protocol: agreement
+name: pot-threshold-tier-filter
+byte_pinning: false
+description: |
+    Proof of Trust (PoT) parallel to `poa-threshold-rank-filter`.
+    Exercises AgreementByTrust's `threshold_tier` gate: voters whose
+    trust tier is below threshold have their vote forced to False in
+    finalize regardless of what they cast.
+
+    Setup: alice (tier 2) is the highest-tier voter (the "leader"
+    under PoT's leader-decides semantics — see trust-tiers.md §10);
+    bob (tier 1) is a peer; threshold_tier is 3. Alice votes approve.
+    Under unfiltered PoT leader-decides this would yield True; with
+    threshold_tier=3, alice's tier-2 vote is below threshold →
+    _count_vote forces it to False → _accumulate_votes looks up the
+    leader's vote at tier=2 and finalizes False.
+
+    Companion to the PoA scenario; the two together pin that PoT
+    mirrors PoA's shape exactly but reads `voter.tier` instead of
+    `voter.rank`. A future change that flattens the two axes (e.g.
+    routing PoT through the same threshold field as PoA) would flip
+    this case relative to the PoA one and surface the regression.
+
+participants:
+  - id: alice
+    role: voter
+  - id: bob
+    role: voter
+
+fixtures:
+  impl: trust
+  threshold_tier: 3
+  tiers:
+    alice: 2
+    bob: 1
+  myself: bob
+  blobs:
+    blob-x:
+      originator: alice
+      payload: "below-threshold-payload"
+
+steps:
+  - id: 1
+    from: alice
+    to: agreement
+    function: vote
+    payload:
+      blob: blob-x
+      approval: true
+    description: |
+        alice (tier 2, the highest-tier voter so "leader" under PoT)
+        approves blob-x. With threshold_tier=3 her vote is below
+        threshold and _count_vote forces it to False;
+        _accumulate_votes looks up the leader's vote at tier=2 and
+        gets False.
+
+expected_state:
+  agreement:
+    blob-x:
+      outcome: false

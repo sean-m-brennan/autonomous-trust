@@ -101,6 +101,25 @@ from forged_identity import create_forged_identity_sensor  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def _ts_keep(batch_id: str, denom: int) -> bool:
+    """Deterministic per-batch decimation for TS submission.
+
+    Both the sender (here) and the coordinator
+    (DoDMissionCoordinator._maybe_submit_batch_scores) call this
+    with the same batch_id and AT_TS_DECIMATION, so they always
+    agree on which batches produce a TS.  This preserves the
+    bilateral pairing that Transaction.add / TransactionHistory.update
+    (reputation.py:209) requires before a Transaction is appended
+    to the chain — without agreement, every Transaction would stay
+    at len==1 and CTFT would never score anything.
+    """
+    if denom <= 1:
+        return True
+    # UUID4 is random; the first 8 hex chars are enough entropy for
+    # uniform mod-denom selection without a hash function.
+    return int(batch_id.replace('-', '')[:8], 16) % denom == 0
+
+
 class DoDDataProcess(DataProcess, metaclass=ProcMeta,
                      proc_name='data-source',
                      description='DoD ISR / sensor data source'):
@@ -139,6 +158,7 @@ class DoDDataProcess(DataProcess, metaclass=ProcMeta,
     _logged_first_acquire = False
     _logged_first_emit = False
     _logged_first_tx_submit = False
+    _last_batch_id: Optional[str] = None
 
     def acquire(self):
         if self.generators is None:
@@ -166,12 +186,10 @@ class DoDDataProcess(DataProcess, metaclass=ProcMeta,
             DoDDataProcess._logged_first_emit = True
         # Stamp every reading in this tick with the same task_id so
         # the coordinator can identify which deliveries belong to the
-        # same paxos round.  The generator submits a single
-        # TransactionScore(task_id, 0.9) per tick (in process()
-        # below); the coordinator submits a single
-        # TransactionScore(task_id, 0.8|0.3) per tick.  Bilateral
-        # transactions then form in everyone's reputation history,
-        # so _contrite_tit_for_tat has real input to score against.
+        # same paxos round.  Both sides (sender here + coordinator)
+        # submit a TransactionScore for batches selected by _ts_keep;
+        # paired submissions form the bilateral Transaction that
+        # CTFT scores against (reputation.py:209).
         batch_id = str(uuid4())
         emitted: list[dict] = []
         for r in readings:
@@ -184,16 +202,12 @@ class DoDDataProcess(DataProcess, metaclass=ProcMeta,
         self._last_batch_id = batch_id
         return emitted
 
-    _last_batch_id: Optional[str] = None
-
     def process(self, queues, signal):
-        """Override the parent loop only so we can submit a
-        TransactionScore after each successful broadcast.  The body
-        is intentionally a close copy of DataProcess.process so the
-        message-handling and acquire-then-send sequence stays
-        identical; the only addition is the
-        reputation_queue.put(TransactionScore(...)) call after a
-        batch goes out.
+        """Override the parent loop so we can submit a
+        TransactionScore after each successful broadcast (subject
+        to deterministic per-batch decimation, see _ts_keep) and
+        log unhandled messages explicitly (the base
+        DataProcess.process silently drops them).
         """
         from queue import Empty as _Empty
         while self.keep_running(signal):
@@ -225,12 +239,19 @@ class DoDDataProcess(DataProcess, metaclass=ProcMeta,
                                 client_id)
                     batch_id = self._last_batch_id
                     self._last_batch_id = None
-                    if batch_id is not None and self.clients:
-                        # Sender's "I delivered" score for this batch.
-                        # Pinned to 0.9 to match automate.py:537 — the
-                        # AT convention for successful local task
-                        # execution.
-                        ts = TransactionScore(task_id=batch_id, score=0.9)
+                    denom = int(os.environ.get("AT_TS_DECIMATION", "30"))
+                    if (batch_id is not None and self.clients
+                            and _ts_keep(batch_id, denom)):
+                        # Sender's "I delivered" score for this
+                        # batch.  Pinned to 0.9; pairs with the
+                        # coordinator's verdict TS (0.8 clean / 0.3
+                        # anomalous) on the same task_id to form
+                        # the bilateral Transaction CTFT scores.
+                        # Tagged with dod.sensor-report so the
+                        # weighting math applies on both sides (see
+                        # examples/dod_mission/trust_ladder.yaml).
+                        ts = TransactionScore(task_id=batch_id, score=0.9,
+                                              capability_name="dod.sensor-report")
                         try:
                             queues[CfgIds.reputation].put(
                                 ts, block=True, timeout=self.q_cadence)
@@ -238,7 +259,8 @@ class DoDDataProcess(DataProcess, metaclass=ProcMeta,
                                 self.logger.info(
                                     "DoDDataProcess: first "
                                     "TransactionScore submitted "
-                                    "(batch=%s, score=0.9)", batch_id)
+                                    "(batch=%s, score=0.9, denom=%d)",
+                                    batch_id, denom)
                                 DoDDataProcess._logged_first_tx_submit = True
                         except Full:
                             self.logger.warning(
@@ -394,6 +416,13 @@ class DoDMissionParticipant(AutonomousTrust):
         if self.generators is not None:
             self.capabilities.register_ability(
                 DataProcess.capability_name, None)
+        # Register DoD trust-ladder caps so peer_capabilities advertised
+        # to the cohort carries the right tier/weight metadata, and so
+        # this participant's local reputation process finds the weights
+        # when scoring TSs. Metadata-only (function=None); the actual
+        # data flow still goes through DataProcess.
+        from .trust_ladder import register_trust_ladder  # local import
+        self._trust_ladder = register_trust_ladder(self.capabilities)
         logger.info(
             "autonomous_ability: peer=%s capabilities=%s — "
             "broadcasting to %d worker queue(s)",

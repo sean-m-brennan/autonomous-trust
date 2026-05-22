@@ -4,11 +4,16 @@ protocol: negotiation
 name: invite-refuse-low-rep
 byte_pinning: false
 description: |
-    Refusal path: bob is capable, but alice's peer level for him is 0
-    (lowest tier) so bob would normally serve the request — but the
-    handler in negprocess.py applies the level check on the SENDER (the
-    requestor's level as known to the responder). With alice pre-placed
-    at level 0 in bob's peers list, bob refuses.
+    Trust-tier refusal path: bob is capable, but the data_fetch
+    capability requires trust tier 1 and alice's trust tier (as
+    seen by bob) is 0. handle_invite's tier-gate refuses the
+    invite. See doc/architecture/trust-tiers.md §7.1.
+
+    Previously this scenario exercised a hierarchy-bucket gate
+    (`peer_level == 0 → refuse`); the new gate generalises to
+    `peer._tier < cap.required_tier → refuse`, and the original
+    "tier 0 refuses" semantics is preserved by setting
+    required_tier = 1 on data_fetch.
 
 participants:
   - id: alice
@@ -19,7 +24,9 @@ participants:
 fixtures:
   capabilities:
     bob: [data_fetch]
-  peer_levels:
+  capability_tiers:
+    data_fetch: 1
+  peer_tiers:
     alice: 0
 
 steps:
