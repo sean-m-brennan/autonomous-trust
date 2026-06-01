@@ -27,11 +27,19 @@ DEFINE_TEST(test_tx_history_basic)
     ck_assert_ret_ok(tx_history_init(&hist));
     ck_assert_int_eq(tx_history_len(&hist), 0);
 
-    uuid_t task_uuid, peer_uuid;
+    uuid_t task_uuid, peer1_uuid, peer2_uuid;
     uuid_generate(task_uuid);
-    uuid_generate(peer_uuid);
+    uuid_generate(peer1_uuid);
+    uuid_generate(peer2_uuid);
 
-    ck_assert_ret_ok(tx_history_update(&hist, task_uuid, peer_uuid, 0.75));
+    /* First slot fill keeps the tx pending — mirrors Python's
+     * TransactionHistory.__len__ returning len(_chain), which
+     * only counts bilateral entries. */
+    ck_assert_ret_ok(tx_history_update(&hist, task_uuid, peer1_uuid, 0.75));
+    ck_assert_int_eq(tx_history_len(&hist), 0);
+
+    /* Second slot fill promotes to committed and bumps len. */
+    ck_assert_ret_ok(tx_history_update(&hist, task_uuid, peer2_uuid, 0.85));
     ck_assert_int_eq(tx_history_len(&hist), 1);
 
     tx_history_free(&hist);

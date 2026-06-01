@@ -72,7 +72,17 @@ class CrossSourceValidator:
         self.threshold = threshold
         self.min_sources = min_sources
         self.window_sec = window_sec
-        self._buffer: dict[str, list[Reading]] = {}
+        # Buffer key is (peer_name, world_uid) so two peers reporting
+        # different targets of the same data_type don't get smeared
+        # into one consensus bucket. world_uid defaults to "_default"
+        # for readings without that metadata (e.g. weather sensors),
+        # preserving prior per-peer-only behaviour.
+        self._buffer: dict[tuple[str, str], list[Reading]] = {}
+
+    @staticmethod
+    def _bucket_key(reading: Reading) -> tuple[str, str]:
+        return (reading.peer_name,
+                str(reading.metadata.get("world_uid", "_default")))
 
     def submit(self, reading: Reading) -> Optional[ValidationResult]:
         """Submit a reading for validation.
@@ -83,24 +93,25 @@ class CrossSourceValidator:
         if reading.data_type != self.data_type:
             return None
 
-        # Add to buffer
-        if reading.peer_name not in self._buffer:
-            self._buffer[reading.peer_name] = []
-        self._buffer[reading.peer_name].append(reading)
+        # Add to buffer (keyed by (peer, world_uid))
+        key = self._bucket_key(reading)
+        self._buffer.setdefault(key, []).append(reading)
 
         # Trim old readings
         cutoff = reading.timestamp - timedelta(seconds=self.window_sec)
-        for peer in self._buffer:
-            self._buffer[peer] = [
-                r for r in self._buffer[peer]
+        for k in self._buffer:
+            self._buffer[k] = [
+                r for r in self._buffer[k]
                 if r.timestamp >= cutoff
             ]
 
-        # Need enough sources
+        # Cross-validation only compares within the same target bucket
+        # (same world_uid) — distinct targets get distinct consensus.
+        target_uid = key[1]
         active_sources = {
-            peer: readings[-1]
-            for peer, readings in self._buffer.items()
-            if readings
+            k[0]: readings[-1]                     # peer_name -> latest
+            for k, readings in self._buffer.items()
+            if readings and k[1] == target_uid
         }
         if len(active_sources) < self.min_sources:
             return None
@@ -134,10 +145,60 @@ class CrossSourceValidator:
         )
 
 
-# Default validators for the multi-agency demo
+# Default validators for the multi-agency demo. The coordinator
+# applies each one to incoming readings whose data_type matches; the
+# rest stay no-ops. Bundled in ALL_VALIDATORS so the coordinator can
+# install the whole set with one import.
 TEMPERATURE_VALIDATOR = CrossSourceValidator(
     data_type="temperature",
     threshold=5.0,      # Flag if >5C from consensus
     min_sources=3,
     window_sec=15.0,
 )
+
+# Wind speed (m/s) — the NOAA stations' wind sensors. min_sources=2
+# because the baseline scenario has only 3 NOAA peers and we need to
+# detect divergence even when noaa-3 is the rogue.
+WIND_VALIDATOR = CrossSourceValidator(
+    data_type="wind",
+    threshold=4.0,      # m/s deviation from consensus
+    min_sources=2,
+    window_sec=15.0,
+)
+
+# Pressure (hPa) — secondary weather signal; smaller thresholds since
+# pressure varies slowly and divergence is meaningful at lower deltas.
+PRESSURE_VALIDATOR = CrossSourceValidator(
+    data_type="pressure",
+    threshold=8.0,
+    min_sources=2,
+    window_sec=15.0,
+)
+
+# Seismic magnitude (USGS) — paired sensors, so min_sources=2.
+MAGNITUDE_VALIDATOR = CrossSourceValidator(
+    data_type="magnitude",
+    threshold=0.6,      # Richter-scale-ish; same-event readings should agree
+    min_sources=2,
+    window_sec=15.0,
+)
+
+# Air-quality index (EPA late-joiner) — single source most of the run
+# (no peer to cross-check against). min_sources=1 short-circuits the
+# consensus check and the validator effectively never fires; kept for
+# symmetry so the dispatch loop has no special cases.
+AQI_VALIDATOR = CrossSourceValidator(
+    data_type="aqi",
+    threshold=50.0,
+    min_sources=1,
+    window_sec=15.0,
+)
+
+
+ALL_VALIDATORS = [
+    TEMPERATURE_VALIDATOR,
+    WIND_VALIDATOR,
+    PRESSURE_VALIDATOR,
+    MAGNITUDE_VALIDATOR,
+    AQI_VALIDATOR,
+]

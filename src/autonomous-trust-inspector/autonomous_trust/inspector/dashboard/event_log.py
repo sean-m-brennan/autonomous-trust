@@ -50,6 +50,12 @@ _SCENARIO_SEVERITY = {
     "COMPROMISE_START":   SEVERITY_WARNING,
     "COMPROMISE_DETECT":  SEVERITY_WARNING,
     "PEER_EXCLUDE":       SEVERITY_THREAT,
+    # TIER_LOST is a reputation-derived demotion (a peer's _tier
+    # dropped this cycle). The DoD coordinator emits these as
+    # dict-shaped records, not real PhaseEvents, so the playback
+    # engine's PhaseEvent filter drops them but add_from_event_record
+    # still colours the row.
+    "TIER_LOST":          SEVERITY_WARNING,
     "ANNOTATION":         SEVERITY_INFO,
     "CUSTOM":             SEVERITY_INFO,
 }
@@ -197,7 +203,11 @@ class EventLogPanel:
                 className=e.css_class(),
                 children=[
                     html.Span(e.time_str(),
-                              className="demo-event__time"),
+                              className="demo-event__time",
+                              # Inline gap so the time and node name stay
+                              # separated even where demo.css isn't loaded
+                              # (e.g. the DoD demo's inline-styled app).
+                              style={"marginRight": "6px"}),
                     html.Span(e.text,
                               className="demo-event__text"),
                 ],

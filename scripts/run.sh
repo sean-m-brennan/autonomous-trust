@@ -25,7 +25,7 @@ WHAT=$1  # required
 shift
 
 if [ "$WHAT" = "c-demo" ]; then
-  scripts/run-c-demo.sh $@
+  scripts/run-demo.sh --variant=c $@
 elif [ "$WHAT" = "demo" ]; then
   scripts/run-demo.sh $@
 elif [ "$WHAT" = "mission" ]; then

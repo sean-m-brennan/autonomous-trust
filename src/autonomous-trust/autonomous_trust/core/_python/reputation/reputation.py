@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from uuid import UUID
 
 from ..config import Configuration
+from ..structures.merkle import MerkleTree
 
 
 class TransactionScore(Configuration):
@@ -35,13 +36,23 @@ class TransactionScore(Configuration):
 
 class Transaction(Configuration):
     def __init__(self, task_id: UUID, p1_id: UUID = None, p1_score: float = None,
-                 p2_id: UUID = None, p2_score: float = None, index: int = None):
+                 p2_id: UUID = None, p2_score: float = None, index: int = None,
+                 prev_hash: bytes = None):
         self.task_id = task_id
         self.p1_id = p1_id
         self.p1_score = p1_score
         self.p2_id = p2_id
         self.p2_score = p2_score
         self.index = index
+        # Phase 1 hash-linking: digest of the entry committed immediately
+        # before this one in the resident chain (b'' / None for the genesis
+        # entry or the oldest entry whose predecessor has been evicted). Set
+        # by TransactionHistory when the tx goes bilateral and is appended.
+        # Makes a committed Transaction tamper-evident on its own and the
+        # catch-up sync verifiable (see reputation-vs-blockchain-analysis.md
+        # §2.1). Mirrors transaction_t.prev_hash in the C twin; the canonical
+        # serialization below MUST stay byte-identical across languages.
+        self.prev_hash = prev_hash
 
     def __len__(self):
         if self.p1_id is None and self.p2_id is None:
@@ -49,6 +60,35 @@ class Transaction(Configuration):
         if self.p1_id is None or self.p2_id is None:
             return 1
         return 2
+
+    def _canonical_bytes(self) -> bytes:
+        """Deterministic, language-agnostic serialization of the entry's
+        identifying content (everything EXCEPT prev_hash). Floats use
+        ``%.17g`` (round-trip-exact for IEEE-754 doubles and identical to
+        C's ``snprintf("%.17g", …)``); UUIDs use the canonical lowercase
+        hyphenated form (== C's ``uuid_unparse_lower``); None is ``null``.
+        Keep this in lockstep with ``transaction_canonical_bytes`` in
+        ``src/c/autonomous_trust/reputation/reputation.c``."""
+        def _u(x):
+            return 'null' if x is None else str(x)
+
+        def _f(x):
+            return 'null' if x is None else format(float(x), '.17g')
+
+        def _i(x):
+            return 'null' if x is None else str(int(x))
+
+        return '|'.join((_u(self.task_id), _u(self.p1_id), _f(self.p1_score),
+                         _u(self.p2_id), _f(self.p2_score),
+                         _i(self.index))).encode('utf-8')
+
+    def entry_hash(self) -> bytes:
+        """blake2b digest (64-char lowercase-hex bytes, matching
+        ``MerkleTree.get_hash``) over the canonical content chained with
+        ``prev_hash``. This is the value the next entry stores as its
+        ``prev_hash``, forming the tamper-evident link."""
+        prev = self.prev_hash if self.prev_hash else b''
+        return MerkleTree.get_hash(self._canonical_bytes() + prev)
 
     def add(self, peer_id: UUID, score: float):
         if self.p1_id is None:
@@ -145,6 +185,12 @@ class TransactionHistory(Mapping):
         # See class docstring for the late-committed reanimation
         # hazard this guards against.
         self._evicted_task_ids: 'OrderedDict[UUID, None]' = OrderedDict()
+        # Phase 1 hash-linking: digest of the current chain head (the most
+        # recently appended entry), i.e. the prev_hash the next finalized tx
+        # will carry. b'' before the first commit. Recomputed from the loaded
+        # chain's tail so a persisted/synced chain resumes the link cleanly.
+        self._head_hash: bytes = (self._chain[-1].entry_hash()
+                                  if self._chain else b'')
 
     def _map_peers(self, tx: Transaction):
         if tx.p1_id is not None:
@@ -214,9 +260,14 @@ class TransactionHistory(Mapping):
         if len(tx) > 1:
             tx.index = self._next_index
             self._next_index += 1
+            # Link this entry to the current head BEFORE eviction (eviction
+            # drops chain[0] and never touches the head digest, so the link
+            # stays valid across the sliding window).
+            tx.prev_hash = self._head_hash
             if len(self._chain) >= self.max_chain_len:
                 self._evict_oldest()
             self._chain.append(tx)
+            self._head_hash = tx.entry_hash()
             if len(self._chain) == 1:
                 self._first_index = tx.index
 
@@ -240,13 +291,268 @@ class TransactionHistory(Mapping):
         offset = max(0, idx - self._first_index)
         return self._chain[offset:]
 
+    @staticmethod
+    def verify_chain_links(chain: 'list[Transaction]') -> bool:
+        """Verify the hash-linkage of a (contiguous) committed chain.
+
+        Returns False if any adjacent pair fails ``chain[i].prev_hash ==
+        chain[i-1].entry_hash()`` — i.e. the segment was tampered with or
+        corrupted in transit. The first entry's ``prev_hash`` points at a
+        predecessor outside the segment and is therefore not checkable, so
+        verification spans ``chain[1:]`` onward. An empty or single-entry
+        chain trivially verifies. Unindexed (not-yet-bilateral) entries are
+        skipped — only committed entries participate in the link.
+        """
+        prev = None
+        for link in chain:
+            if link.index is None:
+                continue
+            if prev is not None and link.prev_hash != prev.entry_hash():
+                return False
+            prev = link
+        return True
+
+    def verify_links(self) -> bool:
+        """Verify the resident window's internal hash-linkage. See
+        ``verify_chain_links``; the oldest resident entry's predecessor has
+        been evicted, so checking starts at the second resident entry."""
+        return self.verify_chain_links(self._chain)
+
     def catchup(self, chain: list[Transaction]):
+        # Reject a chain whose internal hash-linkage doesn't hold: a peer
+        # (or a corrupted transfer) cannot slip an altered committed entry
+        # past us. This is the "verifiable instead of social" sync win
+        # (reputation-vs-blockchain-analysis.md §2.1) — the received segment
+        # must be self-consistent before any of it is replayed.
+        if not self.verify_chain_links(chain):
+            return
         for link in chain:
             if link.index is None:
                 continue
             if link.index >= self._next_index:
                 self.update(link.task_id, link.p1_id, link.p1_score)
                 self.update(link.task_id, link.p2_id, link.p2_score)
+
+    # ----- Phase 2: ordered Merkle root over the resident window ----------
+    # The prev_hash chain (Phase 1) makes the window tamper-EVIDENT in
+    # sequence; a Merkle root makes it tamper-PROVABLE in O(log n): a single
+    # quorum-signed root commits to every resident entry, and an inclusion
+    # proof lets a verifier (gateway parent, slash adjudicator) confirm one tx
+    # belongs to the committed window without holding the whole chain
+    # (reputation-vs-blockchain-analysis.md §2.1 / §3). Leaves are the
+    # per-entry ``entry_hash`` values in resident order. We use the RFC 6962
+    # Merkle Tree Hash — domain-separated leaf (0x00) and node (0x01) prefixes
+    # defeat the CVE-2012-2459 duplicate-subtree ambiguity that the red-black
+    # ``MerkleTree`` guards against by promotion. This construction is a pure
+    # function of the ordered leaf digests, so it is byte-identical to the C
+    # twin ``transaction_window_root`` (no tree-shape dependence).
+
+    _MERKLE_LEAF_PREFIX = b'\x00'
+    _MERKLE_NODE_PREFIX = b'\x01'
+
+    @classmethod
+    def _mth(cls, leaves: 'list[bytes]') -> bytes:
+        """RFC 6962 Merkle Tree Hash over an ordered list of leaf digests
+        (each already a ``Transaction.entry_hash``). Empty -> H(b''). Keep in
+        lockstep with C ``transaction_window_root``."""
+        n = len(leaves)
+        if n == 0:
+            return MerkleTree.get_hash(b'')
+        if n == 1:
+            return MerkleTree.get_hash(cls._MERKLE_LEAF_PREFIX + leaves[0])
+        k = 1
+        while k * 2 < n:
+            k *= 2
+        left = cls._mth(leaves[:k])
+        right = cls._mth(leaves[k:])
+        return MerkleTree.get_hash(cls._MERKLE_NODE_PREFIX + left + right)
+
+    @classmethod
+    def _audit_path(cls, m: int, leaves: 'list[bytes]') -> 'list[tuple]':
+        """RFC 6962 audit path for leaf index ``m``: a bottom-up list of
+        ``(sibling_root, sibling_is_left)`` tuples."""
+        n = len(leaves)
+        if n <= 1:
+            return []
+        k = 1
+        while k * 2 < n:
+            k *= 2
+        if m < k:
+            return cls._audit_path(m, leaves[:k]) + [(cls._mth(leaves[k:]), False)]
+        return cls._audit_path(m - k, leaves[k:]) + [(cls._mth(leaves[:k]), True)]
+
+    def _indexed_window(self) -> 'list[Transaction]':
+        """Resident committed (bilateral, indexed) entries in chain order."""
+        return [tx for tx in self._chain if tx.index is not None]
+
+    def window_root(self) -> bytes:
+        """Merkle root committing to every committed entry resident in the
+        window. The value a Phase 2 checkpoint quorum-signs."""
+        return self._mth([tx.entry_hash() for tx in self._indexed_window()])
+
+    def inclusion_proof(self, abs_index: int) -> 'list[tuple]':
+        """Audit path proving the entry at absolute ``index`` belongs to the
+        current ``window_root``. Returns None if that index is not resident."""
+        window = self._indexed_window()
+        pos = next((i for i, tx in enumerate(window) if tx.index == abs_index), None)
+        if pos is None:
+            return None
+        return self._audit_path(pos, [tx.entry_hash() for tx in window])
+
+    @classmethod
+    def verify_inclusion(cls, leaf_digest: bytes, proof: 'list[tuple]',
+                         root: bytes) -> bool:
+        """Fold a leaf ``entry_hash`` up its audit ``proof`` and check it
+        reproduces ``root``. Static so an adjudicator can verify against a
+        signed checkpoint root without the originating chain."""
+        if proof is None:
+            return False
+        digest = MerkleTree.get_hash(cls._MERKLE_LEAF_PREFIX + leaf_digest)
+        for sibling, sibling_is_left in proof:
+            if sibling_is_left:
+                digest = MerkleTree.get_hash(cls._MERKLE_NODE_PREFIX + sibling + digest)
+            else:
+                digest = MerkleTree.get_hash(cls._MERKLE_NODE_PREFIX + digest + sibling)
+        return digest == root
+
+
+class SlashAttestation(Configuration):
+    """A signed accusation that ``target_uuid`` defected, carrying the
+    floor its reputation should be pinned to.
+
+    Slashing is the fast-penalty path: where the consensus EMA
+    (``CONSENSUS_EMA_HALF_LIFE``) takes ~20 committed bilateral txs to
+    move a peer's score, a quorum-co-signed slash floors it *immediately*
+    at the top of ``_consensus_reputation`` / ``_compute_reputation``,
+    bypassing the chain entirely. This is the principled fix for the
+    "short-lived rogue never drops off baseline" problem (a peer active
+    only ~30 s can't accumulate enough anomalous txs before exclusion
+    freezes it). See doc/architecture/reputation.md and
+    reputation-vs-blockchain-analysis.md (slashing == PoS-style penalty /
+    PKI-style revocation).
+
+    ``reason`` ∈ {sustained_anomaly, peer_exclude, invalid_tx,
+    rehabilitate}. ``evidence_ref`` is an optional
+    ``(task_id, inclusion_proof)`` tying the slash to a Merkle-committed
+    anomalous transaction — unused/optional in the Phase-0 trust-the-
+    detector path; verified against a finalized checkpoint root once the
+    Merkle/checkpoint phases land. ``signature`` is the slasher's
+    Ed25519 signature over ``designation`` (HexEncoder SignedMessage),
+    enabling non-repudiable re-dissemination on the ``slash_final`` path.
+    """
+
+    REASON_SUSTAINED_ANOMALY = 'sustained_anomaly'
+    REASON_PEER_EXCLUDE = 'peer_exclude'
+    REASON_INVALID_TX = 'invalid_tx'
+    REASON_REHABILITATE = 'rehabilitate'
+
+    def __init__(self, slasher_uuid: UUID, target_uuid: UUID,
+                 reason: str, floor_score: float, epoch: int = 0,
+                 evidence_ref=None, nonce: bytes = None, signature=None):
+        self.slasher_uuid = slasher_uuid
+        self.target_uuid = target_uuid
+        self.reason = reason
+        self.floor_score = floor_score
+        self.epoch = epoch
+        self.evidence_ref = evidence_ref
+        self.nonce = nonce
+        self.signature = signature
+
+    @property
+    def designation(self) -> bytes:
+        """Canonical, domain-separated bytes the slasher signs and every
+        co-signer / verifier re-derives. Float is fixed-precision so the
+        bytes match the C twin (the one byte-pinning hazard). Excludes
+        ``signature`` (self-reference) and ``evidence_ref`` (large,
+        verified separately)."""
+        return (b'AT-SLASH\x00'
+                + str(self.slasher_uuid).encode()
+                + b'|' + str(self.target_uuid).encode()
+                + b'|' + str(self.reason).encode()
+                + b'|' + ('%.6f' % float(self.floor_score)).encode()
+                + b'|' + str(self.epoch).encode())
+
+    def key(self):
+        """Dedup / sig-accumulation key: a slash is identified by its
+        target and epoch (a re-slash of the same target uses a fresh
+        epoch)."""
+        return (str(self.target_uuid), int(self.epoch))
+
+
+class SignedSlash(Configuration):
+    """A ``SlashAttestation`` plus the set of co-signer signatures that
+    finalized it. Disseminated on ``slash_final`` so a node that missed
+    the live quorum round can still verify (Phase 3) and apply the floor.
+    ``sigs`` maps voter-uuid-str -> Ed25519 signature over the
+    attestation's ``designation``."""
+
+    def __init__(self, attestation: 'SlashAttestation' = None,
+                 sigs: dict = None):
+        self.attestation = attestation
+        self.sigs = sigs if sigs is not None else {}
+
+
+class Checkpoint(Configuration):
+    """A signed commitment to a peer's resident committed window: the RFC 6962
+    Merkle ``root`` (``TransactionHistory.window_root``) plus the window bounds
+    (``first_index`` .. ``first_index + count``) it covers.
+
+    A checkpoint is the quorum-agreed anchor the gateway-tree rollup and the
+    Phase 3 slash-evidence proofs verify against
+    (reputation-vs-blockchain-analysis.md §2.1 / §3): instead of replaying a
+    peer's whole chain, a verifier checks an inclusion proof against a
+    checkpoint root that a quorum co-signed. Co-signing is conditional — a
+    member signs only if ITS OWN ``window_root`` matches the proposed root, so
+    a finalized checkpoint certifies that a majority observed the same
+    committed window (a lightweight finality gadget over the BFT chain).
+
+    ``root`` is the 64-char lowercase-hex digest as bytes. ``signature`` is the
+    proposer's Ed25519 signature over ``designation`` (HexEncoder
+    SignedMessage). Mirrors the SlashAttestation shape; keep ``designation``
+    byte-identical to the C twin (fixed-form integers, raw hex root)."""
+
+    def __init__(self, proposer_uuid: UUID, root: bytes, epoch: int = 0,
+                 first_index: int = 0, count: int = 0, nonce: bytes = None,
+                 signature=None):
+        self.proposer_uuid = proposer_uuid
+        self.root = root
+        self.epoch = epoch
+        self.first_index = first_index
+        self.count = count
+        self.nonce = nonce
+        self.signature = signature
+
+    @property
+    def designation(self) -> bytes:
+        """Canonical, domain-separated bytes the proposer signs and every
+        co-signer / verifier re-derives. Excludes ``signature`` (self-ref) and
+        ``nonce`` (anti-replay only, carried alongside)."""
+        root = self.root if self.root else b''
+        if isinstance(root, str):
+            root = root.encode()
+        return (b'AT-CKPT\x00'
+                + str(self.proposer_uuid).encode()
+                + b'|' + root
+                + b'|' + str(int(self.epoch)).encode()
+                + b'|' + str(int(self.first_index)).encode()
+                + b'|' + str(int(self.count)).encode())
+
+    def key(self):
+        """Dedup / sig-accumulation key: proposer + epoch. Each proposer
+        numbers its own checkpoints monotonically."""
+        return (str(self.proposer_uuid), int(self.epoch))
+
+
+class SignedCheckpoint(Configuration):
+    """A ``Checkpoint`` plus the co-signer signatures that finalized it.
+    Disseminated on ``checkpoint_final`` so a node that missed the live quorum
+    round can still store (and Phase 3: verify against) the agreed root.
+    ``sigs`` maps voter-uuid-str -> Ed25519 signature over the checkpoint's
+    ``designation``."""
+
+    def __init__(self, checkpoint: 'Checkpoint' = None, sigs: dict = None):
+        self.checkpoint = checkpoint
+        self.sigs = sigs if sigs is not None else {}
 
 
 class Reputation(Configuration):
@@ -275,3 +581,7 @@ class Reputations(Configuration):
 
     def update(self, peer_id: UUID, score: float):
         self.current[peer_id] = score
+
+    def filtered_for_persist(self, keep_uuids):
+        keep = {UUID(str(u)) if not isinstance(u, UUID) else u for u in keep_uuids}
+        return Reputations(current={u: r for u, r in self.current.items() if u in keep})

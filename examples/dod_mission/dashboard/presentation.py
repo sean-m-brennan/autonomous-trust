@@ -140,7 +140,7 @@ class PresentationLayout:
             graph_html=graph_html or _placeholder("Trust network graph"),
             event_log_html=event_log_html or _placeholder("Event log"),
             timeline_html=timeline_html or _placeholder("Trust dynamics chart"),
-            target_chart_html=target_chart_html or _placeholder("Target X-position chart"),
+            target_chart_html=target_chart_html or _placeholder("Asset / Target Position map"),
             detail_html=detail_html or "",
             playback_html=self._playback.to_html(),
             narration_html=narration_html,
@@ -161,7 +161,7 @@ class PresentationLayout:
             event_log_html=_placeholder(
                 "[T+0:00] Setup — Squad cohort forms<br>"
                 "[T+2:30] sensor-1 excluded (forged identity)<br>"
-                "[T+4:30] ANOMALY: mq800 target_position_x deviation 80m<br>"
+                "[T+4:30] ANOMALY: mq800 designates a different building<br>"
                 "[T+4:45] mq800 excluded (autonomous)",
                 height=180, align="top",
             ),
@@ -170,8 +170,8 @@ class PresentationLayout:
                 height=200,
             ),
             target_chart_html=_placeholder(
-                "Target X-position — rq86-1, rq86-2 agree; "
-                "mq800 diverges at T+4:15",
+                "Target Position — rq86-1, rq86-2 agree; "
+                "mq800 designates a different building at T+4:15",
                 height=180,
             ),
             playback_state=PlaybackState(
@@ -329,7 +329,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
             {timeline_html}
         </div>
         <div class="panel">
-            <div class="panel-title">Target X-Position — ISR Cross-Source</div>
+            <div class="panel-title">Asset / Target Position — Overhead ISR</div>
             {target_chart_html}
         </div>
     </div>
