@@ -127,6 +127,17 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         except EOFError:
             fullname = hostname
             nickname = random_name(sep='', cap=True)
+        # Mirror of the randomize-branch lookup above: deployment-set
+        # AT_PEER_NAME (eg. compose generators that label containers
+        # 'noaa-1', 'mq800', 'microdrone-1', ...) wins over the random
+        # codename so the inspector dashboards + recording sidecars
+        # can match an AT peer to its scenario role without a
+        # uuid→role mapping table. fullname follows so log output
+        # stays consistent across both branches.
+        env_name = os.environ.get('AT_PEER_NAME', '').strip()
+        if env_name:
+            nickname = env_name
+            fullname = '%s@tekfive.com' % env_name
     if not os.path.exists(net_file) or not preserve:
         if defaults:
             ip4_addr = ip4_address

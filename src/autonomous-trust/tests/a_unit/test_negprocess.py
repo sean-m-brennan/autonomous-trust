@@ -335,10 +335,12 @@ class TestHandleHaggleDeeper:
     def test_flexible_task(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
+        # ``flexible`` is a read-only property; set it via the
+        # constructor's ``_flexible`` kwarg (negotiation.py:65-68).
+        tp = TaskParameters('cap1', _flexible=True,
+                            when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
         task.to_json_string = MagicMock(return_value='yaml')
-        task.parameters.flexible = True
         msg = Message(CfgIds.negotiation, NegotiationProtocol.response,
                       task, from_whom=peer)
         net_q = queue.Queue()
@@ -349,9 +351,9 @@ class TestHandleHaggleDeeper:
     def test_inflexible_task(self):
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
+        tp = TaskParameters('cap1', _flexible=False,
+                            when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
-        task.parameters.flexible = False
         # Need the task in my_tasks for _cancel_participant
         np.my_tasks[task.uuid] = TaskTracker(task)
         np.my_tasks[task.uuid].results[peer.uuid] = None
@@ -752,10 +754,10 @@ class TestHandleInviteFloodCounter:
         """Full exception when sending announce for flexible task."""
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
+        tp = TaskParameters('cap1', _flexible=True,
+                            when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
         task.to_json_string = MagicMock(return_value='yaml')
-        task.parameters.flexible = True
         msg = Message(CfgIds.negotiation, NegotiationProtocol.response,
                       task, from_whom=peer)
         full_q = MagicMock()
@@ -767,9 +769,9 @@ class TestHandleInviteFloodCounter:
         """Full exception in _cancel_participant for non-flexible task."""
         np = _make_neg_process()
         peer = _make_mock_peer()
-        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
+        tp = TaskParameters('cap1', _flexible=False,
+                            when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer, size=2)
-        task.parameters.flexible = False
         np.my_tasks[task.uuid] = TaskTracker(task)
         np.my_tasks[task.uuid].results[peer.uuid] = None
         msg = Message(CfgIds.negotiation, NegotiationProtocol.response,

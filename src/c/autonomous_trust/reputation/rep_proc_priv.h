@@ -59,6 +59,12 @@ void reputation_set_chain_len(int len);
  *  handle_request's id1 > last_id check rejects stale ballots. */
 void reputation_set_last_id(int64_t id);
 
+/** Pre-set the catch-up quorum (rep_state.num_updates). Conformance
+ *  scenarios lower it to 1 so a single `latest update` step triggers the
+ *  chain merge — the harness resets state per step, so the production
+ *  default of 3 could never accumulate across steps. */
+void reputation_set_num_updates(int n);
+
 /** Pre-install an outstanding paxos round on the dispatching
  *  participant. handle_grant looks the entry up by @p proposer_uuid.
  *  @p task_uuid carries through into the broadcast tx payload on
@@ -77,8 +83,37 @@ void reputation_install_my_request(int64_t id1, int64_t id2,
 void reputation_install_accepted(int64_t id1, int64_t id2);
 
 /** Read the current chain length (committed history entries) for
- *  expected_state assertions. Returns -1 if state is uninitialized. */
+ *  expected_state assertions. Returns -1 if state is uninitialized.
+ *  NOTE: this returns rep_state.paxos.chain_len (the ballot-gating
+ *  counter set by the history_len fixture), NOT the live tx_history. For
+ *  the count of transactions actually resident in rep_state.history (e.g.
+ *  after a catch-up replay), use reputation_get_committed_tx_count. */
 int reputation_get_chain_len(void);
+
+/** Read the number of committed transactions resident in
+ *  rep_state.history (the hash-linked chain) for the `committed_tx_count`
+ *  expected_state assertion. Mirrors Python's len(self.process.history).
+ *  Returns -1 if state is uninitialized. */
+int reputation_get_committed_tx_count(void);
+
+/** Write the RFC 6962 ordered Merkle root over the resident committed window
+ *  (transaction_window_root) into `out` (must hold TX_HASH_HEX_LEN + 1 bytes)
+ *  for the `window_root` expected_state assertion. Mirrors Python
+ *  TransactionHistory.window_root. Empty / invalid state yields an empty
+ *  string. */
+void reputation_get_window_root(char *out);
+
+/** Write the latest finalized checkpoint root (handle_checkpoint_final) into
+ *  `out` (TX_HASH_HEX_LEN + 1 bytes) for the `checkpoint_root` expected_state
+ *  assertion. Empty string if no checkpoint has been stored. Mirrors Python
+ *  ReputationProcess._checkpoint.root. */
+void reputation_get_checkpoint_root(char *out);
+
+/** Pre-seed a finalized checkpoint (root hex + epoch) for the `checkpoint`
+ *  fixture, so an evidence-bearing slash can be verified against it within a
+ *  single conformance step. Mirrors setting Python's
+ *  ReputationProcess._checkpoint. */
+void reputation_install_checkpoint(const char *root, int64_t epoch);
 
 /** Read the count of granted Paxos rounds for the
  *  `requests_count` expected_state assertion. */

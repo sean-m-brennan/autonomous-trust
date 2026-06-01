@@ -118,21 +118,24 @@ def build_dashboard(scenario: DoDMissionScenario) -> dict:
             label=phase.name,
         )
 
-    # Sensor comparison: target_position_x is the metric the MQ-800
-    # falsifies (see compromise/contradictory_isr.py).  Show the two
-    # RQ-86s and the MQ-800 so the divergence is the visual money shot
-    # at T+4:15.  Microdrone position is noisier and would muddy the
-    # chart — leave it out here; it shows up on the map instead.
-    target_x_chart = SensorComparisonChart(
-        data_type="target_position_x",
-        unit="m",
+    # Target-position map: each overhead-ISR peer reports a target
+    # location as parallel (target_position_x, target_position_y)
+    # readings; this panel pairs them, converts squad-frame metres to
+    # WGS84, and shows a per-peer marker on a map. The MQ-800
+    # compromise beat (compromise/contradictory_isr.py) used to surface
+    # as an X-coordinate divergence on a time-series line chart; the
+    # map makes the contradiction visible as a peer pointing at a
+    # *different building*. Replaces the previous SensorComparisonChart
+    # on data_type=target_position_x.
+    from .target_position_map import TargetPositionMapPanel
+    target_x_chart = TargetPositionMapPanel(
         peer_colors={
             "rq86-1": RQ86_GOLD,
             "rq86-2": "#E6C656",   # lighter gold to differentiate from rq86-1
             "mq800":  MQ800_AMBER,
         },
         window_sec=120.0,
-        title="Target X-Position — Overhead ISR Reports",
+        title="Asset Positions / Target Position via Overhead ISR",
     )
 
     # Secondary: electronic noise floor — RQ-86s see the noise spike when

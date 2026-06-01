@@ -85,6 +85,10 @@ class PhaseEvent(Enum):
     PEER_EXCLUDE = auto()
     DATA_STREAM_START = auto()
     DATA_STREAM_STOP = auto()
+    # Reputation-derived trust-tier demotion (peer's _tier dropped).
+    # Recorded as a dict by the DoD coordinator; the playback engine
+    # reconstructs it as a ScenarioEvent on this enum.
+    TIER_LOST = auto()
     ANNOTATION = auto()       # Narration / explanatory text for presentation mode
     CUSTOM = auto()
 
@@ -125,11 +129,21 @@ class Phase:
         start:       Offset from scenario start
         description: Narration text for this phase
         events:      Events that fire during this phase
+        gate:        Optional predicate. When set, ``advance_to`` will
+                     refuse to step from the prior phase into this one
+                     until ``gate(scenario)`` returns True. Lets a
+                     scenario hold a transition on an external
+                     readiness signal (e.g. ≥90% of peers reached a
+                     trust-tier floor) without depending on a
+                     specific clock value. A scenario whose gates
+                     never clear effectively halts at the last
+                     unblocked phase.
     """
     name: str
     start: timedelta
     description: str = ""
     events: list[ScenarioEvent] = field(default_factory=list)
+    gate: Optional[Callable[["Scenario"], bool]] = None
 
 
 class Scenario(ABC):
@@ -148,6 +162,10 @@ class Scenario(ABC):
         self._start_time: Optional[datetime] = None
         self._current_phase_idx: int = 0
         self._running: bool = False
+        # Phase names already logged as gate-blocked at least once.
+        # Used to keep advance_to's blocked-by-gate log line one-shot
+        # per phase even when called every tick by the live coordinator.
+        self._gate_blocks_logged: set[str] = set()
 
         # Let the subclass define everything
         self.define()
@@ -293,9 +311,33 @@ class Scenario(ABC):
                         description=f"{name} ({role.agency}) joins the network",
                     ))
 
-        # Advance phase index
+        # Advance phase index. A Phase whose ``gate`` predicate is
+        # set must consent before we step into it -- the scenario
+        # holds at the prior phase index but scenario_time keeps
+        # ticking, so the moment the gate clears the next advance_to
+        # call steps in. The first refusal per (phase) is logged so
+        # there's a visible record without spam; subsequent refusals
+        # for the same phase are silent.
         while (self._current_phase_idx < len(self._phases) - 1 and
                self._phases[self._current_phase_idx + 1].start <= scenario_time):
+            next_phase = self._phases[self._current_phase_idx + 1]
+            if next_phase.gate is not None:
+                try:
+                    cleared = bool(next_phase.gate(self))
+                except Exception:
+                    logger.exception(
+                        "Phase gate %r raised; treating as blocked",
+                        next_phase.name)
+                    cleared = False
+                if not cleared:
+                    if next_phase.name not in self._gate_blocks_logged:
+                        self._gate_blocks_logged.add(next_phase.name)
+                        logger.info(
+                            "Phase '%s' blocked by gate at T+%s (holding "
+                            "at '%s')",
+                            next_phase.name, next_phase.start,
+                            self._phases[self._current_phase_idx].name)
+                    break
             self._current_phase_idx += 1
             phase = self._phases[self._current_phase_idx]
             logger.info("Phase: %s (T+%s)", phase.name, phase.start)

@@ -55,8 +55,11 @@ def test_delete():
         b = ABlob(uuid4())
         mt.insert(b)
         blobs.append(b)
-    # MerkleTree._rehash has a pre-existing bug with red-black tree node comparison
-    # so just test that blobs list is correctly updated
+    # NOTE: the delete/shrink rehash path is unsupported — Tree.delete does not
+    # maintain MerkleTree.leaves, so _rehash cannot shrink the leaf set and the
+    # root would not recompute. Production never deletes (identity only inserts),
+    # so we assert only the blobs-list bookkeeping here. (insert + inclusion_proof
+    # + audit ARE fixed; see the membership-proof tests below.)
     assert blobs[0] in mt.blobs
     mt.blobs.remove(blobs[0])
     assert blobs[0] not in mt.blobs
@@ -269,21 +272,11 @@ def test_inclusion_proof_empty_tree():
 
 
 # ---------------------------------------------------------------------------
-# Additional tests for inclusion_proof, audit, __contains__
-# These exercise the code paths even though _rehash has a pre-existing bug
-# that prevents inner nodes from being properly hashed.
+# inclusion_proof / audit / __contains__ — real membership proofs.
+# inclusion_proof resolves the matching leaf node's red-black key (no longer
+# requiring blobs to carry a .key), and audit folds the leaf digest up the
+# sibling chain to the root, so these verify genuine Merkle membership.
 # ---------------------------------------------------------------------------
-
-class AKeyBlob(SimplestBlob):
-    """Blob that also stores a 'key' attribute so inclusion_proof can find it."""
-    def __init__(self, originator, uuid=None):
-        super().__init__(originator, uuid)
-        self.key = None  # will be set by the tree
-
-    @property
-    def designation(self) -> bytes:
-        return str(self.uuid).encode()
-
 
 def _make_tree_with_blobs(n=3):
     """Build a MerkleTree with n blobs inserted."""
@@ -302,74 +295,103 @@ def test_inclusion_proof_blob_not_in_tree():
     assert result is None
 
 
-def test_inclusion_proof_blob_matched_but_no_key():
-    """Blob in leaves but without a .key attribute raises AttributeError."""
+def test_inclusion_proof_blob_matched_uses_leaf_key():
+    """Blob in the tree yields a proof without the blob carrying a .key.
+
+    inclusion_proof now resolves the matching leaf NODE's red-black key, so a
+    plain SimplestBlob (no .key attribute) produces a proof rather than raising
+    AttributeError. With two blobs the matched leaf has a sibling, so the proof
+    walks at least one level up to the root and is non-empty.
+    """
     mt = _make_tree_with_blobs(2)
-    # Use a blob that IS in the tree (leaf.blob references it)
     blob = mt.blobs[0]
-    # ABlob has no .key attribute, so after matching leaf.blob == blob,
-    # `key = blob.key` raises AttributeError (line 193 in merkle.py)
-    with pytest.raises(AttributeError):
-        mt.inclusion_proof(blob)
+    result = mt.inclusion_proof(blob)
+    assert isinstance(result, list)
+    assert len(result) >= 1
+    # Each step is a (left_digest, right_digest) sibling tuple.
+    for step in result:
+        assert isinstance(step, tuple) and len(step) == 2
 
 
-def test_inclusion_proof_blob_with_key_set():
-    """Blob with .key set: inclusion_proof can walk the tree."""
-    from autonomous_trust.core.structures.merkle import _MerkleNode
+def test_inclusion_proof_single_blob_is_root():
+    """A lone blob is the root, so its inclusion proof is an empty path."""
     mt = MerkleTree()
-    blob = AKeyBlob(uuid4())
+    blob = ABlob(uuid4())
     mt.insert(blob)
-    # After insert, the leaf node holds the blob
     assert len(mt.leaves) == 1
-    leaf = mt.leaves[0]
-    # Set key on blob to match the leaf's key so inclusion_proof can call find()
-    blob.key = leaf.key
     result = mt.inclusion_proof(blob)
     # Node IS the root (single node), so the while loop doesn't execute → empty list
     assert result == []
 
 
-def test_audit_calls_inclusion_proof():
-    """audit() with no chain argument falls back to inclusion_proof."""
+def test_audit_single_blob_self_verifies():
+    """audit() with no chain folds the lone leaf (== root) to True."""
     mt = MerkleTree()
     blob = ABlob(uuid4())
     mt.insert(blob)
-    # audit() calls inclusion_proof which returns None for this blob (no .key),
-    # then tries chain[-1] on None → IndexError or TypeError depending on result
-    # We just verify the behaviour is deterministic and doesn't silently pass bad data.
-    try:
-        result = mt.audit(blob)
-    except (IndexError, TypeError, AttributeError):
-        pass  # expected when chain/inclusion_proof returns None or [] and root is unpopulated
+    # Single node: leaf IS the root, proof is empty, leaf digest == root_digest.
+    assert mt.audit(blob) is True
 
 
-def test_audit_empty_chain_raises():
-    """audit() with an explicitly empty chain causes IndexError on chain[-1]."""
+def test_audit_empty_chain_single_blob():
+    """An explicit empty chain on a single-blob tree still verifies (leaf==root)."""
     mt = MerkleTree()
     blob = ABlob(uuid4())
     mt.insert(blob)
-    with pytest.raises((IndexError, AttributeError, TypeError)):
-        mt.audit(blob, chain=[])
+    assert mt.audit(blob, chain=[]) is True
 
 
-def test_contains_raises_without_super_hash():
-    """__contains__ raises AttributeError when root has no .digest (empty tree)."""
+def test_audit_proves_membership_and_detects_tamper():
+    """Each member blob audits True against the live root; a non-member fails."""
+    mt = _make_tree_with_blobs(0)
+    members = [ABlob(uuid4()) for _ in range(7)]
+    for b in members:
+        mt.insert(b)
+    for b in members:
+        proof = mt.inclusion_proof(b)
+        assert proof is not None
+        assert mt.audit(b, proof) is True
+    # A blob never inserted is not provable / not a member.
+    outsider = ABlob(uuid4())
+    assert mt.inclusion_proof(outsider) is None
+    assert mt.audit(outsider) is False
+
+
+def test_audit_against_wrong_super_hash_fails():
+    """A correct membership proof rejected when checked against a wrong root."""
+    mt = _make_tree_with_blobs(0)
+    for _ in range(4):
+        mt.insert(ABlob(uuid4()))
+    blob = mt.blobs[1]
+    proof = mt.inclusion_proof(blob)
+    mt.super_hash = b'not_the_real_root_digest'
+    assert mt.audit(blob, proof) is False
+
+
+def test_contains_false_on_empty_tree():
+    """__contains__ returns False for a blob not in an empty tree."""
     mt = MerkleTree()
     blob = ABlob(uuid4())
-    # Empty tree: root is EmptyNode sentinel, which has no .digest
-    with pytest.raises((AttributeError, TypeError)):
-        _ = blob in mt
+    assert (blob in mt) is False
 
 
-def test_contains_with_super_hash_triggers_audit():
-    """__contains__ with super_hash set delegates to audit()."""
-    mt = MerkleTree()
-    blob = ABlob(uuid4())
-    mt.insert(blob)
+def test_contains_true_for_member():
+    """__contains__ returns True for an inserted blob (audited against root)."""
+    mt = _make_tree_with_blobs(0)
+    members = [ABlob(uuid4()) for _ in range(5)]
+    for b in members:
+        mt.insert(b)
+    assert all((b in mt) for b in members)
+    assert (ABlob(uuid4()) in mt) is False
+
+
+def test_contains_with_wrong_super_hash():
+    """__contains__ against a bogus super_hash rejects an otherwise-present blob."""
+    mt = _make_tree_with_blobs(0)
+    for _ in range(3):
+        mt.insert(ABlob(uuid4()))
     mt.super_hash = b'fake_super_hash'
-    # audit() will raise because chain resolution fails, but __contains__ is exercised
-    with pytest.raises((IndexError, TypeError, AttributeError)):
-        _ = blob in mt
+    assert (mt.blobs[0] in mt) is False
 
 
 def test_consistent_trees_same_size_same_hash():

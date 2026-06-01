@@ -23,6 +23,7 @@ from pathlib import Path
 
 from autonomous_trust.core import AutonomousTrust, Configuration, LogLevel
 from autonomous_trust.core.config.generate import generate_identity, generate_worker_config
+from autonomous_trust.core.system import queue_cadence
 from autonomous_trust.services.data.server import DataProcess, DataConfig
 from autonomous_trust.services.network_statistics import NetStatsSource
 
@@ -31,6 +32,12 @@ try:
     HAS_SIMULATOR = True
 except ImportError:
     HAS_SIMULATOR = False
+
+# Sibling-module access for script invocation (`python participant.py`).
+# Mirrors the dod_mission participant — lets `register_trust_ladder` be
+# imported by bare name from the same directory.
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +59,38 @@ class MultiAgencyParticipant(AutonomousTrust):
 
         # Data source for sensor readings
         self.add_worker(DataProcess)
+
+    def autonomous_ability(self, queues):
+        """Advertise this peer's data capability + trust-ladder caps.
+
+        Mirrors ``DoDMissionParticipant.autonomous_ability``: register
+        the abilities on ``self.capabilities``, then push the populated
+        Capabilities object onto every worker queue so DataRcvr /
+        idprocess in sibling subprocesses learn what this peer offers.
+        Without the broadcast, the coordinator never subscribes to this
+        peer's data stream and tier-weight metadata never reaches the
+        reputation process.
+        """
+        self.capabilities.register_ability(
+            DataProcess.capability_name, None)
+        # `participant.py` is invoked as a script, and _HERE is on
+        # sys.path (top of module) — bare-name import works.
+        from trust_ladder import register_trust_ladder  # local import
+        self._trust_ladder = register_trust_ladder(self.capabilities)
+        logger.info(
+            "autonomous_ability: peer=%s capabilities=%s — "
+            "broadcasting to %d worker queue(s)",
+            self.peer_name, self.capabilities.to_list(),
+            len([q for q in queues if q != self.proc_name]))
+        for q_name in queues:
+            if q_name == self.proc_name:
+                continue
+            try:
+                queues[q_name].put(self.capabilities,
+                                   block=True, timeout=queue_cadence)
+            except Exception:
+                logger.warning("Failed to publish capabilities to %s",
+                               q_name)
 
     def autonomous_tasking(self, queues):
         """Called each tick by the AT event loop."""

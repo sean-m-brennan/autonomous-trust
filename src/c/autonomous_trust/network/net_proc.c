@@ -254,18 +254,34 @@ static void pest_track_annoy(const char *address)
  * Deferred encrypted message queue (mystery handler)
  ****************************/
 
+/* MAX_DEFERRED bounds peak DoS exposure (a misbehaving peer can't make
+ * us hold unbounded memory by spraying encrypted messages we can't yet
+ * decrypt). DEFERRED_MSG_MAX is the UDP-payload sanity cap (65535 IP
+ * MTU minus IP+UDP headers); anything larger is malformed by
+ * construction and gets truncated to this size.
+ *
+ * Storage is heap-backed (was static BSS pre-2026-05-28). The previous
+ * design preallocated MAX_DEFERRED × DEFERRED_MSG_MAX ≈ 4.0 MiB of BSS
+ * regardless of actual traffic, which dominated libautonomous_trust's
+ * load image and made Cortex-M ports infeasible. Per-slot allocation
+ * sized to the real message means typical traffic (consensus messages
+ * < 1 KiB) consumes ~64 KiB rather than ~4 MiB peak. See
+ * STRETCH_GOAL_3_EMBEDDED_PLAN.md §3 Q1 for the footprint story. */
 #define MAX_DEFERRED 64
 #define DEFERRED_MSG_MAX 65507
 
+/* Flexible array member: each slot is one allocation of
+ * sizeof(deferred_msg_t) + len, with the encrypted payload appended
+ * inline. Compaction becomes a pointer move; no 65 KiB memcpy. */
 typedef struct {
-    uint8_t data[DEFERRED_MSG_MAX];
     size_t len;
     char from_addr[ADDR_LEN + 1];
     uuid_t src_uuid;        /* Original sender's UUID (envelope mode). */
     bool   has_src_uuid;    /* True iff src_uuid is meaningful. */
+    uint8_t data[];         /* Flexible: allocated with `len` bytes. */
 } deferred_msg_t;
 
-static deferred_msg_t deferred_messages[MAX_DEFERRED];
+static deferred_msg_t *deferred_messages[MAX_DEFERRED];   /* owning ptrs, NULL when slot free */
 static size_t deferred_count = 0;
 static pthread_mutex_t deferred_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -280,25 +296,32 @@ static pthread_mutex_t deferred_lock = PTHREAD_MUTEX_INITIALIZER;
 static void defer_message(const uint8_t *data, size_t len,
                           const char *from_addr, const uuid_t src_uuid)
 {
+    if (len > DEFERRED_MSG_MAX)
+        len = DEFERRED_MSG_MAX;
+    /* Allocate header + payload as one block so the slot is freed by a
+     * single free(). On OOM, drop the message — same observable
+     * behaviour as the prior "queue full" branch. */
+    deferred_msg_t *dm = malloc(sizeof(*dm) + len);
+    if (dm == NULL)
+        return;
+    dm->len = len;
+    memcpy(dm->data, data, len);
+    snprintf(dm->from_addr, sizeof(dm->from_addr), "%s", from_addr);
+    if (src_uuid != NULL) {
+        memcpy(dm->src_uuid, src_uuid, 16);
+        dm->has_src_uuid = true;
+    } else {
+        memset(dm->src_uuid, 0, 16);
+        dm->has_src_uuid = false;
+    }
     pthread_mutex_lock(&deferred_lock);
     if (deferred_count < MAX_DEFERRED) {
-        size_t idx = deferred_count;
-        if (len > sizeof(deferred_messages[0].data))
-            len = sizeof(deferred_messages[0].data);
-        memcpy(deferred_messages[idx].data, data, len);
-        deferred_messages[idx].len = len;
-        snprintf(deferred_messages[idx].from_addr,
-                 sizeof(deferred_messages[idx].from_addr), "%s", from_addr);
-        if (src_uuid != NULL) {
-            memcpy(deferred_messages[idx].src_uuid, src_uuid, 16);
-            deferred_messages[idx].has_src_uuid = true;
-        } else {
-            memset(deferred_messages[idx].src_uuid, 0, 16);
-            deferred_messages[idx].has_src_uuid = false;
-        }
-        deferred_count++;
+        deferred_messages[deferred_count++] = dm;
+        dm = NULL;  /* ownership transferred to the queue */
     }
     pthread_mutex_unlock(&deferred_lock);
+    /* If we hit the queue cap, dm is still owned by us — free it. */
+    free(dm);
 }
 
 /* Match predicate: a deferred entry matches a newly-admitted peer iff
@@ -325,6 +348,12 @@ size_t net_proc_test_deferred_count(void)
 void net_proc_test_reset_deferred(void)
 {
     pthread_mutex_lock(&deferred_lock);
+    /* Per-slot owning pointers — free everything before resetting the
+     * count, otherwise we leak the heap-backed payloads. */
+    for (size_t i = 0; i < deferred_count; i++) {
+        free(deferred_messages[i]);
+        deferred_messages[i] = NULL;
+    }
     deferred_count = 0;
     pthread_mutex_unlock(&deferred_lock);
 }
@@ -334,8 +363,8 @@ bool net_proc_test_deferred_matches_peer(size_t idx,
 {
     bool m = false;
     pthread_mutex_lock(&deferred_lock);
-    if (idx < deferred_count)
-        m = deferred_matches_peer(&deferred_messages[idx], new_peer);
+    if (idx < deferred_count && deferred_messages[idx] != NULL)
+        m = deferred_matches_peer(deferred_messages[idx], new_peer);
     pthread_mutex_unlock(&deferred_lock);
     return m;
 }
@@ -523,6 +552,12 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
      * downstream process stays correlated with the wire side. */
     memcpy(gmsg.info.net_msg.trace_id, wmsg->trace_id,
            sizeof(gmsg.info.net_msg.trace_id));
+    /* Carry signature-verification result so downstream handlers can
+     * reject spoofed Paxos / consensus messages. Mirrors Python
+     * netprocess where Message.verified is set in deserialize_message
+     * (network/message.py:243) and read by repprocess.handle_*. */
+    gmsg.info.net_msg.verified = wmsg->verified;
+    gmsg.info.net_msg.has_signature = wmsg->has_signature;
 
     int ret = messaging_send(wmsg->process, NET_MESSAGE, &gmsg, false);
     if (ret != 0) {
@@ -1674,12 +1709,17 @@ static int network_run(const net_transport_t *transport,
                 /* Retry deferred encrypted messages with the new peer. Match
                  * by envelope src_uuid when the entry has one (gateway-
                  * forwarded traffic under AT_NET_ENVELOPE); otherwise by
-                 * the transport-reported from_addr (legacy / non-envelope). */
+                 * the transport-reported from_addr (legacy / non-envelope).
+                 *
+                 * Slots are owning heap pointers (post-2026-05-28). On
+                 * successful replay we free the slot; on no-match or
+                 * decrypt-failure we keep it and compact via pointer
+                 * move (no payload copy). */
                 pthread_mutex_lock(&deferred_lock);
                 size_t remaining = 0;
                 for (size_t di = 0; di < deferred_count; di++) {
-                    deferred_msg_t *dm = &deferred_messages[di];
-                    if (deferred_matches_peer(dm, new_peer)) {
+                    deferred_msg_t *dm = deferred_messages[di];
+                    if (dm != NULL && deferred_matches_peer(dm, new_peer)) {
                         uint8_t *plain = NULL;
                         size_t plain_len = 0;
                         if (decrypt_message(myself, new_peer, dm->data, dm->len,
@@ -1692,12 +1732,20 @@ static int network_run(const net_transport_t *transport,
                             }
                             free(plain);
                             net_wire_msg_free(&wmsg);
+                            free(dm);             /* slot consumed */
+                            deferred_messages[di] = NULL;
                         } else {
-                            if (remaining != di) deferred_messages[remaining] = *dm;
+                            if (remaining != di) {
+                                deferred_messages[remaining] = dm;
+                                deferred_messages[di] = NULL;
+                            }
                             remaining++;
                         }
                     } else {
-                        if (remaining != di) deferred_messages[remaining] = *dm;
+                        if (remaining != di) {
+                            deferred_messages[remaining] = dm;
+                            deferred_messages[di] = NULL;
+                        }
                         remaining++;
                     }
                 }

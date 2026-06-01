@@ -58,6 +58,11 @@ EventListener = Callable[[ScenarioEvent, timedelta], None]
 # Tick callback signature -- called every loop even if no event fires.
 TickListener = Callable[[timedelta], None]
 
+# Snapshot callback signature -- fired as scenario_time crosses each
+# recorded snapshot's `t`. Receives the raw snapshot dict + the fresh
+# scenario_time at the moment of firing.
+SnapshotListener = Callable[[dict, timedelta], None]
+
 
 class PlaybackMode:
     """String enum."""
@@ -111,10 +116,15 @@ class PlaybackEngine:
         self._last_wall: Optional[float] = None
         self._event_listeners: list[EventListener] = []
         self._tick_listeners: list[TickListener] = []
+        self._snapshot_listeners: list[SnapshotListener] = []
         self._wired = False
         # PLAYBACK mode: recorded events buffered here, consumed by tick()
         # as scenario time crosses each event's timestamp.
         self._deferred_events: list[ScenarioEvent] = []
+        # Parallel buffer for recorded snapshots (reputation samples,
+        # sensor readings, etc.). Time-sorted; tick() pops as
+        # scenario_time advances past each entry's `t`.
+        self._deferred_snapshots: list[dict] = []
         self._wire_scenario_listener()
 
     # --- wiring ------------------------------------------------------
@@ -138,6 +148,16 @@ class PlaybackEngine:
 
     def on_tick(self, listener: TickListener):
         self._tick_listeners.append(listener)
+
+    def on_snapshot(self, listener: SnapshotListener):
+        """Register a callback for recorded snapshot records.
+
+        Snapshots are non-PhaseEvent payloads (reputation samples,
+        sensor readings, etc.) loaded via ``load_recorded``'s
+        ``snapshots`` sidecar; they fire in time order as the engine
+        ticks past each one.
+        """
+        self._snapshot_listeners.append(listener)
 
     # --- transport ---------------------------------------------------
 
@@ -247,6 +267,21 @@ class PlaybackEngine:
         else:
             self._scenario.advance_to(new_t)
 
+        # Snapshots fire independent of mode -- a live run with replayed
+        # snapshots is nonsensical (the live AT mesh produces its own
+        # reputation/reading stream), but the buffer will be empty in
+        # that case so the loop is a no-op.
+        while (self._deferred_snapshots
+               and self._deferred_snapshots[0].get("t", 0.0)
+               <= new_t.total_seconds()):
+            snap = self._deferred_snapshots.pop(0)
+            for lst in self._snapshot_listeners:
+                try:
+                    lst(snap, self._scenario_time)
+                except Exception:
+                    logger.exception("Snapshot listener failed for %r",
+                                     snap.get("type"))
+
         for lst in self._tick_listeners:
             try:
                 lst(self._scenario_time)
@@ -275,7 +310,10 @@ class PlaybackEngine:
         event pipeline.
 
         Accepts either a raw event list or a {\"event_log\": [...]}
-        wrapper from the inspector's recorder.
+        wrapper from the inspector's recorder. When the wrapper also
+        carries a ``snapshots`` sidecar (reputation samples, sensor
+        readings, etc.) those are buffered for the snapshot listener
+        path and fire in time order alongside the scripted events.
         """
         with open(path) as f:
             data = json.load(f)
@@ -304,6 +342,25 @@ class PlaybackEngine:
                 logger.exception("Replay parse failed for event: %r", rec)
         buf.sort(key=lambda ev: ev.timestamp)
         self._deferred_events = buf
+
+        snapshots = (data.get("snapshots")
+                     if isinstance(data, dict) else None) or []
+        if not isinstance(snapshots, list):
+            logger.warning("recorded playback: snapshots not a list, ignoring")
+            snapshots = []
+        snap_buf: list[dict] = []
+        for rec in snapshots:
+            if not isinstance(rec, dict):
+                continue
+            try:
+                rec = dict(rec)
+                rec["t"] = float(rec.get("t", 0.0))
+            except (TypeError, ValueError):
+                logger.exception("Replay parse failed for snapshot: %r", rec)
+                continue
+            snap_buf.append(rec)
+        snap_buf.sort(key=lambda r: r.get("t", 0.0))
+        self._deferred_snapshots = snap_buf
 
     # --- helpers -----------------------------------------------------
 
