@@ -88,11 +88,10 @@ class Group(InitializableConfig):
         :param nonce: bytes
         :return: bytes
         """
-        plaintext = Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)
-        try:
-            return plaintext.decode('utf-8')
-        except (UnicodeDecodeError, AttributeError):
-            return plaintext
+        # Always return bytes — see identity.py:135 for the parity
+        # rationale; group.decrypt mirrors identity.decrypt to keep
+        # the two encrypt/decrypt entry points symmetric.
+        return Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)
 
     def publish(self):
         return Group(self.uuid, self.addresses, self.nickname, Encryptor(self.encryptor.publish(), True), True)
@@ -125,3 +124,25 @@ class Group(InitializableConfig):
     def initialize(address_map, our_nickname):
         time.sleep(random.random())  # reduce chance of collision
         return Group(uuid_mod.uuid4(), address_map, our_nickname, Encryptor.generate(), False)
+
+
+class ChildGroupSet(object):
+    """IPC carrier for the set of child groups a gateway participates in.
+
+    A gateway (rank > 1) belongs to its primary/parent group plus one or
+    more child groups it bridges. The primary group is propagated to the
+    other processes by fanning out a bare ``Group`` (which sets
+    ``Protocol.group``). Child groups need the same cross-process
+    propagation but must NOT clobber that single primary slot, so they
+    ride in this distinct wrapper instead. Fanned out exactly like a
+    ``Group`` via ``ProcessTracker.update``; handled in
+    ``Protocol.run_message_handlers`` by setting ``Protocol.child_groups``.
+
+    Plain picklable object (no protobuf) — it only ever travels the local
+    inter-process queues, never the network. See
+    doc/architecture/gateway-reputation-tree.md.
+    """
+
+    def __init__(self, groups=None):
+        # dict[group-uuid-str -> Group]
+        self.groups = dict(groups) if groups else {}

@@ -15,8 +15,10 @@
  *******************/
 
 #include <string.h>
+#include <stdio.h>
 #include <math.h>
 #include <errno.h>
+#include <sodium.h>
 
 #include "reputation/reputation.h"
 #include "structures/map.h"
@@ -26,6 +28,263 @@
 DEFINE_ERROR(EREP_NOTX, "Transaction not found");
 DEFINE_ERROR(EREP_NOPEER, "Peer not found in reputation map");
 DEFINE_ERROR(EREP_CHAIN_FULL, "Transaction chain is full");
+
+/****************************
+ * Phase 1 hash-linking
+ ****************************/
+
+/* Serialize a UUID field, or the literal "null" when unset, into out.
+ * Returns the number of chars written (excluding NUL). */
+static int append_uuid_field(char *out, size_t outsz, const uuid_t u, bool set)
+{
+    if (!set)
+        return snprintf(out, outsz, "null");
+    char ustr[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(u, ustr);
+    return snprintf(out, outsz, "%s", ustr);
+}
+
+int transaction_canonical_bytes(const transaction_t *tx, char *out, size_t outsz)
+{
+    /* Deterministic, language-agnostic serialization of everything EXCEPT
+     * prev_hash. MUST match Python Transaction._canonical_bytes:
+     *   task_id|p1_id|p1_score|p2_id|p2_score|index
+     * UUIDs lowercase-hyphenated (or "null"), floats "%.17g" (or "null"),
+     * index decimal (or "null" when pending / -1). The task_uuid is always
+     * present. p1/p2 follow their *_set flags; a pending (index < 0) tx
+     * serializes index as "null" to match Python's None. */
+    char buf[UUID_STRING_LEN * 3 + 128];
+    int n = 0;
+    char tstr[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(tx->task_uuid, tstr);
+    n += snprintf(buf + n, sizeof(buf) - n, "%s|", tstr);
+    n += append_uuid_field(buf + n, sizeof(buf) - n, tx->p1_uuid, tx->p1_set);
+    if (tx->p1_set)
+        n += snprintf(buf + n, sizeof(buf) - n, "|%.17g|", tx->p1_score);
+    else
+        n += snprintf(buf + n, sizeof(buf) - n, "|null|");
+    n += append_uuid_field(buf + n, sizeof(buf) - n, tx->p2_uuid, tx->p2_set);
+    if (tx->p2_set)
+        n += snprintf(buf + n, sizeof(buf) - n, "|%.17g|", tx->p2_score);
+    else
+        n += snprintf(buf + n, sizeof(buf) - n, "|null|");
+    if (tx->index < 0)
+        n += snprintf(buf + n, sizeof(buf) - n, "null");
+    else
+        n += snprintf(buf + n, sizeof(buf) - n, "%d", tx->index);
+    if (n < 0 || (size_t)n >= sizeof(buf) || (size_t)n >= outsz)
+        return -1;
+    memcpy(out, buf, (size_t)n + 1);
+    return n;
+}
+
+void transaction_entry_hash(const transaction_t *tx, char out[TX_HASH_HEX_LEN + 1])
+{
+    /* blake2b over (canonical_bytes || prev_hash), hex-encoded. Matches
+     * Python MerkleTree.get_hash(canonical + prev_hash): 32-byte digest,
+     * lowercase hex. prev_hash is appended as its raw ASCII hex bytes (the
+     * same concatenation Python performs on the b'' / 64-hex-byte value). */
+    char canon[UUID_STRING_LEN * 3 + 128];
+    int clen = transaction_canonical_bytes(tx, canon, sizeof(canon));
+    if (clen < 0)
+    {
+        out[0] = '\0';
+        return;
+    }
+    size_t plen = strnlen(tx->prev_hash, TX_HASH_HEX_LEN);
+    unsigned char in[sizeof(canon) + TX_HASH_HEX_LEN];
+    memcpy(in, canon, (size_t)clen);
+    memcpy(in + clen, tx->prev_hash, plen);
+    unsigned char digest[32];
+    crypto_generichash(digest, sizeof(digest), in, (size_t)clen + plen, NULL, 0);
+    sodium_bin2hex(out, TX_HASH_HEX_LEN + 1, digest, sizeof(digest));
+}
+
+bool tx_verify_chain_links(const transaction_t *chain, int count)
+{
+    const transaction_t *prev = NULL;
+    for (int i = 0; i < count; i++)
+    {
+        const transaction_t *link = &chain[i];
+        if (link->index < 0)
+            continue;  /* pending entry — not part of the committed link */
+        if (prev != NULL)
+        {
+            char expect[TX_HASH_HEX_LEN + 1];
+            transaction_entry_hash(prev, expect);
+            if (strncmp(link->prev_hash, expect, TX_HASH_HEX_LEN + 1) != 0)
+                return false;
+        }
+        prev = link;
+    }
+    return true;
+}
+
+bool tx_history_verify_links(const tx_history_t *hist)
+{
+    return tx_verify_chain_links(hist->chain, hist->chain_len);
+}
+
+/****************************
+ * Phase 2: ordered Merkle root over the resident window
+ *
+ * RFC 6962 Merkle Tree Hash with domain-separated leaf (0x00) and node (0x01)
+ * prefixes, over each committed entry's entry_hash in resident order. The
+ * construction is a pure function of the ordered leaf digests (no tree-shape
+ * dependence), so it stays byte-identical to Python
+ * TransactionHistory.window_root / _mth / _audit_path / verify_inclusion.
+ ****************************/
+
+#define MERKLE_LEAF_PREFIX 0x00
+#define MERKLE_NODE_PREFIX 0x01
+
+/* blake2b(in) -> TX_HASH_HEX_LEN lowercase hex chars + NUL. Same primitive as
+ * transaction_entry_hash (crypto_generichash 32-byte digest, sodium_bin2hex),
+ * i.e. Python MerkleTree.get_hash. */
+static void merkle_hash_hex(const unsigned char *in, size_t len,
+                            char out[TX_HASH_HEX_LEN + 1])
+{
+    unsigned char digest[32];
+    crypto_generichash(digest, sizeof(digest), in, len, NULL, 0);
+    sodium_bin2hex(out, TX_HASH_HEX_LEN + 1, digest, sizeof(digest));
+}
+
+/* RFC 6962 MTH over leaves[lo .. hi). Empty range -> H(""). */
+static void mth_range(const char (*leaves)[TX_HASH_HEX_LEN + 1],
+                      int lo, int hi, char out[TX_HASH_HEX_LEN + 1])
+{
+    int n = hi - lo;
+    if (n <= 0)
+    {
+        merkle_hash_hex((const unsigned char *)"", 0, out);
+        return;
+    }
+    if (n == 1)
+    {
+        unsigned char in[1 + TX_HASH_HEX_LEN];
+        in[0] = MERKLE_LEAF_PREFIX;
+        memcpy(in + 1, leaves[lo], TX_HASH_HEX_LEN);
+        merkle_hash_hex(in, 1 + TX_HASH_HEX_LEN, out);
+        return;
+    }
+    int k = 1;
+    while (k * 2 < n)
+        k *= 2;
+    char left[TX_HASH_HEX_LEN + 1], right[TX_HASH_HEX_LEN + 1];
+    mth_range(leaves, lo, lo + k, left);
+    mth_range(leaves, lo + k, hi, right);
+    unsigned char in[1 + 2 * TX_HASH_HEX_LEN];
+    in[0] = MERKLE_NODE_PREFIX;
+    memcpy(in + 1, left, TX_HASH_HEX_LEN);
+    memcpy(in + 1 + TX_HASH_HEX_LEN, right, TX_HASH_HEX_LEN);
+    merkle_hash_hex(in, 1 + 2 * TX_HASH_HEX_LEN, out);
+}
+
+/* RFC 6962 audit path for leaf position `m` within leaves[lo .. hi). Appends
+ * (sibling_root, sibling_is_left) steps bottom-up at *cnt. */
+static void audit_path(const char (*leaves)[TX_HASH_HEX_LEN + 1],
+                       int lo, int hi, int m,
+                       tx_merkle_step_t *steps, int *cnt)
+{
+    int n = hi - lo;
+    if (n <= 1)
+        return;
+    int k = 1;
+    while (k * 2 < n)
+        k *= 2;
+    char sib[TX_HASH_HEX_LEN + 1];
+    if (m < lo + k)
+    {
+        audit_path(leaves, lo, lo + k, m, steps, cnt);
+        mth_range(leaves, lo + k, hi, sib);
+        memcpy(steps[*cnt].sibling, sib, TX_HASH_HEX_LEN + 1);
+        steps[*cnt].sibling_is_left = false;
+    }
+    else
+    {
+        audit_path(leaves, lo + k, hi, m, steps, cnt);
+        mth_range(leaves, lo, lo + k, sib);
+        memcpy(steps[*cnt].sibling, sib, TX_HASH_HEX_LEN + 1);
+        steps[*cnt].sibling_is_left = true;
+    }
+    (*cnt)++;
+}
+
+/* Collect the committed (index >= 0) window leaves in resident order; returns
+ * the leaf count and, if want_index >= 0, the position of that absolute index
+ * (or -1). */
+static int collect_window_leaves(const tx_history_t *hist,
+                                 char (*leaves)[TX_HASH_HEX_LEN + 1],
+                                 int want_index, int *pos_out)
+{
+    int n = 0, pos = -1;
+    for (int i = 0; i < hist->chain_len; i++)
+    {
+        if (hist->chain[i].index < 0)
+            continue;
+        if (want_index >= 0 && hist->chain[i].index == want_index)
+            pos = n;
+        transaction_entry_hash(&hist->chain[i], leaves[n]);
+        n++;
+    }
+    if (pos_out != NULL)
+        *pos_out = pos;
+    return n;
+}
+
+void transaction_window_root(const tx_history_t *hist, char out[TX_HASH_HEX_LEN + 1])
+{
+    char leaves[MAX_CHAIN_LEN][TX_HASH_HEX_LEN + 1];
+    int n = collect_window_leaves(hist, leaves, -1, NULL);
+    mth_range(leaves, 0, n, out);
+}
+
+int transaction_window_proof(const tx_history_t *hist, int abs_index,
+                             tx_merkle_step_t *steps, int *n_steps)
+{
+    char leaves[MAX_CHAIN_LEN][TX_HASH_HEX_LEN + 1];
+    int pos = -1;
+    int n = collect_window_leaves(hist, leaves, abs_index, &pos);
+    if (pos < 0)
+    {
+        if (n_steps != NULL)
+            *n_steps = 0;
+        return -1;
+    }
+    int cnt = 0;
+    audit_path(leaves, 0, n, pos, steps, &cnt);
+    if (n_steps != NULL)
+        *n_steps = cnt;
+    return 0;
+}
+
+bool tx_merkle_verify(const char leaf_hex[TX_HASH_HEX_LEN + 1],
+                      const tx_merkle_step_t *steps, int n_steps,
+                      const char root_hex[TX_HASH_HEX_LEN + 1])
+{
+    char cur[TX_HASH_HEX_LEN + 1];
+    unsigned char leaf_in[1 + TX_HASH_HEX_LEN];
+    leaf_in[0] = MERKLE_LEAF_PREFIX;
+    memcpy(leaf_in + 1, leaf_hex, TX_HASH_HEX_LEN);
+    merkle_hash_hex(leaf_in, 1 + TX_HASH_HEX_LEN, cur);
+    for (int i = 0; i < n_steps; i++)
+    {
+        unsigned char in[1 + 2 * TX_HASH_HEX_LEN];
+        in[0] = MERKLE_NODE_PREFIX;
+        if (steps[i].sibling_is_left)
+        {
+            memcpy(in + 1, steps[i].sibling, TX_HASH_HEX_LEN);
+            memcpy(in + 1 + TX_HASH_HEX_LEN, cur, TX_HASH_HEX_LEN);
+        }
+        else
+        {
+            memcpy(in + 1, cur, TX_HASH_HEX_LEN);
+            memcpy(in + 1 + TX_HASH_HEX_LEN, steps[i].sibling, TX_HASH_HEX_LEN);
+        }
+        merkle_hash_hex(in, 1 + 2 * TX_HASH_HEX_LEN, cur);
+    }
+    return strncmp(cur, root_hex, TX_HASH_HEX_LEN + 1) == 0;
+}
 
 /****************************
  * Transaction history
@@ -43,8 +302,12 @@ int tx_history_create(tx_history_t **hist)
 int tx_history_init(tx_history_t *hist)
 {
     hist->chain_len = 0;
+    hist->committed_count = 0;
+    hist->next_index = 0;
+    hist->first_index = 0;
     hist->evicted_ring_head = 0;
     hist->evicted_ring_len = 0;
+    hist->head_hash[0] = '\0';  /* Phase 1: empty genesis link */
     int err = map_init(&hist->task_map);
     if (err != 0) return err;
     err = map_init(&hist->peer_map);
@@ -72,6 +335,7 @@ static void tx_history_evict_oldest(tx_history_t *hist)
     transaction_t evicted = hist->chain[0];
     char task_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(evicted.task_uuid, task_str);
+    bool evicted_committed = evicted.p1_set && evicted.p2_set;
 
     /* 1. Drop evicted's task_map entry. */
     map_remove(&hist->task_map, task_str);
@@ -203,12 +467,32 @@ static void tx_history_evict_oldest(tx_history_t *hist)
     }
     array_free(&empty_peers);
 
-    /* 4. Memmove the chain down, renumber tx->index in the remainder. */
+    /* 4. Memmove the chain down. tx->index is now monotonic absolute
+     *    (mirrors Python `_next_index`) so we do NOT rewrite it after
+     *    the shift — only the task_map slot-position values are
+     *    decremented above. The committed-count and first_index
+     *    bookkeeping is what Python's _evict_oldest tail does
+     *    (reputation.py:182-185). */
     memmove(&hist->chain[0], &hist->chain[1],
             (size_t)(hist->chain_len - 1) * sizeof(transaction_t));
     hist->chain_len--;
-    for (int i = 0; i < hist->chain_len; i++)
-        hist->chain[i].index = i;
+    if (evicted_committed)
+    {
+        hist->committed_count--;
+        /* Advance first_index past the evicted entry — to the next
+         * still-committed entry's index, or to next_index when no
+         * committed entry remains. Walk forward through the chain
+         * because pending entries may sit between committed ones. */
+        hist->first_index = hist->next_index;
+        for (int i = 0; i < hist->chain_len; i++)
+        {
+            if (hist->chain[i].p1_set && hist->chain[i].p2_set)
+            {
+                hist->first_index = hist->chain[i].index;
+                break;
+            }
+        }
+    }
 }
 
 void tx_history_destroy(tx_history_t *hist)
@@ -271,10 +555,20 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
         uuid_copy(tx->p1_uuid, peer_uuid);
         tx->p1_score = score;
         tx->p1_set = true;
-        tx->index = idx;
+        /* index is assigned monotonically only when the tx goes
+         * bilateral (p2 also fills). Mark pending with -1 so callers
+         * that look at tx->index for an unfinished tx see a sentinel.
+         * Mirrors Python: _next_index advances inside the
+         * `if len(tx) > 1` branch of update(), not at task creation. */
+        tx->index = -1;
         hist->chain_len++;
 
-        /* Record in task_map */
+        /* Record slot position in task_map. NOTE: this is the
+         * positional index in chain[], not tx->index (those agree
+         * only by coincidence before the first eviction). Python's
+         * _task_mapping is keyed by task_id → Transaction directly;
+         * the C twin uses an integer slot because chain[] is a flat
+         * array. */
         data_t *new_idx = integer_data(idx);
         map_set(&hist->task_map, task_str, new_idx);
     }
@@ -302,6 +596,7 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
          * NOT extend the slot count — the asymmetric p1/p2 scoring
          * semantics (requester ≠ worker) don't generalize. */
         transaction_t *tx = &hist->chain[idx];
+        bool was_committed = tx->p1_set && tx->p2_set;
         if (!tx->p1_set)
         {
             uuid_copy(tx->p1_uuid, peer_uuid);
@@ -332,6 +627,27 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
              * every replayed/late message, inflating by_peer() counts
              * and skewing downstream reputation math. */
             return 0;
+        }
+        /* Bilateral promotion: this update just filled the second
+         * slot — assign the monotonic absolute index and bump the
+         * committed counter. Mirrors Python's
+         * `if len(tx) > 1: tx.index = self._next_index;
+         *  self._next_index += 1` in reputation.py:214-221. */
+        if (!was_committed && tx->p1_set && tx->p2_set)
+        {
+            tx->index = hist->next_index;
+            hist->next_index++;
+            if (hist->committed_count == 0)
+                hist->first_index = tx->index;
+            hist->committed_count++;
+            /* Phase 1 hash-linking: chain this entry to the current head,
+             * then advance the head to this entry's digest. Eviction only
+             * fires in the new-task arm above and never rewrites head_hash,
+             * so the link survives the sliding window. Mirrors Python
+             * TransactionHistory.update's `tx.prev_hash = self._head_hash;
+             * self._head_hash = tx.entry_hash()`. */
+            memcpy(tx->prev_hash, hist->head_hash, TX_HASH_HEX_LEN + 1);
+            transaction_entry_hash(tx, hist->head_hash);
         }
     }
 
@@ -412,21 +728,40 @@ int tx_history_by_peer(const tx_history_t *hist, const uuid_t peer_uuid,
 int tx_history_era(const tx_history_t *hist, int start_idx, int end_idx,
                    transaction_t *out, int *out_count)
 {
+    /* start_idx / end_idx are positional within the committed
+     * subsequence — matches what rep_proc.c:1112-1113 expects
+     * after calling tx_history_len() (which now returns the
+     * committed count, not chain_len). Walk chain[] skipping
+     * unilateral entries; emit the slice [start_idx, end_idx)
+     * of the committed sequence. */
     if (start_idx < 0) start_idx = 0;
-    if (end_idx > hist->chain_len) end_idx = hist->chain_len;
+    if (end_idx > hist->committed_count) end_idx = hist->committed_count;
 
     *out_count = 0;
-    for (int i = start_idx; i < end_idx; i++)
+    int committed_seen = 0;
+    for (int i = 0; i < hist->chain_len && committed_seen < end_idx; i++)
     {
-        out[*out_count] = hist->chain[i];
-        (*out_count)++;
+        if (!hist->chain[i].p1_set || !hist->chain[i].p2_set)
+            continue;
+        if (committed_seen >= start_idx)
+        {
+            out[*out_count] = hist->chain[i];
+            (*out_count)++;
+        }
+        committed_seen++;
     }
     return 0;
 }
 
 int tx_history_len(const tx_history_t *hist)
 {
-    return hist->chain_len;
+    /* Returns committed-bilateral count, mirroring Python
+     * TransactionHistory.__len__ (reputation.py:223-224 returns
+     * len(self._chain), and `_chain.append` runs only when
+     * `len(tx) > 1`). Callers use this for paxos slot numbering
+     * and chain-catchup era boundaries, so a unilateral tx
+     * sitting in chain[] must not be counted. */
+    return hist->committed_count;
 }
 
 /* Frama-C: skipped — [solver-timeout] container free cascade */
@@ -449,8 +784,12 @@ void tx_history_free(tx_history_t *hist)
     map_free(&hist->peer_map);
     map_free(&hist->evicted_set);
     hist->chain_len = 0;
+    hist->committed_count = 0;
+    hist->next_index = 0;
+    hist->first_index = 0;
     hist->evicted_ring_head = 0;
     hist->evicted_ring_len = 0;
+    hist->head_hash[0] = '\0';
 }
 
 /****************************
@@ -460,15 +799,28 @@ void tx_history_free(tx_history_t *hist)
 /* Frama-C: skipped — [serialization] jansson JSON serialization */
 int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx, json_t **out)
 {
+    /* start_idx / end_idx are positional within the committed
+     * subsequence (mirrors tx_history_era). Skip pending entries
+     * so the wire never carries half-formed transactions — they
+     * would otherwise be deserialized as committed on the
+     * receiver and trigger spurious reputation math. */
     if (start_idx < 0) start_idx = 0;
-    if (end_idx > hist->chain_len) end_idx = hist->chain_len;
+    if (end_idx > hist->committed_count) end_idx = hist->committed_count;
 
     json_t *arr = json_array();
     if (arr == NULL) return EXCEPTION(ENOMEM);
 
-    for (int i = start_idx; i < end_idx; i++)
+    int committed_seen = 0;
+    for (int i = 0; i < hist->chain_len && committed_seen < end_idx; i++)
     {
         const transaction_t *tx = &hist->chain[i];
+        if (!tx->p1_set || !tx->p2_set)
+            continue;
+        if (committed_seen < start_idx)
+        {
+            committed_seen++;
+            continue;
+        }
         char task_str[UUID_STRING_LEN + 1];
         uuid_unparse_lower(tx->task_uuid, task_str);
         char p1_str[UUID_STRING_LEN + 1];
@@ -476,17 +828,19 @@ int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
         char p2_str[UUID_STRING_LEN + 1];
         uuid_unparse_lower(tx->p2_uuid, p2_str);
 
-        json_t *obj = json_pack("{s:s, s:s, s:f, s:b, s:s, s:f, s:b, s:i}",
+        json_t *obj = json_pack("{s:s, s:s, s:f, s:b, s:s, s:f, s:b, s:i, s:s}",
             "task", task_str,
             "p1", p1_str, "p1_score", tx->p1_score, "p1_set", tx->p1_set,
             "p2", p2_str, "p2_score", tx->p2_score, "p2_set", tx->p2_set,
-            "index", tx->index);
+            "index", tx->index,
+            "prev_hash", tx->prev_hash);  /* Phase 1 hash-link */
         if (obj == NULL)
         {
             json_decref(arr);
             return -1;
         }
         json_array_append_new(arr, obj);
+        committed_seen++;
     }
 
     *out = arr;
@@ -501,6 +855,56 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
 
     size_t idx;
     json_t *obj;
+    int max_loaded_index = -1;
+
+    /* Phase 1: verify the incoming segment's hash-linkage before loading
+     * any of it. A peer (or a corrupted transfer) cannot slip an altered
+     * committed entry past us — the "verifiable instead of social" sync win
+     * (reputation-vs-blockchain-analysis.md §2.1). Mirrors Python
+     * TransactionHistory.catchup's wholesale reject. We stream-verify with
+     * just the previous committed entry so an over-long array needs no temp
+     * buffer. */
+    {
+        transaction_t prev;
+        bool have_prev = false;
+        json_array_foreach(arr, idx, obj)
+        {
+            const char *task_str = json_string_value(json_object_get(obj, "task"));
+            const char *p1_str = json_string_value(json_object_get(obj, "p1"));
+            const char *p2_str = json_string_value(json_object_get(obj, "p2"));
+            if (task_str == NULL || p1_str == NULL || p2_str == NULL)
+                continue;
+            transaction_t cur;
+            memset(&cur, 0, sizeof(cur));
+            uuid_parse(task_str, cur.task_uuid);
+            uuid_parse(p1_str, cur.p1_uuid);
+            cur.p1_score = json_number_value(json_object_get(obj, "p1_score"));
+            cur.p1_set = json_boolean_value(json_object_get(obj, "p1_set"));
+            uuid_parse(p2_str, cur.p2_uuid);
+            cur.p2_score = json_number_value(json_object_get(obj, "p2_score"));
+            cur.p2_set = json_boolean_value(json_object_get(obj, "p2_set"));
+            cur.index = (int)json_integer_value(json_object_get(obj, "index"));
+            const char *ph = json_string_value(json_object_get(obj, "prev_hash"));
+            cur.prev_hash[0] = '\0';
+            if (ph != NULL)
+            {
+                strncpy(cur.prev_hash, ph, TX_HASH_HEX_LEN);
+                cur.prev_hash[TX_HASH_HEX_LEN] = '\0';
+            }
+            if (cur.index < 0)
+                continue;  /* pending entry — not part of the committed link */
+            if (have_prev)
+            {
+                char expect[TX_HASH_HEX_LEN + 1];
+                transaction_entry_hash(&prev, expect);
+                if (strncmp(cur.prev_hash, expect, TX_HASH_HEX_LEN + 1) != 0)
+                    return 0;  /* broken link — reject the whole segment */
+            }
+            prev = cur;
+            have_prev = true;
+        }
+    }
+
     json_array_foreach(arr, idx, obj)
     {
         const char *task_str = json_string_value(json_object_get(obj, "task"));
@@ -522,6 +926,16 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
         tx->p2_score = json_number_value(json_object_get(obj, "p2_score"));
         tx->p2_set = json_boolean_value(json_object_get(obj, "p2_set"));
         tx->index = (int)json_integer_value(json_object_get(obj, "index"));
+        /* Preserve the wire prev_hash (consistent with preserving the wire
+         * index above); the verified segment is self-consistent, so the
+         * loaded chain's links hold. */
+        const char *ph = json_string_value(json_object_get(obj, "prev_hash"));
+        tx->prev_hash[0] = '\0';
+        if (ph != NULL)
+        {
+            strncpy(tx->prev_hash, ph, TX_HASH_HEX_LEN);
+            tx->prev_hash[TX_HASH_HEX_LEN] = '\0';
+        }
 
         /* Update maps */
         char task_key[UUID_STRING_LEN + 1];
@@ -529,7 +943,40 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
         data_t *idx_d = integer_data(hist->chain_len);
         map_set(&hist->task_map, task_key, idx_d);
 
+        /* Loaded entries from era_to_json are always bilateral
+         * (era_to_json filters unilateral out), but tolerate
+         * malformed input that drops the *_set flags. Only
+         * bilateral entries increment committed_count and feed
+         * next_index. Matches Python catch-up flow where era()
+         * + update() pair only commits whole pairs. */
+        if (tx->p1_set && tx->p2_set)
+        {
+            if (hist->committed_count == 0 ||
+                tx->index < hist->first_index)
+                hist->first_index = tx->index;
+            hist->committed_count++;
+            if (tx->index > max_loaded_index)
+                max_loaded_index = tx->index;
+        }
+
         hist->chain_len++;
+    }
+    /* Seed next_index past the largest absolute index just loaded
+     * so subsequent local commits don't collide. Mirrors Python's
+     * `max_existing + 1` seed in TransactionHistory.__init__
+     * (reputation.py:130-133). */
+    if (max_loaded_index + 1 > hist->next_index)
+        hist->next_index = max_loaded_index + 1;
+    /* Phase 1: resume the link from the loaded tail so subsequent local
+     * commits chain cleanly. The last committed slot is the head. */
+    hist->head_hash[0] = '\0';
+    for (int i = hist->chain_len - 1; i >= 0; i--)
+    {
+        if (hist->chain[i].p1_set && hist->chain[i].p2_set)
+        {
+            transaction_entry_hash(&hist->chain[i], hist->head_hash);
+            break;
+        }
     }
     return 0;
 }

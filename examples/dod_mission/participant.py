@@ -88,15 +88,53 @@ from scenario import DoDMissionScenario  # noqa: E402
 sys.path.insert(0, str(_HERE / "generators"))
 from isr import OverheadISRGenerators, MicrodroneGenerators  # noqa: E402
 from ground_sensor import GroundSensorGenerators  # noqa: E402
+from detection import (  # noqa: E402
+    build_detection_source, DETECTION_VIEW_CENTER_OVERRIDE,
+)
 
 sys.path.insert(0, str(_HERE / "compromise"))
 from contradictory_isr import (  # noqa: E402
     create_compromised_mq800_position_x,
     create_compromised_mq800_position_y,
     create_compromised_mq800_electronic_noise,
+    wrap_detection_source_with_compromise,
     DEFAULT_ACTIVATE_AT,
 )
 from forged_identity import create_forged_identity_sensor  # noqa: E402
+
+
+class _DetectionAugmentedBundle:
+    """Wraps an existing generator bundle with a sibling DetectionSource.
+
+    Implements the same ``tick(t) -> list[Reading]`` interface so
+    DoDDataProcess.acquire() doesn't care which bundle it's running.
+    Exposes the wrapped bundle's attributes for code that mutates
+    ``bundle.target_x`` / ``bundle.electronic_noise`` etc. (see the
+    contradictory_isr compromise).
+    """
+
+    def __init__(self, bundle, detection_source):
+        self._bundle = bundle
+        self._detection_source = detection_source
+
+    def __getattr__(self, name):
+        # Unpickle-safe delegation. When multiprocessing rehydrates this
+        # object in a worker, __new__ runs without __init__ — `_bundle`
+        # isn't in __dict__ yet, and a bare `getattr(self._bundle, name)`
+        # would re-enter __getattr__ infinitely. Read via __dict__.get
+        # so the unpickled-but-not-yet-populated state raises a clean
+        # AttributeError that pickle handles.
+        bundle = self.__dict__.get('_bundle')
+        if bundle is None:
+            raise AttributeError(name)
+        return getattr(bundle, name)
+
+    def tick(self, t):
+        out = list(self._bundle.tick(t) or [])
+        ds_out = self._detection_source.tick(t)
+        if ds_out:
+            out.extend(ds_out)
+        return out
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +379,39 @@ class DoDMissionParticipant(AutonomousTrust):
                     type(self.generators).__name__ if self.generators else "none",
                     compromised, forgery_mode)
 
+    def _maybe_add_detection(self, bundle, kind, roster_latlon):
+        """Attach a DetectionSource alongside a drone-role bundle.
+
+        Silently returns the bare bundle if the catalogue file is
+        missing (the demo runs even before tools/detection_prep.py
+        has been executed). Compromised MQ-800 peers get the
+        DetectionSource wrapped by the contradictory-ISR UID swap
+        so the inspector panel shows the wrong building while the
+        cross-source validator catches the position lie inside
+        compound-alpha's bucket.
+        """
+        view_override = DETECTION_VIEW_CENTER_OVERRIDE.get(self.peer_name)
+        ds = build_detection_source(
+            peer_name=self.peer_name,
+            role=kind,
+            roster_latlon=roster_latlon,
+            view_center_override_latlon=view_override,
+        )
+        if ds is None:
+            return bundle
+        if kind == "armed-drone" and self.compromised:
+            ds = wrap_detection_source_with_compromise(
+                ds, mode=self.compromise_mode)
+            logger.info(
+                "Wrapping %s detection source with CompromisedDetectionSource "
+                "(mode=%s, visible=%s)",
+                self.peer_name, self.compromise_mode, ds.visible_uids)
+        else:
+            logger.info(
+                "DetectionSource for %s (%s): visible UIDs %s",
+                self.peer_name, kind, ds.visible_uids)
+        return _DetectionAugmentedBundle(bundle, ds)
+
     def _build_generators(self):
         """Pick the right generator bundle for this peer's role."""
         kind = self.role.kind
@@ -350,10 +421,12 @@ class DoDMissionParticipant(AutonomousTrust):
         sensor_xy = (self.role.position.lat, self.role.position.lon)
 
         if kind == "microdrone":
-            return MicrodroneGenerators(self.peer_name, sensor_xy)
+            return self._maybe_add_detection(
+                MicrodroneGenerators(self.peer_name, sensor_xy), kind, sensor_xy)
 
         if kind == "recon-drone":
-            return OverheadISRGenerators(self.peer_name, sensor_xy)
+            return self._maybe_add_detection(
+                OverheadISRGenerators(self.peer_name, sensor_xy), kind, sensor_xy)
 
         if kind == "armed-drone":
             # MQ-800: honest ISR generators, optionally wrapped by the
@@ -382,7 +455,7 @@ class DoDMissionParticipant(AutonomousTrust):
                     bundle.target_x, bundle.target_y,
                     bundle.bearing, bundle.electronic_noise,
                 ]
-            return bundle
+            return self._maybe_add_detection(bundle, kind, sensor_xy)
 
         if kind == "ground-sensor":
             if self.forgery_mode:
@@ -421,7 +494,10 @@ class DoDMissionParticipant(AutonomousTrust):
         # this participant's local reputation process finds the weights
         # when scoring TSs. Metadata-only (function=None); the actual
         # data flow still goes through DataProcess.
-        from .trust_ladder import register_trust_ladder  # local import
+        # `participant.py` is invoked as a script (not a module), so we
+        # use a bare-name import after sys.path.insert(_HERE) above —
+        # same pattern as `from scenario import ...`.
+        from trust_ladder import register_trust_ladder  # local import
         self._trust_ladder = register_trust_ladder(self.capabilities)
         logger.info(
             "autonomous_ability: peer=%s capabilities=%s — "

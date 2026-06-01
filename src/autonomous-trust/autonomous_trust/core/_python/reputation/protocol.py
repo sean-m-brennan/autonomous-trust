@@ -71,3 +71,27 @@ class ReputationProtocol(Protocol):
     # via rep_req; the reply reuses rep_resp so automate.py's
     # latest_reputation dispatch consumes it unchanged.
     consensus_rep_req = 'request consensus reputation'
+    # Slashing — fast-penalty path (default-off; absent in legacy
+    # scenarios so byte-pinned corpora are unaffected). A detector
+    # broadcasts `slash_propose` (a SlashAttestation); members co-sign
+    # with `slash_sign`; on quorum the slasher broadcasts `slash_final`
+    # (a SignedSlash) and every node floors the target's reputation at
+    # the top of _consensus_reputation/_compute_reputation, bypassing the
+    # slow EMA. Mirrors the transaction/accepted/committed three-phase
+    # shape. See reputation.py SlashAttestation and
+    # doc/architecture/reputation.md.
+    slash_propose = 'slash propose'
+    slash_sign = 'slash sign'
+    slash_final = 'slash final'
+    # Phase 2 — quorum-signed Merkle checkpoints (default-off; absent in
+    # legacy scenarios so byte-pinned corpora are unaffected). A proposer
+    # broadcasts `checkpoint_propose` (a Checkpoint over its window_root);
+    # each member co-signs with `checkpoint_sign` ONLY if its own
+    # window_root matches; on quorum the proposer broadcasts
+    # `checkpoint_final` (a SignedCheckpoint) and every node stores it as the
+    # latest finalized commitment to the agreed committed window. Mirrors the
+    # slash three-phase shape. See reputation.py Checkpoint/SignedCheckpoint
+    # and reputation-vs-blockchain-analysis.md §2.1.
+    checkpoint_propose = 'checkpoint propose'
+    checkpoint_sign = 'checkpoint sign'
+    checkpoint_final = 'checkpoint final'

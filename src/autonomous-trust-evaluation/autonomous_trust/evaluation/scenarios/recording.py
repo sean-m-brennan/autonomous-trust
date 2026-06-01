@@ -52,10 +52,17 @@ class EventRecorder:
         engine.on_event(lambda ev, t: rec.record(ev))
         # ... scenario runs ...
         rec.save('recording.json', scenario=scenario)
+
+    Snapshots (reputation samples, sensor readings, etc.) go into a
+    separate sidecar list via ``record_snapshot`` so the event log
+    panel doesn't drown in 1 Hz reading records during replay. The
+    payload shape is opaque to the recorder; the playback consumer
+    decides how to interpret each ``type``.
     """
 
     def __init__(self):
         self._events: list[dict] = []
+        self._snapshots: list[dict] = []
 
     def record(self, ev) -> None:
         """Accept a ScenarioEvent or any object exposing .to_dict()."""
@@ -72,12 +79,35 @@ class EventRecorder:
         except Exception:
             logger.exception("EventRecorder.record failed for %r", ev)
 
+    def record_snapshot(self, snapshot: dict) -> None:
+        """Buffer a snapshot dict for the sidecar stream.
+
+        Expected keys: ``t`` (float seconds), ``type`` (string label
+        the playback consumer dispatches on). Everything else is
+        passed through verbatim.
+        """
+        try:
+            if not isinstance(snapshot, dict):
+                return
+            entry = dict(snapshot)
+            entry.setdefault("t", 0.0)
+            self._snapshots.append(entry)
+        except Exception:
+            logger.exception("EventRecorder.record_snapshot failed for %r",
+                             snapshot)
+
     @property
     def events(self) -> list[dict]:
         return list(self._events)
 
+    @property
+    def snapshots(self) -> list[dict]:
+        return list(self._snapshots)
+
     def save(self, path: str, scenario=None) -> None:
         payload: dict = {"event_log": list(self._events)}
+        if self._snapshots:
+            payload["snapshots"] = list(self._snapshots)
         if scenario is not None and hasattr(scenario, "export_scenario_def"):
             payload["scenario"] = scenario.export_scenario_def()
             payload["recorded_at"] = datetime.now(timezone.utc).isoformat()

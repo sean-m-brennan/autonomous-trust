@@ -52,6 +52,9 @@ from isr import (  # noqa: E402
     TargetPositionXGenerator, TargetPositionYGenerator,
     ElectronicNoiseGenerator,
 )
+from detection import (  # noqa: E402
+    DetectionSource, CatalogueObject,
+)
 
 
 # Default activation: phase 4 starts at T+4:00; we delay 15s so the
@@ -113,6 +116,82 @@ def create_compromised_mq800_electronic_noise(
 ) -> CompromiseBehavior:
     honest = ElectronicNoiseGenerator(peer_name, seed=seed)
     return _wrap(honest, mode, activate_at, offset, drift_rate=3.0)
+
+
+# --- DetectionSource compromise (Stretch Goal 2, plan section 5.6) --------
+#
+# Re-expresses the MQ-800 compromise on the new sparse-detection pipeline.
+# Instead of offsetting a synthetic target position, the compromise swaps
+# the *content* of any honest compound-alpha detection for compound-bravo's
+# position + crop while keeping the honest world_uid label. The validator
+# then sees the lie in compound-alpha's bucket (one peer disagrees with
+# everyone else about where alpha is) and the inspector panel shows the
+# decoy crop in the MQ-800 panel — the "wrong building" visual story
+# from the plan's executive summary.
+
+DEFAULT_TRUE_UID = "compound-alpha"
+DEFAULT_DECOY_UID = "compound-bravo"
+
+
+class CompromisedDetectionSource(DetectionSource):
+    """Honest DetectionSource subclass that swaps detection content.
+
+    On every emission for ``true_uid``, this source substitutes the
+    catalogue entry for ``decoy_uid`` while keeping the ``true_uid``
+    label on the resulting Reading. The reported position therefore
+    lands inside the honest target's cross-validation bucket as an
+    outlier, and the inspector receives the decoy's crop_id.
+
+    If either UID is missing from the catalogue (e.g. the catalogue was
+    rebuilt without compound-bravo), the compromise short-circuits and
+    behaves like the honest base class.
+    """
+
+    def __init__(self, *args, true_uid: str = DEFAULT_TRUE_UID,
+                 decoy_uid: str = DEFAULT_DECOY_UID, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._true_uid = true_uid
+        self._decoy_obj: Optional[CatalogueObject] = next(
+            (o for o in self.catalogue if o.world_uid == decoy_uid), None
+        )
+
+    def _resolve_emission(self, obj: CatalogueObject):
+        if (self._decoy_obj is not None
+                and obj.world_uid == self._true_uid):
+            return self._decoy_obj, self._true_uid
+        return super()._resolve_emission(obj)
+
+
+def wrap_detection_source_with_compromise(
+    honest: DetectionSource,
+    mode: str = "abrupt",
+    true_uid: str = DEFAULT_TRUE_UID,
+    decoy_uid: str = DEFAULT_DECOY_UID,
+) -> CompromisedDetectionSource:
+    """Build a CompromisedDetectionSource that mirrors an honest one.
+
+    Copies every construction parameter from the honest source so the
+    FOV, view-centre, bearing, cadence, and suppression match. ``mode``
+    is accepted for parity with the legacy position generators but the
+    swap is always abrupt — the visual story doesn't gain anything
+    from a gradual UID drift, and gradual would just be one peer
+    sometimes-honest, sometimes-lying.
+    """
+    del mode  # reserved
+    return CompromisedDetectionSource(
+        peer_name=honest.peer_name,
+        role=honest.role,
+        catalogue=honest.catalogue,
+        view_center_latlon=honest._view_center_latlon,
+        bearing_deg=honest.bearing_deg,
+        fov=honest.fov,
+        link_quality=honest.link_quality,
+        time_floor_sec=honest.time_floor_sec,
+        suppression_sec=honest.suppression_sec,
+        drift_threshold_m=honest.drift_threshold_m,
+        true_uid=true_uid,
+        decoy_uid=decoy_uid,
+    )
 
 
 def create_all_mq800_compromised_generators(

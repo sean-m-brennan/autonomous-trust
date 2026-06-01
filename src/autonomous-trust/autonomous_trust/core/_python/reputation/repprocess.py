@@ -28,9 +28,17 @@ from ..processes import Process, ProcMeta
 from ..config import Configuration, from_json_string, to_json_string
 from ..identity.protocol import IdentityProtocol
 from .protocol import ReputationProtocol
-from .reputation import TransactionHistory, Reputation, Reputations, TransactionScore
+from .reputation import (TransactionHistory, Reputation, Reputations,
+                         TransactionScore, SlashAttestation, SignedSlash,
+                         Checkpoint, SignedCheckpoint)
 from ..system import CfgIds, now, encoding
 from .. import _probes
+
+
+# Reputation save gate: only peers strictly above this threshold survive
+# a process restart. Self is always persisted regardless. See
+# doc/architecture/persistent-cohort.md for the rationale.
+REPUTATION_PERSIST_THRESHOLD = 0.5
 
 
 @dataclass
@@ -124,7 +132,32 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(
             ReputationProtocol.consensus_rep_req,
             self.handle_consensus_reputation_request)
+        self.protocol.register_handler(
+            ReputationProtocol.slash_propose, self.handle_slash_propose)
+        self.protocol.register_handler(
+            ReputationProtocol.slash_sign, self.handle_slash_sign)
+        self.protocol.register_handler(
+            ReputationProtocol.slash_final, self.handle_slash_final)
+        self.protocol.register_handler(
+            ReputationProtocol.checkpoint_propose, self.handle_checkpoint_propose)
+        self.protocol.register_handler(
+            ReputationProtocol.checkpoint_sign, self.handle_checkpoint_sign)
+        self.protocol.register_handler(
+            ReputationProtocol.checkpoint_final, self.handle_checkpoint_final)
         self.history = TransactionHistory()
+        # Gateway reputation tree: one child chain per child group this
+        # node gateways (keyed by group-uuid string). Empty on rank-1
+        # leaf nodes — every code path below degrades to the single
+        # self.history chain when this is empty, so leaves are
+        # byte-for-byte unchanged. Lazily populated by _chain_for_group
+        # the first time a commit routes to a known child group. See
+        # doc/architecture/gateway-reputation-tree.md.
+        self.child_histories: dict[str, TransactionHistory] = {}
+        # Per-paxos-round group binding (idx -> group-uuid string). Set
+        # by the proposer in _start_paxos so handle_grant / handle_accepted
+        # / _paxos_timeout size the quorum and route the commit against
+        # the round's own group rather than the conflated self.peers.all.
+        self.round_group: dict[tuple, str] = {}
         self.my_requests: dict[tuple[int, int], TxCount] = {}
         self.requests: list[tuple[int, int]] = []
         self.proposals: dict[tuple[int, int], TransactionScore] = {}
@@ -132,7 +165,26 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.last_id = None
         self.last_value = None
         self.backoff = {}
-        self.reputations = Reputations()
+        # Prime from the persisted/seeded reputation snapshot when present
+        # (warm-start). Previously this was always a fresh empty
+        # Reputations, so reputation.cfg.json (written by
+        # _persist_reputations and by tools/seed_dod_cohort.py) was loaded
+        # into self.configs but never actually used — warm-start priors
+        # and the consensus baseline both went missing. Fall back to an
+        # empty store on a cold start.
+        loaded_reps = self.configs.get(CfgIds.reputation)
+        self.reputations = (loaded_reps
+                            if isinstance(loaded_reps, Reputations)
+                            else Reputations())
+        # Sticky consensus memory: peer-uuid-str -> last real (chain-derived)
+        # consensus score. The tx chain is a bounded window, so an idle
+        # peer's transactions evict within ~one window of sustained
+        # activity; without this its consensus would snap back to 0.5 the
+        # moment its last tx ages out. Stickiness holds the last computed
+        # value until NEW transactions update it — so a peer that stops
+        # interacting (out of range) keeps its earned reputation (incl. a
+        # low one for a corrupt node) instead of decaying to neutral.
+        self._consensus_last: dict[str, float] = {}
         self.requested_reps = []
         self.updates = {}
         self.num_updates = 3
@@ -172,6 +224,43 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # False = CTFT, True = pure. Combined with COOP_ENTER /
         # COOP_EXIT to give the mode switch hysteresis.
         self._coop_mode: dict[UUID, bool] = {}
+        # --- Slashing (fast-penalty path) ---------------------------------
+        # Applied floors: target-uuid-str -> (floor_score, epoch). Consulted
+        # at the TOP of _consensus_reputation / _compute_reputation so a
+        # slashed peer reads its floor regardless of chain/EMA/baseline.
+        # Volatile (not persisted): a process restart clears slashes, which
+        # matches the persist model (a slashed peer is simply below
+        # REPUTATION_PERSIST_THRESHOLD and isn't carried over).
+        self._slashed: dict[str, tuple] = {}
+        # Proposer-side co-signature accumulation: slash-key -> set of
+        # voter-uuid-str. Seeded with the slasher itself on initiation.
+        self._slash_sigs: dict[tuple, set] = {}
+        # Proposer-side pending attestations awaiting quorum: key -> attestation.
+        self._slash_pending: dict[tuple, SlashAttestation] = {}
+        # Dedup for finalized slashes (FIFO bounded), so a re-broadcast
+        # slash_final is a cheap no-op. Mirrors committed_paxos_rounds.
+        self._slashed_seen: 'OrderedDict[tuple, None]' = OrderedDict()
+        # Monotonic epoch for slashes this node originates (distinguishes a
+        # re-slash of the same target). Phase 2 will tie this to checkpoint
+        # epochs; standalone counter suffices for Phase 0.
+        self._slash_epoch = 0
+
+        # --- Phase 2: quorum-signed Merkle checkpoints --------------------
+        # Latest finalized checkpoint of OUR window (the agreed commitment a
+        # gateway parent / slash adjudicator verifies inclusion proofs
+        # against). None until the first checkpoint finalizes. Volatile.
+        self._checkpoint: 'Checkpoint | None' = None
+        # Proposer-side co-signature accumulation: checkpoint-key -> set of
+        # voter-uuid-str (only members whose own window_root matched). Seeded
+        # with the proposer itself on initiation.
+        self._checkpoint_sigs: dict[tuple, set] = {}
+        # Proposer-side pending checkpoints awaiting quorum: key -> Checkpoint.
+        self._checkpoint_pending: dict[tuple, Checkpoint] = {}
+        # Dedup for finalized checkpoints (FIFO bounded) so a re-broadcast
+        # checkpoint_final is a cheap no-op. Mirrors _slashed_seen.
+        self._checkpoint_seen: 'OrderedDict[tuple, None]' = OrderedDict()
+        # Monotonic epoch for checkpoints this node originates.
+        self._checkpoint_epoch = 0
 
     @property
     def peers(self):
@@ -180,6 +269,70 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     @property
     def group(self):
         return self.protocol.group
+
+    @property
+    def child_groups(self):
+        # dict[group-uuid-str -> Group] for the cohorts this node
+        # gateways. Empty for leaf nodes (Protocol.child_groups defaults
+        # empty), which keeps every multi-group code path inert here.
+        return getattr(self.protocol, 'child_groups', {}) or {}
+
+    def _group_by_uuid(self, group_uuid):
+        """Resolve a group-uuid string to its Group (primary or child),
+        or None when unknown."""
+        if group_uuid is None:
+            return self.group
+        key = str(group_uuid)
+        if self.group is not None and key == str(self.group.uuid):
+            return self.group
+        return self.child_groups.get(key)
+
+    def _members_of_group(self, group):
+        """Peers (from self.peers.all) whose address is in this group's
+        address map. Used to size per-group Paxos quorum on a gateway
+        whose self.peers.all spans several groups."""
+        if group is None:
+            return list(self.peers.all)
+        try:
+            addrs = set(group.addresses)
+        except Exception:
+            return list(self.peers.all)
+        return [p for p in self.peers.all
+                if getattr(p, 'address', None) in addrs]
+
+    def _quorum_for_group(self, group_uuid):
+        """Majority threshold (floor(N/2)) for a round in the given group.
+
+        Back-compat: a non-gateway node (no child_groups) always uses the
+        historical len(self.peers.all)//2, so leaf quorum math is
+        unchanged. Only a gateway — whose self.peers.all conflates the
+        members of every group it belongs to — sizes per-group."""
+        if not self.child_groups:
+            return len(self.peers.all) // 2
+        grp = self._group_by_uuid(group_uuid)
+        if grp is None:
+            return len(self.peers.all) // 2
+        return len(self._members_of_group(grp)) // 2
+
+    def _chain_for_group(self, group_uuid):
+        """Return the TransactionHistory for a group-uuid, defaulting to
+        the primary chain (self.history).
+
+        Unknown / None group-uuids and the primary group resolve to
+        self.history — so a leaf node (no child_groups) always operates
+        on its single chain exactly as before. A commit tagged with a
+        known child group's uuid routes to that child's chain, created
+        lazily on first use."""
+        if group_uuid is None:
+            return self.history
+        key = str(group_uuid)
+        if self.group is not None and key == str(self.group.uuid):
+            return self.history
+        if key in self.child_groups:
+            if key not in self.child_histories:
+                self.child_histories[key] = TransactionHistory()
+            return self.child_histories[key]
+        return self.history
 
     @staticmethod
     def _paxos_id_index(id1, id2):
@@ -234,12 +387,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def _paxos_timeout(self, queues, pax_id):
         retry = True
         idx = self._paxos_id_index(pax_id[0], pax_id[1])
+        quorum = self._quorum_for_group(self.round_group.get(idx))
         start = now()
         while (now() - start).total_seconds() < self.protocol_timeout:
             if idx not in self.my_requests:
                 retry = False  # already completed by handle_grant
                 break
-            if self.my_requests[idx].count >= len(self.peers.all) // 2:
+            if self.my_requests[idx].count >= quorum:
                 retry = False
                 break
             time.sleep(self.cadence)
@@ -265,7 +419,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self.logger.debug('Grant for already-completed request')
                 return True
             self.my_requests[idx].count += 1
-            if self.my_requests[idx].count >= len(self.peers.all) // 2:
+            if self.my_requests[idx].count >= self._quorum_for_group(
+                    self.round_group.get(idx)):
                 try:
                     score = (id1, id2, peer_id), self.my_requests[idx].score
                     msg = Message(self.name, ReputationProtocol.transaction,
@@ -364,12 +519,20 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         while len(self.task_weights) > self._TASK_WEIGHTS_CAP:
             self.task_weights.pop(next(iter(self.task_weights)))
 
-    def _start_paxos(self, queues, score: TransactionScore):
+    def _start_paxos(self, queues, score: TransactionScore, group_uuid=None):
         id1 = int(now().timestamp() * 1000)
         id2 = len(self.history) + 1
         idx = self._paxos_id_index(id1, id2)
         pax_id = (id1, id2, self.identity.uuid)
         self.my_requests[idx] = TxCount(score, 0)
+        # Bind this round to its group so quorum + commit routing use
+        # the round's own group, not the conflated self.peers.all.
+        # Defaults to the primary group (the gateway's own/parent
+        # cohort), which is correct for the demo where a gateway's
+        # self-initiated transactions are with its command cohort.
+        if group_uuid is None and self.group is not None:
+            group_uuid = str(self.group.uuid)
+        self.round_group[idx] = group_uuid
         pax_msg = Message(self.name, ReputationProtocol.request,
                           to_json_string(pax_id), self.group,
                           from_whom=self.identity)
@@ -440,7 +603,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     self.logger.warning(f"Rejecting unverified Paxos acceptance from {message.from_whom}")
                     return True  # drop unverified acceptance
                 self.acceptances[score.task_id].append(message.from_whom)
-            if len(self.acceptances[score.task_id]) > len(self.peers.all) // 2:
+            round_group_uuid = self.round_group.get(idx)
+            if len(self.acceptances[score.task_id]) > self._quorum_for_group(
+                    round_group_uuid):
                 # Idempotency guard: every ACCEPTED that arrives
                 # after the majority threshold has been crossed would
                 # otherwise re-fire the commit-and-broadcast block.
@@ -462,29 +627,41 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # the same on their end, so the resulting
                 # Transaction has both p1 and p2 filled across all
                 # peers' histories (see ReputationProtocol.committed
-                # for the rationale).
-                self.history.update(score.task_id, peer_id, score.score)
+                # for the rationale). Route to the round's group chain
+                # — primary for leaf nodes, a child chain on a gateway.
+                self._chain_for_group(round_group_uuid).update(
+                    score.task_id, peer_id, score.score)
+                # Bumped to info to make demo debugging tractable —
+                # without a commit log, "no movement on reputations"
+                # is indistinguishable from "no paxos commits".
+                _routed = self._chain_for_group(round_group_uuid)
                 # Bumped to info to make demo debugging tractable —
                 # without a commit log, "no movement on reputations"
                 # is indistinguishable from "no paxos commits".
                 self.logger.info(
                     'Transaction committed: task=%s peer=%s score=%.2f '
-                    '(history now %d txs, %d task_maps)',
+                    'group=%s (chain now %d txs, %d task_maps)',
                     str(getattr(score, "task_id", ""))[:8],
                     str(peer_id)[:8], score.score,
-                    len(self.history),
-                    len(self.history._task_mapping))
+                    str(round_group_uuid)[:8],
+                    len(_routed),
+                    len(_routed._task_mapping))
                 try:
                     # Pass task_id and peer_id through unchanged —
                     # ConfigJSONEncoder round-trips UUID objects with
                     # a __type__ tag, so handle_committed receives
                     # the same types we put in.  Stringifying here
-                    # would break that round-trip.
+                    # would break that round-trip. The trailing
+                    # group_uuid lets receivers route the commit to the
+                    # right chain; handle_committed unpacks it
+                    # length-tolerantly so legacy 3-tuples still work.
                     commit_msg = Message(
                         self.name, ReputationProtocol.committed,
                         to_json_string(
-                            (score.task_id, peer_id, score.score)),
-                        self.group, from_whom=self.identity)
+                            (score.task_id, peer_id, score.score,
+                             round_group_uuid)),
+                        self._group_by_uuid(round_group_uuid) or self.group,
+                        from_whom=self.identity)
                     queues[CfgIds.network].put(
                         commit_msg, block=True, timeout=self.q_cadence)
                 except Full:
@@ -506,20 +683,469 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         retries are safe."""
         if message.function == ReputationProtocol.committed:
             try:
-                task_id, peer_id, score = from_json_string(message.obj)
+                parsed = from_json_string(message.obj)
+                # Length-tolerant: new payloads carry a trailing
+                # group_uuid; legacy 3-tuples resolve to the primary
+                # chain (group_uuid None -> _chain_for_group default).
+                task_id, peer_id, score = parsed[0], parsed[1], parsed[2]
+                group_uuid = parsed[3] if len(parsed) > 3 else None
             except Exception:
                 self.logger.warning(
                     'handle_committed: malformed payload %r', message.obj)
                 return True
             if str(peer_id) == str(self.identity.uuid):
                 return True
-            self.history.update(task_id, peer_id, float(score))
+            chain = self._chain_for_group(group_uuid)
+            chain.update(task_id, peer_id, float(score))
             self.logger.info(
                 'Recorded committed tx from %s: task=%s score=%.2f '
-                '(history now %d txs, %d task_maps)',
+                'group=%s (chain now %d txs, %d task_maps)',
                 str(peer_id)[:8], str(task_id)[:8], float(score),
-                len(self.history),
-                len(self.history._task_mapping))
+                str(group_uuid)[:8],
+                len(chain),
+                len(chain._task_mapping))
+            return True
+        return False
+
+    # --- Slashing (fast-penalty path) ---------------------------------
+    # Three-phase shape mirroring transaction/accepted/committed:
+    #   forward_slash  : local detector originates -> self-apply + broadcast
+    #                    slash_propose, seeding its own co-signature.
+    #   slash_propose  : members co-sign (slash_sign) back to the slasher.
+    #   slash_sign     : slasher tallies; on > quorum, broadcasts slash_final.
+    #   slash_final    : every node floors the target's reputation.
+    # Phase 0 trusts the transport-verified detector (message.verified);
+    # Merkle-evidence verification + quorum-signature checking land in
+    # Phase 3. Default-off: absent in legacy scenarios, so byte-pinned
+    # corpora are unaffected.
+
+    def _slash_quorum(self, group_uuid=None):
+        """Co-signers required to finalize a slash; reuses Paxos majority
+        sizing. '> quorum' total signers (including the slasher) finalizes,
+        mirroring handle_accepted."""
+        return self._quorum_for_group(group_uuid)
+
+    def _slash_target_ok(self, attestation) -> bool:
+        """Reject self-slash adoption and degenerate slasher==target."""
+        if str(attestation.target_uuid) == str(self.identity.uuid):
+            return False
+        if str(attestation.slasher_uuid) == str(attestation.target_uuid):
+            return False
+        return True
+
+    def build_slash_evidence(self, task_id):
+        """Phase 3: build the Merkle inclusion evidence for the committed tx
+        ``task_id``, tying a slash to a checkpoint-committed offending entry.
+
+        Returns a JSON-friendly dict ``{task_id, leaf, proof, root}`` where
+        ``leaf`` is the tx's ``entry_hash`` (hex), ``proof`` the RFC 6962 audit
+        path ([[sibling_hex, sibling_is_left], ...]) against the current
+        ``window_root``, and ``root`` that window root (hex). Returns None if
+        the task is not resident in the window. A detector attaches this to a
+        ``SlashAttestation.evidence_ref`` so peers can verify the accusation
+        against a quorum-finalized checkpoint instead of trusting the detector
+        (reputation-vs-blockchain-analysis.md §2.1 / §3)."""
+        tx = self.history._task_mapping.get(task_id)
+        if tx is None or tx.index is None:
+            return None
+        proof = self.history.inclusion_proof(tx.index)
+        if proof is None:
+            return None
+        root = self.history.window_root()
+        return {
+            'task_id': str(task_id),
+            'leaf': tx.entry_hash().decode('ascii'),
+            'proof': [[s.decode('ascii') if isinstance(s, bytes) else s,
+                       bool(left)] for s, left in proof],
+            'root': root.decode('ascii') if isinstance(root, bytes) else str(root),
+        }
+
+    def _verify_slash_evidence(self, attestation) -> bool:
+        """Phase 3: gate a slash on Merkle evidence.
+
+        - No ``evidence_ref`` -> True (Phase 0 trust-the-detector fallback, so
+          legacy / evidence-free slashes are unaffected).
+        - With ``evidence_ref`` -> the offending tx's inclusion proof must
+          verify against a root this node has FINALIZED as a checkpoint
+          (``self._checkpoint.root``). Tying it to our own quorum-agreed
+          checkpoint — not a root chosen by the accuser — is what makes the
+          evidence trustworthy. Any malformed / mismatched / unverifiable
+          evidence returns False and the slash is refused."""
+        ev = attestation.evidence_ref
+        if ev is None:
+            return True
+        if self._checkpoint is None:
+            return False  # nothing to verify against
+        try:
+            leaf = ev['leaf']
+            leaf = leaf.encode('ascii') if isinstance(leaf, str) else leaf
+            root = ev['root']
+            root = root.encode('ascii') if isinstance(root, str) else root
+            proof = [(s.encode('ascii') if isinstance(s, str) else s, bool(left))
+                     for s, left in ev['proof']]
+        except (KeyError, TypeError, ValueError):
+            return False
+        ck_root = self._checkpoint.root
+        if isinstance(ck_root, str):
+            ck_root = ck_root.encode('ascii')
+        # The evidence must be proven against OUR finalized checkpoint root.
+        if root != ck_root:
+            return False
+        return TransactionHistory.verify_inclusion(leaf, proof, root)
+
+    def _apply_slash(self, attestation):
+        """Pin (or, for 'rehabilitate', lift) the target's reputation floor
+        and queue a tier recompute so tier_lost flows through the existing
+        path. Idempotent per (target, epoch)."""
+        key = attestation.key()
+        if key in self._slashed_seen:
+            return
+        target = str(attestation.target_uuid)
+        if attestation.reason == SlashAttestation.REASON_REHABILITATE:
+            self._slashed.pop(target, None)
+            # Drop sticky floor so the score recomputes from chain/EMA.
+            self._consensus_last.pop(target, None)
+        else:
+            floor = float(attestation.floor_score)
+            self._slashed[target] = (floor, int(attestation.epoch))
+            # Reflect the floor in the canonical reputation store too, so
+            # the verdict is observable to persistence, tier publication,
+            # and any reader of self.reputations (e.g. the conformance
+            # `reputation_of` assertion) — not only lazily at scoring time.
+            # A floored peer is below REPUTATION_PERSIST_THRESHOLD so it is
+            # not carried across a restart, matching the volatile intent.
+            try:
+                self.reputations.update(attestation.target_uuid, floor)
+            except Exception:
+                self.logger.debug('apply_slash: reputations.update failed',
+                                  exc_info=True)
+        self._slashed_seen[key] = None
+        while len(self._slashed_seen) > self.COMMITTED_ROUNDS_CAP:
+            self._slashed_seen.popitem(last=False)
+        # Queue a tier recompute (drained in process()): _compute_reputation
+        # now short-circuits on the floor and publishes tier 0 / tier_lost.
+        self.pending_tiers.append(
+            (attestation.target_uuid, float(attestation.floor_score)))
+        self.logger.info(
+            'Slash %s: target=%s reason=%s floor=%.2f epoch=%d',
+            'lifted' if attestation.reason
+            == SlashAttestation.REASON_REHABILITATE else 'applied',
+            target[:8], attestation.reason,
+            float(attestation.floor_score), int(attestation.epoch))
+
+    def forward_slash(self, queues, message):
+        """Entry point for a locally-originated slash: a detector (e.g. the
+        dod_mission coordinator) puts a SlashAttestation on the reputation
+        queue. Stamp epoch/nonce, sign, apply to our OWN view immediately
+        (a node always trusts its own detection — this is what the
+        detector's dashboard reads), seed the co-signature set with
+        ourself, and broadcast slash_propose to collect a quorum. Mirrors
+        forward_transaction's role for TransactionScore."""
+        if isinstance(message, SlashAttestation):
+            try:
+                att = message
+                att.slasher_uuid = self.identity.uuid
+                self._slash_epoch += 1
+                att.epoch = self._slash_epoch
+                if att.nonce is None:
+                    att.nonce = os.urandom(8)
+                try:
+                    att.signature = self.identity.sign(att.designation)
+                except Exception:
+                    att.signature = None
+                key = att.key()
+                self._slash_pending[key] = att
+                self._slash_sigs[key] = {str(self.identity.uuid)}
+                # Self-apply now so the detector's own consensus view (the
+                # dashboard) floors the target immediately, independent of
+                # co-sign round-trip latency.
+                self._apply_slash(att)
+                if self.group is not None:
+                    msg = Message(self.name, ReputationProtocol.slash_propose,
+                                  to_json_string(att), self.group,
+                                  from_whom=self.identity)
+                    queues[CfgIds.network].put(
+                        msg, block=True, timeout=self.q_cadence)
+                self.logger.info(
+                    'Initiated slash: target=%s reason=%s floor=%.2f',
+                    str(att.target_uuid)[:8], att.reason,
+                    float(att.floor_score))
+            except Full:
+                self.logger.error('forward_slash: network queue full')
+            return True
+        return False
+
+    def handle_slash_propose(self, queues, message):
+        if message.function == ReputationProtocol.slash_propose:
+            if not message.verified:
+                self.logger.warning(
+                    'Rejecting unverified slash_propose from %s',
+                    message.from_whom)
+                return True
+            # Message auto-deserializes a top-level Configuration payload
+            # into message.obj (see Message.__init__), so this is usually
+            # already a SlashAttestation; tolerate a raw JSON string too.
+            att = (message.obj if isinstance(message.obj, SlashAttestation)
+                   else from_json_string(message.obj))
+            # Don't co-sign our own bounce-back, and don't adopt a self-slash.
+            if str(att.slasher_uuid) == str(self.identity.uuid):
+                return True
+            if not self._slash_target_ok(att):
+                return True
+            # Phase 3: if the slash carries Merkle evidence, refuse to co-sign
+            # unless the offending tx's inclusion proof verifies against our
+            # own finalized checkpoint. Evidence-free slashes fall back to the
+            # Phase 0 trust-the-detector path (_verify_slash_evidence -> True).
+            if not self._verify_slash_evidence(att):
+                self.logger.warning(
+                    'Declining slash_propose: evidence failed verification')
+                return True
+            try:
+                sig = self.identity.sign(att.designation)
+            except Exception:
+                sig = None
+            tgt, epoch = att.key()
+            ack = (tgt, epoch, str(self.identity.uuid), sig)
+            try:
+                msg = Message(self.name, ReputationProtocol.slash_sign,
+                              to_json_string(ack), message.from_whom,
+                              from_whom=self.identity)
+                queues[CfgIds.network].put(
+                    msg, block=True, timeout=self.q_cadence)
+            except Full:
+                self.logger.error('handle_slash_propose: queue full')
+            return True
+        return False
+
+    def handle_slash_sign(self, queues, message):
+        if message.function == ReputationProtocol.slash_sign:
+            if not message.verified:
+                return True
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            tgt, epoch, voter, _sig = payload
+            key = (str(tgt), int(epoch))
+            att = self._slash_pending.get(key)
+            if att is None:
+                return True  # not our round, or already finalized
+            self._slash_sigs.setdefault(key, set()).add(str(voter))
+            grp_uuid = str(self.group.uuid) if self.group is not None else None
+            if len(self._slash_sigs[key]) > self._slash_quorum(grp_uuid):
+                signed = SignedSlash(attestation=att, sigs={})
+                try:
+                    msg = Message(
+                        self.name, ReputationProtocol.slash_final,
+                        to_json_string(signed),
+                        self._group_by_uuid(grp_uuid) or self.group,
+                        from_whom=self.identity)
+                    queues[CfgIds.network].put(
+                        msg, block=True, timeout=self.q_cadence)
+                    self.logger.info(
+                        'Slash finalized & broadcast: target=%s signers=%d',
+                        str(att.target_uuid)[:8], len(self._slash_sigs[key]))
+                except Full:
+                    self.logger.error(
+                        'handle_slash_sign: queue full broadcasting final')
+                # Drop pending so later signs are no-ops (finality dedup).
+                del self._slash_pending[key]
+            return True
+        return False
+
+    def handle_slash_final(self, _, message):
+        if message.function == ReputationProtocol.slash_final:
+            if not message.verified:
+                self.logger.warning(
+                    'Rejecting unverified slash_final from %s',
+                    message.from_whom)
+                return True
+            signed = (message.obj if isinstance(message.obj, SignedSlash)
+                      else from_json_string(message.obj))
+            att = getattr(signed, 'attestation', None)
+            if att is None:
+                return True
+            # The slasher already self-applied; skip the bounce-back.
+            if str(att.slasher_uuid) == str(self.identity.uuid):
+                return True
+            if not self._slash_target_ok(att):
+                return True
+            # Phase 3: an evidence-bearing slash is applied only if its
+            # inclusion proof verifies against our finalized checkpoint;
+            # evidence-free slashes keep the Phase 0 trust-the-finalizer path.
+            if not self._verify_slash_evidence(att):
+                self.logger.warning(
+                    'Rejecting slash_final: evidence failed verification')
+                return True
+            self._apply_slash(att)
+            return True
+        return False
+
+    # ----- Phase 2: quorum-signed Merkle checkpoints ----------------------
+    # Lifecycle (mirrors the slash three-phase shape):
+    #   forward_checkpoint    : a node originates -> stamps epoch/root over its
+    #                           own window, signs, seeds its own co-signature,
+    #                           broadcasts checkpoint_propose.
+    #   handle_checkpoint_propose: a member co-signs (checkpoint_sign) ONLY if
+    #                           its own window_root matches the proposed root.
+    #   handle_checkpoint_sign : proposer tallies matching signers; on > quorum
+    #                           broadcasts checkpoint_final.
+    #   handle_checkpoint_final: every node stores the SignedCheckpoint as the
+    #                           latest agreed commitment to the committed window.
+
+    def _checkpoint_quorum(self, group_uuid=None):
+        """Co-signers required to finalize a checkpoint; reuses Paxos majority
+        sizing. '> quorum' matching signers (including the proposer) finalize."""
+        return self._quorum_for_group(group_uuid)
+
+    def forward_checkpoint(self, queues, message):
+        """Entry point for a locally-originated checkpoint: putting a
+        ``Checkpoint`` on the reputation queue triggers a proposal over THIS
+        node's current ``window_root``. Any fields on the trigger object are
+        ignored — the proposer always commits to its own live window. Mirrors
+        ``forward_slash``."""
+        if isinstance(message, Checkpoint):
+            try:
+                self._checkpoint_epoch += 1
+                window = self.history._indexed_window()
+                root = self.history.window_root()
+                first = window[0].index if window else self.history._next_index
+                ckpt = Checkpoint(
+                    proposer_uuid=self.identity.uuid, root=root,
+                    epoch=self._checkpoint_epoch,
+                    first_index=first, count=len(window),
+                    nonce=os.urandom(8))
+                try:
+                    ckpt.signature = self.identity.sign(ckpt.designation)
+                except Exception:
+                    ckpt.signature = None
+                key = ckpt.key()
+                self._checkpoint_pending[key] = ckpt
+                self._checkpoint_sigs[key] = {str(self.identity.uuid)}
+                # Self-store immediately so a single-node group (or the
+                # originator's own view) has a finalized checkpoint without a
+                # co-sign round-trip, matching forward_slash's self-apply.
+                self._store_checkpoint(ckpt)
+                if self.group is not None:
+                    msg = Message(self.name,
+                                  ReputationProtocol.checkpoint_propose,
+                                  to_json_string(ckpt), self.group,
+                                  from_whom=self.identity)
+                    queues[CfgIds.network].put(
+                        msg, block=True, timeout=self.q_cadence)
+                self.logger.info(
+                    'Proposed checkpoint: epoch=%d count=%d root=%s',
+                    ckpt.epoch, ckpt.count,
+                    (root.decode() if isinstance(root, bytes) else str(root))[:12])
+            except Full:
+                self.logger.error('forward_checkpoint: network queue full')
+            return True
+        return False
+
+    def _store_checkpoint(self, ckpt):
+        """Record ``ckpt`` as the latest finalized checkpoint (idempotent on
+        re-broadcast via the seen-dedup ring)."""
+        key = ckpt.key()
+        if key in self._checkpoint_seen:
+            return
+        self._checkpoint = ckpt
+        self._checkpoint_seen[key] = None
+        while len(self._checkpoint_seen) > self.COMMITTED_ROUNDS_CAP:
+            self._checkpoint_seen.popitem(last=False)
+
+    def handle_checkpoint_propose(self, queues, message):
+        if message.function == ReputationProtocol.checkpoint_propose:
+            if not message.verified:
+                self.logger.warning(
+                    'Rejecting unverified checkpoint_propose from %s',
+                    message.from_whom)
+                return True
+            ckpt = (message.obj if isinstance(message.obj, Checkpoint)
+                    else from_json_string(message.obj))
+            # Don't co-sign our own bounce-back.
+            if str(ckpt.proposer_uuid) == str(self.identity.uuid):
+                return True
+            # Consensus check: co-sign ONLY if our own committed window
+            # produces the SAME Merkle root. A divergent window declines
+            # silently (no signature), so a checkpoint finalizes only when a
+            # quorum genuinely observed the same committed history.
+            proposed = ckpt.root
+            if isinstance(proposed, str):
+                proposed = proposed.encode()
+            mine = self.history.window_root()
+            if mine != proposed:
+                self.logger.debug(
+                    'checkpoint_propose: window_root mismatch, declining')
+                return True
+            try:
+                sig = self.identity.sign(ckpt.designation)
+            except Exception:
+                sig = None
+            proposer, epoch = ckpt.key()
+            ack = (proposer, epoch, str(self.identity.uuid), sig)
+            try:
+                msg = Message(self.name, ReputationProtocol.checkpoint_sign,
+                              to_json_string(ack), message.from_whom,
+                              from_whom=self.identity)
+                queues[CfgIds.network].put(
+                    msg, block=True, timeout=self.q_cadence)
+            except Full:
+                self.logger.error('handle_checkpoint_propose: queue full')
+            return True
+        return False
+
+    def handle_checkpoint_sign(self, queues, message):
+        if message.function == ReputationProtocol.checkpoint_sign:
+            if not message.verified:
+                return True
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            proposer, epoch, voter, _sig = payload
+            key = (str(proposer), int(epoch))
+            ckpt = self._checkpoint_pending.get(key)
+            if ckpt is None:
+                return True  # not our round, or already finalized
+            self._checkpoint_sigs.setdefault(key, set()).add(str(voter))
+            grp_uuid = str(self.group.uuid) if self.group is not None else None
+            if len(self._checkpoint_sigs[key]) > self._checkpoint_quorum(grp_uuid):
+                signed = SignedCheckpoint(checkpoint=ckpt, sigs={})
+                try:
+                    msg = Message(
+                        self.name, ReputationProtocol.checkpoint_final,
+                        to_json_string(signed),
+                        self._group_by_uuid(grp_uuid) or self.group,
+                        from_whom=self.identity)
+                    queues[CfgIds.network].put(
+                        msg, block=True, timeout=self.q_cadence)
+                    self.logger.info(
+                        'Checkpoint finalized & broadcast: epoch=%d signers=%d',
+                        ckpt.epoch, len(self._checkpoint_sigs[key]))
+                except Full:
+                    self.logger.error(
+                        'handle_checkpoint_sign: queue full broadcasting final')
+                # Drop pending so later signs are no-ops (finality dedup).
+                del self._checkpoint_pending[key]
+            return True
+        return False
+
+    def handle_checkpoint_final(self, _, message):
+        if message.function == ReputationProtocol.checkpoint_final:
+            if not message.verified:
+                self.logger.warning(
+                    'Rejecting unverified checkpoint_final from %s',
+                    message.from_whom)
+                return True
+            signed = (message.obj if isinstance(message.obj, SignedCheckpoint)
+                      else from_json_string(message.obj))
+            ckpt = getattr(signed, 'checkpoint', None)
+            if ckpt is None:
+                return True
+            # The proposer already self-stored; skip the bounce-back.
+            if str(ckpt.proposer_uuid) == str(self.identity.uuid):
+                return True
+            # Phase 3 will verify signed.sigs against known member identities;
+            # for now trust the transport-verified finalizer.
+            self._store_checkpoint(ckpt)
             return True
         return False
 
@@ -545,19 +1171,24 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             self.updates[message.from_whom.uuid] = from_json_string(message.obj)
             up_count = len(self.updates)
             if up_count >= self.num_updates:
-                grouping = []
+                # Group reported chains by their serialized (canonical) form
+                # so peers reporting the SAME committed history land in one
+                # bucket. Comparing Transaction objects with `==` fell back to
+                # identity (Configuration defines no __eq__), so deserialized
+                # chains never grouped and the majority vote could never be
+                # reached. The C twin already groups by JSON-dump string
+                # (rep_proc.c handle_update); this brings Python in lockstep —
+                # a prerequisite for the Phase 1 verifiable-catchup conformance
+                # (reputation-vs-blockchain-analysis.md §2.1).
+                grouping: 'dict[str, list]' = {}
                 for update in self.updates.values():
-                    grouped = False
-                    for grp in grouping:
-                        if update == grp[0]:
-                            grp.append(update)
-                            grouped = True
-                    if not grouped:
-                        grouping.append([update])
-                grouping.sort(key=len)
+                    key = to_json_string(update)
+                    grouping.setdefault(key, []).append(update)
+                best_key = max(grouping, key=lambda k: len(grouping[k]))
+                best = grouping[best_key]
                 self.logger.debug(grouping)
-                if len(grouping[-1]) > up_count // 2:
-                    chain = grouping[-1][0]  # all entries are identical; use one
+                if len(best) > up_count // 2:
+                    chain = best[0]  # all entries in the bucket are identical
                     self.history.catchup(chain)
                     self.logger.debug('Updated')
                 else:
@@ -657,6 +1288,24 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 return tier
         return 0
 
+    def _persist_reputations(self):
+        """Write the reputation snapshot to disk, filtered by threshold.
+
+        Only peers with score strictly above REPUTATION_PERSIST_THRESHOLD
+        are persisted; self is always included regardless. The on-disk
+        file is therefore the authoritative "trusted cohort" snapshot
+        used by the warm-start path in IdentityProcess.choose_group()
+        and by the dod-mission seed generator at
+        tools/seed_dod_cohort.py.
+        """
+        keep_uuids = {self.identity.uuid}
+        for u, score in self.reputations.current.items():
+            if score is not None and score > REPUTATION_PERSIST_THRESHOLD:
+                keep_uuids.add(u)
+        snapshot = self.reputations.filtered_for_persist(keep_uuids)
+        snapshot.to_file(os.path.join(Configuration.get_cfg_dir(),
+                                      CfgIds.reputation + Configuration.file_ext))
+
     def _publish_tier_change(self, queues, peer_uuid, score):
         """Notify IdentityProcess of a trust-tier crossing.
 
@@ -711,6 +1360,25 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # below also returns a string — `peer_uuid` is the same
             # type as the keys in self.reputations / self._coop_mode.
             peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
+            # Slash override (fast-penalty path): a finalized slash floors
+            # the score immediately, bypassing the CTFT/pure EMA dispatch.
+            # Force CTFT mode so that if the slash is later lifted the peer
+            # re-earns trust from the punished regime rather than snapping
+            # back into cooperation. Mirrors the commit tail below.
+            slashed = self._slashed.get(str(peer_uuid))
+            if slashed is not None:
+                rep_score = float(slashed[0])
+                self._coop_mode[peer_uuid] = False
+                self.reputations.update(peer_uuid, rep_score)
+                try:
+                    self._persist_reputations()
+                except (OSError, IOError) as e:
+                    self.logger.warning('Could not persist reputations: %s' % e)
+                self.pending_tiers.append((peer_uuid, rep_score))
+                self.requested_reps.append(
+                    (Reputation(peer_uuid, rep_score), req_proc, requestor))
+                _probes.counter('rep.compute', 'slashed')
+                return
             previous = 0.0
             if peer_uuid in self.reputations:
                 previous = self.reputations[peer_uuid]
@@ -745,8 +1413,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 rep_score = self._contrite_tit_for_tat(peer)
             self.reputations.update(peer_uuid, rep_score)
             try:
-                self.reputations.to_file(os.path.join(Configuration.get_cfg_dir(),
-                                                      CfgIds.reputation + Configuration.file_ext))
+                self._persist_reputations()
             except (OSError, IOError) as e:
                 self.logger.warning('Could not persist reputations: %s' % e)
             # Queue a tier-update for IdentityProcess; drained by the
@@ -760,27 +1427,81 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             _probes.counter('rep.compute', 'exception', type(e).__name__)
             self.logger.warning('_compute_reputation failed: %s' % e)
 
-    def _consensus_reputation(self, peer_uuid):
-        """Deterministic reputation score over the consensus tx chain.
+    def _consensus_baseline(self, peer_uuid):
+        """Cold-start baseline for a peer with no committed bilateral
+        history yet.
+
+        Priority: (1) the last real consensus value computed for this
+        peer (stickiness — so an idle peer whose txs have evicted from
+        the bounded chain keeps its earned score instead of resetting to
+        0.5), (2) the locally-known reputation (a warm-start seeded prior
+        from reputation.cfg.json, or a prior local compute), (3) the
+        neutral 0.5. Used only when the consensus chain has nothing for
+        the peer — once real bilateral txs exist, the EMA in
+        _consensus_reputation dominates and refreshes the sticky value.
+        Tolerates the str/UUID key ambiguity in self.reputations.current."""
+        last = self._consensus_last.get(str(peer_uuid))
+        if last is not None:
+            return last
+        try:
+            cur = self.reputations.current
+        except AttributeError:
+            return 0.5
+        for k in (peer_uuid, str(peer_uuid)):
+            if k in cur and cur[k] is not None:
+                return float(cur[k])
+        try:
+            u = UUID(str(peer_uuid))
+            if u in cur and cur[u] is not None:
+                return float(cur[u])
+        except (ValueError, TypeError, AttributeError):
+            pass
+        return 0.5
+
+    def _consensus_reputation(self, peer_uuid, chain=None):
+        """Deterministic reputation score over a consensus tx chain.
 
         Walks committed bilateral transactions involving the peer in
         chain order and folds each counterparty-side score into an
-        exponentially-weighted moving average.  Pure function of
-        ``self.history`` and ``peer_uuid`` — no dependence on
-        ``self.identity``, ``self.reputations``, or any per-node
-        latch — so every node with the same chain state arrives at
-        the same number.  Intended for the inspector dashboard;
+        exponentially-weighted moving average.  Pure function of the
+        ``chain`` (default ``self.history``) and ``peer_uuid`` — no
+        dependence on ``self.identity``, ``self.reputations``, or any
+        per-node latch — so every node with the same chain state
+        arrives at the same number. The optional ``chain`` argument
+        lets a gateway score a peer against one of its child-group
+        chains; omitting it preserves the original single-chain
+        behaviour exactly.
+
+        Cold-start exception: when the chain has NO committed bilateral
+        history for the peer, falls back to ``_consensus_baseline``
+        (the locally-known/seeded prior) instead of a flat 0.5, so a
+        warm-started cohort reads its primed rep on the dashboard
+        rather than a uniform 0.5. This is the only point where the
+        score depends on per-node state, and only until the first real
+        tx lands — after that the EMA dominates and nodes reconverge.
+        Intended for the inspector dashboard;
         ``rep_req`` callers continue to get the identity-dependent
         CTFT / _pure_reputation score from ``_compute_reputation``.
 
         The counterparty side is used (mirroring _pure_reputation's
         extraction) so the value reflects "what the network observed
         about this peer", not "what this peer self-reported".
+
+        Slash override: a finalized slash floors the score here,
+        bypassing the chain/EMA/baseline entirely (the fast-penalty
+        path). _consensus_last is refreshed to the floor so a later
+        rehabilitation won't snap back to a stale pre-slash value.
         """
+        slashed = self._slashed.get(str(peer_uuid))
+        if slashed is not None:
+            floor = float(slashed[0])
+            self._consensus_last[str(peer_uuid)] = floor
+            return floor
+        history = self.history if chain is None else chain
         try:
-            txs = list(self.history.by_peer(peer_uuid))
+            txs = list(history.by_peer(peer_uuid))
         except KeyError:
-            return 0.5
+            return self._consensus_baseline(peer_uuid)
         alpha = 1.0 - 0.5 ** (1.0 / float(self.CONSENSUS_EMA_HALF_LIFE))
         ema = None
         # Sort by chain index (when present) so we get true commit
@@ -812,21 +1533,76 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     ema = float(cp_score)
                 else:
                     ema = alpha * float(cp_score) + (1.0 - alpha) * ema
-        return 0.5 if ema is None else ema
+        if ema is None:
+            return self._consensus_baseline(peer_uuid)
+        # Refresh the sticky value so it survives later eviction of these
+        # txs from the bounded chain window.
+        self._consensus_last[str(peer_uuid)] = ema
+        return ema
+
+    def _subtree_roster(self, gateway_uuid):
+        """Reputation roster for a node and everything below it in the
+        cohort tree.
+
+        Returns a list of Reputation. For a leaf node (no child chains)
+        this is a single-element list — the node's own consensus score
+        over the primary chain — which forward_reputation serialises as
+        a bare Reputation, byte-identical to the pre-tree single-score
+        reply. For a gateway it additionally includes a Reputation for
+        every peer seen in each child-group chain, scored against that
+        child chain (which the gateway holds as a multi-group member).
+
+        Grandchildren (a child that is itself a gateway over a deeper
+        group) are NOT recursed here — direct-children coverage is
+        complete for the 2-level demo topology; deeper trees are a
+        documented follow-up (recursive forward + aggregate).
+        """
+        roster = [Reputation(
+            gateway_uuid, self._consensus_reputation(gateway_uuid))]
+        seen = {str(gateway_uuid)}
+        for grp_uuid, group in self.child_groups.items():
+            # Lazily materialises an (empty) chain for this child group
+            # so peers with no committed tx yet still score via the
+            # consensus baseline rather than being omitted.
+            chain = self._chain_for_group(grp_uuid)
+            member_uuids = set()
+            # Members known from the child group's address map — present
+            # from t=0 (seeded), so the cohort appears in the roster
+            # immediately at its baseline rep instead of only after the
+            # first field-chain commit.
+            try:
+                member_uuids |= set(group._address_map.keys())
+            except (AttributeError, TypeError):
+                pass
+            # Plus anyone already transacting in the child chain.
+            try:
+                member_uuids |= set(chain._peer_mapping.keys())
+            except AttributeError:
+                pass
+            for child_uuid in member_uuids:
+                if str(child_uuid) in seen:
+                    continue
+                seen.add(str(child_uuid))
+                roster.append(Reputation(
+                    child_uuid,
+                    self._consensus_reputation(child_uuid, chain=chain)))
+        return roster
 
     def _compute_consensus_reputation(self, peer, req_proc, requestor):
         _probes.counter('rep.consensus', 'enter')
         try:
             # See _compute_reputation for the peer-type contract.
             peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
-            rep_score = self._consensus_reputation(peer_uuid)
-            # Deliberately not writing self.reputations[peer_uuid] —
-            # that dict feeds _compute_reputation's mode selection
-            # and _pure_reputation's counterparty weighting, so
-            # overwriting it with the consensus value would corrupt
-            # the local trust path for any rep_req caller.
-            self.requested_reps.append(
-                (Reputation(peer_uuid, rep_score), req_proc, requestor))
+            # Return the full subtree roster: this node's own consensus
+            # score plus a score for every peer in each child chain. A
+            # leaf yields a one-element roster (a bare Reputation on the
+            # wire). Deliberately not writing self.reputations[*] —
+            # that dict feeds _compute_reputation's mode selection and
+            # _pure_reputation's counterparty weighting, so overwriting
+            # it with consensus values would corrupt the local trust
+            # path for any rep_req caller.
+            roster = self._subtree_roster(peer_uuid)
+            self.requested_reps.append((roster, req_proc, requestor))
             _probes.counter('rep.consensus', 'queued')
         except Exception as e:
             _probes.counter('rep.consensus', 'exception', type(e).__name__)
@@ -897,8 +1673,19 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def forward_reputation(self, queues):
         while len(self.requested_reps) > 0:
-            reputation, req_proc, requestor = self.requested_reps.pop(0)
+            payload, req_proc, requestor = self.requested_reps.pop(0)
             self.logger.debug('Forward reps to %s at %s' % (req_proc, requestor))
+            # payload is either a single Reputation (the rep_req /
+            # _compute_reputation path) or a list[Reputation] (the
+            # consensus subtree path). A 1-element roster is sent as a
+            # bare Reputation so leaf nodes stay wire-identical to the
+            # pre-tree behaviour; a multi-element roster is serialised
+            # as a JSON array (automate.py unpacks it length-tolerantly).
+            if isinstance(payload, list):
+                reputation = (payload[0] if len(payload) == 1
+                              else to_json_string(payload))
+            else:
+                reputation = payload
             try:
                 # Route the rep_resp back where the rep_req came from.
                 # If the requestor is a remote Identity (e.g. an Inspector
@@ -965,13 +1752,18 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     drained += 1
                     if not self.protocol.run_message_handlers(queues, message):
                         if not self.forward_transaction(queues, message):
-                            if isinstance(message, Message):
-                                _probes.counter('proc.reputation', 'unhandled', message.function)
-                                _probes.trace_msg(message, 'unhandled', proc='reputation')
-                                self.logger.error('Unhandled message %s' % message.function)
-                            else:
-                                _probes.counter('proc.reputation', 'unhandled', 'type:' + message.__class__.__name__)
-                                self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                            # Raw SlashAttestation objects (put on the queue
+                            # by a local detector, e.g. the coordinator)
+                            # route here, mirroring forward_transaction.
+                            if not self.forward_slash(queues, message) \
+                                    and not self.forward_checkpoint(queues, message):
+                                if isinstance(message, Message):
+                                    _probes.counter('proc.reputation', 'unhandled', message.function)
+                                    _probes.trace_msg(message, 'unhandled', proc='reputation')
+                                    self.logger.error('Unhandled message %s' % message.function)
+                                else:
+                                    _probes.counter('proc.reputation', 'unhandled', 'type:' + message.__class__.__name__)
+                                    self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
                 _probes.counter('proc.reputation', 'iter_drained', str(drained))
                 self.forward_reputation(queues)
                 # Drain tier updates queued by _compute_reputation.
@@ -986,6 +1778,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 for prop in dict(self.proposals):
                     if present - prop[0] > self.expiration:
                         del self.proposals[prop]
+                for rnd in list(self.round_group):
+                    if present - rnd[0] > self.expiration:
+                        del self.round_group[rnd]
                 # No sleep_until here: removing the 0.5 s cadence
                 # throttle was the whole point. Pacing is already
                 # provided by queue.get's q_cadence-second blocking
@@ -993,3 +1788,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             except Exception as err:
                 self.logger.error(err)
                 self.logger.error(traceback.format_exc())
+        # Final flush on graceful shutdown — ensures the most-recent
+        # reputation snapshot survives a SIGTERM/quit. Belt-and-suspenders
+        # on top of the per-transaction save in _compute_reputation.
+        try:
+            self._persist_reputations()
+            self.logger.debug('Final reputation flush on shutdown')
+        except Exception as err:
+            self.logger.warning('Final reputation flush failed: %s' % err)

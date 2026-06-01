@@ -132,6 +132,22 @@ class PeerCapabilities(Mapping, Configuration):
                 self._listing[name] = []
             self._listing[name].append(peer_id)
 
+    def filtered_for_persist(self, keep_uuids):
+        """Return a copy with peer-ids not in keep_uuids removed.
+
+        Capability names with no remaining peers after the filter are
+        dropped entirely. Used by the persistent-cohort save path so
+        untrusted (rep<=0.5) peers' capability advertisements don't
+        survive a process restart.
+        """
+        keep = {str(u) for u in keep_uuids}
+        new_listing = {}
+        for cap_name, peer_ids in self._listing.items():
+            kept = [pid for pid in peer_ids if str(pid) in keep]
+            if kept:
+                new_listing[cap_name] = kept
+        return PeerCapabilities(_listing=new_listing)
+
     def sync_to_message(self):
         # Invert Python's {cap_name: [peer_ids]} to proto's {peer: [capabilities]}
         peer_caps = {}

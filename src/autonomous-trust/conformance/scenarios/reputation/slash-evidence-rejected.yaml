@@ -1,0 +1,60 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: slash-evidence-rejected
+byte_pinning: false
+description: |
+    Phase 3 — Merkle-evidence-gated slashing, rejection path
+    (reputation-vs-blockchain-analysis.md §2.1 / §3).
+
+    Same setup as slash-evidence-verified, but the slash's evidence carries a
+    TAMPERED leaf entry_hash (first hex digit flipped), so its inclusion proof
+    no longer folds to bob's finalized checkpoint root. bob refuses to apply
+    the slash: a peer cannot floor rogue with an accusation that is not
+    provably committed under the quorum-agreed checkpoint. rogue's reputation
+    stays at its prior 0.6 in both languages — the negative twin of
+    slash-evidence-verified.
+
+participants:
+  - id: alice
+    role: detector
+  - id: bob
+    role: member
+  - id: rogue
+    role: target
+
+fixtures:
+  reputations:
+    bob:
+      rogue: 0.6
+  checkpoint:
+    bob:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 1
+      count: 3
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: slash final
+    payload:
+      target: rogue
+      floor_score: 0.1
+      epoch: 9
+      evidence:
+        task_id: "offending-tx"
+        # Tampered: leading 0 -> 1. The proof no longer reproduces the root.
+        leaf: "17b59d032e50c07b60566f7a37db00376b53774dd25e892cda3d3941f3fad7b7"
+        proof:
+          - ["6e0ab4df99d68b69c33d3477346184c131caffaa37578386ca6a5b9ab834665f", false]
+          - ["1b7150f96be8562a226f831d4535ec4855b1c08530956ea149114e16799e52b7", false]
+        root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+    description: |
+        alice broadcasts a slash whose evidence proof does not verify; bob
+        rejects it and rogue's reputation is unchanged.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.6

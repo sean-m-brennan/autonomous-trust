@@ -1,0 +1,62 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: checkpoint-cosign-flow
+byte_pinning: false
+description: |
+    Phase 2 quorum-signed Merkle checkpoints
+    (reputation-vs-blockchain-analysis.md §2.1).
+
+    Exercises the full checkpoint handshake — checkpoint_propose (a member
+    co-signs only if its own window_root matches the proposed root),
+    checkpoint_sign (the proposer tallies toward quorum), and
+    checkpoint_final (every node stores the agreed root). The co-signature
+    bytes are cryptographic and per-implementation, so the intermediate
+    emissions are NOT asserted; only the terminal stored checkpoint root is
+    checked, which both the Python and C reputation processes must agree on.
+
+    The committed `root` is the RFC 6962 ordered Merkle root of the same
+    three-entry window pinned by chain-catchup-verifies-links — a checkpoint
+    is precisely a quorum-co-signed commitment to such a window. Both
+    languages must store this exact hex.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: member
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: checkpoint propose
+    payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 7
+      first_index: 0
+      count: 3
+    description: |
+        alice proposes a checkpoint over its window root; bob co-signs
+        (checkpoint_sign) iff its own window_root matches.
+
+  - id: 2
+    from: bob
+    to: alice
+    function: checkpoint sign
+    payload:
+      epoch: 7
+    description: bob's co-signature reaches alice (the proposer tallies it).
+
+  - id: 3
+    from: alice
+    to: bob
+    function: checkpoint final
+    payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 7
+    description: alice broadcasts the finalized checkpoint; bob stores the root.
+
+expected_state:
+  bob:
+    checkpoint_root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"

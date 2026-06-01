@@ -28,19 +28,16 @@ positions and altitudes here are already set up so paths can be slotted
 in without re-deriving coordinates.  See examples/mission/simulator/
 scenario.yaml for the path shapes that should eventually be emitted.
 
-Loader gap (shared with multi-agency, surfaced 2026-05-18):
-`autonomous_trust.simulator.sim_data.SimConfig.load` calls
-`Configuration.from_json_string`, which routes through `json.loads`.
-This dict-style YAML is not valid JSON, so it cannot be consumed by the
-loader as-is.  The original `examples/mission/simulator/scenario.yaml`
-used tagged-YAML (`!Cfg:autonomous_trust.simulator.sim_data.SimConfig`)
-which a previous YAML loader presumably handled; that path appears to
-be retired.  This generator's output matches the multi-agency format
-exactly so any fix benefits both demos.  Likely resolutions: (a) add a
-PyYAML loader path in `Configuration.from_string` that detects YAML and
-deserializes via a `Loader` subclass that handles `!Cfg:` tags, or
-(b) emit JSON here instead of YAML.  Defer until Phase 3 (deployment),
-when the simulator container actually has to consume this file.
+Loader format: writes JSON (with a `.yaml` extension for filename
+continuity with the original mission demo and multi-agency).
+`autonomous_trust.simulator.sim_data.SimConfig.load` routes the file
+contents through `json.loads` via `Configuration.from_string`, so the
+on-disk bytes must be JSON regardless of extension. An earlier
+revision emitted PyYAML output and surfaced a `JSONDecodeError` in
+the simulator pod; the docstring's prior speculation about a YAML
+loader path in `Configuration` turned out not to exist, so resolution
+(b) — emit JSON — is the active fix. Multi-agency carries the same
+mismatch; treat this as the template if/when that side gets fixed.
 """
 
 from __future__ import annotations
@@ -59,16 +56,24 @@ sys.path.insert(0, str(_DOD_PKG))
 from scenario import DoDMissionScenario  # noqa: E402
 
 
-# Per-role radio profile.  See src/autonomous-trust-simulator/.../radio/iface.py
-# for the enum values.  Conservative defaults; refine after radio modeling.
+from autonomous_trust.services.peer.position import GeoPosition, UTMPosition  # noqa: E402
+from autonomous_trust.simulator.peer.peer import PeerInfo  # noqa: E402
+from autonomous_trust.simulator.peer.path import (  # noqa: E402
+    PathData, PointData, Variability,
+)
+from autonomous_trust.simulator.radio.iface import Antenna, NetInterface  # noqa: E402
+from autonomous_trust.simulator.sim_data import SimConfig  # noqa: E402
+
+# Per-role radio profile.  Conservative defaults; refine after radio
+# modeling.
 ROLE_RADIO = {
-    "soldier":      ("DIPOLE",    "SMALL", -200.0),
-    "microdrone":   ("DIPOLE",    "SMALL", -200.0),
-    "recon-drone":  ("PARABOLIC", "LARGE", -1200.0),
-    "armed-drone":  ("PARABOLIC", "LARGE", -1200.0),
-    "ground-sensor":("DIPOLE",    "SMALL", -200.0),
-    "fighter-jet":  ("YAGI",      "LARGE", -1200.0),
-    "command-node": ("PARABOLIC", "LARGE", -1200.0),
+    "soldier":       (Antenna.DIPOLE,    NetInterface.SMALL, -200.0),
+    "microdrone":    (Antenna.DIPOLE,    NetInterface.SMALL, -200.0),
+    "recon-drone":   (Antenna.PARABOLIC, NetInterface.LARGE, -1200.0),
+    "armed-drone":   (Antenna.PARABOLIC, NetInterface.LARGE, -1200.0),
+    "ground-sensor": (Antenna.DIPOLE,    NetInterface.SMALL, -200.0),
+    "fighter-jet":   (Antenna.YAGI,      NetInterface.LARGE, -1200.0),
+    "command-node":  (Antenna.PARABOLIC, NetInterface.LARGE, -1200.0),
 }
 
 
@@ -76,56 +81,60 @@ def _radio_for(kind: str):
     return ROLE_RADIO.get(kind, ROLE_RADIO["soldier"])
 
 
-def generate(output_path: Path, *, scenario_kwargs: dict | None = None) -> dict:
+def generate(output_path: Path, *, scenario_kwargs: dict | None = None) -> SimConfig:
     sc = DoDMissionScenario(**(scenario_kwargs or {}))
 
     # Wall-clock window: arbitrary but consistent with the original mission
-    # YAML's time range (1 hour).  Simulator uses this for path interpolation.
+    # YAML's time range.  Simulator uses this for path interpolation.
     start = datetime(2025, 6, 1, 12, 0, 0)
     end = start + sc.duration
 
     peers = []
     for name, role in sc.peers.items():
         antenna, iface, signal = _radio_for(role.kind)
-        pos = {
-            "lat": role.position.lat,
-            "lon": role.position.lon,
-            "alt": role.position.alt if role.position.alt is not None else 0.0,
-        }
-        peers.append({
-            "uuid": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"dod-mission:{name}")),
-            "kind": role.kind,
-            "nickname": role.metadata.get("nickname", name),
-            "ip4_addr": "",  # Docker network assigns
-            "position": pos,
-            "signal": signal,
-            "antenna": antenna,
-            "interface": iface,
-            "initial_time": start.isoformat(),
-            "last_seen": end.isoformat(),
-            # Stationary first pass; replace with Bezier/Ellipse path_list
-            # once role-based motion patterns are wired in.
-            "path_list": [{"type": "point", "position": pos}],
-            "data_streams": [],
-            "agency": role.agency,
-            "capabilities": role.capabilities,
-            "join_phase": role.join_phase,
-        })
+        # GeoPosition → UTMPosition: PathData/ShapeData want metric
+        # coordinates so distance + bearing math stays linear; the
+        # simulator internally converts on the boundary anyway.
+        alt = role.position.alt if role.position.alt is not None else 0.0
+        utm_pos = GeoPosition(role.position.lat,
+                              role.position.lon,
+                              alt).convert(UTMPosition)
+        # Stationary first pass: a single PointData on the peer's home
+        # location. Replace with BezierData / EllipseData when role-
+        # based motion patterns are wired in (squad approach,
+        # microdrone sweep, RQ-86 orbit, jet ingress).
+        shape = PointData(utm_pos)
+        path = PathData(start, end, shape, Variability.UNIFORM, 0.0,
+                        Variability.UNIFORM)
+        peers.append(PeerInfo(
+            str(uuid.uuid5(uuid.NAMESPACE_DNS, f"dod-mission:{name}")),
+            role.kind,
+            role.metadata.get("nickname", name),
+            "",                   # ip4_addr — docker network assigns
+            utm_pos,
+            signal,
+            antenna,
+            iface,
+            start,
+            end,
+            [path],
+            [],                   # data_streams
+        ))
 
-    config = {
-        "start": start.isoformat(),
-        "end": end.isoformat(),
-        "peers": peers,
-    }
+    config = SimConfig(start=start, end=end, peers=peers)
 
-    import yaml
+    # SimConfig.to_json_string() uses Configuration.ConfigJSONEncoder,
+    # which tags datetime / UUID / Enum / Configuration subclasses with
+    # `__type__` markers so SimConfig.load (which routes through
+    # json.loads + config_json_decoder) can reconstruct them. Anything
+    # else (e.g. PyYAML output, plain ISO strings) lands as opaque
+    # dicts/strings and the loader produces a SimConfig with a string
+    # in `.start`, killing the simulator on its first `self.end -
+    # self.start` arithmetic. The `.yaml` filename extension is a
+    # historical carryover from the original mission demo.
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w") as f:
-        f.write(f"# Auto-generated scenario for: {sc.name}\n")
-        f.write(f"# {len(peers)} peers across {len(sc.phases)} phases.\n")
-        f.write("# Source: examples/dod_mission/scenario.py "
-                "(via simulator/generate_scenario.py)\n\n")
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        f.write(config.to_json_string())
 
     return config
 
@@ -153,7 +162,7 @@ def main(argv=None):
         include_jet=not args.no_jet,
         include_command=not args.no_command,
     ))
-    print(f"Wrote {args.output}  ({len(cfg['peers'])} peers)")
+    print(f"Wrote {args.output}  ({len(cfg.peers)} peers)")
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ repo_root = ".."
 deploy_dir = repo_root + "/deploy/multi_agency"
 
 # --- Manifest regeneration -------------------------------------------------
-# Mirrors `scripts/run-demo-multi-agency.sh` PYTHONPATH and CLI invocation so
+# Mirrors `scripts/run-demo.sh --variant=multi-agency` PYTHONPATH and CLI invocation so
 # Tilt produces the same artifacts the launcher script does. Runs once on
 # Tiltfile evaluation; the local_resource below re-runs it whenever the
 # generator or scenario sources change.
@@ -87,7 +87,7 @@ git_version = git_version.removeprefix("v")
 build_args["GIT_VERSION"] = git_version
 
 # --- Image builds ---------------------------------------------------------
-# Three-image chain (mirrors run-demo-multi-agency.sh):
+# Three-image chain (mirrors run-demo.sh --variant=multi-agency):
 #   autonomous-trust            base (.core only)
 #   autonomous-trust-disaster   adds .evaluation + .services so peer
 #                               pods can run disaster_response_demo

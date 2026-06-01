@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import random
+import signal
 import sys
 import time
 import logging
@@ -40,11 +41,14 @@ try:
     from autonomous_trust.core import __version__ as version
 except ImportError:
     version = '?.?.?'
-from .config import Configuration, to_json_string, ConfigMap
+from .config import Configuration, to_json_string, from_json_string, ConfigMap
 from .config.discover import get_cfg_type, load_configs
 from .processes import Process, LogLevel, ProcessTracker
 from .identity import Peers
-from .bootstrap_capabilities import register_bootstrap_capabilities
+from .bootstrap_capabilities import (
+    register_bootstrap_capabilities,
+    BOOTSTRAP_CAPABILITY_NAMES,
+)
 from .capabilities import Capabilities, Capability, PeerCapabilities
 from .system import CfgIds, PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
 from .protocol import Protocol
@@ -340,6 +344,33 @@ class AutonomousTrust(Protocol):
                 queues[self.external_control] = q_in  # main loop must watch/process
             if q_out is not None:
                 queues[self.external_feedback] = q_out  # main loop must upload to this
+
+            # Graceful SIGTERM shutdown — pods/services hit this on
+            # `kubectl delete`, `docker stop`, Tilt teardown, etc. Without
+            # the handler, subprocess loops exit via os._exit and skip
+            # their final-flush hooks (repprocess._persist_reputations,
+            # idprocess._record_peers/group on shutdown). Propagating
+            # sig_quit through the existing signal queues lets each
+            # subprocess exit its `while self.keep_running(signal)` loop
+            # cleanly and run its tail-of-loop persistence.
+            def _graceful_shutdown(signum, _frame):
+                try:
+                    self.logger.info(self.name + ':  SIGTERM received, '
+                                     'propagating quit to subprocesses')
+                except Exception:
+                    pass
+                for sig in signals.values():
+                    try:
+                        sig.put_nowait(Process.sig_quit)
+                    except Exception:
+                        pass
+            try:
+                signal.signal(signal.SIGTERM, _graceful_shutdown)
+            except (ValueError, OSError):
+                # Non-main-thread invocation (some test harnesses) —
+                # signal.signal raises ValueError; harmless to skip.
+                pass
+
             pool.close()  # no more system tasks (use separate pool for dynamic tasks)
             # Wait briefly for system processes to initialize before declaring ready
             _ready_wait = 0.0
@@ -509,20 +540,32 @@ class AutonomousTrust(Protocol):
                                 'No PID received within timeout.' %
                                 (self.name, task.capability.name, capability.name, task.uuid))
                 elif isinstance(message, Message) and message.function == ReputationProtocol.rep_resp:
+                    # A rep_resp carries either a single Reputation (the
+                    # classic rep_req / leaf path) or a subtree roster
+                    # from a gateway. A roster arrives as a JSON array
+                    # string (a multi-element list); a bare Reputation
+                    # arrives as an object. Normalise to a list and run
+                    # the per-Reputation body once per entry — the maps
+                    # below are keyed per-uuid, so a gateway's reply
+                    # populates one entry for every peer in its subtree.
                     rep = message.obj
-                    if rep.peer_id == self.identity.uuid:
-                        self.print('My current reputation score:\033[32m %s\033[00m' % rep.score)
-                    else:
-                        peer = self.peers.find_by_uuid(rep.peer_id)
-                        if peer:
-                            self.print("%s's current reputation score:\033[32m %s\033[00m" % (peer.nickname, rep.score))
-                    self.latest_reputation[str(rep.peer_id)] = rep
-                    # Bilateral capture: track WHO computed this score.
+                    if isinstance(rep, str):
+                        rep = from_json_string(rep)
+                    reps = rep if isinstance(rep, list) else [rep]
                     observer = getattr(message, "from_whom", None)
                     observer_uuid = getattr(observer, "uuid", None)
-                    if observer_uuid is not None:
-                        key = (str(observer_uuid), str(rep.peer_id))
-                        self.latest_reputation_pairs[key] = rep
+                    for rep in reps:
+                        if rep.peer_id == self.identity.uuid:
+                            self.print('My current reputation score:\033[32m %s\033[00m' % rep.score)
+                        else:
+                            peer = self.peers.find_by_uuid(rep.peer_id)
+                            if peer:
+                                self.print("%s's current reputation score:\033[32m %s\033[00m" % (peer.nickname, rep.score))
+                        self.latest_reputation[str(rep.peer_id)] = rep
+                        # Bilateral capture: track WHO computed this score.
+                        if observer_uuid is not None:
+                            key = (str(observer_uuid), str(rep.peer_id))
+                            self.latest_reputation_pairs[key] = rep
                 else:
                     self.unhandled_messages.append(message)
         return True
@@ -565,7 +608,17 @@ class AutonomousTrust(Protocol):
                 del results[key]
 
     def _random_task(self, queues: dict[str, QueueType]):
-        cap_list = self.capabilities.to_list()
+        # Bootstrap capabilities (at.handshake / at.time-attest /
+        # at.echo-challenge) are exercised exclusively by BootstrapWorker
+        # via _build_task_args, which knows their per-cap kwarg shape.
+        # _random_task only knows about the legacy `pi`/`pow` corpus
+        # and defaults everything else to two positional ints — which
+        # collides with at_handshake(nonce: int = 0). Filter the
+        # bootstrap names out of the random-pick pool.
+        cap_list = [n for n in self.capabilities.to_list()
+                    if n not in BOOTSTRAP_CAPABILITY_NAMES]
+        if not cap_list:
+            return
         cap = Capability(cap_list[random.randint(0, len(cap_list) - 1)])
         args = (random.randint(2, 1000000), random.randint(2, 1000000))
         if cap.name == 'pi':

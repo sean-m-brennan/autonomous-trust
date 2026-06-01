@@ -28,7 +28,14 @@ import logging
 import os
 import queue
 import sys
+from collections import deque
 from datetime import timedelta
+
+# Stretch Goal 2 / Phase 3: bound the per-peer detection ring buffer.
+# Plan section 6.1 caps the inspector drawer's log strip at 10; we keep
+# the same depth in the coordinator cache so the drawer can render the
+# full history without further plumbing.
+DETECTION_LOG_CAPACITY = 10
 from pathlib import Path
 
 from autonomous_trust.core import (
@@ -36,7 +43,8 @@ from autonomous_trust.core import (
 )
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
-from autonomous_trust.core.reputation.reputation import TransactionScore
+from autonomous_trust.core.reputation.reputation import (
+    TransactionScore, SlashAttestation)
 from autonomous_trust.services.data import Reading
 from autonomous_trust.core.config.generate import (
     generate_identity, generate_worker_config,
@@ -326,8 +334,29 @@ class DoDMissionCoordinator(AutonomousTrust):
             "tiers": {},
             "tick": 0, "phase": None,
         }
+        # Stretch Goal 2 / Phase 3+4: per-(peer, world_uid) detection
+        # cache so a peer reporting multiple distinct targets keeps
+        # them all available to the drawer (the MQ-800 compromise
+        # emits both an alpha lie and an honest bravo per tick; a
+        # latest-wins per-peer cache would lose the lie). The flat
+        # `_detection_per_peer` view that the dashboard reads is
+        # derived in `_push_dashboard_update` by picking the
+        # storyline-critical UID first, then the most-recent
+        # overall. The per-peer log keeps every emission in arrival
+        # order so the drawer's thumbnail strip carries history.
+        self._detection_per_target: dict[tuple[str, str], dict] = {}
+        self._detection_log_per_peer: dict[str, deque] = {}
         # nickname -> tier int (so _render_reputations can show both)
         self._tier_cache: dict[str, int] = {}
+        # Mirror of the prior _query_reputations cycle's _tier_cache.
+        # We diff the two each cycle so a tier demotion (new < prev)
+        # produces a TIER_LOST event on the dashboard event log and in
+        # the recording sidecar. Without this, AT's reputation process
+        # publishes tier_lost on the negotiation queue (see
+        # repprocess.py:_publish_tier_change) but it's invisible to the
+        # coordinator's main process. Polling _tier off self.peers.all
+        # is the lightest-weight bridge.
+        self._prev_tier_cache: dict[str, int] = {}
         self.data_queue: queue.Queue = queue.Queue()
         # Per-batch state for sender-scoring.  batch_id (uuid str) →
         # {'submitted': bool, 'anomalous': bool, 'first_tick': int}.
@@ -352,6 +381,36 @@ class DoDMissionCoordinator(AutonomousTrust):
         self._ts_decimation = int(
             os.environ.get("AT_TS_DECIMATION", "30"))
 
+        # --- Slashing (fast-penalty path) -----------------------------
+        # The consensus EMA is structurally too slow for a short-lived
+        # rogue (mq800 is active ~30s; at decimation 30 it samples ~1
+        # bilateral tx, and the half-life-20 EMA barely moves before
+        # exclusion freezes it -> "stuck at 0.5"). When we detect
+        # SUSTAINED anomalies, or the scenario excludes a peer, emit a
+        # signed SlashAttestation that floors the peer's reputation
+        # immediately on the reputation chain (bypassing the EMA). See
+        # repprocess.SlashAttestation / reputation-vs-blockchain-analysis.md.
+        self._anomaly_streak: dict[str, int] = {}
+        self._slashed_peers: set = set()
+        # Live queues handle, set each tick by autonomous_tasking; used by
+        # _on_scenario_event (which has no queues param of its own).
+        self._task_queues = None
+        # Anomalous SELECTED batches from one peer before we slash it.
+        self._slash_threshold = int(
+            os.environ.get("AT_SLASH_ANOMALY_THRESHOLD", "2"))
+        self._slash_floor = float(
+            os.environ.get("AT_SLASH_FLOOR", "0.1"))
+
+        # Per-peer-per-datatype reading-snapshot decimation, used only
+        # when an event recorder is attached. Default 1 records every
+        # reading; raise via AT_RECORDING_READING_STRIDE to trim the
+        # recording file for long runs. The chart panels still see
+        # every reading on the live path — this only affects what
+        # lands in the recording sidecar.
+        self._recording_reading_stride = max(1, int(
+            os.environ.get("AT_RECORDING_READING_STRIDE", "1")))
+        self._reading_record_counts: dict[tuple[str, str], int] = {}
+
         # Validators run inline on the coordinator; in a full deployment
         # these would also run on dedicated fusion peers (squad-intel,
         # command).  Keeping them here for Phase 3 simplicity.
@@ -373,7 +432,10 @@ class DoDMissionCoordinator(AutonomousTrust):
         # capability_name="dod.sensor-report". Must run BEFORE _configure
         # / subprocess fork so the workers inherit the populated
         # Capabilities. See examples/dod_mission/trust_ladder.yaml.
-        from .trust_ladder import register_trust_ladder  # local import
+        # `coordinator.py` is invoked as a script (not a module), so the
+        # sibling imports use bare names after the sys.path.insert(_HERE)
+        # near the top of this file — same pattern as `from scenario ...`.
+        from trust_ladder import register_trust_ladder  # local import
         self._trust_ladder = register_trust_ladder(self.capabilities)
 
         if HAS_INSPECTOR:
@@ -402,6 +464,13 @@ class DoDMissionCoordinator(AutonomousTrust):
         # the canned-playback log alongside our own anomaly events.
         scenario.on_event(self._on_scenario_event)
 
+        # Phase 6 #2 rank-gate: the Approach phase's gate predicate
+        # polls this callable for the live tier view; the gate clears
+        # only when ≥90% of admitted peers have peer._tier >= 1.
+        # Attached as a scenario attribute so DoDMissionScenario
+        # doesn't need a coordinator reference at construction time.
+        scenario._tier_view_provider = lambda: dict(self._tier_cache)
+
     # -- AT lifecycle ---------------------------------------------------
 
     def init_tasking(self, queues):
@@ -422,11 +491,19 @@ class DoDMissionCoordinator(AutonomousTrust):
             state_provider=lambda: self._latest_state,
             port=self._dashboard_port,
             narration_script=DOD_NARRATION,
+            # Show the guiding narration (top-of-viewport overlay) from
+            # the start; it can still be toggled off via Presentation Mode.
+            presentation_default=True,
+            peer_names=sorted(self.scenario.peers.keys()),
         )
         logger.info("Dashboard serving on :%d", self._dashboard_port)
 
     def autonomous_tasking(self, queues):
         self._tick_count += 1
+        # Stash the live queues so callbacks without a queues param
+        # (e.g. _on_scenario_event, fired from _advance_scenario_clock)
+        # can submit slashes onto the reputation queue.
+        self._task_queues = queues
         # Drain every tick — readings arrive at ~1 Hz per peer; if we
         # batch the drain to N>1 ticks we risk filling per-peer
         # data_stream queues (a small, fixed-size multiproc Queue
@@ -436,8 +513,32 @@ class DoDMissionCoordinator(AutonomousTrust):
         # multi-agency assumes; tune later from real runs).
         if self._tick_count % 60 == 0:
             self._query_reputations(queues)
+        # Advance the scenario clock so phases progress past Setup in
+        # live mode. The Approach-phase gate (Phase 6 #2) consults the
+        # live tier view attached above; until ≥90% of peers reach
+        # tier ≥1 the scenario holds at Setup even after T+1:00. Pace
+        # at 10 ticks (~5 s) so the gate sees fresh tier data without
+        # flooding the log.
         if self._tick_count % 10 == 0:
+            self._advance_scenario_clock()
             self._push_dashboard_update()
+
+    def _advance_scenario_clock(self) -> None:
+        """Tick the scenario forward to (now - tasking_start).
+
+        The DoD coordinator does not use PlaybackInterface in live
+        mode, so without this the scenario never leaves Setup and the
+        dashboard phase indicator never updates. Idempotent: Scenario
+        already guards against re-firing events past `current_phase`.
+        """
+        try:
+            t = now() - self.tasking_start
+        except Exception:
+            return
+        try:
+            self.scenario.advance_to(t)
+        except Exception:
+            logger.exception("scenario.advance_to(%s) failed", t)
 
     _logged_first_drain = False
     _logged_first_reading = False
@@ -561,13 +662,67 @@ class DoDMissionCoordinator(AutonomousTrust):
     # -- internal -------------------------------------------------------
 
     def _on_scenario_event(self, event):
-        """Forward scenario events to the event log + playback record."""
+        """Forward scenario events to the event log + playback record.
+
+        On PEER_EXCLUDE, also issue a slash so the excluded peer's
+        reputation reflects the exclusion verdict immediately rather than
+        waiting for the slow consensus EMA (which, for a short-lived
+        rogue, never catches up before exclusion freezes its chain)."""
         try:
             self._panels["event_log"].add_from_scenario_event(event)
         except Exception:
             logger.exception("Failed to forward scenario event to dashboard")
         if self._event_recorder is not None:
             self._event_recorder.record(event)
+        # Compare by enum name to avoid importing PhaseEvent here.
+        if (getattr(getattr(event, "event_type", None), "name", "")
+                == "PEER_EXCLUDE"):
+            peer_name = getattr(event, "peer_name", None)
+            if peer_name:
+                self._submit_slash(
+                    self._task_queues, peer_name,
+                    reason=SlashAttestation.REASON_PEER_EXCLUDE,
+                    floor=0.0)
+
+    def _peer_uuid(self, peer_name):
+        """Resolve a roster nickname to its peer UUID (or None)."""
+        try:
+            for p in self.peers.all:
+                if getattr(p, "nickname", None) == peer_name:
+                    return p.uuid
+        except Exception:
+            logger.debug("peer-uuid lookup failed for %s", peer_name,
+                         exc_info=True)
+        return None
+
+    def _submit_slash(self, queues, peer_name, reason, floor,
+                      evidence_batch=None):
+        """Put a SlashAttestation on the reputation queue (once per peer).
+
+        The reputation process (forward_slash) stamps epoch/nonce, signs,
+        self-applies the floor (so this coordinator's dashboard reflects
+        it at once), and runs the co-sign quorum so peers adopt it too."""
+        if peer_name in self._slashed_peers:
+            return
+        if queues is None:
+            return
+        uuid = self._peer_uuid(peer_name)
+        if uuid is None:
+            logger.warning("Slash: cannot resolve uuid for %s yet", peer_name)
+            return
+        att = SlashAttestation(
+            slasher_uuid=self.identity.uuid, target_uuid=uuid,
+            reason=reason, floor_score=floor,
+            evidence_ref=((evidence_batch, None) if evidence_batch else None))
+        try:
+            queues[CfgIds.reputation].put(
+                att, block=True, timeout=queue_cadence)
+            self._slashed_peers.add(peer_name)
+            logger.warning(
+                "SLASH submitted: peer=%s reason=%s floor=%.2f",
+                peer_name, reason, floor)
+        except Exception:
+            logger.exception("Failed to submit slash for %s", peer_name)
 
     def _query_reputations(self, queues):
         """Send consensus_rep_req for every known peer, then drain
@@ -629,7 +784,47 @@ class DoDMissionCoordinator(AutonomousTrust):
             # Stash the peer's trust tier alongside the score so the
             # dashboard reputations panel can show both. tier defaults
             # to 0 if the peer object isn't fully resolved yet.
-            self._tier_cache[name] = int(getattr(peer, "_tier", 0))
+            new_tier = int(getattr(peer, "_tier", 0))
+            prev_tier = self._prev_tier_cache.get(name)
+            self._tier_cache[name] = new_tier
+            if prev_tier is not None and new_tier < prev_tier:
+                self._emit_tier_lost(name, prev_tier, new_tier)
+            self._prev_tier_cache[name] = new_tier
+
+    def _emit_tier_lost(self, peer_name: str, prev_tier: int,
+                        new_tier: int) -> None:
+        """Surface a peer's tier demotion to the dashboard + recording.
+
+        Built on the same record shape as COMPROMISE_DETECT so the
+        playback engine + event-log panel reuse the existing parser
+        path. The `data.source="tier_change"` tag lets a tool split
+        validator-driven anomalies from reputation-driven tier drops.
+        """
+        try:
+            t_sec = (now() - self.tasking_start).total_seconds()
+        except Exception:
+            t_sec = self._tick_count * 0.5
+        record = {
+            "t": t_sec,
+            "type": "TIER_LOST",
+            "peer": peer_name,
+            "prev_tier": prev_tier,
+            "new_tier": new_tier,
+            "description": (
+                f"{peer_name} tier {prev_tier} → {new_tier} "
+                f"(access revoked)"
+            ),
+            "data": {"source": "tier_change"},
+        }
+        self._anomaly_log.append(record)
+        if self._event_recorder is not None:
+            self._event_recorder.record(record)
+        try:
+            live_server.feed_event(self._panels, record)
+        except Exception:
+            logger.exception("Failed to feed tier_lost to event log")
+        logger.warning(
+            "TIER_LOST: %s tier %d -> %d", peer_name, prev_tier, new_tier)
 
     def _feed_timeline(self, peer_name: str, score: float) -> None:
         # AutonomousTrust sets ``tasking_start`` once init_tasking runs;
@@ -642,6 +837,91 @@ class DoDMissionCoordinator(AutonomousTrust):
             t = self._tick_count * 0.5
         live_server.feed_timeline_sample(
             self._panels, t_seconds=t, peer_name=peer_name, score=score)
+        if self._event_recorder is not None:
+            self._event_recorder.record_snapshot({
+                "t": t,
+                "type": "REPUTATION_SAMPLE",
+                "peer": peer_name,
+                "score": float(score),
+            })
+
+    def _cache_detection_reading(self, reading) -> None:
+        """Stash a detection-typed Reading in per-(peer, uid) caches.
+
+        Stores a flat dict (rather than DetectionSummary) so the entry
+        survives the data_queue pickle hop into the live_server callback
+        process without needing the inspector import on the wire path.
+        """
+        md = reading.metadata or {}
+        world_uid = str(md.get("world_uid", ""))
+        entry = {
+            "peer_name": reading.peer_name,
+            "world_uid": world_uid,
+            "label": str(md.get("label", "")),
+            "confidence": float(reading.value),
+            "crop_b64": md.get("crop_b64") or "",
+            "crop_size_px": tuple(md.get("crop_size_px") or (0, 0)),
+            "bbox_in_crop_px": tuple(md.get("bbox_in_crop_px")
+                                     or (0, 0, 0, 0)),
+            "target_latlon": tuple(md.get("target_latlon") or (0.0, 0.0)),
+            "t_seconds": reading.timestamp.total_seconds(),
+        }
+        self._detection_per_target[(reading.peer_name, world_uid)] = entry
+        log = self._detection_log_per_peer.get(reading.peer_name)
+        if log is None:
+            log = deque(maxlen=DETECTION_LOG_CAPACITY)
+            self._detection_log_per_peer[reading.peer_name] = log
+        log.append(entry)
+
+    # Priority list for `_pick_primary_detection_per_peer`. World UIDs
+    # that appear earlier "win" the per-peer slot, even if a later
+    # detection arrived for a lower-priority UID. This is what keeps
+    # MQ-800's compound-alpha lie visible to the operator even when
+    # MQ-800 also reports an honest compound-bravo on the same tick.
+    DETECTION_PRIORITY_UIDS = ("compound-alpha", "compound-bravo")
+
+    def _pick_primary_detection_per_peer(self) -> dict[str, dict]:
+        """Collapse the (peer, uid) cache to one entry per peer.
+
+        Order of preference: storyline-critical UIDs (per
+        DETECTION_PRIORITY_UIDS) first, then most-recent t_seconds.
+        """
+        out: dict[str, dict] = {}
+        by_peer: dict[str, list[dict]] = {}
+        for (peer, _uid), entry in self._detection_per_target.items():
+            by_peer.setdefault(peer, []).append(entry)
+        for peer, entries in by_peer.items():
+            for priority_uid in self.DETECTION_PRIORITY_UIDS:
+                hit = next((e for e in entries
+                            if e["world_uid"] == priority_uid), None)
+                if hit is not None:
+                    out[peer] = dict(hit)
+                    break
+            else:
+                out[peer] = dict(max(entries, key=lambda e: e["t_seconds"]))
+        return out
+
+    def _reputations_view(self) -> dict:
+        """Reputations for the dashboard, completed with pre-established peers.
+
+        Every pre-established peer (join_phase 0) should be forming a
+        consensus reputation by the Approach beat, so surface all of them
+        even before a consensus score has landed: such a peer maps to
+        ``None``, which the panel renders as "forming…" rather than the
+        peer being silently absent (which read as "only rq86-1 has a
+        reputation"). Peers with a consensus score show it; later joiners
+        appear once scored.
+        """
+        reps: dict = dict(self._reputation_cache)
+        try:
+            for role in self.scenario.peers.values():
+                if (getattr(role, "join_phase", 0) == 0
+                        and role.name not in reps):
+                    reps[role.name] = None
+        except Exception:
+            logger.debug("reputations-view roster merge failed",
+                         exc_info=True)
+        return reps
 
     def _push_dashboard_update(self):
         # Scenario seconds since tasking_start — falls back to tick-derived
@@ -651,12 +931,51 @@ class DoDMissionCoordinator(AutonomousTrust):
         except Exception:
             t_seconds = self._tick_count * 0.5
         self._latest_state = {
-            "reputations": dict(self._reputation_cache),
+            "reputations": self._reputations_view(),
             "tiers": dict(self._tier_cache),
             "tick": self._tick_count,
             "t_seconds": t_seconds,
             "phase": (self.scenario.current_phase.name
                       if self.scenario.current_phase else None),
+            # Stretch Goal 2 / Phase 3+4: dashboard-facing flat view.
+            # detection_per_peer collapses the (peer, uid) cache to
+            # the storyline-critical UID (compound-alpha) when
+            # available, so the inspector drawer + AgencyMap marker
+            # show the MQ-800 lie instead of the peer's most-recent
+            # honest reading. detection_per_target carries the full
+            # per-(peer, uid) cache for components that want all of
+            # a peer's contacts. Age computed at render time against
+            # t_seconds.
+            # Static role lookups so the drawer can render the
+            # header (agency, kind) without reaching back into the
+            # scenario object across the data_queue boundary.
+            "agencies": {p.name: p.agency
+                         for p in self.scenario.peers.values()},
+            "kinds": {p.name: p.kind
+                      for p in self.scenario.peers.values()},
+            # Live squad + microdrone positions for the target-position
+            # map's asset markers. Updated each tick by the scenario's
+            # movement model (scenario.advance_to). See
+            # TargetPositionMapPanel.set_platforms.
+            "platforms": {
+                p.name: {"lat": p.position.lat, "lon": p.position.lon,
+                         "alt": p.position.alt, "kind": p.kind,
+                         "color": p.color}
+                for p in self.scenario.peers.values()
+                if p.kind in ("soldier", "microdrone",
+                              "recon-drone", "armed-drone",
+                              "fighter-jet", "ground-sensor")
+            },
+            "detection_per_peer": self._pick_primary_detection_per_peer(),
+            "detection_per_target": {
+                f"{peer}|{uid}": dict(entry)
+                for (peer, uid), entry
+                in self._detection_per_target.items()
+            },
+            "detection_log_per_peer": {
+                k: [dict(entry) for entry in log]
+                for k, log in self._detection_log_per_peer.items()
+            },
         }
         try:
             self.data_queue.put_nowait(("state", self._latest_state))
@@ -669,6 +988,19 @@ class DoDMissionCoordinator(AutonomousTrust):
         for the batch as a whole once it has settled (see
         _maybe_submit_batch_scores).
         """
+        # Stretch Goal 2 / Phase 3: detection-typed readings hold the
+        # full crop + metadata for the inspector. They don't feed the
+        # numeric charts; drop them into the per-peer cache and skip
+        # the chart fan-out + validator loop (the parallel
+        # target_position_x/y readings are what the validators score).
+        if reading.data_type == "detection":
+            self._cache_detection_reading(reading)
+            return
+        if reading.data_type == "detection_heartbeat":
+            # No visible state to update — the cache stays as-is so
+            # the drawer keeps showing the most-recent real detection.
+            return
+
         # Fan the reading to both sensor charts; each ignores mismatched
         # data_types internally, so the dispatch stays simple.
         for chart_key in ("target_x_chart", "noise_chart"):
@@ -676,6 +1008,24 @@ class DoDMissionCoordinator(AutonomousTrust):
                 self._panels[chart_key].add_reading(reading)
             except Exception:
                 logger.exception("Failed to forward reading to %s", chart_key)
+        # Stash a snapshot of the reading so canned playback can replay
+        # what the live charts showed. Decimated per
+        # (peer, data_type) by self._recording_reading_stride.
+        if self._event_recorder is not None:
+            key = (reading.peer_name, reading.data_type)
+            seq = self._reading_record_counts.get(key, 0)
+            self._reading_record_counts[key] = seq + 1
+            if seq % self._recording_reading_stride == 0:
+                self._event_recorder.record_snapshot({
+                    "t": reading.timestamp.total_seconds(),
+                    "type": "SENSOR_READING",
+                    "peer": reading.peer_name,
+                    "data_type": reading.data_type,
+                    "value": float(reading.value),
+                    "unit": reading.unit,
+                    "quality": float(reading.quality),
+                    "metadata": dict(reading.metadata or {}),
+                })
 
         # Track the batch this reading came from; flip its anomaly flag
         # if any validator fires.  The Reading's task_id is stamped by
@@ -802,6 +1152,24 @@ class DoDMissionCoordinator(AutonomousTrust):
                 queues[CfgIds.reputation].put(
                     ts, block=True, timeout=queue_cadence)
                 state["submitted"] = True
+                # Sustained-anomaly slash: count anomalous SELECTED batches
+                # per peer; past the threshold, floor its reputation now
+                # via a slash (the 0.3 TS above still records the bilateral
+                # defection on-chain, but the slash is what makes the score
+                # drop within the rogue's short active window).
+                if is_anomaly:
+                    pname = state.get("peer_name")
+                    if pname:
+                        self._anomaly_streak[pname] = (
+                            self._anomaly_streak.get(pname, 0) + 1)
+                        if (self._anomaly_streak[pname]
+                                >= self._slash_threshold):
+                            self._submit_slash(
+                                queues, pname,
+                                reason=(SlashAttestation
+                                        .REASON_SUSTAINED_ANOMALY),
+                                floor=self._slash_floor,
+                                evidence_batch=batch_id)
                 if not DoDMissionCoordinator._logged_first_batch_submit:
                     logger.info(
                         "Coordinator: first batch TransactionScore "
@@ -856,6 +1224,13 @@ def main():
     dat_dir = Configuration.get_data_dir()
     os.makedirs(cfg_dir, exist_ok=True)
     os.makedirs(dat_dir, exist_ok=True)
+
+    # Give the coordinator's AT node a stable, human-readable identity
+    # instead of a random codename (e.g. "SafeKing") so it shows as
+    # "coordinator" in the reputations list / trust graph. AT_PEER_NAME is
+    # the same hook participants use to carry their scenario role name into
+    # the AT identity nickname; honor a deployment-provided value if set.
+    os.environ.setdefault("AT_PEER_NAME", "coordinator")
 
     # generate_identity needs cfg_dir as first arg (mission/coordinator.py
     # is the working reference).  `defaults=True` lets AT fill in

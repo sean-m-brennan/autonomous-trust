@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from uuid import UUID, uuid4
 from typing import Union
 
-from .redblack import Node, Tree, EmptyNode
+from .redblack import Node, Tree
 from ..config import Configuration
 from ..system import encoding
 
@@ -208,54 +208,70 @@ class MerkleTree(Tree, Configuration):
         key = None
         for leaf in self.leaves:
             if leaf.blob == blob:
-                key = blob.key
+                # Use the matching leaf NODE's red-black key, not blob.key.
+                # The blob (a SimplestBlob) does not carry a tree key; the
+                # leaf node assigned during insert() does. The previous
+                # `blob.key` read forced callers to hand-mirror the leaf key
+                # onto the blob and otherwise raised AttributeError.
+                key = leaf.key
                 break
         if key is None:
             return None
         node = self.find(key)
-        while node != self.root:
-            if node.sibling is EmptyNode:
+        while node is not self.root:
+            sib = node.sibling  # None when the sibling is the EmptyNode sentinel
+            if sib is None:
+                # No sibling: _hash_inner_node promotes this single child's
+                # digest to the parent UNCHANGED (CVE-2012-2459 guard), so the
+                # proof records a no-op step.
                 nodes.append((None, None))
-            elif node == node.parent.left:
-                nodes.append((None, node.right.digest))
+            elif node is node.parent.left:
+                # Sibling sits on the RIGHT: parent = H(self || sibling).
+                nodes.append((None, sib.digest))
             else:
-                nodes.append((node.left.digest, None))
+                # Sibling sits on the LEFT: parent = H(sibling || self).
+                nodes.append((sib.digest, None))
             node = node.parent
         return nodes
 
     def audit(self, blob, chain=None):
         """
-        Verify blob membership given a subtree chain and a super-hash (root hash or off-tree)
-        Off-tree chain must have this tree's root as the leaf
-        O(n) in chain length, or O(logn) in number of blobs in the tree(s)
+        Verify blob membership by folding its leaf digest up the sibling chain
+        and comparing to the expected root (``super_hash`` if set, else this
+        tree's ``root_digest``).
+
+        Each chain step is ``(left|None, right|None)`` where the non-None slot
+        holds the sibling digest and its position says which side to combine on,
+        matching ``inclusion_proof``/``_hash_inner_node``. ``(None, None)`` is a
+        promote step (lone child) and leaves the running digest unchanged.
+
         :param blob: SimplestBlob
-        :param chain: list of tuples of digest|None from siblings along the path from leaf to root
+        :param chain: optional precomputed proof; defaults to ``inclusion_proof``
         :return: bool
         """
         if chain is None:
-            chain = self.inclusion_proof(blob)  # my own
-        if chain[-1].digest != self.root.digest:  # noqa
-            chain = self.inclusion_proof(blob) + chain  # append local to super-chain
-        digest = self.get_hash(blob.sig)
+            chain = self.inclusion_proof(blob)
+        if chain is None:
+            return False
+        digest = blob.get_hash()  # leaf digest, as set in _rehash
         for hash_tpl in chain:
             if hash_tpl == (None, None):
-                digest = self.get_hash(digest)
-            elif hash_tpl[0] is None:  # i.e. digest was from the right
-                digest = self.get_hash(digest + hash_tpl[1])  # noqa
-            else:
-                digest = self.get_hash(hash_tpl[1] + digest)  # noqa
-        return digest == self.super_hash
+                continue  # promoted unchanged
+            elif hash_tpl[0] is None:  # sibling on the right
+                digest = self.get_hash(digest + hash_tpl[1])
+            else:  # sibling on the left
+                digest = self.get_hash(hash_tpl[0] + digest)
+        target = self.super_hash if self.super_hash is not None else self.root_digest
+        return target is not None and digest == target
 
     def __contains__(self, blob):
         """
-        Membership test, assumes we usually want to test a non-local blob
+        Membership test against the expected root (``super_hash`` when set,
+        otherwise the local ``root_digest``).
         :param blob: SimplestBlob
         :return: bool
         """
-        root_hash = self.root.digest
-        if self.super_hash is not None:
-            root_hash = self.super_hash
-        return self.audit(blob, root_hash)
+        return self.audit(blob)
 
     def consistent_trees(self, other_size, other_root_hash):
         """
