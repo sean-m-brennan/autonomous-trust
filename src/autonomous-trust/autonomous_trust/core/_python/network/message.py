@@ -100,7 +100,19 @@ class Message(object):
             # handlers to deserialize explicitly via from_json_string().
             if check.startswith('{') and '"__type__"' in obj:
                 try:
-                    self.obj = Configuration.from_string(obj)
+                    deserialized = Configuration.from_string(obj)
+                    # Only adopt when the *top-level* result is a Configuration.
+                    # The "__type__" substring check above also matches
+                    # NESTED Configurations inside a plain wrapper dict (e.g.
+                    # partition_probe sends {'from_identity': <Identity>, ...});
+                    # adopting that as self.obj turns it into a Python dict
+                    # whose str() (used by _content_str and __bytes__) is the
+                    # Python repr — receivers calling from_json_string()
+                    # blow up with "Expecting property name enclosed in
+                    # double quotes". Leaving the JSON string intact for
+                    # those payloads lets the receiver round-trip cleanly.
+                    if isinstance(deserialized, Configuration):
+                        self.obj = deserialized
                 except Exception:
                     pass  # leave obj as string if deserialization fails
 

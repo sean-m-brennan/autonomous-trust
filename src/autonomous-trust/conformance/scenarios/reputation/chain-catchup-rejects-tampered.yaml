@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: chain-catchup-rejects-tampered
+byte_pinning: false
+description: |
+    Phase 1 hash-linking — the tamper-rejection half of the verifiable
+    catch-up path (reputation-vs-blockchain-analysis.md §2.1).
+
+    alice reports a chain, but a committed score in the second entry has been
+    mutated AFTER the chain was linked, so the third entry's recorded prev_hash
+    no longer matches the recomputed hash of the second. With the catch-up
+    quorum lowered to 1 (fixture), dave replays the segment through catchup,
+    which verifies the prev_hash linkage first — the broken link is detected
+    and the WHOLE segment is rejected. dave admits nothing; its history stays
+    empty.
+
+    A peer (or a corrupted transfer) thus cannot slip an altered committed
+    entry past the catch-up — the sync is verifiable, not merely social. Both
+    languages must reach the same empty-history state.
+
+participants:
+  - id: alice
+    role: provider
+  - id: dave
+    role: consumer
+
+fixtures:
+  num_updates:
+    dave: 1
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: latest update
+    payload:
+      tamper: true
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5}
+        - {task: b, p1: 0.9, p2: 0.3}
+        - {task: c, p1: 0.6, p2: 0.4}
+    description: |
+        alice reports a chain whose 2nd entry was tampered post-link. With the
+        quorum at 1, dave verifies the segment, detects the broken prev_hash
+        link, and rejects the whole chain.
+
+expected_state:
+  dave:
+    committed_tx_count: 0

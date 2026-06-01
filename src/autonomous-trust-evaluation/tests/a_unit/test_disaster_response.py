@@ -366,6 +366,143 @@ class TestPlaybackEngine:
         finally:
             os.unlink(path)
 
+    def test_snapshot_roundtrip(self):
+        """Reputation samples and sensor-reading snapshots written via
+        EventRecorder.record_snapshot must survive a save/load cycle
+        through PlaybackEngine and fire snapshot listeners in time
+        order as the engine ticks past their timestamps.
+        """
+        from autonomous_trust.evaluation.scenarios.playback_engine import (
+            PlaybackEngine, PlaybackMode,
+        )
+        from autonomous_trust.evaluation.scenarios.recording import (
+            EventRecorder,
+        )
+
+        s = DisasterResponseScenario()
+        rec = EventRecorder()
+        # Two reputation samples + two sensor readings, intentionally
+        # written out of order to confirm load_recorded sorts them.
+        rec.record_snapshot({
+            "t": 30.0, "type": "REPUTATION_SAMPLE",
+            "peer": "noaa-1", "score": 0.62,
+        })
+        rec.record_snapshot({
+            "t": 5.0, "type": "REPUTATION_SAMPLE",
+            "peer": "noaa-1", "score": 0.50,
+        })
+        rec.record_snapshot({
+            "t": 10.0, "type": "SENSOR_READING",
+            "peer": "noaa-1", "data_type": "temperature",
+            "value": 21.3, "unit": "C", "quality": 0.97,
+            "metadata": {"sensor_id": "A"},
+        })
+        rec.record_snapshot({
+            "t": 20.0, "type": "SENSOR_READING",
+            "peer": "noaa-2", "data_type": "temperature",
+            "value": 21.5, "unit": "C", "quality": 0.97,
+            "metadata": {},
+        })
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
+                                         delete=False) as fh:
+            path = fh.name
+        try:
+            rec.save(path, scenario=s)
+            # Saved payload must carry the snapshot sidecar.
+            with open(path) as f:
+                payload = json.load(f)
+            assert "snapshots" in payload
+            assert len(payload["snapshots"]) == 4
+
+            s2 = DisasterResponseScenario()
+            engine = PlaybackEngine(s2, mode=PlaybackMode.PLAYBACK)
+            received: list[dict] = []
+            engine.on_snapshot(lambda snap, t: received.append(snap))
+            engine.load_recorded(path)
+
+            # Engine.tick() consumes the buffer as scenario_time
+            # crosses each entry's t. Drive it by seeking past the
+            # last snapshot in one go.
+            engine.play()
+            engine.seek(60.0)
+            engine.tick()
+
+            assert [s["t"] for s in received] == [5.0, 10.0, 20.0, 30.0]
+            assert received[0]["type"] == "REPUTATION_SAMPLE"
+            assert received[1]["type"] == "SENSOR_READING"
+            assert received[1]["peer"] == "noaa-1"
+            assert received[1]["metadata"] == {"sensor_id": "A"}
+        finally:
+            os.unlink(path)
+
+    def test_tier_lost_event_routes_to_event_log(self):
+        """A TIER_LOST record (peer's trust tier demoted) must:
+          - Reconstruct as a PhaseEvent through PlaybackEngine.load_recorded
+          - Render in EventLogPanel.add_from_event_record at warning severity
+        Both halves of the new Phase 6 tier_lost path pinned here so a
+        future PhaseEvent rename or severity-map edit fails fast.
+        """
+        from autonomous_trust.evaluation.scenarios.playback_engine import (
+            PlaybackEngine, PlaybackMode,
+        )
+        from autonomous_trust.evaluation.scenarios.recording import (
+            EventRecorder,
+        )
+        from autonomous_trust.evaluation.scenarios.scenario import PhaseEvent
+        from autonomous_trust.inspector.dashboard.event_log import (
+            EventLogPanel, SEVERITY_WARNING,
+        )
+
+        # 1. Enum hookup: TIER_LOST must be a PhaseEvent so load_recorded
+        #    doesn't silently drop it.
+        assert hasattr(PhaseEvent, "TIER_LOST")
+
+        # 2. Event log routing: the record shape the DoD coordinator
+        #    produces lands as a warning row.
+        log = EventLogPanel()
+        log.add_from_event_record({
+            "t": 245.0,
+            "type": "TIER_LOST",
+            "peer": "mq800",
+            "description": "mq800 tier 2 → 1 (access revoked)",
+            "data": {"source": "tier_change"},
+        })
+        assert len(log.entries) == 1
+        e = log.entries[0]
+        assert e.severity == SEVERITY_WARNING
+        assert e.peer_name == "mq800"
+        assert "tier 2" in e.text and "→ 1" in e.text
+
+        # 3. Playback round-trip: a recorded TIER_LOST record reloads
+        #    into the engine's deferred_events buffer (no longer skipped
+        #    by the PhaseEvent filter in load_recorded).
+        rec = EventRecorder()
+        rec.record({
+            "t": 245.0,
+            "type": "TIER_LOST",
+            "peer": "mq800",
+            "description": "mq800 tier 2 → 1 (access revoked)",
+            "data": {"source": "tier_change"},
+        })
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
+                                         delete=False) as fh:
+            path = fh.name
+        try:
+            rec.save(path, scenario=DisasterResponseScenario())
+            engine = PlaybackEngine(DisasterResponseScenario(),
+                                    mode=PlaybackMode.PLAYBACK)
+            received: list = []
+            engine.on_event(lambda ev, t: received.append(ev))
+            engine.load_recorded(path)
+            engine.play()
+            engine.seek(300.0)
+            engine.tick()
+            kinds = [ev.event_type.name for ev in received]
+            assert "TIER_LOST" in kinds
+        finally:
+            os.unlink(path)
+
     def test_keystats_derived_from_scenario(self):
         from autonomous_trust.evaluation.scenarios.playback_engine import (
             PlaybackEngine,

@@ -79,6 +79,18 @@ typedef struct
      * stays correlated end-to-end. Empty string means "not set"; the
      * wire serializer mints one in that case. */
     char trace_id[33];
+    /* Signature-verification result carried from net_message_from_wire
+     * across the IPC hop. Mirrors Python Message.verified
+     * (network/message.py:72). Without this field the wire layer's
+     * verification result is silently dropped at route_to_process, so
+     * downstream handlers (e.g. reputation/handle_transaction) can't
+     * reject unsigned/spoofed Paxos consensus messages — a parity
+     * gap with Python's repprocess.handle_transaction:390 /
+     * handle_accepted:439. has_signature distinguishes "no signature
+     * supplied" from "signature present but failed verify"; both
+     * leave verified=false but only the latter is a security event. */
+    bool verified;
+    bool has_signature;
 } net_msg_t;
 
 typedef enum {

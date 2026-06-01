@@ -140,11 +140,17 @@ class Identity(InitializableConfig, AgreementVoter):
         :param nonce: bytes
         :return: bytes
         """
-        plaintext = Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)
-        try:
-            return plaintext.decode('utf-8')
-        except (UnicodeDecodeError, AttributeError):
-            return plaintext
+        # Return raw bytes unconditionally — matches the docstring,
+        # the C twin (identity_decrypt in src/c/autonomous_trust/
+        # identity/identity.c returns the buffer as-is), and the
+        # native_encrypt_decrypt_roundtrip conformance test. The
+        # previous try/except utf-8-decode silently produced a str
+        # for ASCII payloads, which broke the docstring contract
+        # and made cross-runtime parity tests fail.
+        # Message.parse (network/message.py:197) accepts either
+        # bytes or str so downstream callers (netprocess.py:417 and
+        # neighbours) are unaffected.
+        return Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)
 
     def publish(self):
         return Identity(self.uuid, self.address, self.fullname, self.nickname,

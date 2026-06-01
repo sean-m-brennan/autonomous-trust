@@ -44,6 +44,11 @@ dependencies:
   - websockets
   - pydantic
   - pyyaml
+  - pytorch
+  - torchvision
+  - ultralytics
+  - ultralytics-thop
+  - pyproj
   - pip
   - pip:
       #- mediapipe
