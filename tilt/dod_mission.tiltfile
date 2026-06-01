@@ -1,0 +1,266 @@
+# Tiltfile for the AutonomousTrust DoD squad-infiltration demo (k8s)
+# Usage: tilt up -- --variant=dod-mission [--namespace=dod-demo]
+#                                         [--log-level=info]
+#
+# What this does:
+#   1. Regenerates kubernetes/ manifests from the DoDMissionScenario
+#      definition + scaling knobs (single source of truth via
+#      examples/dod_mission/deploy/generate_k8s.py).
+#   2. Builds four images (first two shared with multi_agency):
+#        autonomous-trust            base (.core + native C library)
+#        autonomous-trust-inspector  adds .evaluation + .services +
+#                                    .simulator + .inspector + Dash deps
+#        at-dod-mission-demo         atop inspector — coordinator +
+#                                    simulator pod (full stack)
+#        at-dod-mission-peer         atop autonomous-trust — participant
+#                                    pods (lean: no Dash, no .inspector)
+#   3. Applies all manifests via k8s_yaml.
+#   4. Port-forwards the coordinator dashboard NodePort to
+#      localhost:8050 for the Tilt UI 'Open Web View' affordance.
+#
+# Live-reload: changes under src/autonomous-trust*/autonomous_trust/
+# or examples/dod_mission/ trigger image rebuild and rolling-update of
+# affected Deployments.
+
+namespace = os.getenv("_TILT_NAMESPACE", "dod-demo")
+log_level = os.getenv("_TILT_LOG_LEVEL", "info")
+# DoD-specific scaling knobs (no multi-agency equivalent).
+swarm_size = os.getenv("_TILT_SWARM_SIZE", "4")
+sensor_count = os.getenv("_TILT_SENSOR_COUNT", "3")
+hacked_sensors = os.getenv("_TILT_HACKED_SENSORS", "2")
+compromise_mode = os.getenv("_TILT_COMPROMISE_MODE", "abrupt")
+# Persistent-cohort seeding. tools/seed_dod_cohort.py writes per-peer
+# cfg.json files under .demo-state/dod-mission/<peer>/etc/at; generate_k8s
+# emits a ConfigMap per seeded peer + an InitContainer that copies them
+# into the per-pod emptyDir on first start. AT_PRESEED=0 skips the seed
+# step entirely so peers cold-bootstrap (useful for testing the
+# handshake/Sybil-rejection flow without warm-start).
+preseed = os.getenv("AT_PRESEED", "1")
+
+# Run against whatever k8s context the user has selected. minikube,
+# kind, k3d, etc. all work — the manifests are NodePort-based with no
+# cluster-specific networking assumptions beyond a flat pod network.
+allow_k8s_contexts(k8s_context())
+
+repo_root = ".."
+deploy_dir = repo_root + "/examples/dod_mission/deploy"
+k8s_dir = deploy_dir + "/kubernetes"
+seed_root = repo_root + "/.demo-state/dod-mission"
+
+# --- Manifest regeneration -------------------------------------------------
+# Mirrors `scripts/run-demo.sh --variant=dod-mission` PYTHONPATH and CLI invocation
+# so Tilt produces the same artifacts the launcher script does. Runs once
+# on Tiltfile evaluation; the local_resource below re-runs it whenever
+# the generator or scenario sources change.
+_at_src = ":".join([
+    # repo_root FIRST so `python -m tools.seed_dod_cohort` resolves to
+    # the repo-root tools/ package, not the conflicting
+    # src/autonomous-trust/tools/__init__.py (which holds at_diagram +
+    # corpus_to_json — distinct contents, regular package, would
+    # otherwise win). The src-side AT packages still resolve fine via
+    # the path entries below because there's no shadowing
+    # `autonomous_trust/` at the repo root. `examples.*` likewise
+    # resolves cleanly via repo_root.
+    repo_root,
+    repo_root + "/src/autonomous-trust",
+    repo_root + "/src/autonomous-trust-evaluation",
+    repo_root + "/src/autonomous-trust-inspector",
+    repo_root + "/src/autonomous-trust-services",
+    repo_root + "/src/autonomous-trust-simulator",
+])
+_k8s_gen_args = [
+    "PYTHONPATH=" + _at_src,
+    "python3 -m examples.dod_mission.deploy.generate_k8s",
+    "--out " + k8s_dir,
+    "--namespace " + namespace,
+    "--image at-dod-mission-demo",
+    "--peer-image at-dod-mission-peer",
+    "--image-tag :dev",
+    "--log-level " + log_level,
+    "--swarm-size " + swarm_size,
+    "--sensor-count " + sensor_count,
+    "--hacked-sensors " + hacked_sensors,
+    "--compromise-mode " + compromise_mode,
+]
+if preseed == "1":
+    _k8s_gen_args.append("--seed-root " + seed_root)
+_k8s_gen_cmd = " ".join(_k8s_gen_args)
+
+# Seed generator runs before manifest generation so the per-peer CMs
+# pick up its output. Skipped when AT_PRESEED=0. The script is
+# idempotent — re-running on an already-seeded dir is a no-op (preserves
+# identities so the keys agreed between peers stay valid). Pass --force
+# at the env-var level (AT_PRESEED_FORCE=1) to regenerate identities.
+_seed_force = "--force" if os.getenv("AT_PRESEED_FORCE") == "1" else ""
+_seed_cmd = " ".join([
+    "PYTHONPATH=" + _at_src,
+    "python3 -m tools.seed_dod_cohort",
+    "--out " + seed_root,
+    "--swarm-size " + swarm_size,
+    "--sensor-count " + sensor_count,
+    "--hacked-sensors " + hacked_sensors,
+    _seed_force,
+]).strip()
+if preseed != "1":
+    _seed_cmd = "echo 'AT_PRESEED=0: skipping cohort seed'"
+# Simulator scenario is JSON (despite the .yaml extension) and gets
+# baked into at-dod-mission-demo via COPY of examples/dod_mission/. The
+# simulator pod loads it via SimConfig.load → json.loads, so it has to
+# be regenerated before the docker_build below picks up the new bytes.
+_sim_gen_cmd = " ".join([
+    "PYTHONPATH=" + _at_src,
+    "python3 -m examples.dod_mission.simulator.generate_scenario",
+    repo_root + "/examples/dod_mission/simulator/scenario.yaml",
+    "--swarm-size " + swarm_size,
+    "--sensor-count " + sensor_count,
+    "--hacked-sensors " + hacked_sensors,
+])
+# Seed BEFORE manifest generation so the per-peer ConfigMaps pick up
+# the freshly-written cfg.json files.
+_gen_cmd = _seed_cmd + " && " + _k8s_gen_cmd + " && " + _sim_gen_cmd
+local(_gen_cmd, quiet=True, echo_off=True)
+
+# Re-run manifest generation when the generator or scenario sources
+# change. Outputs (the YAML files) are not declared because Tilt
+# watches them via the explicit k8s_yaml() paths below; the simulator
+# scenario.yaml is picked up by the at-dod-mission-demo docker_build
+# context.
+local_resource(
+    "dod-mission-manifests",
+    cmd=_gen_cmd,
+    deps=[
+        repo_root + "/examples/dod_mission/deploy/generate_k8s.py",
+        repo_root + "/examples/dod_mission/simulator/generate_scenario.py",
+        repo_root + "/examples/dod_mission/scenario.py",
+        repo_root + "/tools/seed_dod_cohort.py",
+    ],
+    labels=["scenario"],
+)
+
+# --- Build args (proxy / cert / git version) ------------------------------
+build_args = {}
+for var in ["http_proxy", "https_proxy", "no_proxy"]:
+    val = os.getenv(var, "")
+    if val:
+        build_args[var] = val
+
+cert_content = os.getenv("CERT_CONTENT", "")
+if not cert_content:
+    cert_path = "/usr/local/share/ca-certificates/proxy-ca.crt"
+    result = str(local("cat " + cert_path + " 2>/dev/null || true",
+                       quiet=True, echo_off=True))
+    if result.strip():
+        cert_content = result.strip()
+if cert_content:
+    build_args["CERT_CONTENT"] = cert_content
+
+git_version = str(local("git describe HEAD 2>/dev/null || echo unknown",
+                        quiet=True, echo_off=True)).strip()
+git_version = git_version.removeprefix("v")
+build_args["GIT_VERSION"] = git_version
+
+# --- Image builds ---------------------------------------------------------
+# Four-image chain (first two shared with examples/multi_agency's native
+# chain):
+#   autonomous-trust            base (.core + native C library)
+#   autonomous-trust-inspector  adds .evaluation + .services +
+#                               .simulator + .inspector + Dash deps
+#   at-dod-mission-demo         coordinator + simulator pod (atop
+#                               inspector — full stack with Dash)
+#   at-dod-mission-peer         participant pods (atop autonomous-trust
+#                               — lean, no Dash, no .inspector)
+#
+# Tilt's docker_build manages each image: content-hash caching, FROM
+# chain resolution (preflight in run-demo.sh seeds the daemon with the
+# canonical :dev tags so the Dockerfile defaults resolve), and image-
+# ref rewriting in k8s_yaml() so Deployments auto-roll when their
+# image rebuilds.
+#
+# An earlier revision wrapped each build in a local_resource for
+# per-image build rows in the Tilt UI, but that broke auto-rollout
+# (Tilt couldn't see the image change) and the multi-agency pattern
+# turned out smoother in practice.
+
+docker_build(
+    "autonomous-trust",
+    repo_root,
+    dockerfile=repo_root + "/src/autonomous-trust/Dockerfile-native",
+    network="host",
+    build_args=build_args,
+)
+
+docker_build(
+    "autonomous-trust-inspector",
+    repo_root,
+    dockerfile=repo_root + "/src/autonomous-trust-inspector/Dockerfile",
+    network="host",
+    build_args=build_args,
+)
+
+docker_build(
+    "at-dod-mission-demo",
+    repo_root,
+    dockerfile=repo_root + "/examples/dod_mission/deploy/Dockerfile",
+    network="host",
+    build_args=build_args,
+)
+
+docker_build(
+    "at-dod-mission-peer",
+    repo_root,
+    dockerfile=repo_root + "/examples/dod_mission/deploy/Dockerfile-peer",
+    network="host",
+    build_args=build_args,
+)
+
+# --- K8s manifests --------------------------------------------------------
+# Order matters for first-time apply: namespace before the rest. Tilt
+# orders by reading the namespace metadata in each doc, but listing
+# namespace.yaml first keeps the kubectl-equivalent ordering obvious.
+# The agency set is fixed by examples/dod_mission/scenario.py; the
+# scaling knobs (swarm_size, sensor_count, ...) change peer counts
+# inside these files, not the file list. Add an entry here if
+# scenario.py gains a new agency or one of the include_* toggles is
+# disabled.
+k8s_yaml([
+    k8s_dir + "/namespace.yaml",
+    k8s_dir + "/scenario-config.yaml",
+    k8s_dir + "/oda.yaml",
+    k8s_dir + "/air-support.yaml",
+    k8s_dir + "/unknown-air.yaml",
+    k8s_dir + "/leave-behind.yaml",
+    k8s_dir + "/command.yaml",
+    k8s_dir + "/simulator.yaml",
+    k8s_dir + "/coordinator.yaml",
+])
+
+# Group resources for the Tilt UI. The coordinator gets a port-forward
+# so 'Open Web View' lands on http://localhost:8050. NodePort 30851 is
+# still exposed for direct cluster access (e.g. demo presenters using
+# `minikube service`). Tilt's docker_build chain auto-gates k8s_resources
+# on the image they consume, so there's no need for explicit
+# resource_deps here — coordinator + simulator wait for
+# at-dod-mission-demo, participants wait for at-dod-mission-peer,
+# implicitly via Tilt's image-dependency tracking.
+k8s_resource(
+    "dod-coordinator",
+    port_forwards=["8050:8050", "8000:8000"],
+    labels=["coordinator"],
+)
+k8s_resource(
+    "dod-simulator",
+    port_forwards=["8051:8051"],
+    labels=["simulator"],
+)
+
+# --- Watch sources --------------------------------------------------------
+watch_file(repo_root + "/src/autonomous-trust/autonomous_trust")
+watch_file(repo_root + "/src/autonomous-trust-evaluation/autonomous_trust")
+watch_file(repo_root + "/src/autonomous-trust-services/autonomous_trust")
+watch_file(repo_root + "/src/autonomous-trust-inspector/autonomous_trust")
+watch_file(repo_root + "/src/autonomous-trust-simulator/autonomous_trust")
+watch_file(repo_root + "/examples/dod_mission")
+
+# Don't fight ourselves over the generated tree: the local_resource
+# above is the only thing that should write under k8s_dir.
+watch_settings(ignore=[k8s_dir, repo_root + "/examples/dod_mission/simulator/scenario.yaml"])

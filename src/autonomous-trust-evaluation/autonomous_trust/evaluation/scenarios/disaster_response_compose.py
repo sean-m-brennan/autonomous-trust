@@ -76,7 +76,7 @@ class ComposeOptions:
     # true, every container gets AT_PROBES=1 and the host directory
     # `probes_host_dir` is bind-mounted at `probes_container_dir`. Defaults
     # honor host env so callers can flip probes on with
-    # `AT_PROBES=1 ./scripts/run-demo-multi-agency.sh` without code changes.
+    # `AT_PROBES=1 ./scripts/run-demo.sh --variant=multi-agency` without code changes.
     probes: bool = field(default_factory=lambda: bool(os.environ.get('AT_PROBES')))
     probes_host_dir: str = field(default_factory=lambda: os.environ.get('AT_PROBES_HOST_DIR', './at-probes'))
     probes_container_dir: str = '/var/at-probes'
@@ -237,17 +237,28 @@ def generate_compose(scenario, opts: Optional[ComposeOptions] = None) -> str:
     opts = opts or ComposeOptions()
     lines: list[str] = ["services:"]
 
+    # Per-peer setup-phase stagger. Default keeps the historical
+    # `i * 5s` behaviour (group_size=1, sec=5 → 5 s per peer). At
+    # scale this becomes painful — 100 peers compounds to ~8 min of
+    # accumulated startup delay — so callers can override with env:
+    #   AT_PEER_STAGGER_GROUP=10   peers per group (default 1)
+    #   AT_PEER_STAGGER_SEC=1      seconds per group (default 5)
+    # E.g. GROUP=10 SEC=1 spreads 100 peers over ~10 s instead of
+    # ~500 s. Matches the DoD generator's pattern; see
+    # examples/dod_mission/deploy/generate_compose.py.
+    stagger_group = max(1, int(os.environ.get("AT_PEER_STAGGER_GROUP", "1")))
+    stagger_sec = max(0, int(os.environ.get("AT_PEER_STAGGER_SEC", "5")))
+
     # Deterministic IP assignment follows scenario peer order.
     for i, (name, role) in enumerate(scenario.peers.items()):
         ip = f"{opts.subnet.rsplit('.', 1)[0]}.{opts.first_ip + i}"
-        # 5s stagger so early peers finish identity before later ones join.
         # Late joiners (epa-1) need a much longer stagger so they arrive
         # at the scenario's Onboarding phase (T+6:00 = 360s).
         if role.join_phase > 0 and scenario.phases \
                 and role.join_phase < len(scenario.phases):
             delay = int(scenario.phases[role.join_phase].start.total_seconds())
         else:
-            delay = i * 5
+            delay = (i // stagger_group) * stagger_sec
         lines.extend(_peer_entry(name, role, ip, delay, opts))
 
     if opts.include_inspector:

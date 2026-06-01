@@ -79,8 +79,10 @@ run_python() {
     tox -e conformance -- "${pytest_args[@]}"
   else
     echo "tox not found; falling back to direct pytest invocation." >&2
-    echo "If imports fail, install:" >&2
-    echo "  pip install -r requirements.txt -r tests_require.txt jsonschema protobuf" >&2
+    echo "If imports fail, activate the project conda env (which supplies" >&2
+    echo "protobuf and the harness deps):" >&2
+    echo "  conda activate autonomous_trust" >&2
+    echo "  conda install -c conda-forge jsonschema   # if missing" >&2
     python -m pytest \
       conformance/harness/python \
       conformance/harness/common/tests \

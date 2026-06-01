@@ -28,7 +28,7 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import SignedMessage
 
 from . import Peers
-from .group import Group
+from .group import Group, ChildGroupSet
 from .history.history import IdentityHistory
 from ..algorithms.agreement import AgreementProof
 from ..algorithms.impl import AgreementImpl
@@ -51,6 +51,13 @@ VoteData = tuple[IdentityObj, AgreementProof, tuple[bytes, bytes]]
 GroupHistory = tuple[Group, IdentityHistory]
 
 GroupTree = tuple[Group, list[LinkedStep]]
+
+
+# Persistent-cohort gate: peers below this trust tier are excluded from
+# the peers.cfg.json / peer-capabilities.cfg.json snapshots. Mirrors
+# REPUTATION_PERSIST_THRESHOLD (rep > 0.5) via TIER_FLOORS: tier 1 floor
+# is 0.50, so any peer that's been scored above 0.5 has _tier >= 1.
+PERSIST_TIER_FLOOR = 1
 
 
 class IdentityProcess(Process, metaclass=ProcMeta,
@@ -128,6 +135,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.self_bootstrapped = False
         self.merging = False
         self.peer_potentials = {}
+        # Gateway multi-group state — see
+        # doc/architecture/gateway-reputation-tree.md.
+        #   child_groups:   group-uuid-str -> Group (with key) we gateway
+        #   parent_gateway: uuid-str of the higher-rank node we federate
+        #                   through, or None
+        # Both empty/None on rank-1 leaf nodes, which keeps every
+        # multi-group path inert and behaviour identical to today.
+        self.child_groups: dict[str, Group] = {}
+        self.parent_gateway: Optional[str] = None
         # Partition-recovery state — see doc/architecture/partition-recovery.md.
         # All three maps are pure local memory; no wire egress, no
         # configuration import.  They get reset when _merge_to_mesh adopts
@@ -160,13 +176,35 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     def capabilities(self):
         return self.protocol.capabilities
 
+    def _trusted_uuids_for_persist(self):
+        """Return uuids that should survive the persistent-cohort filter.
+
+        Self is always included. A peer survives iff its `_tier` attr
+        (populated by handle_tier_update from ReputationProcess) is at
+        or above PERSIST_TIER_FLOOR — i.e. rep > REPUTATION_PERSIST_THRESHOLD
+        per repprocess.TIER_FLOORS.
+        """
+        kept = {self.identity.uuid}
+        for peer in self.peers.all:
+            tier = getattr(peer, '_tier', 0) or 0
+            if tier >= PERSIST_TIER_FLOOR:
+                puuid = getattr(peer, 'uuid', None)
+                if puuid is not None:
+                    kept.add(puuid)
+        return kept
+
     def _remember_activity(self, queues, name: str, obj: Union[Peers, PeerCapabilities, GroupHistory]):
         filename = os.path.join(Configuration.get_cfg_dir(), name + Configuration.file_ext)
         try:
             with self.lock:  # multiple *threads* may try to save data
                 if isinstance(obj, Peers) or isinstance(obj, PeerCapabilities):
                     self.configs[name] = obj
-                    obj.to_file(filename)
+                    # The in-memory object keeps untrusted peers (so we
+                    # can still detect/handle them during this session);
+                    # only the on-disk snapshot is filtered.
+                    keep_uuids = self._trusted_uuids_for_persist()
+                    snapshot = obj.filtered_for_persist(keep_uuids)
+                    snapshot.to_file(filename)
                     # Fan-put BOTH Peers and PeerCapabilities. Previously
                     # only Peers was broadcast here; PeerCapabilities was
                     # saved to file but never propagated, so any cap
@@ -212,6 +250,85 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # _peer_accepted at debug level, which is enough.
         self.logger.verbose('Add group')
         self._remember_activity(queues, CfgIds.group, (self.group, self._history))
+
+    def _record_child_groups(self, queues):
+        """Fan the current child-group set out to the other processes.
+
+        Sibling of _record_group, but for the gateway's child groups
+        rather than its primary. Sends a ChildGroupSet so the
+        reputation / network processes can hold the child keys and
+        chains without clobbering Protocol.group. No-op (and no IPC) on
+        a leaf node — child_groups is empty. See
+        doc/architecture/gateway-reputation-tree.md.
+        """
+        if not self.child_groups:
+            return
+        self.protocol.child_groups = dict(self.child_groups)
+        try:
+            self.update(ChildGroupSet(self.child_groups), queues)
+        except Exception as err:
+            self.logger.warning('Could not propagate child groups: %s' % err)
+
+    def _adopt_child_group(self, queues, group, peer_idents=None):
+        """Adopt a foreign cohort as one of our child groups (gateway).
+
+        Stores the group (with its key) under child_groups keyed by
+        uuid, seeds its member identities into our peer view, and
+        propagates the updated child-group set. Idempotent — re-adopting
+        a known child group just refreshes it. Does NOT touch self.group
+        (the primary/parent cohort). See
+        doc/architecture/gateway-reputation-tree.md.
+        """
+        if group is None:
+            return
+        key = str(group.uuid)
+        if self.group is not None and key == str(self.group.uuid):
+            return  # never demote our own primary group to a child
+        self.child_groups[key] = group
+        self.logger.info('Gateway adopted child group %s (%s)' %
+                         (getattr(group, 'nickname', '?'), key[:8]))
+        if peer_idents:
+            self._populate_peers_from_history(queues, list(peer_idents))
+        self._record_child_groups(queues)
+
+    def _load_child_groups(self, queues):
+        """Seed-assisted dual membership: adopt any child-group config
+        files present in the config dir.
+
+        A gateway is seeded with group.cfg.json for its primary/parent
+        cohort plus one ``group_child_*.cfg.json`` per cohort it
+        gateways (each holding that group's shared key). Runtime rank
+        still governs the reputation roster and commit routing; this
+        only hands the gateway the child keys at t=0 so the demo's
+        warm-started, pre-partitioned cohorts work without a runtime
+        cross-group join handshake. Leaf nodes have no such files, so
+        this is a no-op. See doc/architecture/gateway-reputation-tree.md.
+        """
+        try:
+            cfg_dir = Configuration.get_cfg_dir()
+            prefix = 'group_child'
+            ext = Configuration.file_ext
+            try:
+                names = sorted(os.listdir(cfg_dir))
+            except FileNotFoundError:
+                return
+            from ..config.configuration import config_json_decoder
+            for fname in names:
+                if not (fname.startswith(prefix) and fname.endswith(ext)):
+                    continue
+                path = os.path.join(cfg_dir, fname)
+                try:
+                    with open(path, 'r') as cfg:
+                        payload = json.load(cfg, object_hook=config_json_decoder)
+                    # Tolerate (Group, hist_dict) — mirroring the primary
+                    # group.cfg.json layout — or a bare Group.
+                    group = payload[0] if isinstance(payload, (list, tuple)) else payload
+                    self._adopt_child_group(queues, group)
+                except Exception as err:
+                    self.logger.warning(
+                        'Could not load child group %s: %s' % (fname, err))
+        except Exception as err:
+            self.logger.warning('_load_child_groups failed: %s' % err)
 
     def _record_peers(self, queues):
         self.logger.debug('Add peers')
@@ -1467,6 +1584,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.logger.debug('Phase %s' % self.phase)
         self.acquire_capabilities(queues)
         self.announce_identity(queues)
+        # Seed-assisted dual membership: a gateway adopts its child
+        # cohort(s) from group_child_*.cfg.json before grouping. No-op
+        # on leaf nodes. See doc/architecture/gateway-reputation-tree.md.
+        self._load_child_groups(queues)
         if not self.choosing:
             # initial run, may be called again
             self._spawn(self.choose_group, args=(queues,))
@@ -1511,3 +1632,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.messages += untouched
             except Exception as err:
                 self.report_exception(err, 'process')
+        # Final flush on graceful shutdown — ensures the most-recent
+        # peers + capabilities + group snapshots survive a SIGTERM/quit.
+        # Belt-and-suspenders on top of the per-mutation saves in
+        # _record_peers / _record_group.
+        try:
+            self._record_group(queues)
+            self._record_peers(queues)
+            self.logger.debug('Final identity-state flush on shutdown')
+        except Exception as err:
+            self.logger.warning('Final identity-state flush failed: %s' % err)

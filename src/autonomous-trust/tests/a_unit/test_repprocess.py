@@ -487,7 +487,11 @@ class TestHandleAcceptedDeeper:
                       to_yaml_string((id1, id2, peer1.uuid)),
                       from_whom=peer1)
         msg.verified = True  # simulate signed message (mock peer can't sign)
-        rp.handle_accepted(None, msg)
+        # Crossing the majority threshold triggers a `committed`
+        # broadcast through queues[CfgIds.network]; previously this
+        # test passed None and crashed at the broadcast site.
+        net_q = queue.Queue()
+        rp.handle_accepted({CfgIds.network: net_q}, msg)
         # 1 acceptance > 1//2=0, so transaction should be committed
         assert len(rp.history) > 0
 
@@ -515,14 +519,27 @@ class TestForwardTransactionDeeper:
         assert not net_q.empty()
 
     def test_updates_history(self):
+        """forward_transaction kicks off Paxos but does NOT touch the
+        local history.
+
+        Mirrors the C twin (rep_proc.c:1081-1102 _forward_transaction)
+        and the comment in repprocess.forward_transaction (line
+        411-423): writing the proposer's side at submission time
+        would later be overwritten by the proposer's own
+        handle_accepted, producing a p1=self/p2=self self-transaction
+        that CTFT silently rejected. History is updated solely from
+        handle_accepted once the round commits.
+        """
         rp = _make_rep_process()
         tid = uuid4()
         score = TransactionScore(tid, 0.7)
         net_q = queue.Queue()
         rp.forward_transaction({CfgIds.network: net_q}, score)
-        # forward_transaction adds identity's side; transaction is in task_mapping
-        # but not yet in the chain (needs 2 peers for chain commit)
-        assert tid in rp.history._task_mapping
+        # Paxos round started — the transaction proposal is on the wire,
+        # but history stays empty until handle_accepted hits majority.
+        assert tid not in rp.history._task_mapping
+        assert len(rp.history) == 0
+        assert not net_q.empty()  # propose-message queued for network
 
 
 class TestHandleBackdateDeeper:
@@ -592,10 +609,16 @@ class TestContriteTitForTatBranches:
     def test_defected_good_standing(self):
         rp = _make_rep_process()
         peer = _make_mock_peer()
-        # peer_scores[-1] < 0.5 (defected) AND my_standing >= 0.5
+        # Need: peer's last score < 0.5 (peer defected) AND my own
+        # standing >= 0.5. Per _contrite_tit_for_tat:626-631, when
+        # peer fills p1 then peer_scores gets p1_score; when self
+        # fills p2 then my_scores gets p2_score. So peer must
+        # submit a low score (0.3) and self must submit a high one
+        # (0.8). The earlier revision of this test had the values
+        # swapped, asserting a punishment that never triggered.
         tid = uuid4()
-        rp.history.update(tid, peer.uuid, 0.8)       # p1_score=0.8 -> my_scores (good standing)
-        rp.history.update(tid, rp.identity.uuid, 0.3) # p2_score=0.3 -> peer_scores (defected)
+        rp.history.update(tid, peer.uuid, 0.3)        # peer's score → peer_scores
+        rp.history.update(tid, rp.identity.uuid, 0.8) # self's score → my_scores
         result = rp._contrite_tit_for_tat(peer)
         assert result <= 0.49  # punish defection
 
@@ -830,6 +853,18 @@ class TestHandleRepReqStr:
 
 class TestHandleAcceptedAlreadyAccepted:
     def test_duplicate_acceptance(self):
+        """Re-sending an ACCEPTED from a peer that already accepted
+        must not double-add to acceptances.
+
+        This scenario also crosses the majority threshold (1 peer
+        cohort), so to keep the test focused on the duplicate-add
+        guard we mark the paxos round as already committed
+        (repprocess.py:454-455 short-circuits the commit branch).
+        The previous revision passed ``None`` for queues and ran
+        into the commit broadcast site — fails as a TypeError on
+        ``queues[CfgIds.network].put`` rather than the actual
+        assertion under test.
+        """
         rp = _make_rep_process()
         peer1 = _make_mock_peer(nickname='p1')
         rp.protocol.peers.all = [peer1]
@@ -841,11 +876,12 @@ class TestHandleAcceptedAlreadyAccepted:
         score = TransactionScore(tid, 0.8)
         rp.proposals[idx] = score
         rp.acceptances[tid] = [peer1]  # already accepted
+        rp.committed_paxos_rounds[idx] = None  # already committed
 
         msg = Message(CfgIds.reputation, ReputationProtocol.accepted,
                       to_yaml_string((id1, id2, peer1.uuid)),
                       from_whom=peer1)
-        result = rp.handle_accepted(None, msg)
+        result = rp.handle_accepted({CfgIds.network: queue.Queue()}, msg)
         assert result is True
         # Should not add duplicate
         assert len(rp.acceptances[tid]) == 1
@@ -1084,7 +1120,14 @@ class TestHandleAcceptedDeeper2:
     """Cover handle_accepted majority path (lines 229-230 area): commits transaction."""
 
     def test_accepted_majority_commits_history(self):
-        """Majority of acceptances commits transaction to history."""
+        """Majority of acceptances commits transaction to history.
+
+        Once the threshold is crossed, handle_accepted broadcasts a
+        `committed` message via queues[CfgIds.network] (repprocess.py:
+        488). Pass a real queue rather than None — the prior None
+        crashed the test with TypeError before reaching the
+        assertion.
+        """
         rp = _make_rep_process()
         peer1 = _make_mock_peer(nickname='p1')
         rp.protocol.peers.all = [peer1]  # 1 peer → quorum = 0
@@ -1102,7 +1145,8 @@ class TestHandleAcceptedDeeper2:
                       to_yaml_string((id1, id2, peer1.uuid)),
                       from_whom=peer1)
         msg.verified = True  # simulate signed message (mock peer can't sign)
-        result = rp.handle_accepted(None, msg)
+        net_q = queue.Queue()
+        result = rp.handle_accepted({CfgIds.network: net_q}, msg)
         assert result is True
         # 1 acceptance > 1//2=0, so history should have been updated
         assert len(rp.history) > 0

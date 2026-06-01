@@ -39,25 +39,41 @@ class Simulator(net.SelectServer):
     seq_fmt = SimClient.seq_fmt
     time_resolution = 'seconds'
 
+    # Periodic heartbeat in send_state: log one INFO line every N ticks
+    # so operators can tell the simulator is alive and which sim-time
+    # it's on. The simulator otherwise only logs on connect/disconnect
+    # and runs entirely in response to client polls, so a busy demo
+    # produces no progress output. Override via AT_SIM_HEARTBEAT_TICKS=N
+    # at startup; 0 disables.
+    _HEARTBEAT_TICKS = int(os.environ.get('AT_SIM_HEARTBEAT_TICKS', '30'))
+
     def __init__(self, cfg_file_path: str, max_time_steps: int = None, geo: bool = False, precompute: bool = False,
                  log_level: int = logging.INFO, logfile: str = None, **kwargs):
         if max_time_steps is None:
             max_time_steps = default_steps
-        if logfile is None:
-            handler = logging.StreamHandler(sys.stdout)
-        else:
+        fmt = logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
+                                '%Y-%m-%d %H:%M:%S')
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(log_level)
+        # Always attach a stdout handler so `kubectl logs` / `docker logs` /
+        # Tilt's per-pod UI sees simulator progress (heartbeat ticks,
+        # new-client/disconnect lines). When --log <file> is also passed,
+        # the file handler is added alongside; previously file-mode
+        # replaced stdout entirely, leaving the deployment "silent".
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler.setFormatter(fmt)
+        stdout_handler.setLevel(log_level)
+        self.logger.addHandler(stdout_handler)
+        if logfile is not None:
             if not os.path.isabs(logfile):
                 cfg_dir = Configuration.get_cfg_dir()
                 if not os.path.exists(cfg_dir):
                     os.makedirs(cfg_dir, exist_ok=True)
                 logfile = os.path.join(cfg_dir, logfile)
-            handler = logging.FileHandler(logfile)
-        handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
-                                               '%Y-%m-%d %H:%M:%S'))
-        handler.setLevel(log_level)
-        self.logger = logging.getLogger(__name__)
-        self.logger.addHandler(handler)
-        self.logger.setLevel(log_level)
+            file_handler = logging.FileHandler(logfile)
+            file_handler.setFormatter(fmt)
+            file_handler.setLevel(log_level)
+            self.logger.addHandler(file_handler)
         super().__init__(self.logger, **kwargs)
 
         self.max_time_steps = max_time_steps
@@ -198,6 +214,19 @@ class Simulator(net.SelectServer):
             self.send_all(sock, 'end'.encode())
             self.init_computation()
             return
+        # Heartbeat: one INFO line per _HEARTBEAT_TICKS so operators can
+        # confirm the simulator is alive and which sim-time it's on.
+        # Logged before the wire send so the line lands even if the
+        # client socket has gone away mid-tick (send_all errors get
+        # swallowed by SelectServer's listen loop).
+        if (self._HEARTBEAT_TICKS > 0
+                and tick > 0 and tick % self._HEARTBEAT_TICKS == 0):
+            self.logger.info(
+                'tick=%d sim_time=%s active_peers=%d clients=%d max_steps=%d',
+                tick, cur_time.isoformat(timespec='seconds'),
+                len(state.active or []), len(self.clients),
+                self.max_time_steps,
+            )
         if self.return_geo:
             state = state.convert()
         data = state.to_json_string().encode()

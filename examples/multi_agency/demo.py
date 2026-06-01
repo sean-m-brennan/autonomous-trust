@@ -210,6 +210,13 @@ class MultiAgencyDemo:
         iface.register_event_log_handler(
             self._event_log_panel.add_from_event_record)
         iface.register_reset_handler(self._on_reset)
+        # Snapshot sidecar: in --record mode, _on_bridge_event also
+        # writes reputation/reading observations into the recorder's
+        # snapshot list. In --playback mode, this handler replays them
+        # back into the same in-process state the bridge would have
+        # populated (trust timeline samples + sensor chart history).
+        # Mirror of examples/dod_mission/__main__.py's snapshot wiring.
+        iface.register_snapshot_handler(self._on_snapshot)
 
         self._dash = DashControl(
             name="examples.multi_agency.demo",
@@ -799,6 +806,12 @@ class MultiAgencyDemo:
                     score=score,
                 ))
             self._live_rep_peers.add(name)
+            self._maybe_record_snapshot({
+                "t": scenario_time,
+                "type": "REPUTATION_SAMPLE",
+                "peer": name,
+                "score": score,
+            })
             # Iframe srcDoc is rebuilt only when the selected peer
             # changes (see comment near the tick callback). Without
             # this nudge, the Reputation tab shows the score that was
@@ -839,6 +852,16 @@ class MultiAgencyDemo:
             self._streams_panel.update(reading)
             self._record_reading(reading)
             self._live_stream_peers.add(name)
+            self._maybe_record_snapshot({
+                "t": reading.timestamp.total_seconds(),
+                "type": "SENSOR_READING",
+                "peer": reading.peer_name,
+                "data_type": reading.data_type,
+                "value": float(reading.value),
+                "unit": reading.unit,
+                "quality": float(reading.quality),
+                "metadata": dict(reading.metadata or {}),
+            })
 
     def _on_reset(self) -> None:
         """Clear UI-derived state. Fired by ``PlaybackInterface.reset()``
@@ -873,6 +896,58 @@ class MultiAgencyDemo:
         # Force a re-render of the peer detail iframe on the next tick
         # so the user sees the post-reset state if a peer was selected.
         self._peer_detail_last_peer = "<unset>"
+
+    def _maybe_record_snapshot(self, snapshot: dict) -> None:
+        """Push a snapshot to the interface's recorder if one is
+        attached (i.e. ``--record FILE`` was passed). No-op in
+        ordinary live mode and in playback mode (where the recorder
+        is intentionally None so re-record loops don't compound).
+        """
+        recorder = getattr(self._iface, "event_recorder", None)
+        if recorder is None:
+            return
+        try:
+            recorder.record_snapshot(snapshot)
+        except Exception:
+            logger.exception(
+                "record_snapshot failed for %r", snapshot.get("type"))
+
+    def _on_snapshot(self, snap: dict, _t) -> None:
+        """Replay a snapshot sidecar entry into in-process state.
+
+        Mirror of the live ``_on_bridge_event`` paths for reputation
+        and reading tags: REPUTATION_SAMPLE appends a ReputationSample
+        to the trust-timeline buffer, SENSOR_READING reconstructs a
+        Reading and feeds the sensor history + streams panel. Unknown
+        types are silently ignored so older recordings stay compatible.
+        """
+        kind = snap.get("type")
+        try:
+            if kind == "REPUTATION_SAMPLE":
+                name = str(snap.get("peer", ""))
+                self._rep_samples.setdefault(name, []).append(
+                    ReputationSample(
+                        t=float(snap.get("t", 0.0)),
+                        peer_name=name,
+                        score=float(snap.get("score", 0.0)),
+                    ))
+                self._live_rep_peers.add(name)
+            elif kind == "SENSOR_READING":
+                reading = Reading(
+                    timestamp=timedelta(seconds=float(snap.get("t", 0.0))),
+                    peer_name=str(snap.get("peer", "")),
+                    data_type=str(snap.get("data_type", "")),
+                    value=float(snap.get("value", 0.0)),
+                    unit=str(snap.get("unit", "")),
+                    quality=float(snap.get("quality", 1.0)),
+                    metadata=dict(snap.get("metadata") or {}),
+                )
+                self._streams_panel.update(reading)
+                self._record_reading(reading)
+                self._live_stream_peers.add(reading.peer_name)
+        except Exception:
+            logger.exception(
+                "snapshot replay failed for %r", kind)
 
     def _record_reading(self, reading: Reading) -> None:
         """Append a reading to the per-(data_type, peer) ring used by

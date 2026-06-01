@@ -1,0 +1,64 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: slash-evidence-verified
+byte_pinning: false
+description: |
+    Phase 3 — Merkle-evidence-gated slashing
+    (reputation-vs-blockchain-analysis.md §2.1 / §3).
+
+    bob holds a finalized Phase 2 checkpoint over a committed window (root
+    pinned by chain-catchup-verifies-links / checkpoint-cosign-flow). alice
+    finalizes a slash against rogue carrying Merkle evidence: the offending
+    tx's leaf entry_hash and an RFC 6962 inclusion proof against that same
+    checkpoint root. bob verifies the proof folds to its finalized checkpoint
+    and applies the floor — the accusation is cryptographically tied to a
+    quorum-committed transaction, not merely trusted. Both languages must
+    floor rogue to 0.1.
+
+participants:
+  - id: alice
+    role: detector
+  - id: bob
+    role: member
+  - id: rogue
+    role: target
+
+fixtures:
+  # bob's prior view of rogue — a rejected slash would leave this unchanged;
+  # a verified one floors it.
+  reputations:
+    bob:
+      rogue: 0.6
+  # bob's finalized checkpoint over the committed window (== window_root of
+  # chain-catchup-verifies-links). The evidence proof must fold to this root.
+  checkpoint:
+    bob:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 1
+      count: 3
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: slash final
+    payload:
+      target: rogue
+      floor_score: 0.1
+      epoch: 9
+      evidence:
+        task_id: "offending-tx"
+        leaf: "07b59d032e50c07b60566f7a37db00376b53774dd25e892cda3d3941f3fad7b7"
+        proof:
+          - ["6e0ab4df99d68b69c33d3477346184c131caffaa37578386ca6a5b9ab834665f", false]
+          - ["1b7150f96be8562a226f831d4535ec4855b1c08530956ea149114e16799e52b7", false]
+        root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+    description: |
+        alice broadcasts the finalized slash with a valid inclusion proof;
+        bob verifies it against its checkpoint and floors rogue.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.1

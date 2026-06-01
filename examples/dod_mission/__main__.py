@@ -5,7 +5,7 @@
 """Entrypoint for the DoD mission demo dashboard.
 
 Live runs use ``coordinator.py`` inside the Docker stack
-(``scripts/run-demo-dod-mission.sh``).  This entrypoint is the
+(``scripts/run-demo.sh --variant=dod-mission``).  This entrypoint is the
 counterpart for **canned playback** — replays a recorded scenario
 event log without bringing up containers, so a presentation laptop
 that has the AT Python packages installed can show the same dashboard
@@ -24,13 +24,12 @@ scenario shape under ``payload["scenario"]``; the scaling knobs above
 let you reconstruct the matching ``DoDMissionScenario`` for the
 dashboard panels.  Use the same knobs that the live run used.
 
-Note: a playback recording today contains scripted scenario events
-(PEER_JOIN, COMPROMISE_START, ANOMALY_DETECT, …) and the
-coordinator's cross-source anomaly records.  The trust timeline and
-sensor charts (reputations + readings) are **not** recorded; in
-playback they render as the bare scaffolding the panels carry by
-default.  Extending the recording to cover reputation/reading
-snapshots is the next step.
+Recordings now carry a sidecar ``snapshots`` stream of reputation
+samples (one per coordinator reputation poll, ~30 s apart per peer)
+and sensor readings (every reading the coordinator validators see,
+modulo ``AT_RECORDING_READING_STRIDE``).  Playback replays both: the
+trust timeline and sensor charts populate in time order alongside
+the scripted scenario events.
 """
 
 from __future__ import annotations
@@ -119,6 +118,48 @@ def main(argv=None):
 
     iface.register_event_log_handler(_on_event_record)
 
+    # Snapshot stream — populates the trust timeline + sensor charts
+    # from the recording sidecar. The dispatcher is intentionally
+    # minimal; unknown snapshot types are silently ignored so old
+    # recordings stay compatible.
+    from datetime import timedelta as _td
+    from autonomous_trust.services.data import Reading
+
+    def _on_snapshot(snap, _t):
+        kind = snap.get("type")
+        if kind == "REPUTATION_SAMPLE":
+            try:
+                live_server.feed_timeline_sample(
+                    panels,
+                    t_seconds=float(snap.get("t", 0.0)),
+                    peer_name=str(snap.get("peer", "")),
+                    score=float(snap.get("score", 0.0)),
+                )
+            except Exception:
+                logger.exception("Failed to feed reputation snapshot")
+        elif kind == "SENSOR_READING":
+            try:
+                reading = Reading(
+                    timestamp=_td(seconds=float(snap.get("t", 0.0))),
+                    peer_name=str(snap.get("peer", "")),
+                    data_type=str(snap.get("data_type", "")),
+                    value=float(snap.get("value", 0.0)),
+                    unit=str(snap.get("unit", "")),
+                    quality=float(snap.get("quality", 1.0)),
+                    metadata=dict(snap.get("metadata") or {}),
+                )
+            except Exception:
+                logger.exception("Failed to reconstruct reading snapshot")
+                return
+            for chart_key in ("target_x_chart", "noise_chart"):
+                try:
+                    panels[chart_key].add_reading(reading)
+                except Exception:
+                    logger.exception(
+                        "Failed to feed reading snapshot to %s", chart_key)
+
+    iface.register_snapshot_handler(_on_snapshot)
+
     state = {"reputations": {}, "tick": 0, "t_seconds": 0.0, "phase": None}
 
     def state_provider():
@@ -130,6 +171,15 @@ def main(argv=None):
         state["tick"] = int(tel.scenario_time)
         state["t_seconds"] = float(tel.scenario_time)
         state["phase"] = tel.current_phase_name
+        # Playback advances the scenario (playback_engine calls
+        # scenario.advance_to), so the squad/microdrone positions move
+        # too — surface them for the target-position map's asset markers.
+        state["platforms"] = {
+            name: {"lat": r.position.lat, "lon": r.position.lon,
+                   "alt": r.position.alt, "kind": r.kind, "color": r.color}
+            for name, r in scenario.peers.items()
+            if r.kind in ("soldier", "microdrone")
+        }
         return state
 
     if not args.paused:

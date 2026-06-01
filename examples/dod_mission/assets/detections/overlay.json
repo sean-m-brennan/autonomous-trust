@@ -1,0 +1,80 @@
+{
+  "_doc": "Hand-authored synthetic objects for the DoD scenario. Injected at confidence=1.0 alongside YOLOv8-obb detections by tools/detection_prep.py (Pass B, plan section 4.2). Positions sourced from examples/dod_mission/scenario.py landmarks; see header for the conversion math.",
+  "_landmarks_source": {
+    "scenario_py": "examples/dod_mission/scenario.py:56-61",
+    "GROUND_START_lat_lon": [34.706505, -86.633657],
+    "GROUND_MID_lat_lon":   [34.724448, -86.639802],
+    "MQ800_INGRESS_lat_lon": [34.715000, -86.580000],
+    "_note_mq800_ingress": "Outside the 4096m panorama centred at GROUND_MID; the MQ-800 entry waypoint is intentionally absent from the catalogue."
+  },
+  "_geometry_assumptions": {
+    "deg_per_m_lat": 9.009e-06,
+    "deg_per_m_lon_at_34.7N": 1.0944e-05,
+    "_source": "1 deg latitude ~ 111000 m; 1 deg longitude ~ 111000 * cos(34.72 deg) m"
+  },
+  "objects": [
+    {
+      "world_uid": "compound-alpha",
+      "class": "target-building",
+      "bbox_extent_m": [40.0, 40.0],
+      "lat": 34.724448,
+      "lon": -86.639802,
+      "ground_truth_label": "compound-alpha",
+      "scenario_role": "mq800-target",
+      "_note": "RQ-86 orbit center; this is the building the MQ-800 is supposed to be designating. Cross-source validators expect target_position_x/y near here."
+    },
+    {
+      "world_uid": "compound-bravo",
+      "class": "target-building",
+      "bbox_extent_m": [40.0, 40.0],
+      "lat": 34.726971,
+      "lon": -86.636738,
+      "ground_truth_label": "compound-bravo",
+      "scenario_role": "mq800-decoy",
+      "_note": "Decoy. ~396 m NE of compound-alpha (280 m N, 280 m E). Compromised MQ-800 reports detections against this UID; CrossSourceValidator catches the position disagreement (threshold 50 m, validation.py:41-50)."
+    },
+    {
+      "world_uid": "sensor-1-site",
+      "class": "ground-sensor",
+      "bbox_extent_m": [3.0, 3.0],
+      "lat": 34.710991,
+      "lon": -86.635193,
+      "ground_truth_label": "hacked-sensor",
+      "scenario_role": "leave-behind-hacked",
+      "linked_peer": "sensor-1",
+      "_note": "t=0.25 along GROUND_START -> GROUND_MID line (scenario.py:298). Hacked per default hacked_sensors=2."
+    },
+    {
+      "world_uid": "sensor-2-site",
+      "class": "ground-sensor",
+      "bbox_extent_m": [3.0, 3.0],
+      "lat": 34.715477,
+      "lon": -86.636730,
+      "ground_truth_label": "hacked-sensor",
+      "scenario_role": "leave-behind-hacked",
+      "linked_peer": "sensor-2",
+      "_note": "t=0.50 along approach. Hacked."
+    },
+    {
+      "world_uid": "sensor-3-site",
+      "class": "ground-sensor",
+      "bbox_extent_m": [3.0, 3.0],
+      "lat": 34.719962,
+      "lon": -86.638266,
+      "ground_truth_label": "clean-sensor",
+      "scenario_role": "leave-behind-clean",
+      "linked_peer": "sensor-3",
+      "_note": "t=0.75 along approach. Clean (last sensor in default config)."
+    },
+    {
+      "world_uid": "insertion-zone",
+      "class": "marker",
+      "bbox_extent_m": [20.0, 20.0],
+      "lat": 34.706505,
+      "lon": -86.633657,
+      "ground_truth_label": "insertion-zone",
+      "scenario_role": "squad-start",
+      "_note": "GROUND_START. Microdrone launch site; visible at southern edge of panorama."
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: slash-cosign-flow
+byte_pinning: false
+description: |
+    Exercises the full slashing handshake — slash_propose (a member
+    co-signs), slash_sign (the detector tallies toward quorum), and
+    slash_final (every node floors the target). Co-signature bytes are
+    cryptographic and per-implementation, so the intermediate emissions
+    are NOT asserted; only the terminal floored state is checked, which
+    both the Python and C reputation processes must agree on.
+
+participants:
+  - id: alice
+    role: detector
+  - id: bob
+    role: member
+  - id: rogue
+    role: target
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: slash propose
+    payload:
+      target: rogue
+      floor_score: 0.1
+      epoch: 7
+    description: alice proposes slashing rogue; bob co-signs (slash_sign).
+
+  - id: 2
+    from: bob
+    to: alice
+    function: slash sign
+    payload:
+      target: rogue
+      epoch: 7
+    description: bob's co-signature reaches alice (the detector tallies it).
+
+  - id: 3
+    from: alice
+    to: bob
+    function: slash final
+    payload:
+      target: rogue
+      floor_score: 0.1
+      epoch: 7
+    description: alice broadcasts the finalized slash; bob floors rogue.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.1

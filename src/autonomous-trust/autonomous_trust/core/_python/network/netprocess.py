@@ -148,6 +148,30 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     def group(self):
         return self.protocol.group
 
+    @property
+    def child_groups(self):
+        # dict[group-uuid-str -> Group] for cohorts this node gateways.
+        # Empty on leaf nodes, so the group-receive fast path below is
+        # unchanged for them. See doc/architecture/gateway-reputation-tree.md.
+        return getattr(self.protocol, 'child_groups', {}) or {}
+
+    def _group_for_sender(self, from_addr):
+        """Return the group (primary or child) whose address map contains
+        ``from_addr``, or None. Checks the primary group first so a leaf
+        node (no child groups) takes exactly the historical path; only a
+        gateway falls through to its child groups, letting it decrypt a
+        frame from a cohort below it with that cohort's own key."""
+        grp = self.group
+        if grp is not None and from_addr in grp.addresses:
+            return grp
+        for child in self.child_groups.values():
+            try:
+                if from_addr in child.addresses:
+                    return child
+            except Exception:
+                continue
+        return None
+
     def track_send_stats(self, uuid, num_bytes):
         if uuid not in self.statistics:
             self.statistics[uuid] = NetStat()
@@ -580,8 +604,22 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     self.logger.error('Network: %s' % err)
                                     self.track_send_error(self.unknown_peer)
                             elif isinstance(message.to_whom, Group):
-                                if message.encrypt and self.group is not None:
-                                    msg = self.group.encrypt(bytes(message), self.group)
+                                # Encrypt with the TARGET group's key when
+                                # we hold its private half (e.g. a gateway
+                                # addressing one of its child cohorts);
+                                # otherwise fall back to the primary group,
+                                # which is the historical single-group
+                                # behaviour for a leaf node.
+                                enc_grp = self.group
+                                tgt = message.to_whom
+                                try:
+                                    if (not getattr(tgt, '_public_only', True)
+                                            and getattr(tgt.encryptor, 'private', None) is not None):
+                                        enc_grp = tgt
+                                except Exception:
+                                    enc_grp = self.group
+                                if message.encrypt and enc_grp is not None:
+                                    msg = enc_grp.encrypt(bytes(message), enc_grp)
                                 else:
                                     msg = bytes(message)
                                 for addr in message.to_whom.addresses:
@@ -670,10 +708,17 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     except IndexError:
                         break
                     drained_grp += 1
-                    if from_addr in self.group.addresses:
+                    # Resolve which group this sender belongs to. For a
+                    # leaf node this is always the primary group (or
+                    # None), so the path is identical to before. A
+                    # gateway additionally matches its child groups,
+                    # decrypting a cohort-below frame with that cohort's
+                    # own key. See doc/architecture/gateway-reputation-tree.md.
+                    sender_group = self._group_for_sender(from_addr)
+                    if sender_group is not None:
                         from_whom = self.peers.find_by_address(from_addr)
                         try:
-                            decrypt_msg = self.group.decrypt(raw_msg, self.group)
+                            decrypt_msg = sender_group.decrypt(raw_msg, sender_group)
                             if from_whom is not None:
                                 self._msg_to_queue(decrypt_msg, from_whom, queues, 'group')
                             else:

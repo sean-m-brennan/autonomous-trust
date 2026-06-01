@@ -27,7 +27,12 @@ class TestReputationParity:
     """Verify native reputation types work correctly."""
 
     def test_transaction_history_crud(self):
-        """TransactionHistory: create, update, len."""
+        """TransactionHistory: create, update, len.
+
+        Mirrors Python TransactionHistory.__len__ semantics
+        (reputation.py:223-224): len(hist) returns the count of
+        bilateral commits, not the count of in-progress slots.
+        """
         from autonomous_trust.core._native.reputation import (
             NativeTransactionHistory as TransactionHistory,
         )
@@ -38,17 +43,21 @@ class TestReputationParity:
         task_id = uuid.uuid4()
         peer_id = uuid.uuid4()
 
+        # First update fills p1 only — tx is pending, not yet committed.
         hist.update(task_id, peer_id, 0.8)
-        assert len(hist) == 1
+        assert len(hist) == 0
 
-        # Second update to same task creates a second slot in the transaction
+        # Second update fills p2 — bilateral commit promotes the tx.
         peer2 = uuid.uuid4()
         hist.update(task_id, peer2, 0.6)
-        assert len(hist) == 1  # still 1 transaction, just with both peers
+        assert len(hist) == 1
 
-        # New task
+        # New task, also goes through unilateral → bilateral.
         task2 = uuid.uuid4()
         hist.update(task2, peer_id, 0.9)
+        assert len(hist) == 1  # still 1 — task2 is unilateral
+        peer3 = uuid.uuid4()
+        hist.update(task2, peer3, 0.7)
         assert len(hist) == 2
 
     def test_reputations_crud(self):

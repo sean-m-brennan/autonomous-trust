@@ -122,3 +122,22 @@ void _smrt_deref_impl(void *ptr)
     }
     //@ assert sptr->refs == \at(sptr->refs, Pre) - 1 || \at(sptr->refs, Pre) == 1;
 }
+
+/* Real-symbol wrapper for FFI callers (Python via CFFI). The
+ * smrt_deref macro at allocation.h:103 expands to
+ * `_smrt_deref_impl(ptr); ptr = NULL;` so in-tree C code still
+ * gets the NULL-on-deref safety net; this function exists only
+ * because macros don't generate ELF symbols and Python's
+ * `lib.smrt_deref(ptr)` would otherwise fail to resolve. The
+ * NULL-on-deref behaviour isn't needed on the Python side: CFFI
+ * wrappers track ownership themselves and __del__ runs at most
+ * once per wrapper.
+ *
+ * #undef the macro before the function declaration so the
+ * preprocessor doesn't mangle `smrt_deref(ptr)` into the
+ * macro's `do { ... } while(0)` body. */
+#undef smrt_deref
+void smrt_deref(void *ptr)
+{
+    _smrt_deref_impl(ptr);
+}

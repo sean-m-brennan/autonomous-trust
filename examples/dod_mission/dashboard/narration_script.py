@@ -119,18 +119,20 @@ DOD_NARRATION: list[NarrationBlock] = [
     ),
     NarrationBlock(
         t_start=255,
-        t_end=275,
+        t_end=270,
         text="MQ-800 starts feeding target-position data that disagrees with "
              "everyone else's.",
         subtext="The cross-source position validator is running on the "
              "fusion node.  RQ-86-1, RQ-86-2, and the microdrones agree "
-             "within 5 m.  The MQ-800 is 80 m off.  The red line on the "
-             "Target X-Position chart shows the divergence in real time.",
+             "within a few metres; the MQ-800 designates a different "
+             "building several hundred metres away.  On the Target "
+             "Position map its marker visibly splits from the cluster in "
+             "real time.",
         style="alert",
     ),
     NarrationBlock(
-        t_start=275,
-        t_end=290,
+        t_start=270,
+        t_end=285,
         text="Reputation collapse.  Independent peers reach the same "
              "conclusion through gossip.",
         subtext="Each peer's transaction scoring drops MQ-800 below the "
@@ -140,7 +142,7 @@ DOD_NARRATION: list[NarrationBlock] = [
         style="alert",
     ),
     NarrationBlock(
-        t_start=290,
+        t_start=285,
         t_end=305,
         text="MQ-800 excluded.  Its messages are dropped at the protocol "
              "layer across the cohort.",

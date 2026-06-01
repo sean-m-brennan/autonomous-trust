@@ -201,6 +201,171 @@ class TestTransactionHistory:
         assert len(th) == cap
         assert first_tid not in th._task_mapping
 
+    # ----- Phase 1: prev-hash linking (reputation-vs-blockchain-analysis
+    # §2.1). Lockstep with the C twin's hash-link tests in
+    # src/c/test/reputation2_test.c — keep the canonical serialization and
+    # blake2b hashing byte-identical so the two languages agree on links.
+
+    def test_genesis_entry_has_empty_prev_hash(self):
+        th = TransactionHistory()
+        tid = uuid4()
+        th.update(tid, uuid4(), 0.7)
+        th.update(tid, uuid4(), 0.5)
+        # The first committed entry chains from the empty genesis digest.
+        assert th[tid].prev_hash in (b'', None)
+
+    def test_each_entry_links_to_previous(self):
+        th = TransactionHistory()
+        for _ in range(4):
+            tid = uuid4()
+            th.update(tid, uuid4(), 0.7)
+            th.update(tid, uuid4(), 0.5)
+        chain = list(th)
+        for i in range(1, len(chain)):
+            assert chain[i].prev_hash == chain[i - 1].entry_hash()
+        assert th.verify_links() is True
+
+    def test_verify_links_detects_tampering(self):
+        th = TransactionHistory()
+        for _ in range(4):
+            tid = uuid4()
+            th.update(tid, uuid4(), 0.7)
+            th.update(tid, uuid4(), 0.5)
+        assert th.verify_links() is True
+        # Mutating a committed score changes that entry's hash, breaking
+        # the link its successor recorded.
+        list(th)[1].p1_score = 0.99
+        assert th.verify_links() is False
+
+    def test_links_survive_eviction(self):
+        # Eviction drops the head and never rewrites the tail's prev_hash,
+        # so the resident window stays internally linked.
+        th = TransactionHistory(max_chain_len=3)
+        for _ in range(6):
+            tid = uuid4()
+            th.update(tid, uuid4(), 0.7)
+            th.update(tid, uuid4(), 0.5)
+        assert len(th) == 3
+        assert th.verify_links() is True
+
+    def test_verify_chain_links_static(self):
+        th = TransactionHistory()
+        for _ in range(3):
+            tid = uuid4()
+            th.update(tid, uuid4(), 0.7)
+            th.update(tid, uuid4(), 0.5)
+        chain = list(th)
+        assert TransactionHistory.verify_chain_links(chain) is True
+        # A single-entry or empty segment trivially verifies.
+        assert TransactionHistory.verify_chain_links(chain[:1]) is True
+        assert TransactionHistory.verify_chain_links([]) is True
+
+    def test_catchup_rejects_broken_chain(self):
+        # Build a valid committed chain, then corrupt a middle entry. The
+        # receiver must verify the segment's linkage and replay nothing.
+        src = TransactionHistory()
+        for _ in range(3):
+            tid = uuid4()
+            src.update(tid, uuid4(), 0.7)
+            src.update(tid, uuid4(), 0.5)
+        good = list(src)
+        dst = TransactionHistory()
+        dst.catchup(good)
+        assert len(dst) == 3  # clean chain accepted
+
+        bad = list(TransactionHistory(_chain=[
+            Transaction(t.task_id, t.p1_id, t.p1_score, t.p2_id,
+                        t.p2_score, t.index, t.prev_hash) for t in good]))
+        bad[1].p2_score = -1.0  # break the link to bad[2]
+        dst2 = TransactionHistory()
+        dst2.catchup(bad)
+        assert len(dst2) == 0  # tampered chain rejected wholesale
+
+    def test_prev_hash_survives_wire_round_trip(self):
+        from autonomous_trust.core.config import (
+            to_json_string, from_json_string)
+        th = TransactionHistory()
+        for _ in range(3):
+            tid = uuid4()
+            th.update(tid, uuid4(), 0.7)
+            th.update(tid, uuid4(), 0.5)
+        wire = from_json_string(to_json_string(list(th)))
+        assert isinstance(wire[1].prev_hash, bytes)
+        assert TransactionHistory.verify_chain_links(wire) is True
+
+    # ----- Phase 2: ordered Merkle root over the resident window
+    # (reputation-vs-blockchain-analysis.md §2.1). Lockstep with the C twin's
+    # transaction_window_root tests in src/c/test/reputation2_test.c.
+
+    @staticmethod
+    def _fill(th, n):
+        for _ in range(n):
+            tid = uuid4()
+            th.update(tid, uuid4(), 0.7)
+            th.update(tid, uuid4(), 0.5)
+        return th
+
+    def test_empty_window_root_is_hash_of_empty(self):
+        from autonomous_trust.core.structures.merkle import MerkleTree
+        th = TransactionHistory()
+        assert th.window_root() == MerkleTree.get_hash(b'')
+
+    def test_window_root_is_deterministic_and_content_bound(self):
+        # Same committed content -> same root; mutating any entry changes it.
+        a = self._fill(TransactionHistory(), 5)
+        b = TransactionHistory(_chain=[
+            Transaction(t.task_id, t.p1_id, t.p1_score, t.p2_id,
+                        t.p2_score, t.index, t.prev_hash) for t in list(a)])
+        assert a.window_root() == b.window_root()
+        b._chain[2].p1_score = 0.123456789
+        assert a.window_root() != b.window_root()
+
+    def test_single_entry_root_matches_rfc6962_leaf(self):
+        from autonomous_trust.core.structures.merkle import MerkleTree
+        th = self._fill(TransactionHistory(), 1)
+        leaf = th._chain[0].entry_hash()
+        assert th.window_root() == MerkleTree.get_hash(b'\x00' + leaf)
+
+    def test_inclusion_proof_verifies_for_every_entry(self):
+        th = self._fill(TransactionHistory(), 7)  # not a power of two
+        root = th.window_root()
+        for tx in th._chain:
+            proof = th.inclusion_proof(tx.index)
+            assert proof is not None
+            assert TransactionHistory.verify_inclusion(
+                tx.entry_hash(), proof, root) is True
+
+    def test_inclusion_proof_rejects_wrong_leaf_or_root(self):
+        th = self._fill(TransactionHistory(), 4)
+        root = th.window_root()
+        tx = th._chain[1]
+        proof = th.inclusion_proof(tx.index)
+        # Wrong leaf digest under a valid proof/root -> fail.
+        assert TransactionHistory.verify_inclusion(
+            th._chain[2].entry_hash(), proof, root) is False
+        # Correct leaf/proof but wrong root -> fail.
+        assert TransactionHistory.verify_inclusion(
+            tx.entry_hash(), proof, b'not-the-root') is False
+
+    def test_inclusion_proof_none_for_absent_index(self):
+        th = self._fill(TransactionHistory(), 3)
+        assert th.inclusion_proof(9999) is None
+        assert TransactionHistory.verify_inclusion(b'x', None, b'y') is False
+
+    def test_window_root_tracks_eviction(self):
+        # Root commits to the RESIDENT window; eviction rolls it forward.
+        th = TransactionHistory(max_chain_len=3)
+        self._fill(th, 3)
+        root_before = th.window_root()
+        self._fill(th, 1)  # evicts oldest, appends newest
+        assert len(th) == 3
+        assert th.window_root() != root_before
+        # Every still-resident entry remains provable against the new root.
+        for tx in th._chain:
+            assert TransactionHistory.verify_inclusion(
+                tx.entry_hash(), th.inclusion_proof(tx.index),
+                th.window_root()) is True
+
 
 class TestReputation:
     def test_init(self):
@@ -429,6 +594,10 @@ class TestProposerHistoryBilateral:
 
         stub = SimpleNamespace()
         stub.history = history
+        # Gateway-tree routing: a legacy 3-tuple commit carries no
+        # group_uuid, so _chain_for_group(None) resolves to the primary
+        # chain — which for this leaf stub is just `history`.
+        stub._chain_for_group = lambda g: history
         stub.identity = SimpleNamespace(uuid=self_id)
         stub.logger = SimpleNamespace(
             warning=lambda *a, **k: None, debug=lambda *a, **k: None,
@@ -482,6 +651,8 @@ class TestProposerHistoryBilateral:
         #    fills the second slot.
         stub = SimpleNamespace(
             history=history,
+            # Legacy 3-tuple commit -> group_uuid None -> primary chain.
+            _chain_for_group=lambda g: history,
             identity=SimpleNamespace(uuid=self_id),
             logger=SimpleNamespace(
                 warning=lambda *a, **k: None, debug=lambda *a, **k: None,

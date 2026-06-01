@@ -46,18 +46,53 @@ def _render_status_bar(title: str, state: dict[str, Any]) -> list:
 
 def _render_reputations(state: dict[str, Any]) -> list:
     reps = state.get("reputations", {})
+    tiers = state.get("tiers", {}) or {}
     if not reps:
         return [html.Div("No reputations observed yet",
                          style={"color": "#475569", "fontSize": "12px"})]
-    rows = [
-        html.Tr([html.Td(name, style={"padding": "2px 8px"}),
-                 html.Td(f"{score:.2f}",
-                         style={"padding": "2px 8px",
-                                "fontFamily": "monospace",
-                                "color": ("#84CC16" if score >= 0.5
-                                          else "#F87171")})])
-        for name, score in sorted(reps.items())
-    ]
+    # Per-tier colour stops mirror DoD's reputations panel so the two
+    # demos read the same at a glance.
+    tier_colour = {
+        0: "#475569",   # admitted, no trust yet
+        1: "#94A3B8",   # network presence
+        2: "#FACC15",   # sensor-report
+        3: "#FB923C",   # fusion-validate
+        4: "#84CC16",   # coordinate
+    }
+    # Access labels mirror the access1..4 slide deck (Network /
+    # Communication / Services / Data-sharing). Plain text rather
+    # than Font Awesome so Dash needs no external stylesheet.
+    access_label = {
+        0: "—",      # admitted, no trust
+        1: "NET",    # transport / network presence
+        2: "COMM",   # communication
+        3: "SVCS",   # services
+        4: "DATA",   # data-sharing
+    }
+    rows = []
+    for name, score in sorted(reps.items()):
+        tier = int(tiers.get(name, 0))
+        rows.append(html.Tr([
+            html.Td(name, style={"padding": "2px 8px"}),
+            html.Td(f"T{tier}", style={
+                "padding": "2px 8px",
+                "fontFamily": "monospace",
+                "color": tier_colour.get(tier, "#475569"),
+                "fontWeight": "600",
+            }),
+            html.Td(access_label.get(tier, "—"), style={
+                "padding": "2px 8px",
+                "fontFamily": "monospace",
+                "fontSize": "11px",
+                "color": tier_colour.get(tier, "#475569"),
+                "letterSpacing": "0.5px",
+            }),
+            html.Td(f"{score:.2f}",
+                    style={"padding": "2px 8px",
+                           "fontFamily": "monospace",
+                           "color": ("#84CC16" if score >= 0.5
+                                     else "#F87171")}),
+        ]))
     return [html.Table([html.Tbody(rows)],
                        style={"fontSize": "12px", "color": "#E2E8F0"})]
 

@@ -41,14 +41,24 @@ from examples.multi_agency.tasks.validation import CrossSourceValidator
 POSITION_VALIDATOR_X = CrossSourceValidator(
     data_type="target_position_x",
     threshold=50.0,          # meters from consensus
-    min_sources=2,           # 2 overhead + ≥1 microdrone produces ≥3
+    # 3, not 2: with only 2 active sources the "median of others" is a
+    # single value, so any natural spread between two honest overhead
+    # platforms (orbit parallax, path jitter) trips the validator and
+    # the two RQ-86s flag each other before the squad/microdrones are
+    # producing position readings — the "anomalous way too early" false
+    # positive. Requiring ≥3 means each reading is judged against the
+    # median of ≥2 others (robust to one outlier); the validator just
+    # returns None until that many independent sources exist. The
+    # MQ-800 joins at phase 4 when the full roster is reporting, so its
+    # detection is unaffected.
+    min_sources=3,
     window_sec=10.0,
 )
 
 POSITION_VALIDATOR_Y = CrossSourceValidator(
     data_type="target_position_y",
     threshold=50.0,
-    min_sources=2,
+    min_sources=3,           # see POSITION_VALIDATOR_X
     window_sec=10.0,
 )
 
@@ -58,7 +68,8 @@ POSITION_VALIDATOR_Y = CrossSourceValidator(
 ELECTRONIC_NOISE_VALIDATOR = CrossSourceValidator(
     data_type="electronic_noise_db",
     threshold=15.0,
-    min_sources=2,
+    min_sources=3,           # see POSITION_VALIDATOR_X — avoid 2-source
+                             # degenerate consensus flagging honest RQ-86s
     window_sec=10.0,
 )
 

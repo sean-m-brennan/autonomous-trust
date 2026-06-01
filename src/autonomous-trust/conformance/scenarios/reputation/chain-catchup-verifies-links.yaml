@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: chain-catchup-verifies-links
+byte_pinning: false
+description: |
+    Phase 1 hash-linking — the verifiable catch-up path
+    (reputation-vs-blockchain-analysis.md §2.1).
+
+    alice reports a committed history (a hash-linked chain of three bilateral
+    transactions) to dave via `latest update`. The num_updates quorum is
+    lowered to 1 (fixture) so a single report fires the chain merge — the C
+    conformance harness resets state per step, so a 3-peer quorum could never
+    accumulate across steps. dave replays the agreed segment through
+    TransactionHistory.catchup, which first verifies the chain's internal
+    prev_hash linkage. The links hold, so all three entries are admitted and
+    dave's history length reads 3.
+
+    Both languages must agree: Python now groups chains by their serialized
+    form (matching C's JSON-dump grouping) so the majority vote can actually
+    be reached, and both verify the segment's hash-links before replaying.
+
+participants:
+  - id: alice
+    role: provider
+  - id: dave
+    role: consumer
+
+fixtures:
+  num_updates:
+    dave: 1
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5}
+        - {task: b, p1: 0.9, p2: 0.3}
+        - {task: c, p1: 0.6, p2: 0.4}
+    description: |
+        alice reports her 3-entry hash-linked chain to dave. With the quorum
+        at 1, dave verifies the segment's prev_hash links, accepts it, and
+        catches up to 3 txs.
+
+expected_state:
+  dave:
+    committed_tx_count: 3
+    # Phase 2: the RFC 6962 ordered Merkle root over dave's resident window
+    # after catch-up. Pins cross-language byte-identity — Python's
+    # TransactionHistory.window_root and C's transaction_window_root must both
+    # reproduce this exact hex from byte-identical entry_hashes.
+    window_root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"

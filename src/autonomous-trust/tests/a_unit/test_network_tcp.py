@@ -39,15 +39,32 @@ from autonomous_trust.core.network.netprocess import TransmissionError
 
 def _make_proc(my_address='192.168.1.10', port=8000, group_port=8001,
                enc='utf-8', accept_peer=True, accept_group=True):
-    """Return a minimal mock satisfying TCPNetworkProcess method contracts."""
+    """Return a minimal mock satisfying TCPNetworkProcess method contracts.
+
+    The current recv_peer / recv_group implementations gate inbound on
+    ``reject_message`` (blacklist-only), not the old
+    ``accept_peer_message`` / ``accept_group_message`` whitelist —
+    the gate was relaxed to fix a bootstrap regression where
+    not-yet-known peers couldn't deliver the unencrypted
+    identity:accept envelope. ``accept_peer`` / ``accept_group`` here
+    invert into reject_message's return value so existing call sites
+    keep their semantic meaning.
+    """
     proc = MagicMock(spec=TCPNetworkProcess)
     proc.enc = enc
     proc.my_address = my_address
     proc.port = port
     proc.group_port = group_port
     proc.logger = MagicMock()
+    # Legacy hooks (kept for tests that still mock them explicitly).
     proc.accept_peer_message.return_value = accept_peer
     proc.accept_group_message.return_value = accept_group
+    # Current production gate. accept_peer/group=True → reject_message=False
+    # (do not reject). The recv path uses ONLY reject_message; both
+    # recv_peer and recv_group call the same predicate, so the tests
+    # that flip a single side (accept_peer=False with default
+    # accept_group=True, or vice versa) drive the gate uniformly.
+    proc.reject_message.return_value = not (accept_peer and accept_group)
     # These sockets are assigned in __init__ so they are not covered by spec;
     # add them manually so tests that call recv_peer / recv_group can configure them.
     proc.recv_ptp_sock = MagicMock()
@@ -334,12 +351,15 @@ def _build_recv_sock(msg_bytes, enc='utf-8', empty_chunk=False):
 # ---------------------------------------------------------------------------
 
 class TestRecv:
+    """_recv returns raw bytes — encrypted point-to-point payloads
+    are not valid UTF-8, so the prior .decode() path crashed on the
+    first encrypted inbound. See tcp.py:158-167 for the rationale."""
+
     def test_normal_short_message(self):
-        """_recv decodes and returns a short message correctly."""
         proc = _make_proc()
         sock = _build_recv_sock(b'hello world')
         result = TCPNetworkProcess._recv(proc, sock)
-        assert result == 'hello world'
+        assert result == b'hello world'
 
     def test_empty_body_message(self):
         """_recv handles a zero-length body without error."""
@@ -349,7 +369,7 @@ class TestRecv:
         prefix = struct.pack('!I', 0)
         sock.recv.side_effect = [prefix]
         result = TCPNetworkProcess._recv(proc, sock)
-        assert result == ''
+        assert result == b''
 
     def test_multi_chunk_message(self):
         """_recv reassembles multi-chunk messages correctly."""
@@ -361,7 +381,7 @@ class TestRecv:
         calls = [prefix, msg[:2048], msg[2048:]]
         sock.recv.side_effect = calls
         result = TCPNetworkProcess._recv(proc, sock)
-        assert result == 'x' * 4096
+        assert result == b'x' * 4096
 
     def test_empty_chunk_raises_transmission_error(self):
         """_recv raises TransmissionError when a data chunk is b'' (connection broken)."""
@@ -370,12 +390,12 @@ class TestRecv:
         with pytest.raises(TransmissionError, match='no bytes sent'):
             TCPNetworkProcess._recv(proc, sock)
 
-    def test_result_is_decoded_string(self):
-        """_recv returns a str, not bytes."""
+    def test_result_is_bytes(self):
+        """_recv returns bytes (so downstream decrypt can run)."""
         proc = _make_proc()
         sock = _build_recv_sock(b'test')
         result = TCPNetworkProcess._recv(proc, sock)
-        assert isinstance(result, str)
+        assert isinstance(result, bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -417,26 +437,33 @@ class TestRecvPeer:
         proc = _make_proc(my_address='192.168.1.10', accept_peer=True)
         client_sock = MagicMock()
         proc.recv_ptp_sock.accept.return_value = (client_sock, ('10.0.0.5', 55001))
-        proc._recv.return_value = 'hello from peer'
+        # _recv returns bytes (see TestRecv); the dispatch path
+        # downstream handles bytes.
+        proc._recv.return_value = b'hello from peer'
         result = TCPNetworkProcess.recv_peer(proc)
-        assert result == ('hello from peer', '10.0.0.5', 55001)
+        assert result == (b'hello from peer', '10.0.0.5', 55001)
 
     def test_accepted_peer_calls_recv_with_client_sock(self):
         """recv_peer passes the accepted client socket to _recv."""
         proc = _make_proc(my_address='192.168.1.10', accept_peer=True)
         client_sock = MagicMock()
         proc.recv_ptp_sock.accept.return_value = (client_sock, ('10.0.0.5', 55001))
-        proc._recv.return_value = 'data'
+        proc._recv.return_value = b'data'
         TCPNetworkProcess.recv_peer(proc)
         proc._recv.assert_called_once_with(client_sock)
 
-    def test_accept_peer_message_called_with_sender_addr(self):
-        """recv_peer calls accept_peer_message with the sender's IP address."""
+    def test_reject_message_called_with_sender_addr(self):
+        """recv_peer calls reject_message with the sender's IP address.
+
+        The old whitelist gate (accept_peer_message) was replaced
+        with a blacklist-only check (reject_message) — see tcp.py:
+        168-190 for the bootstrap-regression reason.
+        """
         proc = _make_proc(my_address='192.168.1.10', accept_peer=True)
         proc.recv_ptp_sock.accept.return_value = (MagicMock(), ('10.0.0.5', 55001))
-        proc._recv.return_value = 'data'
+        proc._recv.return_value = b'data'
         TCPNetworkProcess.recv_peer(proc)
-        proc.accept_peer_message.assert_called_once_with('10.0.0.5')
+        proc.reject_message.assert_called_once_with('10.0.0.5')
 
 
 # ---------------------------------------------------------------------------
@@ -477,32 +504,37 @@ class TestRecvGroup:
         proc = _make_proc(my_address='192.168.1.10', accept_group=True)
         client_sock = MagicMock()
         proc.recv_grp_sock.accept.return_value = (client_sock, ('10.0.0.5', 55002))
-        proc._recv.return_value = 'group broadcast'
+        proc._recv.return_value = b'group broadcast'
         result = TCPNetworkProcess.recv_group(proc)
-        assert result == ('group broadcast', '10.0.0.5', 55002)
+        assert result == (b'group broadcast', '10.0.0.5', 55002)
 
     def test_accepted_group_calls_recv_with_client_sock(self):
         """recv_group passes the accepted client socket to _recv."""
         proc = _make_proc(my_address='192.168.1.10', accept_group=True)
         client_sock = MagicMock()
         proc.recv_grp_sock.accept.return_value = (client_sock, ('10.0.0.5', 55002))
-        proc._recv.return_value = 'data'
+        proc._recv.return_value = b'data'
         TCPNetworkProcess.recv_group(proc)
         proc._recv.assert_called_once_with(client_sock)
 
-    def test_accept_group_message_called_with_sender_addr(self):
-        """recv_group calls accept_group_message with the sender's IP address."""
+    def test_reject_message_called_with_sender_addr_group(self):
+        """recv_group calls reject_message with the sender's IP address.
+
+        Symmetric to the peer-side gate change: tcp.py:192-207 uses
+        the blacklist-only ``reject_message`` rather than the old
+        ``accept_group_message`` whitelist.
+        """
         proc = _make_proc(my_address='192.168.1.10', accept_group=True)
         proc.recv_grp_sock.accept.return_value = (MagicMock(), ('10.0.0.5', 55002))
-        proc._recv.return_value = 'data'
+        proc._recv.return_value = b'data'
         TCPNetworkProcess.recv_group(proc)
-        proc.accept_group_message.assert_called_once_with('10.0.0.5')
+        proc.reject_message.assert_called_once_with('10.0.0.5')
 
     def test_recv_group_uses_recv_grp_sock_not_ptp(self):
         """recv_group accepts on recv_grp_sock, not recv_ptp_sock."""
         proc = _make_proc(my_address='192.168.1.10', accept_group=True)
         proc.recv_grp_sock.accept.return_value = (MagicMock(), ('10.0.0.5', 55002))
-        proc._recv.return_value = 'data'
+        proc._recv.return_value = b'data'
         TCPNetworkProcess.recv_group(proc)
         proc.recv_grp_sock.accept.assert_called_once()
         proc.recv_ptp_sock.accept.assert_not_called()

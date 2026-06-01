@@ -14,14 +14,26 @@
 #   limitations under the License.
 # ******************
 # Top-level Tiltfile — dispatches to a variant-specific Tiltfile
-# Usage: tilt up -- --variant=python   [--num-nodes=4 ...]
-#        tilt up -- --variant=native   [--num-nodes=4 ...]
-#        tilt up -- --variant=multi-agency [--namespace=disaster-demo]
-#                                          [--log-level=info]
+# Usage: tilt up -- --variant=python       [--num-nodes=4 --backend=native|python ...]
+#        tilt up -- --variant=c            [--num-nodes=4 ...]
+#        tilt up -- --variant=multi-agency [--namespace=disaster-demo --log-level=info]
+#        tilt up -- --variant=dod-mission  [--namespace=dod-demo ...]
 #
-# The multi-agency variant deploys the disaster-response demo to the
-# current kube context (typically minikube). Peer count is set by the
-# scenario, not --num-nodes.
+# Two axes here, easy to confuse:
+#   * --variant  picks which sub-Tiltfile to include (which demo).
+#       python       — multi-node Python demo (uses the C library via
+#                      CFFI by default; --backend=python switches to
+#                      Dockerfile-lite for a pure-Python build).
+#       c            — multi-node pure-C demo (Dockerfile-c). Was
+#                      called --variant=native, renamed to avoid
+#                      colliding with the python variant's
+#                      --backend=native (CFFI).
+#       multi-agency — disaster-response scenario in k8s.
+#       dod-mission  — DoD squad-infiltration scenario in k8s.
+#   * --backend  only meaningful when --variant=python; selects the
+#                C library binding flavor inside that sub-Tiltfile.
+#
+# The k8s scenarios set peer count from scenario.py, not --num-nodes.
 
 config.define_string("variant")
 config.define_string("num-nodes")
@@ -42,11 +54,13 @@ os.putenv("_TILT_BACKEND", cfg.get("backend", "native"))
 os.putenv("_TILT_METRICS_DIR", cfg.get("metrics-dir", ""))
 os.putenv("_TILT_NAMESPACE", cfg.get("namespace", "disaster-demo"))
 
-if variant == "native":
+if variant == "c":
     include("tilt/native.tiltfile")
 elif variant == "python":
     include("tilt/python.tiltfile")
 elif variant == "multi-agency":
     include("tilt/multi_agency.tiltfile")
+elif variant == "dod-mission":
+    include("tilt/dod_mission.tiltfile")
 else:
-    fail("Unknown variant '{}'. Use 'python', 'native', or 'multi-agency'.".format(variant))
+    fail("Unknown variant '{}'. Use 'python', 'c', 'multi-agency', or 'dod-mission'.".format(variant))

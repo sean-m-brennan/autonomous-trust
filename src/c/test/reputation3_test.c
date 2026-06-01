@@ -36,10 +36,16 @@ DEFINE_TEST(test_tx_history_json_roundtrip)
     uuid_generate(peer1);
     uuid_generate(peer2);
 
-    /* Create two-peer transactions */
+    /* Two bilateral transactions. After Bug 6 fix only bilateral
+     * commits enter the chain and are serialized — the third
+     * update below would have left task2 unilateral, and
+     * era_to_json now correctly filters that out. To keep the
+     * "2 entries on the wire" assertion meaningful, finish task2
+     * bilaterally too. */
     ck_assert_ret_ok(tx_history_update(&hist, task1, peer1, 0.8));
     ck_assert_ret_ok(tx_history_update(&hist, task1, peer2, 0.6));
     ck_assert_ret_ok(tx_history_update(&hist, task2, peer1, 0.9));
+    ck_assert_ret_ok(tx_history_update(&hist, task2, peer2, 0.5));
 
     /* Serialize to JSON */
     json_t *json_out = NULL;
@@ -76,13 +82,16 @@ DEFINE_TEST(test_tx_two_peer_transaction)
     uuid_generate(peer1);
     uuid_generate(peer2);
 
-    /* First update: fills p1 slot */
+    /* First update: fills p1 slot — tx is pending, not yet
+     * committed (mirrors Python `_chain.append` gated on
+     * `len(tx) > 1`). */
     ck_assert_ret_ok(tx_history_update(&hist, task, peer1, 0.7));
-    ck_assert_int_eq(tx_history_len(&hist), 1);
+    ck_assert_int_eq(tx_history_len(&hist), 0);
 
-    /* Second update same task: fills p2 slot */
+    /* Second update same task: fills p2 slot — bilateral commit
+     * promotes the tx and bumps len to 1. */
     ck_assert_ret_ok(tx_history_update(&hist, task, peer2, 0.3));
-    ck_assert_int_eq(tx_history_len(&hist), 1);  /* still 1 tx */
+    ck_assert_int_eq(tx_history_len(&hist), 1);
 
     transaction_t out;
     ck_assert_ret_ok(tx_history_by_task(&hist, task, &out));

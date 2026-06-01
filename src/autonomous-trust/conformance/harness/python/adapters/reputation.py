@@ -45,7 +45,9 @@ from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.processes import ProcessTracker
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
-from autonomous_trust.core.reputation.reputation import TransactionScore
+from autonomous_trust.core.reputation.reputation import (
+    TransactionScore, SlashAttestation, SignedSlash,
+    Checkpoint, SignedCheckpoint)
 from autonomous_trust.core.system import CfgIds, PackageHash
 
 from ...common.scenario_loader import Case
@@ -107,6 +109,43 @@ class _Participant:
                 if actual != expected:
                     raise AssertionError(
                         f'{self.id}: history_len={actual}, expected {expected}'
+                    )
+            elif key == 'committed_tx_count':
+                # Count of transactions resident in the hash-linked chain
+                # (== len(history) here). The C twin reads tx_history rather
+                # than its paxos.chain_len ballot counter, so this key stays
+                # meaningful cross-language after a catch-up replay where the
+                # two C counters diverge.
+                actual = len(self.process.history)
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: committed_tx_count={actual}, '
+                        f'expected {expected}'
+                    )
+            elif key == 'window_root':
+                # Phase 2: RFC 6962 ordered Merkle root over the resident
+                # committed window. Pins cross-language byte-identity of the
+                # checkpoint commitment — C's transaction_window_root must
+                # reproduce this exact hex from byte-identical entry_hashes.
+                actual = self.process.history.window_root()
+                if isinstance(actual, bytes):
+                    actual = actual.decode('ascii')
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: window_root={actual}, expected {expected}'
+                    )
+            elif key == 'checkpoint_root':
+                # Phase 2: the root of the latest finalized quorum-signed
+                # checkpoint this node stored (handle_checkpoint_final). Empty
+                # string when none. Pins the final->store path cross-language.
+                ckpt = getattr(self.process, '_checkpoint', None)
+                actual = ''
+                if ckpt is not None and ckpt.root:
+                    actual = (ckpt.root.decode('ascii')
+                              if isinstance(ckpt.root, bytes) else str(ckpt.root))
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: checkpoint_root={actual}, expected {expected}'
                     )
             elif key == 'last_id_set':
                 actual = self.process.last_id is not None
@@ -254,6 +293,18 @@ class ReputationAdapter:
         # Hysteresis latch read by _compute_reputation; combined with `reputations`,
         # pins which branch (pure vs. CTFT) runs.
         preset_coop_mode: dict[str, dict[str, bool]] = fixtures.get('coop_mode', {}) or {}
+        # checkpoint pre-seeds a finalized Phase 2 checkpoint root.
+        # { pid -> {root: <hex>, epoch: int} }. Lets a single-step scenario
+        # verify an evidence-bearing slash against a checkpoint (Phase 3); the
+        # C harness resets per step, so the checkpoint can't be carried from a
+        # prior checkpoint_final step. Mirrors reputation_install_checkpoint.
+        preset_checkpoint: dict[str, dict[str, Any]] = fixtures.get('checkpoint', {}) or {}
+        # num_updates pre-sets self.process.num_updates (the catch-up quorum).
+        # { pid -> int }. Lets a single-step scenario exercise the verifiable
+        # catch-up path (Phase 1) without accumulating across steps — the C
+        # conformance harness resets state per step, so cross-step quorum
+        # accumulation isn't portable. Default stays the production value (3).
+        preset_num_updates: dict[str, int] = fixtures.get('num_updates', {}) or {}
 
         identities: dict[str, Identity] = {}
         for idx, spec in enumerate(spec_participants):
@@ -304,6 +355,19 @@ class ReputationAdapter:
 
             if pid in preset_last_id:
                 participant.process.last_id = preset_last_id[pid]
+
+            if pid in preset_num_updates:
+                participant.process.num_updates = int(preset_num_updates[pid])
+
+            if pid in preset_checkpoint:
+                spec_ck = preset_checkpoint[pid]
+                root = spec_ck.get('root', '')
+                participant.process._checkpoint = Checkpoint(
+                    proposer_uuid=identity.uuid,
+                    root=root.encode('ascii') if isinstance(root, str) else root,
+                    epoch=int(spec_ck.get('epoch', 1)),
+                    first_index=int(spec_ck.get('first_index', 0)),
+                    count=int(spec_ck.get('count', 0)))
 
             for r in preset_requests.get(pid, []):
                 # Each preset request entry is [id1, id2] — pre-stage the
@@ -494,7 +558,32 @@ class ReputationAdapter:
         elif function == ReputationProtocol.outdated:
             obj = str(payload.get('length', 0))
         elif function == ReputationProtocol.update:
-            obj = to_json_string([])  # empty chain by default
+            # Phase 1: optionally carry a real hash-linked chain so a
+            # catch-up scenario can exercise verify-on-replay. The payload's
+            # `chain` is a list of {task, p1, p2} committed entries; the
+            # adapter builds them through a temp TransactionHistory so the
+            # prev_hash links are computed by the production code. With
+            # `tamper: true`, a committed score is mutated AFTER linking, so
+            # the successor's recorded prev_hash no longer matches and the
+            # receiver's catchup must reject the whole segment. Default
+            # (no `chain`) stays the empty-chain no-crash case.
+            spec = payload.get('chain') if isinstance(payload, dict) else None
+            if not spec:
+                obj = to_json_string([])
+            else:
+                from autonomous_trust.core.reputation.reputation import (
+                    TransactionHistory)
+                tmp = TransactionHistory(max_chain_len=max(len(spec) + 1, 2))
+                for entry in spec:
+                    tk = uuid5(_NS, f"chain:{entry['task']}")
+                    p1 = uuid5(_NS, f"chainp1:{entry['task']}")
+                    p2 = uuid5(_NS, f"chainp2:{entry['task']}")
+                    tmp.update(tk, p1, float(entry['p1']))
+                    tmp.update(tk, p2, float(entry['p2']))
+                built = list(tmp)
+                if payload.get('tamper') and len(built) >= 2:
+                    built[1].p2_score = -1.0
+                obj = to_json_string(built)
         elif function in (ReputationProtocol.rep_req,
                           ReputationProtocol.consensus_rep_req):
             # Canonical wire form (BUGS.md §P9B): JSON object with named
@@ -514,6 +603,64 @@ class ReputationAdapter:
                 'peer_uuid': target_uuid,
                 'requesting_process': req_proc,
             })
+        elif function in (ReputationProtocol.slash_propose,
+                          ReputationProtocol.slash_sign,
+                          ReputationProtocol.slash_final):
+            # Slashing — Python's native shapes (per-implementation;
+            # byte_pinning:false checks state equivalence). propose/final
+            # carry a SlashAttestation / SignedSlash (Configuration);
+            # sign is a (target, epoch, voter, sig) tuple. The slasher is
+            # the proposer so a node receiving slash_final (self != slasher)
+            # applies the floor rather than self-skipping.
+            target_pid = payload.get('target', from_id)
+            target_uuid = (str(participants[target_pid].impl.identity.uuid)
+                           if target_pid in participants else target_pid)
+            floor = float(payload.get('floor_score', 0.0))
+            epoch = int(payload.get('epoch', 1))
+            reason = payload.get('reason',
+                                 SlashAttestation.REASON_PEER_EXCLUDE)
+            if function == ReputationProtocol.slash_sign:
+                obj = to_json_string(
+                    (target_uuid, epoch, str(proposer_uuid), None))
+            else:
+                att = SlashAttestation(
+                    slasher_uuid=str(proposer_uuid), target_uuid=target_uuid,
+                    reason=reason, floor_score=floor, epoch=epoch)
+                # Phase 3: optional Merkle evidence {task_id, leaf, proof,
+                # root} tying the slash to a checkpoint-committed tx.
+                if isinstance(payload, dict) and payload.get('evidence'):
+                    att.evidence_ref = payload['evidence']
+                obj = (to_json_string(SignedSlash(attestation=att, sigs={}))
+                       if function == ReputationProtocol.slash_final
+                       else to_json_string(att))
+        elif function in (ReputationProtocol.checkpoint_propose,
+                          ReputationProtocol.checkpoint_sign,
+                          ReputationProtocol.checkpoint_final):
+            # Phase 2 checkpoints — Python's native shapes (per-impl;
+            # byte_pinning:false checks state equivalence). propose/final
+            # carry a Checkpoint / SignedCheckpoint; sign is a
+            # (proposer, epoch, voter, sig) tuple. The proposer is the sender
+            # so a node receiving checkpoint_final (self != proposer) stores
+            # the root rather than self-skipping. ``root`` is the agreed
+            # window Merkle root as a hex string; carried as its ASCII bytes
+            # so the stored value round-trips to the same hex the C twin
+            # stores (the `checkpoint_root` observable).
+            root_hex = payload.get('root', '')
+            epoch = int(payload.get('epoch', 1))
+            first_index = int(payload.get('first_index', 0))
+            count = int(payload.get('count', 0))
+            if function == ReputationProtocol.checkpoint_sign:
+                obj = to_json_string(
+                    (str(proposer_uuid), epoch, str(proposer_uuid), None))
+            else:
+                ck = Checkpoint(
+                    proposer_uuid=str(proposer_uuid),
+                    root=root_hex.encode('ascii') if isinstance(root_hex, str)
+                    else root_hex,
+                    epoch=epoch, first_index=first_index, count=count)
+                obj = (to_json_string(SignedCheckpoint(checkpoint=ck, sigs={}))
+                       if function == ReputationProtocol.checkpoint_final
+                       else to_json_string(ck))
         else:
             raise AssertionError(f'unsupported reputation function {function!r}')
 

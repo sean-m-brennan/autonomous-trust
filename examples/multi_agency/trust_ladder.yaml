@@ -1,0 +1,72 @@
+# Authoritative capability-to-tier mapping for the multi-agency
+# disaster-response demo. Mirror of examples/dod_mission/trust_ladder.yaml
+# (the DoD demo's structure) and the design in
+# doc/architecture/trust-tiers.md §1.
+#
+# Each entry registers a Capability on coordinator + participant
+# AutonomousTrust instances at init time, with the listed
+# `required_tier` (peer._tier needed to be invited) and
+# `transaction_weight` (multiplier in _pure_reputation). The
+# underlying service implementations (envdata streams, fusion tasks)
+# live elsewhere; the entries here are metadata-only so the
+# negotiation gate and weighted-reputation math wire correctly.
+#
+# AT-core bootstrap capabilities (at.handshake / at.time-attest /
+# at.echo-challenge) are registered separately by
+# bootstrap_capabilities.register_bootstrap_capabilities — listed
+# here for reference only so the ladder is visible in one place.
+#
+# Trust tier semantics (see doc/architecture/trust-tiers.md §1):
+#   0 — admitted, no trust yet (bootstrap only)
+#   1 — basic operational (network presence / NetStats)
+#   2 — data-submission (sensor reports — weather/seismic/airquality)
+#   3 — coordinator-side fusion / cross-source validation
+#   4 — coordination / cross-agency decisions
+
+# Authoritative bootstrap entries — duplicated from
+# bootstrap_capabilities.py so the demo can pin its expectations
+# end-to-end. The loader does NOT re-register these (the AT-core
+# auto-registration owns the canonical tier/weight); it only checks
+# that the values match.
+bootstrap:
+  at.handshake:
+    required_tier: 0
+    transaction_weight: 1
+  at.time-attest:
+    required_tier: 0
+    transaction_weight: 1
+  at.echo-challenge:
+    required_tier: 0
+    transaction_weight: 1
+
+# Multi-agency-specific capabilities — registered by register_trust_ladder.
+multi:
+  multi.network-presence:
+    required_tier: 1
+    transaction_weight: 2
+    description: |
+        Cohort-metadata exchange / NetStats heartbeat. First tier
+        every peer should reach via the BootstrapWorker's at.* runs.
+  multi.sensor-report:
+    required_tier: 2
+    transaction_weight: 4
+    description: |
+        Data-submission flow covering weather_stream, seismic_stream,
+        and airquality_stream emissions. Coordinator's
+        _maybe_submit_batch_scores tags submitted TSs with this name
+        so the weighting math applies (4× per batch).
+  multi.fusion-validate:
+    required_tier: 3
+    transaction_weight: 8
+    description: |
+        Cross-source fusion + validation (data_fusion + validation
+        capabilities on FEMA fusion nodes). tier_lost cancellations
+        of in-flight fusion tasks are the visible signal when a
+        compromised peer (noaa-3) loses tier 2.
+  multi.coordinate:
+    required_tier: 4
+    transaction_weight: 8
+    description: |
+        Cross-agency coordination (FEMA primary's coordination +
+        cross_agency caps). Scaffolded for follow-up — no domain
+        code uses it yet.

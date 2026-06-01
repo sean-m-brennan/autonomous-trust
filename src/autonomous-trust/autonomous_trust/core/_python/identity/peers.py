@@ -156,3 +156,17 @@ class Peers(Configuration):
                 del self.listing[who.address]
                 self.all.remove(who)
             del self.valuation[idx][index]
+
+    def filtered_for_persist(self, keep_uuids):
+        """Return a deep-ish copy with only peers whose uuid is in keep_uuids.
+
+        Used by the persistent-cohort save path so untrusted (rep<=0.5) peers
+        don't survive a process restart. Hierarchy + valuation are filtered
+        in parallel; peer objects themselves are reused (no deep copy).
+        """
+        keep = {str(u) for u in keep_uuids}
+        def _filt(level):
+            return {k: v for k, v in level.items()
+                    if str(getattr(v, 'uuid', '')) in keep}
+        return Peers(hierarchy=[_filt(lvl) for lvl in self.hierarchy],
+                     valuation=[_filt(tier) for tier in self.valuation])

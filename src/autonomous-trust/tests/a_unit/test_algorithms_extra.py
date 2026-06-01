@@ -31,7 +31,14 @@ def _mock_voter(rank=1, uid=None):
 
 
 class ConcreteBlob:
-    """Simple blob for testing."""
+    """Simple blob for testing.
+
+    `get_hash` returns ASCII-hex bytes to match the
+    `MerkleTree.hash_func` contract that the POW algorithm expects
+    (work.py:25-31): the production code calls
+    ``HexEncoder.decode(blob.get_hash(nonce))`` so any raw-bytes
+    digest would trip a `binascii.Error` on the first hex-decode.
+    """
     def __init__(self):
         self._data = b'testdata'
 
@@ -40,7 +47,7 @@ class ConcreteBlob:
         d = self._data
         if nonce:
             d = d + nonce
-        return hashlib.sha256(d).digest()
+        return hashlib.sha256(d).hexdigest().encode('ascii')
 
 
 # Concrete subclass for AgreementByAuthority
@@ -193,12 +200,21 @@ class TestAgreementByAuthorityAccumulateNoLeader:
     """Cover _accumulate_votes when the leader rank is not in the votes dict."""
 
     def test_accumulate_votes_leader_not_in_votes(self):
-        """If leader's rank is not a key in votes dict, dict[leader] raises KeyError."""
+        """Leader absent from votes → not approved.
+
+        Updated to match the current production semantics
+        (authority.py:46-57): instead of raising KeyError, the POA
+        accumulator returns False so a cross-runtime conformance
+        scenario (agreement/poa-leader-abstains) passes. The C twin
+        ``_authority_accumulate`` does the same. Voters list
+        contains the abstaining leader (rank 10) plus a voter at
+        rank 3 whose vote is supplied but doesn't decide.
+        """
         me = _mock_voter(rank=10)
-        ca = ConcreteAuthority(me, [], threshold_rank=5)
+        other = _mock_voter(rank=3)
+        ca = ConcreteAuthority(me, [other], threshold_rank=5)
         # votes contains no entry for rank 10 (the max / leader rank)
-        with pytest.raises(KeyError):
-            ca._accumulate_votes([(3, True)])
+        assert ca._accumulate_votes([(3, True)]) is False
 
     def test_accumulate_votes_multiple_voters_leader_wins(self):
         """_accumulate_votes returns the vote of the highest-rank voter."""
@@ -305,12 +321,19 @@ class TestAgreementByWorkVerifyNonce:
     """Cover AgreementByWork.verify when digest matches with a nonce."""
 
     def test_verify_with_matching_nonce_hash_easy(self):
-        """With DIFFICULTY=0, any digest that matches blob.get_hash(nonce) is approved."""
+        """With DIFFICULTY=0, any digest that matches blob.get_hash(nonce) is approved.
+
+        proof.digest must be the raw-bytes digest (HexEncoder.decode
+        of blob.get_hash output) — that's what prove() stores, and
+        what verify() compares against. Using hex-bytes here would
+        spuriously fail the equality check.
+        """
+        from nacl.encoding import HexEncoder
         me = _mock_voter()
         ew = EasyWorkExtra(me, [])
         blob = ConcreteBlob()
         nonce = b'42'
-        digest = blob.get_hash(nonce)
+        digest = HexEncoder.decode(blob.get_hash(nonce))
         proof = MagicMock()
         proof.digest = digest
         proof.nonce = nonce
@@ -319,11 +342,15 @@ class TestAgreementByWorkVerifyNonce:
         assert blob in ew._approved
 
     def test_verify_with_matching_nonce_hash_no_nonce(self):
-        """With DIFFICULTY=0, digest matching blob.get_hash(None) is approved."""
+        """With DIFFICULTY=0, digest matching blob.get_hash(None) is approved.
+
+        Same raw-bytes-digest invariant as the nonce variant above.
+        """
+        from nacl.encoding import HexEncoder
         me = _mock_voter()
         ew = EasyWorkExtra(me, [])
         blob = ConcreteBlob()
-        digest = blob.get_hash()  # no nonce
+        digest = HexEncoder.decode(blob.get_hash())  # no nonce
         proof = MagicMock()
         proof.digest = digest
         proof.nonce = None
