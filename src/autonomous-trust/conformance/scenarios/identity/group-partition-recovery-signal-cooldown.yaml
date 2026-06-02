@@ -1,0 +1,59 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-partition-recovery-signal-cooldown
+byte_pinning: false
+description: |
+    Probe rate-limiting — pins the per-from_addr probe cooldown in
+    `handle_partition_signal` (doc/architecture/partition-recovery.md §5.2
+    and §9).
+
+    A flood of cross-group traffic from a single foreign address produces
+    a stream of `partition_signal` IPC events. Without rate-limiting, each
+    would emit a fresh probe and a chatty neighbour could drive a probe
+    storm. The handler suppresses repeat probes for the same from_addr
+    within a 10 s window (`_PARTITION_PROBE_COOLDOWN_SEC` /
+    `PARTITION_PROBE_COOLDOWN_US`), so a burst collapses to a single probe.
+
+    The scenario delivers the same partition_signal four times (`repeat`)
+    from one from_addr; the cooldown is keyed on that address, so peer_b
+    emits exactly ONE group_partition_probe. The `partition_probes_emitted`
+    observable counts emitted probes in both harnesses (Python tallies the
+    participant outbox; C scans the engine's captured emissions for
+    from==peer_b, function==group_partition_probe).
+
+    Pairs with group-partition-recovery-basic (which proves a single
+    signal DOES emit a probe): together they pin "one probe per signal,
+    but at most one per from_addr per window".
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-000000000001"
+      size: 1
+    peer_b:
+      uuid: "0b000000-0000-4000-8000-000000000002"
+      size: 1
+
+steps:
+  - id: 1
+    from: peer_a
+    to: peer_b
+    function: partition_signal
+    repeat: 4
+    payload:
+      from_addr: "10.7.7.7:6000"
+    description: |
+        Four identical partition_signals from the same from_addr,
+        delivered back-to-back (well inside the 10 s cooldown). The first
+        emits a probe; the cooldown suppresses the other three.
+
+expected_state:
+  peer_b:
+    partition_probes_emitted: 1

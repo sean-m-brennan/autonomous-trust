@@ -176,7 +176,13 @@ int signal_to_proto(const signal_t *msg, void **data_ptr, size_t *data_len_ptr)
 /* Frama-C: skipped — [solver-timeout] JSON + protobuf preconditions */
 int net_msg_pack_json(net_msg_t *msg, json_t *json)
 {
-    char *str = json_dumps(json, JSON_COMPACT);
+    /* JSON_ENCODE_ANY: permit a scalar root (e.g. a bare string), not just
+     * object/array. The partition_signal IPC carries the from_addr as a
+     * bare JSON string (doc/architecture/partition-recovery.md §5.1);
+     * without this flag json_dumps returns NULL for it and the signal is
+     * silently dropped (the probe is never emitted). Object/array payloads
+     * encode identically. */
+    char *str = json_dumps(json, JSON_COMPACT | JSON_ENCODE_ANY);
     if (str == NULL)
         return -1;
     size_t slen = strlen(str);
@@ -197,7 +203,10 @@ int net_msg_unpack_json(const net_msg_t *msg, json_t **json)
     if (msg->obj == NULL || msg->len == 0)
         return -1;
     json_error_t error;
-    *json = json_loads((const char *)msg->obj, 0, &error);
+    /* JSON_DECODE_ANY mirrors the JSON_ENCODE_ANY in net_msg_pack_json so a
+     * scalar-root payload (the partition_signal from_addr) round-trips.
+     * Object/array payloads decode identically. */
+    *json = json_loads((const char *)msg->obj, JSON_DECODE_ANY, &error);
     if (*json == NULL)
         return -1;
     return 0;
