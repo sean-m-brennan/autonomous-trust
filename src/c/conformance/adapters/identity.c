@@ -43,6 +43,9 @@
 #include "identity/identity.h"
 #include "identity/identity_priv.h"   /* hexlify / public_identity_to_json */
 #include "identity/id_proc_priv.h"
+#include "identity/group.h"           /* group_init / group_add_address */
+#include "config/configuration.h"     /* config_t (proc->configs["identity"]) */
+#include "structures/data.h"          /* object_ptr_data */
 #include "network/net_message.h"
 #include "processes/processes.h"
 #include "structures/array.h"
@@ -153,6 +156,24 @@ static ic_impl_t *_build_participant_impl(const char *id, size_t idx) {
     if (map_create(&impl->proc->protocol.handlers) != 0) goto fail;
     impl->proc->protocol.phase = 3;
     if (identity_register_handlers(impl->proc) != 0) goto fail;
+
+    /* Wire the participant's own identity into proc->configs under the
+     * "identity" key — exactly where _partition_self_identity (and the
+     * welcoming-committee's _resolve_self_identity) look for it. Without
+     * this the partition handlers find no self identity and silently emit
+     * nothing. Python's adapter already supplies a full identity config;
+     * this brings the C participant to parity. */
+    {
+        config_t *id_cfg = calloc(1, sizeof(config_t));
+        if (id_cfg == NULL) goto fail;
+        id_cfg->name = "identity";
+        id_cfg->data_struct = impl->full;
+        data_t *id_dat = object_ptr_data((ptr_t)id_cfg, sizeof(config_t));
+        if (id_dat == NULL) { free(id_cfg); goto fail; }
+        if (map_create(&impl->proc->configs) != 0) { free(id_cfg); goto fail; }
+        if (map_set(impl->proc->configs, (map_key_t)"identity", id_dat) != 0)
+            goto fail;
+    }
     return impl;
 fail:
     if (impl != NULL) {
@@ -214,6 +235,63 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
             }
             identity_set_own_capabilities(impl->proc, names, k);
             free((void *)names);
+        }
+    }
+
+    /* groups: { "<participant>": { "uuid": "<str>", "size": <int> }, ... }
+     * Distinct-group mode for partition-recovery scenarios. Each listed
+     * participant gets its OWN group (pinned uuid + `size` members) and
+     * peers are NOT cross-populated, so each peer sees the other's group
+     * traffic as foreign — the split-brain precondition. Mirrors the
+     * Python adapter's _build_group_from_fixture. The pinned uuid keeps
+     * the equal-size tiebreak deterministic and identical across harnesses;
+     * filler members exist only to set map_size(group.address_map) (the
+     * value the partition handlers sign and compare) and use distinct
+     * addresses because group_add_address dedups by address. */
+    json_t *groups = json_object_get(fixtures, "groups");
+    if (json_is_object(groups))
+    {
+        const char *gpid;
+        json_t *gspec;
+        size_t gi = 0;
+        json_object_foreach(groups, gpid, gspec) {
+            sce_participant_t *part = sce_find_participant(ctx, gpid);
+            if (part != NULL && json_is_object(gspec)) {
+                ic_impl_t *impl = (ic_impl_t *)part->impl;
+                if (impl != NULL && impl->proc != NULL && impl->pub != NULL) {
+                    const char *guuid_str = NULL;
+                    json_t *gu = json_object_get(gspec, "uuid");
+                    if (json_is_string(gu)) guuid_str = json_string_value(gu);
+                    int gsize = 1;
+                    json_t *gs = json_object_get(gspec, "size");
+                    if (json_is_integer(gs)) gsize = (int)json_integer_value(gs);
+
+                    char gaddr[ADDR_LEN + 1];
+                    snprintf(gaddr, sizeof(gaddr), "239.9.%zu.1", gi);
+                    uuid_t guuid;
+                    if (guuid_str != NULL && uuid_parse(guuid_str, guuid) == 0)
+                        group_init(&guuid, gaddr, &impl->proc->protocol.group);
+                    else
+                        group_init(NULL, gaddr, &impl->proc->protocol.group);
+
+                    /* member 0: the participant itself */
+                    char own_uuid_str[UUID_STRING_LEN + 1];
+                    uuid_unparse_lower(impl->pub->uuid, own_uuid_str);
+                    group_add_address(&impl->proc->protocol.group,
+                                      own_uuid_str, impl->pub->address);
+                    /* fillers to reach `size` members */
+                    for (int k = 0; k < gsize - 1; k++) {
+                        char fuuid[UUID_STRING_LEN + 1];
+                        char faddr[ADDR_LEN + 1];
+                        snprintf(fuuid, sizeof(fuuid),
+                                 "f111%04zu-0000-4000-8000-%012d", gi, k);
+                        snprintf(faddr, sizeof(faddr), "10.9.%zu.%d", gi, k + 2);
+                        group_add_address(&impl->proc->protocol.group,
+                                          fuuid, faddr);
+                    }
+                }
+            }
+            gi++;
         }
     }
 
@@ -385,6 +463,23 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         if (json_is_integer(sz)) group_size = (int)json_integer_value(sz);
         json_t *ir = json_object_get(payload, "in_response_to");
         if (json_is_string(ir)) in_resp = json_string_value(ir);
+        /* in_response_to_id: a participant id resolved to that participant's
+         * actual uuid. The probe sender's uuid is runtime-derived (it
+         * differs between the Python and C harnesses), so scenarios that
+         * chain probe->response can't hard-code it — they name the probing
+         * participant and each adapter resolves it locally. */
+        char in_resp_buf[UUID_STRING_LEN + 1] = {0};
+        json_t *ir_id = json_object_get(payload, "in_response_to_id");
+        if (json_is_string(ir_id)) {
+            sce_participant_t *t = sce_find_participant(ctx, json_string_value(ir_id));
+            if (t != NULL) {
+                ic_impl_t *ti = (ic_impl_t *)t->impl;
+                if (ti != NULL && ti->pub != NULL) {
+                    uuid_unparse_lower(ti->pub->uuid, in_resp_buf);
+                    in_resp = in_resp_buf;
+                }
+            }
+        }
         json_t *lu = json_object_get(payload, "leader_uuid");
         if (json_is_string(lu)) leader_uuid = json_string_value(lu);
         json_t *la = json_object_get(payload, "leader_address");
@@ -432,10 +527,20 @@ static int _dispatch(sce_run_ctx_t *ctx,
                      generic_msg_t *inbound) {
     (void)ctx;
     ic_impl_t *impl = (ic_impl_t *)target->impl;
-    /* directory_t is array_t; _remember_activity walks it without a NULL
-     * guard. Pass an empty array. */
+    /* directory_t is array_t of sibling-process queue names. Populate it
+     * with the names handlers expect to find: _announce_identity (the
+     * partition-recovery request_access re-broadcast) returns early unless
+     * the directory contains "network" (array_contains check), and other
+     * handlers index it similarly. The real runtime supplies this
+     * directory; an empty array silently suppresses those emissions. */
     array_t *queues = NULL;
     array_create(&queues);
+    static const char *const qnames[] = {"network", "identity",
+                                         "negotiation", "main"};
+    for (size_t i = 0; i < sizeof(qnames) / sizeof(qnames[0]); i++) {
+        data_t *qn = string_data((string_t)qnames[i], strlen(qnames[i]));
+        if (qn != NULL) array_append(queues, qn);
+    }
     run_message_handlers(impl->proc, queues, NET_MESSAGE, inbound);
     array_free(queues);
     return 0;
@@ -556,6 +661,29 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: peer_caps_count=%d, expected %d",
                              pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "partition_probes_emitted") == 0
+                       || strcmp(key, "partition_responses_emitted") == 0) {
+                /* Count emissions of the named function attributed to this
+                 * participant across the whole scenario. The engine records
+                 * every emitted (from, to, function) in ctx->captured; the
+                 * cooldown scenario delivers N signals and asserts the
+                 * per-from_addr cooldown collapses them to a single probe.
+                 * Mirrors the Python adapter's per-participant emit_tally. */
+                const char *want_fn =
+                    (key[10] == 'p') ? "group_partition_probe"
+                                     : "group_partition_response";
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->captured_count; i++) {
+                    if (strcmp(ctx->captured[i].from, pid) == 0
+                        && strcmp(ctx->captured[i].function, want_fn) == 0)
+                        got++;
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: %s=%d, expected %d", pid, key, got, want);
                     return -1;
                 }
             } else {

@@ -1,0 +1,90 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-partition-recovery-size-tie
+byte_pinning: false
+description: |
+    Group partition recovery, equal-size groups — pins the uuid tiebreak
+    in `handle_partition_response` (doc/architecture/partition-recovery.md
+    §5.4 and §9).
+
+    Same shape as group-partition-recovery-basic, but both groups have
+    size 2, so size alone cannot decide which group wins. The adoption
+    rule then falls to the deterministic tiebreak: a peer adopts the other
+    group iff `their_group_uuid < our_group_uuid` (string compare). Group
+    uuids are pinned peer_a `0a..` < peer_b `0b..`, so peer_b (the larger
+    uuid) is the one that adopts and re-broadcasts request_access. The
+    tiebreak string and direction are identical in the Python and C
+    handlers, so both harnesses reach the same winner.
+
+    The symmetric peer_a side is a quiet no-op: when peer_a receives a
+    probe/response advertising peer_b's equal-size group, peer_a's
+    `their_group_uuid (0b..) < our_group_uuid (0a..)` is false, so it
+    takes the `we_win` branch and does not initiate. Asserting that
+    non-emission is outside the assertion engine's match-existence model;
+    the determinism of the pinned ordering is what this scenario locks.
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-000000000001"
+      size: 2
+    peer_b:
+      uuid: "0b000000-0000-4000-8000-000000000002"
+      size: 2
+
+steps:
+  - id: 1
+    from: peer_a
+    to: peer_b
+    function: partition_signal
+    payload:
+      from_addr: "10.7.7.7:6000"
+    description: |
+        peer_b emits a partition_probe for its own size-2 group (0b..).
+
+  - id: 2
+    from: peer_b
+    to: peer_a
+    function: group_partition_probe
+    in_response_to: 1
+    payload:
+      group_uuid: "0b000000-0000-4000-8000-000000000002"
+      group_size: 2
+    description: |
+        Deliver peer_b's probe to peer_a; peer_a replies with a
+        partition_response advertising its own size-2 group (0a..).
+
+  - id: 3
+    from: peer_a
+    to: peer_b
+    function: group_partition_response
+    in_response_to: 2
+    payload:
+      group_uuid: "0a000000-0000-4000-8000-000000000001"
+      group_size: 2
+      in_response_to_id: peer_b
+    description: |
+        Deliver peer_a's response to peer_b. Sizes tie (2 == 2); peer_b
+        adopts because peer_a's group uuid (0a..) sorts before its own
+        (0b..). peer_b re-broadcasts request_access.
+
+  - id: 4
+    from: peer_b
+    to: broadcast
+    function: request_access
+    in_response_to: 3
+    no_propagate: true
+    description: |
+        request_access trigger, emitted purely on the strength of the
+        uuid tiebreak. Verified-only.
+
+expected_state:
+  peer_b:
+    partition_probes_emitted: 1

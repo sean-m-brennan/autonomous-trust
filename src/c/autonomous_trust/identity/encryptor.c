@@ -51,13 +51,17 @@ int encryptor_init(encryptor_t *encr, const unsigned char *hex_seed, size_t hex_
 /* Frama-C: skipped — [solver-timeout] libsodium stub preconditions */
 unsigned char *encryptor_publish(const encryptor_t *encr)
 {
-    unsigned char *hex = malloc(crypto_box_PUBLICKEYBYTES * 2);
+    /* public_hex is NUL-terminated ([... * 2 + 1]); copy the terminator too
+     * so callers treating the result as a C string (json_string in
+     * public_identity_to_json) read exactly the 64 hex chars instead of
+     * over-running into the heap. Length-passing callers are unaffected. */
+    unsigned char *hex = malloc(crypto_box_PUBLICKEYBYTES * 2 + 1);
     if (hex == NULL)
     {
         EXCEPTION(ENOMEM);
         return NULL;
     }
-    memcpy(hex, encr->public_hex, crypto_box_PUBLICKEYBYTES * 2);
+    memcpy(hex, encr->public_hex, crypto_box_PUBLICKEYBYTES * 2 + 1);
     return hex;
 }
 
