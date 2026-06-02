@@ -75,6 +75,13 @@ class _Participant:
     process: IdentityProcess
     queues: dict[str, Any]
     outbox_buffer: list[Message] = field(default_factory=list)
+    # Persistent per-function emission tally (NOT cleared on drain). The
+    # partition cooldown scenarios assert on how many probes a participant
+    # emitted across N repeated signals; outbox_buffer is drained every
+    # dispatch, so a separate running tally is needed. Keyed by the
+    # Message.function string (e.g. 'group_partition_probe'). Mirrors the
+    # C adapter's scan of the engine's captured[] for the same function.
+    emit_tally: dict[str, int] = field(default_factory=dict)
 
     def drain_outbox(self) -> list[CapturedMessage]:
         captured: list[CapturedMessage] = []
@@ -121,6 +128,26 @@ class _Participant:
                 if count != expected:
                     raise AssertionError(
                         f'{self.id}: peer_caps_count={count}, expected {expected}'
+                    )
+            elif key == 'partition_probes_emitted':
+                # Number of group_partition_probe messages this participant
+                # emitted over the whole scenario. The signal-cooldown
+                # scenario delivers N partition_signals from the same
+                # from_addr and asserts the 10s per-addr cooldown collapses
+                # them to a single emitted probe. C mirrors this by scanning
+                # the engine's captured[] for (from==self, function==probe).
+                actual = self.emit_tally.get(IdentityProtocol.partition_probe, 0)
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: partition_probes_emitted={actual}, '
+                        f'expected {expected}'
+                    )
+            elif key == 'partition_responses_emitted':
+                actual = self.emit_tally.get(IdentityProtocol.partition_response, 0)
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: partition_responses_emitted={actual}, '
+                        f'expected {expected}'
                     )
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
@@ -257,6 +284,20 @@ class IdentityAdapter:
             )
             identities[pid] = identity
 
+        # Distinct-group mode (partition-recovery scenarios): when
+        # `fixtures.groups` is present, every listed participant gets its
+        # OWN group with a pinned uuid and a fixed member count, and peers
+        # are NOT cross-populated. That is what makes a split-brain
+        # reproducible — each peer sees the other's group traffic as
+        # foreign. See doc/architecture/partition-recovery.md §9.
+        groups_fix: dict[str, Any] = fixtures.get('groups', {}) or {}
+        distinct_groups = bool(groups_fix)
+        group_by_pid: dict[str, Group] = {}
+        if distinct_groups:
+            for gi, (pid, spec_g) in enumerate(groups_fix.items()):
+                group_by_pid[pid] = self._build_group_from_fixture(
+                    pid, gi, identities[pid], spec_g)
+
         # All participants except the newcomer share the same group key in
         # Phase C scenarios. Newcomer is detected as the participant with role
         # `new_node`, mirroring the canonical scenario's role naming.
@@ -266,7 +307,7 @@ class IdentityAdapter:
         )
         existing_pids = [s['id'] for s in spec_participants if s['id'] != newcomer_pid]
         group: Group | None = None
-        if existing_pids:
+        if existing_pids and not distinct_groups:
             seed = identities[existing_pids[0]]
             group = Group(seed.uuid, {seed.uuid: seed.address}, 'conformance-grp',
                           Encryptor.generate(), False)
@@ -286,13 +327,15 @@ class IdentityAdapter:
             role = spec['role']
             identity = identities[pid]
             peers = Peers()
-            for other_pid in existing_pids:
-                if other_pid == pid:
-                    continue
-                peers.add(identities[other_pid])
-            if amnesia_known and pid in existing_pids and newcomer_pid is not None:
-                peers.add(identities[newcomer_pid])
-            participant = self._build_one(pid, role, identity, peers, group)
+            if not distinct_groups:
+                for other_pid in existing_pids:
+                    if other_pid == pid:
+                        continue
+                    peers.add(identities[other_pid])
+                if amnesia_known and pid in existing_pids and newcomer_pid is not None:
+                    peers.add(identities[newcomer_pid])
+            this_group = group_by_pid.get(pid) if distinct_groups else group
+            participant = self._build_one(pid, role, identity, peers, this_group)
             # Install own-capability allowlist from fixtures.capabilities;
             # mirrors the C adapter's `identity_set_own_capabilities`
             # plumbing. handle_caps_query reads
@@ -334,6 +377,33 @@ class IdentityAdapter:
         ns = UUID('00000000-0000-0000-0000-000000000aaa')
         from uuid import uuid5
         return uuid5(ns, f'at-conformance:{pid}')
+
+    def _build_group_from_fixture(self, pid: str, group_index: int,
+                                  identity: Identity,
+                                  spec: dict[str, Any]) -> Group:
+        """Build a distinct Group for a partition-recovery participant.
+
+        `spec` is `fixtures.groups[pid]` — `{uuid: <str>, size: <int>}`.
+        The group is seeded with the participant's own (uuid -> address)
+        and padded with `size - 1` synthetic filler members so
+        `len(group.addresses) == size`, which is the value the partition
+        handlers sign and compare. The group uuid is pinned so the
+        equal-size uuid tiebreak in `handle_partition_response` is
+        deterministic (and identical to the C harness, which pins the
+        same string). Filler addresses must be distinct — `add_address`
+        dedups by address.
+        """
+        from uuid import uuid5
+        group_uuid = UUID(spec['uuid']) if spec.get('uuid') else identity.uuid
+        size = int(spec.get('size', 1))
+        grp = Group(group_uuid, {identity.uuid: identity.address},
+                    f'grp-{pid}', Encryptor.generate(), False)
+        ns = UUID('00000000-0000-0000-0000-000000000aaa')
+        for k in range(max(0, size - 1)):
+            filler_uuid = uuid5(ns, f'at-conformance-fill:{pid}:{k}')
+            filler_addr = f'10.9.{group_index}.{k + 2}'
+            grp.add_address(filler_uuid, filler_addr)
+        return grp
 
     def _build_one(self, pid: str, role: str, identity: Identity,
                    peers: Peers, group: Group | None) -> _Participant:
@@ -399,6 +469,8 @@ class IdentityAdapter:
         def _record_and_put(item, *args, **kwargs):
             if isinstance(item, Message):
                 captured.outbox_buffer.append(item)
+                captured.emit_tally[item.function] = \
+                    captured.emit_tally.get(item.function, 0) + 1
             original_put(item, *args, **kwargs)
 
         queues[CfgIds.network].put = _record_and_put  # type: ignore[method-assign]

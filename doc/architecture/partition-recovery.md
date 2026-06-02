@@ -388,6 +388,45 @@ Concrete deltas:
 Expected end state: 117/117 (or whatever the new total is) each side,
 0 asymmetric, `--strict-coverage` clean — same bar as v1.
 
+**Status (2026-06-02) — DONE.** Three scenarios landed under
+`conformance/scenarios/identity/`:
+`group-partition-recovery-basic.yaml` (full
+signal→probe→response→request_access trigger),
+`group-partition-recovery-size-tie.yaml` (equal-size groups, deterministic
+uuid tiebreak), and `group-partition-recovery-signal-cooldown.yaml` (flood
+bounded by the 10 s per-from_addr probe cooldown). Corpus is **129/129 each
+side, 0 asymmetric, `--strict-coverage` clean**.
+
+Two adapter additions were needed (mirrored in Python and C):
+
+- **Distinct-group fixtures** (`fixtures.groups: { <pid>: { uuid, size } }`):
+  each listed participant gets its OWN group of the given size with peers
+  NOT cross-populated — the split-brain precondition. Pinned uuids make the
+  equal-size tiebreak deterministic and identical across harnesses.
+- **`partition_probes_emitted` observable** (per-participant count of emitted
+  probes) for the cooldown scenario, plus `in_response_to_id` (a
+  participant-id payload key resolved to that peer's runtime uuid) so the
+  probe→response chain works under the C engine's rebuild-on-propagate model.
+
+**The corpus schema stays at `"1"`** — the YAML structure did not change, so
+no v2 bump (this supersedes §9's original "bump to v2" note and matches the
+later corpus-state decision).
+
+**Two latent C bugs surfaced and fixed** (the corpus doing its job):
+
+1. `net_msg_pack_json` called `json_dumps` without `JSON_ENCODE_ANY`, so a
+   bare-string IPC payload (the `partition_signal` from_addr, §5.1) failed to
+   serialize and the probe was never emitted — broken in production
+   `net_proc.c` too, not just the harness. Fixed by adding
+   `JSON_ENCODE_ANY` / `JSON_DECODE_ANY` to the shared pack/unpack helpers.
+2. `signature_publish` / `encryptor_publish` malloc'd exactly `KEYBYTES*2`
+   and copied that many bytes, dropping the NUL terminator that `public_hex`
+   carries. `json_string()` in `public_identity_to_json` then over-read the
+   heap, so `public_identity_from_json` rejected the round-tripped key and
+   probe/response signature verification failed. Fixed by copying the
+   terminator (`*2 + 1`). Latent everywhere a published identity is
+   round-tripped + decoded; this is the first conformance case that does so.
+
 ## 10. Sequencing & owner notes
 
 Implementation order (one commit chain, but multiple sessions):
