@@ -315,6 +315,27 @@ int identity_get_peer_caps_count(const uuid_t uuid)
     return n;
 }
 
+void identity_install_peer_caps(const uuid_t uuid,
+                                const char *const *caps, size_t n_caps)
+{
+    _ensure_id_init();
+    array_t *arr = NULL;
+    if (array_create(&arr) != 0 || arr == NULL)
+        return;
+    for (size_t i = 0; i < n_caps; i++) {
+        if (caps[i] == NULL) continue;
+        data_t *str_dat = string_data((char *)caps[i], strlen(caps[i]));
+        if (str_dat != NULL)
+            array_append(arr, str_dat);
+    }
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(uuid, uuid_str);
+    data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.peer_caps_map, uuid_str, arr_dat);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
 /****************************
  * Internal helpers
  ****************************/
@@ -2533,6 +2554,71 @@ static int _partition_broadcast(const process_t *proc, generic_msg_t *buf)
     return ret;
 }
 
+/****************************
+ * Helper: _periodic_caps_resync
+ *
+ * Periodic backstop for the late-joiner capability-loss UDP case. Mirrors
+ * Python's IdentityProcess._periodic_caps_resync (idprocess.py) — see
+ * memory feedback_late_joiner_caps, layer 7.
+ *
+ * The confirm-time directed caps_query (handle_confirm_peer →
+ * _send_caps_query) recovers a peer whose announce was lost, but it is a
+ * ONE-SHOT; if that query OR its caps_response is also dropped over UDP,
+ * the peer stays in proc->protocol.peers[] yet absent from
+ * id_state.peer_caps_map — invisible to cap-driven discovery. This sweep
+ * re-sends caps_query to every admitted peer with ZERO registered caps.
+ *
+ * Self-limiting: a peer with any cap is skipped, so a converged group
+ * emits nothing. Reuses the existing reliable directed query/response —
+ * NO new wire message, so Python/C wire parity (conformance corpus) is
+ * unaffected. Bounded at CAPS_RESYNC_MAX_PER_SWEEP so a large degraded
+ * group can't burst the network queue. Cap-less peers are snapshotted
+ * under the peers read-lock (cap-count check nests id_state.lock, which
+ * is safe: no path holds id_state.lock then takes the peers write-lock),
+ * then queried after the lock is released.
+ ****************************/
+void identity_periodic_caps_resync(const process_t *proc)
+{
+    if (proc == NULL) return;
+    /* Only when operational and actually in a group (mirror Python's
+     * `phase == 3 and group is not None and not choosing`). */
+    if (proc->protocol.phase != 3) return;
+    if (proc->protocol.group.uuid[0] == 0
+        && map_size(&((process_t *)proc)->protocol.group.address_map) == 0)
+        return;
+    pthread_mutex_lock(&id_state.lock);
+    bool choosing = id_state.choosing_group;
+    pthread_mutex_unlock(&id_state.lock);
+    if (choosing) return;
+
+    const identity_t *self = _partition_self_identity(proc);
+
+    public_identity_t capless[CAPS_RESYNC_MAX_PER_SWEEP];
+    size_t cnt = 0;
+    peers_read_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    for (size_t i = 0; i < n && cnt < CAPS_RESYNC_MAX_PER_SWEEP; i++) {
+        const public_identity_t *peer = &proc->protocol.peers[i];
+        if (self != NULL && uuid_compare(peer->uuid, self->uuid) == 0)
+            continue;
+        if (identity_get_peer_caps_count(peer->uuid) > 0)
+            continue;
+        memcpy(&capless[cnt++], peer, sizeof(public_identity_t));
+    }
+    peers_read_unlock(proc);
+
+    for (size_t i = 0; i < cnt; i++)
+        _send_caps_query(proc, &capless[i]);
+    if (cnt > 0) {
+        char cnt_str[16];
+        snprintf(cnt_str, sizeof(cnt_str), "%zu", cnt);
+        probes_counter("peer.set", "caps_resync_query", cnt_str);
+        log_debug(proc->logger,
+                  "Identity: caps resync re-queried %zu cap-less peer(s)\n",
+                  cnt);
+    }
+}
+
 static bool handle_partition_signal(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -3071,6 +3157,11 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
     _build_announcement(proc, &announce_buf);
     int announce_interval = 10; /* re-announce every 10 cadence cycles (~5s) */
     int cycle = 0;
+    /* Late-joiner cap-loss backstop: re-query cap-less peers every
+     * ~20s (≈40 cadence cycles), matching Python's
+     * _CAPS_RESYNC_INTERVAL_SEC=20. See _periodic_caps_resync. */
+    int caps_resync_interval = 40;
+    int caps_cycle = 0;
 
     while (keep_running(proc, &pctx.sig_q, logger))
     {
@@ -3085,6 +3176,15 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
             cycle = 0;
             messaging_send("network", NET_MESSAGE, &announce_buf, false);
             log_debug(logger, "Identity: re-announcing (no peers yet)\n");
+        }
+
+        /* Periodic late-joiner cap-loss backstop (interval-gated so the
+         * fast loop doesn't sweep every iteration; a converged group
+         * emits no queries). */
+        if (++caps_cycle >= caps_resync_interval)
+        {
+            caps_cycle = 0;
+            identity_periodic_caps_resync(proc);
         }
 
         generic_msg_t buf = {0};

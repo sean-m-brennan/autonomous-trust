@@ -156,6 +156,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self._partition_probe_cooldown: dict[str, datetime] = {}
         self._partition_response_cooldown: dict[str, datetime] = {}
         self._partition_recovery_in_progress: Optional[tuple[str, datetime]] = None
+        # Late-joiner capability-loss backstop (see feedback_late_joiner_caps):
+        # the confirm-time directed caps_query is a one-shot; if it OR its
+        # response is lost in UDP, a peer stays in self.peers but invisible to
+        # cap-driven discovery. This timestamp paces a periodic re-query sweep
+        # over cap-less peers. Set on first process() iteration (post-fork).
+        self._last_caps_resync: Optional[datetime] = None
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
         self.protocol.register_handler(IdentityProtocol.accept, self.handle_acceptance)
         self.protocol.register_handler(IdentityProtocol.history, self.receive_history)
@@ -1165,6 +1171,65 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.report_exception(err, 'handle_caps_response')
         return True
 
+    # How often the cap-resync sweep runs, and the max queries it emits per
+    # sweep (so a large degraded group can't burst the network queue). The
+    # interval is long relative to the q_cadence loop so steady-state cost is
+    # negligible; a converged group emits zero queries (every peer has caps).
+    _CAPS_RESYNC_INTERVAL_SEC = 20.0
+    _CAPS_RESYNC_MAX_PER_SWEEP = 16
+
+    def _periodic_caps_resync(self, queues):
+        """Periodic backstop for the late-joiner UDP-loss case.
+
+        The confirm-time directed ``caps_query`` (``handle_confirm_peer``)
+        recovers a peer whose ``announce`` was lost — but it is a one-shot.
+        If that query or its ``caps_response`` is also dropped (UDP across
+        the docker bridge), the peer stays in ``self.peers`` yet absent from
+        ``peer_capabilities``, so cap-driven discovery (DataRcvr's stream
+        subscription, negotiation participant lookup) never sees it. This
+        sweep re-sends ``caps_query`` to every admitted peer that has NO
+        capabilities registered, every ``_CAPS_RESYNC_INTERVAL_SEC``, until
+        the caps arrive.
+
+        Self-limiting: a peer with any registered cap is skipped, so a
+        converged group emits nothing. Idempotent: ``handle_caps_response``
+        already per-cap-dedups, so a redundant re-query is harmless. Reuses
+        the existing reliable directed query/response — no new wire message,
+        so Python/C wire parity is unaffected.
+        """
+        if self.phase != 3 or self.group is None or self.choosing:
+            return
+        try:
+            with self.lock:
+                if self.peers is None:
+                    return
+                # uuids that already have at least one cap registered
+                known = set()
+                for _cap, uuids in self.peer_capabilities.items():
+                    known.update(str(u) for u in uuids)
+                self_uuid = str(self.identity.uuid)
+                capless = [
+                    peer for peer in self.peers.all
+                    if str(peer.uuid) != self_uuid
+                    and str(peer.uuid) not in known
+                ]
+            if not capless:
+                return
+            sent = 0
+            for peer in capless:
+                if sent >= self._CAPS_RESYNC_MAX_PER_SWEEP:
+                    _probes.counter('peer.set', 'caps_resync_truncated',
+                                    str(len(capless) - sent))
+                    break
+                self._send_caps_query(queues, peer)
+                sent += 1
+            _probes.counter('peer.set', 'caps_resync_query', str(sent))
+            self.logger.debug(
+                'Caps resync: re-queried %d cap-less peer(s)' % sent)
+        except Exception as err:
+            _probes.counter('peer.set', 'caps_resync_exc')
+            self.report_exception(err, '_periodic_caps_resync')
+
     def handle_history_diff(self, queues, message):
         """
         Receive a history diff, possibly merge
@@ -1606,6 +1671,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.logger.debug('Phase %s' % self.phase)
                     phase = self.phase
                 self.vote_response(queues)
+
+                # Periodic late-joiner cap-loss backstop. Interval-gated so
+                # the fast drain loop doesn't run it every iteration; a
+                # converged group emits no queries. See
+                # _periodic_caps_resync / feedback_late_joiner_caps.
+                tick = now()
+                if (self._last_caps_resync is None
+                        or (tick - self._last_caps_resync).total_seconds()
+                        >= self._CAPS_RESYNC_INTERVAL_SEC):
+                    self._last_caps_resync = tick
+                    self._periodic_caps_resync(queues)
 
                 untouched = []
                 while len(self.messages) > 0:
