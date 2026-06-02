@@ -71,6 +71,27 @@ void identity_set_own_capabilities(const process_t *proc,
  *  `peer_caps_count` expected_state key. */
 int identity_get_peer_caps_count(const uuid_t uuid);
 
+/** Test accessor: install @p n_caps capability names for @p uuid directly
+ *  into the shared peer_caps_map, bypassing the caps_response wire path.
+ *  Mirrors how handle_caps_response populates the map. Used by the
+ *  late-joiner cap-resync unit test to set up cap-less vs cap-bearing
+ *  peers. Strings are copied. */
+void identity_install_peer_caps(const uuid_t uuid,
+                                const char *const *caps, size_t n_caps);
+
+/** Max directed caps_query emissions per resync sweep — bounds the burst
+ *  a large degraded group can put on the network queue. */
+#define CAPS_RESYNC_MAX_PER_SWEEP 16
+
+/** Periodic backstop for the late-joiner capability-loss UDP case:
+ *  re-send a directed caps_query to every admitted peer in
+ *  @p proc->protocol.peers[] that has ZERO registered caps. Mirrors
+ *  Python's IdentityProcess._periodic_caps_resync. Invoked from
+ *  identity_run's main loop on an interval; exposed here so the unit
+ *  test can drive it directly. Self-limiting and bounded
+ *  (CAPS_RESYNC_MAX_PER_SWEEP). See memory feedback_late_joiner_caps. */
+void identity_periodic_caps_resync(const process_t *proc);
+
 /** Return the reputation-derived trust tier last published for @p uuid
  *  via the ID_TIER local-IPC handler (handle_tier_update). Returns 0 if
  *  no entry exists. The map is populated by ReputationProcess crossing
