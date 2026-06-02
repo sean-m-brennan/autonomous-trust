@@ -1,0 +1,105 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-partition-recovery-basic
+byte_pinning: false
+description: |
+    Group partition recovery — the full probe / response / request_access
+    trigger sequence from doc/architecture/partition-recovery.md §5 and §9.
+
+    Two peers come up in DIFFERENT groups on the same multicast domain
+    (the dod_mission split-brain). `fixtures.groups` puts peer_a in a
+    size-3 group and peer_b in a size-1 group, with no shared membership,
+    so each sees the other's group traffic as foreign.
+
+    Sequence (one handler cascade per step):
+      1. peer_b's NetProcess drops a cross-group frame from peer_a's
+         address and pushes a `partition_signal` (local IPC). peer_b's
+         IdentityProcess emits a `group_partition_probe` carrying its own
+         group (uuid + size=1).
+      2. peer_a receives the probe, verifies the signature, sees the
+         sender is not in its group, and replies with a
+         `group_partition_response` carrying ITS group (uuid + size=3).
+      3. peer_b receives the response, finds peer_a's group larger
+         (3 > 1), marks recovery in flight, and re-broadcasts
+         `request_access` toward peer_a's group — re-entering the normal
+         welcoming-committee flow.
+      4. The emitted `request_access` is the recovery trigger. Asserted
+         with `no_propagate` — the subsequent admission + full_history +
+         _merge_to_mesh is the existing new-node-admission path and is out
+         of scope for this partition-trigger pin.
+
+    Group uuids are pinned (peer_a `0a..` < peer_b `0b..`) so the
+    equal-size tiebreak in `group-partition-recovery-size-tie` is
+    deterministic and identical across the Python and C harnesses; here
+    the size difference alone decides the adoption.
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-000000000001"
+      size: 3
+    peer_b:
+      uuid: "0b000000-0000-4000-8000-000000000002"
+      size: 1
+
+steps:
+  - id: 1
+    from: peer_a
+    to: peer_b
+    function: partition_signal
+    payload:
+      from_addr: "10.7.7.7:6000"
+    description: |
+        Local IPC into peer_b: a group frame arrived from peer_a's address
+        that peer_b could not decrypt (foreign group). peer_b emits a
+        partition_probe announcing its own group (uuid 0b.., size 1).
+
+  - id: 2
+    from: peer_b
+    to: peer_a
+    function: group_partition_probe
+    in_response_to: 1
+    payload:
+      group_uuid: "0b000000-0000-4000-8000-000000000002"
+      group_size: 1
+    description: |
+        Assert peer_b broadcast the probe, then deliver it to peer_a.
+        peer_a verifies the probe signature, sees peer_b is not a member
+        of its group, and replies with a partition_response.
+
+  - id: 3
+    from: peer_a
+    to: peer_b
+    function: group_partition_response
+    in_response_to: 2
+    payload:
+      group_uuid: "0a000000-0000-4000-8000-000000000001"
+      group_size: 3
+      in_response_to_id: peer_b
+    description: |
+        Assert peer_a broadcast the response (advertising its size-3
+        group), then deliver it to peer_b. peer_b finds 3 > 1, adopts,
+        and re-broadcasts request_access toward peer_a's group.
+
+  - id: 4
+    from: peer_b
+    to: broadcast
+    function: request_access
+    in_response_to: 3
+    no_propagate: true
+    description: |
+        The request_access re-broadcast is the partition-recovery trigger.
+        Verified-only (no_propagate): the welcoming-committee admission it
+        re-enters is the existing new-node-admission path, pinned
+        elsewhere.
+
+expected_state:
+  peer_b:
+    partition_probes_emitted: 1
