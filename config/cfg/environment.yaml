@@ -51,6 +51,6 @@ dependencies:
   - pyproj
   - cryptography
   - pip
-  - pip:
-      #- mediapipe
-      #- parrot-olympe # uses an old version of protobuf
+  # pip packages currently disabled:
+  #   - mediapipe
+  #   - parrot-olympe  # uses an old version of protobuf

@@ -1,0 +1,46 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: propose-vote-admit
+byte_pinning: false
+description: |
+    Propose→vote happy path — the positive control for the sybil/blacklist
+    guard. alice (a border guard) proposes the newcomer to bob (another border
+    guard) via a propose_peer message carrying the candidate's full public
+    identity (uuid + signature/encryptor public keys). bob's handle_vote_on_peer
+    runs the collision and blacklist guards, finds no conflict, and emits one
+    approval vote — votes_emitted == 1.
+
+    This pairs with propose-vote-sybil-uuid (which asserts votes_emitted == 0):
+    together they show the guard is what suppresses the vote, not some unrelated
+    short-circuit.
+
+    Cross-impl timing parity: Python queues the vote in confirmed_block during
+    _process_id and only sends it on the next vote_response phase-3 cycle, so the
+    harness ticks vote_response after the propose dispatch to flush it. C sends
+    the vote in-handler (synchronous_dispatch). Both converge on one vote_on_peer
+    emitted by bob.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: propose_peer
+    payload:
+      candidate: newcomer
+    description: |
+        alice proposes newcomer to bob. newcomer is not in bob's peer list, so
+        neither the UUID/signature/encryptor collision guard nor the blacklist
+        guard fires — bob votes to admit.
+
+expected_state:
+  bob:
+    votes_emitted: 1
