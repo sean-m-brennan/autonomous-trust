@@ -271,6 +271,22 @@ from validation import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+# The consensus reputation baseline for a peer with no committed bilateral
+# history is exactly the neutral 0.5 (see repprocess._consensus_baseline,
+# final fallback). A real EMA over the demo's transaction scores (0.3 for an
+# anomalous batch, 0.8 for a clean one) never lands exactly on 0.5, and a
+# slash floors to 0.1 — so an exact-0.5 reading is the "no information yet"
+# cold-start placeholder, not an earned score. _query_reputations uses this
+# to keep a re-keyed peer's forming/stale uuid from dragging the peer's
+# known reputation down to 0.5 (which drew a sawtooth on the timeline).
+_NEUTRAL_REP_DEFAULT = 0.5
+
+
+def _is_neutral_rep(score: float) -> bool:
+    """True if a reputation reading is the cold-start neutral 0.5 default."""
+    return abs(score - _NEUTRAL_REP_DEFAULT) < 1e-9
+
+
 def _ts_keep(batch_id: str, denom: int) -> bool:
     """Deterministic per-batch decimation for TS submission.
 
@@ -392,6 +408,12 @@ class DoDMissionCoordinator(AutonomousTrust):
         # repprocess.SlashAttestation / reputation-vs-blockchain-analysis.md.
         self._anomaly_streak: dict[str, int] = {}
         self._slashed_peers: set = set()
+        # Peers the scenario has excluded (PEER_EXCLUDE). A forged-identity
+        # sensor is rejected at the ZTA identity layer, so it never forms a
+        # consensus chain and the exclusion slash can't resolve its uuid;
+        # tracking the exclusion here lets _reputations_view floor its
+        # displayed score deterministically (see that method).
+        self._excluded_peers: set = set()
         # Live queues handle, set each tick by autonomous_tasking; used by
         # _on_scenario_event (which has no queues param of its own).
         self._task_queues = None
@@ -679,6 +701,10 @@ class DoDMissionCoordinator(AutonomousTrust):
                 == "PEER_EXCLUDE"):
             peer_name = getattr(event, "peer_name", None)
             if peer_name:
+                # Track the exclusion unconditionally so the dashboard can
+                # floor the score even when the slash below is a no-op (a
+                # forged-identity peer never joins, so its uuid won't resolve).
+                self._excluded_peers.add(peer_name)
                 self._submit_slash(
                     self._task_queues, peer_name,
                     reason=SlashAttestation.REASON_PEER_EXCLUDE,
@@ -773,18 +799,43 @@ class DoDMissionCoordinator(AutonomousTrust):
                 [(str(k)[:8], round(getattr(v, "score", -1), 3))
                  for k, v in list(self.latest_reputation.items())[-5:]])
             DoDMissionCoordinator._logged_first_rep_drain = True
+        # Reconcile entries that resolve to the same display name before
+        # touching the cache/timeline. A peer that re-keys or rejoins (see
+        # the late-joiner handling) can leave a stale/forming uuid in
+        # latest_reputation alongside its live one; the forming uuid scores
+        # the neutral consensus baseline (0.5) while the live uuid carries
+        # the real EMA. The old code fed BOTH to the timeline each cycle, so
+        # a single peer's line drew two points per tick — its real score and
+        # 0.5 — i.e. a sawtooth (and the reputations table flipped to
+        # whichever uuid was iterated last). Collect candidate (score, tier)
+        # per name, then keep ONE representative, preferring a real
+        # (non-neutral) score over the 0.5 placeholder so a known reputation
+        # never jumps to 0.5.
+        candidates: dict[str, list[tuple[float, int]]] = {}
         for peer_id_str, rep in list(self.latest_reputation.items()):
             score = getattr(rep, "score", None)
             if score is None:
                 continue
             peer = peers_by_uuid.get(str(peer_id_str))
-            name = getattr(peer, "nickname", None) or str(peer_id_str)
-            self._reputation_cache[name] = float(score)
-            self._feed_timeline(name, float(score))
+            if peer is None:
+                # A uuid no longer in peers.all — a peer that left, or the
+                # stale identity of one that re-keyed (now deduped out by
+                # Peers.add). Its entry lingers in latest_reputation with a
+                # frozen value; skip it so it doesn't draw an orphan line.
+                continue
+            name = peer.nickname
+            tier = int(getattr(peer, "_tier", 0))
+            candidates.setdefault(name, []).append((float(score), tier))
+
+        for name, vals in candidates.items():
+            real = [v for v in vals if not _is_neutral_rep(v[0])]
+            # Prefer a real score; fall back to the neutral default only when
+            # that's all we have (a genuinely cold/forming peer).
+            score, new_tier = real[-1] if real else vals[-1]
+            self._reputation_cache[name] = score
+            self._feed_timeline(name, score)
             # Stash the peer's trust tier alongside the score so the
-            # dashboard reputations panel can show both. tier defaults
-            # to 0 if the peer object isn't fully resolved yet.
-            new_tier = int(getattr(peer, "_tier", 0))
+            # dashboard reputations panel can show both.
             prev_tier = self._prev_tier_cache.get(name)
             self._tier_cache[name] = new_tier
             if prev_tier is not None and new_tier < prev_tier:
@@ -921,6 +972,41 @@ class DoDMissionCoordinator(AutonomousTrust):
         except Exception:
             logger.debug("reputations-view roster merge failed",
                          exc_info=True)
+        # Deterministic untrusted-floor, mirroring the trust verdict:
+        #   ZTA invalid (forged identity) -> 0.0 (untrusted the moment known)
+        #   excluded but ZTA-valid        -> slash floor (sub-0.5, untrusted)
+        #
+        # PRIMARY MECHANISM (2026-06-03): forged-identity sensors are now
+        # rejected at the IDENTITY LAYER by the ZTA admission gate
+        # (idprocess.welcoming_committee + identity/zta/; provisioned by
+        # tools/provision_zta_certs.py). A rejected peer never joins, never
+        # gets scored, and so never appears in self._reputation_cache — the
+        # `forged_identity` floor below no longer fires in a ZTA-enabled run.
+        # It is retained as a DASHBOARD FALLBACK for ZTA-disabled runs (no
+        # zta_policy / no mission CA): there the hacked sensor would otherwise
+        # sit at the cold-start 0.5 baseline, so we still floor it to 0.0 as
+        # soon as it surfaces a reputation or is excluded (independent of the
+        # scripted PEER_EXCLUDE, which can lag if the bootstrap gate holds the
+        # clock at Setup). Floors only peers already present (or excluded) so
+        # we never conjure an absent peer; min() so we never raise a peer
+        # already lower. Clean sensors untouched. See zta-python-parity.md.
+        # TODO(follow-up): surface the actual ZTA rejection as a dashboard
+        # event (cross-process plumbing from the worker idprocess), then this
+        # fallback can be dropped entirely.
+        for role in self.scenario.peers.values():
+            name = role.name
+            zta_invalid = bool((getattr(role, "metadata", None) or {})
+                               .get("forged_identity"))
+            excluded = name in self._excluded_peers
+            if zta_invalid and (name in reps or excluded):
+                floor = 0.0
+            elif excluded:
+                floor = self._slash_floor
+            else:
+                continue
+            existing = reps.get(name)
+            reps[name] = (min(existing, floor)
+                          if isinstance(existing, (int, float)) else floor)
         return reps
 
     def _push_dashboard_update(self):

@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-x509-admit-valid
+byte_pinning: false
+description: |
+    ZTA X.509 admission — happy path. The border guard runs with a ZTA policy
+    (enabled, require_at_admission, verifier_type x509) trusting the mission CA
+    bundle. The newcomer announces with a credential (drone_alpha.der) issued by
+    that CA, so the welcoming committee verifies the chain and proposes the
+    newcomer for the group vote — propose_emitted == 1.
+
+    Cross-impl: currently SKIPPED on the C side (the C conformance adapter's
+    ZTA wiring is a tracked follow-up); the Python adapter pins this scenario.
+    A skip on one side is not an asymmetric failure (diff_results.py).
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/ca-bundle.pem
+  credentials:
+    newcomer: testdata/zta/certs/drone_alpha.der
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces with a CA-signed credential. bg's welcoming_committee
+        verifies it (VERIFIED) and proceeds to propose the candidate.
+
+expected_state:
+  bg:
+    propose_emitted: 1
