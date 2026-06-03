@@ -1,0 +1,44 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-ddil-defer
+byte_pinning: false
+description: |
+    ZTA DDIL fallback. The verification backend is unreachable — modeled with
+    verifier_type "oidc", whose stub verifier returns UNAVAILABLE on both
+    implementations. With allow_ddil_fallback true, the welcoming committee does
+    NOT drop the newcomer: it admits it (proposes it) under a reputation cap,
+    preserving network formation in disconnected environments. So
+    propose_emitted == 1, exercising the DEFERRED/UNAVAILABLE branch of the gate
+    distinct from the VERIFIED happy path. See zta-integration.md §11 (step 4).
+
+    Cross-impl: currently SKIPPED on the C side (the C conformance adapter's
+    ZTA wiring is a tracked follow-up); the Python adapter pins this scenario.
+    A skip on one side is not an asymmetric failure (diff_results.py).
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    verifier_type: oidc
+    allow_ddil_fallback: true
+    ddil_fallback_reputation_cap: 0.5
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces while ZTA infra is unreachable (oidc stub ->
+        UNAVAILABLE). bg admits under DDIL fallback and proposes the candidate.
+
+expected_state:
+  bg:
+    propose_emitted: 1

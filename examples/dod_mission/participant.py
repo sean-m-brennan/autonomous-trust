@@ -520,6 +520,36 @@ class DoDMissionParticipant(AutonomousTrust):
         pass
 
 
+def _attach_zta_credential(cfg_dir: str) -> None:
+    """Bind a provisioned ZTA credential to this peer's identity.
+
+    ``tools/provision_zta_certs.py`` writes ``zta_credential.der`` into each
+    peer's config dir — a mission-CA-signed cert for legitimate peers, or a
+    rogue/absent credential for the hacked leave-behind sensors. Loading it
+    onto the identity here means the peer's announce carries it, so the
+    welcoming committee's ZTA gate (idprocess.welcoming_committee) verifies it
+    at admission against the receiver's ``zta_policy`` — rejecting the forged
+    sensors at the identity layer instead of merely flooring them on the
+    dashboard. No-op when no credential file is present (ZTA-disabled runs).
+    """
+    cred_file = Path(cfg_dir) / "zta_credential.der"
+    if not cred_file.is_file():
+        return
+    from autonomous_trust.core.identity import Identity  # local: heavy import
+    id_file = Path(cfg_dir) / ("identity" + Identity.file_ext)
+    if not id_file.is_file():
+        return
+    try:
+        ident = Identity.from_file(str(id_file))
+        ident.zta_credential = cred_file.read_bytes()
+        ident.to_file(str(id_file))
+        logger.info("Attached ZTA credential (%d bytes) to identity in %s",
+                    len(ident.zta_credential), cfg_dir)
+    except Exception:
+        logger.warning("Failed to attach ZTA credential from %s", cred_file,
+                       exc_info=True)
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -565,6 +595,7 @@ def main():
     os.makedirs(dat_dir, exist_ok=True)
 
     generate_identity(cfg_dir, preserve=True, defaults=True)
+    _attach_zta_credential(cfg_dir)
 
     # Build the scenario from the same env-var knobs the coordinator uses,
     # so all peers agree on the peer roster (squad_size, swarm_size, ...).

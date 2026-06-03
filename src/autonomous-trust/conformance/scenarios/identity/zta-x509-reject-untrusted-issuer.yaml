@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-x509-reject-untrusted-issuer
+byte_pinning: false
+description: |
+    ZTA X.509 admission — the "self-signed / unknown-CA" forgery. The newcomer
+    announces a syntactically valid, unexpired certificate (unknown_ca.der) that
+    chains to an issuer NOT in the mission CA bundle. Chain validation fails
+    (REJECTED, "unable to get local issuer certificate"), so the welcoming
+    committee drops the candidate — propose_emitted == 0.
+
+    Cross-impl: currently SKIPPED on the C side (the C conformance adapter's
+    ZTA wiring is a tracked follow-up); the Python adapter pins this scenario.
+    A skip on one side is not an asymmetric failure (diff_results.py).
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/ca-bundle.pem
+  credentials:
+    newcomer: testdata/zta/certs/unknown_ca.der
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces a cert signed by an untrusted CA. bg rejects at
+        admission; no propose is emitted.
+
+expected_state:
+  bg:
+    propose_emitted: 0

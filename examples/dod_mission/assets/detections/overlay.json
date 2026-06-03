@@ -17,21 +17,21 @@
       "world_uid": "compound-alpha",
       "class": "target-building",
       "bbox_extent_m": [40.0, 40.0],
-      "lat": 34.724448,
-      "lon": -86.639802,
+      "lat": 34.72352,
+      "lon": -86.63792,
       "ground_truth_label": "compound-alpha",
       "scenario_role": "mq800-target",
-      "_note": "RQ-86 orbit center; this is the building the MQ-800 is supposed to be designating. Cross-source validators expect target_position_x/y near here."
+      "_note": "The real target building (== scenario.py GROUND_MID). RQ-86 orbit center; the building the MQ-800 is supposed to be designating. Cross-source validators expect target_position_x/y near here."
     },
     {
       "world_uid": "compound-bravo",
       "class": "target-building",
       "bbox_extent_m": [40.0, 40.0],
-      "lat": 34.726971,
-      "lon": -86.636738,
+      "lat": 34.72636,
+      "lon": -86.63414,
       "ground_truth_label": "compound-bravo",
       "scenario_role": "mq800-decoy",
-      "_note": "Decoy. ~396 m NE of compound-alpha (280 m N, 280 m E). Compromised MQ-800 reports detections against this UID; CrossSourceValidator catches the position disagreement (threshold 50 m, validation.py:41-50)."
+      "_note": "Decoy building the compromised MQ-800 designates instead of the target. ~467 m NE of compound-alpha (315 m N, 345 m E) — far past the 50 m CrossSourceValidator threshold so the faked designation reads as an unmistakable lie, not a statistical/sensor anomaly. The validator catches the position disagreement (validation.py:41-50)."
     },
     {
       "world_uid": "sensor-1-site",

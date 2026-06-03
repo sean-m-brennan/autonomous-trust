@@ -99,12 +99,15 @@ class RoleFOV:
 
 # Per-peer view-centre override (lat, lon), used when a peer's roster
 # position is outside the AO panorama. MQ-800's roster ingress is
-# 3.4 km east of the AO; for v1 we pin its detection vantage ~500 m
-# east of compound-alpha so its 600 m oblique FOV catches the target
-# and the decoy. Microdrones / RQ-86s use their roster positions
-# (no override entry).
+# 3.4 km east of the AO; we pin its detection vantage east of and
+# between compound-alpha (target) and compound-bravo (decoy) so its
+# west-facing (bearing 270deg) 600 m x 600 m FOV catches both: the decoy
+# sits ~196 m forward and the target ~541 m forward, each ~158 m off the
+# centreline (well inside the 300 m half-width). Microdrones / RQ-86s use
+# their roster positions (no override entry). Keep in sync with the
+# compound-alpha/bravo positions in assets/detections/overlay.json.
 DETECTION_VIEW_CENTER_OVERRIDE: dict[str, tuple[float, float]] = {
-    "mq800": (34.724448, -86.634330),
+    "mq800": (34.724940, -86.632000),
 }
 
 

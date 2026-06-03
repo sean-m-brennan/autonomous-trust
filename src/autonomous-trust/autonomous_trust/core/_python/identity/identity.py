@@ -36,7 +36,8 @@ class Identity(InitializableConfig, AgreementVoter):
     enc = encoding
 
     def __init__(self, _uuid, address, _fullname, _nickname, _signature, _encryptor, petname='',
-                 _public_only=True, _rank=0, _block_impl=agreement_impl, _tier=0):
+                 _public_only=True, _rank=0, _block_impl=agreement_impl, _tier=0,
+                 zta_credential=b'', zta_issuer='', zta_credential_hash=b''):
         Configuration.__init__(self, identity_pb2.Identity)
         AgreementVoter.__init__(self, str(_uuid), _rank, _tier=_tier)
         self.address = address  # corresponds to one address in Network config
@@ -47,6 +48,17 @@ class Identity(InitializableConfig, AgreementVoter):
         self.petname = petname
         self._public_only = _public_only
         self._block_impl = _block_impl
+        # ZTA credential binding (identity.proto fields 6-8; parity with C
+        # public_identity_t, identity.c:349-398). The credential is an X.509
+        # cert (DER) issued by the mission CA; it rides the announce/propose/
+        # confirm payloads so the welcoming committee can verify it at
+        # admission (see idprocess.welcoming_committee + identity/zta/). These
+        # are deliberately NOT part of __eq__: credential rotation updates the
+        # binding but must not change identity (zta-integration.md §6). Param
+        # names mirror the stored attributes so config_json_decoder round-trips.
+        self.zta_credential = zta_credential or b''
+        self.zta_issuer = zta_issuer or ''
+        self.zta_credential_hash = zta_credential_hash or b''
         # Reputation-derived trust tier (0..4) is stored on the base
         # AgreementVoter via the __init__ call above (so PoT can read
         # voter.tier directly). The protobuf wire form
@@ -156,7 +168,9 @@ class Identity(InitializableConfig, AgreementVoter):
         return Identity(self.uuid, self.address, self.fullname, self.nickname,
                         Signature(self.signature.publish(), True), Encryptor(self.encryptor.publish(), True),
                         self.petname, True, _rank=self._rank,
-                        _block_impl=self._block_impl)
+                        _block_impl=self._block_impl,
+                        zta_credential=self.zta_credential, zta_issuer=self.zta_issuer,
+                        zta_credential_hash=self.zta_credential_hash)
 
     def sync_to_message(self):
         self.message.uuid = str(self.uuid).encode('utf-8')
@@ -167,6 +181,14 @@ class Identity(InitializableConfig, AgreementVoter):
         self._signature.sync_to_message()
         self._encryptor.message = self.message.encryptor
         self._encryptor.sync_to_message()
+        # ZTA binding (proto fields 6-8). Only set when populated, matching the
+        # C side (identity.c:349-354) which omits empty fields from the proto.
+        if self.zta_credential:
+            self.message.zta_credential = self.zta_credential
+        if self.zta_issuer:
+            self.message.zta_issuer = self.zta_issuer
+        if self.zta_credential_hash:
+            self.message.zta_credential_hash = self.zta_credential_hash
 
     def sync_from_message(self):
         self._uuid = self.message.uuid.decode('utf-8')
@@ -185,6 +207,10 @@ class Identity(InitializableConfig, AgreementVoter):
         self._encryptor.message = identity_pb2.Encryptor()
         self._encryptor.message.CopyFrom(self.message.encryptor)
         self._encryptor.sync_from_message()
+        # ZTA binding (proto fields 6-8); parity with C identity.c:384-398.
+        self.zta_credential = bytes(self.message.zta_credential)
+        self.zta_issuer = self.message.zta_issuer
+        self.zta_credential_hash = bytes(self.message.zta_credential_hash)
 
     @staticmethod
     def initialize(my_name, my_nickname, my_address):
