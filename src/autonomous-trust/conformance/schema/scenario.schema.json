@@ -8,7 +8,7 @@
   "properties": {
     "schema_version": {"type": "string", "enum": ["1"]},
     "kind": {"const": "scenario"},
-    "protocol": {"type": "string", "enum": ["identity", "reputation", "negotiation", "network", "agreement"]},
+    "protocol": {"type": "string", "enum": ["identity", "reputation", "negotiation", "network", "agreement", "bootstrap"]},
     "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
     "description": {"type": "string"},
     "byte_pinning": {

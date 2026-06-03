@@ -33,6 +33,7 @@ from typing import Any
 from ..common.scenario_loader import Case, discover
 
 from .adapters.agreement import AgreementAdapter
+from .adapters.bootstrap import BootstrapAdapter
 from .adapters.identity import IdentityAdapter
 from .adapters.negotiation import NegotiationAdapter
 from .adapters.network import NetworkAdapter
@@ -96,6 +97,7 @@ def _adapters() -> dict[str, Any]:
         'agreement': AgreementAdapter(corpus_root=CORPUS_ROOT),
         'negotiation': NegotiationAdapter(corpus_root=CORPUS_ROOT),
         'reputation': ReputationAdapter(corpus_root=CORPUS_ROOT),
+        'bootstrap': BootstrapAdapter(corpus_root=CORPUS_ROOT),
     }
 
 

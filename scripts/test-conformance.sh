@@ -95,14 +95,37 @@ run_python() {
 # C harness
 # ---------------------------------------------------------------------------
 
+# Build dir the C conformance harness was run in; consumed by run_diff to
+# locate c-latest.json. Set by run_c_harness once it picks ZTA-on vs -off.
+c_build_dir=""
+
 run_c_harness() {
   local c_dir="$here/src/c"
-  local build_dir="$c_dir/build"
 
   if ! command -v cmake >/dev/null 2>&1; then
     echo "ERROR: cmake not found; --c requires cmake on PATH." >&2
     return 2
   fi
+
+  # ZTA: pin the zta-x509-*/zta-ddil-defer scenarios symmetrically (they run
+  # on the C side only under AT_ZTA, which needs OpenSSL). When OpenSSL is
+  # present, build with -DAT_ZTA=ON in a dedicated build-zta/ dir so the
+  # plain build/ stays ZTA-free for dev/ctest. Without OpenSSL, fall back to
+  # build/ with AT_ZTA off — those scenarios then skip on C, which is still
+  # non-asymmetric (diff_results treats a one-side skip as a match), just
+  # unpinned on this side.
+  local cmake_zta_arg=""
+  local build_dir
+  if pkg-config --exists openssl 2>/dev/null \
+     || [[ -f /usr/include/openssl/ssl.h ]]; then
+    build_dir="$c_dir/build-zta"
+    cmake_zta_arg="-DAT_ZTA=ON"
+  else
+    echo "OpenSSL not found; building C conformance without AT_ZTA " \
+         "(zta-x509-* scenarios will skip on the C side)." >&2
+    build_dir="$c_dir/build"
+  fi
+  c_build_dir="$build_dir"
 
   # Cache-staleness guard: if any FILEPATH the cache thinks it knows is
   # missing on disk now (e.g. a system lib was uninstalled, or a conda
@@ -130,14 +153,14 @@ run_c_harness() {
   if [[ ! -d "$build_dir" ]]; then
     echo "Initializing C build dir at $build_dir ..." >&2
     mkdir -p "$build_dir"
-    (cd "$build_dir" && cmake ..)
+    (cd "$build_dir" && cmake .. $cmake_zta_arg)
   else
     # Reuse existing build dir for incremental builds. The compiler launcher
     # set up by AT_CC_VALIDATE_OUTPUT (see src/c/CMakeLists.txt) handles the
     # virtiofs page-cache reconciliation hazard that previously forced us
     # to wipe build/ on every run; refresh the cmake config in case CMake
-    # files changed since last run.
-    (cd "$build_dir" && cmake ..) >/dev/null
+    # files changed since last run (and to apply/keep -DAT_ZTA).
+    (cd "$build_dir" && cmake .. $cmake_zta_arg) >/dev/null
   fi
 
   echo "Building + running C conformance harness ..."
@@ -157,7 +180,7 @@ run_diff() {
     return 0
   fi
 
-  local c_result="$here/src/c/build/conformance/results/c-latest.json"
+  local c_result="${c_build_dir:-$here/src/c/build}/conformance/results/c-latest.json"
   if [[ ! -f "$c_result" ]]; then
     echo "diff: C results not at $c_result; skipping." >&2
     return 0

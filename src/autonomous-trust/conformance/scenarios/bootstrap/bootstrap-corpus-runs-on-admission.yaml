@@ -1,0 +1,56 @@
+schema_version: "1"
+kind: scenario
+protocol: bootstrap
+name: bootstrap-corpus-runs-on-admission
+byte_pinning: false
+description: |
+    BootstrapWorker coverage contract (doc/architecture/trust-tiers.md §6.5).
+    A freshly-admitted peer (`self`), once it has peers, opens a bootstrap
+    window and issues a seeded sequence of pairwise Task invitations against
+    the three tier-0 at.* capabilities (at.handshake / at.time-attest /
+    at.echo-challenge). Over a generous pair budget the uniform-random
+    selector exercises each capability at least once, so the bootstrap corpus
+    seeds reputation from bilateral pairs before any domain capability fires.
+
+    The scenario is not message-driven: the single step is a trigger. Each
+    adapter builds the worker from `fixtures.bootstrap`, ticks it `ticks`
+    times against the peer set (participants minus the host), and asserts the
+    per-host observable.
+
+    Cross-impl: the contract is the RNG-agnostic coverage SET — all three caps
+    fired (bootstrap_caps_fired == 3) and the full pair budget issued
+    (pairs_issued == 30). Python uses random.Random; C uses splitmix64. The
+    two selection sequences differ, but both cover all three caps and issue
+    the same number of pairs over the seeded run, so the observable is
+    symmetric without requiring identical PRNG streams.
+
+participants:
+  - id: self
+    role: new_node
+  - id: peer_a
+    role: border_guard
+  - id: peer_b
+    role: border_guard
+
+fixtures:
+  bootstrap:
+    seed: 12345
+    ticks: 30
+    pairs_target: 30
+    duration_sec: 999
+
+steps:
+  - id: 1
+    from: self
+    to: self
+    function: run_bootstrap_window
+    description: |
+        Trigger: the host runs its post-admission bootstrap window. The
+        adapter ticks the worker `ticks` times; in-handler the worker opens
+        the window on the first tick (peers present) and paces one invitation
+        per tick up to pairs_target.
+
+expected_state:
+  self:
+    bootstrap_caps_fired: 3
+    pairs_issued: 30

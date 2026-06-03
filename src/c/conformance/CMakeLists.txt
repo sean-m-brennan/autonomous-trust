@@ -38,6 +38,7 @@ set(AT_CONFORMANCE_SOURCES
     adapters/agreement.c
     adapters/negotiation.c
     adapters/reputation.c
+    adapters/bootstrap.c
 )
 
 # The corpus YAML lives next to src/c/, under src/autonomous-trust/conformance/.

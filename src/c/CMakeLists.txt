@@ -423,6 +423,8 @@ set(libsrc
     autonomous_trust/network/net_transport_hybrid.c
     autonomous_trust/network/net_transport_registry.c
     autonomous_trust/network/network.c
+    autonomous_trust/bootstrap/bootstrap_capabilities.c
+    autonomous_trust/bootstrap/bootstrap_worker.c
     autonomous_trust/processes/capabilities.c
     autonomous_trust/processes/daemonize.c
     autonomous_trust/processes/process_tracker.c
@@ -903,6 +905,14 @@ add_executable(agreement_test test/agreement_test.c)
 set_source_files_properties(test/agreement_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(agreement_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(bootstrap_capabilities_test test/bootstrap_capabilities_test.c)
+set_source_files_properties(test/bootstrap_capabilities_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(bootstrap_capabilities_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(bootstrap_worker_test test/bootstrap_worker_test.c)
+set_source_files_properties(test/bootstrap_worker_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(bootstrap_worker_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(net_message_test test/net_message_test.c)
 set_source_files_properties(test/net_message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_message_test PRIVATE ${AT_TEST_LIBS})
@@ -1023,6 +1033,8 @@ add_test(NAME rb_test COMMAND $<TARGET_FILE:rb_test>)
 add_test(NAME merkle_test COMMAND $<TARGET_FILE:merkle_test>)
 add_test(NAME dag_test COMMAND $<TARGET_FILE:dag_test>)
 add_test(NAME agreement_test COMMAND $<TARGET_FILE:agreement_test>)
+add_test(NAME bootstrap_capabilities_test COMMAND $<TARGET_FILE:bootstrap_capabilities_test>)
+add_test(NAME bootstrap_worker_test COMMAND $<TARGET_FILE:bootstrap_worker_test>)
 add_test(NAME net_message_test COMMAND $<TARGET_FILE:net_message_test>)
 add_test(NAME socket_helpers_test COMMAND $<TARGET_FILE:socket_helpers_test>)
 add_test(NAME at_jansson_test COMMAND $<TARGET_FILE:at_jansson_test>)
