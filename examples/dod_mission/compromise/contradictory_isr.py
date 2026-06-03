@@ -29,8 +29,14 @@ Two refinement notes:
      pass a negative offset for that generator so the divergence is
      "MQ-800 says 30 dB when everyone else says 55 dB."
 
-Offsets are chosen large enough to trip the validator thresholds:
-  POSITION_VALIDATOR_*:  threshold = 50 m → use offset 80 m
+Offsets are chosen FAR beyond the validator thresholds, so the divergence
+reads unambiguously as a deliberate lie rather than sensor/statistical
+noise (an 80 m offset against a 50 m threshold was only 1.6x over — easy
+for an audience to wave off as GPS jitter):
+  POSITION_VALIDATOR_*:  threshold = 50 m → use offset 300 m (per axis;
+                         ~424 m NE, same heading as the compound-bravo
+                         decoy so the two erroneous reports don't straddle
+                         the true target)
   ELECTRONIC_NOISE:      threshold = 15 dB → use offset -25 dB
 """
 
@@ -63,8 +69,10 @@ from detection import (  # noqa: E402
 # scenario.py (phase "Rogue").
 DEFAULT_ACTIVATE_AT = timedelta(minutes=4, seconds=15)
 
-# Offsets — sized to trip the validators in ../tasks/validation.py.
-DEFAULT_POSITION_OFFSET_M = 80.0
+# Offsets — sized FAR past the validators in ../tasks/validation.py so the
+# erroneous target is visibly, decisively off (not a near-threshold blip
+# that could pass for a statistical anomaly). 300 m per axis ≈ 424 m NE.
+DEFAULT_POSITION_OFFSET_M = 300.0
 DEFAULT_NOISE_OFFSET_DB = -25.0
 
 

@@ -17,6 +17,8 @@ render empty traces with their axes + threshold lines.
 from __future__ import annotations
 
 import logging
+import os
+import queue
 import threading
 from typing import Any, Callable, Optional
 
@@ -36,6 +38,19 @@ from autonomous_trust.inspector.dashboard.narration import (
 
 
 _TICK_MS = 1000
+
+# Bound the dashboard's HTTP worker threads. Werkzeug's dev server (what
+# Dash's app.run uses) spawns one *unbounded* thread per request; the
+# dashboard polls every tick (status bar, every chart, the reputations
+# table, plus the peer-detail iframe reloading its srcDoc), and it runs in
+# the same process as the AutonomousTrust core (already thread/process
+# heavy). Under sustained polling those request threads pile up faster than
+# they retire and the process hits its thread limit:
+#   RuntimeError: can't start new thread
+# A fixed pool caps concurrency — its queue absorbs bursts instead of
+# minting a thread per request. The dashboard is low-concurrency (a handful
+# of viewers), so a small pool is ample. Override via AT_DASH_HTTP_THREADS.
+_SERVER_THREADS = int(os.environ.get("AT_DASH_HTTP_THREADS", "8"))
 
 
 def _narration_div(block: Optional[NarrationBlock]) -> Any:
@@ -311,8 +326,39 @@ def make_app(name: str, title: str,
             # Left column: the square Target-position map + its HTML legend,
             # with the reputations table and event log beneath it.
             html.Div(children=[
-                *([dcc.Graph(id=chart_graph_ids[0],
-                             config={"displayModeBar": False}),
+                *([html.Div(
+                       # Relative wrapper so the cursor lat/lon readout can
+                       # be absolutely positioned over the bottom-left of
+                       # the map. The readout is driven entirely client-side
+                       # (see the map-coord clientside callback below) by the
+                       # underlying MapLibre map's mousemove; it freezes
+                       # (dims) on mouseout.
+                       style={"position": "relative"},
+                       children=[
+                           dcc.Graph(id=chart_graph_ids[0],
+                                     config={"displayModeBar": False}),
+                           html.Div(
+                               id="map-coord-readout",
+                               children="lat —   lon —",
+                               style={
+                                   "position": "absolute",
+                                   "left": "12px",
+                                   "bottom": "12px",
+                                   "zIndex": 1000,
+                                   "padding": "3px 8px",
+                                   "background": "rgba(11,18,32,0.78)",
+                                   "border": "1px solid #334155",
+                                   "borderRadius": "4px",
+                                   "color": "#E2E8F0",
+                                   "font": "12px/1.2 ui-monospace, "
+                                           "SFMono-Regular, Menlo, monospace",
+                                   "whiteSpace": "nowrap",
+                                   # Selectable so the frozen value can be
+                                   # copied; moving onto the chip leaves the
+                                   # map canvas, which freezes the readout.
+                                   "userSelect": "text",
+                               }),
+                       ]),
                    # External legend for the map panel — a sibling div so
                    # CSS controls its horizontal layout (see
                    # _render_map_legend / TargetPositionMapPanel.legend_groups).
@@ -366,6 +412,9 @@ def make_app(name: str, title: str,
         ]),
         html.Div(id="narration-overlay",
                  style={"visibility": presentation_visible_initially}),
+        # Dummy sink for the map cursor-readout clientside callback (the
+        # callback only installs DOM listeners; it never feeds Dash state).
+        dcc.Store(id="map-coord-hook"),
         dcc.Interval(id="tick", interval=_TICK_MS, n_intervals=0),
     ]
     app.layout = html.Div(
@@ -494,6 +543,68 @@ def make_app(name: str, title: str,
             Input("fullscreen-toggle", "n_clicks"),
         )
 
+    # Cursor lat/lon readout over the bottom-left of the Target-position
+    # map.  Plotly's go.Scattermap renders on a MapLibre GL map.  Two
+    # gotchas this callback handles:
+    #   1. dcc.Graph(id="chart-0") renders an OUTER <div id="chart-0">; the
+    #      Plotly graph div (carrying _fullLayout + the map instance) is the
+    #      ".js-plotly-plot" descendant, not the element with the id.
+    #   2. The map subplot is keyed "map" for go.Scattermap (MapLibre) but
+    #      "mapbox" for the legacy go.Scattermapbox; the live MapLibre/Mapbox
+    #      instance hangs off <subplot>._subplot.map, created asynchronously
+    #      after the figure draws.
+    # So we drive this off the tick Interval and retry until the map exists,
+    # attaching the listeners exactly once (guarded by a window flag).  The
+    # listeners write straight to the readout DOM node; the callback's Store
+    # output is an unused sink — Dash state never carries the coordinates.
+    map_graph_id = chart_graph_ids[0] if chart_graph_ids else "chart-0"
+    app.clientside_callback(
+        """
+        function(n_intervals) {
+            var NO = window.dash_clientside.no_update;
+            if (window.__mapCoordHooked) { return NO; }
+            var outer = document.getElementById('__GRAPH_ID__');
+            if (!outer) { return NO; }
+            var gd = outer.classList && outer.classList.contains('js-plotly-plot')
+                     ? outer : outer.querySelector('.js-plotly-plot');
+            var readout = document.getElementById('map-coord-readout');
+            if (!gd || !gd._fullLayout || !readout) { return NO; }  // not drawn yet
+            var fl = gd._fullLayout;
+            // Locate the live MapLibre/Mapbox map.  Try the known subplot keys
+            // first, then fall back to scanning every subplot container for one
+            // whose ._subplot.map quacks like a maplibre map (on + unproject).
+            function isMap(m) {
+                return m && typeof m.on === 'function' &&
+                       typeof m.unproject === 'function';
+            }
+            var map = (fl.map && fl.map._subplot && fl.map._subplot.map) ||
+                      (fl.mapbox && fl.mapbox._subplot && fl.mapbox._subplot.map);
+            if (!isMap(map)) {
+                map = null;
+                for (var k in fl) {
+                    var s = fl[k];
+                    if (s && s._subplot && isMap(s._subplot.map)) {
+                        map = s._subplot.map; break;
+                    }
+                }
+            }
+            if (!isMap(map)) { return NO; }  // not ready yet; retry next tick
+            function fmt(v) { return (v >= 0 ? '+' : '') + v.toFixed(5); }
+            map.on('mousemove', function(e) {
+                readout.style.opacity = '1';
+                readout.textContent =
+                    'lat ' + fmt(e.lngLat.lat) + '   lon ' + fmt(e.lngLat.lng);
+            });
+            // Freeze on exit: keep the last value, dim it to flag it's stale.
+            map.on('mouseout', function() { readout.style.opacity = '0.55'; });
+            window.__mapCoordHooked = true;
+            return NO;
+        }
+        """.replace("__GRAPH_ID__", map_graph_id),
+        Output("map-coord-hook", "data"),
+        Input("tick", "n_intervals"),
+    )
+
     return app
 
 
@@ -515,8 +626,7 @@ def start_in_thread(name: str, title: str,
 
     def _run():
         try:
-            app.run(host=host, port=port,
-                    debug=False, use_reloader=False)
+            _serve_bounded(app, host, port)
         except Exception:
             logging.getLogger(__name__).exception(
                 "Dashboard server crashed")
@@ -525,6 +635,100 @@ def start_in_thread(name: str, title: str,
                          name="dod-dashboard")
     t.start()
     return t
+
+
+def _serve_bounded(app: "dash.Dash", host: str, port: int) -> None:
+    """Serve the Dash WSGI app with a fixed pool of daemon worker threads.
+
+    Two properties this guarantees, both learned the hard way:
+
+    * Bounded: werkzeug's dev server spawns one *unbounded* thread per
+      request; under the dashboard's per-tick polling that exhausts the
+      process thread limit (``can't start new thread``). A fixed worker
+      count caps concurrency; the listen queue absorbs bursts.
+    * Non-blocking shutdown: the workers are plain ``daemon`` threads, NOT a
+      concurrent.futures pool. ThreadPoolExecutor installs a global atexit
+      hook that joins its workers with no timeout at interpreter shutdown —
+      which, when the coordinator catches SIGTERM (Tilt/k8s teardown) and
+      returns from its main loop, can stall the process at exit with the
+      dashboard threads still alive. Daemon threads are simply killed when
+      the interpreter exits, so they can never keep the process running.
+
+    Falls back to Dash's app.run if werkzeug's serving internals aren't
+    shaped as expected on this version, so the dashboard still comes up.
+    """
+    log = logging.getLogger(__name__)
+    try:
+        from werkzeug.serving import make_server, WSGIRequestHandler
+
+        # Disable HTTP/1.1 keep-alive. With keep-alive a persistent
+        # connection holds its handler for the connection's whole lifetime,
+        # so a few idle browser connections (browsers open ~6/host, plus the
+        # peer-detail iframe) would tie up every worker and stall the pool.
+        # HTTP/1.0 closes after each response, so a pooled worker handles one
+        # short request and returns — making the bound depend only on
+        # concurrent in-flight requests, not on how many tabs are open. The
+        # read timeout reaps a connection whose client vanished mid-request
+        # so a worker can't be parked forever.
+        class _Handler(WSGIRequestHandler):
+            protocol_version = "HTTP/1.0"
+            timeout = 30
+
+        # threaded=False: a plain single-threaded BaseWSGIServer whose
+        # synchronous process_request we replace with pool dispatch below.
+        # (We do our own bounded threading, so we want none of werkzeug's
+        # ThreadingMixIn per-request thread spawning.)
+        srv = make_server(host, port, app.server, threaded=False,
+                          request_handler=_Handler)
+
+        # Hand-rolled bounded pool of daemon workers (see docstring for why
+        # not ThreadPoolExecutor). The work queue is bounded so a flood of
+        # connections can't grow it without limit; an over-capacity request
+        # is closed rather than queued forever.
+        work: "queue.Queue" = queue.Queue(maxsize=_SERVER_THREADS * 16)
+
+        def _worker():
+            while True:
+                request, client_address = work.get()
+                try:
+                    srv.finish_request(request, client_address)
+                except Exception:
+                    try:
+                        srv.handle_error(request, client_address)
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        srv.shutdown_request(request)
+                    except Exception:
+                        pass
+
+        for i in range(_SERVER_THREADS):
+            threading.Thread(target=_worker, daemon=True,
+                             name="dod-dash-wsgi-%d" % i).start()
+
+        def _process_request(request, client_address):
+            try:
+                work.put((request, client_address), timeout=5)
+            except queue.Full:
+                # Saturated: drop the connection so the client retries
+                # rather than letting the queue (and latency) grow unbounded.
+                try:
+                    srv.shutdown_request(request)
+                except Exception:
+                    pass
+
+        # Replace the server's synchronous process_request with pool dispatch
+        # so each accepted request runs on a bounded daemon worker, not inline.
+        srv.process_request = _process_request
+        log.info("Dashboard serving on %s:%d with %d HTTP worker threads",
+                 host, port, _SERVER_THREADS)
+        srv.serve_forever()
+    except Exception:
+        log.exception(
+            "Bounded dashboard server setup failed; "
+            "falling back to app.run (unbounded threads)")
+        app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
 def feed_timeline_sample(panels: dict[str, Any],

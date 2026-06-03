@@ -45,6 +45,7 @@ from autonomous_trust.core.identity.encrypt import Encryptor
 from autonomous_trust.core.identity.idprocess import IdentityProcess
 from autonomous_trust.core.identity.protocol import IdentityProtocol
 from autonomous_trust.core.identity.sign import Signature
+from autonomous_trust.core.identity.zta import ZtaPolicy
 from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.network.network import Network
 from autonomous_trust.core.processes import ProcessTracker
@@ -148,6 +149,17 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: partition_responses_emitted={actual}, '
                         f'expected {expected}'
+                    )
+            elif key == 'propose_emitted':
+                # Number of `propose` messages this (border-guard) participant
+                # emitted. A welcomed newcomer triggers exactly one propose; a
+                # ZTA-rejected newcomer triggers none — so this is the
+                # admit/reject observable for the zta-x509-* scenarios. C
+                # mirrors by scanning captured[] for (from==self, propose).
+                actual = self.emit_tally.get(IdentityProtocol.propose, 0)
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: propose_emitted={actual}, expected {expected}'
                     )
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
@@ -284,6 +296,29 @@ class IdentityAdapter:
             )
             identities[pid] = identity
 
+        # ZTA credential binding (zta-x509-* scenarios): attach each
+        # participant's X.509 credential (DER) from fixtures.credentials so its
+        # announce carries it. A participant absent from the map announces with
+        # no credential (the "unsigned" forgery). Paths resolve against the
+        # corpus root, like fixtures.keys. See doc/architecture/zta-python-parity.md §7.
+        cred_fix: dict[str, str] = fixtures.get('credentials', {}) or {}
+        for pid, rel in cred_fix.items():
+            if pid in identities and rel:
+                with open(self.corpus_root / rel, 'rb') as fp:
+                    identities[pid].zta_credential = fp.read()
+
+        # ZTA policy (zta-x509-* scenarios): a single policy applied to every
+        # participant's IdentityProcess (the border guards consult it at
+        # admission). ca_bundle_path resolves against the corpus root. Mirrors
+        # the C adapter wiring proc->configs["zta_policy"].
+        zta_policy: ZtaPolicy | None = None
+        zta_fix = fixtures.get('zta_policy')
+        if isinstance(zta_fix, dict):
+            spec = dict(zta_fix)
+            if spec.get('ca_bundle_path'):
+                spec['ca_bundle_path'] = str(self.corpus_root / spec['ca_bundle_path'])
+            zta_policy = ZtaPolicy(**spec)
+
         # Distinct-group mode (partition-recovery scenarios): when
         # `fixtures.groups` is present, every listed participant gets its
         # OWN group with a pinned uuid and a fixed member count, and peers
@@ -335,7 +370,8 @@ class IdentityAdapter:
                 if amnesia_known and pid in existing_pids and newcomer_pid is not None:
                     peers.add(identities[newcomer_pid])
             this_group = group_by_pid.get(pid) if distinct_groups else group
-            participant = self._build_one(pid, role, identity, peers, this_group)
+            participant = self._build_one(pid, role, identity, peers, this_group,
+                                          zta_policy=zta_policy)
             # Install own-capability allowlist from fixtures.capabilities;
             # mirrors the C adapter's `identity_set_own_capabilities`
             # plumbing. handle_caps_query reads
@@ -406,7 +442,8 @@ class IdentityAdapter:
         return grp
 
     def _build_one(self, pid: str, role: str, identity: Identity,
-                   peers: Peers, group: Group | None) -> _Participant:
+                   peers: Peers, group: Group | None,
+                   zta_policy: ZtaPolicy | None = None) -> _Participant:
         net_sink: list[Any] = []
         main_sink: list[Any] = []
         neg_sink: list[Any] = []
@@ -426,6 +463,10 @@ class IdentityAdapter:
             PackageHash.key: self._package_hash,
             'processes': [_FakeDep(CfgIds.network)],
         }
+        # ZTA admission policy (zta-x509-* scenarios). IdentityProcess._zta_policy
+        # reads configs[ZtaPolicy.CONFIG_KEY]; mirrors the C proc->configs entry.
+        if zta_policy is not None:
+            configurations[ZtaPolicy.CONFIG_KEY] = zta_policy
 
         process = IdentityProcess(
             configurations,

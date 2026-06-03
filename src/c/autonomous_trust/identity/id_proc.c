@@ -777,12 +777,19 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
 #ifdef AT_ZTA_ENABLED
     /* ZTA credential verification at admission */
     {
-        /* Look up ZTA policy from configs */
-        data_t *zta_cfg = NULL;
+        /* Look up ZTA policy from configs. Values are object_ptr_data(config_t)
+         * (load_all_configs), so unwrap data_t -> config_t -> data_struct,
+         * exactly as the "identity" config is read above. (A prior direct
+         * cast of the data_t wrapper to zta_policy_t* read garbage — the
+         * policy fields landed on the data_t header.) */
+        data_t *zta_dat = NULL;
+        config_t *zta_cfg = NULL;
         zta_policy_t *zta_policy = NULL;
         char zta_key[] = "zta_policy";
-        if (map_get(proc->configs, zta_key, &zta_cfg) == 0 && zta_cfg)
-            zta_policy = (zta_policy_t *)zta_cfg;
+        if (map_get(proc->configs, zta_key, &zta_dat) == 0 && zta_dat
+            && data_object_ptr(zta_dat, (void **)&zta_cfg) == 0
+            && zta_cfg != NULL && zta_cfg->data_struct != NULL)
+            zta_policy = (zta_policy_t *)zta_cfg->data_struct;
 
         if (zta_policy && zta_policy->enabled && zta_policy->require_at_admission) {
             zta_verifier_t *verifier = NULL;
@@ -1518,6 +1525,30 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
         json_decref(payload);
         log_warn(proc->logger, "Identity: handle_vote_on_peer: missing uuid\n");
         return true;
+    }
+
+    /* Sybil guard — parity with Python idprocess._process_id (the
+     * collision check at the top): refuse to vote for a candidate whose
+     * UUID collides with an existing peer. A forged peer claiming a known
+     * identity is dropped here, so no approval vote is emitted; a genuinely
+     * new UUID falls through to the normal vote. Peers are read lock-free,
+     * matching the other handler-side reads in this file (the identity
+     * message loop is single-threaded). */
+    {
+        uuid_t proposed_uuid;
+        if (uuid_parse(proposed_uuid_raw, proposed_uuid) == 0) {
+            for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+                if (memcmp(proc->protocol.peers[i].uuid, proposed_uuid,
+                           sizeof(uuid_t)) == 0) {
+                    log_warn(proc->logger,
+                             "Identity: refusing vote — candidate UUID %s "
+                             "collides with an existing peer (sybil)\n",
+                             proposed_uuid_raw);
+                    json_decref(payload);
+                    return true;
+                }
+            }
+        }
     }
 
     vote_on_peer_args_t *args = calloc(1, sizeof(*args));

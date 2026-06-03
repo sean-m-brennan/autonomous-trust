@@ -155,9 +155,12 @@ int zta_policy_create_verifier(const zta_policy_t *policy, zta_verifier_t **out)
     if (strcmp(policy->verifier_type, "x509") == 0) {
         x509_verifier_config_t cfg;
         memset(&cfg, 0, sizeof(cfg));
-        strncpy(cfg.ca_bundle_path, policy->ca_bundle_path, X509_PATH_LEN - 1);
-        strncpy(cfg.ocsp_url, policy->ocsp_url, X509_PATH_LEN - 1);
-        strncpy(cfg.crl_path, policy->crl_path, X509_PATH_LEN - 1);
+        /* snprintf (not strncpy) for guaranteed NUL-termination — satisfies
+         * -Wstringop-truncation and is safe when src is full-length. */
+        snprintf(cfg.ca_bundle_path, sizeof(cfg.ca_bundle_path), "%s",
+                 policy->ca_bundle_path);
+        snprintf(cfg.ocsp_url, sizeof(cfg.ocsp_url), "%s", policy->ocsp_url);
+        snprintf(cfg.crl_path, sizeof(cfg.crl_path), "%s", policy->crl_path);
         cfg.connect_timeout_ms = 2000;
         return x509_verifier_create(&cfg, out);
     }

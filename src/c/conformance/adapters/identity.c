@@ -46,6 +46,9 @@
 #include "identity/group.h"           /* group_init / group_add_address */
 #include "config/configuration.h"     /* config_t (proc->configs["identity"]) */
 #include "structures/data.h"          /* object_ptr_data */
+#ifdef AT_ZTA_ENABLED
+#include "zta/zta_policy.h"           /* zta_policy_t / defaults / from_json */
+#endif
 #include "network/net_message.h"
 #include "processes/processes.h"
 #include "structures/array.h"
@@ -201,12 +204,89 @@ static void _free_participant_impl(ic_impl_t *impl) {
     free(impl);
 }
 
+#ifdef AT_ZTA_ENABLED
+/* ZTA fixtures (zta-x509-* scenarios). Mirrors the Python adapter:
+ *   fixtures.zta_policy   -> a zta_policy_t in each participant's
+ *                            proc->configs["zta_policy"] (object_ptr_data
+ *                            (config_t), exactly as load_all_configs stores
+ *                            configs and the gate reads them).
+ *   fixtures.credentials  -> attach the DER credential to each named peer's
+ *                            public identity so its announce (from_whom copy)
+ *                            carries it to the welcoming committee.
+ * Cert paths are corpus-relative (testdata/ is mirrored into the C corpus
+ * root by tools/corpus_to_json). Allocations here outlive the scenario and
+ * are reclaimed at process exit — the same convention as the "identity"
+ * config built in _build_participant_impl. */
+static void _apply_zta_fixtures(sce_run_ctx_t *ctx, json_t *fixtures) {
+    const char *root = at_runner_corpus_json_root();
+
+    json_t *creds = json_object_get(fixtures, "credentials");
+    if (json_is_object(creds) && root != NULL) {
+        const char *pid; json_t *relv;
+        json_object_foreach(creds, pid, relv) {
+            if (!json_is_string(relv)) continue;
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/%s", root, json_string_value(relv));
+            FILE *fp = fopen(path, "rb");
+            if (fp == NULL) continue;
+            fseek(fp, 0, SEEK_END);
+            long n = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            if (n <= 0) { fclose(fp); continue; }
+            uint8_t *buf = malloc((size_t)n);
+            size_t got = (buf != NULL) ? fread(buf, 1, (size_t)n, fp) : 0;
+            fclose(fp);
+            if (buf == NULL || got != (size_t)n) { free(buf); continue; }
+            sce_participant_t *p = sce_find_participant(ctx, pid);
+            if (p == NULL) { free(buf); continue; }
+            ic_impl_t *impl = (ic_impl_t *)p->impl;
+            impl->pub->zta_credential = buf;
+            impl->pub->zta_credential_len = (size_t)n;
+        }
+    }
+
+    json_t *zp = json_object_get(fixtures, "zta_policy");
+    if (json_is_object(zp)) {
+        for (size_t i = 0; i < ctx->participant_count; i++) {
+            ic_impl_t *impl = (ic_impl_t *)ctx->participants[i].impl;
+            zta_policy_t *pol = calloc(1, sizeof(zta_policy_t));
+            if (pol == NULL) continue;
+            zta_policy_defaults(pol);
+            zta_policy_from_json(zp, pol);
+            if (root != NULL && pol->ca_bundle_path[0] != '\0'
+                && pol->ca_bundle_path[0] != '/') {
+                /* Make the corpus-relative bundle path absolute. Bounded
+                 * widths keep the total provably within the buffers, so
+                 * -Wformat-truncation is satisfied (the combined path is
+                 * ~140 chars in practice). */
+                char abs[1024];
+                snprintf(abs, sizeof(abs), "%.700s/%.255s", root,
+                         pol->ca_bundle_path);
+                snprintf(pol->ca_bundle_path, sizeof(pol->ca_bundle_path),
+                         "%.*s", (int)(sizeof(pol->ca_bundle_path) - 1), abs);
+            }
+            config_t *cfg = calloc(1, sizeof(config_t));
+            if (cfg == NULL) { free(pol); continue; }
+            cfg->name = "zta_policy";
+            cfg->data_struct = pol;
+            data_t *d = object_ptr_data(cfg, sizeof(config_t));
+            if (d == NULL) { free(cfg); free(pol); continue; }
+            map_set(impl->proc->configs, (map_key_t)"zta_policy", d);
+        }
+    }
+}
+#endif /* AT_ZTA_ENABLED */
+
 /* Apply scenario fixtures: amnesia_known => pre-stage non-newcomer
  * participants' peer lists with the newcomer (so welcoming_committee's
  * already-known branch is reachable). */
 static void _apply_fixtures(sce_run_ctx_t *ctx) {
     json_t *fixtures = json_object_get(ctx->case_data, "fixtures");
     if (!json_is_object(fixtures)) return;
+
+#ifdef AT_ZTA_ENABLED
+    _apply_zta_fixtures(ctx, fixtures);
+#endif
 
     /* capabilities: { "<participant>": ["<cap>", ...], ... } —
      * install each participant's own-capability allowlist via
@@ -686,6 +766,22 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              "%s: %s=%d, expected %d", pid, key, got, want);
                     return -1;
                 }
+            } else if (strcmp(key, "propose_emitted") == 0) {
+                /* Admit/reject observable for the zta-x509-* scenarios: a
+                 * welcomed newcomer triggers one propose_peer; a ZTA-rejected
+                 * one triggers none. Mirrors the Python emit_tally check. */
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->captured_count; i++) {
+                    if (strcmp(ctx->captured[i].from, pid) == 0
+                        && strcmp(ctx->captured[i].function, "propose_peer") == 0)
+                        got++;
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: propose_emitted=%d, expected %d", pid, got, want);
+                    return -1;
+                }
             } else {
                 snprintf(ctx->err, sizeof(ctx->err),
                          "%s: unsupported expected_state key %s", pid, key);
@@ -708,6 +804,24 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
         at_case_result_set_skip(out, detail);
         return;
     }
+
+    /* ZTA admission scenarios (fixtures.zta_policy present) require the ZTA
+     * gate, which is compiled in only under AT_ZTA. When built without it,
+     * skip — a skip on one side is not an asymmetric failure (diff_results.py)
+     * and the Python adapter still pins the scenario. When built with
+     * -DAT_ZTA=ON the adapter wires the policy + credentials (_apply_zta_
+     * fixtures) and runs the scenario symmetrically. */
+#ifndef AT_ZTA_ENABLED
+    {
+        json_t *fx = json_object_get(c->data, "fixtures");
+        if (json_is_object(fx) && json_object_get(fx, "zta_policy") != NULL) {
+            at_case_result_set_skip(
+                out, "ZTA scenario skipped: C built without AT_ZTA "
+                     "(build -DAT_ZTA=ON to run it symmetrically)");
+            return;
+        }
+    }
+#endif
 
     char err[256] = {0};
     struct timespec t0, t1;

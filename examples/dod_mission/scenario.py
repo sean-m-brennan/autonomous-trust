@@ -56,7 +56,7 @@ from autonomous_trust.evaluation.scenarios.scenario import (
 # Landmarks (UTM 16N from the original mission YAML → WGS84 via utm.to_latlon).
 # Madison County, AL — generic civilian terrain.
 GROUND_START   = (34.706505, -86.633657, 197.0)   # Squad insertion
-GROUND_MID     = (34.724448, -86.639802, 195.0)   # Target area
+GROUND_MID     = (34.72352, -86.63792, 195.0)     # Target area (target building)
 RQ86_ORBIT     = (34.724448, -86.639802, 5000.0)  # Overhead orbit center
 MQ800_INGRESS  = (34.715000, -86.580000, 600.0)   # MQ-800 enters from the east
 JET_INGRESS    = (34.724448, -86.453789, 400.0)   # ~17 km east of target

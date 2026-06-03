@@ -41,6 +41,7 @@ from ..network import Message, Network
 from .history import IdentityByWork, IdentityByStake, IdentityByAuthority
 from .history import IdentityObj
 from .protocol import IdentityProtocol
+from .zta import ZtaPolicy, ZtaStatus
 from ..structures.dag import LinkedStep
 from ..system import CfgIds, encoding, PackageHash, now
 from .. import _probes
@@ -125,6 +126,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # sender versions send a 2-tuple; choose_group() tolerates both.
         self.histories: list[tuple] = []
         self.package_hash = self.configs[PackageHash.key]
+        # ZTA admission gate (parity with the C handle_welcoming_committee
+        # block, id_proc.c:777-821). Lazily built on first announce; the
+        # default policy is disabled so non-ZTA deployments are unaffected.
+        # See doc/architecture/zta-python-parity.md and zta-integration.md §11.
+        self._zta_policy_cache: Optional[ZtaPolicy] = None
+        self._zta_verifier_cache = None
+        self._zta_capped: set = set()  # uuids admitted via DDIL fallback (rep-capped)
         self.choosing = False
         # P1 group-merge tracking: set when choose_group falls through to
         # self-bootstrap (mesh didn't answer in init_timeout). A late
@@ -667,6 +675,73 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                          source='peer_accepted')
             self._add_peer(queues, blob.identity, amnesia)
 
+    def _zta_policy(self) -> ZtaPolicy:
+        """Resolve the ZTA policy once (configs['zta_policy'] or the on-disk
+        zta_policy.cfg.json, else a disabled default). Cached for the process."""
+        if self._zta_policy_cache is None:
+            cfg = self.configs.get(ZtaPolicy.CONFIG_KEY) if hasattr(self.configs, 'get') else None
+            if isinstance(cfg, ZtaPolicy):
+                self._zta_policy_cache = cfg
+            else:
+                try:
+                    self._zta_policy_cache = ZtaPolicy.load()
+                except Exception:
+                    self._zta_policy_cache = ZtaPolicy.defaults()
+        return self._zta_policy_cache
+
+    def _zta_verifier(self):
+        """Build the configured verifier once (cached)."""
+        if self._zta_verifier_cache is None:
+            self._zta_verifier_cache = self._zta_policy().create_verifier()
+        return self._zta_verifier_cache
+
+    def _zta_admit(self, new_id) -> str:
+        """ZTA admission decision for a newly-announced peer.
+
+        Mirrors zta-integration.md §11 / the C gate: returns 'admit' (proceed,
+        no cap), 'admit_capped' (DDIL fallback, reputation-capped), or 'reject'
+        (do not propose). A no-op ('admit') when the policy is disabled or does
+        not require verification at admission.
+        """
+        policy = self._zta_policy()
+        if not (policy.enabled and policy.require_at_admission):
+            return 'admit'
+        nick = getattr(new_id, 'nickname', '?')
+        try:
+            cred = new_id.zta_credential or None
+        except AttributeError:
+            cred = None  # peer from an older/non-ZTA build carries no field
+        result = self._zta_verifier().verify_credential(cred)
+        status = result.status
+        if status is ZtaStatus.VERIFIED:
+            return 'admit'
+        if status in (ZtaStatus.REJECTED, ZtaStatus.EXPIRED, ZtaStatus.REVOKED):
+            self.logger.warning('ZTA: rejecting %s at admission: %s (%s)',
+                                 nick, status.value, result.reason)
+            _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
+                         zta_status=status.value, reason=result.reason)
+            _probes.counter('id.welcome', 'zta_rejected')
+            return 'reject'
+        # DEFERRED / UNAVAILABLE -> DDIL handling
+        if policy.allow_ddil_fallback:
+            self.logger.info('ZTA: verification deferred for %s (%s); admitting '
+                             'with reputation cap %.2f', nick, status.value,
+                             policy.ddil_fallback_reputation_cap)
+            _probes.emit('id.welcome', 'zta_deferred', peer_nick=str(nick),
+                         zta_status=status.value, reason=result.reason)
+            _probes.counter('id.welcome', 'zta_deferred')
+            try:
+                self._zta_capped.add(new_id.uuid)
+            except Exception:
+                pass
+            return 'admit_capped'
+        self.logger.warning('ZTA: verification unavailable for %s (%s) and DDIL '
+                            'fallback disabled; rejecting', nick, status.value)
+        _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
+                     zta_status=status.value, reason=result.reason)
+        _probes.counter('id.welcome', 'zta_rejected')
+        return 'reject'
+
     def welcoming_committee(self, queues, message):
         """
         Handle incoming newbies. Every peer in phase 3 caches the
@@ -722,6 +797,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.logger.debug('Received new identity: %s - %s - %s' % (new_id.nickname, new_id.address, new_id.uuid))
                 if not id_obj.validate():
                     self.logger.warning('Invalid identity object from %s' % new_id.nickname)
+                    return True
+                # ZTA credential check at admission (parity with the C gate in
+                # handle_welcoming_committee). A forged/unsigned/expired/
+                # untrusted-issuer credential is rejected here, before the peer
+                # is cached or proposed for the welcoming-committee vote — the
+                # peer never enters the trust graph. No-op when the zta_policy
+                # is disabled. See doc/architecture/zta-python-parity.md.
+                zta_decision = self._zta_admit(new_id)
+                if zta_decision == 'reject':
                     return True
                 # Cache the announcement on every peer (regardless of
                 # border_guard_mode). Without this, non-welcomers later
