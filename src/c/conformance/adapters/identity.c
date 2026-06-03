@@ -477,6 +477,31 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_decref(body);
     }
 
+    /* propose_peer — drives the receiver's handle_vote_on_peer. The payload
+     * carries the candidate's full public identity (uuid + fullname +
+     * address + signature/encryptor hex), exactly the shape the production
+     * welcoming_committee emits, so the receiver can run the sybil/blacklist
+     * guards. public_identity_to_json produces a superset of those keys. The
+     * candidate is named by participant id in `candidate`. */
+    if (strcmp(function, "propose_peer") == 0 && json_is_object(payload)) {
+        const char *cand_id = NULL;
+        json_t *c = json_object_get(payload, "candidate");
+        if (json_is_string(c)) cand_id = json_string_value(c);
+        sce_participant_t *cand = cand_id ? sce_find_participant(ctx, cand_id) : NULL;
+        if (cand != NULL) {
+            ic_impl_t *cand_impl = (ic_impl_t *)cand->impl;
+            if (cand_impl != NULL && cand_impl->pub != NULL) {
+                json_t *body = NULL;
+                if (public_identity_to_json(cand_impl->pub, &body) == 0
+                    && body != NULL) {
+                    net_msg_pack_json(&out->info.net_msg, body);
+                    json_decref(body);
+                }
+            }
+        }
+        return 0;
+    }
+
     /* partition_signal — local-only IPC payload is just the from_addr
      * string. See doc/architecture/partition-recovery.md §5.1. */
     if (strcmp(function, "partition_signal") == 0) {
@@ -780,6 +805,25 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                 if (got != want) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: propose_emitted=%d, expected %d", pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "votes_emitted") == 0) {
+                /* Approval-vote observable for the propose-vote scenarios: a
+                 * receiver that accepts a proposal emits one vote_on_peer; a
+                 * receiver whose sybil/blacklist guard fires emits none.
+                 * Mirrors the Python emit_tally check (which ticks
+                 * vote_response after the propose dispatch to flush the
+                 * deferred vote, so both sides count the same emission). */
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->captured_count; i++) {
+                    if (strcmp(ctx->captured[i].from, pid) == 0
+                        && strcmp(ctx->captured[i].function, "vote_on_peer") == 0)
+                        got++;
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: votes_emitted=%d, expected %d", pid, got, want);
                     return -1;
                 }
             } else {

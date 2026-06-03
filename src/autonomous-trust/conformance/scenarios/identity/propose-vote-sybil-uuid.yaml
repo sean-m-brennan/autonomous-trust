@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: propose-vote-sybil-uuid
+byte_pinning: false
+description: |
+    Sybil guard — UUID collision. The amnesia_known fixture pre-populates the
+    newcomer into every existing peer's peer list, so when alice proposes the
+    newcomer to bob, bob already holds an identity with that UUID. bob's
+    handle_vote_on_peer collision guard (parity with Python
+    idprocess._process_id, which rejects on uuid OR signature OR encryptor
+    collision) refuses to vote, so bob emits no approval vote —
+    votes_emitted == 0.
+
+    The contrast with propose-vote-admit (votes_emitted == 1, same topology
+    without amnesia_known) is what makes this a meaningful pin: the only
+    difference is the pre-seated colliding peer, and that alone suppresses the
+    vote on both implementations.
+
+    Cross-impl: the rejection is symmetric without any vote_response timing
+    subtlety — Python's _process_id returns None (nothing queued in
+    confirmed_block, so the harness's vote_response tick emits nothing) and C's
+    guard returns before dispatch. Both emit zero vote_on_peer.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  amnesia_known: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: propose_peer
+    payload:
+      candidate: newcomer
+    description: |
+        alice proposes newcomer to bob, but amnesia_known already seated the
+        newcomer in bob's peer list. The UUID collision trips the sybil guard,
+        so bob casts no vote.
+
+expected_state:
+  bob:
+    votes_emitted: 0
