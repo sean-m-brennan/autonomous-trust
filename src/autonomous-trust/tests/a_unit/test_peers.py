@@ -67,6 +67,33 @@ class TestPeers:
         p.add(peer)  # should not duplicate
         assert p.all.count(peer) == 1
 
+    def test_add_rejoin_same_nickname_dedups(self):
+        # A peer rejoining under a new uuid/address keeps its nickname. The
+        # stale identity must NOT linger in self.all / self.listing — there
+        # must be exactly one peer per nickname, and it must be the new one.
+        p = Peers()
+        old = _mock_peer(nickname='mq800', address='10.0.0.1', uuid=uuid4())
+        new = _mock_peer(nickname='mq800', address='10.0.0.2', uuid=uuid4())
+        p.add(old)
+        p.add(new)
+        assert p.all == [new]
+        assert old not in p.all
+        assert old.address not in p.listing
+        assert new.address in p.listing
+        assert p.find_by_index('mq800') is new
+        assert p.find_by_uuid(new.uuid) is new
+        assert p.find_by_uuid(old.uuid) is None
+
+    def test_add_distinct_nicknames_coexist(self):
+        # Dedup is per-nickname only: different nicknames are unaffected.
+        p = Peers()
+        a = _mock_peer(nickname='a', address='10.0.0.1', uuid=uuid4())
+        b = _mock_peer(nickname='b', address='10.0.0.2', uuid=uuid4())
+        p.add(a)
+        p.add(b)
+        assert a in p.all and b in p.all
+        assert len(p.all) == 2
+
     def test_find_by_uuid(self):
         p = Peers()
         uid = uuid4()
