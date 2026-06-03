@@ -241,6 +241,9 @@ class TargetPositionMapPanel:
                     "opacity": 0.65 if is_anom else 0.95,
                 },
                 name=name + (" (ANOMALOUS)" if is_anom else ""),
+                # customdata carries the bare peer name so a map click can
+                # resolve to a drawer selection (live_server click callback).
+                customdata=[name],
                 legendgroup="target",
                 legend="legend2",
                 hovertext=[f"{name}: target at "
@@ -289,6 +292,7 @@ class TargetPositionMapPanel:
                 marker={"size": 11 if kind == "soldier" else 8,
                         "color": color},
                 name=name,
+                customdata=[name],
                 legendgroup="asset",
                 legend="legend",
                 hovertext=[f"{name} ({kind})"

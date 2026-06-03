@@ -379,6 +379,17 @@ class DoDMissionParticipant(AutonomousTrust):
                     type(self.generators).__name__ if self.generators else "none",
                     compromised, forgery_mode)
 
+    def _detection_pose_provider(self, kind, roster_latlon):
+        """Hook for simulator-driven peer motion. Return a callable
+        ``() -> (lat, lon[, bearing_deg]) | None`` that yields the peer's
+        live pose each tick, or ``None`` (the default) to keep the
+        stationary roster pose. Override on the participant (or set
+        ``self._pose_provider``) once a per-peer live position feed is wired
+        from the simulator — a moving microdrone then brings the target
+        compound into its forward FOV as it advances. Returning the
+        instance attribute keeps the v1 behavior (None) unless set."""
+        return getattr(self, "_pose_provider", None)
+
     def _maybe_add_detection(self, bundle, kind, roster_latlon):
         """Attach a DetectionSource alongside a drone-role bundle.
 
@@ -396,6 +407,7 @@ class DoDMissionParticipant(AutonomousTrust):
             role=kind,
             roster_latlon=roster_latlon,
             view_center_override_latlon=view_override,
+            pose_provider=self._detection_pose_provider(kind, roster_latlon),
         )
         if ds is None:
             return bundle

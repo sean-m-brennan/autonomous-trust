@@ -490,13 +490,28 @@ def make_app(name: str, title: str,
     # Stretch Goal 2 / Phase 4: peer-detail drawer.
     # Dropdown change -> Store; Store + tick -> re-render the
     # iframe srcDoc from the cached detection + reputation state.
+    # Two ways to pick the drawer peer: the dropdown, or clicking the peer's
+    # marker on the map (charts[0]). Both feed the one selected-peer-name
+    # Store via a single callback (Dash forbids duplicate Outputs); the
+    # trigger source disambiguates. The map markers carry the bare peer name
+    # in customdata (see TargetPositionMapPanel.figure).
+    _map_graph_id = chart_graph_ids[0] if chart_graph_ids else None
+    _select_inputs = [Input("peer-selector", "value")]
+    if _map_graph_id:
+        _select_inputs.append(Input(_map_graph_id, "clickData"))
+
     @app.callback(
         Output("selected-peer-name", "data"),
-        Input("peer-selector", "value"),
+        *_select_inputs,
         prevent_initial_call=True,
     )
-    def _sync_selected(value):
-        return value or None
+    def _sync_selected(selector_value, click_data=None):
+        if _map_graph_id and dash.callback_context.triggered_id == _map_graph_id:
+            peer = _peer_from_map_click(click_data)
+            # Ignore clicks on non-peer geometry (trails/sightlines without
+            # customdata) rather than clearing the current selection.
+            return peer if peer else dash.no_update
+        return selector_value or None
 
     @app.callback(
         Output("peer-detail", "srcDoc"),
@@ -751,6 +766,22 @@ def feed_event(panels: dict[str, Any], record: dict) -> None:
 # components. A dashboard callback wires them by reading
 # state["detection_per_peer"] each tick.
 
+def _peer_from_map_click(click_data) -> Optional[str]:
+    """Resolve a Plotly map ``clickData`` payload to a peer name.
+
+    Peer markers (TargetPositionMapPanel) carry the bare peer name in
+    ``customdata``; non-peer geometry (trails, sightlines) carries none.
+    Returns ``None`` when the click can't be resolved to a peer, so the
+    caller can leave the current selection untouched."""
+    try:
+        cd = (click_data or {})["points"][0].get("customdata")
+    except (KeyError, IndexError, TypeError):
+        return None
+    if isinstance(cd, (list, tuple)):
+        return cd[0] if cd else None
+    return cd
+
+
 def detection_summary_for(state: dict[str, Any],
                           peer_name: str):
     """Build a DetectionSummary for the inspector drawer.
@@ -773,6 +804,8 @@ def detection_summary_for(state: dict[str, Any],
         crop_size_px=tuple(bucket.get("crop_size_px") or (0, 0)),
         bbox_in_crop_px=tuple(bucket.get("bbox_in_crop_px")
                               or (0, 0, 0, 0)),
+        obb_in_crop_px=tuple(tuple(p) for p in
+                             (bucket.get("obb_in_crop_px") or [])),
         label=bucket.get("label", ""),
         world_uid=bucket.get("world_uid", ""),
         confidence=float(bucket.get("confidence", 0.0)),
@@ -798,6 +831,8 @@ def detection_log_for(state: dict[str, Any], peer_name: str) -> list:
             crop_size_px=tuple(bucket.get("crop_size_px") or (0, 0)),
             bbox_in_crop_px=tuple(bucket.get("bbox_in_crop_px")
                                   or (0, 0, 0, 0)),
+            obb_in_crop_px=tuple(tuple(p) for p in
+                                 (bucket.get("obb_in_crop_px") or [])),
             label=bucket.get("label", ""),
             world_uid=bucket.get("world_uid", ""),
             confidence=float(bucket.get("confidence", 0.0)),
