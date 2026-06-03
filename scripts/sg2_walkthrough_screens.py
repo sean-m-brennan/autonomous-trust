@@ -151,6 +151,28 @@ def _srcdoc(html: str) -> str:
     return html.replace("&", "&amp;").replace('"', "&quot;")
 
 
+def _maybe_write_png(fig, html_target: Path) -> None:
+    """Best-effort static PNG export beside the HTML (needs Kaleido).
+
+    The interactive HTML stays the source of truth; the PNG is for slide
+    decks / docs that can't embed a live Plotly figure. Silently degrades to
+    a one-line hint when Kaleido isn't installed, so the walkthrough still
+    regenerates without it."""
+    try:
+        import kaleido  # noqa: F401
+    except Exception:  # noqa: BLE001 — optional dependency
+        print(f"  (skipping PNG for {html_target.name}: "
+              f"pip install --upgrade kaleido to enable static export)")
+        return
+    png = html_target.with_suffix(".png")
+    try:
+        fig.write_image(str(png), width=900, height=700, scale=2)
+        print(f"wrote {png.relative_to(REPO_ROOT)} "
+              f"({png.stat().st_size:,} bytes)")
+    except Exception as e:  # noqa: BLE001
+        print(f"  (PNG export failed for {html_target.name}: {e})")
+
+
 def _agency_map_sightlines() -> None:
     from autonomous_trust.inspector.dashboard.disaster_response_map import (
         AgencyMap, MapPeer,
@@ -183,6 +205,7 @@ def _agency_map_sightlines() -> None:
     target = OUT_DIR / "agency_map_sightlines.html"
     fig.write_html(str(target), include_plotlyjs="cdn", full_html=True)
     print(f"wrote {target.relative_to(REPO_ROOT)} ({target.stat().st_size:,} bytes)")
+    _maybe_write_png(fig, target)
 
 
 def main() -> None:
