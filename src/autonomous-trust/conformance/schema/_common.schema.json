@@ -10,7 +10,7 @@
     },
     "protocol": {
       "type": "string",
-      "enum": ["identity", "reputation", "negotiation", "network", "agreement"]
+      "enum": ["identity", "reputation", "negotiation", "network", "agreement", "bootstrap"]
     },
     "name": {
       "type": "string",

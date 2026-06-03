@@ -340,13 +340,16 @@ moving peers off tier 0.
 
 The contract — freshly-admitted peer triggers the worker, picks a
 partner, and runs at least one round of each of the three
-capabilities — is pinned today by the unit test
+capabilities — is pinned by the unit test
 `tests/a_unit/test_bootstrap_worker.py::TestBootstrapCoverage::test_all_three_caps_exercised_over_a_run`
-under a fixed `AT_BOOTSTRAP_SEED`. The corresponding YAML scenario
-(`bootstrap/bootstrap-corpus-runs-on-admission.yaml`) would require a
-new `bootstrap` protocol adapter in both Python and C harnesses;
-that scaffolding is the follow-up. The unit test exercises the same
-guarantees against the real worker code.
+under a fixed `AT_BOOTSTRAP_SEED` **and**, since 2026-06-03, by the
+cross-language conformance scenario
+`bootstrap/bootstrap-corpus-runs-on-admission.yaml`. A new `bootstrap`
+conformance protocol + adapter was added on both harnesses; the observable
+is the RNG-agnostic coverage set (`bootstrap_caps_fired == 3`,
+`pairs_issued == 30`), so Python's `random.Random` and C's splitmix64 need
+not produce identical selection sequences. Pins symmetrically (137/137 each
+side, 0 asymmetric).
 
 **Status (2026-05-22):**
 
@@ -362,8 +365,13 @@ guarantees against the real worker code.
   (default 30 s) up to `AT_BOOTSTRAP_PAIRS` (default 20), and stops
   scheduling when either limit is hit. `AT_BOOTSTRAP_SEED` is honored
   so tests and scenarios get deterministic sequences.
-* C parity for the registry + the worker is part of the same
-  Python↔C follow-up that owns the bootstrap protocol adapter.
+* C parity landed 2026-06-03: `src/c/autonomous_trust/bootstrap/`
+  (`bootstrap_capabilities.{c,h}` — the 3 at.* server fns + verifiers with
+  matching scoring, name registry, `register_bootstrap_capabilities`; and
+  `bootstrap_worker.{c,h}` — seeded splitmix64 selection, paced window,
+  counts-by-cap, env handling). Unit tests `bootstrap_capabilities_test` +
+  `bootstrap_worker_test` (C suite 77/77). The conformance pin runs the C
+  worker via the `bootstrap` adapter, symmetric with Python (§6.5).
 
 ## 7. Tier-up and tier-down transitions
 

@@ -12,9 +12,11 @@ description: |
     propose_emitted == 1, exercising the DEFERRED/UNAVAILABLE branch of the gate
     distinct from the VERIFIED happy path. See zta-integration.md §11 (step 4).
 
-    Cross-impl: currently SKIPPED on the C side (the C conformance adapter's
-    ZTA wiring is a tracked follow-up); the Python adapter pins this scenario.
-    A skip on one side is not an asymmetric failure (diff_results.py).
+    Cross-impl: pinned on BOTH sides. The C conformance adapter wires the ZTA
+    policy + credentials (_apply_zta_fixtures) when built with -DAT_ZTA=ON;
+    scripts/test-conformance.sh enables that automatically when OpenSSL is
+    present (build-zta/). Without OpenSSL the C side skips this scenario, which
+    is still non-asymmetric (diff_results.py treats a one-side skip as a match).
 
 participants:
   - id: bg
