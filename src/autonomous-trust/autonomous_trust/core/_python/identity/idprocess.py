@@ -988,7 +988,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             for peer in self.peers.all:
                 if blob.identity.uuid == peer.uuid or \
                         blob.identity.signature == peer.signature or \
-                        blob.identity.encryptor == peer.signature:
+                        blob.identity.encryptor == peer.encryptor:
                     self.logger.warning('New identity (%s) using peer id (%s)' % (blob.identity.nickname, peer.nickname))
                     return None
             proof: AgreementProof = self._history.prove(blob)
