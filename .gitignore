@@ -159,3 +159,9 @@ embedded/signing.pub
 /examples/dod_mission/assets/video/naip_huntsville.geo.json
 /examples/dod_mission/assets/detections/catalogue.json
 /examples/dod_mission/assets/detections/crops/*.jpg
+
+# YOLOv8-OBB weights: pretrained net auto-downloaded by ultralytics on the
+# first Pass A run (canonical cache: ~/.cache/at-detection-prep/). A bare-name
+# download can also land in the cwd, so never commit model weights — they are
+# fetched artifacts, not source.
+*.pt

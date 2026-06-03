@@ -914,6 +914,8 @@ class DoDMissionCoordinator(AutonomousTrust):
             "crop_size_px": tuple(md.get("crop_size_px") or (0, 0)),
             "bbox_in_crop_px": tuple(md.get("bbox_in_crop_px")
                                      or (0, 0, 0, 0)),
+            "obb_in_crop_px": [list(p) for p in (md.get("obb_in_crop_px")
+                                                 or [])],
             "target_latlon": tuple(md.get("target_latlon") or (0.0, 0.0)),
             "t_seconds": reading.timestamp.total_seconds(),
         }

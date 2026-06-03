@@ -48,6 +48,7 @@ def _make_catalogue(*objects: tuple[str, float, float, str]) -> list:
             crop=f"crops/{uid}.jpg", crop_b64="",
             crop_size_px=(128, 96),
             bbox_panorama_px=(0, 0, 10, 10),
+            obb_panorama_px=(),
             center_utm=(e, n), center_squad_xy=(cx, cy),
             center_latlon=(lat, lon),
             label=uid, extra={"scenario_role": role},
@@ -448,6 +449,28 @@ def test_drawer_renders_detection_section():
     assert "no contacts" in html_empty
 
 
+def test_drawer_renders_obb_polygon_when_present():
+    """When the detection carries an oriented box, the drawer draws a
+    rotated <polygon> (not the axis-aligned <rect>)."""
+    from autonomous_trust.inspector.dashboard.peer_detail import (
+        DetectionSummary, PeerDetailPanel, PeerDetailState,
+    )
+    d = DetectionSummary(
+        crop_b64="dGVzdA==", crop_size_px=(128, 96),
+        bbox_in_crop_px=(21, 16, 107, 80),
+        obb_in_crop_px=((30, 16), (107, 30), (98, 80), (21, 66)),
+        label="compound-alpha", world_uid="compound-alpha",
+        confidence=0.87, age_sec=4.5,
+    )
+    html = PeerDetailPanel().to_html(PeerDetailState(
+        name="rq86-1", agency="Air-Support", kind="recon-drone",
+        detection=d))
+    assert "<polygon points=" in html
+    assert "30,16" in html and "107,30" in html
+    # OBB takes precedence over the axis-aligned rect.
+    assert '<rect x="21"' not in html
+
+
 def test_peer_detail_forming_reputation_matches_list():
     """A peer with no consensus reputation yet renders 'forming…' (the
     same wording the Reputations list shows for a None score), not a
@@ -515,3 +538,231 @@ def test_detection_augmented_bundle_survives_pickle():
     assert back.electronic_noise == 0.05
     # tick() composes both producers — proves the wrapper isn't broken.
     assert back.tick(7) == [("x", 7)]
+
+
+# --- Link-degradation model (§5.5) ------------------------------------
+
+def _count_by_type(readings, data_type):
+    return sum(1 for r in readings if r.data_type == data_type)
+
+
+def test_degradation_tier_mapping():
+    # Boundary checks against §5.5's four tiers.
+    assert det._degradation_tier(0.95) == (det.DEGRADE_PASS, 0.95)
+    assert det._degradation_tier(0.80) == (det.DEGRADE_PASS, 0.95)
+    assert det._degradation_tier(0.79) == (det.DEGRADE_DOWNSAMPLE, 0.7)
+    assert det._degradation_tier(0.50) == (det.DEGRADE_DOWNSAMPLE, 0.7)
+    assert det._degradation_tier(0.49) == (det.DEGRADE_DROP, 0.4)
+    assert det._degradation_tier(0.20) == (det.DEGRADE_DROP, 0.4)
+    assert det._degradation_tier(0.19) == (det.DEGRADE_LOST, 0.1)
+    assert det._degradation_tier(0.0) == (det.DEGRADE_LOST, 0.1)
+
+
+def test_pass_through_full_quality(catalogue):
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=catalogue,
+                              view_center_latlon=GROUND_MID_LL,
+                              link_quality=0.95)
+    assert src.degrade_tier == det.DEGRADE_PASS
+    readings = src.tick(timedelta(seconds=10))
+    dets = [r for r in readings if r.data_type == "detection"]
+    assert dets and all(abs(r.quality - 0.95) < 1e-9 for r in dets)
+
+
+def test_link_lost_suppresses_detections(catalogue):
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=catalogue,
+                              view_center_latlon=GROUND_MID_LL,
+                              link_quality=0.1)
+    assert src.degrade_tier == det.DEGRADE_LOST
+    readings = src.tick(timedelta(seconds=10))
+    # Only a heartbeat fires, flagged link_lost; no detection events.
+    assert _count_by_type(readings, "detection") == 0
+    hbs = [r for r in readings if r.data_type == "detection_heartbeat"]
+    assert len(hbs) == 1
+    assert hbs[0].metadata["link_lost"] is True
+    assert hbs[0].metadata["degradation"] == det.DEGRADE_LOST
+
+
+def test_reading_quality_reflects_downsample_tier(catalogue):
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=catalogue,
+                              view_center_latlon=GROUND_MID_LL,
+                              link_quality=0.6)
+    assert src.degrade_tier == det.DEGRADE_DOWNSAMPLE
+    readings = src.tick(timedelta(seconds=10))
+    dets = [r for r in readings if r.data_type == "detection"]
+    assert dets and all(abs(r.quality - 0.7) < 1e-9 for r in dets)
+    assert all(r.metadata["degradation"] == det.DEGRADE_DOWNSAMPLE
+               for r in dets)
+    assert all(abs(r.metadata["link_quality"] - 0.6) < 1e-9 for r in dets)
+
+
+def test_degraded_link_drops_one_in_three(catalogue):
+    # rq86 sees all three catalogue objects; the per-contact drop counter
+    # advances 1,2,3 within the tick and drops the third (counter % 3 == 0).
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=catalogue,
+                              view_center_latlon=GROUND_MID_LL,
+                              link_quality=0.3)
+    assert src.degrade_tier == det.DEGRADE_DROP
+    readings = src.tick(timedelta(seconds=10))
+    # 3 visible, 1 dropped → 2 detection events, each quality 0.4.
+    assert _count_by_type(readings, "detection") == 2
+    dets = [r for r in readings if r.data_type == "detection"]
+    assert all(abs(r.quality - 0.4) < 1e-9 for r in dets)
+
+
+def _real_crop_b64(w=128, h=96):
+    """A real JPEG crop encoded as base64, for transform tests."""
+    PIL = pytest.importorskip("PIL")
+    from PIL import Image
+    import base64 as _b64
+    import io as _io
+    img = Image.new("RGB", (w, h), (120, 160, 90))
+    buf = _io.BytesIO()
+    img.save(buf, format="JPEG")
+    return _b64.b64encode(buf.getvalue()).decode("ascii"), (w, h)
+
+
+def test_downsample_resizes_crop_bytes():
+    pytest.importorskip("PIL")
+    crop_b64, size = _real_crop_b64()
+    obj = det.CatalogueObject(
+        world_uid="compound-alpha", cls="building", confidence=0.9,
+        crop="crops/alpha.jpg", crop_b64=crop_b64, crop_size_px=size,
+        bbox_panorama_px=(0, 0, 10, 10), obb_panorama_px=(),
+        center_utm=det._wgs84_to_utm(*GROUND_MID_LL),
+        center_squad_xy=det._utm_to_squad_xy(*det._wgs84_to_utm(*GROUND_MID_LL)),
+        center_latlon=GROUND_MID_LL, label="alpha", extra={})
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=[obj],
+                              view_center_latlon=GROUND_MID_LL,
+                              link_quality=0.6)
+    dets = [r for r in src.tick(timedelta(seconds=10))
+            if r.data_type == "detection"]
+    assert len(dets) == 1
+    assert dets[0].metadata["crop_size_px"] == [64, 48]
+    assert dets[0].metadata["crop_b64"] != crop_b64  # actually transformed
+
+
+# --- OBB (oriented box) in crop coords --------------------------------
+
+def test_obb_in_crop_transform():
+    # Axis-aligned OBB corners with a 1:1 crop scale map to the inner rect
+    # left after the 20% bake-out margin.
+    obb = ((100, 100), (200, 100), (200, 200), (100, 200))
+    pts = det._obb_in_crop(obb, (100, 100, 200, 200), (140, 140))
+    assert pts == [[20, 20], [120, 20], [120, 120], [20, 120]]
+    # Unusable inputs degrade to [].
+    assert det._obb_in_crop((), (0, 0, 10, 10), (128, 96)) == []
+    assert det._obb_in_crop(obb, (100, 100, 200, 200), (0, 0)) == []
+
+
+def test_emit_includes_obb_in_crop():
+    obj = det.CatalogueObject(
+        world_uid="compound-alpha", cls="building", confidence=0.9,
+        crop="crops/a.jpg", crop_b64="", crop_size_px=(128, 96),
+        bbox_panorama_px=(100, 100, 200, 200),
+        obb_panorama_px=((110, 100), (200, 110), (190, 200), (100, 190)),
+        center_utm=det._wgs84_to_utm(*GROUND_MID_LL),
+        center_squad_xy=det._utm_to_squad_xy(*det._wgs84_to_utm(*GROUND_MID_LL)),
+        center_latlon=GROUND_MID_LL, label="alpha", extra={})
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=[obj],
+                              view_center_latlon=GROUND_MID_LL,
+                              link_quality=0.95)
+    dets = [r for r in src.tick(timedelta(seconds=10))
+            if r.data_type == "detection"]
+    assert len(dets) == 1
+    obb_pts = dets[0].metadata["obb_in_crop_px"]
+    assert len(obb_pts) == 4 and all(len(p) == 2 for p in obb_pts)
+    # Rotated box is NOT an axis-aligned rectangle (corners differ in both x,y).
+    xs = {p[0] for p in obb_pts}
+    ys = {p[1] for p in obb_pts}
+    assert len(xs) > 2 and len(ys) > 2
+
+
+# --- Map click-to-select (dropdown alternative) -----------------------
+
+def test_map_peer_markers_carry_customdata():
+    """TargetPositionMapPanel tags each peer marker with customdata=[name]
+    so a map click can resolve to a drawer selection."""
+    pytest.importorskip("plotly")
+    sys.path.insert(0, str(_DOD / "dashboard"))
+    import target_position_map as tpm
+
+    panel = tpm.TargetPositionMapPanel({"rq86-1": "#1FB8CD"})
+    for dt, val in (("target_position_x", 120.0), ("target_position_y", 340.0)):
+        panel.add_reading(Reading(
+            timestamp=timedelta(seconds=10), peer_name="rq86-1",
+            data_type=dt, value=val, unit="m", quality=0.95,
+            metadata={"world_uid": "compound-alpha"}))
+    fig = panel.figure()
+    customs = []
+    for tr in fig.data:
+        cd = getattr(tr, "customdata", None)
+        if cd is not None:
+            customs.extend(list(cd))
+    assert "rq86-1" in customs
+
+
+def test_peer_from_map_click_resolves_customdata():
+    """live_server._peer_from_map_click pulls the peer name out of a marker
+    click and returns None for non-peer geometry."""
+    pytest.importorskip("dash")
+    pytest.importorskip("dash_extensions")
+    sys.path.insert(0, str(_DOD / "dashboard"))
+    import live_server as ls
+
+    # Peer marker click → peer name.
+    click = {"points": [{"customdata": ["mq800"], "lat": 34.7, "lon": -86.6}]}
+    assert ls._peer_from_map_click(click) == "mq800"
+    # Scalar customdata also accepted.
+    assert ls._peer_from_map_click(
+        {"points": [{"customdata": "rq86-1"}]}) == "rq86-1"
+    # Non-peer geometry / empty / malformed → None (selection untouched).
+    assert ls._peer_from_map_click({"points": [{"lat": 1.0}]}) is None
+    assert ls._peer_from_map_click({"points": []}) is None
+    assert ls._peer_from_map_click(None) is None
+
+
+# --- Simulator-driven peer motion (pose provider) ----------------------
+
+def test_update_pose_recomputes_visibility(catalogue):
+    # A microdrone parked at the squad start can't see the compound 2km N.
+    src = det.DetectionSource("microdrone-1", "microdrone",
+                              catalogue=catalogue, view_center_latlon=SQUAD_LL)
+    assert "compound-alpha" not in src.visible_uids
+    # Advance it north to the objective — the compound enters its FOV.
+    changed = src.update_pose(GROUND_MID_LL)
+    assert changed is True
+    assert "compound-alpha" in src.visible_uids
+    # Re-applying the same pose is a no-op (no needless FOV recompute).
+    assert src.update_pose(GROUND_MID_LL) is False
+
+
+def test_pose_provider_drives_motion_in_tick(catalogue):
+    # The pose provider feeds the live position each tick; once it places the
+    # microdrone over the objective, it detects the compound.
+    pose = {"ll": SQUAD_LL}
+    src = det.DetectionSource(
+        "microdrone-1", "microdrone", catalogue=catalogue,
+        view_center_latlon=SQUAD_LL,
+        pose_provider=lambda: (pose["ll"][0], pose["ll"][1]))
+    # Still at the squad start: no compound detection.
+    early = src.tick(timedelta(seconds=10))
+    early_uids = {r.metadata.get("world_uid") for r in early
+                  if r.data_type == "detection"}
+    assert "compound-alpha" not in early_uids
+    # Drone advances to the objective; next tick (past the time floor) sees it.
+    pose["ll"] = GROUND_MID_LL
+    late = src.tick(timedelta(seconds=20))
+    late_uids = {r.metadata.get("world_uid") for r in late
+                 if r.data_type == "detection"}
+    assert "compound-alpha" in late_uids
+
+
+def test_pose_provider_failure_keeps_last_pose(catalogue):
+    # A flaky pose source must not crash the sensor loop.
+    def _boom():
+        raise RuntimeError("sim feed dropped")
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=catalogue,
+                              view_center_latlon=GROUND_MID_LL,
+                              pose_provider=_boom)
+    out = src.tick(timedelta(seconds=10))  # must not raise
+    assert any(r.data_type == "detection" for r in out)

@@ -70,7 +70,7 @@ def _build_catalogue():
         objs.append(det.CatalogueObject(
             world_uid=uid, cls="target-building", confidence=1.0,
             crop=crop, crop_b64="", crop_size_px=(128, 96),
-            bbox_panorama_px=(0, 0, 40, 40),
+            bbox_panorama_px=(0, 0, 40, 40), obb_panorama_px=(),
             center_utm=(e, n), center_squad_xy=(cx, cy),
             center_latlon=ll,
             label=uid,
