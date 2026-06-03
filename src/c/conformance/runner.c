@@ -40,6 +40,7 @@
 #include "adapters/agreement.h"
 #include "adapters/negotiation.h"
 #include "adapters/reputation.h"
+#include "adapters/bootstrap.h"
 
 /* Adapters that handle kind:negative need the JSON corpus root to resolve
  * `based_on` references; one runner invocation processes one root, so a
@@ -60,6 +61,8 @@ static void dispatch(const at_case_t *c, at_case_result_t *out) {
         at_negotiation_run(c, out);
     } else if (strcmp(c->protocol, "reputation") == 0) {
         at_reputation_run(c, out);
+    } else if (strcmp(c->protocol, "bootstrap") == 0) {
+        at_bootstrap_run(c, out);
     } else {
         char detail[160];
         snprintf(detail, sizeof(detail),
