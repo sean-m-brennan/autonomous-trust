@@ -876,6 +876,28 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     json_object_set_new(proposal_json, "uuid", json_string(uuid_str));
     json_object_set_new(proposal_json, "fullname", json_string(nmsg->from_whom.fullname));
     json_object_set_new(proposal_json, "address", json_string(nmsg->from_whom.address));
+    /* Carry the candidate's signature/encryptor public keys so voters can
+     * run the full Sybil collision check (uuid OR signature OR encryptor),
+     * matching Python idprocess._process_id. The nested {"hex_seed": ...}
+     * shape mirrors public_identity_to_json's wire format. */
+    unsigned char *cand_sig_hex = signature_publish(&nmsg->from_whom.signature);
+    if (cand_sig_hex != NULL) {
+        json_t *cand_sig = json_object();
+        if (cand_sig != NULL) {
+            json_object_set_new(cand_sig, "hex_seed", json_string((char *)cand_sig_hex));
+            json_object_set_new(proposal_json, "signature", cand_sig);
+        }
+        free(cand_sig_hex);
+    }
+    unsigned char *cand_enc_hex = encryptor_publish(&nmsg->from_whom.encryptor);
+    if (cand_enc_hex != NULL) {
+        json_t *cand_enc = json_object();
+        if (cand_enc != NULL) {
+            json_object_set_new(cand_enc, "hex_seed", json_string((char *)cand_enc_hex));
+            json_object_set_new(proposal_json, "encryptor", cand_enc);
+        }
+        free(cand_enc_hex);
+    }
 
     if (id_state.synchronous_dispatch)
     {
@@ -1528,26 +1550,90 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
     }
 
     /* Sybil guard — parity with Python idprocess._process_id (the
-     * collision check at the top): refuse to vote for a candidate whose
-     * UUID collides with an existing peer. A forged peer claiming a known
+     * collision check at the top): refuse to vote for a candidate that
+     * collides with an existing peer on UUID, signature public key, OR
+     * encryptor public key. A forged peer claiming any facet of a known
      * identity is dropped here, so no approval vote is emitted; a genuinely
-     * new UUID falls through to the normal vote. Peers are read lock-free,
-     * matching the other handler-side reads in this file (the identity
-     * message loop is single-threaded). */
+     * new candidate falls through to the normal vote. The signature/
+     * encryptor hex are carried in the propose payload (see the enriched
+     * payload build above). Peers are read lock-free, matching the other
+     * handler-side reads in this file (the identity message loop is
+     * single-threaded). */
     {
+        const char *proposed_sig = NULL;
+        const char *proposed_enc = NULL;
+        json_t *sig_obj = json_object_get(payload, "signature");
+        if (json_is_object(sig_obj))
+            proposed_sig = json_string_value(json_object_get(sig_obj, "hex_seed"));
+        json_t *enc_obj = json_object_get(payload, "encryptor");
+        if (json_is_object(enc_obj))
+            proposed_enc = json_string_value(json_object_get(enc_obj, "hex_seed"));
+
         uuid_t proposed_uuid;
-        if (uuid_parse(proposed_uuid_raw, proposed_uuid) == 0) {
-            for (size_t i = 0; i < proc->protocol.num_peers; i++) {
-                if (memcmp(proc->protocol.peers[i].uuid, proposed_uuid,
-                           sizeof(uuid_t)) == 0) {
-                    log_warn(proc->logger,
-                             "Identity: refusing vote — candidate UUID %s "
-                             "collides with an existing peer (sybil)\n",
-                             proposed_uuid_raw);
-                    json_decref(payload);
-                    return true;
+        bool have_uuid = (uuid_parse(proposed_uuid_raw, proposed_uuid) == 0);
+        for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+            const public_identity_t *peer = &proc->protocol.peers[i];
+            const char *reason = NULL;
+            if (have_uuid && memcmp(peer->uuid, proposed_uuid,
+                                    sizeof(uuid_t)) == 0) {
+                reason = "uuid";
+            }
+            if (reason == NULL && proposed_sig != NULL) {
+                unsigned char *peer_sig = signature_publish(&peer->signature);
+                if (peer_sig != NULL) {
+                    if (strcmp((char *)peer_sig, proposed_sig) == 0)
+                        reason = "signature";
+                    free(peer_sig);
                 }
             }
+            if (reason == NULL && proposed_enc != NULL) {
+                unsigned char *peer_enc = encryptor_publish(&peer->encryptor);
+                if (peer_enc != NULL) {
+                    if (strcmp((char *)peer_enc, proposed_enc) == 0)
+                        reason = "encryptor";
+                    free(peer_enc);
+                }
+            }
+            if (reason != NULL) {
+                log_warn(proc->logger,
+                         "Identity: refusing vote — candidate %s collides "
+                         "with an existing peer on %s (sybil)\n",
+                         proposed_uuid_raw, reason);
+                json_decref(payload);
+                return true;
+            }
+        }
+    }
+
+    /* Prove-parity — Python idprocess._process_id votes only after
+     * self._history.prove(blob) succeeds; the PoA/PoS prove() override
+     * (poa.py:37-42, pos.py:35-40) returns None for a candidate whose UUID
+     * OR address is blacklisted, so no proof is produced and no approval
+     * vote is appended. Mirror that here by consulting the per-process
+     * identity-history blacklist (identity_history_is_blacklisted, which
+     * backs identity_history_prove) and dropping the vote on a match. The
+     * collision/sybil facet of prove() is handled by the guard above. The
+     * history is reached under id_state.lock via the same lazy initializer
+     * the other handler paths use. */
+    {
+        const char *proposed_addr =
+            json_string_value(json_object_get(payload, "address"));
+        uuid_t bl_uuid;
+        const unsigned char *bl_uuid_ptr = NULL;
+        if (uuid_parse(proposed_uuid_raw, bl_uuid) == 0)
+            bl_uuid_ptr = bl_uuid;
+        pthread_mutex_lock(&id_state.lock);
+        identity_history_t *hist = _ensure_history_locked(proc);
+        bool blacklisted = (hist != NULL) &&
+            identity_history_is_blacklisted(hist, bl_uuid_ptr, proposed_addr);
+        pthread_mutex_unlock(&id_state.lock);
+        if (blacklisted) {
+            log_warn(proc->logger,
+                     "Identity: refusing vote — candidate %s is blacklisted "
+                     "(prove rejected)\n",
+                     proposed_uuid_raw);
+            json_decref(payload);
+            return true;
         }
     }
 

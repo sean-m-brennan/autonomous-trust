@@ -161,6 +161,19 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: propose_emitted={actual}, expected {expected}'
                     )
+            elif key == 'votes_emitted':
+                # Approval votes this participant emitted in response to a
+                # received proposal. Python queues the vote in confirmed_block
+                # during the propose handler (_process_id) and only emits it
+                # on the next vote_response cycle, so _dispatch ticks
+                # vote_response after a propose inbound to flush it; C emits
+                # in-handler. Both converge on one vote_on_peer per accepted
+                # proposal, and zero when the sybil/blacklist guard rejects.
+                actual = self.emit_tally.get(IdentityProtocol.vote, 0)
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: votes_emitted={actual}, expected {expected}'
+                    )
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
 
@@ -528,6 +541,13 @@ class IdentityAdapter:
         # The protocol's handler dispatch is run synchronously. Threads
         # spawned via _spawn() are inlined because synchronous_dispatch is on.
         participant.process.protocol.run_message_handlers(participant.queues, inbound)
+        # A propose handler (_process_id) only queues the approval vote in
+        # confirmed_block; the actual vote_on_peer message is sent by the
+        # separate vote_response phase-3 task. Drive one cycle here so the
+        # deferred vote is captured in the same step — C sends in-handler, so
+        # this is what makes votes_emitted symmetric across the two impls.
+        if inbound.function == IdentityProtocol.propose:
+            participant.process.vote_response(participant.queues)
         return participant.drain_outbox()
 
     # ------------------------------------------------------------------
@@ -556,6 +576,23 @@ class IdentityAdapter:
             from autonomous_trust.core.identity.history import IdentityObj
             blob = IdentityObj(target.publish(), target.uuid)
             obj = blob.to_string()
+        elif function == IdentityProtocol.propose:
+            # A peer proposal for voting. `handle_vote_on_peer` reads
+            # message.obj as the candidate's IdentityObj (Configuration
+            # string), exactly as welcoming_committee emits it
+            # (id_obj.to_string()). The candidate is named by participant id.
+            target_pid = (payload.get('candidate') or payload.get('peer')) \
+                if isinstance(payload, dict) else None
+            if target_pid is None:
+                # No candidate named — older scenarios inject a propose only
+                # to exercise the dispatch path. Preserve the historical
+                # passthrough so handle_vote_on_peer no-ops on the empty blob.
+                obj = to_json_string(payload)
+            else:
+                target = participants[target_pid].impl.identity
+                from autonomous_trust.core.identity.history import IdentityObj
+                blob = IdentityObj(target.publish(), target.uuid)
+                obj = blob.to_string()
         elif function == IdentityProtocol.update:
             target_group = sender.process.group
             obj = target_group.to_string() if target_group else ''
