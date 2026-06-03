@@ -125,9 +125,10 @@ DOD_NARRATION: list[NarrationBlock] = [
         subtext="The cross-source position validator is running on the "
              "fusion node.  RQ-86-1, RQ-86-2, and the microdrones agree "
              "within a few metres; the MQ-800 designates a different "
-             "building several hundred metres away.  On the Target "
-             "Position map its marker visibly splits from the cluster in "
-             "real time.",
+             "building the better part of a kilometre away — far beyond "
+             "any plausible sensor error, so it cannot be written off as a "
+             "statistical anomaly.  On the Target Position map its marker "
+             "visibly splits from the cluster in real time.",
         style="alert",
     ),
     NarrationBlock(

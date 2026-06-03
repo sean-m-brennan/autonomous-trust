@@ -49,6 +49,7 @@ dependencies:
   - ultralytics
   - ultralytics-thop
   - pyproj
+  - cryptography
   - pip
   - pip:
       #- mediapipe

@@ -434,6 +434,26 @@ cleanup_inspector_procs() {
     pkill -f "examples\\.multi_agency" 2>/dev/null || true
 }
 
+# Force-reap the demo namespace's pods on Ctrl-C/teardown WITHOUT the heavy
+# `minikube delete` that the --teardown path runs. `tilt down` deletes the
+# Deployments, but pod termination is async and graceful: an AT node is slow
+# to exit on SIGTERM (it tears down a multiprocessing pool of subprocesses),
+# so the pod sits in Terminating with its whole python process tree still
+# alive — visible host-side, "multiple per node". A grace-period-0 force
+# delete SIGKILLs the pod sandboxes immediately so those trees die now,
+# while minikube + the cached layer images are left intact for a fast next
+# round. Best-effort and non-blocking (--wait=false) so the exit trap never
+# hangs.
+reap_namespace_fast() {
+    [[ "$VARIANT" == "multi-agency" || "$VARIANT" == "dod-mission" ]] || return 0
+    [[ -n "$NAMESPACE" ]] || return 0
+    command -v kubectl &>/dev/null || return 0
+    kubectl delete pods --all -n "$NAMESPACE" \
+        --force --grace-period=0 --wait=false 2>/dev/null || true
+    kubectl delete namespace "$NAMESPACE" \
+        --ignore-not-found=true --wait=false 2>/dev/null || true
+}
+
 ensure_minikube_running() {
     if ! command -v minikube &>/dev/null; then
         err "minikube not installed; see https://minikube.sigs.k8s.io/docs/start/"
@@ -623,6 +643,14 @@ PY
                         --hacked-sensors "$HACKED_SENSORS" \
                         $seed_force \
                         || { err "cohort seed failed"; exit 1; }
+                    if [[ "${AT_ZTA_PROVISION:-1}" == "1" ]]; then
+                        log "Provisioning ZTA mission CA + per-peer credentials ..."
+                        AT_SQUAD_SIZE="$SQUAD_SIZE" AT_SWARM_SIZE="$SWARM_SIZE" \
+                        AT_SENSOR_COUNT="$SENSOR_COUNT" AT_HACKED_SENSORS="$HACKED_SENSORS" \
+                        python3 -m tools.provision_zta_certs \
+                            --out-root .demo-state/dod-mission \
+                            || warn "ZTA provisioning failed (non-fatal; peers cold-bootstrap without ZTA)"
+                    fi
                 else
                     log "AT_PRESEED=0: skipping cohort seed (peers will cold-bootstrap)"
                 fi
@@ -657,6 +685,14 @@ PY
                         --hacked-sensors "$HACKED_SENSORS" \
                         $seed_force \
                         || { err "cohort seed failed"; exit 1; }
+                    if [[ "${AT_ZTA_PROVISION:-1}" == "1" ]]; then
+                        log "Provisioning ZTA mission CA + per-peer credentials ..."
+                        AT_SQUAD_SIZE="$SQUAD_SIZE" AT_SWARM_SIZE="$SWARM_SIZE" \
+                        AT_SENSOR_COUNT="$SENSOR_COUNT" AT_HACKED_SENSORS="$HACKED_SENSORS" \
+                        python3 -m tools.provision_zta_certs \
+                            --out-root .demo-state/dod-mission \
+                            || warn "ZTA provisioning failed (non-fatal; peers cold-bootstrap without ZTA)"
+                    fi
                     seed_root_arg="--seed-root .demo-state/dod-mission"
                 else
                     log "AT_PRESEED=0: skipping cohort seed (peers will cold-bootstrap)"
@@ -842,6 +878,7 @@ case "$BACKEND_MODE" in
               kill $TILT_PID 2>/dev/null || true; \
               wait $TILT_PID 2>/dev/null || true; \
               tilt down -- $_ta_down &>>"$TILT_LOG" || true; \
+              reap_namespace_fast; \
               cleanup_inspector_procs' EXIT
         trap 'echo; log "Stopping Tilt..."; exit 130' INT
         trap 'echo; log "Stopping Tilt..."; exit 143' TERM

@@ -104,12 +104,38 @@ class Peers(Configuration):
     def add(self, who, level=None):
         if level is None:
             level = self.mid_level
+        index = self._index_by(who)
+        # A peer that rejoins under a new identity keeps its nickname but
+        # gets a new uuid (and usually a new address). hierarchy/valuation
+        # are keyed by nickname, so `who` replaces the prior holder there;
+        # but self.all and self.listing are keyed by object/address and
+        # would otherwise retain the stale entry — leaving two peers with
+        # the same nickname in self.all. Downstream that doubles per-peer
+        # work (e.g. reputation queries) and, because the stale uuid scores
+        # the cold-start neutral baseline while the live one carries the
+        # real score, drew a sawtooth on the dashboard's trust timeline.
+        # Evict the prior holder of this nickname (a genuinely new object)
+        # from every structure first, so there is exactly one peer per
+        # nickname. Re-adding the SAME object is left to the idempotent
+        # guards below.
+        prior = self.find_by_index(index)
+        if prior is not None and prior is not who:
+            try:
+                self.all.remove(prior)
+            except ValueError:
+                pass
+            self.listing.pop(getattr(prior, 'address', None), None)
+            self.delete(prior)  # clears the nickname slot in hierarchy/valuation
+            _probes.emit('peer.set', 'replaced',
+                         peer_nick=index,
+                         old_uuid=str(getattr(prior, 'uuid', None)),
+                         new_uuid=str(getattr(who, 'uuid', None)))
+            _probes.counter('peer.set', 'replaced')
         was_new = who.address not in self.listing
         if who.address not in self.listing:
             self.listing[who.address] = who
         if who not in self.all:
             self.all.append(who)
-        index = self._index_by(who)
         self.hierarchy[level][index] = who
         self.valuation[-1][index] = who
         if was_new:
