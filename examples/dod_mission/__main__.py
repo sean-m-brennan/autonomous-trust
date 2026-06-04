@@ -157,6 +157,19 @@ def main(argv=None):
             panels["event_log"].add_from_event_record(rec)
         except Exception:
             logger.exception("Failed to render event record")
+        # Re-arm the gated jet strike from the recorded rogue anomaly (the
+        # src="validator" COMPROMISE_DETECT — the same reliable signal the
+        # live coordinator gates on, and present in every recording), so
+        # playback holds the jet off-map until the anomaly replays. First
+        # (rogue) hit wins; gate_jet_on_anomaly ignores non-rogue peers and
+        # the scripted (sourceless) detect.
+        try:
+            if (rec.get("type") == "COMPROMISE_DETECT"
+                    and (rec.get("data") or {}).get("source") == "validator"):
+                scenario.gate_jet_on_anomaly(
+                    rec.get("peer"), float(rec.get("t", 0.0)))
+        except Exception:
+            logger.exception("Failed to gate jet from replayed anomaly")
 
     iface.register_event_log_handler(_on_event_record)
 
@@ -362,6 +375,10 @@ def main(argv=None):
         # the user sees narration immediately.  Live mode keeps it off
         # (operator opts in via the toggle).
         presentation_default=True,
+        peer_names=sorted(scenario.peers.keys()),
+        # Match the live coordinator: open the Peer Detail drawer on the
+        # rq86-1 gateway by default (falls back to empty if absent).
+        default_peer="rq86-1",
         start_paused=args.paused,
         auto_pause_before_narration=not args.no_auto_pause,
     )
