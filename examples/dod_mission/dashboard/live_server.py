@@ -242,6 +242,7 @@ def make_app(name: str, title: str,
              narration_script: Optional[list[NarrationBlock]] = None,
              presentation_default: bool = True,
              peer_names: Optional[list[str]] = None,
+             default_peer: Optional[str] = None,
              start_paused: bool = False,
              auto_pause_before_narration: bool = False,
              ) -> dash.Dash:
@@ -444,12 +445,21 @@ def make_app(name: str, title: str,
                     id="peer-selector",
                     options=[{"label": p, "value": p}
                              for p in (peer_names or [])],
+                    # Default the drawer to a specific peer (e.g. the rq86-1
+                    # gateway) when caller asks AND it's a known peer; else
+                    # leave empty with the placeholder.
+                    value=(default_peer
+                           if default_peer and default_peer in (peer_names or [])
+                           else None),
                     placeholder=("(select a peer)" if peer_names
                                  else "(no peers known)"),
                     clearable=True,
                     style={"marginBottom": "8px", "color": "#0F172A"},
                 ),
-                dcc.Store(id="selected-peer-name", data=None),
+                dcc.Store(id="selected-peer-name",
+                          data=(default_peer
+                                if default_peer and default_peer in (peer_names or [])
+                                else None)),
                 html.Iframe(
                     id="peer-detail",
                     srcDoc="",
@@ -723,13 +733,15 @@ def start_in_thread(name: str, title: str,
                     narration_script: Optional[list[NarrationBlock]] = None,
                     presentation_default: bool = True,
                     peer_names: Optional[list[str]] = None,
+                    default_peer: Optional[str] = None,
                     ) -> threading.Thread:
     """Start the Dash app in a daemon thread and return the thread."""
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     app = make_app(name, title, panels, chart_keys, state_provider,
                    narration_script=narration_script,
                    presentation_default=presentation_default,
-                   peer_names=peer_names)
+                   peer_names=peer_names,
+                   default_peer=default_peer)
 
     def _run():
         try:

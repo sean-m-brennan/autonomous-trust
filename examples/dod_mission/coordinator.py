@@ -123,6 +123,10 @@ try:
             # kwargs['cohort'] access still succeeds and we don't leak
             # the extra kwarg into the Protocol base class.
             self.reading_drain = kwargs.pop('reading_drain', None)
+            # Nicknames of peers known to produce data — the roster-driven
+            # subscribe fallback for late joiners whose data-cap advert was
+            # lost (see _patched_process). Empty set => fallback is a no-op.
+            self.data_producers = set(kwargs.pop('data_producers', None) or ())
             super().__init__(configurations, subsystems, log_queue,
                              dependencies, **kwargs)
 
@@ -182,6 +186,31 @@ try:
                             "DiagDataRcvr: subscribed to %s",
                             getattr(ident, "nickname", ident))
 
+                # Fallback: subscribe to admitted data-PRODUCING roster peers
+                # whose data-capability advertisement never reached us. A late
+                # joiner (the MQ-800 at T+4:00) can drop that advert under UDP
+                # loss; the cap path above then never lists it, so its readings
+                # never arrive and it is never detected — which also strands the
+                # anomaly-gated jet. The peer's DataProcess runs regardless and
+                # answers a direct request, so subscribing by roster recovers
+                # the stream. Guarded by uuid so it never double-subscribes a
+                # peer the cap path already handled.
+                if self.data_producers:
+                    for p in self._pending_roster_subscriptions(
+                            self.protocol.peers.all, self.servicers,
+                            self.data_producers):
+                        self.servicers.append(p)
+                        msg = _DQ_Message(
+                            _DQ_DataProcess.name,
+                            _DQ_DataProtocol.request,
+                            self.name, p)
+                        queues[_DQ_CfgIds.network].put(
+                            msg, block=True, timeout=self.q_cadence)
+                        self.logger.info(
+                            "DiagDataRcvr: roster-subscribed to %s "
+                            "(data advert not seen)",
+                            getattr(p, "nickname", p))
+
                 # Drain inbound messages (the data payloads).
                 try:
                     message = queues[self.name].get(
@@ -198,6 +227,30 @@ try:
                         self.logger.error(
                             "Unhandled message of type %s",
                             type(message).__name__)
+
+        @staticmethod
+        def _pending_roster_subscriptions(peers_all, servicers, data_producers):
+            """Roster peers that produce data but aren't subscribed yet.
+
+            Pure decision half of the late-joiner fallback (see
+            _patched_process): given the admitted roster, the already-
+            subscribed servicers, and the set of data-producer nicknames,
+            return the peers to subscribe to now. Dedups by uuid string so a
+            peer the capability-advert path already serviced is never
+            re-subscribed, and so the same peer isn't returned twice within
+            one pass.
+            """
+            subscribed = {str(getattr(s, "uuid", s)) for s in servicers}
+            pending = []
+            for p in peers_all:
+                if getattr(p, "nickname", None) not in data_producers:
+                    continue
+                uid = str(getattr(p, "uuid", ""))
+                if not uid or uid in subscribed:
+                    continue
+                subscribed.add(uid)
+                pending.append(p)
+            return pending
 
         def _resolve_identity(self, ref):
             """Accept Identity, UUID, or uuid-string; return Identity
@@ -499,8 +552,21 @@ class DoDMissionCoordinator(AutonomousTrust):
         # required by DataRcvr.__init__ (and useful for peer-metadata
         # bookkeeping); pass it alongside.
         if HAS_DATA and HAS_INSPECTOR:
+            # Roster of peers that PRODUCE data (have generator bundles in
+            # participant._build_generators). The data sink subscribes to
+            # these directly as a fallback when their `data` capability
+            # advertisement never reaches it — a late joiner like the MQ-800
+            # (T+4:00) can drop that advert, and then the cap-driven subscribe
+            # path never lists it, so its readings never arrive and it is
+            # never detected. See DiagDataRcvr._patched_process.
+            _DATA_PRODUCER_KINDS = {
+                "microdrone", "recon-drone", "armed-drone", "ground-sensor"}
+            data_producers = {
+                name for name, role in scenario.peers.items()
+                if getattr(role, "kind", None) in _DATA_PRODUCER_KINDS}
             self.add_worker(DiagDataRcvr, cohort=self._cohort,
-                            reading_drain=self._reading_drain)
+                            reading_drain=self._reading_drain,
+                            data_producers=data_producers)
 
         # Subscribe to the scenario's event stream so we can record
         # PhaseEvents (PEER_JOIN, COMPROMISE_START, PEER_EXCLUDE) to
@@ -538,6 +604,9 @@ class DoDMissionCoordinator(AutonomousTrust):
             # the start; it can still be toggled off via Presentation Mode.
             presentation_default=True,
             peer_names=sorted(self.scenario.peers.keys()),
+            # Open the Peer Detail drawer on the rq86-1 gateway by default
+            # (falls back to empty if that peer isn't in the cohort).
+            default_peer="rq86-1",
         )
         logger.info("Dashboard serving on :%d", self._dashboard_port)
 
@@ -1240,6 +1309,18 @@ class DoDMissionCoordinator(AutonomousTrust):
                 self._anomaly_log.append(record)
                 if self._event_recorder is not None:
                     self._event_recorder.record(record)
+                # Release the gated fighter-jet strike once the rogue is
+                # actually exposed. The validator detection is the reliable
+                # signal in both live and playback (it fires whenever the
+                # rogue's data diverges and is recorded as a src="validator"
+                # COMPROMISE_DETECT); a slash may never resolve the rogue's
+                # uuid, so it is NOT a dependable gate. First (rogue) hit wins;
+                # non-rogue peers are ignored inside gate_jet_on_anomaly.
+                try:
+                    self.scenario.gate_jet_on_anomaly(result.peer_name, t_sec)
+                except Exception:
+                    logger.exception("Failed to gate jet on anomaly for %s",
+                                     result.peer_name)
                 logger.warning(
                     "ANOMALY: %s reported %s=%.2f, consensus=%.2f (dev %.1f > %.1f)",
                     result.peer_name, result.data_type,

@@ -238,7 +238,21 @@ def _orbit_position(center, radius_m, period_s, base_angle_deg, secs):
 # point (well off the map) and only enters view during the Strike beat.
 JET_JOIN_SEC = 360.0    # phase 6 ("Strike") start — jet joins the net (T+6:00)
 JET_LAUNCH_SEC = 290.0  # T+4:50 — scrambled as the MQ-800 is excluded
-JET_STRIKE_SEC = 375.0  # T+6:15 — high-speed pass over the objective
+JET_STRIKE_SEC = 375.0  # T+6:15 — authored high-speed pass over the objective
+JET_EGRESS_SEC = 480.0  # T+8:00 — clears to the west
+# The jet's strike is GATED on the MQ-800 rogue actually being exposed
+# (its reputation collapsing) so the narrative always reads as "threat
+# detected -> jet responds", never the jet overflying before the anomaly.
+# It holds off-map until `gate_jet_on_anomaly` fires, then strikes no
+# sooner than this many seconds later (and never before its authored time).
+JET_ANOMALY_HOLD_SEC = 10.0
+# Safety net: in a degenerate run where the rogue never produces a
+# detectable collapse, release the jet once the clock passes this so the
+# demo still completes instead of holding the strike forever.
+JET_HOLD_CEILING_SEC = 540.0
+# Authored waypoints, used only when there is no rogue to gate on
+# (`include_mq800=False`); the gated path is built by
+# DoDMissionScenario._jet_waypoints anchored to the actual strike time.
 _JET_WAYPOINTS = [
     (0.0,            JET_INGRESS),  # parked off-map east
     (JET_LAUNCH_SEC, JET_INGRESS),  # launch — begins the ingress run
@@ -247,8 +261,15 @@ _JET_WAYPOINTS = [
     # strike, matching the narration / strike annotation instead of
     # trailing ~25 s behind them.
     (JET_STRIKE_SEC, GROUND_MID),   # high-speed pass over the objective
-    (480.0,          JET_EGRESS),   # egresses to the west
+    (JET_EGRESS_SEC, JET_EGRESS),   # egresses to the west
 ]
+# Ingress-run / egress-run durations, preserved when the gated strike
+# time slides later than the authored one.
+_JET_INGRESS_RUN_SEC = JET_STRIKE_SEC - JET_LAUNCH_SEC   # 85s lead-in
+_JET_EGRESS_RUN_SEC = JET_EGRESS_SEC - JET_STRIKE_SEC    # 105s trail-off
+
+# The rogue peer whose exposure releases the jet.
+ROGUE_PEER_NAME = "mq800"
 
 
 # Phase 6 #2 rank-gate: minimum fraction of admitted peers that must
@@ -335,6 +356,10 @@ class DoDMissionScenario(Scenario):
         # RQ-86 orbit phase offsets (name -> base bearing deg), populated
         # by _define_rq86s and consumed by _update_positions.
         self._rq86_orbits: dict[str, float] = {}
+        # Scenario-seconds at which the MQ-800 rogue's reputation collapsed
+        # (set by gate_jet_on_anomaly from the live coordinator or replayed
+        # in playback). None = not yet exposed -> the jet holds off-map.
+        self._jet_anomaly_sec = None
         # Randomly-wandering infil/exfil path (>=10 waypoints), seeded so
         # it is reproducible across playback/tests. See _build_squad_waypoints.
         self._squad_waypoints = _build_squad_waypoints(seed)
@@ -412,16 +437,80 @@ class DoDMissionScenario(Scenario):
                     0.0, secs - MQ800_JOIN_SEC)
                 role.position = GeoPosition(o_lat, o_lon, MQ800_INGRESS[2])
         # Fighter jet: high-speed ingress pass over the objective during
-        # the Strike phase, then egress. Holds off-map east until T+6:00.
+        # the Strike phase, then egress. Holds off-map east until the rogue
+        # is exposed (see _jet_strike_time / gate_jet_on_anomaly) so it never
+        # overflies before the MQ-800 anomaly the narrative depends on.
         if self._include_jet:
             role = self._peers.get("jet-1")
             if role is not None:
-                j_lat, j_lon, j_alt = _interp_path(secs, _JET_WAYPOINTS)
+                launch_sec = self._jet_launch_time(secs)
+                if launch_sec is None:
+                    # Rogue not yet exposed — park at the off-map ingress hold.
+                    j_lat, j_lon, j_alt = JET_INGRESS
+                else:
+                    j_lat, j_lon, j_alt = _interp_path(
+                        secs, self._jet_waypoints(launch_sec))
                 role.position = GeoPosition(j_lat, j_lon, j_alt)
         # Leave-behind sensors are emplaced and stationary — their roster
         # positions are already correct, so no per-tick update is needed;
         # they are surfaced as tracked assets by the coordinator's
         # platform feed.
+
+    # --- jet strike gating ---------------------------------------------
+
+    def gate_jet_on_anomaly(self, peer_name, secs) -> None:
+        """Release the fighter jet once the MQ-800 rogue is exposed.
+
+        Called for every successful reputation slash (live coordinator) or
+        every replayed slash marker (canned playback). Only the rogue's
+        collapse counts, and only the first one — later slashes/re-detections
+        can't push the strike around. No-op when the jet or rogue is disabled
+        for this run, leaving the authored timing untouched.
+        """
+        if peer_name != ROGUE_PEER_NAME:
+            return
+        if not (self._include_jet and self._include_mq800):
+            return
+        if self._jet_anomaly_sec is None:
+            self._jet_anomaly_sec = float(secs)
+
+    def _jet_launch_time(self, secs):
+        """Scenario-seconds at which the jet *begins its ingress run* (leaves
+        the off-map hold), or ``None`` while it must keep holding.
+
+        With no rogue to gate on the jet keeps its authored launch. With the
+        rogue, it holds off-map until the collapse (`gate_jet_on_anomaly`)
+        plus a short beat, never earlier than its authored launch — then
+        flies the full authored ingress run in, so the pass always reads as
+        "threat exposed -> jet scrambles -> strike" with no teleport. A
+        ceiling releases a never-exposed rogue's run so the demo can't hang.
+
+        Anchoring to launch (not the strike) is deliberate: the ingress run
+        is ~85s, so a strike pinned to anomaly+10s would force the jet to
+        have "launched" before the anomaly and snap forward when released.
+        """
+        if not self._include_mq800:
+            return JET_LAUNCH_SEC
+        if self._jet_anomaly_sec is None:
+            if secs >= JET_HOLD_CEILING_SEC:
+                self._jet_anomaly_sec = secs - JET_ANOMALY_HOLD_SEC
+            else:
+                return None
+        return max(JET_LAUNCH_SEC,
+                   self._jet_anomaly_sec + JET_ANOMALY_HOLD_SEC)
+
+    def _jet_waypoints(self, launch_sec):
+        """Ingress→strike→egress waypoints anchored to ``launch_sec``,
+        preserving the authored ingress-run and egress-run durations so a
+        delayed launch still flies the same visual pass, just later (strike
+        = launch + ingress run)."""
+        strike_sec = launch_sec + _JET_INGRESS_RUN_SEC
+        return [
+            (0.0, JET_INGRESS),                          # parked off-map
+            (launch_sec, JET_INGRESS),                   # launch — begin ingress
+            (strike_sec, GROUND_MID),                    # pass over objective
+            (strike_sec + _JET_EGRESS_RUN_SEC, JET_EGRESS),  # egress west
+        ]
 
     # --- peers ---------------------------------------------------------
 
