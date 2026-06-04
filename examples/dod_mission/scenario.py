@@ -512,6 +512,33 @@ class DoDMissionScenario(Scenario):
             (strike_sec + _JET_EGRESS_RUN_SEC, JET_EGRESS),  # egress west
         ]
 
+    def peer_arrived(self, name, secs) -> bool:
+        """Whether ``name`` should be shown on the map at scenario-second
+        ``secs`` — i.e. it has reached its ``join_phase`` start time.
+
+        A late joiner (MQ-800 at phase 4 / T+4:00, leave-behind sensors at
+        phase 2 / T+2:00) should NOT have a map marker before it actually
+        arrives; otherwise it sits at its roster position from t=0 and reads
+        as "already here." Time-based (not event-based) so it behaves
+        identically live and in canned playback, where scripted PEER_JOIN
+        events may or may not have been recorded.
+
+        The fighter-jet is exempt: it manages its own entrance (held off-map
+        at JET_INGRESS, released on the rogue anomaly — see _jet_launch_time),
+        so it is always eligible to render and its position model hides it.
+        """
+        role = self._peers.get(name)
+        if role is None:
+            return False
+        if name == "jet-1":
+            return True
+        jp = getattr(role, "join_phase", 0)
+        if jp <= 0:
+            return True
+        phase_start = (self._phases[jp].start.total_seconds()
+                       if 0 <= jp < len(self._phases) else 0.0)
+        return secs >= phase_start
+
     # --- peers ---------------------------------------------------------
 
     def _define_peers(self):
