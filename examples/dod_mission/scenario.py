@@ -237,7 +237,7 @@ def _orbit_position(center, radius_m, period_s, base_angle_deg, secs):
 # path via _interp_path, so before T+6:00 it clamps to the ingress hold
 # point (well off the map) and only enters view during the Strike beat.
 JET_JOIN_SEC = 360.0    # phase 6 ("Strike") start — jet joins the net (T+6:00)
-JET_LAUNCH_SEC = 290.0  # T+4:50 — scrambled as the MQ-800 is excluded
+JET_LAUNCH_SEC = 290.0  # T+4:50 — patrolling jet vectored in as the MQ-800 is excluded
 JET_STRIKE_SEC = 375.0  # T+6:15 — authored high-speed pass over the objective
 JET_EGRESS_SEC = 480.0  # T+8:00 — clears to the west
 # The jet's strike is GATED on the MQ-800 rogue actually being exposed
@@ -482,7 +482,8 @@ class DoDMissionScenario(Scenario):
         rogue, it holds off-map until the collapse (`gate_jet_on_anomaly`)
         plus a short beat, never earlier than its authored launch — then
         flies the full authored ingress run in, so the pass always reads as
-        "threat exposed -> jet scrambles -> strike" with no teleport. A
+        "threat exposed -> patrolling jet vectored in -> strike" with no
+        teleport. A
         ceiling releases a never-exposed rogue's run so the demo can't hang.
 
         Anchoring to launch (not the strike) is deliberate: the ingress run
