@@ -664,6 +664,7 @@ class DoDMissionCoordinator(AutonomousTrust):
     _logged_first_rep_drain = False
     _logged_first_batch_seen = False
     _logged_missing_task_id = False
+    _logged_jet_gate = False
 
     def _drain_peer_readings(self, queues=None):
         """Drain payloads that DiagDataRcvr has put onto the shared
@@ -1174,6 +1175,10 @@ class DoDMissionCoordinator(AutonomousTrust):
                 if p.kind in ("soldier", "microdrone",
                               "recon-drone", "armed-drone",
                               "fighter-jet", "ground-sensor")
+                # Don't draw a late joiner (MQ-800 @ T+4:00, sensors @ T+2:00)
+                # before it actually arrives — else it sits at its roster
+                # position from t=0 and reads as "already here".
+                and self.scenario.peer_arrived(p.name, t_seconds)
             },
             "detection_per_peer": self._pick_primary_detection_per_peer(),
             "detection_per_target": {
@@ -1286,7 +1291,20 @@ class DoDMissionCoordinator(AutonomousTrust):
                 continue
             if result.is_anomalous:
                 anomalous_this_reading = True
-                t_sec = result.timestamp.total_seconds()
+                # Anomaly time on the coordinator SCENARIO clock
+                # (now - tasking_start) — the same clock that drives the jet
+                # position, phase events, and _jet_launch_time. NOT
+                # result.timestamp: that is reading.timestamp, stamped on the
+                # producer's AT_DEMO_T0_EPOCH (launcher) clock, which precedes
+                # tasking_start by the coordinator's boot/bootstrap offset. Using
+                # it armed gate_jet_on_anomaly that many seconds late, sliding the
+                # jet strike late live AND in playback (the recorded marker's "t"
+                # below re-arms the gate). Falls back to the tick-derived estimate
+                # until tasking_start is set, mirroring _push_dashboard_update.
+                try:
+                    t_sec = (now() - self.tasking_start).total_seconds()
+                except Exception:
+                    t_sec = self._tick_count * 0.5
                 # Type is "COMPROMISE_DETECT" (a PhaseEvent enum name) so the
                 # record survives PlaybackEngine.load_recorded's PhaseEvent
                 # filter and replays in the event log; data.source pins it
@@ -1318,6 +1336,14 @@ class DoDMissionCoordinator(AutonomousTrust):
                 # non-rogue peers are ignored inside gate_jet_on_anomaly.
                 try:
                     self.scenario.gate_jet_on_anomaly(result.peer_name, t_sec)
+                    if (not DoDMissionCoordinator._logged_jet_gate
+                            and getattr(self.scenario,
+                                        "_jet_anomaly_sec", None) is not None):
+                        logger.warning(
+                            "JET GATE armed by %s anomaly at t=%.1fs — "
+                            "jet will launch shortly",
+                            result.peer_name, self.scenario._jet_anomaly_sec)
+                        DoDMissionCoordinator._logged_jet_gate = True
                 except Exception:
                     logger.exception("Failed to gate jet on anomaly for %s",
                                      result.peer_name)

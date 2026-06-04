@@ -332,6 +332,9 @@ def main(argv=None):
                    "alt": r.position.alt, "kind": r.kind, "color": r.color}
             for name, r in scenario.peers.items()
             if r.kind in _ASSET_KINDS
+            # Hide a late joiner until it actually arrives (see
+            # DoDMissionScenario.peer_arrived) — mirrors the live coordinator.
+            and scenario.peer_arrived(name, t_seconds)
         }
         # Static role lookups + accumulated trust/detection state so the
         # peer-detail drawer + Reputations panel render the same
