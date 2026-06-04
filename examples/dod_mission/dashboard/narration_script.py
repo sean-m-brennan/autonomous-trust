@@ -38,7 +38,7 @@ DOD_NARRATION: list[NarrationBlock] = [
         t_start=0,
         t_end=15,
         text="A 12-man squad inserts behind enemy lines on a mobile-target "
-             "mission.  They are three klicks out.",
+             "mission.  They are two kilometers out.",
         subtext="The squad has pre-established trust with their microdrones, "
              "two RQ-86 recon drones overhead, and a remote command node.  "
              "Pre-mission identity chains are loaded.  Nothing else is "
@@ -140,8 +140,8 @@ DOD_NARRATION: list[NarrationBlock] = [
              "everyone else's.",
         subtext="The cross-source position validator is running on the "
              "fusion node.  RQ-86-1, RQ-86-2, and the microdrones agree "
-             "within a few metres; the MQ-800 designates a different "
-             "building the better part of a kilometre away — far beyond "
+             "within a few meters; the MQ-800 designates a different "
+             "building the better part of a kilometer away — far beyond "
              "any plausible sensor error, so it cannot be written off as a "
              "statistical anomaly.  On the Target Position map its marker "
              "visibly splits from the cluster in real time.",
