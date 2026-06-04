@@ -412,6 +412,7 @@ class DetectionSource:
                  suppression_sec: float = DEFAULT_SUPPRESSION_SEC,
                  drift_threshold_m: float = DEFAULT_DRIFT_THRESHOLD_M,
                  seed: Optional[int] = None,
+                 active_after_sec: float = 0.0,
                  pose_provider: Optional[Callable[[], Optional[tuple]]] = None):
         if role not in ROLE_FOV and fov is None:
             raise ValueError(
@@ -433,6 +434,12 @@ class DetectionSource:
         self.time_floor_sec = time_floor_sec
         self.suppression_sec = suppression_sec
         self.drift_threshold_m = drift_threshold_m
+        # Arrival gate: emit nothing (not even a heartbeat) before this
+        # scenario-second. A late-joining emitter like the MQ-800 (join_phase
+        # 4, T+4:00) isn't on the network yet, so its detections must not
+        # appear — or be cross-validated — before it arrives. Pre-established
+        # emitters (microdrones, RQ-86s) pass 0.0 and are unaffected.
+        self.active_after_sec = active_after_sec
         self._view_center_latlon = view_center_latlon
         self._view_utm = _wgs84_to_utm(*view_center_latlon)
         # Optional live-pose source for simulator-driven motion: a callable
@@ -490,6 +497,11 @@ class DetectionSource:
     # --- emit ----------------------------------------------------------
 
     def tick(self, t: timedelta) -> list[Reading]:
+        # Arrival gate: the peer isn't on the network before this scenario
+        # second (e.g. the MQ-800 at T+4:00), so emit nothing at all — no
+        # detection, no position reading, no heartbeat.
+        if t.total_seconds() < self.active_after_sec:
+            return []
         # Refresh pose from the live source (simulator-driven motion) before
         # gating/visibility. Pose tracking is independent of the emission
         # cadence, and update_pose() is a no-op when the pose is unchanged.
@@ -671,6 +683,7 @@ def build_detection_source(peer_name: str, role: str,
                            bearing_deg: Optional[float] = None,
                            link_quality: float = 0.95,
                            seed: Optional[int] = None,
+                           active_after_sec: float = 0.0,
                            pose_provider: Optional[
                                Callable[[], Optional[tuple]]] = None
                            ) -> Optional[DetectionSource]:
@@ -703,5 +716,6 @@ def build_detection_source(peer_name: str, role: str,
         bearing_deg=bearing_deg,
         link_quality=link_quality,
         seed=seed,
+        active_after_sec=active_after_sec,
         pose_provider=pose_provider,
     )
