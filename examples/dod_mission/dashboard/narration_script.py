@@ -18,8 +18,19 @@ Severity / style is consumed by inspector.dashboard.narration:
   "success"  successful autonomous action
 """
 
-from autonomous_trust.inspector.dashboard.narration import NarrationBlock
+from autonomous_trust.inspector.dashboard.narration import (
+    NarrationBlock, NarrationAnchor,
+)
 
+
+# The trust/threat beats below carry ``anchor`` cues so that, during canned
+# playback, examples.dod_mission.__main__ re-times them to when the events
+# *actually* happened in the recording (reputation crossing 0.7, the MQ-800
+# being detected and collapsing, the jet checking in) instead of the
+# idealised ``t_start`` schedule. The ``t_start`` values remain the live-mode
+# fallback (and the fallback if a cue never fires in a given recording).
+# The "cohort_above" cohort (the pre-established peers) is injected at
+# runtime from the scenario roster — see __main__.
 
 DOD_NARRATION: list[NarrationBlock] = [
     # ----- Phase 0: Setup (T+0:00 - T+1:00) ----------------------------
@@ -67,6 +78,9 @@ DOD_NARRATION: list[NarrationBlock] = [
              "have leveled.  The network has autonomously decided these "
              "peers are trustworthy.",
         style="success",
+        # Fires when the LAST pre-established peer first crosses 0.7.
+        anchor=NarrationAnchor(kind="cohort_above", op="above",
+                               threshold=0.7),
     ),
 
     # ----- Phase 2: Contact (T+2:00 - T+3:00) --------------------------
@@ -116,6 +130,8 @@ DOD_NARRATION: list[NarrationBlock] = [
              "just not on this squad's roster.  Watch what the network does "
              "in the next 30 seconds.",
         style="info",
+        # Fires when the MQ-800 first appears in the trust timeline.
+        anchor=NarrationAnchor(kind="peer_sample", peer="mq800", op="first"),
     ),
     NarrationBlock(
         t_start=255,
@@ -130,6 +146,9 @@ DOD_NARRATION: list[NarrationBlock] = [
              "statistical anomaly.  On the Target Position map its marker "
              "visibly splits from the cluster in real time.",
         style="alert",
+        # Fires on the first cross-source position anomaly against the MQ-800.
+        anchor=NarrationAnchor(kind="event", event_type="COMPROMISE_DETECT",
+                               peer="mq800"),
     ),
     NarrationBlock(
         t_start=270,
@@ -141,6 +160,9 @@ DOD_NARRATION: list[NarrationBlock] = [
              "processors, the RQ-86s, and the microdrones converged "
              "independently.",
         style="alert",
+        # Fires when the MQ-800's reputation first drops below the 0.5 line.
+        anchor=NarrationAnchor(kind="peer_sample", peer="mq800", op="below",
+                               threshold=0.5),
     ),
     NarrationBlock(
         t_start=285,
@@ -152,6 +174,9 @@ DOD_NARRATION: list[NarrationBlock] = [
              "\"Network excluded MQ-800 (autonomous).\"  This was not a "
              "human decision.",
         style="alert",
+        # Fires when the MQ-800 hits the untrusted floor (excluded).
+        anchor=NarrationAnchor(kind="peer_sample", peer="mq800", op="below",
+                               threshold=0.2),
     ),
 
     # ----- Phase 5: ECM (T+5:00 - T+6:00) ------------------------------
@@ -180,6 +205,8 @@ DOD_NARRATION: list[NarrationBlock] = [
              "trust anchor and admit it to the cohort.  Elapsed time, "
              "identity to operational trust: under one second.",
         style="success",
+        # Fires when the fighter jet checks in (first appears in the timeline).
+        anchor=NarrationAnchor(kind="peer_sample", peer="jet-1", op="first"),
     ),
     NarrationBlock(
         t_start=380,
