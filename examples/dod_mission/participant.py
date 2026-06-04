@@ -364,14 +364,19 @@ class DoDMissionParticipant(AutonomousTrust):
         # with no role-specific data source (soldier, command-node,
         # fighter-jet) still get a DataProcess so the service is
         # available, but with no bundle attached it just no-ops.
+        # Shared epoch for cross-peer timestamp alignment in the
+        # sensor-comparison charts.  See DoDDataProcess docstring. Computed
+        # before _build_generators so the detection pose-provider closure
+        # (_detection_pose_provider) can replay this peer's scenario path on
+        # the same clock the emitted readings are stamped against.
+        self._t0_epoch = float(os.environ.get("AT_DEMO_T0_EPOCH")
+                               or time.time())
+
         self.generators = self._build_generators()
 
-        # Shared epoch for cross-peer timestamp alignment in the
-        # sensor-comparison charts.  See DoDDataProcess docstring.
-        t0_epoch = float(os.environ.get("AT_DEMO_T0_EPOCH") or time.time())
         self.add_worker(DoDDataProcess,
                         generators=self.generators,
-                        t0_epoch=t0_epoch)
+                        t0_epoch=self._t0_epoch)
 
         logger.info("Participant %s initialized: role=%s, generators=%s, "
                     "compromised=%s, forgery_mode=%s",
@@ -380,15 +385,57 @@ class DoDMissionParticipant(AutonomousTrust):
                     compromised, forgery_mode)
 
     def _detection_pose_provider(self, kind, roster_latlon):
-        """Hook for simulator-driven peer motion. Return a callable
-        ``() -> (lat, lon[, bearing_deg]) | None`` that yields the peer's
-        live pose each tick, or ``None`` (the default) to keep the
-        stationary roster pose. Override on the participant (or set
-        ``self._pose_provider``) once a per-peer live position feed is wired
-        from the simulator — a moving microdrone then brings the target
-        compound into its forward FOV as it advances. Returning the
-        instance attribute keeps the v1 behavior (None) unless set."""
-        return getattr(self, "_pose_provider", None)
+        """Return a callable ``() -> (lat, lon) | None`` yielding this peer's
+        live pose each tick, or ``None`` to keep the stationary roster pose.
+
+        Resolution order:
+
+        1. An explicit ``self._pose_provider`` (e.g. a real simulator feed set
+           on the instance) always wins.
+        2. **Microdrones** get live motion *on by default*: a closure that
+           replays this peer's own deterministic scenario path locally — no
+           simulator dependency — so its ~350 m forward FOV sweeps onto the
+           target compound as it advances from the insertion LZ to the
+           objective (T+1:00..T+7:00). The pose is read from this
+           participant's own ``scenario`` instance (built from the same roster
+           knobs the coordinator uses), driven by ``self._t0_epoch`` — the
+           shared demo clock the emitted readings are also stamped against, so
+           visibility timing lines up with the rest of the timeline. Opt out
+           with ``AT_DETECTION_LIVE_MOTION=0`` to restore the stationary v1.
+        3. Every other role keeps the stationary roster pose (``None``); the
+           RQ-86s orbit overhead (bearing-irrelevant) and the MQ-800 uses its
+           DETECTION_VIEW_CENTER_OVERRIDE.
+        """
+        explicit = getattr(self, "_pose_provider", None)
+        if explicit is not None:
+            return explicit
+        if kind != "microdrone":
+            return None
+        if os.environ.get("AT_DETECTION_LIVE_MOTION", "1") == "0":
+            return None
+
+        scenario = self.scenario
+        peer_name = self.peer_name
+        epoch = self._t0_epoch
+
+        def _pose():
+            # Replay the scenario movement model to this peer's live position.
+            # _update_positions is pure movement (no phase-event side effects),
+            # mutating scenario.peers[*].position in place; we read our own.
+            try:
+                t = timedelta(seconds=time.time() - epoch)
+                scenario._update_positions(t)
+                role = scenario.peers.get(peer_name)
+                pos = getattr(role, "position", None)
+                if pos is None:
+                    return None
+                return (pos.lat, pos.lon)
+            except Exception:  # a flaky pose source must not crash the sensor
+                logger.debug("detection pose provider failed for %s",
+                             peer_name, exc_info=True)
+                return None
+
+        return _pose
 
     def _maybe_add_detection(self, bundle, kind, roster_latlon):
         """Attach a DetectionSource alongside a drone-role bundle.
