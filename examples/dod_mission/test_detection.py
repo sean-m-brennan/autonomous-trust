@@ -159,7 +159,8 @@ def test_compromise_swaps_position_and_crop_keeps_uid(catalogue):
                                  catalogue=catalogue,
                                  view_center_latlon=(34.724448, -86.634330))
     comp = ci.wrap_detection_source_with_compromise(honest)
-    out = comp.tick(timedelta(seconds=10))
+    # Tick past the compromise activation (T+4:15) so the decoy swap is live.
+    out = comp.tick(timedelta(seconds=260))
     by_uid = {}
     for r in out:
         if r.data_type == "detection":
@@ -188,6 +189,48 @@ def test_compromise_falls_back_when_decoy_missing():
     out = comp.tick(timedelta(seconds=10))
     alpha = next(r for r in out if r.data_type == "detection")
     assert alpha.metadata["crop_id"] == "crops/compound-alpha.jpg"
+
+
+def test_compromise_honest_until_activation_then_decoy(catalogue):
+    # Anomaly-reveal gate: the MQ-800 reports the honest target until the
+    # compromise activates (T+4:15), then designates the decoy. Before:
+    # compound-alpha carries its OWN crop (clusters with the RQ-86s). After:
+    # it keeps the alpha UID but carries bravo's crop — the "wrong building".
+    honest = det.DetectionSource("mq800", "armed-drone", catalogue=catalogue,
+                                 view_center_latlon=(34.724448, -86.634330))
+    comp = ci.wrap_detection_source_with_compromise(honest)
+
+    early = {r.metadata["world_uid"]: r
+             for r in comp.tick(timedelta(seconds=100))
+             if r.data_type == "detection"}
+    assert early["compound-alpha"].metadata["crop_id"] == \
+        "crops/compound-alpha.jpg"
+
+    late = {r.metadata["world_uid"]: r
+            for r in comp.tick(timedelta(seconds=260))
+            if r.data_type == "detection"}
+    assert late["compound-alpha"].metadata["crop_id"] == \
+        "crops/compound-bravo.jpg"
+
+
+def test_arrival_gate_suppresses_emission_before_join(catalogue):
+    # Arrival gate: a late joiner emits nothing at all before its join time.
+    src = det.DetectionSource("mq800", "armed-drone", catalogue=catalogue,
+                              view_center_latlon=GROUND_MID_LL,
+                              active_after_sec=240.0)
+    assert src.tick(timedelta(seconds=100)) == []     # not arrived yet
+    assert src.tick(timedelta(seconds=250)) != []      # arrived → emits
+
+
+def test_wrap_preserves_arrival_gate(catalogue):
+    # Wrapping an honest source for compromise must not reopen the
+    # pre-arrival window.
+    honest = det.DetectionSource("mq800", "armed-drone", catalogue=catalogue,
+                                 view_center_latlon=GROUND_MID_LL,
+                                 active_after_sec=240.0)
+    comp = ci.wrap_detection_source_with_compromise(honest)
+    assert comp.active_after_sec == 240.0
+    assert comp.tick(timedelta(seconds=100)) == []
 
 
 # --- Validator integration --------------------------------------------

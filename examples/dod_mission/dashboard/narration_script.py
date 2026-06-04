@@ -197,9 +197,9 @@ DOD_NARRATION: list[NarrationBlock] = [
     NarrationBlock(
         t_start=360,
         t_end=380,
-        text="Command scrambled a fighter jet the moment the MQ-800 went "
-             "rogue.  It arrives now, announces itself, and the cohort "
-             "validates it.",
+        text="A fighter jet was already on patrol nearby.  The moment the "
+             "MQ-800 was exposed as rogue, Command vectored it in.  It "
+             "arrives now, announces itself, and the cohort validates it.",
         subtext="The jet presents a fresh identity chained to Command's "
              "root.  Squad processors verify it against the pre-mission "
              "trust anchor and admit it to the cohort.  Elapsed time, "
