@@ -1,13 +1,17 @@
 """Seed per-peer persistent state for the high-trust dod-mission cohort.
 
 Generates ``./.demo-state/dod-mission/<peer>/etc/at/{identity,group,
-peers,reputation,peer-capabilities}.cfg.json`` for every squad-* /
-microdrone-* / jet-* peer in the scenario. The state encodes mutual
+peers,reputation,peer-capabilities}.cfg.json`` for every pre-trusted peer
+in the scenario (squad-* / microdrone-* / jet-* — see PRE_TRUSTED_PREFIXES
+in examples/dod_mission/reputation_warmstart.py). The state encodes mutual
 recognition + reputation = 0.7 so the cohort starts trusting each other
-from t=0; everyone else (rq-86 recon, mq-800 armed, ground sensors,
-command-node) cold-bootstraps normally so the existing demo beats
-(Sybil rejection on hacked sensors, MQ-800 contradiction detection)
-stay intact.
+from t=0. The jet is included because its strike window is too brief to
+build consensus. Everyone else (rq-86 recon, mq-800 armed, ground sensors,
+command-node) cold-bootstraps normally so the existing demo beats (Sybil
+rejection on hacked sensors, MQ-800 contradiction detection) stay intact.
+
+(``command`` was briefly seeded too, but that made it a mutual-trust field
+member and churned the gateway-reputation tree — reverted; it cold-boots.)
 
 Output layout::
 
@@ -64,17 +68,13 @@ from autonomous_trust.core._python.capabilities import PeerCapabilities  # noqa:
 from autonomous_trust.core._python.system import CfgIds  # noqa: E402
 
 
-# Seed reputation per peer — clearly above the rep-persist threshold
-# (0.5) but well under 1.0 so the trust tier sits in the "trusted but
-# earned" band (TIER_FLOORS in repprocess.py:57-62 maps 0.65..0.80 to
-# tier 2 = "affirmed", which is what we want).
-SEED_REPUTATION = 0.7
-
-# Trust tier (0..4) we bake into each peer's *view* of every other
-# seeded peer. tier 2 ("affirmed") matches SEED_REPUTATION=0.7 per
-# TIER_FLOORS in repprocess.py. The runtime tier-update path will
-# update this after the first reputation cycle if scoring drifts.
-SEED_TIER = 2
+# Seed reputation / tier / pre-trusted set: single source of truth shared
+# with the coordinator's dashboard warm-start (see the module docstring).
+# 0.7 sits above the 0.5 rep-persist threshold but under 1.0 -> tier 2
+# ("affirmed") per TIER_FLOORS in repprocess.py:57-62.
+from examples.dod_mission.reputation_warmstart import (  # noqa: E402
+    SEED_REPUTATION, SEED_TIER, PRE_TRUSTED_PREFIXES,
+)
 
 # Capability list each seeded peer advertises in its peer-capabilities
 # snapshot. Matches the canonical bootstrap set every AT peer registers
@@ -90,8 +90,6 @@ SEEDED_PEER_CAPABILITIES: list[str] = [
 
 GROUP_NICKNAME = "odazone"
 
-PRE_TRUSTED_PREFIXES = ("squad-", "microdrone-", "jet-")
-
 # Gateways (rank > 1 "peer leaders") bridge the command cohort above them
 # to the field cohort below. For seed-assisted dual membership they are
 # given the field group as a CHILD group (group_child_*.cfg.json) and are
@@ -105,7 +103,7 @@ GATEWAY_PREFIXES = ("rq86-",)
 
 
 def is_seeded(peer_name: str) -> bool:
-    """Strictly the spec's pre-trusted set: squad-*, microdrone-*, jet-*."""
+    """The pre-trusted set: squad-*, microdrone-*, jet-*."""
     return peer_name.startswith(PRE_TRUSTED_PREFIXES)
 
 

@@ -228,6 +228,33 @@ def test_validator_catches_mq800_alpha_lie():
     assert lie.deviation > 50.0
 
 
+def test_three_source_one_liar_does_not_flag_honest_sources():
+    """Regression: the degenerate 3-source window (two honest recon + the
+    lone rogue) must flag ONLY the rogue, never the honest pair.
+
+    This is the live false-positive that condemned both RQ-86s: once the
+    swarm exfiltrates, only rq86-1, rq86-2, and the MQ-800 remain on the
+    primary target track. Under the old "median of others" consensus, each
+    honest RQ-86 was judged against the average of {other RQ-86, MQ-800},
+    dragged ~half the gap toward the lie, so all three tripped the 50 m
+    threshold. With the median of ALL sources the honest cluster sets the
+    consensus and only the rogue deviates."""
+    v = CrossSourceValidator(data_type="target_position_x",
+                             threshold=50.0, min_sources=3, window_sec=10.0)
+    # Mirrors the real values around the recorded detection (~t+7:20).
+    v.submit(_detection_position_x("rq86-1", -213.6, "compound-alpha", 0))
+    v.submit(_detection_position_x("rq86-2", -212.5, "compound-alpha", 1))
+    rogue = v.submit(_detection_position_x("mq800", 85.9,
+                                           "compound-alpha", 2))
+    assert rogue is not None and rogue.is_anomalous
+    # Re-submit the honest pair now that all three sources are active; they
+    # must read clean against the median-of-all consensus.
+    h1 = v.submit(_detection_position_x("rq86-1", -213.6, "compound-alpha", 3))
+    h2 = v.submit(_detection_position_x("rq86-2", -212.5, "compound-alpha", 4))
+    assert h1 is not None and not h1.is_anomalous, h1.deviation
+    assert h2 is not None and not h2.is_anomalous, h2.deviation
+
+
 def test_load_catalogue_inlines_real_crops(tmp_path):
     """Real on-disk catalogue + crops -> crop_b64 populated, metadata
     on a detection Reading carries the base64 bytes."""
@@ -502,7 +529,10 @@ def test_validator_backward_compat_for_metadata_less_reading():
     v.submit(Reading(td(seconds=0), "noaa-1", "temperature", 20.0, "C"))
     v.submit(Reading(td(seconds=1), "noaa-2", "temperature", 21.0, "C"))
     res = v.submit(Reading(td(seconds=2), "noaa-3", "temperature", 30.0, "C"))
-    assert res.is_anomalous and abs(res.deviation - 9.5) < 0.01
+    # metadata-less readings still bucket together and validate. Consensus is
+    # the median of ALL sources {20, 21, 30} = 21, so the 30 C outlier
+    # deviates by 9.0 (was 9.5 under the old median-of-others). Still anomalous.
+    assert res.is_anomalous and abs(res.deviation - 9.0) < 0.01
 
 
 class _FakeBundleForPickle:

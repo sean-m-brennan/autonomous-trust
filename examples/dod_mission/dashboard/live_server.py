@@ -36,6 +36,13 @@ from autonomous_trust.inspector.dashboard.narration import (
     NarrationBlock, NarrationOverlay, STYLE_COLORS,
 )
 
+# Pure pause/auto-pause state machine, kept in a Dash-free sibling module so
+# the logic is unit-testable without standing up a server.
+try:
+    from .pause_control import apply_pause_click, auto_pause
+except ImportError:  # imported as a top-level module rather than a package
+    from pause_control import apply_pause_click, auto_pause
+
 
 _TICK_MS = 1000
 
@@ -235,6 +242,8 @@ def make_app(name: str, title: str,
              narration_script: Optional[list[NarrationBlock]] = None,
              presentation_default: bool = True,
              peer_names: Optional[list[str]] = None,
+             start_paused: bool = False,
+             auto_pause_before_narration: bool = False,
              ) -> dash.Dash:
     """Construct the Dash app.
 
@@ -254,6 +263,17 @@ def make_app(name: str, title: str,
     "Presentation" + "Fullscreen" toggle pair in the status bar.  The
     state provider should include a ``t_seconds`` key (scenario seconds,
     float) so narration can advance with the demo clock.
+
+    Pause control (presentations): a "Pause/Resume" button lets the
+    operator freeze the demo at any time.  Freezing means ``_refresh``
+    stops calling ``state_provider`` — for canned playback that halts the
+    recording clock (``PlaybackInterface.tick`` is no longer invoked) and
+    holds every panel as-is.  ``auto_pause_before_narration`` (opt-in;
+    OFF by default so the live coordinator dashboard runs freely) makes the
+    demo freeze itself the moment the clock first reaches the earliest
+    narration block, so the operator can finish bringing the dashboard up and
+    then click Resume to start the narrative on cue — intended for canned
+    playback, where ``__main__`` enables it.  ``start_paused`` opens frozen.
     """
     timeline: TrustTimeline = panels["trust_timeline"]
     # Chart-shaped panels — see make_app docstring for the duck-typed
@@ -264,6 +284,18 @@ def make_app(name: str, title: str,
 
     overlay = (NarrationOverlay(narration_script)
                if narration_script else None)
+
+    # Auto-pause cue: the earliest narration block's start time. When set,
+    # the demo freezes itself the first time the clock reaches it (so the
+    # operator hits Resume to launch the narrative). None disables it.
+    narration_start_t: Optional[float] = (
+        min((b.t_start for b in narration_script), default=None)
+        if (narration_script and auto_pause_before_narration) else None)
+    # Latest state snapshot, refreshed only while running. The peer-detail
+    # drawer reads this instead of calling state_provider() itself, so the
+    # recording clock advances exactly once per tick and a frozen demo stays
+    # frozen even with a drawer open.
+    _latest_state: dict[str, Any] = {}
 
     app = dash.Dash(name, title=title, update_title=None)
 
@@ -276,6 +308,12 @@ def make_app(name: str, title: str,
         # fullscreen toggle has somewhere to keep its state.
         dcc.Store(id="presentation-mode",
                   data={"on": bool(presentation_default)}),
+        # Pause state for the demo clock. "paused" freezes _refresh;
+        # "auto_done" latches once auto-pause-before-narration has fired (or
+        # the operator has taken manual control) so it never re-fires.
+        dcc.Store(id="playback-paused",
+                  data={"paused": bool(start_paused),
+                        "auto_done": bool(start_paused)}),
         html.Div(
             id="control-bar",
             style={"display": "flex" if narration_script else "none",
@@ -304,6 +342,18 @@ def make_app(name: str, title: str,
                                    "border": "1px solid #334155",
                                    "borderRadius": "4px",
                                    "cursor": "pointer"}),
+                # Pause/Resume freezes the demo clock (see _refresh). Label
+                # reflects the action the click performs.
+                html.Button("▶ Resume" if start_paused else "⏸ Pause",
+                            id="pause-toggle",
+                            n_clicks=0,
+                            style={"padding": "4px 12px",
+                                   "background": "#1E293B",
+                                   "color": "#E2E8F0",
+                                   "border": "1px solid #334155",
+                                   "borderRadius": "4px",
+                                   "cursor": "pointer",
+                                   "minWidth": "92px"}),
                 html.Span(id="presentation-status",
                           style={"color": "#94A3B8",
                                  "fontSize": "11px",
@@ -428,6 +478,10 @@ def make_app(name: str, title: str,
 
     chart_outputs = [Output(gid, "figure") for gid in chart_graph_ids]
 
+    # Count of data-panel outputs preceding the pause store/button, used to
+    # size the "freeze" return (everything held with dash.no_update).
+    _n_data_outputs = 7 + len(charts)
+
     @app.callback(
         Output("status-bar", "children"),
         Output("timeline-graph", "figure"),
@@ -437,11 +491,34 @@ def make_app(name: str, title: str,
         Output("event-log", "children"),
         Output("narration-overlay", "children"),
         Output("narration-overlay", "style"),
+        Output("playback-paused", "data"),
+        Output("pause-toggle", "children"),
         Input("tick", "n_intervals"),
+        Input("pause-toggle", "n_clicks"),
         State("presentation-mode", "data"),
+        State("playback-paused", "data"),
     )
-    def _refresh(_n, presentation_data):
+    def _refresh(_n, _pause_clicks, presentation_data, paused_data):
+        paused_data = dict(paused_data or {})
+        is_paused = bool(paused_data.get("paused"))
+        auto_done = bool(paused_data.get("auto_done"))
+
+        # A click on the Pause/Resume button toggles the frozen state.
+        clicked = dash.callback_context.triggered_id == "pause-toggle"
+        is_paused, auto_done = apply_pause_click(clicked, is_paused, auto_done)
+
+        # Frozen: don't call state_provider() (which would advance the
+        # recording clock) and hold every data panel as-is. Only the pause
+        # store + button label change. _latest_state being non-empty means we
+        # have already rendered at least one frame to freeze on.
+        if is_paused and _latest_state:
+            return (*([dash.no_update] * _n_data_outputs),
+                    {"paused": True, "auto_done": auto_done}, "▶ Resume")
+
+        # ---- running: advance the clock exactly once ----
         state = state_provider() or {}
+        _latest_state.clear()
+        _latest_state.update(state)
         # Feed live squad/microdrone positions to any panel that renders
         # them (the TargetPositionMapPanel) before its figure is built.
         platforms = state.get("platforms") or {}
@@ -455,10 +532,20 @@ def make_app(name: str, title: str,
             if hasattr(chart, "legend_groups"):
                 map_legend = _render_map_legend(chart.legend_groups())
                 break
+
+        t_seconds = float(state.get("t_seconds", 0.0))
+        # Auto-pause right before the narrative: the first time the clock
+        # reaches the earliest narration block, freeze.
+        is_paused, auto_done = auto_pause(
+            is_paused, auto_done, t_seconds, narration_start_t)
+        # When this running frame is the one we freeze on (auto-pause just
+        # fired, or we opened with start_paused), hold the narration hidden so
+        # Resume reveals the first block on cue.
+        suppress_narration = is_paused
+
         narration_children: Any = html.Div()
         overlay_style = {"visibility": "hidden"}
-        if overlay is not None:
-            t_seconds = float(state.get("t_seconds", 0.0))
+        if overlay is not None and not suppress_narration:
             overlay.advance_to(t_seconds)
             presentation_on = bool((presentation_data or {}).get("on"))
             if presentation_on:
@@ -476,6 +563,7 @@ def make_app(name: str, title: str,
         timeline_fig.update_layout(width=map_w)
         for cf in chart_figs[1:]:
             cf.update_layout(width=map_w)
+        pause_label = "▶ Resume" if is_paused else "⏸ Pause"
         return (
             _render_status_bar(title, state),
             timeline_fig,
@@ -485,6 +573,8 @@ def make_app(name: str, title: str,
             event_log.to_dash_children(),
             narration_children,
             overlay_style,
+            {"paused": is_paused, "auto_done": auto_done},
+            pause_label,
         )
 
     # Stretch Goal 2 / Phase 4: peer-detail drawer.
@@ -521,8 +611,10 @@ def make_app(name: str, title: str,
     def _render_drawer(_n, selected_peer):
         if not selected_peer:
             return _DRAWER_PLACEHOLDER
-        state = state_provider() or {}
-        return _render_peer_drawer(state, selected_peer)
+        # Read the snapshot _refresh cached this tick rather than calling
+        # state_provider() again — that would advance the recording clock a
+        # second time per tick and would defeat a paused demo.
+        return _render_peer_drawer(_latest_state, selected_peer)
 
     if narration_script:
         @app.callback(

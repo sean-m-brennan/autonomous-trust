@@ -262,6 +262,9 @@ from scenario import DoDMissionScenario  # noqa: E402
 from dashboard.dod_app import build_dashboard  # noqa: E402
 from dashboard import live_server  # noqa: E402
 from dashboard.narration_script import DOD_NARRATION  # noqa: E402
+from reputation_warmstart import (  # noqa: E402
+    is_warm_start_member, reconcile_rep_score,
+)
 sys.path.insert(0, str(_HERE / "tasks"))
 from validation import (  # noqa: E402
     POSITION_VALIDATOR_X, POSITION_VALIDATOR_Y, ELECTRONIC_NOISE_VALIDATOR,
@@ -276,15 +279,9 @@ logger = logging.getLogger(__name__)
 # final fallback). A real EMA over the demo's transaction scores (0.3 for an
 # anomalous batch, 0.8 for a clean one) never lands exactly on 0.5, and a
 # slash floors to 0.1 — so an exact-0.5 reading is the "no information yet"
-# cold-start placeholder, not an earned score. _query_reputations uses this
-# to keep a re-keyed peer's forming/stale uuid from dragging the peer's
-# known reputation down to 0.5 (which drew a sawtooth on the timeline).
-_NEUTRAL_REP_DEFAULT = 0.5
-
-
-def _is_neutral_rep(score: float) -> bool:
-    """True if a reputation reading is the cold-start neutral 0.5 default."""
-    return abs(score - _NEUTRAL_REP_DEFAULT) < 1e-9
+# cold-start placeholder, not an earned score. The neutral test + the
+# warm-start substitution that uses it now live in reputation_warmstart
+# (is_neutral_rep / reconcile_rep_score), shared with tools/seed_dod_cohort.py.
 
 
 def _ts_keep(batch_id: str, denom: int) -> bool:
@@ -339,6 +336,30 @@ class DoDMissionCoordinator(AutonomousTrust):
         self._compromise_mode = compromise_mode
         self._dashboard_port = dashboard_port
         self._reputation_cache: dict[str, float] = {}
+        # Dashboard warm-start: replace a pre-trusted peer's cold-start 0.5
+        # with its seeded prior when it has no *earned* consensus to show.
+        # Two cases qualify:
+        #   * join_phase > 0   — joins too late to build history (the
+        #                        fighter-jet's ~15 s strike window).
+        #   * kind == soldier  — consumer-only (participant.py: squad members
+        #                        run no data generator), so they never appear
+        #                        as a counterparty in scored bilateral
+        #                        transactions and their consensus stays at the
+        #                        neutral baseline forever. Their trust is
+        #                        pre-established (seeded), exactly as the
+        #                        narration states ("pre-established trust with
+        #                        their microdrones…"), so the dashboard should
+        #                        show that seeded prior, not 0.5.
+        # Data-producing pre-trusted peers (the microdrones) are NOT
+        # warm-started — they earn real, rising consensus (~0.8), which is the
+        # build-up the trust-dynamics chart is meant to show. Keyed by roster
+        # name (== the AT identity nickname the reputation cache uses). See
+        # reputation_warmstart.reconcile_rep_score.
+        self._warm_start_peers: set[str] = {
+            p.name for p in scenario.peers.values()
+            if is_warm_start_member(
+                p.name, getattr(p, "join_phase", 0), p.kind)
+        }
         self._anomaly_log: list[dict] = []
         self._tick_count = 0
         self._latest_state: dict = {
@@ -535,6 +556,11 @@ class DoDMissionCoordinator(AutonomousTrust):
         # multi-agency assumes; tune later from real runs).
         if self._tick_count % 60 == 0:
             self._query_reputations(queues)
+            # Flush the recording on the same cadence so a hard kill (or a
+            # missed graceful-shutdown window — e.g. k8s teardown wiping the
+            # node) can't discard the whole run; cleanup() still does a final
+            # flush. No-op when recording is disabled.
+            self._flush_recording()
         # Advance the scenario clock so phases progress past Setup in
         # live mode. The Approach-phase gate (Phase 6 #2) consults the
         # live tier view attached above; until ≥90% of peers reach
@@ -668,17 +694,31 @@ class DoDMissionCoordinator(AutonomousTrust):
                         "Validator/chart dispatch failed for %s",
                         peer_name)
 
+    def _flush_recording(self, *, final: bool = False) -> None:
+        """Persist the recording captured so far.
+
+        Called periodically from autonomous_tasking (so an ungraceful exit
+        can't lose the run) and once more on shutdown. Safe to call when
+        recording is disabled (no-op) and to call repeatedly — ``save()``
+        rewrites the file each time."""
+        if self._event_recorder is None or not self._record_path:
+            return
+        try:
+            self._event_recorder.save(
+                self._record_path, scenario=self.scenario)
+            n = len(self._event_recorder.events)
+            if final:
+                logger.info("Recorded %d events to %s",
+                            n, self._record_path)
+            else:
+                logger.debug("Flushed %d events to %s (periodic)",
+                             n, self._record_path)
+        except Exception:
+            logger.exception("Failed to save recording")
+
     def cleanup(self):
         """Flush the event log to disk on shutdown."""
-        if self._event_recorder is not None and self._record_path:
-            try:
-                self._event_recorder.save(
-                    self._record_path, scenario=self.scenario)
-                logger.info("Recorded %d events to %s",
-                            len(self._event_recorder.events),
-                            self._record_path)
-            except Exception:
-                logger.exception("Failed to save recording")
+        self._flush_recording(final=True)
         logger.info("DoD mission coordinator shutting down")
 
     # -- internal -------------------------------------------------------
@@ -828,10 +868,13 @@ class DoDMissionCoordinator(AutonomousTrust):
             candidates.setdefault(name, []).append((float(score), tier))
 
         for name, vals in candidates.items():
-            real = [v for v in vals if not _is_neutral_rep(v[0])]
-            # Prefer a real score; fall back to the neutral default only when
-            # that's all we have (a genuinely cold/forming peer).
-            score, new_tier = real[-1] if real else vals[-1]
+            # Prefer a real (non-neutral) score; for a warm-start peer with
+            # only the neutral cold-start placeholder (e.g. the fighter-jet,
+            # present too briefly to build consensus) substitute its seeded
+            # prior so a pre-trusted asset never reads untrusted while up.
+            # Otherwise fall back to neutral (a genuinely cold/forming peer).
+            score, new_tier = reconcile_rep_score(
+                vals, name in self._warm_start_peers)
             self._reputation_cache[name] = score
             self._feed_timeline(name, score)
             # Stash the peer's trust tier alongside the score so the
@@ -894,14 +937,22 @@ class DoDMissionCoordinator(AutonomousTrust):
                 "type": "REPUTATION_SAMPLE",
                 "peer": peer_name,
                 "score": float(score),
+                # Carry the access tier alongside the score so canned
+                # playback can colour the Reputations ladder + drive the
+                # peer-detail status the same way the live dashboard does
+                # (it has no _tier_cache to reach into). Defaults to 0
+                # when the peer hasn't been tiered yet.
+                "tier": int(self._tier_cache.get(peer_name, 0)),
             })
 
-    def _cache_detection_reading(self, reading) -> None:
+    def _cache_detection_reading(self, reading) -> dict:
         """Stash a detection-typed Reading in per-(peer, uid) caches.
 
         Stores a flat dict (rather than DetectionSummary) so the entry
         survives the data_queue pickle hop into the live_server callback
         process without needing the inspector import on the wire path.
+        Returns the cached entry so callers (the recorder path) can
+        persist it into the playback sidecar.
         """
         md = reading.metadata or {}
         world_uid = str(md.get("world_uid", ""))
@@ -925,6 +976,7 @@ class DoDMissionCoordinator(AutonomousTrust):
             log = deque(maxlen=DETECTION_LOG_CAPACITY)
             self._detection_log_per_peer[reading.peer_name] = log
         log.append(entry)
+        return entry
 
     # Priority list for `_pick_primary_detection_per_peer`. World UIDs
     # that appear earlier "win" the per-peer slot, even if a later
@@ -1082,7 +1134,20 @@ class DoDMissionCoordinator(AutonomousTrust):
         # the chart fan-out + validator loop (the parallel
         # target_position_x/y readings are what the validators score).
         if reading.data_type == "detection":
-            self._cache_detection_reading(reading)
+            entry = self._cache_detection_reading(reading)
+            # Persist the detection (crop + bbox + label + UID) into the
+            # playback sidecar so the canned-playback peer-detail drawer
+            # can rebuild detection_per_peer / detection_log_per_peer —
+            # there is no live AT mesh in playback to re-emit these, and
+            # the crop imagery isn't otherwise reconstructable. Detection
+            # emissions are sparse (time-floor + per-UID suppression in
+            # generators/detection.py), so recording every one is cheap.
+            if self._event_recorder is not None and entry is not None:
+                snap = dict(entry)
+                snap["t"] = reading.timestamp.total_seconds()
+                snap["type"] = "DETECTION"
+                snap["peer"] = reading.peer_name
+                self._event_recorder.record_snapshot(snap)
             return
         if reading.data_type == "detection_heartbeat":
             # No visible state to update — the cache stays as-is so
