@@ -576,12 +576,18 @@ class AgencyMap:
                 f"(conf {marker.confidence:.2f})"
             )
         if line_lats:
+            # Scattergeo.line supports `dash`; Scattermap.line does NOT
+            # (it rejects the property key even when the value is None), so
+            # only include it on the vector-globe path. Mirrors the flows
+            # trace, which drops dash for the same reason.
+            line_kw = dict(color="rgba(148, 163, 184, 0.55)", width=1)
+            if not self._use_tiles:
+                line_kw["dash"] = "dot"
             fig.add_trace(scatter(
                 lat=line_lats,
                 lon=line_lons,
                 mode="lines",
-                line=dict(color="rgba(148, 163, 184, 0.55)", width=1,
-                          dash="dot" if not self._use_tiles else None),
+                line=line_kw,
                 hoverinfo="skip",
                 name="detection-sightlines",
                 showlegend=False,

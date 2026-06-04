@@ -5,10 +5,10 @@ after `tools/naip_fetch.py` and `tools/detection_prep.py` have written
 their outputs (the conda env supplies ultralytics/Pillow/pyproj/numpy):
 
     conda activate autonomous_trust
-    PYTHONPATH=src/autonomous-trust:src/autonomous-trust-services:\
-src/autonomous-trust-inspector:src/autonomous-trust-evaluation:\
-src/autonomous-trust-simulator \
-        python -m scripts.sg2_walkthrough_screens
+    python3 scripts/sg2_walkthrough_screens.py
+
+The script bootstraps the autonomous_trust namespace-package src roots onto
+``sys.path`` itself (see below), so no ``PYTHONPATH=`` prefix is needed.
 
 Produces:
 * doc/architecture/_generated/sg2/catalogue_overlay.jpg
@@ -24,7 +24,22 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "examples" / "dod_mission"))
+# Self-contained path bootstrap so the script runs with a bare
+# `python3 scripts/sg2_walkthrough_screens.py` (no PYTHONPATH= prefix). Adds
+# the dod_mission example dir plus the autonomous_trust namespace-package src
+# roots; harmless when autonomous_trust is already pip-installed in the env.
+_SRC = REPO_ROOT / "src"
+for _p in (
+    REPO_ROOT / "examples" / "dod_mission",
+    _SRC / "autonomous-trust",
+    _SRC / "autonomous-trust-services",
+    _SRC / "autonomous-trust-inspector",
+    _SRC / "autonomous-trust-evaluation",
+    _SRC / "autonomous-trust-simulator",
+):
+    _ps = str(_p)
+    if _p.is_dir() and _ps not in sys.path:
+        sys.path.insert(0, _ps)
 
 OUT_DIR = REPO_ROOT / "doc" / "architecture" / "_generated" / "sg2"
 ASSETS = REPO_ROOT / "examples" / "dod_mission" / "assets"

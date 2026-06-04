@@ -50,6 +50,7 @@ dependencies:
   - ultralytics-thop
   - pyproj
   - cryptography
+  - python-kaleido
   - pip
   # pip packages currently disabled:
   #   - mediapipe
