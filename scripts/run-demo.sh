@@ -39,7 +39,8 @@
 #                 and dod-mission.
 #   --playback FILE  Inspector-only replay (multi-agency only).
 #   --record FILE    Inspector-only scripted run, captures events
-#                    (multi-agency only).
+#                    (multi-agency only). For dod-mission, record a *live*
+#                    run instead with --record-to FILE (see dod-mission opts).
 #   --teardown    Stop a previous run + clean up, exit.
 #
 # Examples:
@@ -50,6 +51,7 @@
 #   scripts/run-demo.sh --variant=multi-agency --compose
 #   scripts/run-demo.sh --variant=multi-agency --playback recording.json
 #   scripts/run-demo.sh --variant=dod-mission --swarm-size=8
+#   scripts/run-demo.sh --variant=dod-mission --compose --record-to demo.json
 #   scripts/run-demo.sh --variant=multi-agency --teardown
 
 set -euo pipefail
@@ -88,7 +90,8 @@ REGISTRY="${REGISTRY:-}"
 IMAGE_TAG="${IMAGE_TAG:-:dev}"
 IMAGE_NAME="${IMAGE_NAME:-autonomous-trust}"
 PLAYBACK_FILE=""                     # multi-agency only
-RECORD_FILE=""                       # multi-agency only
+RECORD_FILE=""                       # multi-agency only (inspector-only mode)
+RECORD_TO=""                         # dod-mission: record a live run to a file
 
 # DoD scenario knobs (only honored when --variant=dod-mission).
 SQUAD_SIZE=4
@@ -164,9 +167,15 @@ dod-mission options:
   --sensor-count N       Sensors (default: $SENSOR_COUNT)
   --hacked-sensors N     Hacked sensors (default: $HACKED_SENSORS)
   --compromise-mode M    abrupt|gradual (default: $COMPROMISE_MODE)
+  --record-to FILE       Record this live run for canned playback. The
+                         coordinator flushes FILE on graceful shutdown
+                         (compose: ./recording/FILE beside the compose file;
+                         k8s: on the node). Play back with
+                         'python -m examples.dod_mission --playback FILE'.
 
 Environment overrides: VARIANT, NAMESPACE, INSPECTOR_PORT, DEPLOY_DIR,
-                       REGISTRY, IMAGE_TAG, LOG_LEVEL, TILT_LOG
+                       REGISTRY, IMAGE_TAG, LOG_LEVEL, TILT_LOG,
+                       AT_RECORD, AT_RECORD_HOST_DIR, AT_RECORD_NODE_PATH
 EOF
     exit "${1:-0}"
 }
@@ -186,6 +195,8 @@ while [[ $# -gt 0 ]]; do
         --clean)                 BACKEND_MODE="clean";       shift;;
         --playback)              BACKEND_MODE="playback"; PLAYBACK_FILE="$2"; shift 2;;
         --record)                BACKEND_MODE="record";   RECORD_FILE="$2";   shift 2;;
+        --record-to=*)           RECORD_TO="${1#*=}";        shift;;
+        --record-to)             RECORD_TO="$2";             shift 2;;
         --namespace=*)           NAMESPACE="${1#*=}";        shift;;
         --namespace)             NAMESPACE="$2";             shift 2;;
         --port=*)                INSPECTOR_PORT="${1#*=}";   shift;;
@@ -276,7 +287,26 @@ _allowed="${!_allowed_var}"
 if [[ ! " $_allowed " == *" $BACKEND_MODE "* ]]; then
     err "Backend mode '$BACKEND_MODE' is not valid for variant '$VARIANT'."
     err "    Allowed for $VARIANT: $_allowed"
+    if [[ "$BACKEND_MODE" == "record" && "$VARIANT" == "dod-mission" ]]; then
+        err "    To record a dod-mission live run, use: --record-to FILE"
+    fi
     exit 1
+fi
+
+# dod-mission: --record-to FILE records the live run. The compose/k8s/tilt
+# paths all generate via generate_compose/_k8s, which read AT_RECORD, so just
+# export it; the coordinator then gets `--record` + a host-backed recording
+# volume and flushes the canned-playback log on graceful shutdown.
+if [[ -n "$RECORD_TO" ]]; then
+    if [[ "$VARIANT" != "dod-mission" ]]; then
+        err "--record-to is only supported for --variant=dod-mission"
+        err "    (multi-agency records via its inspector-only --record FILE mode)"
+        exit 1
+    fi
+    export AT_RECORD="$RECORD_TO"
+    log "Recording this run -> coordinator writes $(basename "$RECORD_TO") on"
+    log "    graceful shutdown (compose: ./recording/ beside the compose file;"
+    log "    k8s: ${AT_RECORD_NODE_PATH:-/data/dod-mission-recording}/ on the node)."
 fi
 
 # --- Clean fast path ------------------------------------------------------
@@ -615,8 +645,14 @@ PY
                 # Module form (mirrors generate_k8s below). PYTHONPATH
                 # is exported at the top of this script, so `examples`
                 # resolves.
+                # Pin the image to the locally-built tag (e.g. :dev). Without
+                # this the compose defaults to the untagged DEMO_IMAGE, which
+                # Docker reads as :latest and then tries to PULL — failing with
+                # "pull access denied" since only the :dev tag exists locally.
+                # Mirrors the --image-tag the k8s generator already gets below.
                 python3 -m examples.dod_mission.deploy.generate_compose \
                     "$COMPOSE_FILE" \
+                    --image "${REGISTRY}at-dod-mission-demo${IMAGE_TAG}" \
                     --squad-size "$SQUAD_SIZE" \
                     --swarm-size "$SWARM_SIZE" \
                     --sensor-count "$SENSOR_COUNT" \

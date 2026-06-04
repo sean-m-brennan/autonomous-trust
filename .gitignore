@@ -165,3 +165,8 @@ embedded/signing.pub
 # download can also land in the cwd, so never commit model weights — they are
 # fetched artifacts, not source.
 *.pt
+
+# Canned-playback recordings captured from a live dod-mission run
+# (run-demo.sh --variant=dod-mission --record-to FILE; default compose host dir).
+/examples/dod_mission/deploy/recording/
+/dod-demo.json
