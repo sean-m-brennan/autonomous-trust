@@ -796,3 +796,77 @@ def test_pose_provider_failure_keeps_last_pose(catalogue):
                               pose_provider=_boom)
     out = src.tick(timedelta(seconds=10))  # must not raise
     assert any(r.data_type == "detection" for r in out)
+
+
+def _haversine_m(ll_a, ll_b):
+    import math
+    (la1, lo1), (la2, lo2) = ll_a, ll_b
+    la1, la2 = math.radians(la1), math.radians(la2)
+    dla, dlo = la2 - la1, math.radians(lo2 - lo1)
+    h = (math.sin(dla / 2) ** 2
+         + math.cos(la1) * math.cos(la2) * math.sin(dlo / 2) ** 2)
+    return 2 * 6371000.0 * math.asin(math.sqrt(h))
+
+
+def _pose_stub(peer_name="microdrone-1"):
+    """Minimal stand-in for a DoDMissionParticipant carrying just the
+    attributes _detection_pose_provider reads, so we can exercise the wiring
+    without the participant's full identity/worker startup."""
+    from scenario import DoDMissionScenario
+
+    class _Stub:
+        pass
+    stub = _Stub()
+    stub.scenario = DoDMissionScenario()
+    stub.peer_name = peer_name
+    stub._t0_epoch = 0.0
+    return stub
+
+
+def test_microdrone_live_motion_wired_on_by_default():
+    # The participant wires live microdrone motion on by default: the pose
+    # provider replays this peer's scenario path, carrying it from the
+    # insertion LZ (~km from the objective) to the objective hold (~tens of m)
+    # as scenario time advances.
+    import time as _time
+    sys.path.insert(0, str(_DOD))
+    from participant import DoDMissionParticipant
+    from scenario import GROUND_MID  # the squad's actual objective (lat,lon,alt)
+
+    objective_ll = (GROUND_MID[0], GROUND_MID[1])
+    stub = _pose_stub()
+
+    def _pose_at(scenario_secs):
+        # The closure captures _t0_epoch; epoch = now - t lands the replay at t.
+        stub._t0_epoch = _time.time() - scenario_secs
+        prov = DoDMissionParticipant._detection_pose_provider(
+            stub, "microdrone", SQUAD_LL)
+        assert prov is not None
+        return prov()
+
+    lz = _pose_at(0.0)
+    hold = _pose_at(210.0)
+    assert lz is not None and hold is not None
+    assert _haversine_m(lz, objective_ll) > 1000     # still at the LZ
+    assert _haversine_m(hold, objective_ll) < 100     # converged on objective
+
+
+def test_pose_provider_scoping_and_optout(monkeypatch):
+    # Non-microdrone roles keep the stationary roster pose; an explicit
+    # instance provider wins; AT_DETECTION_LIVE_MOTION=0 opts out.
+    sys.path.insert(0, str(_DOD))
+    from participant import DoDMissionParticipant
+
+    stub = _pose_stub()
+    assert DoDMissionParticipant._detection_pose_provider(
+        stub, "recon-drone", GROUND_MID_LL) is None
+
+    sentinel = lambda: (1.0, 2.0)  # noqa: E731
+    stub._pose_provider = sentinel
+    assert DoDMissionParticipant._detection_pose_provider(
+        stub, "microdrone", SQUAD_LL) is sentinel
+
+    stub2 = _pose_stub()
+    monkeypatch.setenv("AT_DETECTION_LIVE_MOTION", "0")
+    assert DoDMissionParticipant._detection_pose_provider(
+        stub2, "microdrone", SQUAD_LL) is None
