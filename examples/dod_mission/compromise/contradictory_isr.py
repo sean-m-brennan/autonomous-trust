@@ -156,16 +156,33 @@ class CompromisedDetectionSource(DetectionSource):
     """
 
     def __init__(self, *args, true_uid: str = DEFAULT_TRUE_UID,
-                 decoy_uid: str = DEFAULT_DECOY_UID, **kwargs):
+                 decoy_uid: str = DEFAULT_DECOY_UID,
+                 activate_at: timedelta = DEFAULT_ACTIVATE_AT, **kwargs):
         super().__init__(*args, **kwargs)
         self._true_uid = true_uid
         self._decoy_obj: Optional[CatalogueObject] = next(
             (o for o in self.catalogue if o.world_uid == decoy_uid), None
         )
+        # The decoy swap only begins at ``activate_at`` (the COMPROMISE_START
+        # beat, T+4:15) — the same instant the contradictory ISR position
+        # generators start diverging. Before then the MQ-800 reports the
+        # honest target (clusters with the RQ-86s); after, it designates the
+        # decoy and reads as the outlier the cross-validator catches. The red
+        # "caught" ring follows ~15 s later when reputation drops (the
+        # coordinator's mark_anomalous on the validator hit). Gating on START
+        # (not DETECT) keeps both the detection and ISR paths agreeing, so the
+        # map marker never flickers between honest and offset.
+        self._activate_at_sec = activate_at.total_seconds()
+        self._now_sec = float("-inf")
+
+    def tick(self, t: timedelta):
+        self._now_sec = t.total_seconds()
+        return super().tick(t)
 
     def _resolve_emission(self, obj: CatalogueObject):
         if (self._decoy_obj is not None
-                and obj.world_uid == self._true_uid):
+                and obj.world_uid == self._true_uid
+                and self._now_sec >= self._activate_at_sec):
             return self._decoy_obj, self._true_uid
         return super()._resolve_emission(obj)
 
@@ -175,6 +192,7 @@ def wrap_detection_source_with_compromise(
     mode: str = "abrupt",
     true_uid: str = DEFAULT_TRUE_UID,
     decoy_uid: str = DEFAULT_DECOY_UID,
+    activate_at: timedelta = DEFAULT_ACTIVATE_AT,
 ) -> CompromisedDetectionSource:
     """Build a CompromisedDetectionSource that mirrors an honest one.
 
@@ -197,8 +215,12 @@ def wrap_detection_source_with_compromise(
         time_floor_sec=honest.time_floor_sec,
         suppression_sec=honest.suppression_sec,
         drift_threshold_m=honest.drift_threshold_m,
+        # Carry the honest source's arrival gate (e.g. the MQ-800's T+4:00)
+        # so wrapping for compromise doesn't reopen the pre-arrival window.
+        active_after_sec=honest.active_after_sec,
         true_uid=true_uid,
         decoy_uid=decoy_uid,
+        activate_at=activate_at,
     )
 
 

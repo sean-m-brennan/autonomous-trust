@@ -171,11 +171,13 @@ def test_full_pipeline_catches_mq800_lie(pipeline):
     cache: dict = {}
     log: dict = {}
 
-    # T+10: prime the validator with honest baselines on alpha.
-    _drive(rq1, 10.0, validator, cache, log)
-    _drive(rq2, 10.0, validator, cache, log)
-    # MQ-800 reports alpha at bravo's coords -> validator catches.
-    flagged = _drive(mq, 10.0, validator, cache, log)
+    # Past the compromise activation (T+4:15) so the MQ-800's decoy swap is
+    # live; all three share one validator window. Prime honest baselines on
+    # alpha, then the MQ-800 reports alpha at bravo's coords -> validator
+    # catches it inside the alpha bucket.
+    _drive(rq1, 260.0, validator, cache, log)
+    _drive(rq2, 260.0, validator, cache, log)
+    flagged = _drive(mq, 260.0, validator, cache, log)
 
     alpha_results = [r for r in flagged
                      if r.peer_name == "mq800" and r.is_anomalous]

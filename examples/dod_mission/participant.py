@@ -449,11 +449,22 @@ class DoDMissionParticipant(AutonomousTrust):
         compound-alpha's bucket.
         """
         view_override = DETECTION_VIEW_CENTER_OVERRIDE.get(self.peer_name)
+        # Arrival gate: a late joiner (the MQ-800 at join_phase 4 / T+4:00)
+        # must not emit — or be cross-validated — before it is on the network.
+        # Derive the threshold from the peer's join-phase start, mirroring
+        # scenario.peer_arrived; pre-established emitters (join_phase 0) get
+        # 0.0 and are unaffected.
+        arrival_sec = 0.0
+        jp = getattr(self.role, "join_phase", 0)
+        phases = getattr(self.scenario, "_phases", None)
+        if jp and phases and 0 <= jp < len(phases):
+            arrival_sec = phases[jp].start.total_seconds()
         ds = build_detection_source(
             peer_name=self.peer_name,
             role=kind,
             roster_latlon=roster_latlon,
             view_center_override_latlon=view_override,
+            active_after_sec=arrival_sec,
             pose_provider=self._detection_pose_provider(kind, roster_latlon),
         )
         if ds is None:
