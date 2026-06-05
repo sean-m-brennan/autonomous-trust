@@ -1177,18 +1177,28 @@ class DoDMissionCoordinator(AutonomousTrust):
                               "fighter-jet", "ground-sensor")
                 # Don't draw a late joiner (MQ-800 @ T+4:00, sensors @ T+2:00)
                 # before it actually arrives — else it sits at its roster
-                # position from t=0 and reads as "already here".
-                and self.scenario.peer_arrived(p.name, t_seconds)
+                # position from t=0 and reads as "already here". peer_active
+                # also drops the two ECM microdrone casualties before exfil.
+                and self.scenario.peer_active(p.name, t_seconds)
             },
-            "detection_per_peer": self._pick_primary_detection_per_peer(),
+            # Detection markers follow the same active-peer gate so a lost
+            # microdrone's last detection doesn't linger on the map after it
+            # has dropped off.
+            "detection_per_peer": {
+                peer: entry
+                for peer, entry in self._pick_primary_detection_per_peer().items()
+                if self.scenario.peer_active(peer, t_seconds)
+            },
             "detection_per_target": {
                 f"{peer}|{uid}": dict(entry)
                 for (peer, uid), entry
                 in self._detection_per_target.items()
+                if self.scenario.peer_active(peer, t_seconds)
             },
             "detection_log_per_peer": {
                 k: [dict(entry) for entry in log]
                 for k, log in self._detection_log_per_peer.items()
+                if self.scenario.peer_active(k, t_seconds)
             },
         }
         try:

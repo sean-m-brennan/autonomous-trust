@@ -332,9 +332,10 @@ def main(argv=None):
                    "alt": r.position.alt, "kind": r.kind, "color": r.color}
             for name, r in scenario.peers.items()
             if r.kind in _ASSET_KINDS
-            # Hide a late joiner until it actually arrives (see
-            # DoDMissionScenario.peer_arrived) — mirrors the live coordinator.
-            and scenario.peer_arrived(name, t_seconds)
+            # Hide a late joiner until it arrives, and drop the two ECM
+            # microdrone casualties before exfil (DoDMissionScenario.
+            # peer_active) — mirrors the live coordinator.
+            and scenario.peer_active(name, t_seconds)
         }
         # Static role lookups + accumulated trust/detection state so the
         # peer-detail drawer + Reputations panel render the same
@@ -347,9 +348,13 @@ def main(argv=None):
                           for p in scenario.peers.values()}
         state["reputations"] = _reputations_view()
         state["tiers"] = dict(_tier_by_peer)
-        state["detection_per_peer"] = _detection_per_peer()
+        state["detection_per_peer"] = {
+            peer: entry for peer, entry in _detection_per_peer().items()
+            if scenario.peer_active(peer, t_seconds)
+        }
         state["detection_log_per_peer"] = {
             k: list(v) for k, v in _detection_log_per_peer.items()
+            if scenario.peer_active(k, t_seconds)
         }
         return state
 

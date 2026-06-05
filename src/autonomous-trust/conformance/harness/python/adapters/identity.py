@@ -562,10 +562,13 @@ class IdentityAdapter:
         # Translate the high-level YAML payload into the form the protocol
         # expects on the wire. Each function gets its own constructor.
         if function == IdentityProtocol.announce:
-            # (identity, package_hash, capabilities_list)
+            # DRY request_access contract: identity rides the envelope from_*
+            # fields (set via from_whom on the Message below — the canonical
+            # cross-runtime sender representation); the payload carries only
+            # [package_hash, capabilities_list]. Mirrors
+            # idprocess._broadcast_request_access and the C _build_announcement.
             caps_list = payload.get('capabilities', [])
-            obj = to_json_string((sender_identity.publish(),
-                                  self._package_hash, caps_list))
+            obj = to_json_string((self._package_hash, caps_list))
         elif function == IdentityProtocol.accept:
             caps_list = payload.get('capabilities', [])
             obj = to_json_string((sender_identity.publish(),

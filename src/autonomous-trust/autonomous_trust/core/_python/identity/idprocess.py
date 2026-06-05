@@ -28,6 +28,7 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import SignedMessage
 
 from . import Peers
+from .identity import Identity
 from .group import Group, ChildGroupSet
 from .history.history import IdentityHistory
 from ..algorithms.agreement import AgreementProof
@@ -369,9 +370,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         channel. Factored out of announce_identity so the group-merge
         path (see _merge_to_mesh) can re-broadcast without a phase change.
         Quiet on Full — caller logs."""
-        msg_str = to_json_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
+        # DRY request_access wire contract (cross-runtime canonical): the
+        # requester identity travels in the envelope from_* fields (set via
+        # from_whom below — the single representation C and Python both
+        # emit/parse, pinned by the message-envelope conformance vectors),
+        # NOT in the payload. The payload carries only the request-specific
+        # extras [package_hash, capabilities]. This is what lets a C at_demo
+        # node (whose net_proc stamps identity into from_* on every outbound
+        # and leaves request-payload identity absent) be admitted by a Python
+        # welcoming committee, and vice-versa. See welcoming_committee and
+        # message._identity_from_wire.
+        msg_str = to_json_string((self.package_hash, self.capabilities.to_list()))
         message = Message(self.name, IdentityProtocol.announce,
-                          msg_str, to_whom=Network.broadcast, encrypt=False)
+                          msg_str, to_whom=Network.broadcast,
+                          from_whom=self.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
     def announce_identity(self, queues):
@@ -753,13 +765,33 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.announce:
             try:
-                new_id, ph, caps = from_json_string(message.obj)  # from self.announce_identity()
+                # DRY request_access contract: requester identity comes from
+                # the envelope (Message.parse reconstructs from_whom from the
+                # canonical from_* fields for an as-yet-unknown peer); the
+                # payload carries only [package_hash, capabilities]. See
+                # _broadcast_request_access and message._identity_from_wire.
+                new_id = message.from_whom
+                if not isinstance(new_id, Identity):
+                    self.logger.warning('request_access with no sender identity; ignoring')
+                    return True
+                ph, caps = from_json_string(message.obj)  # [package_hash, capabilities]
                 if new_id == self.identity:
                     self.logger.debug('Should not have received my own announcement')
                     return
-                if not hmac.compare_digest(str(ph), str(self.package_hash)):
+                # Counterfeit check: a peer advertising a DIFFERENT non-empty
+                # package hash is running tampered software → reject. An EMPTY
+                # advertised hash means the peer doesn't compute one (e.g. a C
+                # at_demo node, which has no package-hash concept) — treat as
+                # "unknown", skip the check, and admit on identity/keys alone.
+                # This is the heterogeneous-fleet allowance that lets a C node
+                # join a Python welcoming committee; a same-runtime counterfeit
+                # still advertises its (mismatched) hash and is caught.
+                if str(ph) and not hmac.compare_digest(str(ph), str(self.package_hash)):
                     self.logger.error("Newbie is running a counterfeit; Ignore")
                     return True
+                if not str(ph):
+                    self.logger.debug("Peer advertised no package hash (heterogeneous "
+                                      "runtime, e.g. C node); skipping counterfeit check")
                 id_obj = IdentityObj(new_id, new_id.uuid)
                 existing = self.peers.find_by_uuid(new_id.uuid)
                 if new_id == existing:  # don't care if it's a different address

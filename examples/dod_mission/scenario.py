@@ -216,6 +216,13 @@ MQ800_ORBIT_RADIUS_M = 2500.0    # broad rogue orbit around the objective
 MQ800_ORBIT_PERIOD_S = 200.0
 MQ800_JOIN_SEC = 240.0           # phase 4 ("Rogue") start — see join_phase=4
 
+# Two microdrones are lost to enemy countermeasures during the ECM phase
+# (whitepaper scenario_7: "countermeasures are dropping micro-drones out of the
+# sky"), leaving the storyline's "two drones" for exfil. They drop off the map
+# at these scenario-seconds — staggered, both before the strike (T+6:00) and
+# the exfil beat (T+7:00). See DoDMissionScenario._casualty_sec / peer_active.
+SWARM_CASUALTY_SEC = (320.0, 340.0)   # T+5:20, T+5:40
+
 
 def _orbit_position(center, radius_m, period_s, base_angle_deg, secs):
     """(lat, lon, alt) on a circular orbit around ``center`` at ``secs``.
@@ -353,6 +360,9 @@ class DoDMissionScenario(Scenario):
         # super().__init__() because that calls self.define().
         self._squad_offsets: dict[str, tuple[float, float]] = {}
         self._microdrone_index: dict[str, int] = {}
+        # microdrone name -> scenario-second at which it is lost (drops off the
+        # map). Populated by _define_microdrones; consumed by peer_active.
+        self._casualty_sec: dict[str, float] = {}
         # RQ-86 orbit phase offsets (name -> base bearing deg), populated
         # by _define_rq86s and consumed by _update_positions.
         self._rq86_orbits: dict[str, float] = {}
@@ -540,6 +550,19 @@ class DoDMissionScenario(Scenario):
                        if 0 <= jp < len(self._phases) else 0.0)
         return secs >= phase_start
 
+    def peer_active(self, name, secs) -> bool:
+        """Whether ``name`` should be rendered at scenario-second ``secs``:
+        it has arrived (see peer_arrived) AND has not been lost as a casualty.
+
+        Two microdrones are ECM casualties (see _casualty_sec / the whitepaper
+        drone-loss beat); once past their loss time they drop off the map so
+        the exfil "two microdrones survive" beat is visibly true. Time-based,
+        so it behaves identically live and in canned playback."""
+        if not self.peer_arrived(name, secs):
+            return False
+        lost_at = self._casualty_sec.get(name)
+        return lost_at is None or secs < lost_at
+
     # --- peers ---------------------------------------------------------
 
     def _define_peers(self):
@@ -607,6 +630,14 @@ class DoDMissionScenario(Scenario):
                               "imu", "gps", "recon_sweep"],
                 metadata={"nickname": nickname},
             ))
+        # Mark the last (up to) two microdrones as ECM casualties so the
+        # storyline's "two drones survive" reads true and they visibly drop
+        # off the map before exfil. Always leaves >= 2 survivors; a swarm too
+        # small to spare two takes no casualties (scale-test safe).
+        n_cas = max(0, min(len(SWARM_CASUALTY_SEC), self._swarm_size - 2))
+        for k in range(n_cas):
+            idx = self._swarm_size - k  # 1-based: last drones first
+            self._casualty_sec[f"microdrone-{idx}"] = SWARM_CASUALTY_SEC[k]
 
     def _define_rq86s(self):
         # RQ-86s are peer leaders, orbit at altitude.

@@ -1,0 +1,102 @@
+name: ARM64 Cross-Build
+
+# Stretch Goal 3 / on-ramp #1, Phase 1: make the existing aarch64
+# cross-compile reproducible in CI and publish a fresh at_demo-arm64
+# on every push/PR. The cross-compile already exists locally via
+# `embedded/build-arm.sh` (docker buildx --platform linux/arm64 against
+# src/autonomous-trust/Dockerfile-c); this workflow just runs it in CI
+# and uploads the resulting tarballs as artifacts.
+#
+# Local equivalent: `cd embedded && ./build-arm.sh` (add --static for the
+# fully-static binary, --all-arch to also build amd64).
+#
+# Note on runners: ubuntu-latest builds arm64 under QEMU emulation, which
+# is slow (~15 min). If a self-hosted aarch64 runner becomes available,
+# point `runs-on` at it to drop native builds to ~3 min (see
+# STRETCH_GOAL_3_EMBEDDED_PLAN.md §5 Phase 1 / §7 Q2).
+
+on:
+  push:
+    branches: [master, main, 'feature/**']
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # build-arm.sh drives `docker buildx build --platform linux/arm64`.
+      # QEMU registration lets the amd64 runner execute aarch64 binaries
+      # inside the build container; buildx provides the multi-platform
+      # builder. Both are no-ops on a native aarch64 runner.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cross-build at_demo for arm64 (dynamic + static)
+        run: |
+          cd embedded
+          ./build-arm.sh           # autonomous-trust-arm64.tar.gz
+          ./build-arm.sh --static  # autonomous-trust-arm64-static.tar.gz + at_demo-arm64-static
+
+      - name: Report artifact sizes
+        if: always()
+        run: |
+          echo "## ARM64 build artifacts" >> "$GITHUB_STEP_SUMMARY"
+          ls -lh embedded/dist/*arm64* 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          if command -v size >/dev/null && [ -f embedded/dist/at_demo-arm64-static ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            size embedded/dist/at_demo-arm64-static >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload arm64 tarballs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autonomous-trust-arm64
+          path: |
+            embedded/dist/autonomous-trust-arm64.tar.gz
+            embedded/dist/autonomous-trust-arm64-static.tar.gz
+            embedded/dist/at_demo-arm64-static
+          if-no-files-found: error
+
+  # The multi-node QEMU smoke test (embedded/test-qemu.sh) cross-builds,
+  # deploys to QEMU VMs over a virtual LAN, and verifies peer discovery.
+  # It needs qemu-system + cloud-image tooling and is heavier than the
+  # build job, so it is its own non-blocking job for now. Promote it to a
+  # required check once it is observed green in CI (plan §5 Phase 1).
+  qemu-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install QEMU + cloud-image tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils cloud-image-utils openssh-client wget
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Two-node QEMU discovery smoke test
+        run: |
+          cd embedded
+          ./test-qemu.sh --nodes 2
