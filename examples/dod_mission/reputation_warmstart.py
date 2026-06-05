@@ -45,28 +45,33 @@ def is_pre_trusted(peer_name: str) -> bool:
 
 
 def is_warm_start_member(peer_name: str, join_phase: int, kind: str) -> bool:
-    """True if a peer's DASHBOARD reputation should be warm-started.
+    """True if a peer's DASHBOARD reputation should be warm-started — i.e.
+    surface a seeded prior instead of "forming…"/cold-start 0.5 for a peer
+    that doesn't reliably earn committed consensus in the coordinator's view.
 
-    A pre-trusted peer is warm-started only when it has no *earned* consensus
-    to show, so the dashboard surfaces its seeded prior instead of the
-    cold-start neutral 0.5:
+    Warm-started:
 
-      * ``join_phase > 0`` — joins too late to build any committed history
-        (the fighter-jet's ~15 s strike window).
-      * ``kind == "soldier"`` — consumer-only. Squad members run no data
-        generator (see participant.py), so they never appear as a scored
-        counterparty in a bilateral transaction and their consensus never
-        leaves the neutral baseline. Their trust is pre-established/seeded,
-        exactly as the narration states.
+      * **Infrastructure** — the command node and the coordinator's own AT
+        node (nickname "coordinator", see coordinator.py). Neither is a field
+        sensor that earns bilateral consensus, so both read trusted from t=0.
+      * **Pre-trusted field assets** — ``join_phase > 0`` (the fighter-jet's
+        ~15 s strike window is too brief to build history); ``kind ==
+        "soldier"`` (consumer-only squad members run no data generator, so
+        they never appear as a scored counterparty); and ``kind ==
+        "microdrone"``. Microdrones are seeded in the persistent cohort
+        (~0.7) and their earned build-up does not reliably surface via the
+        coordinator's consensus query, so they were reading "forming…"
+        indefinitely — warm-start them to the seeded prior (a real rising
+        score still overrides it the moment one lands; see reconcile_rep_score).
 
-    Data-producing pre-trusted peers (the microdrones) are NOT warm-started:
-    they earn real, rising consensus, which is the build-up the trust chart
-    is meant to show. Non-pre-trusted peers (command gateway, sensors) are
-    never warm-started — they cold-bootstrap. Pure.
+    Non-pre-trusted field peers (leave-behind sensors) are never warm-started —
+    they cold-bootstrap. Pure.
     """
+    if kind == "command-node" or peer_name in ("command", "coordinator"):
+        return True
     if not is_pre_trusted(peer_name):
         return False
-    return join_phase > 0 or kind == "soldier"
+    return join_phase > 0 or kind in ("soldier", "microdrone")
 
 
 def is_neutral_rep(score: float) -> bool:
