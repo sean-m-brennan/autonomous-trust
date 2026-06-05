@@ -471,6 +471,7 @@ set(libsrc
     autonomous_trust/fleet/update_proposal.c
     autonomous_trust/fleet/fleet_helpers.c
     autonomous_trust/fleet/fleet_ops.c
+    autonomous_trust/data_source/data_source_proc.c
     autonomous_trust/fleet/fleet_proc.c
     autonomous_trust/fleet/artifact_store.c
     autonomous_trust/fleet/artifact_proc_helpers.c
