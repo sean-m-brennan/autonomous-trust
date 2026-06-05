@@ -461,6 +461,13 @@ int generate_subsystems_config(const char *cfg_dir)
     err = tracker_register_subsystem(&tracker, "config", "config_proc");
     if (err != 0)
         return err;
+    /* ISR data-source service (C counterpart of Python DataProcess). Subsystem
+     * key "data-source" becomes the process queue name net_proc routes inbound
+     * subscribe requests to (route_to_process), and must match the wire name the
+     * coordinator's DataRcvr addresses (Python DataProcess.name). */
+    err = tracker_register_subsystem(&tracker, "data-source", "data_source_proc");
+    if (err != 0)
+        return err;
 
     char filepath[CFG_PATH_LEN + 1];
     if (path_join(filepath, sizeof(filepath), cfg_dir, default_tracker_filename) < 0)

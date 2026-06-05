@@ -16,6 +16,7 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <getopt.h>
@@ -37,6 +38,9 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  --log-level LEVEL   Set log level: debug, info, warning, error, critical\n");
     fprintf(stderr, "  --test              Run in test mode (limited iterations)\n");
     fprintf(stderr, "  --inject-update     Inject a self-referencing update proposal after peer discovery\n");
+    fprintf(stderr, "  --ingest-readings PATH  Feed ISR Readings to the data-source service over an\n");
+    fprintf(stderr, "                          AF_UNIX SOCK_STREAM socket at PATH (length-prefixed JSON\n");
+    fprintf(stderr, "                          batches). Equivalent to setting AT_INGEST_SOCKET=PATH.\n");
 }
 
 static log_level_t parse_log_level(const char *str)
@@ -130,11 +134,12 @@ int main(int argc, char *argv[])
         {"log-level", required_argument, NULL, 'l'},
         {"test", no_argument, NULL, 't'},
         {"inject-update", no_argument, NULL, 'i'},
+        {"ingest-readings", required_argument, NULL, 'r'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "gl:tih", long_options, NULL)) != -1)
+    while ((opt = getopt_long(argc, argv, "gl:tir:h", long_options, NULL)) != -1)
     {
         switch (opt)
         {
@@ -150,6 +155,11 @@ int main(int argc, char *argv[])
         case 'i':
             inject_update = true;
             test_mode = true;
+            break;
+        case 'r':
+            /* The data-source process (forked child) reads this from the
+             * environment; set it before at_node_init so the child inherits it. */
+            setenv("AT_INGEST_SOCKET", optarg, 1);
             break;
         case 'h':
             print_usage(argv[0]);
