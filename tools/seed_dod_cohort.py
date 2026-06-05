@@ -75,6 +75,16 @@ from autonomous_trust.core._python.system import CfgIds  # noqa: E402
 from examples.dod_mission.reputation_warmstart import (  # noqa: E402
     SEED_REPUTATION, SEED_TIER, PRE_TRUSTED_PREFIXES,
 )
+# Compose IP scheme — single source of truth so a pre-seeded C node's stored
+# address matches the IP the compose generator assigns it (the C node preserves
+# its seeded identity and does not re-discover the interface; the announce
+# envelope's from_address derives from this).
+from examples.dod_mission.deploy.generate_compose import (  # noqa: E402
+    SUBNET_BASE, BASE_PEER_OCTET,
+)
+from tools.c_identity import (  # noqa: E402
+    make_c_node_identity, public_identity_from_c_json,
+)
 
 # Capability list each seeded peer advertises in its peer-capabilities
 # snapshot. Matches the canonical bootstrap set every AT peer registers
@@ -110,6 +120,26 @@ def is_seeded(peer_name: str) -> bool:
 def is_gateway(peer_name: str) -> bool:
     """Gateways that get the field cohort as a seeded child group."""
     return peer_name.startswith(GATEWAY_PREFIXES)
+
+
+def _compose_ip(scenario: DoDMissionScenario, peer_name: str) -> str:
+    """The IP generate_compose.py assigns this peer (same enumerate order)."""
+    idx = list(scenario.peers).index(peer_name)
+    return f"{SUBNET_BASE}.{BASE_PEER_OCTET + idx}"
+
+
+def _read_or_init_c_identity(ident_file: Path, peer_name: str, address: str,
+                             force: bool) -> tuple[dict, Identity]:
+    """C-node analog of _read_or_init_identity: emit a seed-based C-format
+    identity (so the C ``at_demo`` node loads it via its preserve path) and the
+    matching public-only cohort view. Idempotent: a re-run without ``--force``
+    reuses the stored seeds so the C node keeps its UUID/pubkeys.
+    """
+    if ident_file.exists() and not force:
+        with ident_file.open("r") as f:
+            c_json = json.load(f)  # plain C JSON, NOT ConfigJSONEncoder
+        return c_json, public_identity_from_c_json(c_json)
+    return make_c_node_identity(peer_name, address)
 
 
 def _read_or_init_identity(ident_file: Path, peer_name: str,
@@ -150,9 +180,16 @@ def _peer_view_of(ident: Identity) -> Identity:
 
 
 def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
-                force: bool = False) -> list[str]:
+                force: bool = False,
+                c_nodes: frozenset[str] = frozenset()) -> list[str]:
     """Write seeded state under ``out_root``. Returns the list of seeded
     peer names (squad-*/microdrone-*/jet-*).
+
+    ``c_nodes`` names peers that run the C ``at_demo`` binary instead of the
+    Python participant. They get a seed-based **C-format** ``identity.cfg.json``
+    (no Python-format group/peers/reputation in their own dir — they cold-join
+    for the group key via the live handshake) while still being registered, at
+    seed tier, in every *other* peer's view so the cohort recognises them at t=0.
     """
     seeded = [name for name in scenario.peers.keys() if is_seeded(name)]
     if not seeded:
@@ -171,8 +208,17 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     identities: dict[str, Identity] = {}
     for peer in seeded + gateways:
         ident_file = out_root / peer / "etc" / "at" / "identity.cfg.json"
-        identities[peer] = _read_or_init_identity(ident_file, peer, force)
-        _save_json(ident_file, identities[peer])
+        if peer in c_nodes:
+            # C node: write the C-runtime schema verbatim (json.dump, not
+            # ConfigJSONEncoder); register the public-only view for the cohort.
+            c_json, identities[peer] = _read_or_init_c_identity(
+                ident_file, peer, _compose_ip(scenario, peer), force)
+            ident_file.parent.mkdir(parents=True, exist_ok=True)
+            with ident_file.open("w") as f:
+                json.dump(c_json, f, indent=2)
+        else:
+            identities[peer] = _read_or_init_identity(ident_file, peer, force)
+            _save_json(ident_file, identities[peer])
 
     # Phase 2: shared field Group. Its address map spans the seeded field
     # members AND the gateways, so field members unicast field-group
@@ -204,6 +250,13 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     # the gateways (so it recognises and unicasts to them).
     field_and_gw = seeded + gateways
     for peer in seeded:
+        if peer in c_nodes:
+            # C node loads only its C-format identity; it cold-joins for the
+            # group key + peer set via the live admission handshake (the cohort
+            # already trusts its seeded pubkey). Writing Python-format group/
+            # peers/reputation into its dir would just be unparsed noise to the
+            # C loader, so skip — it stays in *other* peers' views via `seeded`.
+            continue
         peer_cfg_dir = out_root / peer / "etc" / "at"
 
         # Group: shared content, one file per peer (each container
@@ -285,6 +338,10 @@ def main(argv=None) -> int:
     p.add_argument("--no-mq800", action="store_true")
     p.add_argument("--no-jet", action="store_true")
     p.add_argument("--no-command", action="store_true")
+    p.add_argument("--c-microdrones", action="store_true",
+                   help="Seed the microdrone-* peers as C at_demo nodes "
+                        "(C-format identity; they cold-join for the group key). "
+                        "Pair with generate_compose.py --c-microdrones.")
     args = p.parse_args(argv)
 
     scenario = DoDMissionScenario(
@@ -296,12 +353,17 @@ def main(argv=None) -> int:
         include_jet=not args.no_jet,
         include_command=not args.no_command,
     )
-    seeded = seed_cohort(args.out, scenario, force=args.force)
+    c_nodes = frozenset(
+        name for name in scenario.peers if name.startswith("microdrone-")
+    ) if args.c_microdrones else frozenset()
+    seeded = seed_cohort(args.out, scenario, force=args.force, c_nodes=c_nodes)
     n_skipped = len(scenario.peers) - len(seeded)
     print(f"Seeded {len(seeded)} peers under {args.out} "
           f"({n_skipped} peers left to cold-bootstrap)")
     if seeded:
         print("  Trusted cohort: " + ", ".join(sorted(seeded)))
+    if c_nodes:
+        print("  C at_demo nodes: " + ", ".join(sorted(c_nodes)))
     return 0
 
 
