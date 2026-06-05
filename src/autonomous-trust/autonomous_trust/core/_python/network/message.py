@@ -48,6 +48,38 @@ def _sig_to_hex_str(sig):
     return HexEncoder.encode(bytes(sig)).decode('ascii')
 
 
+def _identity_from_wire(wire):
+    """Reconstruct a public ``Identity`` from the envelope ``from_*`` wire
+    fields, or return ``None`` when no sender identity is present.
+
+    The ``from_uuid`` / ``from_name`` / ``from_address`` / ``from_sig_hex`` /
+    ``from_enc_hex`` envelope fields are the single canonical, cross-runtime
+    representation of a message sender's identity (C ``net_message.c`` and
+    Python ``Message.__bytes__`` emit the same five keys; pinned by the
+    message-envelope conformance vectors). This is how a peer whose identity
+    we do NOT yet know — the ``request_access`` discovery broadcast from a
+    brand-new node, including a C ``at_demo`` peer — is admitted: identity
+    travels in the envelope, NOT the payload (the payload carries only
+    ``[package_hash, capabilities]``). The hex fields are the hex-encoded
+    public keys, exactly what ``Signature``/``Encryptor`` accept with
+    ``public_only=True``. nickname is unknown over the wire (the envelope
+    has no nickname slot) and is left empty; equality/lookup for a new peer
+    keys on uuid + public keys, which are all present."""
+    from ..identity import Identity, Signature, Encryptor
+    from_uuid = wire.get('from_uuid') or ''
+    from_sig = wire.get('from_sig_hex') or ''
+    from_enc = wire.get('from_enc_hex') or ''
+    if not from_uuid or not from_sig or not from_enc:
+        return None
+    try:
+        sig = Signature(from_sig.encode('ascii'), public_only=True)
+        enc = Encryptor(from_enc.encode('ascii'), public_only=True)
+        return Identity(from_uuid, wire.get('from_address', '') or '',
+                        wire.get('from_name', '') or '', '', sig, enc)
+    except (ValueError, TypeError, RuntimeError):
+        return None
+
+
 class Message(object):
     """
     Wraps message data for IPC use, not for line transmission
@@ -232,7 +264,28 @@ class Message(object):
                 # field) → trace_id falls back to a fresh UUID, breaking
                 # the chain at that hop but not the message.
                 wire_trace = wire.get('trace_id') or None
-                msg = Message(process, function, obj_str, from_whom=sender,
+                # Resolve the sender. When the network layer couldn't map
+                # the source address to a known peer (sender is None) — the
+                # request_access discovery broadcast from a brand-new node,
+                # C or Python — reconstruct the sender identity from the
+                # canonical envelope from_* fields. This is what lets a C
+                # at_demo peer (which puts its identity ONLY in from_*, not
+                # the payload) be admitted, and is the receive-side half of
+                # the DRY request_access contract (identity in from_*,
+                # payload = [package_hash, capabilities]).
+                # On the broadcast/multicast channel the network layer passes
+                # the source ADDRESS string as `sender` (netprocess.py:759,
+                # validate=False), and on an unmatched p2p address it passes
+                # None — in both cases the peer identity is not yet known. When
+                # the envelope carries from_* (every request_access does, C and
+                # Python alike), reconstruct the real sender Identity from it so
+                # handlers receive an Identity rather than a bare address/None.
+                eff_sender = sender
+                if not isinstance(eff_sender, Identity):
+                    reconstructed = _identity_from_wire(wire)
+                    if reconstructed is not None:
+                        eff_sender = reconstructed
+                msg = Message(process, function, obj_str, from_whom=eff_sender,
                               encrypt=wire.get('encrypt', False),
                               trace_id=wire_trace)
                 msg.verified = False
@@ -245,16 +298,16 @@ class Message(object):
                 # the wire hex once ourselves and hand the 64-byte
                 # signature straight to VerifyKey.verify with no encoder.
                 sig_hex = wire.get('signature')
-                if sig_hex and sender is not None and isinstance(sender, Identity):
+                if sig_hex and eff_sender is not None and isinstance(eff_sender, Identity):
                     try:
                         sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
                         content = '|'.join([process, function, obj_str])
-                        sender.signature.public.verify(
+                        eff_sender.signature.public.verify(
                             content.encode(Network.encoding), sig_raw,
                         )
                         msg.verified = True
                     except (BadSignatureError, Exception) as e:
-                        logger.warning(f"Message signature verification failed from {sender}: {e}")
+                        logger.warning(f"Message signature verification failed from {eff_sender}: {e}")
                         msg.verified = False
                 return msg
         except (json.JSONDecodeError, ValueError, KeyError):

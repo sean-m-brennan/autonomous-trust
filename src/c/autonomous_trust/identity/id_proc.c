@@ -2474,6 +2474,39 @@ static int _build_announcement(const process_t *proc, generic_msg_t *buf)
         }
     }
 
+    /* DRY request_access payload: identity rides the envelope from_*
+     * fields (stamped above + by net_proc on outbound) — the canonical,
+     * cross-runtime identity representation. The payload carries only the
+     * request-specific extras [package_hash, capabilities], matching
+     * Python's _broadcast_request_access (idprocess.py). Without a payload
+     * Python's welcoming_committee (which does `ph, caps =
+     * from_json_string(obj)`) would choke; emit the 2-element array so the
+     * two runtimes parse identically. The C node has no package-hash
+     * concept, so slot 0 is the empty string (Python treats an empty peer
+     * hash as "unknown" and skips its counterfeit check — see
+     * welcoming_committee). Slot 1 is this node's own capability names. */
+    json_t *payload = json_array();
+    if (payload != NULL) {
+        json_array_append_new(payload, json_string(""));  /* package_hash */
+        json_t *caps_arr = json_array();
+        array_t *own = _id_own_caps_for(proc);
+        if (own != NULL) {
+            pthread_mutex_lock(&id_state.lock);
+            for (size_t i = 0; i < array_size(own); i++) {
+                data_t *str_dat = NULL;
+                if (array_get(own, i, &str_dat) != 0 || str_dat == NULL) continue;
+                char *cap_name = NULL;
+                if (data_string_ptr(str_dat, &cap_name) != 0 || cap_name == NULL)
+                    continue;
+                json_array_append_new(caps_arr, json_string(cap_name));
+            }
+            pthread_mutex_unlock(&id_state.lock);
+        }
+        json_array_append_new(payload, caps_arr);
+        net_msg_pack_json(&buf->info.net_msg, payload);
+        json_decref(payload);
+    }
+
     /* Set broadcast recipient (to_whom empty = broadcast) */
     strncpy(buf->info.net_msg.return_to, "identity", PROC_NAME_LEN);
     return 0;

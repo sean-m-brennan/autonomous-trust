@@ -299,8 +299,25 @@ if(NOT DEFINED PROTOBUF_INCLUDE_DIR OR "${PROTOBUF_INCLUDE_DIR}" STREQUAL "")
 endif()
 
 # protobuf-c
-find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c HINTS ${CONDA_ROOT})
-find_library(LIBPROTOBUF_C_LIBRARY NAMES protobuf-c HINTS ${CONDA_ROOT})
+# Mirror the protobuf block above: inside a conda env, resolve protobuf-c
+# strictly from the env (NO_DEFAULT_PATH) so we don't latch onto a system
+# libprotobuf-c.so whose dev symlink may be absent on the host (which leaves
+# a dangling DEPENDS path -> "No rule to make target .../libprotobuf-c.so").
+set(_at_pbc_resolved FALSE)
+if(DEFINED ENV{CONDA_PREFIX})
+    find_path(_at_pbc_inc protobuf-c.h PATH_SUFFIXES protobuf-c
+              HINTS ${CONDA_ROOT} NO_DEFAULT_PATH)
+    find_library(_at_pbc_lib NAMES protobuf-c HINTS ${CONDA_ROOT} NO_DEFAULT_PATH)
+    if(_at_pbc_inc AND _at_pbc_lib)
+        set(LIBPROTOBUF_C_INCLUDE_DIR ${_at_pbc_inc} CACHE PATH "" FORCE)
+        set(LIBPROTOBUF_C_LIBRARY ${_at_pbc_lib} CACHE FILEPATH "" FORCE)
+        set(_at_pbc_resolved TRUE)
+    endif()
+endif()
+if(NOT _at_pbc_resolved)
+    find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c)
+    find_library(LIBPROTOBUF_C_LIBRARY NAMES protobuf-c)
+endif()
 include_directories(${LIBPROTOBUF_C_INCLUDE_DIR})
 #find_program(PROTOC_C_EXE protoc-c HINTS ${CONDA_ROOT})
 if(LIBPROTOBUF_C_LIBRARY)
