@@ -82,12 +82,13 @@ def test_rq86_sees_entire_ao(catalogue):
                                      "squad-marker"}
 
 
-def test_microdrone_fov_limited_to_350m_forward(catalogue):
+def test_microdrone_fov_centered_footprint(catalogue):
     src = det.DetectionSource("microdrone-1", "microdrone",
                               catalogue=catalogue,
                               view_center_latlon=SQUAD_LL)
-    # Squad faces north (default); compound at ~2km north is way out
-    # of the 350m fwd rectangle, only squad-marker (right under) shows
+    # Microdrone has a small nadir footprint centered on itself; at the LZ
+    # only squad-marker (right under) shows. The compound ~2km north is far
+    # outside the footprint until the drone moves over it (see the pose tests).
     assert "squad-marker" in src.visible_uids
     assert "compound-alpha" not in src.visible_uids
 
