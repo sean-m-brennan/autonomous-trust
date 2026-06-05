@@ -200,10 +200,16 @@ DETECTION_VIEW_CENTER_OVERRIDE: dict[str, tuple[float, float]] = {
 
 
 ROLE_FOV: dict[str, RoleFOV] = {
-    # Microdrones: low + close, narrow-ish trapezoid approximated as a
-    # forward rectangle (350 m fwd, 350 m wide). Plan section 5.2.
-    "microdrone": RoleFOV(forward_m=350.0, back_m=0.0,
-                          half_width_m=175.0, alt_m=200.0),
+    # Microdrones: low overhead observers. Modeled as a small NADIR footprint
+    # centered on the drone (a 500 m box: 250 m each way), like a scaled-down
+    # RQ-86 — NOT a forward-only rectangle. With live motion the swarm loiters
+    # *over* the objective during the hold; a forward-only FOV (back_m=0, fixed
+    # north bearing) left the target behind the drones once they arrived, so
+    # detection only flickered for a few seconds on final approach and then
+    # vanished. A centered footprint keeps the compound in view throughout the
+    # T+3:00–T+7:00 hold and is bearing-independent (no overshoot fragility).
+    "microdrone": RoleFOV(forward_m=250.0, back_m=250.0,
+                          half_width_m=250.0, alt_m=200.0),
     # RQ-86: high + nadir; FOV covers a 10 km square centred on the peer.
     "recon-drone": RoleFOV(forward_m=5000.0, back_m=5000.0,
                            half_width_m=5000.0, alt_m=5000.0),

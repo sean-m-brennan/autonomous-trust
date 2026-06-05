@@ -61,7 +61,7 @@ USER user
 COPY --chown=user:user config/cfg/environment.yaml /build/config/cfg/environment.yaml
 COPY --chown=user:user config/cfg/devel_environ.yaml /build/config/cfg/devel_environ.yaml
 RUN --mount=type=cache,target=/opt/conda/pkgs conda env create -n autonomous_trust --file /build/config/cfg/environment.yaml
-RUN --mount=type=cache,target=/opt/conda/pkgs conda env update -n autonomous_trust --file /build/config/cfg/devel_environ.yaml
+RUN --mount=type=cache,target=/opt/conda/pkgs conda env update -n autonomous_trust --file /build/config/cfg/devel_environ.yml
 
 
 SHELL ["conda", "run", "--live-stream", "-n", "autonomous_trust", "/bin/bash", "-c"]
