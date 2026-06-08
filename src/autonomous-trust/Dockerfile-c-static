@@ -48,12 +48,19 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Copy C source and protobuf definitions
-# CMake expects protobuf as a sibling: ${CMAKE_CURRENT_SOURCE_DIR}/../protobuf
-COPY src/c /build/c-src
-COPY src/protobuf /build/protobuf
+# Copy the examples project plus the library and protobuf sources it depends on.
+# at_demo is built by examples/CMakeLists.txt, NOT by src/c (which only builds
+# the library). The examples build add_subdirectory()s the library via the
+# sibling path ../src/c, and the library in turn finds protobuf via ../protobuf.
+# Preserve that sibling layout under /build so both relative paths resolve:
+#   /build/examples  ->  ../src/c == /build/src/c  ->  ../protobuf == /build/src/protobuf
+# AT_STATIC=ON is honored by examples/CMakeLists.txt (links the demo with
+# -static) and forwarded to the library subdirectory build.
+COPY examples /build/examples
+COPY src/c /build/src/c
+COPY src/protobuf /build/src/protobuf
 
-RUN rm -rf /build/c-src/build && mkdir -p /build/c-src/build && cd /build/c-src/build && \
+RUN rm -rf /build/examples/build && mkdir -p /build/examples/build && cd /build/examples/build && \
     CC=clang CXX=clang++ cmake .. \
         -DCMAKE_BUILD_TYPE=Release \
         -DREVISION="$GIT_VERSION" \

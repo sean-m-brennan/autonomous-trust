@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -197,7 +198,29 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     gateways = [name for name in scenario.peers.keys() if is_gateway(name)]
 
     if force and out_root.exists():
-        shutil.rmtree(out_root)
+        # Best-effort wipe. We OWN and must refresh the seeded identities under
+        # each peer's etc/at; the sibling var/at is *runtime* state the live
+        # node/container writes — and when peers ran in Docker as root, those
+        # files come back owned by uid 0 (and on a virtiofs-backed checkout not
+        # even host sudo can unlink them). A plain rmtree() aborts the whole
+        # reseed on the first such file. Skip what we can't remove (the node
+        # overwrites/append its own var/at on boot) and keep going; the ETC/AT
+        # identities we do own get cleared here and regenerated below.
+        undeletable = []
+
+        def _keep_going(func, path, exc):  # onexc(3.12+)/onerror(<3.12) callback
+            undeletable.append(path)
+
+        try:
+            shutil.rmtree(out_root, onexc=_keep_going)        # Python >= 3.12
+        except TypeError:
+            shutil.rmtree(out_root, onerror=_keep_going)      # Python < 3.12
+        if undeletable:
+            print(f"  warning: {len(undeletable)} container-owned runtime "
+                  f"file(s) under {out_root} could not be removed "
+                  f"(e.g. {undeletable[0]}); seeded identities are still "
+                  f"regenerated. To fully reset, delete the dir as the owner "
+                  f"(e.g. a root `docker run --rm -v ...:/s alpine rm -rf /s`).")
     out_root.mkdir(parents=True, exist_ok=True)
 
     # Phase 1: per-peer identities (load existing on re-run unless --force).
@@ -321,6 +344,22 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     return seeded
 
 
+def _resolve_c_microdrones(scenario, raw):
+    """Resolve which microdrones run the C at_demo node from a SPEC string.
+    unset/empty/"0"/"none"/"false" -> none; "1"/"all"/"true" -> every
+    microdrone-*; otherwise a comma-separated list of peer names. Kept in lock
+    step with generate_compose.parse_c_microdrones so seeding and compose agree
+    on the exact set (a mismatch cross-wires a peer's identity format)."""
+    if raw is None:
+        raw = os.environ.get("AT_C_MICRODRONES", "")
+    raw = raw.strip()
+    if raw in ("", "0", "none", "false"):
+        return frozenset()
+    if raw in ("1", "all", "true"):
+        return frozenset(n for n in scenario.peers if n.startswith("microdrone-"))
+    return frozenset(n.strip() for n in raw.split(",") if n.strip())
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--out", type=Path,
@@ -338,10 +377,15 @@ def main(argv=None) -> int:
     p.add_argument("--no-mq800", action="store_true")
     p.add_argument("--no-jet", action="store_true")
     p.add_argument("--no-command", action="store_true")
-    p.add_argument("--c-microdrones", action="store_true",
-                   help="Seed the microdrone-* peers as C at_demo nodes "
-                        "(C-format identity; they cold-join for the group key). "
-                        "Pair with generate_compose.py --c-microdrones.")
+    p.add_argument("--c-microdrones", metavar="SPEC", nargs="?",
+                   const="all", default=None,
+                   help="Seed microdrone-* peers as C at_demo nodes (C-format "
+                        "identity; they cold-join for the group key). SPEC is "
+                        "'all' (the default when the flag is given bare), a "
+                        "comma-separated list of peer names, or unset. MUST match "
+                        "the SPEC passed to generate_compose.py --c-microdrones, "
+                        "else a peer gets a C-format identity but runs as Python "
+                        "(or vice-versa) and fails to load its own identity.")
     args = p.parse_args(argv)
 
     scenario = DoDMissionScenario(
@@ -353,9 +397,7 @@ def main(argv=None) -> int:
         include_jet=not args.no_jet,
         include_command=not args.no_command,
     )
-    c_nodes = frozenset(
-        name for name in scenario.peers if name.startswith("microdrone-")
-    ) if args.c_microdrones else frozenset()
+    c_nodes = _resolve_c_microdrones(scenario, args.c_microdrones)
     seeded = seed_cohort(args.out, scenario, force=args.force, c_nodes=c_nodes)
     n_skipped = len(scenario.peers) - len(seeded)
     print(f"Seeded {len(seeded)} peers under {args.out} "
