@@ -344,7 +344,8 @@ class TestNetworkGraphBase:
         with open(filepath) as f:
             data = json.load(f)
         assert 'nodes' in data
-        assert 'edges' in data
+        # _to_dict normalizes networkx's 'edges' key to 'links' (force.js reads 'links').
+        assert 'links' in data
 
     def test_random_change_add_node(self):
         g = self._make_graph(6)
@@ -406,6 +407,7 @@ class TestRandomNetwork:
 
     def test_change_sets_speed(self):
         rn = RandomNetwork(12, speed=75)
+        rn.change_type = None  # post-init state is NEW; change() requires None (cf. test_change_random_speed)
         rn.change()
         assert rn.next_change == 75
 

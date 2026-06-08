@@ -219,3 +219,48 @@ class Identity(InitializableConfig, AgreementVoter):
         time.sleep(secrets.randbelow(1000) / 1000.0)  # reduce chance of collision
         return Identity(uuid_mod.uuid4(), my_address, my_name, my_nickname,
                         Signature.generate(), Encryptor.generate(), 'me', False)
+
+
+def public_identity_to_canonical(identity):
+    """Flat, cross-runtime ("DRY canonical") PUBLIC-identity payload form,
+    byte-shape identical to C's ``public_identity_to_json`` (identity.c). Used
+    where a peer identity rides the wire in the *payload* rather than the
+    envelope from_* fields — the ``peer_accepted`` (confirm) announcement and
+    the ``full_history`` peer bundle — so a C peer can parse it (Python's
+    default ConfigJSONEncoder ``publish()`` form, with ``__type__`` and a
+    base64-wrapped hex_seed, is unparseable by C). The ``hex_seed`` values are
+    the 64-char hex public keys (what ``signature_publish``/``encryptor_publish``
+    emit and what ``Signature``/``Encryptor(public_only=True)`` accept). No
+    private material. See [[project_group_key_sync]]."""
+    if identity is None:
+        return None
+    return {
+        'typename': 'identity',
+        'uuid': str(identity.uuid),
+        'address': getattr(identity, 'address', '') or '',
+        'fullname': getattr(identity, 'fullname', '') or '',
+        'nickname': getattr(identity, 'nickname', '') or '',
+        'petname': getattr(identity, 'petname', '') or '',
+        'signature': {'hex_seed': identity.signature.publish().decode('ascii')},
+        'encryptor': {'hex_seed': identity.encryptor.publish().decode('ascii')},
+    }
+
+
+def public_identity_from_canonical(d):
+    """Inverse of :func:`public_identity_to_canonical`; reconstruct a public
+    Identity from the flat cross-runtime form (also what C emits). Returns
+    None on a malformed dict (missing uuid or public keys)."""
+    if not isinstance(d, dict):
+        return None
+    try:
+        sig_hex = (d.get('signature') or {}).get('hex_seed', '')
+        enc_hex = (d.get('encryptor') or {}).get('hex_seed', '')
+        if not d.get('uuid') or not sig_hex or not enc_hex:
+            return None
+        sig = Signature(sig_hex.encode('ascii'), public_only=True)
+        enc = Encryptor(enc_hex.encode('ascii'), public_only=True)
+        return Identity(d['uuid'], d.get('address', '') or '',
+                        d.get('fullname', '') or '', d.get('nickname', '') or '',
+                        sig, enc, d.get('petname', '') or '')
+    except (ValueError, TypeError, RuntimeError, KeyError):
+        return None
