@@ -8,11 +8,16 @@
 # admission handshake (Stretch Goal 3 / on-ramp #1, task #10).
 #
 # Brings up ONE C at_demo node and ONE pure-Python node on a shared Docker
-# bridge and verifies they discover + mutually admit each other over live UDP:
+# bridge and verifies they discover + mutually admit each other over live UDP,
+# then that the C node obtains the shared GROUP KEY (group-key sync):
 #   * C -> Python : the Python node reconstructs the C node's identity from the
 #                   envelope from_* fields and admits it (access_granted).
 #   * Python -> C : the C node processes the Python node's announce and unicasts
 #                   a peer_caps_query back.
+#   * group-key  : the C node parses Python's full_history group payload (the
+#                   DRY canonical form) and ADOPTS the shared group key, so it
+#                   can decrypt/emit encrypted group traffic. This exercises
+#                   SG3 blockers 1/2/3 + slot-2 (accept/confirm/history canonical).
 #
 # Why this script exists: the standard Docker image build (Dockerfile-c) needs
 # apt access to the Debian repos, which is firewalled in the dev sandbox. So we
@@ -97,7 +102,11 @@ if ! $SKIP_BUILD; then
     CONDA_CFLAGS=(-I "${CONDA_PREFIX}/include")
     CONDA_LDFLAGS=(-L "${CONDA_PREFIX}/lib" -Wl,-rpath,"${CONDA_PREFIX}/lib")
   fi
-  gcc "$REPO/examples/demo/src/at_demo.c" \
+  # -fms-extensions is required: the AT headers embed anonymous typedef'd
+  # members (smrt_ptr_t etc.) at offset 0; without it gcc drops those members
+  # ("declaration does not declare anything") and diverges the struct layout
+  # from the .so it links against. The library is built with it; match here.
+  gcc -fms-extensions "$REPO/examples/demo/src/at_demo.c" \
     "${CONDA_CFLAGS[@]}" \
     -I "$REPO/src/c" -I "$REPO/src/c/autonomous_trust" -I "$PB" -I "$REPO/examples/build-gcc/lib/protobuf" \
     -L "$REPO/examples/build-gcc/lib" "${CONDA_LDFLAGS[@]}" -lautonomous_trust \
@@ -193,6 +202,7 @@ info "C node container state: ${C_STATE}"
 echo; echo "=============================="
 P=0; F=0
 chk(){ if echo "$PYLOG" | grep -qiE "$2"; then pass "$1"; P=$((P+1)); else fail "$1"; F=$((F+1)); fi; }
+chkc(){ if echo "$CLOG" | grep -qiE "$2"; then pass "$1"; P=$((P+1)); else fail "$1"; F=$((F+1)); fi; }
 
 # C -> Python: Python reconstructed the C identity and admitted it
 # Anchor on the C node's IP: the Python node's own outgoing announce also logs
@@ -205,6 +215,20 @@ chk "Python admitted the C node (access_granted)"      "access_granted"
 chk "Python added the C node as a peer"                "Add peers"
 # Python -> C: the C node processed Python's announce and queried its caps
 chk "C node processed Python + replied (caps_query)"   "peer_caps_query from ${C_IP}"
+
+# ----------------------------------------------------------------------------
+# Group-key sync (SG3 blockers 1/2/3 + slot-2): the C node must obtain and
+# install the Python mesh's shared group key so it can exchange ENCRYPTED group
+# traffic — the layer past admission. The key travels in `full_history` slot 0
+# as the DRY canonical group form; the C node parses it (group_from_json) and
+# adopts it during the self-bootstrap → mesh merge. The "adopted mesh group"
+# line fires ONLY when group_from_json successfully parses Python's canonical
+# group (raw private key + public_only) — before the canonical fix Python's
+# ConfigJSONEncoder group was unparseable by C and this never appeared.
+echo "------ group-key sync ------"
+chk  "Python sent full_history (group key) to the C node" "Send full history"
+chkc "C node received full_history from Python"           "received history from"
+chkc "C node parsed + ADOPTED the Python group key"       "adopted mesh group .* during merge"
 
 echo "=============================="
 echo "  $P passed, $F failed"
