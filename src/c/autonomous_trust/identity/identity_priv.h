@@ -133,6 +133,15 @@ int public_encryptor_init(encryptor_t *encr, const unsigned char *hex_seed, size
 */
 int encryptor_init(encryptor_t *encr, const unsigned char *hex_seed, size_t hex_len);
 
+/** Init from a RAW box private key hex (64 chars), reproducing the public
+ *  key via crypto_scalarmult_base. Cross-runtime canonical for group-key
+ *  transport (matches Python Encryptor(self.private.encode())). */
+int encryptor_init_from_private(encryptor_t *encr, const unsigned char *hex_priv, size_t hex_len);
+
+/** Serialize the RAW box private key as hex (64 chars + NUL); caller frees.
+ *  NULL if the encryptor holds no private key. Mirrors Python serialize(). */
+unsigned char *encryptor_serialize_private(const encryptor_t *encr);
+
 /*@
   requires \valid(encr);
   allocates \result;

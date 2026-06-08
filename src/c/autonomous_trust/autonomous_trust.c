@@ -139,7 +139,13 @@ int run_autonomous_trust(char *q_in, char *q_out,
     int fd2 = 0;
     int flags = 0;
     if (log_file == NULL)
+    {
         flags |= NO_STDERR_REDIRECT;
+        /* Foreground: keep subsystem children's stderr too, so their logs
+         * (id_proc admission/history handlers, net_proc, etc.) reach the
+         * controlling terminal / container stream instead of /dev/null. */
+        process_child_extra_flags |= NO_STDERR_REDIRECT;
+    }
     int err = daemonize(data_dir, flags, &fd1, &fd2);
     if (err != 0)
         return err;

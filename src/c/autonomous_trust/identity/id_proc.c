@@ -561,16 +561,15 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
         confirm.info.net_msg.function = ID_CONFIRM;
         confirm.info.net_msg.encrypt = false;
         /* to_whom left zeroed → network layer broadcast */
-        json_t *peer_json = json_object();
-        if (peer_json == NULL) {
-            log_error(proc->logger, "Identity: json_object OOM (confirm broadcast)\n");
+        /* DRY canonical: full public-identity payload (incl. sig/enc pubkeys),
+         * shared byte-shape with Python public_identity_to_canonical, so a
+         * Python member can parse the confirm announcement. (Was a
+         * {uuid,fullname,address} subset that dropped the public keys.) */
+        json_t *peer_json = NULL;
+        if (public_identity_to_json(new_peer, &peer_json) != 0 || peer_json == NULL) {
+            log_error(proc->logger, "Identity: public_identity_to_json failed (confirm broadcast)\n");
             return EXCEPTION(ENOMEM);
         }
-        char uuid_str[UUID_STRING_LEN + 1];
-        uuid_unparse_lower(new_peer->uuid, uuid_str);
-        json_object_set_new(peer_json, "uuid", json_string(uuid_str));
-        json_object_set_new(peer_json, "fullname", json_string(new_peer->fullname));
-        json_object_set_new(peer_json, "address", json_string(new_peer->address));
         net_msg_pack_json(&confirm.info.net_msg, peer_json);
         json_decref(peer_json);
         messaging_send("network", NET_MESSAGE, &confirm, false);
@@ -586,16 +585,13 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
             confirm.info.net_msg.function = ID_CONFIRM;
             confirm.info.net_msg.encrypt = true;
             memcpy(&confirm.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
-            json_t *peer_json = json_object();
-            if (peer_json == NULL) {
-                log_error(proc->logger, "Identity: json_object OOM (confirm fanout)\n");
+            /* DRY canonical full public-identity payload (see the broadcast
+             * arm above) so a Python member can parse the confirm fanout. */
+            json_t *peer_json = NULL;
+            if (public_identity_to_json(new_peer, &peer_json) != 0 || peer_json == NULL) {
+                log_error(proc->logger, "Identity: public_identity_to_json failed (confirm fanout)\n");
                 continue;
             }
-            char uuid_str[UUID_STRING_LEN + 1];
-            uuid_unparse_lower(new_peer->uuid, uuid_str);
-            json_object_set_new(peer_json, "uuid", json_string(uuid_str));
-            json_object_set_new(peer_json, "fullname", json_string(new_peer->fullname));
-            json_object_set_new(peer_json, "address", json_string(new_peer->address));
             net_msg_pack_json(&confirm.info.net_msg, peer_json);
             json_decref(peer_json);
             messaging_send("network", NET_MESSAGE, &confirm, false);
@@ -1885,7 +1881,11 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
     log_info(proc->logger, "Identity: peer acceptance confirmed from %s\n",
              nmsg->from_whom.fullname);
 
-    /* Unpack peer identity from JSON payload (uuid + fullname) */
+    /* Unpack the new-peer identity from the JSON payload. DRY canonical: the
+     * full public-identity form (shared byte-shape with Python
+     * public_identity_to_canonical, incl. sig/enc pubkeys);
+     * public_identity_from_json also tolerates the legacy {uuid,fullname,
+     * address} subset (sig/enc optional). */
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
     {
@@ -1893,32 +1893,20 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
         return true;
     }
 
-    json_t *j_uuid     = json_object_get(payload, "uuid");
-    json_t *j_fullname = json_object_get(payload, "fullname");
-    json_t *j_address  = json_object_get(payload, "address");
-
-    if (!j_uuid || !j_fullname)
+    public_identity_t new_peer;
+    if (public_identity_from_json(payload, &new_peer) != 0)
     {
         json_decref(payload);
-        log_warn(proc->logger, "Identity: handle_confirm_peer: missing JSON fields\n");
+        log_warn(proc->logger, "Identity: handle_confirm_peer: malformed peer identity\n");
         return true;
     }
-
-    const char *uuid_str  = json_string_value(j_uuid);
-    const char *fullname  = json_string_value(j_fullname);
-    const char *address   = j_address ? json_string_value(j_address) : NULL;
-
-    /* Reconstruct public_identity_t from JSON fields */
-    public_identity_t new_peer;
-    memset(&new_peer, 0, sizeof(public_identity_t));
-    if (uuid_str != NULL)
-        uuid_parse(uuid_str, new_peer.uuid);
-    if (fullname != NULL)
-        strncpy(new_peer.fullname, fullname, NAME_LEN);
-    if (address != NULL)
-        strncpy(new_peer.address, address, ADDR_LEN);
-
     json_decref(payload);
+
+    char uuid_str_buf[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(new_peer.uuid, uuid_str_buf);
+    const char *uuid_str = uuid_str_buf;
+    const char *fullname = new_peer.fullname;
+    const char *address  = (new_peer.address[0] != '\0') ? (const char *)new_peer.address : NULL;
 
     log_info(proc->logger, "Identity: confirmed peer %s (%s)\n", fullname, uuid_str);
 
@@ -3260,8 +3248,64 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         if (final_hcount > 0)
         {
             log_info(logger, "Identity: choose_group: %zu histor%s received; "
-                     "transitioning to phase 3 (selection pending full history parse)\n",
+                     "selecting mesh group\n",
                      final_hcount, final_hcount == 1 ? "y" : "ies");
+
+            /* Parse + adopt the shared group key from the welcomer's
+             * full_history (slot 0 = the DRY canonical group). Mirrors the
+             * selection in _merge_to_mesh: the entry with the most steps wins
+             * (most complete view), else the first entry seeds adoption.
+             * Without this the C node kept its own self-seeded group and never
+             * obtained the mesh key — full_history that arrives DURING the
+             * choose_group wait (the common case once box-decrypt works) hit a
+             * stub that only logged. Python's choose_group adopts here too
+             * (idprocess.py:248+). See [[project_group_key_sync]]. */
+            group_t adopted_group = {0};
+            bool have_group = false;
+            size_t best_steps_len = 0;
+            pthread_mutex_lock(&id_state.lock);
+            size_t n_hist = array_size(&id_state.histories);
+            for (size_t i = 0; i < n_hist; i++) {
+                data_t *h_dat = NULL;
+                if (array_get(&id_state.histories, (int)i, &h_dat) != 0 || h_dat == NULL)
+                    continue;
+                ptr_t hptr = NULL;
+                if (data_object_ptr(h_dat, &hptr) != 0 || hptr == NULL)
+                    continue;
+                json_t *root = (json_t *)hptr;
+                if (!json_is_array(root) || json_array_size(root) < 2)
+                    continue;
+                json_t *s_json = json_array_get(root, 1);
+                size_t this_steps_len =
+                    (s_json && json_is_array(s_json)) ? json_array_size(s_json) : 0;
+                bool pick = (!have_group && this_steps_len == 0)
+                            || (this_steps_len > best_steps_len);
+                if (!pick)
+                    continue;
+                json_t *g_json = json_array_get(root, 0);
+                if (g_json && json_is_object(g_json)) {
+                    group_t parsed = {0};
+                    if (group_from_json(g_json, &parsed) == 0) {
+                        adopted_group = parsed;
+                        have_group = true;
+                        best_steps_len = this_steps_len;
+                    }
+                }
+            }
+            pthread_mutex_unlock(&id_state.lock);
+
+            if (have_group) {
+                char gid_str[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(adopted_group.uuid, gid_str);
+                peers_write_lock(proc);
+                memcpy(&proc->protocol.group, &adopted_group, sizeof(group_t));
+                peers_write_unlock(proc);
+                log_info(logger,
+                         "Identity: adopted mesh group %s during merge\n", gid_str);
+            } else {
+                log_warn(logger, "Identity: choose_group: histories present but "
+                         "no parseable group; keeping self-seeded group\n");
+            }
         }
         else
         {

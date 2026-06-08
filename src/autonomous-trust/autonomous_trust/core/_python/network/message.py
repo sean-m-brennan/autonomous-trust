@@ -206,14 +206,21 @@ class Message(object):
             wire['from_uuid'] = str(self.from_whom.uuid)
             wire['from_name'] = getattr(self.from_whom, 'fullname', '')
             wire['from_address'] = getattr(self.from_whom, 'address', '')
+            # publish() already returns the HEX-encoded public key (bytes), e.g.
+            # b'45cf..' (64 ASCII hex chars). Just decode to str — do NOT hex
+            # encode it again: a second HexEncoder.encode() yields 128 chars,
+            # which C's public_{encryptor,signature}_init reject (they require
+            # exactly 64) and which Message.reconstruct_sender's own
+            # PublicKey/VerifyKey(..., HexEncoder) parse also fails. Both the
+            # parser and C expect the bare 64-char hex pubkey.
             try:
                 sig_pub = self.from_whom.signature.publish()
-                wire['from_sig_hex'] = HexEncoder.encode(sig_pub).decode('ascii') if sig_pub else ''
+                wire['from_sig_hex'] = sig_pub.decode('ascii') if sig_pub else ''
             except (AttributeError, TypeError):
                 pass
             try:
                 enc_pub = self.from_whom.encryptor.publish()
-                wire['from_enc_hex'] = HexEncoder.encode(enc_pub).decode('ascii') if enc_pub else ''
+                wire['from_enc_hex'] = enc_pub.decode('ascii') if enc_pub else ''
             except (AttributeError, TypeError):
                 pass
 

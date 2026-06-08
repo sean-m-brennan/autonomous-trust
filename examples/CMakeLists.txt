@@ -62,7 +62,13 @@ function(add_at_example target source)
         -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive
         ${DEPENDENCIES}
     )
-    target_compile_options(${target} PRIVATE -Wall)
+    # -fms-extensions is REQUIRED, not cosmetic: the library headers embed
+    # smrt_ptr_t (and struct tm / thread_args_t / public_identity_t) as
+    # anonymous typedef'd members. Without this flag GCC silently drops those
+    # members ("declaration does not declare anything"), giving the example a
+    # struct layout that disagrees with the library it links against. The
+    # library itself is built with -fms-extensions (src/c/CMakeLists.txt:136).
+    target_compile_options(${target} PRIVATE -Wall -fms-extensions)
     install(TARGETS ${target} RUNTIME DESTINATION bin)
 endfunction()
 

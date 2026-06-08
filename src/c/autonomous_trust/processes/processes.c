@@ -38,6 +38,11 @@
 
 const char *sig_quit = "quit";
 
+/* See processes.h — extra daemonize() flags applied to every subsystem child.
+ * Set by run_autonomous_trust() to NO_STDERR_REDIRECT in foreground mode so
+ * subsystem logs survive past daemonize(). */
+int process_child_extra_flags = 0;
+
 const long cadence = 500000L; // microseconds
 
 typedef bool (*msg_handler_t)(const process_t *proc, directory_t *queues, generic_msg_t *msg);
@@ -401,9 +406,21 @@ int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
 
     ctx->fd1 = 0;
     ctx->fd2 = 0;
+    /* In foreground mode the daemon keeps stderr; propagate that to children so
+     * their post-daemonize log output isn't redirected to /dev/null. */
+    proc->flags |= process_child_extra_flags;
     int err = daemonize(data_path, proc->flags, &ctx->fd1, &ctx->fd2);
     if (err != 0)
         return err;
+
+    /* Child only (daemonize returned 0). When the close-all-fds sweep ran
+     * (NO_CLOSE_FILES unset, the default for everything but net_proc), it
+     * closed the descriptor under a file-backed logger — re-open it so this
+     * child's log output keeps reaching the log file in daemon mode. No-op for
+     * a stderr/terminal logger (file_name empty). net_proc sets NO_CLOSE_FILES
+     * to keep its sockets, which also preserves its log fd, so skip it there. */
+    if (!(proc->flags & NO_CLOSE_FILES))
+        logger_reopen(logger);
 
     pid_t pid = getpid();
     log_debug(logger, "Child pid %d\n", pid);
