@@ -182,3 +182,26 @@ def test_verify_string_msg(setup_teardown):
     signed = t1.sign('test string')
     result = pub.verify(signed)
     assert result is not None
+
+
+def test_public_identity_canonical_roundtrip(setup_teardown):
+    # DRY canonical public-identity payload (confirm + full_history peer
+    # bundle): flat schema byte-shape identical to C public_identity_to_json,
+    # so a C peer can parse it. Round-trip must preserve uuid + both pubkeys.
+    from autonomous_trust.core.identity.identity import (
+        public_identity_to_canonical, public_identity_from_canonical)
+    ident = Identity.initialize('alice.a.x', 'al', '10.0.0.3')
+    can = public_identity_to_canonical(ident)
+    assert can['typename'] == 'identity'
+    assert len(can['signature']['hex_seed']) == 64
+    assert len(can['encryptor']['hex_seed']) == 64
+    assert set(can) >= {'uuid', 'address', 'fullname', 'nickname',
+                        'petname', 'signature', 'encryptor'}
+    back = public_identity_from_canonical(can)
+    assert str(back.uuid) == str(ident.uuid)
+    assert back.signature.publish() == ident.signature.publish()
+    assert back.encryptor.publish() == ident.encryptor.publish()
+    assert back.fullname == ident.fullname
+    # malformed input → None (no crash)
+    assert public_identity_from_canonical({'uuid': 'x'}) is None
+    assert public_identity_from_canonical('nope') is None

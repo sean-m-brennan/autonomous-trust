@@ -121,17 +121,46 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
     json_object_set(obj, "uuid", json_string(uuid_str));
     json_object_set(obj, "address", json_string((char *)ident->address));
 
-    json_t *addr_map;
-    map_to_json(&ident->address_map, &addr_map);
+    /* DRY canonical: emit address_map as a FLAT {uuid: addr} object (mirrors
+     * Python's _address_map dict), NOT map_to_json's verbose internal hashmap
+     * dump — so a Python peer can parse it and vice versa. */
+    json_t *addr_map = json_object();
+    if (addr_map == NULL)
+        return EXCEPTION(ENOMEM);
+    {
+        map_key_t key;
+        data_t *value;
+        map_entries_for_each((map_t *)&ident->address_map, key, value)
+            string_t addr_s = NULL;
+            if (data_string_ptr(value, &addr_s) == 0 && addr_s != NULL)
+                json_object_set_new(addr_map, (const char *)key,
+                                    json_string((const char *)addr_s));
+        map_end_for_each
+    }
     json_object_set_new(obj, "address_map", addr_map);
 
     json_t *encr = json_object();
     if (encr == NULL)
         return EXCEPTION(ENOMEM);
-    unsigned char *hex = encryptor_publish(&ident->encryptor); // encoded
-    json_object_set(encr, "hex_seed", json_string((char *)hex));
+    /* DRY canonical group-key form (matches Python Encryptor.to_dict): when we
+     * own the shared private key, serialize the RAW private key so a peer can
+     * decrypt group traffic (full_history is box-encrypted in transit); when
+     * public-only, emit the public key. `public_only` disambiguates on read —
+     * both keys are 64 hex chars. (The prior code always wrote the PUBLIC key
+     * but group_from_json read it as a seed, so the keypair never round-tripped.) */
+    bool has_private = !sodium_is_zero(ident->encryptor.private, crypto_box_SECRETKEYBYTES);
+    unsigned char *hex = has_private
+                             ? encryptor_serialize_private(&ident->encryptor)
+                             : encryptor_publish(&ident->encryptor);
+    if (hex == NULL)
+    {
+        json_decref(encr);
+        return EXCEPTION(ENOMEM);
+    }
+    json_object_set_new(encr, "hex_seed", json_string((char *)hex));
+    json_object_set_new(encr, "public_only", json_boolean(!has_private));
     free(hex);
-    json_object_set(obj, "encryptor", encr);
+    json_object_set_new(obj, "encryptor", encr);
 
     return 0;
 }
@@ -156,20 +185,42 @@ int group_from_json(const json_t *obj, void *data_struct)
         }
     }
 
+    /* DRY canonical: parse the FLAT {uuid: addr} address_map (see
+     * group_to_json). group_add_address handles map_set + collision. */
+    map_init(&group->address_map);
     json_t *addr_map_obj = json_object_get(obj, "address_map");
-    if (addr_map_obj != NULL)
-        map_from_json(addr_map_obj, &group->address_map);
-    else
-        map_init(&group->address_map);
+    if (addr_map_obj != NULL && json_is_object(addr_map_obj))
+    {
+        const char *k;
+        json_t *v;
+        json_object_foreach(addr_map_obj, k, v)
+        {
+            const char *addr = json_string_value(v);
+            if (addr != NULL)
+                group_add_address(group, k, addr);
+        }
+    }
 
     /* Extract the hex_seed STRING (not the jansson value pointer — prior
      * cast of `json_object_get` to `uint8_t *` was a latent bug, reading
      * jansson struct bytes as if they were hex). */
-    const char *seed_hex = json_string_value(
-        json_object_get(json_object_get(obj, "encryptor"), "hex_seed"));
-    if (seed_hex == NULL
-        || encryptor_init(&group->encryptor,
-                          (const unsigned char *)seed_hex, strlen(seed_hex)) != 0)
+    json_t *encr_obj = json_object_get(obj, "encryptor");
+    const char *seed_hex = json_string_value(json_object_get(encr_obj, "hex_seed"));
+    if (seed_hex == NULL)
+        return -1;
+    /* DRY canonical: `public_only` selects how to read hex_seed. When false
+     * (we received the shared private key), reconstruct from the RAW private
+     * key (crypto_scalarmult_base); when true, it's a public key. Absent flag
+     * (legacy/public-only peers) defaults to public-only. Mirrors C
+     * group_to_json + Python Encryptor.to_dict/from on the wire. */
+    json_t *po = json_object_get(encr_obj, "public_only");
+    bool public_only = (po == NULL) ? true : json_boolean_value(po);
+    int rc = public_only
+                 ? public_encryptor_init(&group->encryptor,
+                                         (const unsigned char *)seed_hex, strlen(seed_hex))
+                 : encryptor_init_from_private(&group->encryptor,
+                                               (const unsigned char *)seed_hex, strlen(seed_hex));
+    if (rc != 0)
         return -1;
     return 0;
 }

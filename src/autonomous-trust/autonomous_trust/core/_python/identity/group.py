@@ -120,6 +120,44 @@ class Group(InitializableConfig):
         self._encryptor.message.CopyFrom(self.message.encryptor)
         self._encryptor.sync_from_message()
 
+    def to_canonical(self):
+        """Flat, cross-runtime ("DRY canonical") group wire form, byte-shape
+        identical to C's ``group_to_json`` (identity/group.c). Used for the
+        ID_HISTORY group-key delivery so a C peer can parse it (Python's
+        default ConfigJSONEncoder form, with ``__type__``/``_uuid`` and a
+        base64-wrapped hex_seed, is unparseable by C). When we own the shared
+        private key, ``hex_seed`` is the RAW 32-byte box private key (so the
+        peer can decrypt group traffic); otherwise the public key, with
+        ``public_only`` disambiguating on read. See [[project_group_key_sync]]."""
+        addr_map = dict(self._address_map) if isinstance(self._address_map, dict) \
+            else {}
+        owns_private = (not self._public_only) and self.encryptor.private is not None
+        seed = self.encryptor.serialize() if owns_private else self.encryptor.publish()
+        if isinstance(seed, bytes):
+            seed = seed.decode('ascii')
+        return {
+            'typename': 'group',
+            'uuid': str(self._uuid),
+            'address': next(iter(addr_map.values()), ''),
+            'nickname': self._nickname or '',
+            'address_map': addr_map,
+            'encryptor': {'hex_seed': seed, 'public_only': not owns_private},
+        }
+
+    @staticmethod
+    def from_canonical(d):
+        """Inverse of :meth:`to_canonical`; reconstruct a Group from the flat
+        cross-runtime form (also what C emits). Tolerates a missing
+        ``public_only`` (defaults to public-only, matching C)."""
+        encr = d.get('encryptor', {}) or {}
+        seed = encr.get('hex_seed', '')
+        if isinstance(seed, str):
+            seed = seed.encode('ascii')
+        public_only = bool(encr.get('public_only', True))
+        return Group(d.get('uuid'), dict(d.get('address_map', {}) or {}),
+                     d.get('nickname', ''),
+                     Encryptor(seed, public_only=public_only), public_only)
+
     @staticmethod
     def initialize(address_map, our_nickname):
         time.sleep(random.random())  # reduce chance of collision

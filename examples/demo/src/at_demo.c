@@ -175,8 +175,17 @@ int main(int argc, char *argv[])
     if (test_mode)
         max_iters = inject_update ? INJECT_ITERATIONS : TEST_ITERATIONS;
 
+    /* Optional file sink: AT_LOG_FILE=/path routes the AT daemon AND every
+     * subsystem child to that file (append) instead of stderr. Empty/unset
+     * keeps the stderr default. The daemon's file descriptor survives each
+     * subsystem's daemonize via logger_reopen (see processes.c). */
+    const char *log_file = getenv("AT_LOG_FILE");
+    if (log_file != NULL && log_file[0] == '\0')
+        log_file = NULL;
+
     at_node_config_t cfg = {
         .log_level = log_level,
+        .log_file = log_file,
         .generate_config = gen_config,
         .app_name = "at_demo",
         .q_out = "demo_to_at",

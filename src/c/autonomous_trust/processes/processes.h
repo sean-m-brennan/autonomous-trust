@@ -119,6 +119,18 @@ extern const char *sig_quit;
 #define NO_STDOUT_REDIRECT 0x08
 #define NO_STDERR_REDIRECT 0x10
 
+/* Extra daemonize() flags OR'd into every subsystem process's own flags by
+ * process_setup(). The daemon sets this to NO_STDERR_REDIRECT when running in
+ * the foreground (log_file == NULL) so child processes keep stderr connected to
+ * the controlling terminal / container stream instead of having it redirected
+ * to /dev/null. Without it, everything a subsystem logs *after* it daemonizes
+ * (i.e. all of its message-handler output) is silently discarded — invisible to
+ * `docker logs`, journald, or a terminal. Default 0 preserves classic detached
+ * daemon behavior (subsystem stderr -> /dev/null). */
+#ifndef PROCESSES_IMPL
+extern int process_child_extra_flags;
+#endif
+
 /**
  * @brief Initialize a process (config, etc)
  *

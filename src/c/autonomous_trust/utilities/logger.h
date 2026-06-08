@@ -78,6 +78,30 @@ typedef struct {
 int logger_init(logger_t *logger, log_level_t max_level, const char *log_file);
 
 /**
+ * @brief Re-open the log file after a daemonize() closed our descriptors.
+ *
+ * daemonize()'s close-all-fds sweep (run unless NO_CLOSE_FILES is set) closes
+ * the descriptor underlying @p logger->file, leaving the FILE* bound to a dead
+ * fd so every subsequent log line is silently dropped. A subsystem child that
+ * logs to a file (daemon mode, log_file != NULL) must call this immediately
+ * after process_setup()'s daemonize so its handler output keeps reaching the
+ * log file. No-op when logging to a terminal/stderr (file_name empty), since
+ * daemonize preserves fds 0/1/2.
+ *
+ * @param logger Logger instance (existing).
+ * @return 0 on success (including the stderr no-op), -1 on freopen failure.
+ */
+/*@
+  requires logger == \null || \valid(logger);
+  behavior success:
+    ensures \result == 0;
+  behavior failure:
+    ensures \result == -1;
+  disjoint behaviors;
+*/
+int logger_reopen(logger_t *logger);
+
+/**
  * @brief Initialize a logger, specifying time resolution.
  *
  * @param logger Logger instance (existing).
