@@ -28,7 +28,7 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import SignedMessage
 
 from . import Peers
-from .identity import Identity
+from .identity import Identity, public_identity_to_canonical, public_identity_from_canonical
 from .group import Group, ChildGroupSet
 from .history.history import IdentityHistory
 from ..algorithms.agreement import AgreementProof
@@ -446,11 +446,21 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 else:
                     group, steps = hist_tpl[0], hist_tpl[1]
                     peer_idents = None
+                # Group rides the wire as the DRY canonical flat dict (shared
+                # byte-shape with C's group_to_json); reconstruct it. Tolerate
+                # a legacy Group object (in-process / pre-canonical path).
+                if isinstance(group, dict):
+                    group = Group.from_canonical(group)
                 # Merge peer identities from every history that arrived
                 # — even ones we won't pick for our group/DAG — so the
                 # peer set is the union of what all welcomers saw.
                 if peer_idents:
                     for ident in peer_idents:
+                        # Slot-2 peers ride as DRY canonical public-identity
+                        # dicts (shared with C); reconstruct, tolerating a
+                        # legacy Identity object.
+                        if isinstance(ident, dict):
+                            ident = public_identity_from_canonical(ident)
                         uuid = getattr(ident, 'uuid', None)
                         if uuid is not None:
                             unioned_peers.setdefault(str(uuid), ident)
@@ -562,8 +572,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 else:
                     group, steps = hist_tpl[0], hist_tpl[1]
                     peer_idents = None
+                # Group rides the wire as the DRY canonical flat dict (see
+                # _merge_to_mesh); reconstruct it, tolerating a legacy object.
+                if isinstance(group, dict):
+                    group = Group.from_canonical(group)
                 if peer_idents:
                     for ident in peer_idents:
+                        # Slot-2 peers ride as DRY canonical public-identity
+                        # dicts (shared with C); reconstruct, tolerating a
+                        # legacy Identity object.
+                        if isinstance(ident, dict):
+                            ident = public_identity_from_canonical(ident)
                         uuid = getattr(ident, 'uuid', None)
                         if uuid is not None:
                             unioned_peers.setdefault(str(uuid), ident)
@@ -657,12 +676,22 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.logger.debug('Process accepted peer: %s (%s)' % (blob.identity.nickname, amnesia))
 
         # inform existing group members about the new peer;  to self.handle_confirm_peer()
-        message = Message(self.name, IdentityProtocol.confirm, blob, to_whom=self.group)
+        # New-peer identity rides as the DRY canonical public-identity payload
+        # (shared byte-shape with C public_identity_to_json) so a C member can
+        # parse it — the new peer is a third party, so it can't use from_*.
+        msg_str = to_json_string(public_identity_to_canonical(blob.identity))
+        message = Message(self.name, IdentityProtocol.confirm, msg_str, to_whom=self.group)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
-        # send my identity in the open to enable encryption;  to self.handle_acceptance()
-        msg_str = to_json_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
-        message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=blob.identity, encrypt=False)
+        # send my identity in the open to enable encryption — the new peer needs
+        # my enc pubkey to decrypt the box-encrypted full_history that follows.
+        # DRY canonical (mirrors request_access): identity travels in the
+        # envelope from_* (from_whom), payload is [package_hash, capabilities],
+        # so a C peer reads the granter identity where C always stamps it.
+        # to self.handle_acceptance()
+        msg_str = to_json_string((self.package_hash, self.capabilities.to_list()))
+        message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=blob.identity,
+                          from_whom=self.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
         # send group key + history + my peer set so the new peer can
@@ -670,8 +699,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # peers I already admitted (otherwise it never receives confirm
         # broadcasts for those peers — see project_inspector_peer_set_gap).
         # Peer identities are stripped of private keys via publish().
-        peers_payload = [p.publish() for p in self.peers.all]
-        msg_str = to_json_string((self.group, self._history.recite(),
+        # Peer bundle (slot 2) rides as DRY canonical public-identity dicts
+        # (shared byte-shape with C public_identity_to_json) so the joining
+        # peer — including a C node — can parse the existing roster. (Was
+        # p.publish(), the ConfigJSONEncoder form C cannot read.)
+        peers_payload = [public_identity_to_canonical(p) for p in self.peers.all]
+        # Group slot travels as the DRY canonical flat dict (shared byte-shape
+        # with C's group_to_json) so a C peer can parse it and recover the
+        # shared private key; Python peers reconstruct via Group.from_canonical
+        # in receive_history/_merge_to_mesh/choose_group. See
+        # [[project_group_key_sync]].
+        msg_str = to_json_string((self.group.to_canonical(), self._history.recite(),
                                   peers_payload))
         message = Message(self.name, IdentityProtocol.history, msg_str, to_whom=blob.identity)
         self.logger.debug('Send full history (+%d peer identities)' %
@@ -1105,8 +1143,22 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.accept:
             self.logger.debug('Received peer acceptance')
-            ident, pkh, caps = from_json_string(message.obj)  # from self._peer_accepted()
-            if not hmac.compare_digest(str(pkh), str(self.package_hash)):
+            # DRY accept contract (mirrors request_access): granter identity
+            # comes from the envelope (from_whom, reconstructed from the
+            # canonical from_* fields); payload is [package_hash, capabilities].
+            ident = message.from_whom
+            if not isinstance(ident, Identity):
+                self.logger.warning('access_granted with no sender identity; ignoring')
+                return True
+            payload = from_json_string(message.obj) if message.obj else None
+            if payload and len(payload) >= 2:
+                pkh, caps = payload[0], payload[1]
+            else:
+                pkh, caps = '', []  # C granter sends an empty payload
+            # Counterfeit check: skip when the granter advertises an empty
+            # package hash (heterogeneous runtime, e.g. a C node) — same
+            # allowance as the request_access welcoming committee.
+            if str(pkh) and not hmac.compare_digest(str(pkh), str(self.package_hash)):
                 self.logger.error("Counterfeit 'peer'")
                 return True
             with self.lock:
@@ -1130,14 +1182,25 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.confirm:
             self.logger.debug('Received peer confirmation')
+            # DRY canonical confirm contract: the new-peer identity rides as a
+            # flat public-identity dict (shared byte-shape with C
+            # public_identity_to_json). Tolerate a legacy Configuration/
+            # IdentityObj blob (in-process / pre-canonical path).
             blob = message.obj
             if isinstance(blob, str):
-                blob = Configuration.from_string(blob)
-            if hasattr(blob, 'validate') and not blob.validate():
+                blob = from_json_string(blob)
+            if isinstance(blob, dict):
+                peer = public_identity_from_canonical(blob)
+            else:
+                if hasattr(blob, 'validate') and not blob.validate():
+                    _probes.counter('peer.set', 'silent_drop', 'invalid_blob')
+                    self.logger.warning('Invalid peer confirmation blob')
+                    return True
+                peer = blob.identity if hasattr(blob, 'identity') else blob
+            if peer is None or not hasattr(peer, 'uuid'):
                 _probes.counter('peer.set', 'silent_drop', 'invalid_blob')
                 self.logger.warning('Invalid peer confirmation blob')
                 return True
-            peer = blob.identity if hasattr(blob, 'identity') else blob
             # Note: peer_potentials membership was previously a hard gate here.
             # It was redundant — blob.validate() already checked authenticity,
             # the confirm broadcast comes from a trusted group member, and the

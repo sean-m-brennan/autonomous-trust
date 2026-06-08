@@ -121,3 +121,31 @@ class TestGroup:
             g = Group.initialize({'p1': '10.0.0.1'}, 'init_test')
         assert g.nickname == 'init_test'
         assert g._public_only is False
+
+    def test_canonical_roundtrip_owned(self):
+        # DRY canonical group wire form (group-key sync): a group we own
+        # serializes the RAW private key so a peer can decrypt group traffic;
+        # round-trip must reproduce the same keypair. Schema must match C's
+        # group_to_json (flat address_map, encryptor.{hex_seed,public_only}).
+        g = Group(uuid4(), {'p1': '10.0.0.1'}, 'g1',
+                  Encryptor.generate(), _public_only=False)
+        can = g.to_canonical()
+        assert can['typename'] == 'group'
+        assert can['encryptor']['public_only'] is False
+        assert len(can['encryptor']['hex_seed']) == 64  # raw 32-byte priv key
+        assert can['address_map'] == {'p1': '10.0.0.1'}  # flat dict, not verbose
+        g2 = Group.from_canonical(can)
+        assert g2.encryptor.publish() == g.encryptor.publish()
+        assert g2.encryptor.serialize() == g.encryptor.serialize()
+        assert str(g2.uuid) == str(g.uuid)
+
+    def test_canonical_public_only(self):
+        # A published (public-only) group emits the public key + public_only=true
+        # and reconstructs with no private key.
+        g = Group(uuid4(), {}, 'g1', Encryptor.generate(), _public_only=False)
+        can = g.publish().to_canonical()
+        assert can['encryptor']['public_only'] is True
+        g2 = Group.from_canonical(can)
+        assert g2._public_only is True
+        assert g2.encryptor.private is None
+        assert g2.encryptor.publish() == g.encryptor.publish()
