@@ -99,6 +99,11 @@ SWARM_SIZE=4
 SENSOR_COUNT=3
 HACKED_SENSORS=2
 COMPROMISE_MODE="abrupt"
+# Which microdrones run the embedded C at_demo node (dod-mission + --compose
+# only). "" = none (all-Python, the default); "all" = every microdrone-*; or a
+# comma-list of peer names. Threaded identically to seed_dod_cohort.py and
+# generate_compose.py so the seeded identity format matches the runtime.
+C_MICRODRONES="${AT_C_MICRODRONES:-}"
 
 # Probes shared volume defaults to ON for multi-agency compose.
 export AT_PROBES="${AT_PROBES:-1}"
@@ -148,7 +153,10 @@ Common options:
   --deploy-dir DIR       Output dir for generated files
   --no-browser           Don't auto-open the dashboard
   --skip-build           Don't (re)build images
-  --rebuild              Force rebuild of overlay images
+  --rebuild              Force rebuild of the whole image chain (base,
+                         inspector, and overlays) so edited source
+                         propagates. Layer-cached, so unchanged layers
+                         are near-free; only changed COPYs rebuild.
   --reseed               Force-regenerate the persistent-cohort seed
                          (fresh identities + gateway child groups);
                          same as AT_PRESEED_FORCE=1
@@ -167,6 +175,13 @@ dod-mission options:
   --sensor-count N       Sensors (default: $SENSOR_COUNT)
   --hacked-sensors N     Hacked sensors (default: $HACKED_SENSORS)
   --compromise-mode M    abrupt|gradual (default: $COMPROMISE_MODE)
+  --c-microdrones[=SPEC] Run microdrones as embedded C at_demo nodes instead of
+                         Python (requires --compose). SPEC is 'all' (default
+                         when given bare), or a comma-list of peer names
+                         (e.g. microdrone-1,microdrone-2). Builds the
+                         autonomous-trust-c image (Dockerfile-c, needs network
+                         for apt) and seeds those peers with C-format identities
+                         so they cold-join the Python mesh for the group key.
   --record-to FILE       Record this live run for canned playback. The
                          coordinator flushes FILE on graceful shutdown
                          (compose: ./recording/FILE beside the compose file;
@@ -226,6 +241,8 @@ while [[ $# -gt 0 ]]; do
         --hacked-sensors)        HACKED_SENSORS="$2";        shift 2;;
         --compromise-mode=*)     COMPROMISE_MODE="${1#*=}";  shift;;
         --compromise-mode)       COMPROMISE_MODE="$2";       shift 2;;
+        --c-microdrones=*)       C_MICRODRONES="${1#*=}";    shift;;
+        --c-microdrones)         C_MICRODRONES="all";        shift;;
         -v)                      LOG_LEVEL="info";           shift;;
         -vv)                     LOG_LEVEL="debug";          shift;;
         -vvv)                    LOG_LEVEL="verbose";        shift;;
@@ -291,6 +308,22 @@ if [[ ! " $_allowed " == *" $BACKEND_MODE "* ]]; then
         err "    To record a dod-mission live run, use: --record-to FILE"
     fi
     exit 1
+fi
+
+# Normalize the C-microdrone knob ("0"/"none"/"false" -> off) and gate it: the
+# embedded C at_demo path only exists in the dod-mission compose generator
+# (generate_compose.py); the k8s/tilt generators have no C-node support.
+case "$C_MICRODRONES" in 0|none|false|off) C_MICRODRONES="";; esac
+if [[ -n "$C_MICRODRONES" ]]; then
+    if [[ "$VARIANT" != "dod-mission" ]]; then
+        err "--c-microdrones is only supported with --variant=dod-mission."
+        exit 1
+    fi
+    if [[ "$BACKEND_MODE" != "compose" ]]; then
+        err "--c-microdrones requires the --compose backend (the k8s/tilt"
+        err "    generators have no embedded-C at_demo support yet)."
+        exit 1
+    fi
 fi
 
 # dod-mission: --record-to FILE records the live run. The compose/k8s/tilt
@@ -536,18 +569,21 @@ ensure_demo_images() {
             full_ref="${REGISTRY}autonomous-trust${IMAGE_TAG}"
             peer_ref="${REGISTRY}autonomous-trust-disaster${IMAGE_TAG}"
             inspector_ref="${REGISTRY}autonomous-trust-inspector${IMAGE_TAG}"
-            if ! docker image inspect "$full_ref" &>/dev/null; then
+            # --rebuild reaches the whole chain so source edits propagate;
+            # without --no-cache, unchanged layers stay cached (see the
+            # dod-mission branch below for the rationale).
+            if (( REBUILD == 1 )) || ! docker image inspect "$full_ref" &>/dev/null; then
                 log "Image $full_ref not found — building ..."
                 docker build "${build_args[@]}" -t "$full_ref" \
                     -f "$here/src/autonomous-trust/Dockerfile-native" "$here"
             fi
-            if ! docker image inspect "$peer_ref" &>/dev/null; then
+            if (( REBUILD == 1 )) || ! docker image inspect "$peer_ref" &>/dev/null; then
                 log "Image $peer_ref not found — building ..."
                 docker build --build-arg "BASE_IMAGE=$full_ref" \
                     "${build_args[@]}" -t "$peer_ref" \
                     -f "$here/src/autonomous-trust-evaluation/Dockerfile" "$here"
             fi
-            if ! docker image inspect "$inspector_ref" &>/dev/null; then
+            if (( REBUILD == 1 )) || ! docker image inspect "$inspector_ref" &>/dev/null; then
                 log "Image $inspector_ref not found — building ..."
                 docker build --build-arg "BASE_IMAGE=$full_ref" \
                     "${build_args[@]}" -t "$inspector_ref" \
@@ -560,12 +596,22 @@ ensure_demo_images() {
             inspector_ref="${REGISTRY}autonomous-trust-inspector${IMAGE_TAG}"
             demo_ref="${REGISTRY}at-dod-mission-demo${IMAGE_TAG}"
             peer_ref="${REGISTRY}at-dod-mission-peer${IMAGE_TAG}"
-            if ! docker image inspect "$base_ref" &>/dev/null; then
+            # --rebuild must reach the base + inspector images, not just the
+            # thin overlays below: the inspector image COPYs the frequently
+            # edited Python source (core, inspector, evaluation, services,
+            # simulator). Rebuilding only the dod overlay picks up new
+            # examples/ code that imports new library symbols while the
+            # inspector package underneath stays stale -> ImportError (e.g.
+            # narration_script.py importing NarrationAnchor before the
+            # inspector image carries it). These builds don't pass
+            # --no-cache, so when the source is unchanged Docker hits the
+            # layer cache and the forced rebuild is nearly free.
+            if (( REBUILD == 1 )) || ! docker image inspect "$base_ref" &>/dev/null; then
                 log "Building base image: $base_ref ..."
                 docker build --network host "${build_args[@]}" -t "$base_ref" \
                     -f "$here/src/autonomous-trust/Dockerfile-native" "$here"
             fi
-            if ! docker image inspect "$inspector_ref" &>/dev/null; then
+            if (( REBUILD == 1 )) || ! docker image inspect "$inspector_ref" &>/dev/null; then
                 log "Building inspector image: $inspector_ref ..."
                 docker build --network host --build-arg "BASE_IMAGE=$base_ref" \
                     "${build_args[@]}" -t "$inspector_ref" \
@@ -585,6 +631,18 @@ ensure_demo_images() {
                 docker build --network host --build-arg "BASE_IMAGE=$base_ref" \
                     "${build_args[@]}" -t "$peer_ref" \
                     -f "$here/examples/dod_mission/deploy/Dockerfile-peer" "$here"
+            fi
+            # Embedded C at_demo image for --c-microdrones. Standalone build
+            # (Dockerfile-c is FROM debian, no BASE_IMAGE); needs network for
+            # apt, hence --network host. AT_C_IMAGE feeds generate_compose.py.
+            if [[ -n "$C_MICRODRONES" ]]; then
+                local c_ref="${REGISTRY}autonomous-trust-c${IMAGE_TAG}"
+                export AT_C_IMAGE="$c_ref"
+                if (( REBUILD == 1 )) || ! docker image inspect "$c_ref" &>/dev/null; then
+                    log "Building embedded C at_demo image: $c_ref ..."
+                    docker build --network host "${build_args[@]}" -t "$c_ref" \
+                        -f "$here/src/autonomous-trust/Dockerfile-c" "$here"
+                fi
             fi
             ;;
     esac
@@ -641,6 +699,15 @@ PY
                     >/dev/null \
                     || warn "simulator scenario generation failed (non-fatal)"
 
+                # --c-microdrones: render those microdrones as C at_demo nodes
+                # (+ flight-stub sidecar), pinned to the locally-built C image.
+                # Empty -> no C args, fully Python (back-compat default).
+                compose_c_args=()
+                if [[ -n "$C_MICRODRONES" ]]; then
+                    compose_c_args+=(--c-microdrones "$C_MICRODRONES"
+                                     --c-image "${AT_C_IMAGE:-${REGISTRY}autonomous-trust-c${IMAGE_TAG}}")
+                fi
+
                 log "Regenerating docker-compose.yml..."
                 # Module form (mirrors generate_k8s below). PYTHONPATH
                 # is exported at the top of this script, so `examples`
@@ -657,6 +724,7 @@ PY
                     --swarm-size "$SWARM_SIZE" \
                     --sensor-count "$SENSOR_COUNT" \
                     --hacked-sensors "$HACKED_SENSORS" \
+                    "${compose_c_args[@]+"${compose_c_args[@]}"}" \
                     || { err "compose generation failed"; exit 1; }
 
                 if [[ "${AT_PRESEED:-1}" == "1" ]]; then
@@ -671,13 +739,18 @@ PY
                     log "Seeding persistent-cohort dirs under .demo-state/dod-mission/ ..."
                     seed_force=""
                     [[ "${AT_PRESEED_FORCE:-0}" == "1" ]] && seed_force="--force"
+                    # Seed C-format identities for the C microdrones so the SPEC
+                    # matches generate_compose.py exactly (a peer running the C
+                    # node must be seeded C, and vice-versa). No spaces in SPEC.
+                    seed_c_arg=""
+                    [[ -n "$C_MICRODRONES" ]] && seed_c_arg="--c-microdrones $C_MICRODRONES"
                     python3 -m tools.seed_dod_cohort \
                         --out .demo-state/dod-mission \
                         --squad-size "$SQUAD_SIZE" \
                         --swarm-size "$SWARM_SIZE" \
                         --sensor-count "$SENSOR_COUNT" \
                         --hacked-sensors "$HACKED_SENSORS" \
-                        $seed_force \
+                        $seed_force $seed_c_arg \
                         || { err "cohort seed failed"; exit 1; }
                     if [[ "${AT_ZTA_PROVISION:-1}" == "1" ]]; then
                         log "Provisioning ZTA mission CA + per-peer credentials ..."
