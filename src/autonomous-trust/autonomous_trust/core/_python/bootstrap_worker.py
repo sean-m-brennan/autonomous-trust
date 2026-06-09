@@ -52,7 +52,9 @@ import queue
 import random
 from typing import Any
 
-from .bootstrap_capabilities import BOOTSTRAP_CAPABILITY_NAMES
+from .bootstrap_capabilities import (
+    BOOTSTRAP_CAPABILITY_NAMES, register_bootstrap_capabilities,
+)
 from .capabilities import Capabilities
 from .negotiation.negotiation import Task, TaskParameters
 from .negotiation.protocol import NegotiationProtocol
@@ -95,7 +97,24 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
                          dependencies=deps, **kwargs)
         self.identity = configurations[CfgIds.identity]
         self.peers = configurations[CfgIds.peers]
-        self.capabilities: Capabilities = configurations[CfgIds.capabilities]
+        # The node's OWN registered Capabilities live on the orchestrator
+        # (Automate.capabilities) and are NOT exposed through the configs
+        # dict: configs[CfgIds.capabilities] is the PeerCapabilities map
+        # (name -> [peer_ids]) per the Protocol convention (see
+        # protocol.py:45 and Automate._configure's `defaultable`). Reading
+        # that key here grabbed a PeerCapabilities, which has no to_list()
+        # -> _tick raised AttributeError every pass -> the worker never
+        # issued a bootstrap pair -> peers were never admitted to the group
+        # ("not in group" floods, peers.all stuck low, reputations frozen
+        # at 0.5). The worker only ever issues the three bootstrap caps, so
+        # own a private Capabilities with exactly those registered, mirroring
+        # Automate.__init__'s register_bootstrap_capabilities(self.capabilities).
+        # Gate on AT_BOOTSTRAP_DISABLED exactly as Automate does, so the
+        # "cap not registered -> skip" branch in _try_issue_pair stays
+        # meaningful (process() also exits outright when disabled).
+        self.capabilities: Capabilities = Capabilities()
+        if not os.environ.get('AT_BOOTSTRAP_DISABLED'):
+            register_bootstrap_capabilities(self.capabilities)
 
         self.duration_sec = self._read_float_env(
             'AT_BOOTSTRAP_DURATION_SEC', self.DEFAULT_DURATION_SEC)

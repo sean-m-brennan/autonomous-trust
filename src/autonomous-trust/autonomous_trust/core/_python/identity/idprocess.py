@@ -181,6 +181,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.update, self.handle_group_update)
         self.protocol.register_handler(IdentityProtocol.caps_query, self.handle_caps_query)
         self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
+        self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
+        self.protocol.register_handler(IdentityProtocol.id_response, self.handle_identity_response)
         self.protocol.register_handler(IdentityProtocol.tier_update, self.handle_tier_update)
         self.protocol.register_handler(IdentityProtocol.partition_signal, self.handle_partition_signal)
         self.protocol.register_handler(IdentityProtocol.partition_probe, self.handle_partition_probe)
@@ -349,6 +351,23 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.logger.debug('Add peers')
         self._remember_activity(queues, CfgIds.peers, self.peers)
         self._remember_activity(queues, CfgIds.capabilities, self.peer_capabilities)
+        # Reliable re-put of self.peers to the main proc. _remember_activity's
+        # update() fan-put uses the q_cadence (10 ms) timeout, which silently
+        # DROPS under main-proc queue contention — e.g. the dod_mission
+        # coordinator, whose main loop is processing thousands of rep_resp
+        # messages, so the Peers broadcast never lands and self.peers stays
+        # stale (peers.all=1 while group.addresses grows). handle_caps_response
+        # already does exactly this for peer_capabilities (see ~line 1336, the
+        # same drop); self.peers had no equivalent. 1 s timeout rides through
+        # bursty contention; bounded, so it can't deadlock. Without this the
+        # coordinator can never name consensus reputations -> dashboard stuck
+        # "forming…". See dod-coordinator-partition-nonconvergence.md (layer 3).
+        if CfgIds.main in queues:
+            try:
+                queues[CfgIds.main].put(self.peers, block=True, timeout=1.0)
+                _probes.counter('peer.set', 'peers_explicit_main_put')
+            except Full:
+                _probes.counter('peer.set', 'peers_explicit_main_full')
 
     def acquire_capabilities(self, queues):
         start = now()
@@ -1409,6 +1428,119 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             _probes.counter('peer.set', 'caps_resync_exc')
             self.report_exception(err, '_periodic_caps_resync')
 
+    # --- Identity backfill for cold/late joiners ---------------------------
+    # group.addresses can list members whose full Identity never reached us:
+    # the merge/partition path adopts the group (addresses grow) but
+    # _populate_peers_from_history only adds the identities a welcomer bundled,
+    # so self.peers stays sparse. Without the Identity (nickname) we can't name
+    # those peers, so consensus reputations stay unattributed and the
+    # dod_mission dashboard shows everyone "forming…". This sweep asks the
+    # group for the identities we lack; matching members reply with their
+    # published identity, which we add to self.peers (and _record_peers then
+    # reliably reaches the main proc via the explicit-put fix above).
+    # Self-limiting: a node that already holds an identity per group member
+    # emits nothing. Shares the caps-resync cadence (driven from the loop).
+    def _periodic_identity_resync(self, queues):
+        if self.phase != 3 or self.group is None or self.choosing:
+            return
+        try:
+            group_size = len(list(self.group.addresses))
+            have = {str(p.uuid) for p in self.peers.all}
+            have.add(str(self.identity.uuid))
+            # We have an Identity for (at least) every group member -> nothing
+            # to do. uuid-count vs address-count is 1:1 per member; an
+            # occasional over-query is harmless (responders skip via `have`).
+            if len(have) >= group_size:
+                return
+            payload = to_json_string({'group_uuid': str(self.group.uuid),
+                                      'have': sorted(have)})
+            query = Message(self.name, IdentityProtocol.id_query, payload,
+                            to_whom=Network.broadcast, encrypt=False)
+            queues[CfgIds.network].put(query, block=True, timeout=self.q_cadence)
+            _probes.counter('peer.set', 'identity_resync_query',
+                            str(group_size - len(have)))
+            self.logger.debug(
+                'Identity resync: querying group for %d missing member '
+                'identity/ies' % (group_size - len(have)))
+        except Full:
+            _probes.counter('peer.set', 'identity_resync_q_full')
+            self.logger.error('_periodic_identity_resync: Network queue full')
+        except Exception as err:
+            _probes.counter('peer.set', 'identity_resync_exc')
+            self.report_exception(err, '_periodic_identity_resync')
+
+    def handle_identity_query(self, queues, message):
+        """A same-group peer that holds our address but not our Identity asks
+        for it (payload: our group uuid + the uuids it already has). If we're
+        in that group and not in its have-list, reply with our published
+        identity so it can populate self.peers."""
+        if message.function != IdentityProtocol.id_query:
+            return False
+        try:
+            payload = from_json_string(message.obj) \
+                if isinstance(message.obj, (str, bytes)) else message.obj
+            if not isinstance(payload, dict) or self.group is None:
+                return True
+            if str(payload.get('group_uuid')) != str(self.group.uuid):
+                return True  # different group — not our concern
+            have = {str(x) for x in (payload.get('have') or [])}
+            if str(self.identity.uuid) in have:
+                return True  # asker already has us
+            out = to_json_string({'from_identity': self.identity.publish(),
+                                  'from_address': self.identity.address})
+            reply = Message(self.name, IdentityProtocol.id_response, out,
+                            to_whom=Network.broadcast, encrypt=False)
+            queues[CfgIds.network].put(reply, block=True, timeout=self.q_cadence)
+            _probes.counter('peer.set', 'identity_response_sent')
+        except Full:
+            _probes.counter('peer.set', 'identity_response_q_full')
+            self.logger.error('handle_identity_query: Network queue full')
+        except Exception as err:
+            _probes.counter('peer.set', 'identity_query_exc')
+            self.report_exception(err, 'handle_identity_query')
+        return True
+
+    def handle_identity_response(self, queues, message):
+        """Receive a group member's published identity (reply to our
+        id_query) and add it to self.peers. Gated to peers whose advertised
+        address is actually in our group's address map, so a stray
+        broadcaster can't inject itself into our peer set."""
+        if message.function != IdentityProtocol.id_response:
+            return False
+        try:
+            payload = from_json_string(message.obj) \
+                if isinstance(message.obj, (str, bytes)) else message.obj
+            if not isinstance(payload, dict) or self.group is None:
+                return True
+            ident = payload.get('from_identity')
+            if ident is None or getattr(ident, 'uuid', None) is None:
+                _probes.counter('peer.set', 'identity_response_no_identity')
+                return True
+            addr = (getattr(ident, 'address', None)
+                    or payload.get('from_address'))
+            if addr is None or addr not in list(self.group.addresses):
+                # Only backfill identities for actual group members.
+                _probes.counter('peer.set', 'identity_response_not_in_group')
+                return True
+            if str(ident.uuid) == str(self.identity.uuid):
+                return True
+            with self.lock:
+                already = self.peers.find_by_uuid(ident.uuid) is not None
+                if not already:
+                    self.peers.add(ident)
+            if not already:
+                self._record_peers(queues)
+                _probes.counter('peer.set', 'identity_response_added')
+                self.logger.debug(
+                    'Identity resync: backfilled identity for group member '
+                    '%s' % getattr(ident, 'nickname', str(ident.uuid)))
+            else:
+                _probes.counter('peer.set', 'identity_response_redundant')
+        except Exception as err:
+            _probes.counter('peer.set', 'identity_response_exc')
+            self.report_exception(err, 'handle_identity_response')
+        return True
+
     def handle_history_diff(self, queues, message):
         """
         Receive a history diff, possibly merge
@@ -1632,6 +1764,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 _probes.counter('peer.set', 'partition_probe_bad_sig')
                 return True
             sender_uuid = str(sender_id.uuid)
+            our_group_uuid = str(self.group.uuid)
+            our_group_size = len(list(self.group.addresses))
             # If the sender is already in our group, this is the
             # graceful no-op case (their local view is stale); send a
             # normal group_key_update and bail.
@@ -1643,6 +1777,35 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # don't respond with a partition_response.
                 _probes.counter('peer.set', 'partition_probe_known_peer')
                 return True
+            # Symmetric adoption: the probe already advertises the prober's
+            # group size, so decide adoption HERE too — not only in
+            # handle_partition_response. Without this, a node that never
+            # receives a foreign GROUP-channel message — e.g. the
+            # dod_mission coordinator, which sits in no other group's
+            # address map — only ever RESPONDS to probes (its
+            # ``sender_group is None`` trigger in netprocess never fires)
+            # and can never initiate a merge into a larger group, leaving a
+            # size-1/2 group wedged on the losing side of every comparison
+            # (partition-recovery.md §1's size-1-coordinator case). Same
+            # decision as handle_partition_response (strictly larger, or
+            # equal size with smaller uuid), guarded by the in-flight lock
+            # so we neither double-initiate nor ping-pong with the
+            # symmetric peer (exactly one side's adopt test is True).
+            if not self._partition_recovery_active():
+                their_size = int(group_size)
+                if (their_size > our_group_size
+                        or (their_size == our_group_size
+                            and str(group_uuid) < our_group_uuid)):
+                    self._partition_recovery_in_progress = (
+                        str(group_uuid), now())
+                    self._broadcast_request_access(queues)
+                    _probes.counter('peer.set', 'partition_recovery_initiated')
+                    self.logger.info(
+                        'Partition recovery (from probe): adopting group %s '
+                        '(size=%d vs our %d), sent request_access '
+                        '(probe from %s@%s)' %
+                        (group_uuid, their_size, our_group_size,
+                         sender_uuid, payload.get('from_address')))
             cutoff = now()
             last = self._partition_response_cooldown.get(sender_uuid)
             if (last is not None
@@ -1651,8 +1814,6 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 return True
             self._partition_response_cooldown[sender_uuid] = cutoff
             # Build the response.
-            our_group_uuid = str(self.group.uuid)
-            our_group_size = len(list(self.group.addresses))
             leader = self._select_partition_leader()
             resp_sig_bytes = self._partition_response_canonical(
                 our_group_uuid, our_group_size, sender_uuid)
@@ -1861,6 +2022,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         >= self._CAPS_RESYNC_INTERVAL_SEC):
                     self._last_caps_resync = tick
                     self._periodic_caps_resync(queues)
+                    # Same cadence: backfill identities for group members we
+                    # hold an address for but no Identity (cold/late joiner;
+                    # see _periodic_identity_resync + layer 3 memory).
+                    self._periodic_identity_resync(queues)
 
                 untouched = []
                 while len(self.messages) > 0:

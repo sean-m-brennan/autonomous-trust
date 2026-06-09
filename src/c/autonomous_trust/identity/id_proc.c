@@ -61,6 +61,12 @@ static char ID_CONFIRM[]     = "peer_accepted";
 static char ID_UPDATE[]      = "group_key_update";
 static char ID_CAPS_QUERY[]  = "peer_caps_query";
 static char ID_CAPS_RESPONSE[] = "peer_caps_response";
+/* Identity backfill for a cold/late joiner that holds a group member's
+ * address but never received its full Identity (merge/partition path fills
+ * group.address_map but peers[] stays sparse). See identity_periodic_identity
+ * _resync + dod-coordinator-partition-nonconvergence.md (layer 3). */
+static char ID_IDENTITY_QUERY[]    = "peer_identity_query";
+static char ID_IDENTITY_RESPONSE[] = "peer_identity_response";
 /* Local-only IPC from ReputationProcess (no wire egress). Payload is a
  * 2-element JSON array `[peer_uuid_str, new_tier_int]`. Mirrors
  * Python IdentityProtocol.tier_update. */
@@ -2757,6 +2763,286 @@ void identity_periodic_caps_resync(const process_t *proc)
     }
 }
 
+/****************************
+ * Helper: _group_has_address
+ * True iff @p addr appears as a value in the group's address_map. Used by
+ * handle_identity_response to gate backfilled identities to actual group
+ * members (a stray broadcaster's response can't inject itself into peers[]).
+ * Mirrors Python's `addr in list(self.group.addresses)` test.
+ ****************************/
+static bool _group_has_address(group_t *group, const char *addr)
+{
+    if (group == NULL || addr == NULL || addr[0] == '\0') return false;
+    bool found = false;
+    map_key_t key;
+    data_t *value;
+    map_entries_for_each(&group->address_map, key, value)
+        string_t a = NULL;
+        if (data_string_ptr(value, &a) == 0 && a != NULL && strcmp(a, addr) == 0)
+            found = true;
+    map_end_for_each
+    return found;
+}
+
+/****************************
+ * Periodic: identity_periodic_identity_resync
+ *
+ * Cold/late-joiner identity-loss backstop. A node that adopted a group via
+ * the merge/partition path holds the members' ADDRESSES (group.address_map)
+ * but not their full Identities (peers[] stays sparse — only the welcomer's
+ * bundled identities ever landed). Without the identities it can't name
+ * consensus reputations for those members. Broadcasts a peer_identity_query
+ * listing our group uuid + the uuids we already hold; same-group members not
+ * in that have-list reply with their published identity (handle_identity_query)
+ * which we add to peers[] (handle_identity_response).
+ *
+ * Mirrors Python's IdentityProcess._periodic_identity_resync (idprocess.py)
+ * and rides the same caps-resync cadence in identity_run's main loop. See
+ * dod-coordinator-partition-nonconvergence.md (layer 3).
+ ****************************/
+/* Frama-C: skipped — JSON + messaging stubs. */
+void identity_periodic_identity_resync(const process_t *proc)
+{
+    if (proc == NULL) return;
+    /* Only when operational and actually in a group (mirror Python's
+     * `phase == 3 and group is not None and not choosing`). */
+    if (proc->protocol.phase != 3) return;
+    if (proc->protocol.group.uuid[0] == 0
+        && map_size(&((process_t *)proc)->protocol.group.address_map) == 0)
+        return;
+    pthread_mutex_lock(&id_state.lock);
+    bool choosing = id_state.choosing_group;
+    pthread_mutex_unlock(&id_state.lock);
+    if (choosing) return;
+
+    int group_size = (int)map_size(&((process_t *)proc)->protocol.group.address_map);
+    const identity_t *self = _partition_self_identity(proc);
+
+    /* `have` = the uuids we hold an Identity for = our peers + self. */
+    json_t *have = json_array();
+    if (have == NULL) return;
+    if (self != NULL) {
+        char self_uuid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(self->uuid, self_uuid_str);
+        json_array_append_new(have, json_string(self_uuid_str));
+    }
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        char u[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, u);
+        json_array_append_new(have, json_string(u));
+    }
+    peers_read_unlock(proc);
+
+    /* We hold an Identity for (at least) every group member -> nothing to do.
+     * uuid-count vs address-count is 1:1 per member; an occasional over-query
+     * is harmless (responders skip via the have-list). */
+    int have_count = (int)json_array_size(have);
+    if (have_count >= group_size) {
+        json_decref(have);
+        return;
+    }
+
+    char group_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proc->protocol.group.uuid, group_uuid_str);
+    json_t *payload = json_object();
+    if (payload == NULL) { json_decref(have); return; }
+    json_object_set_new(payload, "group_uuid", json_string(group_uuid_str));
+    json_object_set_new(payload, "have", have);  /* steals the reference */
+
+    generic_msg_t query = {0};
+    query.type = NET_MESSAGE;
+    strncpy(query.info.net_msg.process, "identity", PROC_NAME_LEN);
+    query.info.net_msg.function = ID_IDENTITY_QUERY;
+    query.info.net_msg.encrypt = false;       /* may lack peer crypto material */
+    /* to_whom left zeroed → network-layer broadcast */
+    strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    net_msg_pack_json(&query.info.net_msg, payload);
+    json_decref(payload);
+    messaging_send("network", NET_MESSAGE, &query, false);
+
+    char miss_str[16];
+    snprintf(miss_str, sizeof(miss_str), "%d", group_size - have_count);
+    probes_counter("peer.set", "identity_resync_query", miss_str);
+    log_debug(proc->logger,
+              "Identity resync: querying group for %d missing member "
+              "identity/ies\n", group_size - have_count);
+}
+
+/****************************
+ * Handler: handle_identity_query (peer_identity_query)
+ *
+ * A same-group peer that holds our address but not our Identity asks for it
+ * (payload: its group uuid + the uuids it already has). If we're in that
+ * group and not in its have-list, reply with our published identity so it can
+ * populate peers[]. Mirrors Python's handle_identity_query (idprocess.py).
+ ****************************/
+/* Frama-C: skipped — JSON + messaging stubs. */
+static bool handle_identity_query(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    if (proc == NULL || msg == NULL) return true;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (proc->protocol.group.uuid[0] == 0
+        && map_size(&((process_t *)proc)->protocol.group.address_map) == 0)
+        return true;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    if (!json_is_object(payload)) { json_decref(payload); return true; }
+
+    /* Different group — not our concern. */
+    char our_group_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proc->protocol.group.uuid, our_group_uuid_str);
+    const char *asked_group =
+        json_string_value(json_object_get(payload, "group_uuid"));
+    if (asked_group == NULL || strcmp(asked_group, our_group_uuid_str) != 0) {
+        json_decref(payload);
+        return true;
+    }
+
+    /* If the asker already has us, stay silent. */
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) { json_decref(payload); return true; }
+    char self_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self->uuid, self_uuid_str);
+    json_t *have = json_object_get(payload, "have");
+    if (have != NULL && json_is_array(have)) {
+        size_t hn = json_array_size(have);
+        for (size_t i = 0; i < hn; i++) {
+            const char *h = json_string_value(json_array_get(have, i));
+            if (h != NULL && strcmp(h, self_uuid_str) == 0) {
+                json_decref(payload);
+                return true;  /* asker already has us */
+            }
+        }
+    }
+    json_decref(payload);
+
+    /* Reply with our published identity + address. */
+    public_identity_t *self_pub = NULL;
+    if (identity_publish(self, &self_pub) != 0 || self_pub == NULL)
+        return true;
+    json_t *from_id_json = NULL;
+    if (public_identity_to_json(self_pub, &from_id_json) != 0
+        || from_id_json == NULL) {
+        smrt_deref(self_pub);
+        return true;
+    }
+    smrt_deref(self_pub);
+    json_t *out = json_object();
+    if (out == NULL) { json_decref(from_id_json); return true; }
+    json_object_set_new(out, "from_identity", from_id_json);
+    json_object_set_new(out, "from_address", json_string(self->address));
+
+    generic_msg_t reply = {0};
+    reply.type = NET_MESSAGE;
+    strncpy(reply.info.net_msg.process, "identity", PROC_NAME_LEN);
+    reply.info.net_msg.function = ID_IDENTITY_RESPONSE;
+    reply.info.net_msg.encrypt = false;
+    /* to_whom left zeroed → broadcast (mirrors Python's to_whom=broadcast) */
+    strncpy(reply.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    net_msg_pack_json(&reply.info.net_msg, out);
+    json_decref(out);
+    messaging_send("network", NET_MESSAGE, &reply, false);
+    probes_counter("peer.set", "identity_response_sent", "1");
+    log_debug(proc->logger,
+              "Identity resync: replied to identity_query from %s\n",
+              nmsg->from_whom.fullname);
+    return true;
+}
+
+/****************************
+ * Handler: handle_identity_response (peer_identity_response)
+ *
+ * Receive a group member's published identity (reply to our identity_query)
+ * and add it to peers[]. Gated to peers whose advertised address is actually
+ * in our group's address_map, so a stray broadcaster can't inject itself.
+ * Mirrors Python's handle_identity_response (idprocess.py).
+ ****************************/
+/* Frama-C: skipped — JSON parsing + peers mutation. */
+static bool handle_identity_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    if (proc == NULL || msg == NULL) return true;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (proc->protocol.group.uuid[0] == 0
+        && map_size(&((process_t *)proc)->protocol.group.address_map) == 0)
+        return true;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    if (!json_is_object(payload)) { json_decref(payload); return true; }
+
+    json_t *ident_json = json_object_get(payload, "from_identity");
+    if (ident_json == NULL || !json_is_object(ident_json)) {
+        probes_counter("peer.set", "identity_response_no_identity", "1");
+        json_decref(payload);
+        return true;
+    }
+    public_identity_t parsed = {0};
+    if (public_identity_from_json(ident_json, &parsed) != 0) {
+        probes_counter("peer.set", "identity_response_no_identity", "1");
+        json_decref(payload);
+        return true;
+    }
+
+    /* Address: prefer the identity's own, else the explicit field. */
+    const char *addr = (parsed.address[0] != '\0')
+        ? parsed.address
+        : json_string_value(json_object_get(payload, "from_address"));
+
+    /* Only backfill identities for actual group members. */
+    if (!_group_has_address(&((process_t *)proc)->protocol.group, addr)) {
+        probes_counter("peer.set", "identity_response_not_in_group", "1");
+        json_decref(payload);
+        return true;
+    }
+
+    /* Never add self. */
+    const identity_t *self = _partition_self_identity(proc);
+    if (self != NULL && uuid_compare(parsed.uuid, self->uuid) == 0) {
+        json_decref(payload);
+        return true;
+    }
+    json_decref(payload);
+
+    /* Add to peers if not already present. Mirrors
+     * _populate_peers_from_history's append-under-write-lock. Unlike Python
+     * there is no separate `main` peer copy to fan out to (the layer-3a
+     * reliable-put fix is Python-specific) — peers[] is the shared struct. */
+    bool added = false;
+    peers_write_lock((process_t *)proc);
+    bool dup = false;
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        if (uuid_compare(proc->protocol.peers[i].uuid, parsed.uuid) == 0) {
+            dup = true;
+            break;
+        }
+    }
+    if (!dup && proc->protocol.num_peers < MAX_PEERS) {
+        memcpy(&((process_t *)proc)->protocol.peers[proc->protocol.num_peers],
+               &parsed, sizeof(public_identity_t));
+        ((process_t *)proc)->protocol.num_peers++;
+        added = true;
+    }
+    peers_write_unlock((process_t *)proc);
+
+    if (added) {
+        probes_counter("peer.set", "identity_response_added", "1");
+        char u[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(parsed.uuid, u);
+        log_debug(proc->logger,
+                  "Identity resync: backfilled identity for group member %s\n",
+                  u);
+    } else {
+        probes_counter("peer.set", "identity_response_redundant", "1");
+    }
+    return true;
+}
+
 static bool handle_partition_signal(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -2870,7 +3156,6 @@ static bool handle_partition_signal(const process_t *proc, directory_t *queues, 
 
 static bool handle_partition_probe(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
-    (void)queues;
     if (proc == NULL || msg == NULL) return true;
     /* Skip if we have no group yet. */
     if (proc->protocol.group.uuid[0] == 0
@@ -3019,6 +3304,42 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
     log_debug(proc->logger,
               "Identity: partition_response broadcast (to=%s our_group=%s/%d)\n",
               sender_uuid_str, our_group_uuid_str, our_group_size);
+
+    /* Symmetric adoption: the probe already advertises the prober's group
+     * size, so decide adoption HERE too — not only in
+     * handle_partition_response. Without this a node that never receives a
+     * foreign GROUP-channel message (the dod_mission coordinator, in no
+     * other group's address map) only ever RESPONDS to probes and can never
+     * initiate a merge into a larger group, leaving a size-1/2 group wedged
+     * on the losing side of every comparison. Mirrors
+     * handle_partition_response's adopt decision (strictly larger, or equal
+     * size with smaller uuid), guarded by the in-flight lock so exactly one
+     * side adopts. See dod-coordinator-partition-nonconvergence.md (layer 2). */
+    pthread_mutex_lock(&id_state.lock);
+    bool recovery_active = _partition_recovery_active_locked();
+    pthread_mutex_unlock(&id_state.lock);
+    if (!recovery_active) {
+        bool adopt = (sender_group_size > our_group_size)
+            || (sender_group_size == our_group_size
+                && strcmp(sender_group_uuid, our_group_uuid_str) < 0);
+        if (adopt) {
+            pthread_mutex_lock(&id_state.lock);
+            snprintf(id_state.partition_recovery_target,
+                     sizeof(id_state.partition_recovery_target), "%s",
+                     sender_group_uuid);
+            id_state.partition_recovery_started_us = _partition_now_us();
+            pthread_mutex_unlock(&id_state.lock);
+            int rc = _announce_identity(proc, queues);
+            if (rc != 0)
+                log_error(proc->logger,
+                          "Identity: partition_probe adopt: _announce_identity "
+                          "failed (%d)\n", rc);
+            log_info(proc->logger,
+                     "Identity: partition recovery (from probe) -> group=%s "
+                     "(size=%d vs our %d)\n",
+                     sender_group_uuid, sender_group_size, our_group_size);
+        }
+    }
     json_decref(payload);
     return true;
 }
@@ -3146,6 +3467,10 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_UPDATE,   (handler_ptr_t)handle_group_update);
     process_register_handler(proc, ID_CAPS_QUERY,    (handler_ptr_t)handle_caps_query);
     process_register_handler(proc, ID_CAPS_RESPONSE, (handler_ptr_t)handle_caps_response);
+    process_register_handler(proc, ID_IDENTITY_QUERY,
+                             (handler_ptr_t)handle_identity_query);
+    process_register_handler(proc, ID_IDENTITY_RESPONSE,
+                             (handler_ptr_t)handle_identity_response);
     process_register_handler(proc, ID_TIER,          (handler_ptr_t)handle_tier_update);
     process_register_handler(proc, ID_PARTITION_SIGNAL,
                              (handler_ptr_t)handle_partition_signal);
@@ -3379,6 +3704,11 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         {
             caps_cycle = 0;
             identity_periodic_caps_resync(proc);
+            /* Same cadence as caps-resync (Python rides the same interval):
+             * a cold/late joiner holding only member addresses backfills the
+             * missing Identities so consensus reputations can be named. A
+             * converged node emits no query (have_count >= group_size). */
+            identity_periodic_identity_resync(proc);
         }
 
         generic_msg_t buf = {0};

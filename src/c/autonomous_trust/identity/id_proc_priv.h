@@ -92,6 +92,17 @@ void identity_install_peer_caps(const uuid_t uuid,
  *  (CAPS_RESYNC_MAX_PER_SWEEP). See memory feedback_late_joiner_caps. */
 void identity_periodic_caps_resync(const process_t *proc);
 
+/** Periodic backstop for the cold/late-joiner identity-loss case: a node
+ *  that adopted a group via the merge/partition path holds the members'
+ *  addresses (group.address_map) but not their full Identities (peers[]
+ *  stays sparse), so consensus reputations can't be named. Broadcasts a
+ *  peer_identity_query listing our group uuid + the uuids we already hold;
+ *  matching members reply with their published identity, which we add to
+ *  peers[]. Mirrors Python's IdentityProcess._periodic_identity_resync.
+ *  Invoked from identity_run's main loop on the caps-resync interval;
+ *  exposed for the unit test. See dod-coordinator-partition-nonconvergence.md. */
+void identity_periodic_identity_resync(const process_t *proc);
+
 /** Return the reputation-derived trust tier last published for @p uuid
  *  via the ID_TIER local-IPC handler (handle_tier_update). Returns 0 if
  *  no entry exists. The map is populated by ReputationProcess crossing

@@ -901,10 +901,22 @@ class DoDMissionCoordinator(AutonomousTrust):
             # process is actually delivering scores and what they look
             # like.  Without this, "still 0.49" gives no information
             # about which side of the pipeline is stalled.
+            # Diagnostic for the worker->main peer-propagation gap
+            # (dod-coordinator-partition-nonconvergence.md, layer 3): the
+            # IdentityProcess worker admits the mesh but `self.peers` (main
+            # proc) stays tiny. group_addrs tells us whether Group broadcasts
+            # reach main even when Peers broadcasts don't — if group_addrs is
+            # large while peers.all stays ~1, the gap is specifically the
+            # Peers fan-out / run_message_handlers application, not the queue.
+            try:
+                group_addrs = len(list(self.group.addresses)) \
+                    if getattr(self, "group", None) is not None else 0
+            except Exception:
+                group_addrs = -1
             logger.info(
-                "_query_reputations: tick=%d peers.all=%d "
+                "_query_reputations: tick=%d peers.all=%d group_addrs=%d "
                 "latest_reputation=%d history items, last5=%r",
-                self._tick_count, len(self.peers.all),
+                self._tick_count, len(self.peers.all), group_addrs,
                 len(self.latest_reputation),
                 [(str(k)[:8], round(getattr(v, "score", -1), 3))
                  for k, v in list(self.latest_reputation.items())[-5:]])

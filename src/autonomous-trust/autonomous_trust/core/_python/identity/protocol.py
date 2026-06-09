@@ -70,6 +70,16 @@ class IdentityProtocol(Protocol):
     # messages flow via reliable group/TCP, not UDP broadcast.
     caps_query = 'peer_caps_query'  # msg.obj <- '' (sender just asks)
     caps_response = 'peer_caps_response'  # msg.obj <- caps list (json)
+    # Identity backfill for a node that holds a group member's address (in
+    # group.addresses) but never received its full Identity — the cold/late
+    # joiner case (e.g. the dod_mission coordinator: group.addresses grows via
+    # the merge/partition path but self.peers stays sparse, so consensus
+    # reputations can't be named). id_query broadcasts the uuids we lack; the
+    # matching member answers with id_response carrying its published
+    # identity, which we add to self.peers. See _periodic_identity_resync and
+    # dod-coordinator-partition-nonconvergence.md (layer 3).
+    id_query = 'peer_identity_query'  # msg.obj <- json list[uuid_str] we lack
+    id_response = 'peer_identity_response'  # msg.obj <- json {'from_identity': publish()}
     # Local-only IPC (no wire egress). ReputationProcess emits these to
     # CfgIds.identity when a peer's reputation crosses a TIER_FLOORS
     # boundary so IdentityProcess can update the peer's trust tier on
