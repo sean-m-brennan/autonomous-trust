@@ -120,6 +120,28 @@ warn()  { echo -e "${YELLOW}[$VARIANT]${NC} $*"; }
 err()   { echo -e "${RED}[$VARIANT]${NC} $*" >&2; }
 event() { echo -e "${GREEN}[T+${1}]${NC} $2"; }
 
+# Force-reseed cleanup. The demo containers run as root and create var/at/ (and
+# the C nodes' etc/at network/subsystems configs) as root, so the Python seeder
+# — running as the host user — cannot unlink that runtime state. It then
+# survives a --reseed wipe, leaving stale identity/group/reputation state that
+# mismatches the freshly-seeded etc/at (peers fail to re-form the cohort). Wipe
+# the whole state dir as root via a throwaway container so the seed starts
+# clean. Best-effort: if docker can't do it, the seeder's own partial wipe still
+# runs (it skips, rather than crashes on, the undeletable files).
+reseed_wipe_state() {
+    local state_dir="$1"
+    [[ -d "$state_dir" ]] || return 0
+    log "Reseed: wiping persistent state as root via docker ($state_dir) ..."
+    # sh -c so the glob expands INSIDE the container; `docker run ... rm /s/*`
+    # would let the host shell expand /s/* (a nonexistent host path) and pass it
+    # literally to rm, which -f-ignores it (a silent no-op). Include dotfiles;
+    # `|| true` so an already-empty dir isn't a failure.
+    docker run --rm -v "$state_dir:/s" alpine \
+        sh -c 'rm -rf /s/* /s/.[!.]* 2>/dev/null || true' \
+        || warn "Reseed root-wipe via docker failed; seeder falls back to a" \
+                "partial wipe (root-owned var/at may persist)."
+}
+
 # --- Usage ----------------------------------------------------------------
 
 usage() {
@@ -553,6 +575,56 @@ git_version=$(git describe HEAD 2>/dev/null || echo unknown)
 git_version="${git_version#v}"
 build_args+=("--build-arg" "GIT_VERSION=$git_version")
 
+# --- Stale-image schema-skew preflight -----------------------------------
+# Catches the dod-mission "all forming…/peers.all=0" trap: tools/seed_dod_
+# cohort.py runs from the host tree and serializes Identity with whatever
+# fields the host identity.py declares (e.g. the ZTA zta_credential/zta_issuer/
+# zta_credential_hash added in f6250c8). If the baked base image's
+# Identity.__init__ predates those kwargs, every seeded peer TypeErrors at boot
+# -> peers.all=0 -> reputations stuck "forming…". Returns 0 (stale) only when
+# the image clearly exists AND is missing a kwarg the host source has; any
+# uncertainty (no image, can't parse, can't introspect) returns 1 so the normal
+# build path is never blocked.
+base_image_identity_stale() {
+    local base_ref="$1"
+    docker image inspect "$base_ref" &>/dev/null || return 1
+
+    local id_src="$here/src/autonomous-trust/autonomous_trust/core/_python/identity/identity.py"
+    [[ -r "$id_src" ]] || return 1
+
+    # Host kwarg set, via ast (no package import needed).
+    local host_args
+    host_args=$(python3 - "$id_src" <<'PY' 2>/dev/null
+import ast, sys
+mod = ast.parse(open(sys.argv[1]).read())
+for cls in ast.walk(mod):
+    if isinstance(cls, ast.ClassDef) and cls.name == "Identity":
+        for fn in cls.body:
+            if isinstance(fn, ast.FunctionDef) and fn.name == "__init__":
+                a = fn.args
+                names = [x.arg for x in a.args if x.arg != "self"] + [x.arg for x in a.kwonlyargs]
+                print(" ".join(sorted(names)))
+PY
+)
+    [[ -n "$host_args" ]] || return 1
+
+    # Baked kwarg set, introspected from the image (entrypoint bypassed).
+    local img_args
+    img_args=$(docker run --rm --entrypoint python3 "$base_ref" -c \
+        'import inspect; from autonomous_trust.core._python.identity.identity import Identity as I; p=inspect.signature(I.__init__).parameters; print(" ".join(sorted(x for x in p if x!="self")))' \
+        2>/dev/null)
+    [[ -n "$img_args" ]] || return 1
+
+    local a
+    for a in $host_args; do
+        case " $img_args " in
+            *" $a "*) ;;
+            *) return 0 ;;   # image missing a host kwarg -> stale
+        esac
+    done
+    return 1
+}
+
 # --- Image build chains (per variant) ------------------------------------
 # Builds anything missing in the *active* docker daemon (host or
 # cluster, depending on whether use_cluster_docker_env() was called
@@ -596,6 +668,20 @@ ensure_demo_images() {
             inspector_ref="${REGISTRY}autonomous-trust-inspector${IMAGE_TAG}"
             demo_ref="${REGISTRY}at-dod-mission-demo${IMAGE_TAG}"
             peer_ref="${REGISTRY}at-dod-mission-peer${IMAGE_TAG}"
+            # Preflight: a base image whose baked Identity predates the host
+            # source is the "all forming…/peers.all=0" trap (seeded peers
+            # TypeError at boot). Detect it and force a --no-cache base rebuild
+            # so the new identity.py is guaranteed to bake (a plain --rebuild
+            # omits --no-cache and can be served a stale COPY layer). REBUILD=1
+            # then cascades to the inspector/overlay images off the fresh base.
+            local base_cache_flag=()
+            if base_image_identity_stale "$base_ref"; then
+                log "WARNING: base image '$base_ref' Identity schema is OLDER than host source."
+                log "         Seeded peers would TypeError at boot -> reputations stuck 'forming…'."
+                log "         Forcing a --no-cache rebuild of the image chain."
+                REBUILD=1
+                base_cache_flag=(--no-cache)
+            fi
             # --rebuild must reach the base + inspector images, not just the
             # thin overlays below: the inspector image COPYs the frequently
             # edited Python source (core, inspector, evaluation, services,
@@ -608,7 +694,7 @@ ensure_demo_images() {
             # layer cache and the forced rebuild is nearly free.
             if (( REBUILD == 1 )) || ! docker image inspect "$base_ref" &>/dev/null; then
                 log "Building base image: $base_ref ..."
-                docker build --network host "${build_args[@]}" -t "$base_ref" \
+                docker build --network host "${base_cache_flag[@]}" "${build_args[@]}" -t "$base_ref" \
                     -f "$here/src/autonomous-trust/Dockerfile-native" "$here"
             fi
             if (( REBUILD == 1 )) || ! docker image inspect "$inspector_ref" &>/dev/null; then
@@ -739,6 +825,9 @@ PY
                     log "Seeding persistent-cohort dirs under .demo-state/dod-mission/ ..."
                     seed_force=""
                     [[ "${AT_PRESEED_FORCE:-0}" == "1" ]] && seed_force="--force"
+                    # On --reseed, clear root-owned container state first (see
+                    # reseed_wipe_state) so the fresh seed isn't shadowed by it.
+                    [[ -n "$seed_force" ]] && reseed_wipe_state "$here/.demo-state/dod-mission"
                     # Seed C-format identities for the C microdrones so the SPEC
                     # matches generate_compose.py exactly (a peer running the C
                     # node must be seeded C, and vice-versa). No spaces in SPEC.
@@ -786,6 +875,9 @@ PY
                     log "Seeding persistent-cohort dirs under .demo-state/dod-mission/ ..."
                     seed_force=""
                     [[ "${AT_PRESEED_FORCE:-0}" == "1" ]] && seed_force="--force"
+                    # On --reseed, clear root-owned container state first (see
+                    # reseed_wipe_state) so the fresh seed isn't shadowed by it.
+                    [[ -n "$seed_force" ]] && reseed_wipe_state "$here/.demo-state/dod-mission"
                     python3 -m tools.seed_dod_cohort \
                         --out .demo-state/dod-mission \
                         --squad-size "$SQUAD_SIZE" \

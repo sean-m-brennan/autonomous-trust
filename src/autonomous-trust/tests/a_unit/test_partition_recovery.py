@@ -345,6 +345,79 @@ class TestPartitionProbe:
         # Same sender within 30s — only one response.
         assert len(queues[CfgIds.network]) == 1
 
+    def test_adopts_when_prober_advertises_larger_group(self):
+        # Symmetric adoption: a node that only ever RECEIVES probes — it
+        # never gets the inbound foreign-group trigger, like the dod_mission
+        # coordinator which is in no other group's address map — must still
+        # initiate a merge when a probe advertises a larger group. Without
+        # the fix it would only respond and stay wedged in its size-1 group.
+        me = _new_identity('coord', '10.0.0.3')
+        my_group = _group_of_size(me, [])  # size 1
+        proc = _build_process(me, my_group)
+        proc.package_hash = b'pkg-hash-stub'  # _broadcast_request_access uses it
+        from autonomous_trust.core._python.capabilities import Capabilities
+        proc.protocol.capabilities = Capabilities()
+        queues = _build_queues()
+
+        prober = _new_identity('captain', '10.0.0.10')
+        their_group_uuid = str(uuid_mod.uuid4())
+        probe = self._craft_probe(prober, their_group_uuid, 5)
+        handled = proc.handle_partition_probe(queues, probe)
+        assert handled is True
+
+        # Recovery initiated toward the prober's (larger) group...
+        assert proc._partition_recovery_in_progress is not None
+        assert proc._partition_recovery_in_progress[0] == their_group_uuid
+        # ...via a request_access (announce) broadcast,
+        announces = [m for m in queues[CfgIds.network].items
+                     if m.function == IdentityProtocol.announce]
+        assert len(announces) == 1
+        # ...and we still answer the probe so the prober can compare too.
+        responses = [m for m in queues[CfgIds.network].items
+                     if m.function == IdentityProtocol.partition_response]
+        assert len(responses) == 1
+
+    def test_no_adopt_when_prober_group_not_larger(self):
+        # Prober is smaller: we do NOT adopt (they will, from our response).
+        # Guards against accreting larger groups into smaller ones.
+        me = _new_identity('captain', '10.0.0.10')
+        extras = [_new_identity('p%d' % i, '10.0.0.%d' % (11 + i))
+                  for i in range(4)]
+        my_group = _group_of_size(me, extras)  # size 5
+        proc = _build_process(me, my_group)
+        queues = _build_queues()
+
+        prober = _new_identity('coord', '10.0.0.3')
+        probe = self._craft_probe(prober, str(uuid_mod.uuid4()), 1)
+        proc.handle_partition_probe(queues, probe)
+
+        assert proc._partition_recovery_in_progress is None
+        assert all(m.function != IdentityProtocol.announce
+                   for m in queues[CfgIds.network].items)
+        # We still respond so the smaller prober can adopt us.
+        assert any(m.function == IdentityProtocol.partition_response
+                   for m in queues[CfgIds.network].items)
+
+    def test_no_adopt_from_probe_while_recovery_in_flight(self):
+        # The in-flight lock prevents double-initiation when another probe
+        # arrives mid-recovery.
+        me = _new_identity('coord', '10.0.0.3')
+        proc = _build_process(me, _group_of_size(me, []))  # size 1
+        proc.package_hash = b'pkg-hash-stub'
+        from autonomous_trust.core._python.capabilities import Capabilities
+        proc.protocol.capabilities = Capabilities()
+        proc._partition_recovery_in_progress = ('in-flight-uuid', now())
+        queues = _build_queues()
+
+        prober = _new_identity('captain', '10.0.0.10')
+        probe = self._craft_probe(prober, str(uuid_mod.uuid4()), 5)
+        proc.handle_partition_probe(queues, probe)
+
+        # Unchanged recovery target, no new request_access.
+        assert proc._partition_recovery_in_progress[0] == 'in-flight-uuid'
+        assert all(m.function != IdentityProtocol.announce
+                   for m in queues[CfgIds.network].items)
+
 
 # ---------------------------------------------------------------------------
 # handle_partition_response
@@ -458,3 +531,109 @@ class TestMergeHook:
         assert proc.group.uuid == foreign_group.uuid
         assert proc._partition_recovery_in_progress is None
         assert proc._partition_probe_cooldown == {}
+
+
+# ---------------------------------------------------------------------------
+# Identity resync (cold/late-joiner backfill) — dod layer 3
+# ---------------------------------------------------------------------------
+
+class TestIdentityResync:
+    def _id_query(self, group_uuid, have):
+        from autonomous_trust.core.config import to_json_string
+        payload = to_json_string({'group_uuid': str(group_uuid),
+                                  'have': [str(h) for h in have]})
+        return Message(CfgIds.identity, IdentityProtocol.id_query,
+                       payload, encrypt=False)
+
+    def _id_response(self, member_identity):
+        from autonomous_trust.core.config import to_json_string
+        payload = to_json_string({'from_identity': member_identity.publish(),
+                                  'from_address': member_identity.address})
+        return Message(CfgIds.identity, IdentityProtocol.id_response,
+                       payload, encrypt=False)
+
+    def test_query_emitted_when_identities_sparse(self):
+        # group has 3 members (by address) but self.peers is empty -> we lack
+        # identities, so a query naming our group + have-list is broadcast.
+        me = _new_identity('coord', '10.0.0.3')
+        m1 = _new_identity('captain', '10.0.0.10')
+        m2 = _new_identity('intel', '10.0.0.12')
+        grp = _group_of_size(me, [m1, m2])  # 3 addresses
+        proc = _build_process(me, grp, Peers())  # self.peers empty
+        queues = _build_queues()
+
+        proc._periodic_identity_resync(queues)
+
+        from autonomous_trust.core.config import from_json_string
+        qs = [m for m in queues[CfgIds.network].items
+              if m.function == IdentityProtocol.id_query]
+        assert len(qs) == 1
+        payload = from_json_string(qs[0].obj)
+        assert payload['group_uuid'] == str(grp.uuid)
+        assert str(me.uuid) in set(payload['have'])  # we always "have" ourself
+
+    def test_no_query_when_all_identities_present(self):
+        me = _new_identity('coord', '10.0.0.3')
+        m1 = _new_identity('captain', '10.0.0.10')
+        grp = _group_of_size(me, [m1])
+        peers = Peers()
+        peers.add(m1)  # we already hold every other member's identity
+        proc = _build_process(me, grp, peers)
+        queues = _build_queues()
+
+        proc._periodic_identity_resync(queues)
+
+        assert not [m for m in queues[CfgIds.network].items
+                    if m.function == IdentityProtocol.id_query]
+
+    def test_responder_replies_when_in_group_and_not_in_have(self):
+        # We are a group member; an asker in our group lacks us -> we reply.
+        me = _new_identity('captain', '10.0.0.10')
+        asker = _new_identity('coord', '10.0.0.3')
+        grp = _group_of_size(me, [asker])
+        proc = _build_process(me, grp)
+        queues = _build_queues()
+
+        proc.handle_identity_query(queues, self._id_query(grp.uuid, [asker.uuid]))
+
+        resp = [m for m in queues[CfgIds.network].items
+                if m.function == IdentityProtocol.id_response]
+        assert len(resp) == 1
+
+    def test_responder_silent_for_other_group(self):
+        me = _new_identity('captain', '10.0.0.10')
+        grp = _group_of_size(me, [])
+        proc = _build_process(me, grp)
+        queues = _build_queues()
+
+        # Query naming a DIFFERENT group uuid -> no reply.
+        proc.handle_identity_query(queues, self._id_query(uuid_mod.uuid4(), []))
+
+        assert not [m for m in queues[CfgIds.network].items
+                    if m.function == IdentityProtocol.id_response]
+
+    def test_response_backfills_group_member(self):
+        me = _new_identity('coord', '10.0.0.3')
+        member = _new_identity('captain', '10.0.0.10')
+        grp = _group_of_size(me, [member])  # member.address is in the group
+        proc = _build_process(me, grp, Peers())  # but we lack its identity
+        proc._record_peers = MagicMock()  # isolate from file I/O / main-put
+        queues = _build_queues()
+
+        proc.handle_identity_response(queues, self._id_response(member))
+
+        assert proc.peers.find_by_uuid(member.uuid) is not None
+        proc._record_peers.assert_called()  # propagates to main proc
+
+    def test_response_rejects_non_group_address(self):
+        me = _new_identity('coord', '10.0.0.3')
+        grp = _group_of_size(me, [])  # group is just us
+        stranger = _new_identity('stranger', '10.0.0.99')  # not in group
+        proc = _build_process(me, grp, Peers())
+        proc._record_peers = MagicMock()
+        queues = _build_queues()
+
+        proc.handle_identity_response(queues, self._id_response(stranger))
+
+        assert proc.peers.find_by_uuid(stranger.uuid) is None
+        proc._record_peers.assert_not_called()
