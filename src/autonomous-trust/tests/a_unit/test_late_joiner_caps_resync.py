@@ -142,6 +142,40 @@ def test_peer_with_any_cap_is_skipped():
     assert _target_uuid(queried[0]) == str(b.uuid)
 
 
+def test_record_peers_reliably_puts_to_main():
+    # Regression (dod-coordinator-partition-nonconvergence.md layer 3):
+    # _remember_activity's update() fan-put uses the 10ms q_cadence timeout
+    # and silently DROPS the Peers broadcast under main-proc queue contention
+    # (the dod_mission coordinator drowning in rep_resp traffic), so the main
+    # proc's self.peers stayed at 1 while group membership grew -> consensus
+    # reputations could never be named -> dashboard stuck "forming…".
+    # _record_peers now does a reliable 1s-timeout put of self.peers to the
+    # main queue, mirroring handle_caps_response's peer_capabilities fix.
+    me = _new_identity('coord', '10.0.0.1')
+    a = _new_identity('alice', '10.0.0.2')
+    peers = Peers()
+    peers.add(a)
+    proc = _build_process(me, peers)
+    # Isolate the new explicit main-put from _remember_activity's file I/O.
+    proc._remember_activity = lambda *args, **kwargs: None
+    queues = {CfgIds.network: _FakeQueue(), CfgIds.main: _FakeQueue()}
+
+    proc._record_peers(queues)
+
+    main_puts = [m for m in queues[CfgIds.main].items if isinstance(m, Peers)]
+    assert len(main_puts) == 1
+    assert main_puts[0] is proc.peers
+
+
+def test_record_peers_without_main_queue_is_safe():
+    # A process whose queue map omits CfgIds.main must not raise.
+    me = _new_identity('coord', '10.0.0.1')
+    proc = _build_process(me, Peers())
+    proc._remember_activity = lambda *args, **kwargs: None
+    queues = {CfgIds.network: _FakeQueue()}
+    proc._record_peers(queues)  # no CfgIds.main -> no-op, no raise
+
+
 def test_converged_group_emits_nothing():
     me = _new_identity('coord', '10.0.0.1')
     a = _new_identity('alice', '10.0.0.2')
