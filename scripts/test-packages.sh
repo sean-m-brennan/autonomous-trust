@@ -56,12 +56,15 @@ for pkg in autonomous-trust autonomous-trust-services autonomous-trust-inspector
         if $quick; then
           quick_flags="--ignore=tests/b_integration/test_two_node.py"
         fi
-        # Strip -q/--quick from passthrough args
+        # Forward extra args to pytest, but strip the flags this script
+        # consumes itself -- otherwise pytest sees e.g. --quick and errors with
+        # "unrecognized arguments".
         pass_args=()
         for arg in "$@"; do
-          if $quick; then
-            pass_args+=("$arg")
-          fi
+          case "$arg" in
+            --quick|-q|--verbose|-v) ;;  # consumed above; don't forward
+            *) pass_args+=("$arg") ;;
+          esac
         done
         if [[ "$pkg" = "autonomous-trust" ]]; then
           # Test both backends
