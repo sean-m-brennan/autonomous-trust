@@ -179,3 +179,51 @@ def test_monotonic_keeps_narrative_order_despite_inverted_data():
     out = resolve_narration(script, _recording())
     assert out[0].t_start == 300.0
     assert out[1].t_start >= out[0].t_start
+
+
+# --- live gates (advance_to ``gates``) ----------------------------------
+
+def _gated_script():
+    # A "jet arrives" beat that persists (t_end=None) until the gated
+    # "strike confirmed" beat opens, mirroring examples/dod_mission narration.
+    return [
+        NarrationBlock(t_start=360, t_end=None, text="arrives"),
+        NarrationBlock(t_start=380, t_end=420, text="strike",
+                       gate="jet_over_target"),
+    ]
+
+
+def test_gate_holds_block_until_satisfied_no_blank_gap():
+    ov = NarrationOverlay(_gated_script())
+    # Past the gated block's t_start but gate not yet satisfied: the prior
+    # beat persists (no blank overlay) rather than the strike showing early.
+    ov.advance_to(410, gates={"jet_over_target": False})
+    assert ov.current_block.text == "arrives"
+    # Gate satisfied -> the gated beat shows.
+    ov.advance_to(410, gates={"jet_over_target": True})
+    assert ov.current_block.text == "strike"
+
+
+def test_gate_t_start_is_still_an_earliest_floor():
+    ov = NarrationOverlay(_gated_script())
+    # Even with the gate open, the block can't show before its authored start.
+    ov.advance_to(370, gates={"jet_over_target": True})
+    assert ov.current_block.text == "arrives"
+
+
+def test_gates_none_ignores_gate_legacy_and_playback_safe():
+    # No caller gating (e.g. canned playback): a gated block is NOT suppressed
+    # — it shows by its (possibly anchor-re-timed) t_start, as before gates.
+    ov = NarrationOverlay(_gated_script())
+    ov.advance_to(390, gates=None)
+    assert ov.current_block.text == "strike"
+    ov.advance_to(390)  # default arg path
+    assert ov.current_block.text == "strike"
+
+
+def test_missing_gate_key_in_supplied_dict_is_unsatisfied():
+    # When a gates dict IS supplied but doesn't carry the block's key, the
+    # block is treated as not-yet-live (the caller is authoritative).
+    ov = NarrationOverlay(_gated_script())
+    ov.advance_to(410, gates={"some_other_gate": True})
+    assert ov.current_block.text == "arrives"

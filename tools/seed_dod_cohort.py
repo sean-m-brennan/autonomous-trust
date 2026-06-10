@@ -139,7 +139,18 @@ def _read_or_init_c_identity(ident_file: Path, peer_name: str, address: str,
     if ident_file.exists() and not force:
         with ident_file.open("r") as f:
             c_json = json.load(f)  # plain C JSON, NOT ConfigJSONEncoder
-        return c_json, public_identity_from_c_json(c_json)
+        if isinstance(c_json, dict) and "hex_seed" in c_json.get("signature", {}):
+            return c_json, public_identity_from_c_json(c_json)
+        # Format mismatch: a Python-format identity (ConfigJSONEncoder output,
+        # ``__type__``/``signature`` as a nested Configuration) sits on disk but
+        # this run treats the peer as a C node — i.e. ``--c-microdrones`` gained
+        # this peer since the prior seed. The Python schema can't be loaded by
+        # the C runtime, so regenerate a fresh C-format seed rather than KeyError
+        # on the missing ``hex_seed``. Fresh keys are fine: the cohort views are
+        # all rebuilt in this same seed run, so every peer still agrees.
+        print(f"  warning: {peer_name} has a Python-format identity on disk but "
+              f"is being seeded as a C node; regenerating a fresh C identity "
+              f"(drop --c-microdrones to keep it Python, or --force to silence).")
     return make_c_node_identity(peer_name, address)
 
 
@@ -153,7 +164,22 @@ def _read_or_init_identity(ident_file: Path, peer_name: str,
     """
     if ident_file.exists() and not force:
         with ident_file.open("r") as f:
-            return json.load(f, object_hook=config_json_decoder)
+            loaded = json.load(f, object_hook=config_json_decoder)
+        if isinstance(loaded, Identity):
+            return loaded
+        # Format mismatch: the file is a C-runtime identity (flat jansson
+        # schema, no ``__type__``), so the Python decoder handed back a plain
+        # dict. This run is seeding the peer as Python but a prior run seeded it
+        # as a C ``at_demo`` node (the ``--c-microdrones`` SPEC was dropped or
+        # changed). A C seed carries only public material in the wrong schema
+        # and can't be loaded as a Python identity, so regenerate a fresh Python
+        # keypair instead of letting the dict crash _peer_view_of() downstream.
+        # Fresh keys are fine: the whole cohort's views are rebuilt in this same
+        # seed run, so every peer still recognises every other.
+        print(f"  warning: {peer_name} has a C-format identity on disk but is "
+              f"being seeded as a Python peer; regenerating a fresh Python "
+              f"identity (pass --c-microdrones to keep it a C node, or --force "
+              f"to silence).")
     return Identity.initialize(
         my_name=f"{peer_name}@dod-demo",
         my_nickname=peer_name,
@@ -344,19 +370,35 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     return seeded
 
 
+def _microdrones_sorted(scenario):
+    """microdrone-* peer names ordered by numeric suffix (microdrone-2 <
+    microdrone-10) so a "first N" SPEC selects a stable, obvious prefix."""
+    return sorted((n for n in scenario.peers if n.startswith("microdrone-")),
+                  key=lambda n: int(n.rsplit("-", 1)[-1]))
+
+
 def _resolve_c_microdrones(scenario, raw):
     """Resolve which microdrones run the C at_demo node from a SPEC string.
-    unset/empty/"0"/"none"/"false" -> none; "1"/"all"/"true" -> every
-    microdrone-*; otherwise a comma-separated list of peer names. Kept in lock
-    step with generate_compose.parse_c_microdrones so seeding and compose agree
-    on the exact set (a mismatch cross-wires a peer's identity format)."""
+    Kept in LOCKSTEP with generate_compose.parse_c_microdrones so seeding and
+    compose agree on the exact set (a mismatch cross-wires a peer's identity
+    format). Grammar:
+
+      * unset/""/"0"/"none"/"false"  -> none
+      * "all"/"true"                 -> every microdrone-*
+      * a bare integer N             -> the first N microdrones (by numeric
+                                        suffix); N < total -> mixed Python+C.
+                                        "1" means "first 1", not "all".
+      * comma-separated peer names   -> exactly those peers
+    """
     if raw is None:
         raw = os.environ.get("AT_C_MICRODRONES", "")
     raw = raw.strip()
     if raw in ("", "0", "none", "false"):
         return frozenset()
-    if raw in ("1", "all", "true"):
-        return frozenset(n for n in scenario.peers if n.startswith("microdrone-"))
+    if raw in ("all", "true"):
+        return frozenset(_microdrones_sorted(scenario))
+    if raw.isdigit():
+        return frozenset(_microdrones_sorted(scenario)[:int(raw)])
     return frozenset(n.strip() for n in raw.split(",") if n.strip())
 
 
@@ -381,11 +423,13 @@ def main(argv=None) -> int:
                    const="all", default=None,
                    help="Seed microdrone-* peers as C at_demo nodes (C-format "
                         "identity; they cold-join for the group key). SPEC is "
-                        "'all' (the default when the flag is given bare), a "
-                        "comma-separated list of peer names, or unset. MUST match "
-                        "the SPEC passed to generate_compose.py --c-microdrones, "
-                        "else a peer gets a C-format identity but runs as Python "
-                        "(or vice-versa) and fails to load its own identity.")
+                        "'all' (the default when the flag is given bare), a bare "
+                        "integer N for the first N microdrones (N < total -> a "
+                        "mixed Python+C swarm), a comma-separated list of peer "
+                        "names, or unset. MUST match the SPEC passed to "
+                        "generate_compose.py --c-microdrones, else a peer gets a "
+                        "C-format identity but runs as Python (or vice-versa) "
+                        "and fails to load its own identity.")
     args = p.parse_args(argv)
 
     scenario = DoDMissionScenario(
