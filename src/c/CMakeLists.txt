@@ -339,6 +339,16 @@ if(LIBCHECK_LIBRARY)
 else()
     message(WARNING "Testing dependency libcheck not found. Tests will not be built.")
 endif()
+# subunit is only required when libcheck is STATICALLY linked (its TAP output
+# backend); a shared libcheck.so resolves it internally. Link it only if present
+# so builds against a conda/shared libcheck (no separate subunit pkg) don't fail
+# with "cannot find -lsubunit".
+find_library(LIBSUBUNIT_LIBRARY NAMES subunit libsubunit.so libsubunit.a HINTS ${CONDA_ROOT})
+if(NOT LIBSUBUNIT_LIBRARY)
+    # find_library yields <VAR>-NOTFOUND when missing; blank it so it drops out
+    # of target_link_libraries cleanly rather than becoming a bogus link item.
+    set(LIBSUBUNIT_LIBRARY "")
+endif()
 
 # OpenSSL (required only when AT_ZTA is ON)
 if(AT_ZTA)
@@ -707,8 +717,24 @@ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/version.h)
     else()
         find_package(Git)
         if (GIT_FOUND AND EXISTS "${top_src_dir}/.git")
-            execute_process(COMMAND ${GIT_EXECUTABLE} describe HEAD OUTPUT_VARIABLE TAG OUTPUT_STRIP_TRAILING_WHITESPACE)
-            string(REGEX REPLACE "^v" "" VERSION ${TAG})
+            # `git describe` needs a reachable tag; a shallow/tagless checkout
+            # (e.g. actions/checkout, which fetches no tags by default) makes it
+            # fail with "No names found". Tolerate that: fall back to a short
+            # commit hash, then "unknown", and always quote "${TAG}" so the
+            # string(REGEX ...) below keeps its input argument when TAG is empty.
+            execute_process(COMMAND ${GIT_EXECUTABLE} describe HEAD
+                            OUTPUT_VARIABLE TAG OUTPUT_STRIP_TRAILING_WHITESPACE
+                            ERROR_QUIET RESULT_VARIABLE _git_describe_rc)
+            if(NOT _git_describe_rc EQUAL 0 OR TAG STREQUAL "")
+                execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+                                OUTPUT_VARIABLE TAG OUTPUT_STRIP_TRAILING_WHITESPACE
+                                ERROR_QUIET RESULT_VARIABLE _git_rev_rc)
+                if(NOT _git_rev_rc EQUAL 0 OR TAG STREQUAL "")
+                    set(TAG "unknown")
+                endif()
+                message("-- git describe unavailable (no reachable tag); version = ${TAG}")
+            endif()
+            string(REGEX REPLACE "^v" "" VERSION "${TAG}")
             set(REVISION ${VERSION} CACHE STRING "git tag" FORCE)
         else()
             message(WARNING "Git not found, cannot set version info")
@@ -1041,7 +1067,7 @@ target_link_libraries(jcs_test PRIVATE
     at_ryu
     ${LIBJANSSON_LIBRARY}
     ${LIBCHECK_LIBRARY}
-    subunit
+    ${LIBSUBUNIT_LIBRARY}  # empty (and skipped) unless a subunit lib was found
     m
     pthread
     rt

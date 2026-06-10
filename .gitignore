@@ -174,3 +174,5 @@ embedded/signing.pub
 # (run-demo.sh --variant=dod-mission --record-to FILE; default compose host dir).
 /examples/dod_mission/deploy/recording/
 /dod-demo.json
+
+/src/autonomous-trust/core*

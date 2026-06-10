@@ -25,6 +25,14 @@ dependencies:
   - nodejs
   - clang
   - clangxx
+  # libstdc++ for clang++. The bare `clangxx` package ships no C++ stdlib, and
+  # the --sysroot only covers C headers, so the protobuf C++ TU
+  # (protobuf_shutdown.cpp) fails with "'climits' not found". gxx_linux-64
+  # installs the full conda GCC toolchain (headers + libstdc++) at the canonical
+  # location clang++ auto-detects. CXX stays forced to clang++ (ci-local /
+  # conformance.yml export it), so this only supplies the libstdc++ clang++
+  # links against -- it does NOT switch the compiler to g++.
+  - gxx_linux-64
   - lld
   - git
   - lcov
