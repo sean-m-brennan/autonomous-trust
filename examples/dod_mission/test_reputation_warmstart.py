@@ -102,16 +102,31 @@ def test_consumer_only_soldier_is_warm_started():
         assert rw.is_warm_start_member(name, join_phase=0, kind="soldier")
 
 
-def test_data_producing_microdrone_is_not_warm_started():
-    # Microdrones earn real, rising consensus from scored ISR — never seeded.
-    assert not rw.is_warm_start_member("microdrone-3", join_phase=0,
-                                       kind="microdrone")
+def test_data_producing_microdrone_is_warm_started():
+    # Microdrones are seeded in the persistent cohort (~0.7), but their earned
+    # build-up does not reliably surface via the coordinator's consensus query
+    # (data-light / group-churn-prone, more so since C-node interop widened the
+    # field cohort), so without warm-start they read "forming…" indefinitely. A
+    # real rising score still overrides the prior the moment one lands
+    # (reconcile_rep_score), so the trust-dynamics build-up is unaffected when
+    # it does surface. (Changed from "not warm-started" by the C-interop work;
+    # see is_warm_start_member and coordinator._reputations_view.)
+    assert rw.is_warm_start_member("microdrone-3", join_phase=0,
+                                   kind="microdrone")
 
 
-def test_non_pretrusted_peers_never_warm_started():
-    # Command gateway + leave-behind sensors cold-bootstrap regardless of kind.
-    assert not rw.is_warm_start_member("command", join_phase=0,
-                                       kind="command-node")
+def test_command_and_coordinator_infra_are_warm_started():
+    # Infrastructure: the command gateway and the coordinator's own AT node are
+    # not field sensors that earn bilateral consensus, so they read trusted
+    # from t=0 rather than sitting at a permanent cold-start 0.5.
+    assert rw.is_warm_start_member("command", join_phase=0,
+                                   kind="command-node")
+    assert rw.is_warm_start_member("coordinator", join_phase=0,
+                                   kind="coordinator")
+
+
+def test_non_pretrusted_field_peers_never_warm_started():
+    # Leave-behind sensors cold-bootstrap regardless of kind.
     assert not rw.is_warm_start_member("sensor-1", join_phase=2,
                                        kind="ground-sensor")
     # Even a (hypothetical) soldier-kind peer that isn't on the pre-trusted

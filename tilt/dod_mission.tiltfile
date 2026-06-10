@@ -36,6 +36,14 @@ compromise_mode = os.getenv("_TILT_COMPROMISE_MODE", "abrupt")
 # step entirely so peers cold-bootstrap (useful for testing the
 # handshake/Sybil-rejection flow without warm-start).
 preseed = os.getenv("AT_PRESEED", "1")
+# Embedded-C microdrones (Stretch Goal 3, Path B). SPEC threaded from
+# run-demo.sh (--c-microdrones) via _TILT_C_MICRODRONES: "" => all-Python
+# (back-compat); "all"/integer-N/comma-list otherwise. When set, the named
+# microdrones are emitted as C at_demo + flight-stub Pods (generate_k8s),
+# seeded with C-format identities (seed_dod_cohort), and the autonomous-trust-c
+# image is built below. The SPEC must be identical on the seed + manifest sides
+# (generate_compose.parse_c_microdrones resolves both), so they share one knob.
+c_microdrones = os.getenv("_TILT_C_MICRODRONES", "")
 
 # Run against whatever k8s context the user has selected. minikube,
 # kind, k3d, etc. all work — the manifests are NodePort-based with no
@@ -84,6 +92,11 @@ _k8s_gen_args = [
 ]
 if preseed == "1":
     _k8s_gen_args.append("--seed-root " + seed_root)
+if c_microdrones != "":
+    # C node Pods + the C image ref the manifests should carry (Tilt rewrites
+    # the :dev tag to its own build below). Kept in lockstep with the seed SPEC.
+    _k8s_gen_args.append("--c-microdrones " + c_microdrones)
+    _k8s_gen_args.append("--c-image autonomous-trust-c")
 _k8s_gen_cmd = " ".join(_k8s_gen_args)
 
 # Seed generator runs before manifest generation so the per-peer CMs
@@ -92,7 +105,7 @@ _k8s_gen_cmd = " ".join(_k8s_gen_args)
 # identities so the keys agreed between peers stay valid). Pass --force
 # at the env-var level (AT_PRESEED_FORCE=1) to regenerate identities.
 _seed_force = "--force" if os.getenv("AT_PRESEED_FORCE") == "1" else ""
-_seed_cmd = " ".join([
+_seed_args = [
     "PYTHONPATH=" + _at_src,
     "python3 -m tools.seed_dod_cohort",
     "--out " + seed_root,
@@ -100,7 +113,12 @@ _seed_cmd = " ".join([
     "--sensor-count " + sensor_count,
     "--hacked-sensors " + hacked_sensors,
     _seed_force,
-]).strip()
+]
+if c_microdrones != "":
+    # Same SPEC as the manifest side: a peer seeded C-format MUST be emitted as
+    # a C Pod (and vice-versa), else it can't load its own identity.
+    _seed_args.append("--c-microdrones " + c_microdrones)
+_seed_cmd = " ".join(_seed_args).strip()
 if preseed != "1":
     _seed_cmd = "echo 'AT_PRESEED=0: skipping cohort seed'"
 # Simulator scenario is JSON (despite the .yaml extension) and gets
@@ -130,6 +148,8 @@ local_resource(
     cmd=_gen_cmd,
     deps=[
         repo_root + "/examples/dod_mission/deploy/generate_k8s.py",
+        # generate_k8s imports parse_c_microdrones from here; seed uses its twin.
+        repo_root + "/examples/dod_mission/deploy/generate_compose.py",
         repo_root + "/examples/dod_mission/simulator/generate_scenario.py",
         repo_root + "/examples/dod_mission/scenario.py",
         repo_root + "/tools/seed_dod_cohort.py",
@@ -212,6 +232,20 @@ docker_build(
     network="host",
     build_args=build_args,
 )
+
+# Embedded C at_demo image — only built when --c-microdrones names at least one
+# microdrone. Standalone build (Dockerfile-c is FROM debian, not BASE_IMAGE),
+# so it needs network for apt, hence network="host" like the chain above. Tilt
+# rewrites the autonomous-trust-c:dev ref in the C-microdrone Pods to this
+# build and gates those pods on it. The Python-only default never builds it.
+if c_microdrones != "":
+    docker_build(
+        "autonomous-trust-c",
+        repo_root,
+        dockerfile=repo_root + "/src/autonomous-trust/Dockerfile-c",
+        network="host",
+        build_args=build_args,
+    )
 
 # --- K8s manifests --------------------------------------------------------
 # Order matters for first-time apply: namespace before the rest. Tilt
