@@ -22,6 +22,21 @@ cd -- "$(dirname -- "$0")/.." || exit 1
 
 SIM_PKG=src/autonomous-trust-simulator
 
+usage() {
+  cat <<'EOF'
+Usage: test-sim-pkg.sh [OPTIONS]
+
+Run the simulator package integration tests.
+
+Options:
+  --python      Use the Python backend (default).
+  --native      Use the native backend.
+  --clean       Prune before running.
+  --verbose     Verbose test output.
+  -h, --help    Show this help message and exit.
+EOF
+}
+
 backend=python
 verbose=
 prune=false
@@ -43,6 +58,10 @@ while [[ $# -gt 0 ]]; do
         --verbose)
             verbose="-v"
             shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
             ;;
         *)
             echo "Unknown option: $1" >&2

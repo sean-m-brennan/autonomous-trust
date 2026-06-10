@@ -22,6 +22,20 @@
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
 
+usage() {
+  cat <<'EOF'
+Usage: test-c-exe.sh [OPTIONS]
+
+Build and run the C test suites (mirrors test-packages.sh for the C library).
+
+Options:
+  -v, --verbose     Verbose test output.
+  -c, --coverage    Build with coverage instrumentation and report.
+  --filter=PATTERN  Only run tests matching PATTERN.
+  -h, --help        Show this help message and exit.
+EOF
+}
+
 status=0
 c_dir="$here/src/c"
 build_dir="$c_dir/build"
@@ -34,6 +48,7 @@ for arg in "$@"; do
         --verbose|-v) verbose=1 ;;
         --coverage|-c) coverage=1 ;;
         --filter=*)   filter="${arg#--filter=}" ;;
+        --help|-h)    usage; exit 0 ;;
     esac
 done
 

@@ -21,6 +21,25 @@
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
 
+usage() {
+  cat <<'EOF'
+Usage: build-native.sh [-h|--help]
+
+Build the native C library (with the AT_ZTA=ON Zero Trust integration) into
+src/c/build.
+
+Requires the 'autonomous_trust' conda environment to be active (run
+'conda activate autonomous_trust'), which supplies OpenSSL and the toolchain.
+
+Options:
+  -h, --help    Show this help message and exit.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
 if [[ "${CONDA_DEFAULT_ENV:-}" != "autonomous_trust" ]]; then
   echo "ERROR: conda environment 'autonomous_trust' is not active." >&2
   echo "  Run: conda activate autonomous_trust" >&2
