@@ -35,6 +35,10 @@ message Identity {
   bytes zta_credential_hash = 6;   // SHA-256 of ZTA credential at admission
   string zta_issuer = 7;           // Credential issuer identifier
   bytes zta_credential = 8;        // Raw credential for peer verification
+  // nickname/petname are Zooko LOCAL names — intentionally never populated by
+  // either runtime (identity.c sync_out / identity.py sync_to_message leave
+  // them unset, so proto3 omits them). Kept reserved here for field-number
+  // stability; do NOT start serializing them.
   string nickname = 9;
   string petname = 10;
   uint32 rank = 11;                // Voter rank for AgreementByAuthority;

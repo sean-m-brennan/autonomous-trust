@@ -18,6 +18,7 @@ import re
 import ipaddress
 import psutil
 import socket
+import shutil
 import subprocess
 
 from ..config import InitializableConfig
@@ -58,7 +59,17 @@ class Network(InitializableConfig):
 
     @classmethod
     def _get_default_device(cls):
-        route = subprocess.check_output(['/sbin/ip', 'route']).decode().split('\n')[0]
+        # Prefer the canonical /sbin (or /usr/sbin) ip; fall back to any `ip`
+        # on PATH. If iproute2 isn't present at all (e.g. a minimal CI/build
+        # container), return '' so get_addresses falls back to its 'eth0'
+        # default instead of crashing with FileNotFoundError.
+        ip_bin = shutil.which('ip', path='/sbin:/usr/sbin') or shutil.which('ip')
+        if ip_bin is None:
+            return ''
+        try:
+            route = subprocess.check_output([ip_bin, 'route']).decode().split('\n')[0]
+        except (OSError, subprocess.CalledProcessError):
+            return ''
         if 'default' in route:
             return route.split()[4]
         return route.split()[2]

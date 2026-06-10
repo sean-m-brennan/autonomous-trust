@@ -37,6 +37,10 @@ fi
 if [ -z "$CC" ] && command -v clang >/dev/null 2>&1; then
   export CC=clang CXX=clang++
 fi
-cmake -S . -B build
+# AT_ZTA=ON: build the Zero Trust credential integration so the native lib's
+# public_identity_t carries the zta_credential_* fields (matches the CFFI cdef
+# in core/_native/_ffi.py and the AT_ZTA=ON conformance build). Requires
+# OpenSSL, which the conda env (required above) provides.
+cmake -S . -B build -DAT_ZTA=ON
 cd build || exit 1
 make -j1
