@@ -239,8 +239,9 @@ def public_identity_to_canonical(identity):
         'uuid': str(identity.uuid),
         'address': getattr(identity, 'address', '') or '',
         'fullname': getattr(identity, 'fullname', '') or '',
-        'nickname': getattr(identity, 'nickname', '') or '',
-        'petname': getattr(identity, 'petname', '') or '',
+        # nickname/petname are Zooko local names -- never serialized (omitted
+        # here to match C public_identity_to_json so the canonical form stays
+        # byte-identical cross-runtime).
         'signature': {'hex_seed': identity.signature.publish().decode('ascii')},
         'encryptor': {'hex_seed': identity.encryptor.publish().decode('ascii')},
     }
@@ -259,8 +260,10 @@ def public_identity_from_canonical(d):
             return None
         sig = Signature(sig_hex.encode('ascii'), public_only=True)
         enc = Encryptor(enc_hex.encode('ascii'), public_only=True)
+        # nickname/petname intentionally NOT read from the wire form: they are
+        # local-only Zooko names. A receiver assigns its own petname locally.
         return Identity(d['uuid'], d.get('address', '') or '',
-                        d.get('fullname', '') or '', d.get('nickname', '') or '',
-                        sig, enc, d.get('petname', '') or '')
+                        d.get('fullname', '') or '', '',
+                        sig, enc, '')
     except (ValueError, TypeError, RuntimeError, KeyError):
         return None

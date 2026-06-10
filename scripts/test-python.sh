@@ -21,6 +21,25 @@
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
 
+usage() {
+  cat <<'EOF'
+Usage: test-python.sh [pytest args...] [-h|--help]
+
+Run only the pure-Python test suites (AUTONOMOUS_TRUST_BACKEND=python) for
+every autonomous-trust package via each package's run-tests.sh. The two-node
+integration test is ignored by default.
+
+Any extra arguments are forwarded to run-tests.sh / pytest.
+
+Options:
+  -h, --help    Show this help message and exit.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
 export AUTONOMOUS_TRUST_BACKEND=python
 
 extra_args="--ignore=tests/b_integration/test_two_node.py"

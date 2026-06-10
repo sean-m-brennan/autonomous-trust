@@ -21,6 +21,21 @@
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
 
+usage() {
+  cat <<'EOF'
+Usage: test-packages.sh [OPTIONS] [pytest args...]
+
+Build the C library, then run the Python test suites for each autonomous-trust
+package. Extra arguments are forwarded to pytest (the flags consumed here are
+stripped before forwarding).
+
+Options:
+  -q, --quick     Skip the two-node integration test.
+  -v, --verbose   Verbose build and test output.
+  -h, --help      Show this help message and exit.
+EOF
+}
+
 status=0
 quick=false
 verbose=false
@@ -28,6 +43,7 @@ for arg in "$@"; do
     case "$arg" in
         --quick|-q) quick=true ;;
         --verbose|-v) verbose=true ;;
+        --help|-h) usage; exit 0 ;;
     esac
 done
 

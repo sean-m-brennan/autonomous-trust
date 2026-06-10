@@ -44,6 +44,10 @@
 
 set -euo pipefail
 
+# Absolute path to this script, resolved before the cd below so --help can
+# read its own header regardless of the caller's working directory.
+self="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here"
 
@@ -89,7 +93,7 @@ while (( $# )); do
         --speed)           SPEED="$2";          shift 2;;
         --speed=*)         SPEED="${1#*=}";     shift;;
         -h|--help)
-            sed -n '8,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '8,46p' "$self" | sed 's/^# \{0,1\}//'
             exit 0;;
         -*)                PASSTHRU+=("$1");    shift;;   # forward unknown flags
         *)                 RECORDING="$1"; GOT_FILE=1; shift;;

@@ -372,7 +372,28 @@ check_docker() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+usage() {
+    cat <<'EOF'
+Usage: setup-dev.sh [OPTIONS]
+
+Set up the autonomous-trust development environment: install miniforge
+(conda-forge only), create the conda environment, install the Rust toolchain
+and Frama-C inside it, and verify Docker.
+
+Options:
+  --update      Update the existing conda environment instead of full setup.
+  -h, --help    Show this help message and exit.
+EOF
+}
+
 main() {
+    case "${1:-}" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+    esac
+
     if [[ "${1:-}" == "--update" ]]; then
         update_conda_env
         exit 0

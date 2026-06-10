@@ -34,6 +34,25 @@ set -euo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
+usage() {
+  cat <<'EOF'
+Usage: test-conformance.sh [OPTIONS] [pytest args...]
+
+Run the AutonomousTrust conformance corpus. By default runs the Python harness,
+the C harness, and a cross-language diff.
+
+Options:
+  --c                 C harness only (skip Python).
+  --python            Python harness only (skip C).
+  --strict-coverage   Also fail on coverage gaps.
+  -h, --help          Show this help message and exit.
+
+All non-flag arguments are forwarded to pytest. Flags consumed by this script
+must come before any pytest args; use '--' to force everything after it to
+pytest.
+EOF
+}
+
 run_c=1
 c_only=0
 strict_coverage=0
@@ -41,6 +60,10 @@ pytest_args=()
 
 while (("$#")); do
   case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
     --c)
       run_c=1
       c_only=1

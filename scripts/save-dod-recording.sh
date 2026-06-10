@@ -33,6 +33,34 @@ cd "$here"
 log() { printf '[save-dod-recording] %s\n' "$*"; }
 err() { printf '[save-dod-recording] ERROR: %s\n' "$*" >&2; }
 
+usage() {
+  cat <<'EOF'
+Usage: save-dod-recording.sh [OUTPUT.json] [-h|--help]
+
+Pull the DoD squad-infiltration demo recording out of the minikube node and
+write it to a local JSON file you can replay with play-dod-mission.sh.
+
+Arguments:
+  OUTPUT.json   Local destination (default: dod-demo.json).
+
+Environment:
+  REMOTE_RECORDING  Path inside the node
+                    (default: /data/dod-mission-recording/demo.json).
+
+Options:
+  -h, --help    Show this help message and exit.
+
+Examples:
+  scripts/save-dod-recording.sh                 # -> dod-demo.json
+  scripts/save-dod-recording.sh demo.json
+  REMOTE_RECORDING=/data/other/rec.json scripts/save-dod-recording.sh out.json
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
 OUTPUT="${1:-dod-demo.json}"
 REMOTE_RECORDING="${REMOTE_RECORDING:-/data/dod-mission-recording/demo.json}"
 

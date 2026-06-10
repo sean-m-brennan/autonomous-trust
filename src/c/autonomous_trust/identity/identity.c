@@ -191,8 +191,9 @@ int public_identity_to_json(const public_identity_t *p, json_t **obj_ptr)
     json_object_set_new(obj, "uuid", json_string(uuid_str));
     json_object_set_new(obj, "address", json_string((const char *)p->address));
     json_object_set_new(obj, "fullname", json_string(p->fullname));
-    json_object_set_new(obj, "nickname", json_string(p->nickname));
-    json_object_set_new(obj, "petname", json_string(p->petname));
+    /* nickname/petname are Zooko local names: never emitted on the wire. Must
+       match Python public_identity_to_canonical (identity.py), which also omits
+       them, so the cross-runtime canonical form stays byte-identical. */
 
     json_t *sig = json_object();
     if (sig == NULL) return ENOMEM;
@@ -223,10 +224,11 @@ int public_identity_from_json(const json_t *obj, public_identity_t *p)
         strncpy(p->address, s, ADDR_LEN);
     if ((s = json_string_value(json_object_get(obj, "fullname"))) != NULL)
         strncpy(p->fullname, s, NAME_LEN);
-    if ((s = json_string_value(json_object_get(obj, "nickname"))) != NULL)
-        strncpy(p->nickname, s, NAME_LEN);
-    if ((s = json_string_value(json_object_get(obj, "petname"))) != NULL)
-        strncpy(p->petname, s, NAME_LEN);
+    /* nickname/petname are local-only; never imported from the wire form.
+       Clear them (mirrors Python from_canonical) rather than reading any
+       legacy/crafted keys. A receiver assigns its own petname locally. */
+    p->nickname[0] = '\0';
+    p->petname[0] = '\0';
 
     const char *sig_hex = json_string_value(
         json_object_get(json_object_get(obj, "signature"), "hex_seed"));

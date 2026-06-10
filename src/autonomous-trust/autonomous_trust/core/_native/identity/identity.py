@@ -25,7 +25,14 @@ from .sign import NativeSignature
 from .encrypt import NativeEncryptor
 
 # Re-export Python Identity for full API compatibility
-from ..._python.identity.identity import Identity  # noqa: F401
+from ..._python.identity.identity import (  # noqa: F401
+    Identity,
+    # Backend-agnostic canonical helpers (operate on the public Identity
+    # interface); re-exported so `core.identity.identity` resolves them on the
+    # native backend too.
+    public_identity_to_canonical,
+    public_identity_from_canonical,
+)
 
 # libsodium constants
 _CRYPTO_SIGN_BYTES = 64
