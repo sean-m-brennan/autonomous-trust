@@ -1,0 +1,76 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: identity-resync-backfill
+byte_pinning: false
+description: |
+    Identity-resync backfill — the cold/late-joiner identity-loss
+    recovery (doc/architecture/partition-recovery.md layer 3; the C mirror
+    lives in src/c/.../id_proc.c, the Python in idprocess.py).
+
+    A node that adopted a group via the merge/partition path holds the
+    members' ADDRESSES (group.address_map) but not their full Identities
+    (its peers[] stays sparse — only the welcomer's bundled identities ever
+    arrived). Without the Identity it cannot name that member's consensus
+    reputation. The fix: it broadcasts a `peer_identity_query` advertising
+    {group_uuid, have:[uuids it holds]}; a same-group member not in that
+    have-list answers with a `peer_identity_response` carrying its
+    published identity, which the asker adds to peers[] (gated to addresses
+    already in its group, so a stray broadcaster can't inject itself).
+
+    Setup (`fixtures.shared_group`): coord and member share ONE group —
+    both addresses are in each one's address_map — but neither holds the
+    other in peers[] (no cross-population). That is the sparse-peers
+    precondition: coord knows member's address but not its Identity.
+
+    Sequence (one round trip, mirroring peer-caps-exchange):
+      1. coord queries the group for the identities it lacks
+         (peer_identity_query, have: []). member's handle_identity_query
+         sees coord's group uuid == its own and itself absent from the
+         have-list, so it replies with a peer_identity_response carrying
+         member.publish() + member.address.
+      2. member's response is delivered to coord. coord's
+         handle_identity_response confirms member.address is in its group
+         address_map and adds member to peers[].
+
+    `peer_count: 1` on coord asserts the backfill landed — coord's peer set
+    went from empty (sparse) to holding the one previously-missing member.
+    Both impls record the same count.
+
+participants:
+  - id: coord
+    role: group_member
+  - id: member
+    role: group_member
+
+fixtures:
+  shared_group:
+    uuid: "0c000000-0000-4000-8000-000000000003"
+
+steps:
+  - id: 1
+    from: coord
+    to: member
+    function: peer_identity_query
+    payload:
+      have: []
+    description: |
+        coord asks the group for the member identities it is missing
+        (it holds the addresses but not the Identities). member's
+        handle_identity_query replies with a peer_identity_response
+        carrying its published identity + address.
+
+  - id: 2
+    from: member
+    to: coord
+    function: peer_identity_response
+    in_response_to: 1
+    payload: {}
+    description: |
+        member's peer_identity_response delivered to coord.
+        handle_identity_response verifies member's address is a known
+        group address and backfills member into coord's peers[].
+
+expected_state:
+  coord:
+    peer_count: 1

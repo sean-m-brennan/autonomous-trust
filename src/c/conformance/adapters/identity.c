@@ -375,6 +375,40 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
         }
     }
 
+    /* shared_group: { "uuid": "<str>" } — identity-resync scenarios. ONE
+     * group shared by every participant (each member's uuid:address in the
+     * address_map) assigned to all, with peers NOT cross-populated. That is
+     * the cold/late-joiner precondition handle_identity_response backfills:
+     * each node knows the others' addresses but not their Identities. The
+     * uuid is pinned to match the Python harness (the resync query/response
+     * gate on group uuid). Mirrors the Python adapter's shared_group_obj. */
+    json_t *shared = json_object_get(fixtures, "shared_group");
+    if (json_is_object(shared))
+    {
+        const char *guuid_str =
+            json_string_value(json_object_get(shared, "uuid"));
+        uuid_t guuid;
+        bool have_uuid = (guuid_str != NULL && uuid_parse(guuid_str, guuid) == 0);
+        for (size_t i = 0; i < ctx->participant_count; i++) {
+            ic_impl_t *impl = (ic_impl_t *)ctx->participants[i].impl;
+            if (impl == NULL || impl->proc == NULL || impl->pub == NULL) continue;
+            char gaddr[ADDR_LEN + 1];
+            snprintf(gaddr, sizeof(gaddr), "239.8.0.1");
+            if (have_uuid)
+                group_init(&guuid, gaddr, &impl->proc->protocol.group);
+            else
+                group_init(NULL, gaddr, &impl->proc->protocol.group);
+            for (size_t j = 0; j < ctx->participant_count; j++) {
+                ic_impl_t *other = (ic_impl_t *)ctx->participants[j].impl;
+                if (other == NULL || other->pub == NULL) continue;
+                char u[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(other->pub->uuid, u);
+                group_add_address(&impl->proc->protocol.group, u,
+                                  other->pub->address);
+            }
+        }
+    }
+
     json_t *amnesia_j = json_object_get(fixtures, "amnesia_known");
     bool amnesia_known = json_is_true(amnesia_j);
 
@@ -622,6 +656,52 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             net_msg_pack_json(&out->info.net_msg, body);
             json_decref(body);
         }
+    }
+
+    /* peer_identity_query — identity-resync layer 3. {group_uuid,
+     * have:[uuids]}. group_uuid is the asker's group (== the responder's in
+     * a shared-group scenario); handle_identity_query gates on that match
+     * and on the asker's uuid being absent from the have-list. */
+    if (strcmp(function, "peer_identity_query") == 0) {
+        char guuid[UUID_STRING_LEN + 1] = {0};
+        uuid_unparse_lower(sender_impl->proc->protocol.group.uuid, guuid);
+        json_t *have = json_array();
+        if (json_is_object(payload)) {
+            json_t *h = json_object_get(payload, "have");
+            if (json_is_array(h)) {
+                size_t hn = json_array_size(h);
+                for (size_t i = 0; i < hn; i++) {
+                    json_t *v = json_array_get(h, i);
+                    if (json_is_string(v))
+                        json_array_append_new(have,
+                                              json_string(json_string_value(v)));
+                }
+            }
+        }
+        json_t *body = json_object();
+        json_object_set_new(body, "group_uuid", json_string(guuid));
+        json_object_set_new(body, "have", have);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+
+    /* peer_identity_response — the sender's published identity + address.
+     * handle_identity_response gates on from_address being a known group
+     * address, then adds the identity to peers[]. No signature: the
+     * handler does not verify one (the address-in-group gate is the
+     * trust anchor). */
+    if (strcmp(function, "peer_identity_response") == 0) {
+        json_t *from_id_json = NULL;
+        public_identity_to_json(sender_impl->pub, &from_id_json);
+        json_t *body = json_object();
+        if (from_id_json != NULL)
+            json_object_set_new(body, "from_identity", from_id_json);
+        json_object_set_new(body, "from_address",
+                            json_string(sender_impl->pub->address));
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
     }
 
     return 0;

@@ -59,8 +59,14 @@ GROUND_START   = (34.706505, -86.633657, 197.0)   # Squad insertion
 GROUND_MID     = (34.72352, -86.63792, 195.0)     # Target area (target building)
 RQ86_ORBIT     = (34.724448, -86.639802, 5000.0)  # Overhead orbit center
 MQ800_INGRESS  = (34.715000, -86.580000, 600.0)   # MQ-800 enters from the east
-JET_INGRESS    = (34.724448, -86.453789, 400.0)   # ~17 km east of target
-JET_EGRESS     = (34.724448, -86.825815, 400.0)   # mirror of ingress, ~17 km west
+# Jet ingress/egress endpoints. The LONGITUDES set the ~17 km east/west extents
+# of the pass; the LATITUDE here is only the off-map hold point (default
+# GROUND_MID[0]). The actual strike run is re-anchored to the TRUE TARGET's
+# latitude at strike time by _jet_waypoints (the target drifts south off the
+# squad's GROUND_MID hold), so the jet travels straight east-west through the
+# target rather than over the paused squad. See true_target_latlon.
+JET_INGRESS    = (GROUND_MID[0], -86.453789, 400.0)   # ~17 km east hold
+JET_EGRESS     = (GROUND_MID[0], -86.825815, 400.0)   # ~17 km west exit
 COMMAND_REMOTE = (33.518600, -86.810400, 200.0)   # ~135 km south (Birmingham AL)
 GROUND_EXFIL   = (34.699600, -86.668604, 198.0)   # Extraction point (SW of objective)
 
@@ -510,18 +516,82 @@ class DoDMissionScenario(Scenario):
         return max(JET_LAUNCH_SEC,
                    self._jet_anomaly_sec + JET_ANOMALY_HOLD_SEC)
 
+    def true_target_latlon(self, secs) -> tuple[float, float]:
+        """(lat, lon) of the true ISR target at scenario-second ``secs``.
+
+        The target is NOT the squad's hold point (GROUND_MID): it drifts slowly
+        away from it over the mission (generators/isr.py:_target_true_xy /
+        _TARGET_DRIFT), so by the strike the jet must aim where the target
+        actually IS, not where the squad paused. Tracks isr.py's target in the
+        squad-insertion local frame so the jet pass + FOV wedges align with the
+        ISR target markers the dashboard plots."""
+        # Lazy import: keep isr's generator deps out of scenario module load,
+        # and stay in lockstep with the single target model the ISR uses.
+        from examples.dod_mission.generators.isr import _target_true_xy
+        east_m, north_m = _target_true_xy(timedelta(seconds=secs))
+        return _offset_latlon(GROUND_START[0], GROUND_START[1], east_m, north_m)
+
     def _jet_waypoints(self, launch_sec):
         """Ingress→strike→egress waypoints anchored to ``launch_sec``,
         preserving the authored ingress-run and egress-run durations so a
         delayed launch still flies the same visual pass, just later (strike
-        = launch + ingress run)."""
+        = launch + ingress run).
+
+        The pass runs straight east-west at the TRUE TARGET's latitude at the
+        strike (the target drifts south off the squad's GROUND_MID hold over a
+        long run), passing through the target — not the static squad-hold
+        latitude. JET_INGRESS/EGRESS supply only the ~17 km east/west extents."""
         strike_sec = launch_sec + _JET_INGRESS_RUN_SEC
+        tgt_lat, tgt_lon = self.true_target_latlon(strike_sec)
+        ingress = (tgt_lat, JET_INGRESS[1], JET_INGRESS[2])   # off-map east, target lat
+        strike = (tgt_lat, tgt_lon, GROUND_MID[2])            # over the drifting target
+        egress = (tgt_lat, JET_EGRESS[1], JET_EGRESS[2])      # off-map west, target lat
         return [
-            (0.0, JET_INGRESS),                          # parked off-map
-            (launch_sec, JET_INGRESS),                   # launch — begin ingress
-            (strike_sec, GROUND_MID),                    # pass over objective
-            (strike_sec + _JET_EGRESS_RUN_SEC, JET_EGRESS),  # egress west
+            (0.0, ingress),                                  # parked off-map
+            (launch_sec, ingress),                           # launch — begin ingress
+            (strike_sec, strike),                            # pass over the target
+            (strike_sec + _JET_EGRESS_RUN_SEC, egress),      # egress west
         ]
+
+    def jet_launched(self, secs) -> bool:
+        """True once the fighter jet has begun its ingress run (left the
+        off-map hold) at ``secs`` — i.e. it has actually checked into the net.
+
+        Unlike ``peer_arrived`` (which exempts the jet, returning True from
+        t=0 because its position model self-hides it off-map), this tracks the
+        jet's dynamic, anomaly-gated launch so consumers that need its real
+        presence — e.g. the dashboard reputation row — show it when it arrives
+        rather than from the start of the run."""
+        launch = self._jet_launch_time(secs)
+        return launch is not None and secs >= launch
+
+    def jet_over_objective(self, secs) -> bool:
+        """True once the jet has reached its high-speed pass over the
+        objective (GROUND_MID) at ``secs``.
+
+        The launch is gated on the MQ-800 rogue actually being exposed, so the
+        strike time floats run-to-run (strike = launch + the fixed ingress
+        run). The 'Strike confirmed' narration gates on THIS rather than a
+        fixed wall-clock so it never fires before the jet is over the target.
+        Stays True through egress (one-way latch within a run)."""
+        launch = self._jet_launch_time(secs)
+        return launch is not None and secs >= launch + _JET_INGRESS_RUN_SEC
+
+    def peer_reputation_visible(self, name, secs) -> bool:
+        """Whether ``name`` should appear in the dashboard reputation panel at
+        scenario-second ``secs``.
+
+        Mirrors ``peer_arrived`` (map eligibility) so a late joiner's
+        reputation row appears in step with its map marker and narrative beat
+        — the MQ-800 at T+4:00, leave-behind sensors at T+2:00 — instead of
+        being absent until it first earns a consensus score (which lagged the
+        map/narrative and read as confusing). The fighter-jet is the one
+        exception: ``peer_arrived`` exempts it (always True), so here it is
+        gated on its dynamic launch via ``jet_launched`` so its row appears
+        when it checks in, not from t=0."""
+        if name == "jet-1":
+            return self.jet_launched(secs)
+        return self.peer_arrived(name, secs)
 
     def peer_arrived(self, name, secs) -> bool:
         """Whether ``name`` should be shown on the map at scenario-second

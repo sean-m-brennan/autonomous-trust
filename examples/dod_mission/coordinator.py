@@ -316,7 +316,7 @@ from dashboard.dod_app import build_dashboard  # noqa: E402
 from dashboard import live_server  # noqa: E402
 from dashboard.narration_script import DOD_NARRATION  # noqa: E402
 from reputation_warmstart import (  # noqa: E402
-    is_warm_start_member, reconcile_rep_score,
+    is_warm_start_member, reconcile_rep_score, SEED_REPUTATION, SEED_TIER,
 )
 sys.path.insert(0, str(_HERE / "tasks"))
 from validation import (  # noqa: E402
@@ -403,16 +403,33 @@ class DoDMissionCoordinator(AutonomousTrust):
         #                        narration states ("pre-established trust with
         #                        their microdrones…"), so the dashboard should
         #                        show that seeded prior, not 0.5.
-        # Data-producing pre-trusted peers (the microdrones) are NOT
-        # warm-started — they earn real, rising consensus (~0.8), which is the
-        # build-up the trust-dynamics chart is meant to show. Keyed by roster
-        # name (== the AT identity nickname the reputation cache uses). See
-        # reputation_warmstart.reconcile_rep_score.
+        #   * kind == microdrone — seeded in the persistent cohort (~0.7); their
+        #                        earned build-up does not reliably surface via
+        #                        the coordinator's consensus query (data-light /
+        #                        group-churn-prone, more so since C-node interop
+        #                        widened the field cohort), so they read
+        #                        "forming…" indefinitely without warm-start. A
+        #                        real rising score still overrides the prior the
+        #                        moment one lands (reconcile_rep_score), so the
+        #                        trust-dynamics build-up is unaffected when it
+        #                        does surface. See reputation_warmstart
+        #                        .is_warm_start_member (the authoritative set).
+        # Keyed by roster name (== the AT identity nickname the reputation cache
+        # uses). _reputations_view / _tiers_view apply the same prior for a
+        # warm-start asset that never surfaces a score at all.
         self._warm_start_peers: set[str] = {
             p.name for p in scenario.peers.values()
             if is_warm_start_member(
                 p.name, getattr(p, "join_phase", 0), p.kind)
         }
+        # The coordinator's OWN AT node (nickname "coordinator") is the
+        # observer, not a scenario peer, so the comprehension above never sees
+        # it — yet is_warm_start_member treats it as infrastructure that should
+        # read trusted from t=0. Add it explicitly so it surfaces its seeded
+        # prior (0.70 / T2) instead of the cold-start 0.50 it would otherwise
+        # show in its own dashboard. ("command" is a real scenario peer and is
+        # already covered by the comprehension.)
+        self._warm_start_peers.add("coordinator")
         self._anomaly_log: list[dict] = []
         self._tick_count = 0
         self._latest_state: dict = {
@@ -621,14 +638,21 @@ class DoDMissionCoordinator(AutonomousTrust):
         # data_stream queues (a small, fixed-size multiproc Queue
         # allocated from the QueuePool).
         self._drain_peer_readings(queues)
-        # Query reputation every ~30s (60 ticks at the 500ms cadence
-        # multi-agency assumes; tune later from real runs).
-        if self._tick_count % 60 == 0:
+        # Query reputation every ~10s (20 ticks at the 500ms cadence) so an
+        # earned consensus score surfaces on the dashboard promptly instead of
+        # lagging up to a full ~30s behind the tx that produced it. The cohort
+        # is small, so the extra consensus_rep_req fan-out is cheap; pre-trusted
+        # assets already read their warm-start prior immediately
+        # (_reputations_view), so this mainly accelerates the visible climb of
+        # the cold-bootstrap field peers (sensors / rq86 / mq800).
+        if self._tick_count % 20 == 0:
             self._query_reputations(queues)
-            # Flush the recording on the same cadence so a hard kill (or a
-            # missed graceful-shutdown window — e.g. k8s teardown wiping the
-            # node) can't discard the whole run; cleanup() still does a final
-            # flush. No-op when recording is disabled.
+        # Flush the recording on its own (slower) cadence so a hard kill (or a
+        # missed graceful-shutdown window — e.g. k8s teardown wiping the node)
+        # can't discard the whole run; it's a durability backstop, not a display
+        # path, so it need not track the query cadence. cleanup() still does a
+        # final flush. No-op when recording is disabled.
+        if self._tick_count % 60 == 0:
             self._flush_recording()
         # Advance the scenario clock so phases progress past Setup in
         # live mode. The Approach-phase gate (Phase 6 #2) consults the
@@ -946,6 +970,12 @@ class DoDMissionCoordinator(AutonomousTrust):
                 # frozen value; skip it so it doesn't draw an orphan line.
                 continue
             name = peer.nickname
+            # Skip a peer that surfaced before its nickname resolved (e.g. a
+            # half-admitted identity mid-handshake): an empty name renders as a
+            # spurious blank-labelled row (T0 / 0.50) at the top of the panel.
+            # It re-appears under its real name once the nickname lands.
+            if not name or not str(name).strip():
+                continue
             tier = int(getattr(peer, "_tier", 0))
             candidates.setdefault(name, []).append((float(score), tier))
 
@@ -1088,7 +1118,7 @@ class DoDMissionCoordinator(AutonomousTrust):
                 out[peer] = dict(max(entries, key=lambda e: e["t_seconds"]))
         return out
 
-    def _reputations_view(self) -> dict:
+    def _reputations_view(self, t_seconds: float = 0.0) -> dict:
         """Reputations for the dashboard, completed with pre-established peers.
 
         Every pre-established peer (join_phase 0) should be forming a
@@ -1102,9 +1132,29 @@ class DoDMissionCoordinator(AutonomousTrust):
         reps: dict = dict(self._reputation_cache)
         try:
             for role in self.scenario.peers.values():
-                if (getattr(role, "join_phase", 0) == 0
-                        and role.name not in reps):
-                    reps[role.name] = None
+                if role.name in reps:
+                    continue
+                # Only surface a peer's row once it has actually arrived on the
+                # map/narrative (peer_reputation_visible) — a pre-established
+                # asset is visible from t=0, a late joiner (MQ-800 T+4:00, jet
+                # at its dynamic launch) only when it checks in. Showing a late
+                # joiner's row before then read as confusing ("why is the rogue
+                # already listed?"); showing it only after it earns consensus
+                # lagged the map/narrative. This tracks arrival instead.
+                if not self.scenario.peer_reputation_visible(
+                        role.name, t_seconds):
+                    continue
+                # A WARM-START asset (microdrone/soldier/jet/command) reads its
+                # seeded prior, NOT "forming…": the warm-start in
+                # _query_reputations only fires once a peer surfaces in
+                # latest_reputation, which is unreliable for these data-light /
+                # churn-prone peers (see reputation_warmstart). A real
+                # (non-neutral) score still overrides it the moment one lands.
+                # A non-warm-start peer (e.g. the rogue MQ-800) reads "forming…"
+                # (None) until it earns its real — and soon-slashed — score.
+                reps[role.name] = (SEED_REPUTATION
+                                   if role.name in self._warm_start_peers
+                                   else None)
         except Exception:
             logger.debug("reputations-view roster merge failed",
                          exc_info=True)
@@ -1145,6 +1195,23 @@ class DoDMissionCoordinator(AutonomousTrust):
                           if isinstance(existing, (int, float)) else floor)
         return reps
 
+    def _tiers_view(self, t_seconds: float = 0.0) -> dict:
+        """Trust tiers for the dashboard, completed in lockstep with
+        _reputations_view: a pre-established warm-start asset that has no
+        earned tier yet reads its seeded tier (SEED_TIER) rather than T0, so
+        the reputations panel shows a consistent (score, tier) pair instead of
+        "0.70 / T0". A peer with a real cached tier keeps it (set together with
+        its real score in _query_reputations), so an earned tier still wins.
+        """
+        tiers = dict(self._tier_cache)
+        for role in self.scenario.peers.values():
+            if (role.name not in tiers
+                    and role.name in self._warm_start_peers
+                    and self.scenario.peer_reputation_visible(
+                        role.name, t_seconds)):
+                tiers[role.name] = SEED_TIER
+        return tiers
+
     def _push_dashboard_update(self):
         # Scenario seconds since tasking_start — falls back to tick-derived
         # estimate (AT runs at ~500ms cadence) until tasking_start is set.
@@ -1153,8 +1220,20 @@ class DoDMissionCoordinator(AutonomousTrust):
         except Exception:
             t_seconds = self._tick_count * 0.5
         self._latest_state = {
-            "reputations": self._reputations_view(),
-            "tiers": dict(self._tier_cache),
+            "reputations": self._reputations_view(t_seconds),
+            "tiers": self._tiers_view(t_seconds),
+            # Live narration gates for beats whose real moment floats. The jet
+            # strike is gated on the jet actually reaching the objective (its
+            # launch is gated on the MQ-800 collapse, so the strike time floats
+            # later than the authored t_start). See narration_script / the
+            # NarrationOverlay.advance_to gates arg.
+            "narration_gates": {
+                "jet_over_target": self.scenario.jet_over_objective(t_seconds),
+            },
+            # True (drifting) ISR target lat/lon so the map's microdrone FOV
+            # wedges point where the target actually IS, not the static squad
+            # hold (GROUND_MID) the drones loiter on. See target_position_map.
+            "target_latlon": self.scenario.true_target_latlon(t_seconds),
             "tick": self._tick_count,
             "t_seconds": t_seconds,
             "phase": (self.scenario.current_phase.name

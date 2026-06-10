@@ -1,0 +1,100 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-partition-recovery-probe-adopt
+byte_pinning: false
+description: |
+    Group partition recovery — adoption directly from a received PROBE
+    (the symmetric-adopt path), distinct from
+    `group-partition-recovery-basic` which adopts on the RESPONSE.
+
+    Motivation (doc/architecture/partition-recovery.md §1, the
+    size-1-coordinator case): a node that sits in no other group's address
+    map never receives a foreign GROUP-channel frame, so NetProcess never
+    raises its `partition_signal` trigger for it. Such a node can only ever
+    RESPOND to others' probes — it never initiates a merge into a larger
+    group, and a size-1/2 group stays wedged on the losing side of every
+    comparison. The fix evaluates adoption inside `handle_partition_probe`
+    too (a probe already advertises the prober's group uuid + size), so a
+    node that only ever hears probes can still initiate recovery.
+
+    Topology: peer_a is the wedged SMALL group (size 1); peer_b is the
+    larger mesh (size 3). They are in DIFFERENT groups on the same
+    multicast domain (`fixtures.groups`, no shared membership).
+
+    Sequence:
+      1. peer_b's NetProcess drops a cross-group frame and pushes a
+         `partition_signal`; peer_b emits a `group_partition_probe`
+         advertising its size-3 group.
+      2. peer_a receives the probe. The prober's group (3) is larger than
+         peer_a's (1), so peer_a adopts FROM THE PROBE — marks recovery in
+         flight and re-broadcasts `request_access` — in addition to sending
+         the usual `group_partition_response`. (In basic, peer_a here is
+         the LARGER group and so only responds; the size relationship is
+         inverted in this scenario specifically to drive the probe-adopt
+         branch.)
+      3. The `request_access` peer_a emits is the recovery trigger and the
+         proof that adopt-from-probe fired. Verified-only (`no_propagate`):
+         the welcoming-committee admission it re-enters is pinned by
+         new-node-admission.
+
+    Both handlers use the same adopt decision (strictly larger, or equal
+    size + smaller uuid) guarded by the in-flight lock, so exactly one side
+    adopts and the Python and C impls reach the identical outcome. Here the
+    size difference alone decides, so the result is uuid-independent.
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-000000000001"
+      size: 1
+    peer_b:
+      uuid: "0b000000-0000-4000-8000-000000000002"
+      size: 3
+
+steps:
+  - id: 1
+    from: peer_b
+    to: peer_b
+    function: partition_signal
+    payload:
+      from_addr: "10.7.7.7:6000"
+    description: |
+        Local IPC into peer_b: a frame arrived from a cross-group address.
+        peer_b emits a partition_probe announcing its own size-3 group
+        (uuid 0b..).
+
+  - id: 2
+    from: peer_b
+    to: peer_a
+    function: group_partition_probe
+    in_response_to: 1
+    payload:
+      group_uuid: "0b000000-0000-4000-8000-000000000002"
+      group_size: 3
+    description: |
+        Deliver peer_b's probe to peer_a. peer_a verifies the signature,
+        finds the prober's group (3) larger than its own (1), and adopts
+        directly from the probe — re-broadcasting request_access — while
+        also replying with a partition_response.
+
+  - id: 3
+    from: peer_a
+    to: broadcast
+    function: request_access
+    in_response_to: 2
+    no_propagate: true
+    description: |
+        The request_access peer_a emits is the adopt-from-probe trigger.
+        Verified-only: the admission it re-enters is the existing
+        new-node-admission path, pinned elsewhere.
+
+expected_state:
+  peer_a:
+    partition_responses_emitted: 1

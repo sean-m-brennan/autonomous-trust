@@ -129,7 +129,13 @@ def build_dashboard(scenario: DoDMissionScenario) -> dict:
     # on data_type=target_position_x.
     from .target_position_map import TargetPositionMapPanel
     target_x_chart = TargetPositionMapPanel(
+        # Start from the full scenario color map so EVERY peer that reports a
+        # target (microdrones included) gets its own colour + legend entry —
+        # previously only rq86/mq800 were listed, so a microdrone's reported
+        # target rendered grey (#888): near-invisible on the dark map and
+        # unlabelled. Keep the curated overhead-ISR golds/amber as overrides.
         peer_colors={
+            **colors,
             "rq86-1": RQ86_GOLD,
             "rq86-2": "#E6C656",   # lighter gold to differentiate from rq86-1
             "mq800":  MQ800_AMBER,

@@ -50,11 +50,25 @@ def _near(pos, latlonalt, tol_m=50.0):
     return math.hypot(dlat, dlon) <= tol_m
 
 
+def _target(sc, strike_sec):
+    """The true (drifting) ISR target at the strike — where the jet now flies,
+    rather than the static GROUND_MID squad-hold."""
+    lat, lon = sc.true_target_latlon(strike_sec)
+    return (lat, lon, GROUND_MID[2])
+
+
+def _ingress(sc, strike_sec):
+    """The jet's ingress hold during a flown pass: off-map east at the target's
+    (strike-time) latitude, so the whole run is straight east-west on target."""
+    lat, _ = sc.true_target_latlon(strike_sec)
+    return (lat, JET_INGRESS[1], JET_INGRESS[2])
+
+
 def test_no_rogue_uses_authored_timing():
     # Without an MQ-800 there is nothing to gate on: the jet keeps its
-    # authored strike (over the objective at JET_STRIKE_SEC).
+    # authored strike (over the target at JET_STRIKE_SEC).
     sc = _scenario(include_mq800=False)
-    assert _near(_jet_at(sc, JET_STRIKE_SEC), GROUND_MID)
+    assert _near(_jet_at(sc, JET_STRIKE_SEC), _target(sc, JET_STRIKE_SEC))
 
 
 def test_holds_offmap_until_anomaly():
@@ -73,18 +87,18 @@ def test_strikes_after_late_anomaly_flies_in():
     # ingress run in; strike = launch + ingress run, no teleport.
     launch = collapse + JET_ANOMALY_HOLD_SEC
     strike = launch + _JET_INGRESS_RUN_SEC
-    assert _near(_jet_at(sc, launch), JET_INGRESS)        # at the hold, just launching
-    assert not _near(_jet_at(sc, strike - 5), GROUND_MID)  # still inbound
-    assert _near(_jet_at(sc, strike), GROUND_MID)          # over the objective
+    assert _near(_jet_at(sc, launch), _ingress(sc, strike))  # at the hold, just launching
+    assert not _near(_jet_at(sc, strike - 5), _target(sc, strike))  # still inbound
+    assert _near(_jet_at(sc, strike), _target(sc, strike))          # over the target
 
 
 def test_early_anomaly_never_pulls_strike_before_authored():
     sc = _scenario()
     sc.gate_jet_on_anomaly(ROGUE_PEER_NAME, 200.0)  # anomaly+hold = 210 < 375
-    # Floor at the authored time: not over the objective early...
-    assert not _near(_jet_at(sc, 210.0), GROUND_MID)
+    # Floor at the authored time: not over the target early...
+    assert not _near(_jet_at(sc, 210.0), _target(sc, JET_STRIKE_SEC))
     # ...but on target at the authored strike.
-    assert _near(_jet_at(sc, JET_STRIKE_SEC), GROUND_MID)
+    assert _near(_jet_at(sc, JET_STRIKE_SEC), _target(sc, JET_STRIKE_SEC))
 
 
 def test_gate_ignores_non_rogue_and_is_first_wins():
@@ -94,20 +108,22 @@ def test_gate_ignores_non_rogue_and_is_first_wins():
     sc.gate_jet_on_anomaly(ROGUE_PEER_NAME, 420.0)  # first real collapse wins
     sc.gate_jet_on_anomaly(ROGUE_PEER_NAME, 999.0)  # later call cannot move it
     strike = 420.0 + JET_ANOMALY_HOLD_SEC + _JET_INGRESS_RUN_SEC
-    assert _near(_jet_at(sc, strike), GROUND_MID)
+    assert _near(_jet_at(sc, strike), _target(sc, strike))
 
 
 def test_early_anomaly_keeps_authored_launch_and_strike():
     sc = _scenario()
     sc.gate_jet_on_anomaly(ROGUE_PEER_NAME, 200.0)  # anomaly+hold = 210 < launch 290
     # Authored launch/strike preserved when the anomaly is early.
-    assert _near(_jet_at(sc, JET_LAUNCH_SEC + _JET_INGRESS_RUN_SEC), GROUND_MID)
+    strike = JET_LAUNCH_SEC + _JET_INGRESS_RUN_SEC
+    assert _near(_jet_at(sc, strike), _target(sc, strike))
 
 
 def test_ceiling_releases_a_never_exposed_rogue():
     # Degenerate run: rogue never collapses. The jet must still fly its run
     # rather than hold forever, once the clock passes the ceiling.
     sc = _scenario()
-    assert _near(_jet_at(sc, JET_HOLD_CEILING_SEC), JET_INGRESS)  # released, launching
-    assert _near(_jet_at(sc, JET_HOLD_CEILING_SEC + _JET_INGRESS_RUN_SEC),
-                 GROUND_MID)  # flies in to the objective
+    strike = JET_HOLD_CEILING_SEC + _JET_INGRESS_RUN_SEC
+    assert _near(_jet_at(sc, JET_HOLD_CEILING_SEC),
+                 _ingress(sc, strike))  # released, launching
+    assert _near(_jet_at(sc, strike), _target(sc, strike))  # flies in to the target

@@ -346,6 +346,30 @@ class IdentityAdapter:
                 group_by_pid[pid] = self._build_group_from_fixture(
                     pid, gi, identities[pid], spec_g)
 
+        # Shared-group sparse-peers mode (identity-resync scenarios): ONE
+        # group shared by every participant — each member's address is in
+        # the address_map — but peers are NOT cross-populated. So each
+        # participant holds the others' addresses yet not their Identities,
+        # which is the cold/late-joiner precondition handle_identity_response
+        # backfills. See doc/architecture/partition-recovery.md layer 3. The
+        # group uuid is pinned so it is identical across the Python and C
+        # harnesses (the resync query/response gate on it).
+        shared_fix = fixtures.get('shared_group')
+        shared_group_obj: Group | None = None
+        if isinstance(shared_fix, dict) or shared_fix is True:
+            pids_all = [s['id'] for s in spec_participants]
+            seed_id = pids_all[0]
+            if isinstance(shared_fix, dict) and shared_fix.get('uuid'):
+                guuid = UUID(shared_fix['uuid'])
+            else:
+                guuid = identities[seed_id].uuid
+            shared_group_obj = Group(
+                guuid, {identities[seed_id].uuid: identities[seed_id].address},
+                'shared-grp', Encryptor.generate(), False)
+            for pid in pids_all[1:]:
+                shared_group_obj.add_address(identities[pid].uuid,
+                                             identities[pid].address)
+
         # All participants except the newcomer share the same group key in
         # Phase C scenarios. Newcomer is detected as the participant with role
         # `new_node`, mirroring the canonical scenario's role naming.
@@ -375,14 +399,19 @@ class IdentityAdapter:
             role = spec['role']
             identity = identities[pid]
             peers = Peers()
-            if not distinct_groups:
+            if not distinct_groups and shared_group_obj is None:
                 for other_pid in existing_pids:
                     if other_pid == pid:
                         continue
                     peers.add(identities[other_pid])
                 if amnesia_known and pid in existing_pids and newcomer_pid is not None:
                     peers.add(identities[newcomer_pid])
-            this_group = group_by_pid.get(pid) if distinct_groups else group
+            if distinct_groups:
+                this_group = group_by_pid.get(pid)
+            elif shared_group_obj is not None:
+                this_group = shared_group_obj
+            else:
+                this_group = group
             participant = self._build_one(pid, role, identity, peers, this_group,
                                           zta_policy=zta_policy)
             # Install own-capability allowlist from fixtures.capabilities;
@@ -597,8 +626,12 @@ class IdentityAdapter:
                 blob = IdentityObj(target.publish(), target.uuid)
                 obj = blob.to_string()
         elif function == IdentityProtocol.update:
+            # Emit the DRY canonical flat group (matches production
+            # _update_group + C's group_to_json) so the wire form the harness
+            # exercises is the cross-runtime one. handle_group_update parses it
+            # via Group.from_canonical. See [[project_group_key_sync]].
             target_group = sender.process.group
-            obj = target_group.to_string() if target_group else ''
+            obj = to_json_string(target_group.to_canonical()) if target_group else ''
         elif function == IdentityProtocol.diff:
             obj = to_json_string([])
         elif function == IdentityProtocol.history:
@@ -628,6 +661,22 @@ class IdentityAdapter:
             # as a list of capability names. Build that native form.
             caps_list = payload.get('caps', []) if isinstance(payload, dict) else []
             obj = to_json_string(caps_list)
+        elif function == IdentityProtocol.id_query:
+            # Identity-resync query (layer 3): {group_uuid, have:[uuids]}.
+            # The group_uuid is the asker's group (== the responder's in a
+            # shared-group scenario); handle_identity_query gates on that
+            # match and on the asker's uuid being absent from `have`.
+            have = payload.get('have', []) if isinstance(payload, dict) else []
+            grp = sender.process.group
+            group_uuid = str(grp.uuid) if grp is not None \
+                else '00000000-0000-0000-0000-000000000000'
+            obj = to_json_string({'group_uuid': group_uuid, 'have': have})
+        elif function == IdentityProtocol.id_response:
+            # Identity-resync response: the responder's published identity +
+            # address. handle_identity_response gates on `from_address` being
+            # in the recipient's group addresses, then adds it to peers.
+            obj = to_json_string({'from_identity': sender_identity.publish(),
+                                  'from_address': sender_identity.address})
         elif function == IdentityProtocol.partition_signal:
             # Local-only IPC from NetProcess: the payload is the raw
             # from_addr string of the rejected cross-group message.
