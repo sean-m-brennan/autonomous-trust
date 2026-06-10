@@ -42,6 +42,25 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Native FFI cdef drift (fast, env-free preflight).
+  #
+  # Compares the CFFI cdef in core/_native/_ffi.py against the authoritative C
+  # declarations and fails on any function whose arg count drifted AND is called
+  # from a _native wrapper (the latent-segfault class). Pure stdlib, no conda /
+  # no build, so it finishes in ~1s and catches this bug class before the heavy
+  # jobs run. Default severity: cdef-only (uncalled) drift is reported but does
+  # not fail; use --strict to fail on that too.
+  # ---------------------------------------------------------------------------
+  ffi-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Audit native FFI cdef drift
+        run: python3 scripts/audit-ffi-drift.py
+
+  # ---------------------------------------------------------------------------
   # Python package test suites.
   #
   # test-packages.sh first builds the C library (scripts/build.sh --c, used by
@@ -181,13 +200,14 @@ jobs:
 #   rule for `master` (and `main`):
 #     [x] Require status checks to pass before merging
 #     [x] Require branches to be up to date before merging
-#         Add required checks:  python-tests   c-tests
+#         Add required checks:  ffi-drift   python-tests   c-tests
 #         (and, if desired, the existing: conformance, ARM64 build job names)
 #
 # Or with the gh CLI (needs repo-admin + api.github.com access):
 #   gh api -X PUT repos/OWNER/REPO/branches/master/protection \
 #     -H "Accept: application/vnd.github+json" \
 #     -f 'required_status_checks[strict]=true' \
+#     -f 'required_status_checks[contexts][]=ffi-drift' \
 #     -f 'required_status_checks[contexts][]=python-tests' \
 #     -f 'required_status_checks[contexts][]=c-tests' \
 #     -f 'enforce_admins=true' \

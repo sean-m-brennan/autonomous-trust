@@ -330,8 +330,9 @@ int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core_
     proto->uuid.len = sizeof(uuid_t);
     proto->address = identity->address;
     proto->fullname = identity->fullname;
-    proto->nickname = identity->nickname;
-    proto->petname = identity->petname;
+    /* nickname/petname are Zooko local names: never serialized. Leaving the
+       proto fields unset keeps them off the wire (proto3 omits empty), matching
+       the Python twin (identity.py sync_to_message never sets them). */
 
     proto->signature = malloc(sizeof(AutonomousTrust__Core__Protobuf__Identity__Signature));
     AutonomousTrust__Core__Protobuf__Identity__Signature tmp_s = AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__SIGNATURE__INIT;
@@ -364,10 +365,12 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
     memcpy(&identity->uuid, proto->uuid.data, sizeof(uuid_t));
     strncpy(identity->address, proto->address, ADDR_LEN);
     strncpy(identity->fullname, proto->fullname, NAME_LEN);
-    if (proto->nickname != NULL)
-        strncpy(identity->nickname, proto->nickname, NAME_LEN);
-    if (proto->petname != NULL)
-        strncpy(identity->petname, proto->petname, NAME_LEN);
+    /* nickname/petname are local-only Zooko names; never imported from the
+       wire. Clear them (mirrors Python sync_from_message, which sets '') so a
+       crafted proto field 9/10 can't inject into local naming. A receiver
+       assigns its own petname locally. */
+    identity->nickname[0] = '\0';
+    identity->petname[0] = '\0';
     if (public_signature_init(&identity->signature, proto->signature->hex_seed.data,
                               proto->signature->hex_seed.len) != 0)
         return -1;

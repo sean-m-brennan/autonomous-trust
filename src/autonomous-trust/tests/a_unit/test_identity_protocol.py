@@ -41,11 +41,12 @@ class TestIdentityProtocol:
         - trust-tier change notifications (tier_update, tier_lost)
         - group-partition recovery (partition_signal,
           partition_probe, partition_response)
+        - peer identity backfill (id_query, id_response)
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 15
+        assert len(values) == 17
         assert 'announce' in values
