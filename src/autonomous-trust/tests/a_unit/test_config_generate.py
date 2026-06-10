@@ -201,6 +201,35 @@ def test_generate_identity_interactive_eof(setup_teardown):
     assert ident is not None
 
 
+def test_generate_identity_eof_honors_at_peer_name(setup_teardown):
+    """Non-interactive container path (input → EOFError) must still
+    honor AT_PEER_NAME, the same as the randomize=True branch already
+    does. Without this, every participant pod gets a random-pool
+    nickname like 'ClearDale' and the inspector reputations panel
+    can't show scenario role names ('mq800', 'microdrone-1'). See
+    dod-demo-implementation-plan.md Phase 6 #6.
+    """
+    cfg_dir = os.path.join(TEST_DIR, 'gen_eof_at_peer_name')
+    os.makedirs(cfg_dir, exist_ok=True)
+    mock_addrs = {
+        'ip4': '192.168.1.100',
+        'ip6': '::1',
+        'mac': '00:11:22:33:44:55',
+        'ip4_subnet': '255.255.255.0',
+        'ip6_subnet': 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+        'mac_bcast': 'ff:ff:ff:ff:ff:ff',
+    }
+    with patch.dict(os.environ, {'AT_PEER_NAME': 'mq800'}):
+        with patch('autonomous_trust.core.config.generate.Network.get_addresses',
+                   return_value=mock_addrs):
+            with patch('builtins.input', side_effect=EOFError):
+                net, ident, subsys = generate_identity(
+                    cfg_dir, randomize=False, preserve=False,
+                    defaults=True, silent=True)
+    assert ident.nickname == 'mq800'
+    assert ident.fullname == 'mq800@tekfive.com'
+
+
 def test_generate_identity_with_defaults(setup_teardown):
     """Test non-randomize path with defaults=True (skips input for network)."""
     cfg_dir = os.path.join(TEST_DIR, 'gen_defaults')

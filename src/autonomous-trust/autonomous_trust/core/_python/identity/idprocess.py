@@ -18,15 +18,17 @@ import hmac
 import os
 import sys
 import time
+from datetime import datetime
 from queue import Empty, Full
 import threading
 from typing import Optional, Union
 
+from nacl.encoding import HexEncoder
 from nacl.exceptions import BadSignatureError
 from nacl.signing import SignedMessage
 
 from . import Peers
-from .group import Group
+from .group import Group, ChildGroupSet
 from .history.history import IdentityHistory
 from ..algorithms.agreement import AgreementProof
 from ..algorithms.impl import AgreementImpl
@@ -49,6 +51,13 @@ VoteData = tuple[IdentityObj, AgreementProof, tuple[bytes, bytes]]
 GroupHistory = tuple[Group, IdentityHistory]
 
 GroupTree = tuple[Group, list[LinkedStep]]
+
+
+# Persistent-cohort gate: peers below this trust tier are excluded from
+# the peers.cfg.json / peer-capabilities.cfg.json snapshots. Mirrors
+# REPUTATION_PERSIST_THRESHOLD (rep > 0.5) via TIER_FLOORS: tier 1 floor
+# is 0.50, so any peer that's been scored above 0.5 has _tier >= 1.
+PERSIST_TIER_FLOOR = 1
 
 
 class IdentityProcess(Process, metaclass=ProcMeta,
@@ -126,6 +135,27 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.self_bootstrapped = False
         self.merging = False
         self.peer_potentials = {}
+        # Gateway multi-group state — see
+        # doc/architecture/gateway-reputation-tree.md.
+        #   child_groups:   group-uuid-str -> Group (with key) we gateway
+        #   parent_gateway: uuid-str of the higher-rank node we federate
+        #                   through, or None
+        # Both empty/None on rank-1 leaf nodes, which keeps every
+        # multi-group path inert and behaviour identical to today.
+        self.child_groups: dict[str, Group] = {}
+        self.parent_gateway: Optional[str] = None
+        # Partition-recovery state — see doc/architecture/partition-recovery.md.
+        # All three maps are pure local memory; no wire egress, no
+        # configuration import.  They get reset when _merge_to_mesh adopts
+        # a remote group (the partition is resolved at that point).
+        #   _partition_probe_cooldown:   from_addr  -> last probe sent
+        #   _partition_response_cooldown: peer_uuid -> last response sent
+        #   _partition_recovery_in_progress: (their_group_uuid, started_at)
+        #     while non-None, suppress new probes until the timeout (15s)
+        #     elapses or `_merge_to_mesh` clears it.
+        self._partition_probe_cooldown: dict[str, datetime] = {}
+        self._partition_response_cooldown: dict[str, datetime] = {}
+        self._partition_recovery_in_progress: Optional[tuple[str, datetime]] = None
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
         self.protocol.register_handler(IdentityProtocol.accept, self.handle_acceptance)
         self.protocol.register_handler(IdentityProtocol.history, self.receive_history)
@@ -136,12 +166,32 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.update, self.handle_group_update)
         self.protocol.register_handler(IdentityProtocol.caps_query, self.handle_caps_query)
         self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
-        self.protocol.register_handler(IdentityProtocol.rank_update, self.handle_rank_update)
+        self.protocol.register_handler(IdentityProtocol.tier_update, self.handle_tier_update)
+        self.protocol.register_handler(IdentityProtocol.partition_signal, self.handle_partition_signal)
+        self.protocol.register_handler(IdentityProtocol.partition_probe, self.handle_partition_probe)
+        self.protocol.register_handler(IdentityProtocol.partition_response, self.handle_partition_response)
         self.lock = None
 
     @property
     def capabilities(self):
         return self.protocol.capabilities
+
+    def _trusted_uuids_for_persist(self):
+        """Return uuids that should survive the persistent-cohort filter.
+
+        Self is always included. A peer survives iff its `_tier` attr
+        (populated by handle_tier_update from ReputationProcess) is at
+        or above PERSIST_TIER_FLOOR — i.e. rep > REPUTATION_PERSIST_THRESHOLD
+        per repprocess.TIER_FLOORS.
+        """
+        kept = {self.identity.uuid}
+        for peer in self.peers.all:
+            tier = getattr(peer, '_tier', 0) or 0
+            if tier >= PERSIST_TIER_FLOOR:
+                puuid = getattr(peer, 'uuid', None)
+                if puuid is not None:
+                    kept.add(puuid)
+        return kept
 
     def _remember_activity(self, queues, name: str, obj: Union[Peers, PeerCapabilities, GroupHistory]):
         filename = os.path.join(Configuration.get_cfg_dir(), name + Configuration.file_ext)
@@ -149,7 +199,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             with self.lock:  # multiple *threads* may try to save data
                 if isinstance(obj, Peers) or isinstance(obj, PeerCapabilities):
                     self.configs[name] = obj
-                    obj.to_file(filename)
+                    # The in-memory object keeps untrusted peers (so we
+                    # can still detect/handle them during this session);
+                    # only the on-disk snapshot is filtered.
+                    keep_uuids = self._trusted_uuids_for_persist()
+                    snapshot = obj.filtered_for_persist(keep_uuids)
+                    snapshot.to_file(filename)
                     # Fan-put BOTH Peers and PeerCapabilities. Previously
                     # only Peers was broadcast here; PeerCapabilities was
                     # saved to file but never propagated, so any cap
@@ -195,6 +250,85 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # _peer_accepted at debug level, which is enough.
         self.logger.verbose('Add group')
         self._remember_activity(queues, CfgIds.group, (self.group, self._history))
+
+    def _record_child_groups(self, queues):
+        """Fan the current child-group set out to the other processes.
+
+        Sibling of _record_group, but for the gateway's child groups
+        rather than its primary. Sends a ChildGroupSet so the
+        reputation / network processes can hold the child keys and
+        chains without clobbering Protocol.group. No-op (and no IPC) on
+        a leaf node — child_groups is empty. See
+        doc/architecture/gateway-reputation-tree.md.
+        """
+        if not self.child_groups:
+            return
+        self.protocol.child_groups = dict(self.child_groups)
+        try:
+            self.update(ChildGroupSet(self.child_groups), queues)
+        except Exception as err:
+            self.logger.warning('Could not propagate child groups: %s' % err)
+
+    def _adopt_child_group(self, queues, group, peer_idents=None):
+        """Adopt a foreign cohort as one of our child groups (gateway).
+
+        Stores the group (with its key) under child_groups keyed by
+        uuid, seeds its member identities into our peer view, and
+        propagates the updated child-group set. Idempotent — re-adopting
+        a known child group just refreshes it. Does NOT touch self.group
+        (the primary/parent cohort). See
+        doc/architecture/gateway-reputation-tree.md.
+        """
+        if group is None:
+            return
+        key = str(group.uuid)
+        if self.group is not None and key == str(self.group.uuid):
+            return  # never demote our own primary group to a child
+        self.child_groups[key] = group
+        self.logger.info('Gateway adopted child group %s (%s)' %
+                         (getattr(group, 'nickname', '?'), key[:8]))
+        if peer_idents:
+            self._populate_peers_from_history(queues, list(peer_idents))
+        self._record_child_groups(queues)
+
+    def _load_child_groups(self, queues):
+        """Seed-assisted dual membership: adopt any child-group config
+        files present in the config dir.
+
+        A gateway is seeded with group.cfg.json for its primary/parent
+        cohort plus one ``group_child_*.cfg.json`` per cohort it
+        gateways (each holding that group's shared key). Runtime rank
+        still governs the reputation roster and commit routing; this
+        only hands the gateway the child keys at t=0 so the demo's
+        warm-started, pre-partitioned cohorts work without a runtime
+        cross-group join handshake. Leaf nodes have no such files, so
+        this is a no-op. See doc/architecture/gateway-reputation-tree.md.
+        """
+        try:
+            cfg_dir = Configuration.get_cfg_dir()
+            prefix = 'group_child'
+            ext = Configuration.file_ext
+            try:
+                names = sorted(os.listdir(cfg_dir))
+            except FileNotFoundError:
+                return
+            from ..config.configuration import config_json_decoder
+            for fname in names:
+                if not (fname.startswith(prefix) and fname.endswith(ext)):
+                    continue
+                path = os.path.join(cfg_dir, fname)
+                try:
+                    with open(path, 'r') as cfg:
+                        payload = json.load(cfg, object_hook=config_json_decoder)
+                    # Tolerate (Group, hist_dict) — mirroring the primary
+                    # group.cfg.json layout — or a bare Group.
+                    group = payload[0] if isinstance(payload, (list, tuple)) else payload
+                    self._adopt_child_group(queues, group)
+                except Exception as err:
+                    self.logger.warning(
+                        'Could not load child group %s: %s' % (fname, err))
+        except Exception as err:
+            self.logger.warning('_load_child_groups failed: %s' % err)
 
     def _record_peers(self, queues):
         self.logger.debug('Add peers')
@@ -421,6 +555,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.logger.info('Merging self-bootstrap into mesh group %s' %
                              getattr(self.group, 'nickname', '?'))
             self._record_group(queues)
+            # Partition-recovery cleanup: this is the typical exit path
+            # for a successful partition-recovery probe → request_access
+            # → full_history round-trip (see
+            # doc/architecture/partition-recovery.md §5.5).
+            self._partition_recovery_in_progress = None
+            self._partition_probe_cooldown.clear()
             self._populate_peers_from_history(queues, list(unioned_peers.values()))
             # We were not a member of the new group; do NOT send a
             # history_diff here. Re-announce on the open channel so a BG
@@ -699,16 +839,38 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 'Announced self to %d bundled peers' % sent)
 
     def _add_peer(self, queues, identity, amnesia=False):
-        # TODO: Use 'amnesia' parameter — when True, treat this peer as if
-        # we have no prior history with them (e.g. after a partition heal).
+        # The `amnesia` parameter is currently a structural placeholder.
+        # All callers either pass the default (`False`) or are guarded
+        # by `if not amnesia` above. The actual amnesia recovery flow
+        # — registering caps for late-arriving announces and querying
+        # peers directly when announces are lost — lives in
+        # `welcoming_committee` (amnesia branch, line ~566) and
+        # `handle_confirm_peer` (caps_query path, line ~860). See the
+        # late-joiner-caps four-layer defense pattern for context.
+        # The parameter is retained so future per-callsite recovery
+        # policy can plug in here without changing the signature.
         level = self.peers.mid_level
         if self.group is not None:
-            # TODO: Consider delaying group update until after peer is fully
-            # validated, to avoid exposing group key to unconfirmed peers.
+            # DEFERRED DESIGN: delaying group-update vs. exposing group
+            # key. Current behavior adds the new peer's address and
+            # publishes the group BEFORE the peer is fully validated by
+            # the welcoming-committee vote. This trades a brief window
+            # of premature group-key visibility for simpler ordering —
+            # if the peer is later rejected, group_remove cleans up.
+            # Tightening this requires a multi-phase admission protocol
+            # (provisional vs. confirmed group membership) that both
+            # the Python and C implementations would need to agree on.
             self.group.add_address(identity.uuid, identity.address)
             self._record_group(queues)
-            # TODO: Consider using the new peer's group key instead of ours
-            # when the new peer comes from a larger/older group.
+            # DEFERRED DESIGN: adopting the new peer's group key when
+            # they come from an older/larger group (group-merge
+            # protocol). Today we always retain our own group identity
+            # and add the joiner's address to it. Inverting this would
+            # require: (a) a comparable size/age signal on Group, (b)
+            # a peer-key handover handshake, (c) C-side parity. Tracked
+            # alongside the broader group-merge discussion in
+            # divergence.md context (see also the M2 / late-history
+            # paths that already merge histories without merging keys).
             self._update_group(queues, self.group, level)
         self._history.insert_peer(identity, level)
         with self.lock:
@@ -722,8 +884,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     del self.peer_potentials[identity.uuid]
                 except KeyError:
                     pass  # race condition: another thread may have deleted it
-        # TODO: Review whether these capability broadcasts are redundant
-        # with self.update() — they may cause duplicate processing downstream.
+        # Intentional redundancy: these explicit puts back up the fan-put
+        # that `_record_peers` performs via `update()`, which has been
+        # observed to silently drop entries under main-proc queue
+        # contention. The same pattern + a longer 1s timeout appears in
+        # `handle_caps_response` (~line 970), with the full rationale.
+        # Removing either side risks dropped capability updates downstream.
         queues[CfgIds.main].put(self.peer_capabilities, block=True, timeout=self.q_cadence)
         queues[CfgIds.negotiation].put(self.peer_capabilities, block=True, timeout=self.q_cadence)
 
@@ -759,9 +925,22 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.propose:
             self.logger.debug('Received peer proposal')
-            # TODO: Check border_guard_mode — when True, this node acts as a
-            # gatekeeper and should apply stricter validation before processing
-            # proposals. When False, defer to other peers' judgment.
+            # DEFERRED DESIGN: should non-border-guards vote on
+            # proposals? `welcoming_committee` only emits `propose`
+            # when `self.border_guard_mode` is True (line ~587), but
+            # any peer in phase 3 that receives the broadcast
+            # currently votes. Two viable policies:
+            #   A. Current: everyone in phase 3 votes — wider quorum,
+            #      but a non-border-guard's view of the candidate is
+            #      necessarily shallower (no welcoming-committee
+            #      validation context).
+            #   B. Border-guards-only: gate this branch on
+            #      `if self.border_guard_mode:` to mirror the emit
+            #      side. Tighter security model, smaller quorum.
+            # Policy B requires C-side parity — the C implementation
+            # has no `border_guard_mode` concept yet (greppable: no
+            # matches in src/c/autonomous_trust/identity/). Land
+            # cross-impl before changing the Python behavior.
             blob = message.obj  # from self.welcoming_committee()
             if isinstance(blob, str):
                 blob = Configuration.from_string(blob)
@@ -1017,24 +1196,24 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return True
         return False
 
-    def handle_rank_update(self, _, message):
-        """Apply a reputation-derived rank to a peer (or self).
+    def handle_tier_update(self, _, message):
+        """Apply a reputation-derived trust tier to a peer (or self).
 
-        Local-only IPC from ReputationProcess (BUGS.md §P2). Mutating
-        `peer._rank` in `self.peers.all` is visible to AgreementByAuthority
-        because IdentityByAuthority shares this list as its voter set.
-        Self-rank bump updates `self.identity` so subsequent
-        `Identity.publish()` broadcasts carry the elevated rank.
+        Local-only IPC from ReputationProcess. Mutates `peer._tier`
+        (the runtime, local-view trust attribute) — distinct from
+        `peer._rank` (topology, populated from identity.json). The
+        next negotiation tier-gate sees the elevated `_tier` via the
+        local peer mirror.
         """
-        if message.function != IdentityProtocol.rank_update:
+        if message.function != IdentityProtocol.tier_update:
             return False
         try:
             payload = from_json_string(message.obj) if isinstance(
                 message.obj, (str, bytes)) else message.obj
             if not (isinstance(payload, (list, tuple)) and len(payload) >= 2):
-                self.logger.warning('handle_rank_update: bad payload %r' % payload)
+                self.logger.warning('handle_tier_update: bad payload %r' % payload)
                 return True
-            peer_uuid_str, new_rank = str(payload[0]), int(payload[1])
+            peer_uuid_str, new_tier = str(payload[0]), int(payload[1])
             target = None
             if str(self.identity.uuid) == peer_uuid_str:
                 target = self.identity
@@ -1044,17 +1223,292 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         target = peer
                         break
             if target is None:
-                # Rank update arrived before we have the peer's identity.
+                # Tier update arrived before we have the peer's identity.
                 # Drop quietly — the next reputation cycle will retry.
                 return True
-            old = getattr(target, '_rank', 0)
-            if old != new_rank:
-                target._rank = new_rank
-                self.logger.debug('Rank update for %s: %d -> %d' %
+            old = getattr(target, '_tier', 0)
+            if old != new_tier:
+                target._tier = new_tier
+                self.logger.debug('Tier update for %s: %d -> %d' %
                                   (getattr(target, 'nickname', peer_uuid_str),
-                                   old, new_rank))
+                                   old, new_tier))
         except Exception as err:
-            self.report_exception(err, 'handle_rank_update')
+            self.report_exception(err, 'handle_tier_update')
+        return True
+
+    # ------------------------------------------------------------------
+    # Partition recovery (doc/architecture/partition-recovery.md).
+    # ------------------------------------------------------------------
+
+    _PARTITION_PROBE_COOLDOWN_SEC = 10.0   # per from_addr (§5.2)
+    _PARTITION_RESPONSE_COOLDOWN_SEC = 30.0  # per probe-sender uuid (§5.3)
+    _PARTITION_RECOVERY_TIMEOUT_SEC = 15.0  # in-progress lockout (§5.4)
+
+    @staticmethod
+    def _partition_probe_canonical(group_uuid, group_size):
+        """Canonical byte form for probe signature input."""
+        return ('%s|%s' % (group_uuid, int(group_size))).encode('utf-8')
+
+    @staticmethod
+    def _partition_response_canonical(group_uuid, group_size, in_response_to):
+        """Canonical byte form for response signature input."""
+        return ('%s|%s|%s' % (group_uuid, int(group_size),
+                              in_response_to)).encode('utf-8')
+
+    def _partition_recovery_active(self):
+        """True iff a recovery is currently in flight and not yet timed out."""
+        if self._partition_recovery_in_progress is None:
+            return False
+        _, started_at = self._partition_recovery_in_progress
+        elapsed = (now() - started_at).total_seconds()
+        if elapsed >= self._PARTITION_RECOVERY_TIMEOUT_SEC:
+            self._partition_recovery_in_progress = None
+            return False
+        return True
+
+    def _select_partition_leader(self):
+        """Return one of our group members the probe sender can address
+        their request_access to.
+
+        Picks the most recently-admitted peer with peer_rank >= ours
+        (so newcomers don't get pinned as welcomer for the merging
+        peer; the welcoming-committee at the target still runs through
+        the normal voting flow). Falls back to self.identity when our
+        group is size-1 — the dod_mission coordinator case.
+        """
+        candidates = []
+        our_rank = getattr(self.identity, '_rank', 0)
+        for peer in self.peers.all:
+            if str(getattr(peer, 'uuid', '')) == str(self.identity.uuid):
+                continue
+            if getattr(peer, '_rank', 0) < our_rank:
+                continue
+            candidates.append(peer)
+        if not candidates:
+            return self.identity
+        # newest first — fall back to UUID order for determinism
+        candidates.sort(key=lambda p: (getattr(p, '_admitted_at', 0),
+                                       str(p.uuid)),
+                        reverse=True)
+        return candidates[0]
+
+    def handle_partition_signal(self, queues, message):
+        """Local-only IPC from NetProcess: a group message arrived from
+        ``from_addr`` whose address is not in our group. Emit a
+        ``partition_probe`` on unsecured multicast so any responder in
+        any group can identify itself, then decide whether to merge.
+
+        Rate-limited at one probe per ``from_addr`` per 10 s.
+        Suppressed while bootstrapping (``self.group is None`` or
+        ``self.choosing``) and while a recovery is already in flight.
+        See doc/architecture/partition-recovery.md §5.2.
+        """
+        if message.function != IdentityProtocol.partition_signal:
+            return False
+        if self.group is None or self.choosing:
+            return True
+        if self._partition_recovery_active():
+            return True
+        from_addr = message.obj
+        if not isinstance(from_addr, str) or not from_addr:
+            return True
+        cutoff = now()
+        last = self._partition_probe_cooldown.get(from_addr)
+        if (last is not None
+                and (cutoff - last).total_seconds()
+                < self._PARTITION_PROBE_COOLDOWN_SEC):
+            return True
+        self._partition_probe_cooldown[from_addr] = cutoff
+        try:
+            group_uuid = str(self.group.uuid)
+            group_size = len(list(self.group.addresses))
+            sig_bytes = self._partition_probe_canonical(group_uuid, group_size)
+            signed = self.identity.sign(sig_bytes)
+            payload = to_json_string({
+                'from_identity': self.identity.publish(),
+                'from_address': self.identity.address,
+                'my_group_uuid': group_uuid,
+                'my_group_size': group_size,
+                'signature': signed.signature.decode('ascii'),
+            })
+            probe = Message(self.name, IdentityProtocol.partition_probe,
+                            payload, to_whom=Network.broadcast,
+                            encrypt=False)
+            queues[CfgIds.network].put(probe, block=True,
+                                       timeout=self.q_cadence)
+            _probes.counter('peer.set', 'partition_probe_sent')
+            self.logger.debug(
+                'Partition probe broadcast (group=%s size=%d trigger=%s)' %
+                (self.group.nickname, group_size, from_addr))
+        except Full:
+            _probes.counter('peer.set', 'partition_probe_q_full')
+            self.logger.error('handle_partition_signal: Network queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_partition_signal')
+        return True
+
+    def handle_partition_probe(self, queues, message):
+        """Receive an unsecured-multicast probe from a peer that sees us
+        as cross-group. Verify the probe signature against the embedded
+        sender identity, then reply with a ``partition_response`` so the
+        sender can compare group sizes and decide whether to merge.
+
+        Rate-limited at one response per probing peer uuid per 30 s.
+        Skipped if we are still bootstrapping (no group yet). See
+        doc/architecture/partition-recovery.md §5.3.
+        """
+        if message.function != IdentityProtocol.partition_probe:
+            return False
+        if self.group is None:
+            return True
+        try:
+            payload = from_json_string(message.obj) if isinstance(
+                message.obj, (str, bytes)) else message.obj
+            if not isinstance(payload, dict):
+                _probes.counter('peer.set', 'partition_probe_bad_payload')
+                return True
+            sender_id = payload.get('from_identity')
+            group_uuid = payload.get('my_group_uuid')
+            group_size = payload.get('my_group_size')
+            sig_hex = payload.get('signature')
+            if (sender_id is None or group_uuid is None
+                    or group_size is None or sig_hex is None):
+                _probes.counter('peer.set', 'partition_probe_missing_fields')
+                return True
+            # sender_id arrived deserialized as an Identity (Configuration
+            # auto-deserialization in Message.__init__). Verify signature
+            # using the raw-bytes path that message.py:228-243 documents
+            # — Identity.verify's two-arg form double-encodes under nacl.
+            try:
+                sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
+                sender_id.signature.public.verify(
+                    self._partition_probe_canonical(group_uuid, group_size),
+                    sig_raw)
+            except (BadSignatureError, ValueError):
+                _probes.counter('peer.set', 'partition_probe_bad_sig')
+                return True
+            sender_uuid = str(sender_id.uuid)
+            # If the sender is already in our group, this is the
+            # graceful no-op case (their local view is stale); send a
+            # normal group_key_update and bail.
+            if any(str(getattr(p, 'uuid', '')) == sender_uuid
+                   for p in self.peers.all
+                   if str(getattr(p, 'address', '')) in
+                   list(self.group.addresses)):
+                # Existing code already handles group_key_update; just
+                # don't respond with a partition_response.
+                _probes.counter('peer.set', 'partition_probe_known_peer')
+                return True
+            cutoff = now()
+            last = self._partition_response_cooldown.get(sender_uuid)
+            if (last is not None
+                    and (cutoff - last).total_seconds()
+                    < self._PARTITION_RESPONSE_COOLDOWN_SEC):
+                return True
+            self._partition_response_cooldown[sender_uuid] = cutoff
+            # Build the response.
+            our_group_uuid = str(self.group.uuid)
+            our_group_size = len(list(self.group.addresses))
+            leader = self._select_partition_leader()
+            resp_sig_bytes = self._partition_response_canonical(
+                our_group_uuid, our_group_size, sender_uuid)
+            resp_signed = self.identity.sign(resp_sig_bytes)
+            resp_payload = to_json_string({
+                'from_identity': self.identity.publish(),
+                'from_address': self.identity.address,
+                'in_response_to': sender_uuid,
+                'my_group_uuid': our_group_uuid,
+                'my_group_size': our_group_size,
+                'my_group_leader': str(leader.uuid),
+                'my_group_leader_address': leader.address,
+                'signature': resp_signed.signature.decode('ascii'),
+            })
+            reply = Message(self.name, IdentityProtocol.partition_response,
+                            resp_payload, to_whom=Network.broadcast,
+                            encrypt=False)
+            queues[CfgIds.network].put(reply, block=True,
+                                       timeout=self.q_cadence)
+            _probes.counter('peer.set', 'partition_response_sent')
+            self.logger.debug(
+                'Partition response broadcast (to=%s our_group=%s/%d)' %
+                (sender_uuid, self.group.nickname, our_group_size))
+        except Full:
+            _probes.counter('peer.set', 'partition_response_q_full')
+            self.logger.error('handle_partition_probe: Network queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_partition_probe')
+        return True
+
+    def handle_partition_response(self, queues, message):
+        """Receive a probe response. If the responder's group is larger
+        (or equal-size with smaller uuid), initiate a normal
+        ``request_access`` toward their group leader's address — the
+        existing welcoming-committee flow then drives a ``full_history``
+        exchange, which feeds ``_merge_to_mesh`` and adopts the larger
+        group. See doc/architecture/partition-recovery.md §5.4.
+        """
+        if message.function != IdentityProtocol.partition_response:
+            return False
+        if self.group is None or self._partition_recovery_active():
+            return True
+        try:
+            payload = from_json_string(message.obj) if isinstance(
+                message.obj, (str, bytes)) else message.obj
+            if not isinstance(payload, dict):
+                return True
+            sender_id = payload.get('from_identity')
+            in_response_to = payload.get('in_response_to')
+            their_group_uuid = payload.get('my_group_uuid')
+            their_group_size = payload.get('my_group_size')
+            leader_uuid = payload.get('my_group_leader')
+            leader_address = payload.get('my_group_leader_address')
+            sig_hex = payload.get('signature')
+            if (sender_id is None or in_response_to is None
+                    or their_group_uuid is None or their_group_size is None
+                    or leader_address is None or sig_hex is None):
+                _probes.counter('peer.set', 'partition_response_missing_fields')
+                return True
+            if in_response_to != str(self.identity.uuid):
+                # Response to someone else's probe — multicast bleed-through.
+                return True
+            try:
+                sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
+                sender_id.signature.public.verify(
+                    self._partition_response_canonical(
+                        their_group_uuid, their_group_size, in_response_to),
+                    sig_raw)
+            except (BadSignatureError, ValueError):
+                _probes.counter('peer.set', 'partition_response_bad_sig')
+                return True
+            our_size = len(list(self.group.addresses))
+            theirs = int(their_group_size)
+            adopt = (theirs > our_size
+                     or (theirs == our_size
+                         and str(their_group_uuid) < str(self.group.uuid)))
+            if not adopt:
+                # They will reach the symmetric conclusion when they
+                # receive our probe — initiate from their side. No-op.
+                _probes.counter('peer.set', 'partition_response_we_win')
+                return True
+            self._partition_recovery_in_progress = (str(their_group_uuid),
+                                                    now())
+            # Re-broadcast request_access on the open channel. This is the
+            # same call announce_identity uses; the welcoming committee at
+            # the responder's group will admit us through the standard
+            # POA-voting flow, and the resulting full_history will drive
+            # _merge_to_mesh to adopt their group.
+            self._broadcast_request_access(queues)
+            _probes.counter('peer.set', 'partition_recovery_initiated')
+            self.logger.info(
+                'Partition recovery: adopting group %s (size=%d > our %d), '
+                'sent request_access toward leader %s@%s' %
+                (their_group_uuid, theirs, our_size,
+                 leader_uuid, leader_address))
+        except Full:
+            _probes.counter('peer.set', 'partition_request_access_q_full')
+            self.logger.error('handle_partition_response: Network queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_partition_response')
         return True
 
     def handle_group_update(self, queues, message):
@@ -1103,6 +1557,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.logger.debug('Replace %s group with %s group' % (mine.nickname, theirs.nickname))
                 self.group = theirs
                 self._record_group(queues)
+                # Partition recovery completes here whenever the adopted
+                # group matches an in-flight recovery, OR opportunistically
+                # whenever any merge lands (we don't insist on UUID match —
+                # an unrelated merge that absorbs the same addresses is
+                # also a resolution).
+                self._partition_recovery_in_progress = None
+                self._partition_probe_cooldown.clear()
                 return True
             # We are the canonical winner — push our group to peers below us
             # in the hierarchy so they converge on it. Don't echo on every
@@ -1123,6 +1584,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.logger.debug('Phase %s' % self.phase)
         self.acquire_capabilities(queues)
         self.announce_identity(queues)
+        # Seed-assisted dual membership: a gateway adopts its child
+        # cohort(s) from group_child_*.cfg.json before grouping. No-op
+        # on leaf nodes. See doc/architecture/gateway-reputation-tree.md.
+        self._load_child_groups(queues)
         if not self.choosing:
             # initial run, may be called again
             self._spawn(self.choose_group, args=(queues,))
@@ -1167,3 +1632,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.messages += untouched
             except Exception as err:
                 self.report_exception(err, 'process')
+        # Final flush on graceful shutdown — ensures the most-recent
+        # peers + capabilities + group snapshots survive a SIGTERM/quit.
+        # Belt-and-suspenders on top of the per-mutation saves in
+        # _record_peers / _record_group.
+        try:
+            self._record_group(queues)
+            self._record_peers(queues)
+            self.logger.debug('Final identity-state flush on shutdown')
+        except Exception as err:
+            self.logger.warning('Final identity-state flush failed: %s' % err)

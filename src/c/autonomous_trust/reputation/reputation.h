@@ -30,6 +30,7 @@
 #include "structures/array.h"
 #include "identity/identity.h"
 #include "utilities/exception.h"
+#include "processes/capabilities.h"   /* CAP_NAMELEN */
 #include "autonomous_trust/algorithms/paxos.h"
 
 /****************************
@@ -56,12 +57,71 @@ extern char REP_PROTO_NACK[];
 extern char REP_PROTO_BACKDATE[];
 extern char REP_PROTO_TX[];
 extern char REP_PROTO_ACCEPTED[];
+/* Phase 3 — proposer broadcasts the committed (task_id, peer_id,
+ * score) tuple to the group after handle_accepted reaches majority.
+ * Acceptors handle this by writing the entry to their own history,
+ * which is how bilateral Transactions form across all peers' views.
+ * Matches Python's ReputationProtocol.committed verbatim. */
+extern char REP_PROTO_COMMITTED[];
 extern char REP_PROTO_OUTDATED[];
 extern char REP_PROTO_UPDATE[];
 extern char REP_PROTO_REP_REQ[];
 extern char REP_PROTO_REP_RESP[];
+/* History-only reputation score for observer/dashboard use. Distinct
+ * request op so peer-side callers keep their identity-dependent CTFT
+ * scoring via rep_req; reply reuses REP_PROTO_REP_RESP so the existing
+ * response dispatch consumes it unchanged. Mirrors Python's
+ * ReputationProtocol.consensus_rep_req — string must match verbatim. */
+extern char REP_PROTO_CONSENSUS_REP_REQ[];
 extern char REP_PROTO_LOCAL_QUERY[];
 extern char REP_PROTO_LOCAL_RESP[];
+/* Slashing — fast-penalty path. A detector broadcasts SLASH_PROPOSE;
+ * members co-sign with SLASH_SIGN; on quorum the slasher broadcasts
+ * SLASH_FINAL and every node floors the target's reputation, bypassing
+ * the slow consensus EMA. Strings must match Python verbatim
+ * (ReputationProtocol.slash_propose / slash_sign / slash_final). See
+ * reputation-vs-blockchain-analysis.md (slashing == PoS-style penalty). */
+extern char REP_PROTO_SLASH_PROPOSE[];
+extern char REP_PROTO_SLASH_SIGN[];
+extern char REP_PROTO_SLASH_FINAL[];
+/* Phase 2 quorum-signed Merkle checkpoint ops
+ * (ReputationProtocol.checkpoint_propose / checkpoint_sign / checkpoint_final).
+ * A member co-signs only when its own transaction_window_root matches the
+ * proposed root; on quorum the agreed root is stored. See
+ * reputation-vs-blockchain-analysis.md §2.1. */
+extern char REP_PROTO_CHECKPOINT_PROPOSE[];
+extern char REP_PROTO_CHECKPOINT_SIGN[];
+extern char REP_PROTO_CHECKPOINT_FINAL[];
+
+/****************************
+ * Reputation tuning constants — mirror Python class attributes in
+ * src/autonomous-trust/.../reputation/repprocess.py:ReputationProcess.
+ ****************************/
+
+/* Hysteresis band for the CTFT ↔ pure-reputation mode switch in
+ * reputation_compute / handle_rep_request. A single 0.5 threshold
+ * made peers hovering near 0.5 flip scoring functions every tick;
+ * widening the switch band so a peer must clear COOP_ENTER to graduate
+ * and fall below COOP_EXIT to fall back removes the chatter without
+ * altering either scoring function. */
+#define COOP_ENTER 0.55
+#define COOP_EXIT  0.45
+
+/* EMA half-life (in committed bilateral txs) for reputation_consensus.
+ * Smaller → faster crash on a peer that begins producing bad scores,
+ * slower rebuild for the rest. 20 gives α ≈ 0.034. */
+#define CONSENSUS_EMA_HALF_LIFE 20
+
+/* FIFO cap on rep_state.committed_paxos_rounds (rep_proc.c). Paired
+ * with MAX_CHAIN_LEN so neither dedup structure grows without bound.
+ * Mirrors Python's ReputationProcess.COMMITTED_ROUNDS_CAP. Sized for
+ * ~2 min of in-flight protection at ~16 paxos commits/sec — small
+ * caps let late ACCEPTEDs bypass the dedup and trigger redundant
+ * commit re-broadcasts that fan out to every peer (cheap on the
+ * receivers thanks to the tx_history tombstone, but still real
+ * network/dispatch cost). 2000 eliminates the spurious traffic
+ * entirely. */
+#define COMMITTED_ROUNDS_CAP 2000
 
 /****************************
  * Transaction score (pending Paxos request)
@@ -71,11 +131,23 @@ typedef struct {
     smrt_ptr_t;
     uuid_t task_uuid;
     double score;
+    /* Optional: name of the Capability that produced this TS. Used by
+     * _pure_reputation to look up transaction_weight (Slice 3). Empty
+     * string == "unknown / legacy" — weight defaults to 1. Mirrors
+     * Python TransactionScore.capability_name. See
+     * doc/architecture/trust-tiers.md §4.4. */
+    char capability_name[CAP_NAMELEN+1];
 } tx_score_t;
 
 /****************************
  * Transaction record (chain entry)
  ****************************/
+
+/* blake2b digest of the reputation chain, hex-encoded. 32-byte digest
+ * (crypto_generichash default) -> 64 lowercase hex chars + NUL. Matches
+ * Python's MerkleTree.get_hash output (nacl blake2b, HexEncoder, 32-byte
+ * digest). Keep in lockstep so the languages agree on entry hashes. */
+#define TX_HASH_HEX_LEN 64
 
 typedef struct {
     uuid_t task_uuid;
@@ -86,19 +158,75 @@ typedef struct {
     double p2_score;
     bool   p2_set;
     int    index;
+    /* Phase 1 hash-linking (reputation-vs-blockchain-analysis.md §2.1):
+     * entry_hash of the entry committed immediately before this one in the
+     * resident chain; empty string for the genesis entry (or the oldest
+     * resident entry whose predecessor has been evicted). Assigned when the
+     * tx goes bilateral. Mirrors Python Transaction.prev_hash. */
+    char   prev_hash[TX_HASH_HEX_LEN + 1];
 } transaction_t;
 
 /****************************
  * Transaction history (block chain)
  ****************************/
 
-#define MAX_CHAIN_LEN 4096
+/* Cap on the resident chain. When full, tx_history_update evicts
+ * chain[0] (FIFO) and shifts the remainder down by one slot,
+ * renumbering map entries to match. Mirrors Python's
+ * TransactionHistory.DEFAULT_MAX_CHAIN_LEN — keep in lockstep with
+ * src/autonomous-trust/.../reputation/reputation.py.
+ *
+ * Chain admission: tx_history_update writes to chain[] on the very
+ * first slot fill (so task_map can route the second-slot fill back
+ * to the same entry), but tx->index is monotonic absolute and only
+ * assigned once the transaction goes bilateral — matching Python's
+ * "_chain.append only on len(tx) > 1" rule. tx_history_len /
+ * by_peer / era* therefore filter for tx->p1_set && tx->p2_set,
+ * so unilateral txs are invisible to consumers until they commit. */
+#define MAX_CHAIN_LEN 200
 
 typedef struct {
     transaction_t chain[MAX_CHAIN_LEN];
-    int           chain_len;
+    int           chain_len;          /* Total slots in use (committed + pending). */
+    /* Number of bilateral entries in chain[]. Mirrors Python
+     * `len(_chain)`, which is what TransactionHistory.__len__
+     * returns. Without this counter, callers that asked
+     * `tx_history_len()` after a single unilateral update would
+     * see 1 while Python saw 0 — and any era-based serialization
+     * pulled the half-tx onto the wire as if it were committed. */
+    int           committed_count;
+    /* Monotonic insertion counter, assigned to tx->index when a tx
+     * goes bilateral. Survives evictions so indices keep growing
+     * forever — matches Python `_next_index`. Eviction's old
+     * "renumber slots" pass no longer rewrites tx->index. */
+    int           next_index;
+    /* Absolute index of the oldest committed entry (chain[0] if
+     * the head is committed; otherwise the first committed slot's
+     * index). Equals `next_index` when there are zero committed
+     * entries. Mirrors Python `_first_index` — used by era() to
+     * translate absolute requests into chain-relative offsets. */
+    int           first_index;
     map_t         task_map;   /* uuid_str -> int (chain index) */
     map_t         peer_map;   /* uuid_str -> array_t* (list of indices) */
+    /* Tombstone of evicted task_uuids — FIFO ring sized to
+     * MAX_CHAIN_LEN so we remember the most-recent MAX_CHAIN_LEN
+     * evictions. tx_history_update refuses to re-create entries
+     * for tombstoned tasks; without this, a late `committed`
+     * broadcast for an evicted task would build a half-completed
+     * Transaction in task_map that the counterparty's late
+     * `committed` would complete and re-insert at the head of
+     * the chain (silently evicting a legitimate recent entry).
+     * Mirrors Python's TransactionHistory._evicted_task_ids. */
+    char          evicted_ring[MAX_CHAIN_LEN][UUID_STRING_LEN + 1];
+    int           evicted_ring_head;  /* next slot to overwrite */
+    int           evicted_ring_len;   /* up to MAX_CHAIN_LEN */
+    map_t         evicted_set;        /* uuid_str -> integer_data(1) */
+    /* Phase 1 hash-linking: entry_hash of the current chain head (the most
+     * recently committed entry) — the prev_hash the next bilateral commit
+     * will carry. Empty string before the first commit. Eviction never
+     * rewrites it (it tracks the tail), so the link survives the sliding
+     * window. Mirrors Python TransactionHistory._head_hash. */
+    char          head_hash[TX_HASH_HEX_LEN + 1];
 } tx_history_t;
 
 /*@
@@ -117,7 +245,10 @@ int  tx_history_create(tx_history_t **hist);
   requires \valid(hist);
   assigns *hist;
   ensures \result == 0 || \result != 0;
-  ensures \result == 0 ==> hist->chain_len == 0;
+  ensures \result == 0 ==> hist->chain_len == 0 &&
+                           hist->committed_count == 0 &&
+                           hist->next_index == 0 &&
+                           hist->first_index == 0;
 */
 int  tx_history_init(tx_history_t *hist);
 
@@ -131,14 +262,10 @@ void tx_history_destroy(tx_history_t *hist);
   requires \valid(hist);
   requires score >= 0.0 && score <= 1.0;
   assigns hist->chain[0 .. MAX_CHAIN_LEN - 1],
-          hist->chain_len, hist->task_map, hist->peer_map;
-  behavior full:
-    assumes hist->chain_len >= MAX_CHAIN_LEN;
-    ensures \result != 0;
-  behavior success:
-    assumes hist->chain_len < MAX_CHAIN_LEN;
-    ensures \result == 0;
-  disjoint behaviors;
+          hist->chain_len, hist->committed_count,
+          hist->next_index, hist->first_index,
+          hist->task_map, hist->peer_map;
+  ensures \result == 0;
 */
 int  tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
                        const uuid_t peer_uuid, double score);
@@ -155,6 +282,58 @@ int  tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
 */
 int  tx_history_by_task(const tx_history_t *hist, const uuid_t task_uuid,
                         transaction_t *out);
+
+/* Phase 1 hash-linking. transaction_entry_hash writes the blake2b digest
+ * (TX_HASH_HEX_LEN lowercase hex chars + NUL) of the canonical content
+ * chained with tx->prev_hash into `out` — the value the next entry records
+ * as its prev_hash. transaction_canonical_bytes writes the deterministic,
+ * language-agnostic serialization (everything EXCEPT prev_hash) used as the
+ * hash input; it MUST stay byte-identical to Python Transaction._canonical_bytes
+ * (pipe-joined fields, "%.17g" floats, lowercase-hyphenated UUIDs, "null" for
+ * unset). Returns the string length written (excluding NUL), or -1 on overflow. */
+int  transaction_canonical_bytes(const transaction_t *tx, char *out, size_t outsz);
+void transaction_entry_hash(const transaction_t *tx, char out[TX_HASH_HEX_LEN + 1]);
+
+/* Verify the hash-linkage of a contiguous committed chain: every adjacent
+ * pair must satisfy chain[i].prev_hash == entry_hash(chain[i-1]). The first
+ * entry's predecessor lies outside the segment and is not checked. Pending
+ * (index < 0) entries are skipped. Returns true if the segment is
+ * self-consistent (empty/single-entry chains trivially pass). Mirrors Python
+ * TransactionHistory.verify_chain_links / verify_links. */
+bool tx_verify_chain_links(const transaction_t *chain, int count);
+bool tx_history_verify_links(const tx_history_t *hist);
+
+/* Phase 2 ordered Merkle root (reputation-vs-blockchain-analysis.md §2.1).
+ * RFC 6962 Merkle Tree Hash with domain-separated leaf (0x00) and node (0x01)
+ * prefixes over each committed entry's entry_hash, in resident order. A single
+ * root commits to every resident entry; an inclusion proof confirms one tx
+ * belongs to the committed window in O(log n) without the whole chain. Pure
+ * function of the ordered leaf digests -> byte-identical to Python
+ * TransactionHistory.window_root. Empty window -> blake2b of the empty string.
+ * Writes TX_HASH_HEX_LEN hex chars + NUL to out. */
+void transaction_window_root(const tx_history_t *hist, char out[TX_HASH_HEX_LEN + 1]);
+
+/* One step of an inclusion (audit) path: a sibling subtree root and whether it
+ * sits on the LEFT of the running digest. Mirrors Python's
+ * (sibling_root, sibling_is_left) tuples. */
+typedef struct {
+    char sibling[TX_HASH_HEX_LEN + 1];
+    bool sibling_is_left;
+} tx_merkle_step_t;
+
+/* Build the RFC 6962 audit path proving the committed entry at absolute
+ * `abs_index` belongs to transaction_window_root(hist). Writes the step count
+ * into *n_steps (at most ceil(log2(window)) steps; `steps` must hold up to
+ * MAX_CHAIN_LEN). Returns 0 on success, -1 if abs_index is not resident.
+ * Mirrors Python TransactionHistory.inclusion_proof. */
+int  transaction_window_proof(const tx_history_t *hist, int abs_index,
+                              tx_merkle_step_t *steps, int *n_steps);
+
+/* Fold a leaf entry_hash up its audit path and check it reproduces root_hex.
+ * Mirrors Python TransactionHistory.verify_inclusion. */
+bool tx_merkle_verify(const char leaf_hex[TX_HASH_HEX_LEN + 1],
+                      const tx_merkle_step_t *steps, int n_steps,
+                      const char root_hex[TX_HASH_HEX_LEN + 1]);
 
 /*@
   requires \valid(hist);
@@ -181,15 +360,17 @@ int  tx_history_era(const tx_history_t *hist, int start_idx, int end_idx,
 /*@
   requires \valid(hist);
   assigns \nothing;
-  ensures \result == hist->chain_len;
+  ensures \result == hist->committed_count;
   ensures \result >= 0;
 */
 int  tx_history_len(const tx_history_t *hist);
 
 /*@
   requires \valid(hist);
-  assigns hist->task_map, hist->peer_map, hist->chain_len;
+  assigns hist->task_map, hist->peer_map, hist->chain_len,
+          hist->committed_count, hist->next_index, hist->first_index;
   ensures hist->chain_len == 0;
+  ensures hist->committed_count == 0;
 */
 void tx_history_free(tx_history_t *hist);
 
@@ -281,8 +462,14 @@ typedef struct {
   assigns \nothing;
   ensures \result >= 0.0 && \result <= 1.0;
 */
+/** Pure socially-weighted average. @p task_weights is a uuid_str -> int
+ *  map of per-task transaction_weight values (populated by the
+ *  reputation process at proposer + receiver time); pass NULL to
+ *  treat every transaction as weight 1. The weighted form lines up
+ *  with Python's _pure_reputation (trust-tiers.md §5). */
 double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
-                       const uuid_t peer_uuid);
+                       const uuid_t peer_uuid,
+                       const map_t *task_weights);
 
 /*@
   requires \valid(hist);
@@ -299,8 +486,28 @@ double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *re
   assigns \nothing;
   ensures \result >= 0.0 && \result <= 1.0;
 */
+/** @p task_weights forwarded to reputation_pure on the pure branch; NULL
+ *  → unweighted aggregator. CTFT branch ignores it. */
 double reputation_compute(const tx_history_t *hist, const reputations_t *reps,
-                          const uuid_t self_uuid, const uuid_t peer_uuid);
+                          const uuid_t self_uuid, const uuid_t peer_uuid,
+                          const map_t *task_weights);
+
+/*@
+  requires \valid(hist);
+  assigns \nothing;
+  ensures \result >= 0.0 && \result <= 1.0;
+*/
+/** Deterministic, history-only reputation score over the consensus tx
+ *  chain. Walks committed bilateral transactions involving @p peer_uuid
+ *  in chain order and folds each counterparty-side score into an
+ *  exponentially-weighted moving average with half-life
+ *  CONSENSUS_EMA_HALF_LIFE. @p task_weights weights each EMA update by
+ *  running it @c w times (a tier-w transaction moves the EMA exactly
+ *  as far as @c w tier-1 transactions would, preserving the [0,1]
+ *  range). NULL → unweighted. Mirrors Python's
+ *  ReputationProcess._consensus_reputation. */
+double reputation_consensus(const tx_history_t *hist, const uuid_t peer_uuid,
+                            const map_t *task_weights);
 
 /* paxos_id_index is provided by algorithms/paxos.h */
 

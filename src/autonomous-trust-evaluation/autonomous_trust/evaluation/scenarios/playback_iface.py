@@ -237,6 +237,15 @@ class PlaybackInterface(ScenarioInterface):
         dispatches them, before our scenario_event_handlers fire."""
         self._engine.on_event(h)
 
+    def register_snapshot_handler(
+            self, h: Callable[[dict, timedelta], None]) -> None:
+        """Subscribe to recorded snapshot records (reputation samples,
+        sensor readings, etc.) from the playback sidecar. Passthrough
+        to ``PlaybackEngine.on_snapshot`` — exposed here so callers
+        don't have to reach through the interface for it.
+        """
+        self._engine.on_snapshot(h)
+
     # --- internals ---------------------------------------------------
 
     def _dispatch_scenario_event(self, ev: ScenarioEvent,

@@ -1,0 +1,42 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: transaction-committed-bilateral
+byte_pinning: false
+description: |
+    Pins Phase 3 (Bug 5 fix): after a proposer's `handle_accepted`
+    reaches majority and commits locally, it broadcasts a
+    `tx committed` message carrying (task_uuid, peer_uuid, score).
+    Each acceptor handles the broadcast by writing the same entry
+    to its own history.  This is what makes bilateral Transactions
+    form across peers' local histories — without it, every peer
+    sees only its own submissions and CTFT can never find a
+    p1=peer / p2=self entry to score against.
+
+    Here we drive the broadcast leg directly: bob receives a
+    `tx committed` from alice (the proposer) and writes
+    (task=t-1, peer=alice, score=0.8) to bob's history.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      score: 0.8
+
+# No expected_state pin: Python and C have a pre-existing
+# divergence on when TransactionHistory's chain length advances
+# (Python on the bilateral-completion update, C on the first slot
+# fill).  The bilateral-history invariant itself is pinned by the
+# unit tests in tests/a_unit/test_reputation.py
+# (TestProposerHistoryBilateral) and src/c/test/reputation3_test.c.
+# This scenario's job is just to prove both adapters route the new
+# `tx committed` function without raising "unhandled message".

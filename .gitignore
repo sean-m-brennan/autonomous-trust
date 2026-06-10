@@ -23,6 +23,12 @@
 
 **/attic
 
+# Per-peer persistent state for the dod-mission demo. Created by
+# tools/seed_dod_cohort.py and bind-mounted into each compose service /
+# k8s pod's $AUTONOMOUS_TRUST_ROOT. Regenerated on every run-demo.sh
+# unless AT_PRESEED=0.
+/.demo-state/
+
 **/__pycache__
 **/*.egg-info
 **/.tox
@@ -146,3 +152,10 @@ embedded/signing.pub
 /doc/tekfive/Figure_3.png
 /src/c/doc/
 /src/c/autonomous_trust/version.h
+/.scale-results/
+
+# SG2 detection prep: panorama + catalogue regenerated on first run
+/examples/dod_mission/assets/video/naip_huntsville.jpg
+/examples/dod_mission/assets/video/naip_huntsville.geo.json
+/examples/dod_mission/assets/detections/catalogue.json
+/examples/dod_mission/assets/detections/crops/*.jpg

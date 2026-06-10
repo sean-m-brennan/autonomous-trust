@@ -17,8 +17,11 @@
 import traceback
 from queue import Empty, Full
 from datetime import timedelta
+from uuid import UUID
 
 from ..capabilities import Capability
+from ..config import from_json_string
+from ..identity.protocol import IdentityProtocol
 from ..network import Message
 from ..processes import Process, ProcMeta
 from .protocol import NegotiationProtocol
@@ -58,6 +61,10 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(NegotiationProtocol.status_req, self.handle_stat_req)
         self.protocol.register_handler(NegotiationProtocol.status_resp, self.handle_stat_resp)
         self.protocol.register_handler(NegotiationProtocol.result, self.handle_results)
+        # Trust-tier demotion → cancel in-flight tasks the peer is no
+        # longer authorised for. Local IPC from ReputationProcess; see
+        # doc/architecture/trust-tiers.md §7.2.
+        self.protocol.register_handler(IdentityProtocol.tier_lost, self.handle_tier_lost)
 
     @property
     def peers(self):
@@ -150,12 +157,32 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                     self.logger.debug('Remote task refused: not capable')
                 else:
-                    sender_level = self.peers._find(self.peers._index_by(message.from_whom))
-                    if sender_level is not None and sender_level == 0:
+                    # Trust-tier gate. Refuse if the sender's reputation-
+                    # derived tier is below the capability's required_tier
+                    # (capabilities.py:Capability). Generalises the prior
+                    # hierarchy-bucket check; see
+                    # doc/architecture/trust-tiers.md §7.1.
+                    sender = None
+                    if message.from_whom is not None:
+                        sender = self.peers.find_by_uuid(
+                            getattr(message.from_whom, 'uuid', None))
+                    sender_tier = getattr(sender, '_tier', 0) if sender is not None else 0
+                    # Capabilities is keyed by name; the task carries a
+                    # serialized Capability whose required_tier may have
+                    # been built with defaults (e.g. by a remote peer or
+                    # the conformance harness). The local registered
+                    # Capability — set via TrustLadder at startup —
+                    # is the authoritative source of required_tier for
+                    # gating *my* acceptance. See trust-tiers.md §7.1.
+                    local_cap = self.capabilities[task.capability.name]
+                    required_tier = getattr(local_cap, 'required_tier', 0)
+                    if sender_tier < required_tier:
                         msg = Message(self.name, NegotiationProtocol.refusal,
                                       task.to_json_string(), message.from_whom)
                         queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                        self.logger.debug('Remote task refused: peer reputation too low')
+                        self.logger.debug(
+                            'Remote task refused: sender tier %d < required %d',
+                            sender_tier, required_tier)
                     elif task.parameters.acceptable():
                         if self._add_task(task):
                             msg = Message(self.name, NegotiationProtocol.acceptance,
@@ -311,6 +338,134 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     self.logger.error('handle_results: Main queue full')
             return True
         return False
+
+    def handle_tier_lost(self, queues, message):
+        """Cancel in-flight tasks the affected peer is no longer
+        authorised to participate in. Triggered by a tier_lost IPC
+        from ReputationProcess on demotion. See
+        doc/architecture/trust-tiers.md §7.2.
+
+        Walks two surfaces:
+        - ``self.task_stack`` (worker side): jobs scheduled for me to
+          execute on behalf of the affected peer. Cancelled if the
+          task's capability.required_tier > new_tier.
+        - ``self.my_tasks`` (requestor side): trackers for tasks I've
+          requested from peers. If the affected peer is a participant
+          AND the capability now requires a higher tier than they
+          hold, drop them from the tracker.
+        """
+        if message.function != IdentityProtocol.tier_lost:
+            return False
+        try:
+            payload = (from_json_string(message.obj)
+                       if isinstance(message.obj, (str, bytes))
+                       else message.obj)
+            if not (isinstance(payload, (list, tuple)) and len(payload) >= 2):
+                self.logger.warning('handle_tier_lost: bad payload %r' % payload)
+                return True
+            peer_uuid_str, new_tier = str(payload[0]), int(payload[1])
+        except Exception as err:
+            self.report_exception(err, 'handle_tier_lost')
+            return True
+
+        try:
+            # Normalize: target keeps a UUID for set-key lookups in
+            # tracker.results (which use UUID keys), and a string for
+            # comparing against task.requestor.uuid — that attribute
+            # round-trips through JSON as a string in production IPC.
+            target_uuid = UUID(peer_uuid_str)
+            target_str = str(target_uuid)
+        except (ValueError, AttributeError):
+            self.logger.warning(
+                'handle_tier_lost: bad peer uuid %r' % peer_uuid_str)
+            return True
+
+        cancelled_jobs = 0
+        # Worker-side: cancel scheduled jobs originated by the
+        # demoted peer when their tier no longer satisfies the
+        # capability's required_tier. JobQueue stores tuples on a
+        # heap; iterate ._heap directly (no public __iter__). The
+        # required_tier comes from the locally-registered capability,
+        # not the wire-form Capability on the task — same policy
+        # source as handle_invite's tier gate.
+        try:
+            kept: list = []
+            for entry in list(self.task_stack._heap):
+                job = entry[2]
+                task = job.task
+                try:
+                    local_cap = self.capabilities[task.capability.name]
+                except KeyError:
+                    local_cap = task.capability
+                req = getattr(local_cap, 'required_tier', 0)
+                requestor = getattr(task, 'requestor', None)
+                req_uuid = getattr(requestor, 'uuid', None) if requestor is not None else None
+                if req_uuid is not None and str(req_uuid) == target_str and req > new_tier:
+                    cancelled_jobs += 1
+                    self.logger.info(
+                        'Cancelling scheduled task %s: requestor %s tier %d < required %d',
+                        task.uuid, peer_uuid_str, new_tier, req)
+                else:
+                    kept.append(job)
+            if cancelled_jobs:
+                self.task_stack.clear()
+                for j in kept:
+                    self.task_stack.push(j)
+        except Exception as err:
+            self.report_exception(err, 'handle_tier_lost.task_stack')
+
+        # Requestor-side: drop the demoted peer from any tracker
+        # whose capability now exceeds their tier. TaskTracker IS a
+        # Task subclass (carries .capability and .results directly);
+        # there is no nested `.task` attribute. Tracker.results may
+        # be keyed by either UUID or str depending on whether the
+        # tracker was populated locally (UUID) or via the JSON IPC
+        # path (str) — match either. If dropping empties the tracker,
+        # emit TaskResult(Status.cancelled) to main and remove the
+        # entry so further `result` messages are rejected. The
+        # required_tier comes from the locally-registered capability
+        # when known; falls back to the wire-form Capability on the
+        # tracker (defaulting to 0).
+        try:
+            for task_uuid, tracker in list(self.my_tasks.items()):
+                try:
+                    local_cap = self.capabilities[tracker.capability.name]
+                except KeyError:
+                    local_cap = tracker.capability
+                req = getattr(local_cap, 'required_tier', 0)
+                if req <= new_tier:
+                    continue
+                # Try both UUID and str forms — tracker.results may
+                # carry either depending on construction path.
+                drop_key = None
+                if target_uuid in tracker.results:
+                    drop_key = target_uuid
+                elif target_str in tracker.results:
+                    drop_key = target_str
+                if drop_key is not None:
+                    del tracker.results[drop_key]
+                    cancelled_jobs += 1
+                    self.logger.info(
+                        'Dropped %s from task %s: tier %d < required %d',
+                        peer_uuid_str, task_uuid, new_tier, req)
+                if len(tracker.results) == 0:
+                    try:
+                        result = TaskResult(
+                            tracker, Status.cancelled, None)
+                        queues[CfgIds.main].put(
+                            result, block=True, timeout=self.q_cadence)
+                    except Full:
+                        self.logger.error(
+                            'handle_tier_lost: main queue full')
+                    del self.my_tasks[task_uuid]
+        except Exception as err:
+            self.report_exception(err, 'handle_tier_lost.my_tasks')
+
+        if cancelled_jobs:
+            self.logger.info(
+                'tier_lost on %s -> %d: %d task(s) cancelled',
+                peer_uuid_str, new_tier, cancelled_jobs)
+        return True
 
     def process(self, queues, signal):
         # Drain budget per iter — same shape as repprocess.py. The

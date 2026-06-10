@@ -44,7 +44,6 @@ from dash_extensions.enrich import html
 IDS = {
     "topbar_clock":      "demo-topbar-clock",
     "topbar_phase":      "demo-topbar-phase",
-    "topbar_status":     "demo-topbar-status",
     "topbar_keystats":   "demo-topbar-keystats",
     "panel_map":         "demo-panel-map",
     "panel_graph":       "demo-panel-graph",
@@ -95,13 +94,10 @@ def _topbar(scenario_title: str, scenario_subtitle: str) -> html.Div:
             html.Div("-- / --", id=IDS["topbar_phase"],
                      className="demo-topbar__phase"),
             # Key-stat callouts (KeyStatTracker output). Pushed right via
-            # margin-left:auto in CSS so it sits between the phase
-            # indicator and the status chip. Empty by default; populated
-            # each tick.
+            # margin-left:auto in CSS so it hugs the right edge of the
+            # topbar. Empty by default; populated each tick.
             html.Div(id=IDS["topbar_keystats"], children=[],
                      className="demo-topbar__keystats"),
-            html.Div("MONITORING", id=IDS["topbar_status"],
-                     className="demo-topbar__status"),
         ],
     )
 
@@ -242,21 +238,3 @@ def format_phase(idx: int, total: int, name: str = "") -> str:
     return f"{idx + 1}/{total} {name}".strip()
 
 
-def classify_status(has_compromise_detected: bool,
-                    has_rogue_excluded: bool,
-                    any_peer_onboarding: bool) -> tuple[str, str]:
-    """Return (label, css_class) for the top-bar status chip.
-
-    The demo's decision narrative gets a visibly distinct status:
-      - 'EXCLUSION CONFIRMED' after the rogue is cut off (is-ok: autonomous
-        network behavior worked)
-      - 'COMPROMISE DETECTED' while detection is in progress (is-alert)
-      - 'MONITORING' otherwise
-    """
-    if has_rogue_excluded:
-        return "EXCLUSION CONFIRMED", "demo-topbar__status is-ok"
-    if has_compromise_detected:
-        return "COMPROMISE DETECTED", "demo-topbar__status is-alert"
-    if any_peer_onboarding:
-        return "ONBOARDING", "demo-topbar__status"
-    return "MONITORING", "demo-topbar__status"

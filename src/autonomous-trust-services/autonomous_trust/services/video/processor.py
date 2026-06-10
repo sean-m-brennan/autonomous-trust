@@ -38,6 +38,15 @@ class VideoProcessor(VideoProcess):
         self.count = 0
         model_path = os.path.join(os.path.dirname(__file__), self.model_filename)
         if not os.path.exists(model_path):
+            # Security open (S8, model checksum verification): the
+            # downloaded .tflite is consumed without integrity
+            # checking. A compromised storage host or MITM on the
+            # HTTPS transport could substitute a malicious model. Add
+            # an expected SHA-256 (pin alongside `model_url`) and
+            # verify after retrieval; refuse to instantiate the
+            # detector if the hash doesn't match. The `# noqa: S310`
+            # below silences Bandit's audit warning about the
+            # unverified download.
             try:
                 old_timeout = socket.getdefaulttimeout()
                 socket.setdefaulttimeout(30)

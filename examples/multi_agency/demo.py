@@ -54,7 +54,7 @@ from dash_extensions.enrich import (
 
 from autonomous_trust.inspector.dash_components.core import DashControl
 from autonomous_trust.inspector.dashboard.disaster_response_layout import (
-    IDS, build_dashboard, classify_status, format_clock, format_phase,
+    IDS, build_dashboard, format_clock, format_phase,
 )
 from autonomous_trust.inspector.dashboard.data_streams import DataStreamsPanel
 from autonomous_trust.inspector.dashboard.disaster_response_graph import (
@@ -103,7 +103,7 @@ _TICK_SAMPLE_SEC = 2.0  # how often the timeline samples reputation
 
 # Stage-2c element IDs.
 _GRAPH_GRAPH = "demo-trust-graph"
-_STREAMS_IFRAME = "demo-streams-iframe"
+_STREAMS_PANEL = "demo-streams-panel"
 _STREAMS_TICK_SEC = 1.0  # synthesize one reading per stream at 1 Hz
 
 # 3h sensor-comparison chart, embedded inside panel_detail. The chart
@@ -210,6 +210,13 @@ class MultiAgencyDemo:
         iface.register_event_log_handler(
             self._event_log_panel.add_from_event_record)
         iface.register_reset_handler(self._on_reset)
+        # Snapshot sidecar: in --record mode, _on_bridge_event also
+        # writes reputation/reading observations into the recorder's
+        # snapshot list. In --playback mode, this handler replays them
+        # back into the same in-process state the bridge would have
+        # populated (trust timeline samples + sensor chart history).
+        # Mirror of examples/dod_mission/__main__.py's snapshot wiring.
+        iface.register_snapshot_handler(self._on_snapshot)
 
         self._dash = DashControl(
             name="examples.multi_agency.demo",
@@ -306,11 +313,21 @@ class MultiAgencyDemo:
                       config={"displayModeBar": False},
                       responsive=True,
                       style={"height": "100%", "width": "100%"}))
+        # Native scrolling Div instead of an iframe srcDoc: Dash patches
+        # this node's `children` in place each tick, so the wrapping
+        # scrollable container keeps its identity and the user's scroll
+        # position survives the refresh. (Iframe srcDoc replacement
+        # tears down the whole document and forces a scroll-to-top.)
         self._replace_child_by_id(
             dashboard, IDS["panel_streams"],
-            html.Iframe(id=_STREAMS_IFRAME, srcDoc="",
-                        style={"width": "100%", "height": "100%",
-                               "border": "0", "background": "transparent"}))
+            html.Div(id=_STREAMS_PANEL,
+                     style={"width": "100%", "height": "100%",
+                            "overflowY": "auto",
+                            "background": "#1E1E2E",
+                            "padding": "8px",
+                            "borderRadius": "6px",
+                            "fontSize": "11px",
+                            "fontFamily": "monospace"}))
         return html.Div(children=[
             dcc.Interval(id=_TICK_INTERVAL_ID,
                          interval=_TICK_MS, n_intervals=0),
@@ -396,8 +413,6 @@ class MultiAgencyDemo:
         @self._dash.callback(
             Output(IDS["topbar_clock"], "children"),
             Output(IDS["topbar_phase"], "children"),
-            Output(IDS["topbar_status"], "children"),
-            Output(IDS["topbar_status"], "className"),
             Output(IDS["topbar_keystats"], "children"),
             Output(IDS["panel_log"], "children"),
             Output(IDS["narration_overlay"], "children"),
@@ -409,7 +424,7 @@ class MultiAgencyDemo:
             Output(_TIMELINE_GRAPH, "figure"),
             Output(_DETAIL_IFRAME, "srcDoc"),
             Output(_GRAPH_GRAPH, "figure"),
-            Output(_STREAMS_IFRAME, "srcDoc"),
+            Output(_STREAMS_PANEL, "children"),
             Output(_SENSOR_GRAPH, "figure"),
             Output(_SENSOR_DETAILS, "style"),
             Input(_TICK_INTERVAL_ID, "n_intervals"),
@@ -419,18 +434,6 @@ class MultiAgencyDemo:
             iface.tick()
             tel = iface.telemetry()
             states = scenario.peer_states
-            any_onboarding = any(
-                s == PeerState.PENDING for s in states.values())
-            any_detected = any(
-                s in (PeerState.DETECTED, PeerState.EXCLUDED)
-                for s in states.values())
-            any_excluded = any(
-                s == PeerState.EXCLUDED for s in states.values())
-            label, css = classify_status(
-                has_compromise_detected=any_detected,
-                has_rogue_excluded=any_excluded,
-                any_peer_onboarding=any_onboarding,
-            )
 
             clock = format_clock(tel.scenario_time)
             phase_str = format_phase(tel.current_phase_idx,
@@ -508,13 +511,13 @@ class MultiAgencyDemo:
             )
             graph_fig.update_layout(uirevision="demo-graph")
             demo._update_streams(tel.scenario_time, states)
-            streams_html = demo._streams_panel.to_html(height="100%")
+            streams_children = demo._streams_panel.to_dash_children()
 
-            return (clock, phase_str, label, css, keystats_children,
+            return (clock, phase_str, keystats_children,
                     log_children, nchildren, nstyle,
                     play_icon, time_label, progress_style,
                     map_fig, timeline_fig, detail_html,
-                    graph_fig, streams_html,
+                    graph_fig, streams_children,
                     sensor_fig, sensor_style)
 
         @self._dash.callback(
@@ -803,6 +806,12 @@ class MultiAgencyDemo:
                     score=score,
                 ))
             self._live_rep_peers.add(name)
+            self._maybe_record_snapshot({
+                "t": scenario_time,
+                "type": "REPUTATION_SAMPLE",
+                "peer": name,
+                "score": score,
+            })
             # Iframe srcDoc is rebuilt only when the selected peer
             # changes (see comment near the tick callback). Without
             # this nudge, the Reputation tab shows the score that was
@@ -843,6 +852,16 @@ class MultiAgencyDemo:
             self._streams_panel.update(reading)
             self._record_reading(reading)
             self._live_stream_peers.add(name)
+            self._maybe_record_snapshot({
+                "t": reading.timestamp.total_seconds(),
+                "type": "SENSOR_READING",
+                "peer": reading.peer_name,
+                "data_type": reading.data_type,
+                "value": float(reading.value),
+                "unit": reading.unit,
+                "quality": float(reading.quality),
+                "metadata": dict(reading.metadata or {}),
+            })
 
     def _on_reset(self) -> None:
         """Clear UI-derived state. Fired by ``PlaybackInterface.reset()``
@@ -877,6 +896,58 @@ class MultiAgencyDemo:
         # Force a re-render of the peer detail iframe on the next tick
         # so the user sees the post-reset state if a peer was selected.
         self._peer_detail_last_peer = "<unset>"
+
+    def _maybe_record_snapshot(self, snapshot: dict) -> None:
+        """Push a snapshot to the interface's recorder if one is
+        attached (i.e. ``--record FILE`` was passed). No-op in
+        ordinary live mode and in playback mode (where the recorder
+        is intentionally None so re-record loops don't compound).
+        """
+        recorder = getattr(self._iface, "event_recorder", None)
+        if recorder is None:
+            return
+        try:
+            recorder.record_snapshot(snapshot)
+        except Exception:
+            logger.exception(
+                "record_snapshot failed for %r", snapshot.get("type"))
+
+    def _on_snapshot(self, snap: dict, _t) -> None:
+        """Replay a snapshot sidecar entry into in-process state.
+
+        Mirror of the live ``_on_bridge_event`` paths for reputation
+        and reading tags: REPUTATION_SAMPLE appends a ReputationSample
+        to the trust-timeline buffer, SENSOR_READING reconstructs a
+        Reading and feeds the sensor history + streams panel. Unknown
+        types are silently ignored so older recordings stay compatible.
+        """
+        kind = snap.get("type")
+        try:
+            if kind == "REPUTATION_SAMPLE":
+                name = str(snap.get("peer", ""))
+                self._rep_samples.setdefault(name, []).append(
+                    ReputationSample(
+                        t=float(snap.get("t", 0.0)),
+                        peer_name=name,
+                        score=float(snap.get("score", 0.0)),
+                    ))
+                self._live_rep_peers.add(name)
+            elif kind == "SENSOR_READING":
+                reading = Reading(
+                    timestamp=timedelta(seconds=float(snap.get("t", 0.0))),
+                    peer_name=str(snap.get("peer", "")),
+                    data_type=str(snap.get("data_type", "")),
+                    value=float(snap.get("value", 0.0)),
+                    unit=str(snap.get("unit", "")),
+                    quality=float(snap.get("quality", 1.0)),
+                    metadata=dict(snap.get("metadata") or {}),
+                )
+                self._streams_panel.update(reading)
+                self._record_reading(reading)
+                self._live_stream_peers.add(reading.peer_name)
+        except Exception:
+            logger.exception(
+                "snapshot replay failed for %r", kind)
 
     def _record_reading(self, reading: Reading) -> None:
         """Append a reading to the per-(data_type, peer) ring used by

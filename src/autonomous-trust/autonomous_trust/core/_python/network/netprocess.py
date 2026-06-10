@@ -28,6 +28,7 @@ import nacl
 
 from ..protocol import Protocol
 from ..identity import Identity
+from ..identity.protocol import IdentityProtocol
 from ..processes import Process, ProcMeta
 from .. import _probes
 from ..identity import Group
@@ -114,6 +115,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.statistics = {}
         self._rejected_addresses: set[str] = set()
         self._crypto_error_counts: dict[str, int] = {}
+        # Partition-recovery signal cooldown: per-source-address timestamp
+        # of the last signal we forwarded to IdentityProcess. Bounded at
+        # one signal per address per 5 seconds so a chatty rejected-group
+        # peer can't flood the identity queue.
+        #   See doc/architecture/partition-recovery.md §5.1.
+        self._partition_signal_lru: dict[str, datetime] = {}
         # Lazily created in process(). ThreadPoolExecutor can't be
         # pickled, so creating it here would break the multiprocessing
         # spawn handoff. See `_ensure_ping_pool`.
@@ -140,6 +147,30 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     @property
     def group(self):
         return self.protocol.group
+
+    @property
+    def child_groups(self):
+        # dict[group-uuid-str -> Group] for cohorts this node gateways.
+        # Empty on leaf nodes, so the group-receive fast path below is
+        # unchanged for them. See doc/architecture/gateway-reputation-tree.md.
+        return getattr(self.protocol, 'child_groups', {}) or {}
+
+    def _group_for_sender(self, from_addr):
+        """Return the group (primary or child) whose address map contains
+        ``from_addr``, or None. Checks the primary group first so a leaf
+        node (no child groups) takes exactly the historical path; only a
+        gateway falls through to its child groups, letting it decrypt a
+        frame from a cohort below it with that cohort's own key."""
+        grp = self.group
+        if grp is not None and from_addr in grp.addresses:
+            return grp
+        for child in self.child_groups.values():
+            try:
+                if from_addr in child.addresses:
+                    return child
+            except Exception:
+                continue
+        return None
 
     def track_send_stats(self, uuid, num_bytes):
         if uuid not in self.statistics:
@@ -221,6 +252,44 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     def blacklist_address(self, address):
         """Add an address to the rejection list."""
         self._rejected_addresses.add(address)
+
+    _PARTITION_SIGNAL_COOLDOWN = 5.0  # seconds, per from_addr
+
+    def _signal_partition(self, queues, from_addr):
+        """Forward a partition-recovery signal to IdentityProcess.
+
+        Called from the group-channel drop site when ``from_addr`` is
+        not in our group's address list — a possible split-brain
+        indication. We do not validate or decrypt the original message
+        (we can't; it was encrypted under another group's key); the
+        signal payload is just the source address so IdentityProcess
+        can decide whether to emit an unsecured-multicast
+        ``partition_probe`` toward that address's group.
+
+        Rate-limited at one signal per ``from_addr`` per 5 seconds —
+        a chatty cross-group peer would otherwise let this queue grow
+        without bound and starve real identity traffic.
+
+        See doc/architecture/partition-recovery.md §5.1.
+        """
+        now = datetime.now()
+        last = self._partition_signal_lru.get(from_addr)
+        if (last is not None
+                and (now - last).total_seconds() < self._PARTITION_SIGNAL_COOLDOWN):
+            return
+        self._partition_signal_lru[from_addr] = now
+        target = queues.get(CfgIds.identity)
+        if target is None:
+            return
+        signal = Message(CfgIds.identity,
+                         IdentityProtocol.partition_signal,
+                         from_addr,
+                         encrypt=False)
+        try:
+            target.put(signal, block=True, timeout=self.q_cadence)
+            _probes.counter('net.group', 'partition_signal_emitted', from_addr)
+        except Full:
+            _probes.counter('net.group', 'partition_signal_drop', 'queue_full')
 
     def _ensure_ping_pool(self):
         """Lazily instantiate the ping thread pool inside the subprocess.
@@ -535,8 +604,22 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     self.logger.error('Network: %s' % err)
                                     self.track_send_error(self.unknown_peer)
                             elif isinstance(message.to_whom, Group):
-                                if message.encrypt and self.group is not None:
-                                    msg = self.group.encrypt(bytes(message), self.group)
+                                # Encrypt with the TARGET group's key when
+                                # we hold its private half (e.g. a gateway
+                                # addressing one of its child cohorts);
+                                # otherwise fall back to the primary group,
+                                # which is the historical single-group
+                                # behaviour for a leaf node.
+                                enc_grp = self.group
+                                tgt = message.to_whom
+                                try:
+                                    if (not getattr(tgt, '_public_only', True)
+                                            and getattr(tgt.encryptor, 'private', None) is not None):
+                                        enc_grp = tgt
+                                except Exception:
+                                    enc_grp = self.group
+                                if message.encrypt and enc_grp is not None:
+                                    msg = enc_grp.encrypt(bytes(message), enc_grp)
                                 else:
                                     msg = bytes(message)
                                 for addr in message.to_whom.addresses:
@@ -625,10 +708,17 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     except IndexError:
                         break
                     drained_grp += 1
-                    if from_addr in self.group.addresses:
+                    # Resolve which group this sender belongs to. For a
+                    # leaf node this is always the primary group (or
+                    # None), so the path is identical to before. A
+                    # gateway additionally matches its child groups,
+                    # decrypting a cohort-below frame with that cohort's
+                    # own key. See doc/architecture/gateway-reputation-tree.md.
+                    sender_group = self._group_for_sender(from_addr)
+                    if sender_group is not None:
                         from_whom = self.peers.find_by_address(from_addr)
                         try:
-                            decrypt_msg = self.group.decrypt(raw_msg, self.group)
+                            decrypt_msg = sender_group.decrypt(raw_msg, sender_group)
                             if from_whom is not None:
                                 self._msg_to_queue(decrypt_msg, from_whom, queues, 'group')
                             else:
@@ -649,9 +739,13 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         _probes.counter('net.group', 'drop', 'sender_not_in_group')
                         self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
                         self.logger.debug('Ignored payload: %d bytes from %s' % (len(raw_msg), from_addr))
-                        # TODO: Query other group members for the unknown sender's
-                        # identity — they may have admitted this peer while we were
-                        # partitioned. Requires a group-level identity gossip protocol.
+                        # Forward a partition-recovery signal to IdentityProcess
+                        # so it can probe the foreign group and, if larger,
+                        # initiate a normal request_access against it. The
+                        # actual merge runs through the existing _merge_to_mesh
+                        # path; this signal only kicks the probe.
+                        #   See doc/architecture/partition-recovery.md §5.1.
+                        self._signal_partition(queues, from_addr)
                 total_inbound += drained_grp
 
                 # async recv stranger messages (separate channel)

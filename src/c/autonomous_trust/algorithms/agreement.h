@@ -48,12 +48,20 @@ typedef struct {
 typedef struct {
     char uuid[AGREEMENT_UUID_LEN];
     int rank;
+    /* Reputation-derived trust tier (0..4). Distinct from rank
+     * (network topology); read by AgreementByTrust (PoT). PoA/PoS/PoW
+     * leave this 0 — they all key off rank or stake instead. See
+     * doc/architecture/trust-tiers.md §1. */
+    int tier;
 } agreement_voter_t;
 
 typedef enum {
     AGREEMENT_AUTHORITY,
     AGREEMENT_STAKE,
-    AGREEMENT_WORK
+    AGREEMENT_WORK,
+    /* Proof of Trust — parallel to AUTHORITY but reads voter.tier
+     * instead of voter.rank. See doc/architecture/trust-tiers.md §10. */
+    AGREEMENT_TRUST
 } agreement_type_t;
 
 /* PoW canonical difficulty — leading zero BYTES required on the digest
@@ -71,6 +79,11 @@ typedef enum {
  * the explicit override is None (authority.py:30-39). Any negative
  * value works; this name reads cleaner at call sites. */
 #define AUTHORITY_THRESHOLD_DERIVE (-1)
+
+/* Pass to agreement_by_trust_create's @c threshold_tier arg to select
+ * dynamic top-1/3 derivation from the current voter set (mirrors PoA;
+ * see trust.py:32-40). Any negative value works. */
+#define TRUST_THRESHOLD_DERIVE (-1)
 
 typedef struct agreement_protocol_s agreement_protocol_t;
 
@@ -120,6 +133,10 @@ struct agreement_protocol_s {
             int difficulty;                                /**< PoW target (leading-zero bits). */
             array_t *approved;                             /**< UUIDs whose proof has cleared @c difficulty. */
         } work;
+        /** @brief Valid when @c type == @ref AGREEMENT_TRUST. */
+        struct {
+            int threshold_tier;                            /**< Minimum tier that counts. -1 = derive top-1/3. */
+        } trust;
     } state;
 };
 
@@ -197,6 +214,33 @@ int agreement_by_authority_create(agreement_voter_t *myself,
                                   agreement_voter_t *others, int other_count,
                                   int threshold_rank,
                                   agreement_protocol_t **proto);
+
+/*@
+  requires myself != \null && \valid(myself);
+  requires \valid(proto);
+  allocates *proto;
+  behavior success:
+    ensures \result == 0;
+    ensures *proto != \null;
+    ensures (*proto)->type == AGREEMENT_TRUST;
+  behavior failure:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
+/**
+ * Construct an AGREEMENT_TRUST (PoT) protocol.
+ *
+ * Parallel to agreement_by_authority_create but reads voter.tier
+ * instead of voter.rank. Pass a non-negative @p threshold_tier to pin
+ * the cutoff explicitly, or @ref TRUST_THRESHOLD_DERIVE (-1) to let
+ * the protocol derive the threshold dynamically from the current
+ * voter set as the top-1/3 cutoff. Mirrors Python
+ * AgreementByTrust (trust.py); see doc/architecture/trust-tiers.md §10.
+ */
+int agreement_by_trust_create(agreement_voter_t *myself,
+                              agreement_voter_t *others, int other_count,
+                              int threshold_tier,
+                              agreement_protocol_t **proto);
 
 /*@
   requires myself != \null && \valid(myself);

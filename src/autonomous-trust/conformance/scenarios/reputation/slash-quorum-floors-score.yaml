@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: slash-quorum-floors-score
+byte_pinning: false
+description: |
+    Slashing fast-penalty path — the cross-language regression for the
+    "short-lived rogue stuck at baseline" bug (dod_mission mq800).
+
+    A finalized slash (slash_final), once delivered, floors the target's
+    reputation immediately — bypassing the consensus EMA, which is far too
+    slow (half-life 20 committed txs) for a peer active only seconds.
+
+    alice (detector) has collected a quorum of co-signatures and broadcasts
+    slash_final naming rogue with floor 0.0. bob (a member) applies it and
+    rogue's reputation reads 0.0 thereafter. Both the Python and C
+    reputation processes must reach the same floored state.
+
+participants:
+  - id: alice
+    role: detector
+  - id: bob
+    role: member
+  - id: rogue
+    role: target
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: slash final
+    payload:
+      target: rogue
+      floor_score: 0.0
+      epoch: 1
+    description: |
+        alice broadcasts the quorum-finalized slash of rogue; bob applies
+        the floor to rogue's reputation.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.0

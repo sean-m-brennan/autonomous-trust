@@ -64,9 +64,13 @@ class AgreementVoter(ABC):
     """
     Minimum abstract class for peers participating in agreements
     """
-    def __init__(self, _uuid, _rank):
+    def __init__(self, _uuid, _rank, _tier=0):
         self._uuid = _uuid
         self._rank = _rank
+        # Trust tier (0..4) — reputation-derived access level, distinct
+        # from topological rank. Read by AgreementByTrust; PoA voters
+        # leave it at 0. See doc/architecture/trust-tiers.md §1.
+        self._tier = _tier
 
     @property
     def uuid(self):
@@ -75,6 +79,10 @@ class AgreementVoter(ABC):
     @property
     def rank(self):
         return self._rank
+
+    @property
+    def tier(self):
+        return self._tier
 
     @abstractmethod
     def verify(self, proof: AgreementProof, sig: bytes) -> bool:

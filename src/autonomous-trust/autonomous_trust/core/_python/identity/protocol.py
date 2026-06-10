@@ -71,11 +71,36 @@ class IdentityProtocol(Protocol):
     caps_query = 'peer_caps_query'  # msg.obj <- '' (sender just asks)
     caps_response = 'peer_caps_response'  # msg.obj <- caps list (json)
     # Local-only IPC (no wire egress). ReputationProcess emits these to
-    # CfgIds.identity when a peer's reputation crosses a tier boundary
-    # so IdentityProcess can bump the AgreementVoter rank on its local
-    # peer mirror; the next POA vote tally then weighs the elevated rank.
-    # See BUGS.md §P2.
-    rank_update = 'rank_update'  # msg.obj <- (peer_uuid_str, new_rank_int)
+    # CfgIds.identity when a peer's reputation crosses a TIER_FLOORS
+    # boundary so IdentityProcess can update the peer's trust tier on
+    # its local mirror; capability-gated negotiation reads peer._tier.
+    # See doc/architecture/trust-tiers.md for the rank-vs-tier split.
+    tier_update = 'tier_update'  # msg.obj <- (peer_uuid_str, new_tier_int)
+    # Local-only IPC (no wire egress). ReputationProcess emits this to
+    # CfgIds.negotiation when a peer's trust tier drops (demotion).
+    # NegotiationProcess.handle_tier_lost cancels any in-flight tasks
+    # whose capability.required_tier exceeds new_tier. See
+    # doc/architecture/trust-tiers.md §7.2.
+    tier_lost = 'tier_lost'  # msg.obj <- (peer_uuid_str, new_tier_int)
+    # Group partition recovery (doc/architecture/partition-recovery.md).
+    # partition_signal: local-only IPC. NetProcess emits this when it
+    # receives group-channel traffic from a sender that is not in our
+    # group's address list — a possible split-brain signal.
+    #   msg.obj <- str (from_addr "host:port" of the rejected message)
+    partition_signal = 'partition_signal'
+    # partition_probe / partition_response: wire-facing, unsecured
+    # multicast. Probe broadcasts our group's uuid+size; response
+    # carries the responder's group uuid+size+leader-address so the
+    # probe sender can decide whether to initiate a normal request_access
+    # to join the larger group.
+    #   probe.obj    <- {"from_uuid", "from_address", "my_group_uuid",
+    #                    "my_group_size", "signature"}
+    #   response.obj <- {"from_uuid", "from_address", "in_response_to",
+    #                    "my_group_uuid", "my_group_size",
+    #                    "my_group_leader", "my_group_leader_address",
+    #                    "signature"}
+    partition_probe = 'group_partition_probe'
+    partition_response = 'group_partition_response'
 
 
 if __name__ == '__main__':

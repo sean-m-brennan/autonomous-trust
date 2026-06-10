@@ -50,6 +50,15 @@ typedef struct
     map_t arguments; // map of name to data_type_t
     bool local;
     capability_function_t function;
+    /* Trust-tier metadata — mirrors Python Capability.required_tier /
+     * transaction_weight (capabilities.py). required_tier = minimum
+     * peer.tier needed to invoke this capability (0 = any admitted).
+     * transaction_weight = multiplier applied in _pure_reputation;
+     * proto3 can't distinguish "not set" from 0, so consumers treat
+     * 0 as 1 (sentinel for back-compat with peers lacking the field).
+     * See doc/architecture/trust-tiers.md §4. */
+    int required_tier;
+    int transaction_weight;
 } capability_t;
 
 typedef map_t peer_capabilities_matrix_t;   // map of UUID string to array of capabilities

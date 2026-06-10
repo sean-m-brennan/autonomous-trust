@@ -28,6 +28,7 @@ scripted scenario timeline to JSON for later --playback.
 
 import argparse
 import atexit
+import logging
 import os
 import signal as _signal
 import sys
@@ -173,6 +174,19 @@ def _parse_args(argv):
 
 
 def main(argv=None):
+    # Install a root handler so demo.py's module-level `logger.info(...)`
+    # (and anything else in this dashboard-host process) actually reaches
+    # stderr.  Without it, Python's lastResort handler filters everything
+    # below WARNING.  See examples/dod_mission/coordinator.py:main() for
+    # the AT-side rationale (Automaton only handler-binds its own class
+    # logger); this process isn't an Automaton, but the same getLogger
+    # trap applies because no other handler gets attached to root.
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     log_level = _LOG_LEVEL_BY_NAME[args.log_level]
 

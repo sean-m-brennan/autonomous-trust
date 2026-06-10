@@ -39,6 +39,7 @@ class Status(Enum):
     unknown = 'unknown'  # not tracking this task
     no_peers = 'no_peers'  # no capable peers found
     rejected = 'rejected'  # task rejected (reputation too low, etc.)
+    cancelled = 'cancelled'  # task cancelled mid-flight (e.g. tier_lost; see trust-tiers.md §7.2)
 
     @classmethod
     def from_ps(cls, status):

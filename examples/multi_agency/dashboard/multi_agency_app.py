@@ -13,10 +13,10 @@ military-specific colors, map styles, and data types.
 from __future__ import annotations
 
 from autonomous_trust.inspector.dashboard.trust_timeline import TrustTimeline
-from autonomous_trust.inspector.dashboard.event_log import EventLog
+from autonomous_trust.inspector.dashboard.event_log import EventLogPanel
 from autonomous_trust.inspector.dashboard.sensor_chart import SensorComparisonChart
 from autonomous_trust.inspector.dashboard.data_streams import DataStreamsPanel
-from autonomous_trust.inspector.dashboard.peer_detail import PeerDetailDrawer
+from autonomous_trust.inspector.dashboard.peer_detail import PeerDetailPanel
 
 from examples.multi_agency.scenario import (
     DisasterResponseScenario,
@@ -74,14 +74,9 @@ def build_dashboard(scenario: DisasterResponseScenario) -> dict:
         title="Wind Speed — NOAA Sensors",
     )
 
-    # Event log
-    event_log = EventLog(max_entries=200)
-
-    # Data streams panel
+    event_log = EventLogPanel(capacity=200)
     streams = DataStreamsPanel(peer_colors=colors)
-
-    # Peer detail drawer
-    detail = PeerDetailDrawer()
+    detail = PeerDetailPanel()
 
     return {
         "trust_timeline": timeline,

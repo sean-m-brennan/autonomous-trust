@@ -45,7 +45,11 @@ class MetadataProtocol(Protocol):
 
 class TimeSource(object):
     def acquire(self) -> datetime:
-        # TODO tap into custom NTP
+        # Open: tap into custom NTP. Currently returns local
+        # wall-clock UTC; for distributed-trust scenarios a
+        # peer-shared time source (or the C-side native RFC 5905
+        # client at network/ntp.c) would let participants agree on
+        # event ordering across drift.
         return datetime.now(UTC)
 
 
@@ -77,7 +81,12 @@ class Metadata(InitializableConfig):
 
     @property
     def position_source(self):
-        return self.name_to_class(self.position_src_class)()  # TODO params?
+        # Open: position-source constructor params. Today every
+        # registered class must accept no-arg __init__. If position
+        # sources need configuration (e.g. GPS device path,
+        # GeoPosition origin reference), Metadata would need to carry
+        # an additional kwargs payload and pass it through here.
+        return self.name_to_class(self.position_src_class)()
 
     @property
     def time_source(self):

@@ -32,7 +32,7 @@ if command -v cargo >/dev/null 2>&1 && command -v maturin >/dev/null 2>&1; then
   echo "========== Building ZKP module =========="
   (cd "$zkp_dir" && maturin develop --release --manifest-path rust/Cargo.toml)
 elif command -v cargo >/dev/null 2>&1; then
-  echo "WARNING: maturin not found, skipping ZKP build (pip install maturin)" >&2
+  echo "WARNING: maturin not found, skipping ZKP build (conda install -c conda-forge maturin)" >&2
 else
   echo "WARNING: Rust toolchain not found, skipping ZKP build (install rustup)" >&2
 fi

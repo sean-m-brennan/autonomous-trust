@@ -161,8 +161,39 @@ typedef struct {
       td->nsecs < 1000000000;
 */
 
-// FIXME normalization:
-// timedelta(microseconds=-1) == (days=-1, seconds=86399, ms=999999)
+/**
+ * @brief Normalize a (days, seconds, nsecs) triple into a canonical
+ *        @ref timedelta_t with @c 0 <= seconds < 86400 and
+ *        @c 0 <= nsecs < 1000000000.
+ *
+ * Accepts signed inputs so the caller can express intermediate values
+ * outside the normalized ranges — most notably negative microseconds.
+ * Python's `datetime.timedelta` normalizes the same way:
+ *
+ *   timedelta(microseconds=-1) → (days=-1, seconds=86399, ms=999999)
+ *
+ * Carry propagates from @p nsecs into @p seconds and from @p seconds
+ * into @p days; sign is absorbed into @p days only.
+ *
+ * @param[in]  days     Day component (may be negative).
+ * @param[in]  seconds  Second component (any sign / magnitude).
+ * @param[in]  nsecs    Nanosecond component (any sign / magnitude).
+ * @param[out] out      Receives the normalized triple.
+ * @return 0 on success, non-zero on @c \null @p out.
+ */
+/*@
+  requires out != \null && \valid(out);
+  assigns *out;
+  behavior success:
+    ensures \result == 0;
+    ensures valid_timedelta(out);
+    ensures \initialized(out);
+  behavior error:
+    ensures \result != 0;
+  disjoint behaviors;
+*/
+int timedelta_normalize_long(long days, long seconds, long nsecs,
+                             timedelta_t *out);
 
 /**
  * @brief Parse a timedelta from a string ("Dd HH:MM:SS.nnnnnnnnn").

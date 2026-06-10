@@ -244,8 +244,10 @@ ffi.cdef("""
     } msg_str_t;
 
     int  identity_create(unsigned char *uuid, char *address, char *fullname,
+                         char *nickname, char *petname,
                          identity_t **ident);
-    int  identiry_init(unsigned char *uuid, char *address, char *fullname,
+    int  identity_init(unsigned char *uuid, char *address, char *fullname,
+                       char *nickname, char *petname,
                        identity_t *identity);
     int  identity_publish(const identity_t *ident, public_identity_t **pub_copy);
     int  identity_sign(const identity_t *ident, const msg_str_t *in,

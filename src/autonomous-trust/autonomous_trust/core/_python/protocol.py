@@ -21,7 +21,7 @@ import icontract
 
 from .system import CfgIds, QueueType
 from .util import ClassEnumMeta
-from .identity import Group, Peers
+from .identity import Group, ChildGroupSet, Peers
 from .network import Message
 from .capabilities import Capabilities, PeerCapabilities
 
@@ -33,6 +33,11 @@ class Protocol(object, metaclass=ClassEnumMeta):
         self.peers = Peers()
         self.peer_capabilities = PeerCapabilities()
         self.group = None
+        # Child groups this node gateways (group-uuid-str -> Group),
+        # propagated from IdentityProcess via a ChildGroupSet message.
+        # Empty on leaf nodes; kept separate from self.group so the
+        # primary/parent group slot is never clobbered.
+        self.child_groups = {}
         if configurations is not None:
             if CfgIds.peers in configurations:
                 self.peers = configurations[CfgIds.peers]
@@ -51,6 +56,9 @@ class Protocol(object, metaclass=ClassEnumMeta):
     def run_message_handlers(self, queues: dict[str, QueueType], message: Message):
         if isinstance(message, Group):
             self.group = message
+            return True
+        if isinstance(message, ChildGroupSet):
+            self.child_groups = message.groups
             return True
         if isinstance(message, Peers):
             self.peers = message

@@ -25,12 +25,20 @@ class Capability(Configuration):
     """Name and function"""
     _msg_class = capabilities_pb2.Capability
 
-    def __init__(self, name, function=None, arg_names=None, keywords=None):
+    def __init__(self, name, function=None, arg_names=None, keywords=None,
+                 required_tier: int = 0, transaction_weight: int = 1):
         super().__init__(capabilities_pb2.Capability)
         self.name = name
         self.function = function  # this will be None for remote handling
         self.arg_names = arg_names
         self.keywords = keywords
+        # Trust-tier metadata. See doc/architecture/trust-tiers.md §4.
+        # required_tier is the minimum peer._tier needed to invoke this
+        # capability (0 = any admitted peer). transaction_weight is the
+        # multiplier applied in _pure_reputation to TSs from tasks using
+        # this capability (1 = no boost).
+        self.required_tier = required_tier
+        self.transaction_weight = transaction_weight
 
     def execute(self, task, pid_q):
         pid_q.put_nowait(multiprocessing.current_process().pid)
@@ -43,17 +51,33 @@ class Capability(Configuration):
         return self.name == other.name
 
     def to_dict(self):
-        return dict(name=self.name)  # TODO more info
+        # Intentionally minimal — `to_dict` is for log/repr surfaces; the
+        # cross-impl wire form is the protobuf `Capability` message
+        # (capabilities.proto / sync_to_message). `arg_names` and
+        # `keywords` are runtime-only fields cleared by sync_from_message,
+        # so they have no meaningful serialized representation. See
+        # divergence.md H15 (re-audit) for the unified C-side equivalent
+        # via `capability_t.arguments`.
+        return dict(name=self.name,
+                    required_tier=self.required_tier,
+                    transaction_weight=self.transaction_weight)
 
     def sync_to_message(self):
         self.message.name = self.name
         self.message.category = ''
+        self.message.required_tier = self.required_tier
+        self.message.transaction_weight = self.transaction_weight
 
     def sync_from_message(self):
         self.name = self.message.name
         self.function = None
         self.arg_names = None
         self.keywords = None
+        self.required_tier = int(self.message.required_tier)
+        # proto3 can't distinguish "not set" from 0; treat 0 as the
+        # default weight (1) so peers without the field interoperate.
+        w = int(self.message.transaction_weight)
+        self.transaction_weight = w if w > 0 else 1
 
 
 class Capabilities(Mapping):
@@ -76,8 +100,11 @@ class Capabilities(Mapping):
     def to_list(self) -> list[str]:
         return [cap.name for cap in self._listing.values()]
 
-    def register_ability(self, name, function, arg_names=None, keywords=None):
-        self._listing[name] = Capability(name, function, arg_names, keywords)
+    def register_ability(self, name, function, arg_names=None, keywords=None,
+                         required_tier: int = 0, transaction_weight: int = 1):
+        self._listing[name] = Capability(name, function, arg_names, keywords,
+                                         required_tier=required_tier,
+                                         transaction_weight=transaction_weight)
 
 
 class PeerCapabilities(Mapping, Configuration):
@@ -104,6 +131,22 @@ class PeerCapabilities(Mapping, Configuration):
             if name not in self._listing:
                 self._listing[name] = []
             self._listing[name].append(peer_id)
+
+    def filtered_for_persist(self, keep_uuids):
+        """Return a copy with peer-ids not in keep_uuids removed.
+
+        Capability names with no remaining peers after the filter are
+        dropped entirely. Used by the persistent-cohort save path so
+        untrusted (rep<=0.5) peers' capability advertisements don't
+        survive a process restart.
+        """
+        keep = {str(u) for u in keep_uuids}
+        new_listing = {}
+        for cap_name, peer_ids in self._listing.items():
+            kept = [pid for pid in peer_ids if str(pid) in keep]
+            if kept:
+                new_listing[cap_name] = kept
+        return PeerCapabilities(_listing=new_listing)
 
     def sync_to_message(self):
         # Invert Python's {cap_name: [peer_ids]} to proto's {peer: [capabilities]}

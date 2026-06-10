@@ -27,6 +27,15 @@ USER user
 
 WORKDIR /app
 
+# Layer the autonomous_trust.evaluation subpackage onto the namespace
+# package the base image populates with core/inspector/services/simulator.
+# The base image (src/Dockerfile-devel) doesn't include evaluation, but
+# the scenario engine, generators, compromise wrappers, and deployment
+# helpers all live there.  Without this COPY, the coordinator fails at
+# import with `ModuleNotFoundError: No module named 'autonomous_trust.evaluation'`.
+COPY --chown=user:user src/autonomous-trust-evaluation/autonomous_trust/evaluation \
+                       /app/autonomous_trust/evaluation
+
 # Copy multi-agency demo code
 COPY --chown=user:user examples/multi_agency /app/examples/multi_agency
 

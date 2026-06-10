@@ -71,15 +71,40 @@ void identity_set_own_capabilities(const process_t *proc,
  *  `peer_caps_count` expected_state key. */
 int identity_get_peer_caps_count(const uuid_t uuid);
 
-/** Return the reputation-derived rank tier last published for @p uuid via
- *  the ID_RANK local-IPC handler (handle_rank_update). Returns 0 if no
- *  entry exists. The map is populated by ReputationProcess crossing a
- *  RANK_TIERS boundary. Mirrors Python's per-peer `peer._rank` field
- *  consulted by AgreementByAuthority voter weighting (BUGS.md §P2). */
-int identity_get_peer_rank(const uuid_t uuid);
+/** Return the reputation-derived trust tier last published for @p uuid
+ *  via the ID_TIER local-IPC handler (handle_tier_update). Returns 0 if
+ *  no entry exists. The map is populated by ReputationProcess crossing
+ *  a TIER_FLOORS boundary. Mirrors Python's per-peer `peer._tier`
+ *  field consulted by negotiation's capability tier-gate. Distinct
+ *  from topology rank (identity_t::rank); see
+ *  doc/architecture/trust-tiers.md §1. */
+int identity_get_peer_tier(const uuid_t uuid);
 
-/** Return the rank last applied to the local identity via ID_RANK. */
-int identity_get_self_rank(void);
+/** Return the trust tier last applied to the local identity via ID_TIER. */
+int identity_get_self_tier(void);
+
+/** Read the current partition-recovery target group uuid (string) into
+ *  @p out. Returns the number of bytes written (excluding the trailing
+ *  NUL), or 0 if no recovery is in flight. Test-only accessor for the
+ *  conformance harness and the C unit test. See
+ *  doc/architecture/partition-recovery.md. */
+size_t identity_get_partition_recovery_target(char *out, size_t out_len);
+
+/** Build the canonical signature input for a partition_probe payload.
+ *  Mirrors Python's `IdentityProcess._partition_probe_canonical`:
+ *  `"%s|%d"` of (group_uuid, group_size). Returns bytes written
+ *  (excluding the NUL), -1 on buffer overflow. Exposed for the test
+ *  suite to verify byte-for-byte interop with Python. */
+int identity_partition_canonical_probe(const char *group_uuid,
+                                       int group_size,
+                                       char *out, size_t out_len);
+
+/** As @ref identity_partition_canonical_probe but for partition_response:
+ *  `"%s|%d|%s"` of (group_uuid, group_size, in_response_to). */
+int identity_partition_canonical_response(const char *group_uuid,
+                                          int group_size,
+                                          const char *in_response_to,
+                                          char *out, size_t out_len);
 
 /** Toggle synchronous-dispatch mode for the conformance harness.
  *
