@@ -195,8 +195,9 @@ def test_public_identity_canonical_roundtrip(setup_teardown):
     assert can['typename'] == 'identity'
     assert len(can['signature']['hex_seed']) == 64
     assert len(can['encryptor']['hex_seed']) == 64
-    assert set(can) >= {'uuid', 'address', 'fullname', 'nickname',
-                        'petname', 'signature', 'encryptor'}
+    assert set(can) >= {'uuid', 'address', 'fullname', 'signature', 'encryptor'}
+    # nickname/petname are Zooko local names: must NOT appear in the wire form.
+    assert 'nickname' not in can and 'petname' not in can
     back = public_identity_from_canonical(can)
     assert str(back.uuid) == str(ident.uuid)
     assert back.signature.publish() == ident.signature.publish()

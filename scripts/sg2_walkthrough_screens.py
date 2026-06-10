@@ -224,6 +224,18 @@ def _agency_map_sightlines() -> None:
 
 
 def main() -> None:
+    import argparse
+
+    argparse.ArgumentParser(
+        description=(
+            "Regenerate the SG2 walkthrough's _generated/sg2/ artefacts "
+            "(catalogue_overlay.jpg, drawer_ab.html, agency_map_sightlines.html). "
+            "Run from the repo root with the 'autonomous_trust' conda env active, "
+            "after tools/naip_fetch.py and tools/detection_prep.py have produced "
+            "their outputs."
+        ),
+    ).parse_args()
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     if not PANORAMA.exists():
         raise SystemExit(f"missing {PANORAMA}; run tools/naip_fetch.py first")

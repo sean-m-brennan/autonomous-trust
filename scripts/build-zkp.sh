@@ -21,6 +21,25 @@
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
 
+usage() {
+  cat <<'EOF'
+Usage: build-zkp.sh [-h|--help]
+
+Build the ZKP Rust extension into the autonomous-trust package via maturin.
+Skips with a warning if the Rust toolchain or maturin is unavailable.
+
+Requires the 'autonomous_trust' conda environment to be active (run
+'conda activate autonomous_trust').
+
+Options:
+  -h, --help    Show this help message and exit.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
 if [[ "${CONDA_DEFAULT_ENV:-}" != "autonomous_trust" ]]; then
   echo "ERROR: conda environment 'autonomous_trust' is not active." >&2
   echo "  Run: conda activate autonomous_trust" >&2
