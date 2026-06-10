@@ -63,13 +63,9 @@ export PYTHONPATH="${AT_SRC_PATHS}:${here}${PYTHONPATH:+:$PYTHONPATH}"
 # Project is conda-based; the canonical interpreter lives in the
 # `autonomous_trust` env (see environment.yaml + scripts/setup-dev.sh).
 # Match the gating convention used by scripts/build-py.sh: refuse to
-# run when that env isn't active.
+# run when that env isn't active. The actual check is deferred until after
+# argument parsing so that --help works without the env active.
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-autonomous_trust}"
-if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV_NAME" ]]; then
-    echo "ERROR: conda environment '$CONDA_ENV_NAME' is not active." >&2
-    echo "  Run: conda activate $CONDA_ENV_NAME" >&2
-    exit 1
-fi
 # Use the env's python — once activated, plain `python` resolves
 # through $CONDA_PREFIX/bin first. Override with AT_PYTHON for
 # debugging only.
@@ -197,6 +193,13 @@ while [[ $# -gt 0 ]]; do
         *) err "Unknown option: $1"; usage 1;;
     esac
 done
+
+# Enforce the conda-env gate now that --help has had a chance to short-circuit.
+if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV_NAME" ]]; then
+    echo "ERROR: conda environment '$CONDA_ENV_NAME' is not active." >&2
+    echo "  Run: conda activate $CONDA_ENV_NAME" >&2
+    exit 1
+fi
 
 if [[ -z "$SCALES_RAW" ]]; then
     SCALES_RAW="16-peer:4,4,3,2 25-peer:4,16,3,2 100-peer:4,88,3,2"
