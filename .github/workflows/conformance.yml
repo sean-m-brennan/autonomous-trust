@@ -13,6 +13,21 @@ name: Conformance Corpus
 #      (e.g. one passes, one fails) or if --strict-coverage flags a
 #      corpus case neither side recorded.
 #
+# The environment is provisioned with conda (Miniforge + mamba) from the
+# project's own two env files so CI matches local dev exactly:
+#   * config/cfg/environment.yml   — runtime + C build deps (cmake,
+#     libsodium, jansson, libuuid, check, protobuf, libprotobuf,
+#     protobuf-c >=1.5.2 [ships the protoc-gen-c plugin the C harness's
+#     `protoc --c_out` codegen needs], plus the Python runtime deps the
+#     harness imports).
+#   * config/cfg/devel_environ.yml — dev/test tooling layered on top
+#     (tox, pytest, pytest-asyncio/cov, jsonschema, clang/clangxx/lld,
+#     pkg-config). Both files share `name: autonomous_trust`, so the
+#     second is applied via `conda env update`.
+# This replaces the prior apt+pip provisioning, which lacked
+# protobuf-c / protoc-gen-c (apt installed only protobuf-compiler) and
+# could not supply the C libs from pip.
+#
 # Local equivalent: `bash scripts/test-conformance.sh --c --strict-coverage`.
 #
 # When the parent (`sustainable_space/`) CI pipeline materializes,
@@ -30,50 +45,79 @@ on:
 jobs:
   conformance:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
+    defaults:
+      run:
+        # Login shell so `conda activate` (set up by setup-miniconda) is
+        # in effect for every `run:` step.
+        shell: bash -el {0}
+    env:
+      # Keep downloaded packages in a cacheable location.
+      CONDA_PKGS_DIRS: ~/conda_pkgs_dir
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Install system build deps for the C harness
-        # libuuid / libsodium / libjansson / protobuf are the four
-        # find_package() dependencies in src/c/CMakeLists.txt
-        # (libuuid:182, libsodium:192, libjansson:198, protobuf:231).
-        # OpenSSL is conditional but cheap to include. pkg-config is
-        # required by some find_path() lookups.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config \
-            uuid-dev libsodium-dev libjansson-dev \
-            libprotobuf-dev protobuf-compiler \
-            libssl-dev
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Cache conda packages
+        uses: actions/cache@v4
         with:
-          python-version: '3.13'
-          cache: pip
+          path: ~/conda_pkgs_dir
+          key: conda-pkgs-${{ runner.os }}-${{ hashFiles('config/cfg/environment.yml', 'config/cfg/devel_environ.yml') }}
+          restore-keys: |
+            conda-pkgs-${{ runner.os }}-
 
-      - name: Install Python deps for the conformance env
-        # Mirrors tox -e conformance's deps (src/autonomous-trust/tox.ini)
-        # so the fallback `python -m pytest` path in
-        # scripts/test-conformance.sh works without tox.
+      - name: Set up conda env from environment.yml (Miniforge + mamba)
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: autonomous_trust
+          environment-file: config/cfg/environment.yml
+          use-mamba: true
+          auto-activate-base: false
+
+      - name: Layer dev/test deps from devel_environ.yml
+        # Same env name (autonomous_trust); --prune keeps it consistent
+        # with the union of both spec files.
+        run: mamba env update -n autonomous_trust -f config/cfg/devel_environ.yml
+
+      - name: Show toolchain
         run: |
-          python -m pip install --upgrade pip
-          pip install -r src/autonomous-trust/requirements.txt \
-                      -r src/autonomous-trust/tests_require.txt \
-                      jsonschema protobuf tox
+          conda info --envs
+          python --version
+          cmake --version | head -1
+          protoc --version || echo "protoc missing"
+          command -v protoc-gen-c && echo "protoc-gen-c: $(command -v protoc-gen-c)" || echo "protoc-gen-c missing"
+          clang --version | head -1 || echo "clang missing"
 
-      - name: Build + run the C conformance harness, then diff
-        # --c builds and runs the C harness, then invokes
-        # `diff_results` against the Python JSON output.
-        # --strict-coverage fails the run if any corpus case is
-        # missing from either side (a stronger guarantee than the
-        # default per-case-symmetric mode).
-        run: bash scripts/test-conformance.sh --c --strict-coverage
+      - name: Run conformance harnesses (Python, then C) and diff
+        # The script's `--c` mode builds+runs the C harness and diffs it
+        # against the most recent Python results JSON — so the Python harness
+        # must run FIRST to produce that file (otherwise the diff silently
+        # skips). Two invocations:
+        #   1. Python harness in the active conda env. CONFORMANCE_SKIP_TOX=1
+        #      forces the direct-pytest path so the conda interpreter (with
+        #      the harness deps from environment.yml) is what's exercised,
+        #      rather than tox's isolated re-pip venv.
+        #   2. C harness build+run, then the cross-language diff with
+        #      --strict-coverage (fails if any corpus case is missing from
+        #      either side).
+        #
+        # Use the conda toolchain + libs consistently for the C build: point
+        # CMake at the active env prefix (the bare conda LLVM/lib packages
+        # don't install an activation script that sets CMAKE_PREFIX_PATH),
+        # build with the env's clang, and make the conda .so closure
+        # resolvable at run time. OpenSSL from conda enables the AT_ZTA build
+        # path, pinning the zta-* scenarios symmetrically.
+        env:
+          CONFORMANCE_SKIP_TOX: '1'
+        run: |
+          export CC=clang CXX=clang++
+          export CMAKE_PREFIX_PATH="${CONDA_PREFIX}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"
+          export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          bash scripts/test-conformance.sh --python --strict-coverage
+          bash scripts/test-conformance.sh --c --strict-coverage
 
       - name: Upload Python conformance results
         if: always()
