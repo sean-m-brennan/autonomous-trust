@@ -21,6 +21,30 @@
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
 
+usage() {
+  cat <<'EOF'
+Usage: run.sh <target> [extra args...] [-h|--help]
+
+Top-level run dispatcher. Extra arguments are forwarded to the underlying
+run script.
+
+Targets:
+  c-demo     Run the demo with the C variant (run-demo.sh --variant=c).
+  demo       Run the demo (run-demo.sh).
+  mission    Run the mission (run-mission.sh).
+
+Pass --help to the underlying script (e.g. 'run.sh demo --help') for its
+target-specific options.
+
+Options:
+  -h, --help    Show this help message and exit.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help|"") usage; [ -z "${1:-}" ] && exit 1 || exit 0 ;;
+esac
+
 WHAT=$1  # required
 shift
 
