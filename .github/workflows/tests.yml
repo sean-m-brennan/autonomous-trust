@@ -94,6 +94,15 @@ jobs:
           cmake --version | head -1
           clang --version | head -1 || echo "clang missing"
 
+      - name: Generate protobuf Python interfaces
+        # autonomous_trust.core.protobuf is protoc-generated (gitignored, so
+        # absent on a fresh checkout) and imported transitively by every
+        # package's test suite. `proto-only` runs just the protoc codegen,
+        # skipping the poetry/sdist build. Cross-package imports resolve via
+        # each tests/conftest.py (which adds sibling pkg dirs to sys.path), so
+        # no editable install is needed.
+        run: bash scripts/build-py.sh proto-only
+
       - name: Run Python package test suites
         run: |
           # Same conda toolchain + libs the C build needs (mirrors

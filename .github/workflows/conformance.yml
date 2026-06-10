@@ -91,6 +91,15 @@ jobs:
           command -v protoc-gen-c && echo "protoc-gen-c: $(command -v protoc-gen-c)" || echo "protoc-gen-c missing"
           clang --version | head -1 || echo "clang missing"
 
+      - name: Generate protobuf Python interfaces
+        # autonomous_trust.core.protobuf is protoc-generated (gitignored, so
+        # absent on a fresh checkout). The Python harness imports the core
+        # package, which imports these modules; without them collection fails
+        # with `ModuleNotFoundError: No module named 'autonomous_trust.core.protobuf'`.
+        # `proto-only` runs just the `protoc --python_out` codegen (+ package
+        # __init__ files), skipping the poetry/sdist build.
+        run: bash scripts/build-py.sh proto-only
+
       - name: Run conformance harnesses (Python, then C) and diff
         # The script's `--c` mode builds+runs the C harness and diffs it
         # against the most recent Python results JSON — so the Python harness
