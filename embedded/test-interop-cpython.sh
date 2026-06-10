@@ -18,6 +18,11 @@
 #                   DRY canonical form) and ADOPTS the shared group key, so it
 #                   can decrypt/emit encrypted group traffic. This exercises
 #                   SG3 blockers 1/2/3 + slot-2 (accept/confirm/history canonical).
+#   * group_key_update : a membership-propagation update (IdentityProtocol.update),
+#                   distinct from the full_history bootstrap above. Python's
+#                   _update_group now emits the canonical flat group so the C
+#                   co-member's handle_group_update can parse it (pre-fix Python
+#                   sent the ConfigJSONEncoder form, which C silently dropped).
 #
 # Why this script exists: the standard Docker image build (Dockerfile-c) needs
 # apt access to the Debian repos, which is firewalled in the dev sandbox. So we
@@ -229,6 +234,21 @@ echo "------ group-key sync ------"
 chk  "Python sent full_history (group key) to the C node" "Send full history"
 chkc "C node received full_history from Python"           "received history from"
 chkc "C node parsed + ADOPTED the Python group key"       "adopted mesh group .* during merge"
+
+# ----------------------------------------------------------------------------
+# group_key_update (membership propagation, IdentityProtocol.update): distinct
+# from the full_history bootstrap adoption above. Python's _update_group now
+# emits the DRY canonical flat group (to_canonical), so the C co-member's
+# handle_group_update can parse it -- pre-fix Python sent the ConfigJSONEncoder
+# form, which C could not parse and silently dropped. The C "parsed incoming
+# group update (uuid <real-uuid>, addresses N>=1)" line is the cross-runtime
+# proof: it fires on a successful canonical parse regardless of the adopt/no-op
+# outcome (a same-group equal-size no-op leaves no other trace, so the older
+# "adopting incoming group" line alone is too timing-dependent to assert on).
+# A pre-fix / non-canonical payload would instead log "uuid ?, addresses 0".
+echo "------ group_key_update (membership) ------"
+chkc "C node received a group_key_update from Python"      "received group update from"
+chkc "C parsed Python's canonical group_key_update"        "parsed incoming group update \(uuid [0-9a-fA-F-]{36}, addresses [1-9]"
 
 echo "=============================="
 echo "  $P passed, $F failed"
