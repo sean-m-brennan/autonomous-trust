@@ -915,7 +915,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         return False
 
     def _update_group(self, queues, group, level):
-        grp_msg = group.to_string()  # to self.handle_group_update()
+        # DRY canonical flat wire form (shared byte-shape with C's
+        # group_to_json) so a C co-member can parse the group_key_update —
+        # Python's default ConfigJSONEncoder group is unparseable by C, which
+        # left cross-runtime membership updates silently dropped. Mirrors the
+        # full_history group delivery in _peer_accepted. The group key itself
+        # is not rotated here (membership-only; key handover is a deferred
+        # design — see idprocess.py:1042 / [[project_group_key_sync]]).
+        grp_msg = to_json_string(group.to_canonical())  # to self.handle_group_update()
         for to_peer in list(self.peers.hierarchy[level].values()):
             message = Message(self.name, IdentityProtocol.update, grp_msg, to_whom=to_peer)
             queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -1936,7 +1943,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if isinstance(group, str):
                 if not group:
                     return True  # empty payload — no-op
-                group = Configuration.from_string(group)
+                # The group rides as the DRY canonical flat dict (shared
+                # byte-shape with C's group_to_json) so a C co-member's
+                # group_key_update parses; tolerate a legacy ConfigJSONEncoder
+                # Group object (same-runtime / pre-canonical senders, which
+                # from_json_string reconstructs directly via __type__). Mirrors
+                # the full_history reconstruction. See [[project_group_key_sync]].
+                decoded = from_json_string(group)
+                group = (Group.from_canonical(decoded)
+                         if isinstance(decoded, dict) else decoded)
             mine, theirs = self.group, group
             if mine is None or theirs is None:
                 return True

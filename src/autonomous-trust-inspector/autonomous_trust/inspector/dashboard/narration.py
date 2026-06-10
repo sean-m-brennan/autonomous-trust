@@ -63,6 +63,14 @@ class NarrationBlock:
         style:       "default", "alert", "success", "info"
         anchor:      Optional cue that re-times this block against a
                      recording (see :func:`resolve_narration`).
+        gate:        Optional live-gate key. When set, the block is withheld
+                     in a LIVE run until the caller reports the gate satisfied
+                     (see :meth:`NarrationOverlay.advance_to`'s ``gates`` arg)
+                     — for beats whose real moment floats run-to-run (e.g. a
+                     jet strike gated on an emergent threat) and so can't be
+                     pinned to a fixed ``t_start``. ``t_start`` still acts as
+                     the earliest time the block may show. No effect on the
+                     recording path (which re-times via ``anchor``).
     """
     t_start: float
     t_end: Optional[float] = None
@@ -70,6 +78,7 @@ class NarrationBlock:
     subtext: str = ""
     style: str = "default"
     anchor: Optional[NarrationAnchor] = None
+    gate: Optional[str] = None
 
 
 STYLE_COLORS = {
@@ -98,11 +107,25 @@ class NarrationOverlay:
         self._current: Optional[NarrationBlock] = None
         self._visible = True
 
-    def advance_to(self, t_seconds: float):
-        """Update the current narration block based on scenario time."""
+    def advance_to(self, t_seconds: float, gates: Optional[dict] = None):
+        """Update the current narration block based on scenario time.
+
+        ``gates`` maps gate-key -> bool of live conditions the caller is
+        tracking. When a ``gates`` dict is supplied, a block carrying a
+        ``gate`` that is not satisfied is skipped (the search falls through to
+        the most recent ungated/satisfied block), so a beat whose real moment
+        floats — e.g. ``gate="jet_over_target"`` — is held past its authored
+        ``t_start`` until its condition is met, without leaving the overlay
+        blank (the prior block persists). When ``gates`` is None (no caller
+        gating — e.g. canned playback, where a gated block is re-timed by its
+        ``anchor`` or falls back to ``t_start``) gates are ignored entirely, so
+        behaviour is unchanged. A block with no ``gate`` is never affected."""
         self._current = None
         for block in reversed(self._script):
             if t_seconds >= block.t_start:
+                if (gates is not None and block.gate is not None
+                        and not gates.get(block.gate)):
+                    continue  # gated beat not yet live — try the earlier block
                 if block.t_end is None or t_seconds < block.t_end:
                     self._current = block
                 break
@@ -302,5 +325,5 @@ def resolve_narration(script: list[NarrationBlock],
             t_end = capped if t_end is None else min(t_end, capped)
         out.append(NarrationBlock(
             t_start=start, t_end=t_end, text=b.text, subtext=b.subtext,
-            style=b.style, anchor=b.anchor))
+            style=b.style, anchor=b.anchor, gate=b.gate))
     return out

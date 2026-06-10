@@ -199,8 +199,11 @@ dod-mission options:
   --compromise-mode M    abrupt|gradual (default: $COMPROMISE_MODE)
   --c-microdrones[=SPEC] Run microdrones as embedded C at_demo nodes instead of
                          Python (requires --compose). SPEC is 'all' (default
-                         when given bare), or a comma-list of peer names
-                         (e.g. microdrone-1,microdrone-2). Builds the
+                         when given bare), a bare integer N for the first N
+                         microdrones (N < total => a MIXED Python+C swarm, e.g.
+                         --c-microdrones=2), or a comma-list of peer names
+                         (e.g. microdrone-1,microdrone-2). (Note: '1' means the
+                         first one, not all — use 'all'.) Builds the
                          autonomous-trust-c image (Dockerfile-c, needs network
                          for apt) and seeds those peers with C-format identities
                          so they cold-join the Python mesh for the group key.
@@ -333,19 +336,21 @@ if [[ ! " $_allowed " == *" $BACKEND_MODE "* ]]; then
 fi
 
 # Normalize the C-microdrone knob ("0"/"none"/"false" -> off) and gate it: the
-# embedded C at_demo path only exists in the dod-mission compose generator
-# (generate_compose.py); the k8s/tilt generators have no C-node support.
+# embedded C at_demo path exists in the dod-mission compose AND k8s generators
+# (generate_compose.py / generate_k8s.py), the latter driving the tilt backend.
 case "$C_MICRODRONES" in 0|none|false|off) C_MICRODRONES="";; esac
 if [[ -n "$C_MICRODRONES" ]]; then
     if [[ "$VARIANT" != "dod-mission" ]]; then
         err "--c-microdrones is only supported with --variant=dod-mission."
         exit 1
     fi
-    if [[ "$BACKEND_MODE" != "compose" ]]; then
-        err "--c-microdrones requires the --compose backend (the k8s/tilt"
-        err "    generators have no embedded-C at_demo support yet)."
-        exit 1
-    fi
+    case "$BACKEND_MODE" in
+        compose|tilt|k8s) : ;;  # all three generators emit C at_demo nodes
+        *)
+            err "--c-microdrones requires the --compose, --tilt, or --k8s"
+            err "    backend (got --$BACKEND_MODE)."
+            exit 1 ;;
+    esac
 fi
 
 # dod-mission: --record-to FILE records the live run. The compose/k8s/tilt
@@ -878,13 +883,17 @@ PY
                     # On --reseed, clear root-owned container state first (see
                     # reseed_wipe_state) so the fresh seed isn't shadowed by it.
                     [[ -n "$seed_force" ]] && reseed_wipe_state "$here/.demo-state/dod-mission"
+                    # Seed C-format identities for the C microdrones so the SPEC
+                    # matches generate_k8s.py exactly (C Pod <-> C identity).
+                    seed_c_arg=""
+                    [[ -n "$C_MICRODRONES" ]] && seed_c_arg="--c-microdrones $C_MICRODRONES"
                     python3 -m tools.seed_dod_cohort \
                         --out .demo-state/dod-mission \
                         --squad-size "$SQUAD_SIZE" \
                         --swarm-size "$SWARM_SIZE" \
                         --sensor-count "$SENSOR_COUNT" \
                         --hacked-sensors "$HACKED_SENSORS" \
-                        $seed_force \
+                        $seed_force $seed_c_arg \
                         || { err "cohort seed failed"; exit 1; }
                     if [[ "${AT_ZTA_PROVISION:-1}" == "1" ]]; then
                         log "Provisioning ZTA mission CA + per-peer credentials ..."
@@ -898,6 +907,8 @@ PY
                 else
                     log "AT_PRESEED=0: skipping cohort seed (peers will cold-bootstrap)"
                 fi
+                k8s_c_arg=""
+                [[ -n "$C_MICRODRONES" ]] && k8s_c_arg="--c-microdrones $C_MICRODRONES"
                 log "Generating kubernetes manifests under $K8S_DIR ..."
                 python3 -m examples.dod_mission.deploy.generate_k8s \
                     --out "$K8S_DIR" \
@@ -910,7 +921,7 @@ PY
                     --swarm-size "$SWARM_SIZE" \
                     --sensor-count "$SENSOR_COUNT" \
                     --hacked-sensors "$HACKED_SENSORS" \
-                    $seed_root_arg \
+                    $seed_root_arg $k8s_c_arg \
                     || { err "k8s manifest generation failed"; exit 1; }
             fi
             ;;
@@ -933,6 +944,10 @@ prepare_tilt_env() {
             export _TILT_SENSOR_COUNT="$SENSOR_COUNT"
             export _TILT_HACKED_SENSORS="$HACKED_SENSORS"
             export _TILT_COMPROMISE_MODE="$COMPROMISE_MODE"
+            # Embedded-C microdrones: the tiltfile reads this, builds the
+            # autonomous-trust-c image, and threads the SPEC to generate_k8s +
+            # seed_dod_cohort. Empty => all-Python (back-compat).
+            export _TILT_C_MICRODRONES="$C_MICRODRONES"
             ;;
     esac
 }

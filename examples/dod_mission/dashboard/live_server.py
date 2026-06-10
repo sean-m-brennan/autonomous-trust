@@ -530,11 +530,15 @@ def make_app(name: str, title: str,
         _latest_state.clear()
         _latest_state.update(state)
         # Feed live squad/microdrone positions to any panel that renders
-        # them (the TargetPositionMapPanel) before its figure is built.
+        # them (the TargetPositionMapPanel) before its figure is built. Pass
+        # the scenario clock too so the panel's FOV scan / exfil mode tracks
+        # demo time rather than wall-clock frames.
         platforms = state.get("platforms") or {}
+        plat_t = float(state.get("t_seconds", 0.0))
+        target_latlon = state.get("target_latlon")
         for chart in charts:
             if hasattr(chart, "set_platforms"):
-                chart.set_platforms(platforms)
+                chart.set_platforms(platforms, plat_t, target_latlon)
         # External HTML legend for the map panel (first chart exposing
         # legend_groups). Rebuilt each tick so it tracks the live markers.
         map_legend: Any = []
@@ -556,7 +560,10 @@ def make_app(name: str, title: str,
         narration_children: Any = html.Div()
         overlay_style = {"visibility": "hidden"}
         if overlay is not None and not suppress_narration:
-            overlay.advance_to(t_seconds)
+            # Live gates for beats whose real moment floats (e.g. the jet
+            # strike, gated on the jet actually reaching the objective). The
+            # coordinator publishes them in state; absent => no gating.
+            overlay.advance_to(t_seconds, gates=state.get("narration_gates"))
             presentation_on = bool((presentation_data or {}).get("on"))
             if presentation_on:
                 narration_children = _narration_div(overlay.current_block)

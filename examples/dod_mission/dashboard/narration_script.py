@@ -196,7 +196,12 @@ DOD_NARRATION: list[NarrationBlock] = [
     # ----- Phase 6: Strike (T+6:00 - T+7:00) ---------------------------
     NarrationBlock(
         t_start=360,
-        t_end=380,
+        # No fixed t_end: hold this "jet arrives / validating" beat until the
+        # strike-confirmed block below opens its gate (the jet actually
+        # reaching the objective). Otherwise, because the strike beat is gated
+        # and the jet's pass floats later than its authored time, the overlay
+        # would go blank between this beat ending and the gate firing.
+        t_end=None,
         text="A fighter jet was already on patrol nearby.  The moment the "
              "MQ-800 was exposed as rogue, Command vectored it in.  It "
              "arrives now, announces itself, and the cohort validates it.",
@@ -217,6 +222,11 @@ DOD_NARRATION: list[NarrationBlock] = [
              "six seconds of the jet's ingress — orders of magnitude faster "
              "than any human-mediated trust process.",
         style="success",
+        # Held until the jet is actually over the objective. The launch is
+        # gated on the MQ-800 collapse so the strike time floats; t_start is
+        # only the earliest it may show (coordinator publishes the gate; see
+        # scenario.jet_over_objective / coordinator._push_dashboard_update).
+        gate="jet_over_target",
     ),
 
     # ----- Phase 7: Exfil (T+7:00 - T+8:00) ----------------------------
