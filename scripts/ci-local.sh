@@ -20,6 +20,12 @@
 #       CMAKE_PREFIX_PATH/LD_LIBRARY_PATH -> $CONDA_PREFIX). Use --host-conda to
 #       run against a local conda install instead, --conda-image NAME to pin the
 #       image, --recreate-env for a fresh (CI-faithful) env.
+#   tests         (tests.yml)               BLOCKING
+#       Same Miniforge env as conformance (container by default; --host-conda,
+#       --conda-image, --recreate-env all apply). Generates protobuf, then runs
+#       the Python package suites (test-packages.sh --quick) + the C unit tests
+#       (test-c-exe.sh). --quick skips the macvlan two-node Docker integration
+#       test (unavailable off a real cluster).
 #   arm64-build   (arm64-build.yml job 1)   BLOCKING
 #       Registers QEMU binfmt (the CI's setup-qemu-action), then
 #       `embedded/build-arm.sh` (dynamic) + `--static`. Needs docker + buildx.
@@ -28,9 +34,10 @@
 #       here is reported but does NOT fail the overall run, matching CI.
 #
 # Usage:
-#   scripts/ci-local.sh                 # default: conformance + arm64-build
+#   scripts/ci-local.sh                 # default: conformance + tests + arm64
 #   scripts/ci-local.sh --all           # + qemu-smoke (heavy, non-blocking)
 #   scripts/ci-local.sh --conformance   # just one job (repeatable flags)
+#   scripts/ci-local.sh --tests
 #   scripts/ci-local.sh --arm64
 #   scripts/ci-local.sh --qemu
 #   scripts/ci-local.sh --conformance --recreate-env   # match CI's fresh env
@@ -69,57 +76,56 @@ declare -a SELECTED=()
 
 while [[ $# -gt 0 ]]; do case "$1" in
   --conformance) SELECTED+=(conformance); shift;;
+  --tests)       SELECTED+=(tests);       shift;;
   --arm64)       SELECTED+=(arm64);       shift;;
   --qemu)        SELECTED+=(qemu);        shift;;
-  --all)         SELECTED=(conformance arm64 qemu); shift;;
+  --all)         SELECTED=(conformance tests arm64 qemu); shift;;
   --recreate-env) RECREATE_ENV=true; shift;;
   --update-env)   UPDATE_ENV=true;   shift;;
   --host-conda)   USE_HOST_CONDA=true; shift;;
   --conda-image)  CONDA_IMAGE="$2"; shift 2;;
   --conda-image=*) CONDA_IMAGE="${1#*=}"; shift;;
-  --list) echo "jobs: conformance (blocking), arm64 (blocking), qemu (non-blocking)"; exit 0;;
+  --list) echo "jobs: conformance (blocking), tests (blocking), arm64 (blocking), qemu (non-blocking)"; exit 0;;
   -h|--help) awk 'NR>=2 && /^#/{sub(/^# ?/,"");print;next} NR>=2{exit}' "$0"; exit 0;;
   *) err "unknown option: $1"; exit 1;;
 esac; done
 
 # Default selection mirrors the blocking CI jobs (qemu is opt-in / non-blocking).
-if [[ ${#SELECTED[@]} -eq 0 ]]; then SELECTED=(conformance arm64); fi
+if [[ ${#SELECTED[@]} -eq 0 ]]; then SELECTED=(conformance tests arm64); fi
 
 # ---------------------------------------------------------------------------
-# Job: conformance  (conformance.yml)
+# Shared Miniforge env provisioning (conformance + tests)
 #
-# Default path runs inside a Miniforge container (mirrors the workflow's
-# setup-miniconda and needs no host conda). --host-conda uses a local conda
-# instead. Docker is preferred when both are available; falls back to host
-# conda only if Docker is absent.
+# Both conda-env jobs run inside a Miniforge container by default (mirrors the
+# workflows' setup-miniconda and needs no host conda); --host-conda uses a
+# local conda instead. Docker is preferred when both are available; we fall
+# back to host conda only if Docker is absent. Each job passes the bash command
+# block to run once the env is created/activated and CC + CMAKE_PREFIX_PATH +
+# LD_LIBRARY_PATH are exported (the exact env the workflows' run steps use).
 # ---------------------------------------------------------------------------
-job_conformance() {
+
+# Dispatch a conda-env job ($1=label, $2=command block) to docker or host conda.
+_run_conda_job() {
+  local label="$1" commands="$2"
   if $USE_HOST_CONDA; then
     command -v conda >/dev/null 2>&1 || { err "--host-conda set but conda not on PATH"; return 3; }
-    _conformance_host_conda
+    _run_host_conda "$label" "$commands"
   elif command -v docker >/dev/null 2>&1; then
-    _conformance_docker
+    _run_in_container "$label" "$commands" || { err "$label (containerized) failed"; return 1; }
   elif command -v conda >/dev/null 2>&1; then
     warn "docker not found; falling back to host conda."
-    _conformance_host_conda
+    _run_host_conda "$label" "$commands"
   else
-    err "need docker (preferred; pulls $CONDA_IMAGE) or conda on PATH for the conformance job."
+    err "need docker (preferred; pulls $CONDA_IMAGE) or conda on PATH for the $label job."
     return 3
   fi
 }
 
-# Run the conformance harnesses inside a Miniforge container. The conda envs +
-# package cache live in host-side cache dirs ($CI_CACHE) mounted into the
-# container, so the heavy env solve happens once and the container runs as the
-# invoking user (no root-owned build artifacts left in the repo).
-_conformance_docker() {
-  info "Using Miniforge image: $CONDA_IMAGE  (cache: $CI_CACHE)"
-  mkdir -p "$CI_CACHE/conda-envs" "$CI_CACHE/conda-pkgs" "$CI_CACHE/home" || { err "cannot create cache dirs"; return 1; }
-
-  # Inner script runs in the container. Single-quoted heredoc: all $VARS expand
-  # INSIDE the container, not on the host. RECREATE_ENV/UPDATE_ENV arrive via -e.
-  local inner
-  inner=$(cat <<'INNER'
+# Emit the env-provisioning prelude that runs INSIDE the container. Single-
+# quoted heredoc: every $VAR expands in the container, not on the host.
+# RECREATE_ENV/UPDATE_ENV arrive via `docker run -e`.
+_container_prelude() {
+cat <<'INNER'
 set -euo pipefail
 source /opt/conda/etc/profile.d/conda.sh
 MGR=conda; command -v mamba >/dev/null 2>&1 && MGR=mamba
@@ -141,15 +147,54 @@ else
   echo "[ci-local] reusing cached env autonomous_trust"
 fi
 conda activate autonomous_trust
-export CONFORMANCE_SKIP_TOX=1 CC=clang CXX=clang++
+export CC=clang CXX=clang++
 export CMAKE_PREFIX_PATH="$CONDA_PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-echo "[ci-local] Python conformance harness ..."
-bash scripts/test-conformance.sh --python --strict-coverage
-echo "[ci-local] C conformance harness + cross-language diff ..."
-bash scripts/test-conformance.sh --c --strict-coverage
 INNER
-)
+}
+
+# Echo the image to run on (stdout); progress -> stderr; rc 0 if iproute2 is
+# present. Tests shell out to /sbin/ip for default-device detection and the base
+# Miniforge image lacks iproute2 (GitHub's ubuntu-latest runner has it). The
+# work run uses --user (no apt), so derive a small cached image once: root
+# apt-install iproute2 -> commit. On failure, echo the base image and rc 1 (the
+# Python code also degrades gracefully to the eth0 fallback).
+_image_with_iproute2() {
+  local base="$1"
+  local derived
+  derived="ci-local-iproute2:$(echo "$base" | tr '/:' '__')"
+  if docker image inspect "$derived" >/dev/null 2>&1; then
+    echo "$derived"; return 0
+  fi
+  echo "[ci-local] deriving run image with iproute2 (/sbin/ip), one-time ..." >&2
+  local tmp="at-iproute2-$$"
+  if docker run --name "$tmp" "$base" \
+        bash -c 'apt-get update -qq && apt-get install -y -qq iproute2' >/dev/null 2>&1 \
+     && docker commit -q "$tmp" "$derived" >/dev/null 2>&1; then
+    docker rm -f "$tmp" >/dev/null 2>&1 || true
+    echo "$derived"; return 0
+  fi
+  docker rm -f "$tmp" >/dev/null 2>&1 || true
+  echo "$base"; return 1
+}
+
+# Run a job's command block inside the Miniforge container. The conda envs +
+# package cache live in host-side cache dirs ($CI_CACHE) mounted into the
+# container, so the heavy env solve happens once and the container runs as the
+# invoking user (no root-owned build artifacts left in the repo).
+_run_in_container() {
+  local label="$1" commands="$2"
+  local run_image rc_ip=0
+  run_image="$(_image_with_iproute2 "$CONDA_IMAGE")" || rc_ip=$?
+  if [ "$rc_ip" -eq 0 ]; then
+    info "[$label] image: $run_image  (iproute2 present; cache: $CI_CACHE)"
+  else
+    warn "[$label] iproute2 derivation failed; using $run_image (tests fall back to eth0)."
+  fi
+  mkdir -p "$CI_CACHE/conda-envs" "$CI_CACHE/conda-pkgs" "$CI_CACHE/home" || { err "cannot create cache dirs"; return 1; }
+
+  # prelude (env provisioning, expands in-container) + the job's commands.
+  local inner; inner="$(_container_prelude)"$'\n'"$commands"
 
   docker run --rm \
     -v "$REPO:/work" -w /work \
@@ -162,19 +207,22 @@ INNER
     -e CONDA_PKGS_DIRS=/cache/pkgs \
     -e RECREATE_ENV="$RECREATE_ENV" \
     -e UPDATE_ENV="$UPDATE_ENV" \
-    "$CONDA_IMAGE" \
-    bash -c "$inner" || { err "conformance (containerized) failed"; return 1; }
+    "$run_image" \
+    bash -c "$inner"
 }
 
-# Run the conformance harnesses against a local conda install.
-_conformance_host_conda() {
+# Run a job's command block against a local conda install. Env provisioning
+# mirrors _container_prelude; the activated env (PATH, CONDA_PREFIX, ...) is
+# exported, so the command block inherits it in the sub-shell.
+_run_host_conda() {
+  local label="$1" commands="$2"
   local conda_base; conda_base="$(conda info --base 2>/dev/null)" || { err "conda info --base failed"; return 3; }
   # shellcheck disable=SC1091
   source "$conda_base/etc/profile.d/conda.sh" || { err "could not source conda.sh"; return 3; }
 
   local mgr=conda
   command -v mamba >/dev/null 2>&1 && mgr=mamba
-  info "env manager: $mgr"
+  info "[$label] env manager: $mgr"
 
   if $RECREATE_ENV; then
     warn "Removing env '$CENV' for a fresh CI-faithful rebuild ..."
@@ -196,18 +244,60 @@ _conformance_host_conda() {
 
   conda activate "$CENV" || { err "could not activate '$CENV'"; return 1; }
   info "active python: $(command -v python)  ($(python --version 2>&1))"
-
-  # Exactly the env the workflow's run step exports.
-  export CONFORMANCE_SKIP_TOX=1
   export CC=clang CXX=clang++
   export CMAKE_PREFIX_PATH="${CONDA_PREFIX}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"
   export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-  info "Python conformance harness (produces python-*.json) ..."
-  bash scripts/test-conformance.sh --python --strict-coverage || { err "python harness failed"; conda deactivate || true; return 1; }
-  info "C conformance harness + cross-language diff ..."
-  bash scripts/test-conformance.sh --c --strict-coverage || { err "C harness / diff failed"; conda deactivate || true; return 1; }
+  local rc=0
+  bash -c "$commands" || rc=$?
   conda deactivate || true
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
+# Job: conformance  (conformance.yml)
+#
+# protobuf codegen (gitignored, absent on fresh checkout) then the Python
+# harness, then the C harness + cross-language diff. CONFORMANCE_SKIP_TOX=1
+# forces the direct-pytest path so the conda interpreter is exercised.
+# ---------------------------------------------------------------------------
+job_conformance() {
+  _run_conda_job conformance '
+export CONFORMANCE_SKIP_TOX=1
+echo "[ci-local] Generating protobuf Python interfaces ..."
+bash scripts/build-py.sh proto-only
+echo "[ci-local] Python conformance harness ..."
+bash scripts/test-conformance.sh --python --strict-coverage
+echo "[ci-local] C conformance harness + cross-language diff ..."
+bash scripts/test-conformance.sh --c --strict-coverage
+'
+}
+
+# ---------------------------------------------------------------------------
+# Job: tests  (tests.yml: python-tests + c-tests)
+#
+# protobuf codegen, then the Python package suites (--quick skips the macvlan
+# two-node Docker integration test, unavailable here), then the C unit tests.
+# ---------------------------------------------------------------------------
+job_tests() {
+  # Fast, env-free preflight (mirrors tests.yml's ffi-drift job): catch native
+  # FFI cdef arg-count drift before the heavy conda build/test. Runs on the host
+  # if python3 is available (instant fail); if not, it's skipped locally and
+  # CI's ffi-drift job covers it.
+  if command -v python3 >/dev/null 2>&1; then
+    info "[tests] FFI cdef drift audit (preflight) ..."
+    python3 "$REPO/scripts/audit-ffi-drift.py" || { err "FFI drift audit failed"; return 1; }
+  else
+    warn "[tests] python3 not on host; skipping FFI drift preflight (CI's ffi-drift job covers it)."
+  fi
+  _run_conda_job tests '
+echo "[ci-local] Generating protobuf Python interfaces ..."
+bash scripts/build-py.sh proto-only
+echo "[ci-local] Python package test suites (test-packages.sh --quick) ..."
+bash scripts/test-packages.sh --quick
+echo "[ci-local] C unit tests (test-c-exe.sh) ..."
+bash scripts/test-c-exe.sh
+'
 }
 
 # ---------------------------------------------------------------------------
@@ -278,6 +368,7 @@ info "Repo: $REPO"
 info "Selected jobs: ${SELECTED[*]}"
 for j in "${SELECTED[@]}"; do case "$j" in
   conformance) run_job conformance job_conformance yes;;
+  tests)       run_job tests       job_tests       yes;;
   arm64)       run_job arm64       job_arm64       yes;;
   qemu)        run_job qemu        job_qemu        no;;
 esac; done

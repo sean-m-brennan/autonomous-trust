@@ -92,7 +92,10 @@ class NetWireMessage:
         """Serialize to wire format bytes."""
         wire_out = ffi.new('uint8_t **')
         wire_len = ffi.new('size_t *')
-        rc = lib.net_message_to_wire(self._ptr, wire_out, wire_len)
+        # 2nd arg is `const identity_t *signer`; NULL = serialize without
+        # signing (matches the C NULL-signer path). Omitting it left the C
+        # function reading a garbage pointer for the wire-out slot.
+        rc = lib.net_message_to_wire(self._ptr, ffi.NULL, wire_out, wire_len)
         if rc != 0:
             raise RuntimeError(f"net_message_to_wire failed with rc={rc}")
         result = bytes(ffi.buffer(wire_out[0], wire_len[0]))

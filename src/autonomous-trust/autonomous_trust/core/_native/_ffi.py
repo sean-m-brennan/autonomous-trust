@@ -117,6 +117,8 @@ ffi.cdef("""
 
     /* ---- structures/array.h ---- */
     typedef struct array_s array_t;
+    typedef array_t directory_t;   /* processes.h: typedef array_t directory_t */
+    typedef ... pthread_mutex_t;    /* opaque; only ever passed as a pointer */
 
     int    array_init(array_t *a);
     int    array_create(array_t **a_ptr);
@@ -232,8 +234,17 @@ ffi.cdef("""
         unsigned char uuid[16];
         char address[33];
         char fullname[129];
+        char nickname[129];   /* NAME_LEN+1; local-only Zooko names -- never */
+        char petname[129];    /* serialized (see identity.c sync_out/sync_in). */
         signature_t signature;
         encryptor_t encryptor;
+        /* ZTA credential binding (identity.h, #ifdef AT_ZTA_ENABLED). The
+           native lib is built AT_ZTA=ON (build-native.sh -DAT_ZTA=ON), so these
+           are part of the ABI layout and must be present here to match. */
+        uint8_t zta_credential_hash[32];
+        char zta_issuer[64];
+        uint8_t *zta_credential;
+        size_t zta_credential_len;
     } public_identity_t;
 
     typedef struct identity_s identity_t;  /* opaque - contains private keys */
@@ -303,6 +314,7 @@ ffi.cdef("""
     } net_wire_msg_t;
 
     int  net_message_to_wire(const net_wire_msg_t *msg,
+                             const identity_t *signer,
                              uint8_t **wire_out, size_t *wire_len);
     int  net_message_from_wire(const uint8_t *data, size_t len,
                                const public_identity_t *peer,
@@ -321,7 +333,7 @@ ffi.cdef("""
         int received;
     } ping_stats_t;
 
-    int  ping(const char *host, ping_stats_t *stats);
+    int  ping(const char *host, int count, ping_stats_t *stats);
     int  ping_server_start(void);
     int  ping_server_stop(void);
 
@@ -424,7 +436,8 @@ ffi.cdef("""
 
     int  start_process(char *pname, handler_ptr_t runner,
                        map_t *configs, tracker_t *tracker,
-                       map_t *procs, array_t *queues, logger_t *logger);
+                       map_t *procs, pthread_mutex_t *procs_lock,
+                       directory_t *queues, logger_t *logger);
     void process_free(process_t *proc);
 
     /* ---- negotiation/task.h ---- */
@@ -499,7 +512,8 @@ ffi.cdef("""
     double reputation_compute(const tx_history_t *hist,
                               const reputations_t *reps,
                               const unsigned char *self_uuid,
-                              const unsigned char *peer_uuid);
+                              const unsigned char *peer_uuid,
+                              const map_t *task_weights);
 
     /* ---- autonomous_trust.h ---- */
     int run_autonomous_trust(char *q_in, char *q_out,
@@ -554,7 +568,9 @@ def _find_library() -> str:
 
 def _preload_deps():
     """Pre-load shared library dependencies so dlopen() can resolve symbols."""
-    dep_names = ['sodium', 'jansson', 'protobuf-c', 'protobuf', 'uuid']
+    # crypto/ssl are needed because the lib is built AT_ZTA=ON (OpenSSL). They
+    # usually resolve via RPATH/LD_LIBRARY_PATH; preloading is belt-and-braces.
+    dep_names = ['sodium', 'jansson', 'protobuf-c', 'protobuf', 'uuid', 'crypto', 'ssl']
     for name in dep_names:
         path = ctypes.util.find_library(name)
         if path:

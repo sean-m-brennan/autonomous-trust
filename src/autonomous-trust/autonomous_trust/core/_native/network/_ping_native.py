@@ -76,11 +76,13 @@ class PingStats:
                 f'loss={self.loss:.1%})')
 
 
-def ping(host: str) -> PingStats:
+def ping(host: str, count: int = 1) -> PingStats:
     """Ping a host and return statistics (C implementation)."""
     stats = ffi.new('ping_stats_t *')
     host_buf = ffi.new('char[]', host.encode('ascii'))
-    rc = lib.ping(host_buf, stats)
+    # 2nd arg is the ping count; the cdef/wrapper previously omitted it, so the
+    # C side read a garbage count. Default 1 matches the pure-Python ping().
+    rc = lib.ping(host_buf, count, stats)
     if rc != 0:
         raise RuntimeError(f"ping failed with rc={rc}")
     return PingStats(_ptr=stats)
