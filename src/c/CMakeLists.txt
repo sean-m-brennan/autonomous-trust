@@ -123,6 +123,10 @@ if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
     list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align -Wno-cast-function-type-mismatch)
+    # conda's default CFLAGS are GCC-tuned (e.g. -fno-merge-constants) and leak
+    # into CMAKE_C_FLAGS; clang ignores them but, under -Werror, the resulting
+    # -Wignored-optimization-argument would otherwise fail the build.
+    list(APPEND useful_warnings -Wno-ignored-optimization-argument)
 endif()
 set(useful_flags
     #-fanalyzer
