@@ -2056,6 +2056,19 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
     size_t theirs_size = (j_addr_map != NULL && json_is_object(j_addr_map))
                          ? json_object_size(j_addr_map) : 0;
 
+    /* Cross-runtime proof point: the incoming canonical group payload parsed
+     * (Python's to_canonical / C's group_to_json flat form, shared field
+     * names uuid/address/address_map). Logged BEFORE the adopt/no-op decision
+     * so a same-group equal-size no-op (returned silently below) is still
+     * observable -- otherwise a successful parse is indistinguishable from a
+     * parse-failed-and-discarded one. A real uuid + nonzero address count here
+     * means Python's group_key_update was canonical and C ingested it; the
+     * pre-canonical ConfigJSONEncoder form would log "uuid ?, addresses 0".
+     * Asserted by embedded/test-interop-cpython.sh; see project_group_key_sync. */
+    log_info(proc->logger,
+             "Identity: parsed incoming group update (uuid %s, addresses %zu)\n",
+             theirs_uuid_str ? theirs_uuid_str : "?", theirs_size);
+
     /* Mine: snapshot uuid + address_map size. */
     size_t mine_size = map_size(&((process_t *)proc)->protocol.group.address_map);
     char mine_uuid_str[UUID_STRING_LEN + 1];
