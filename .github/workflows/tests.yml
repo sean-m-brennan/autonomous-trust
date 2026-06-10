@@ -1,0 +1,185 @@
+name: Tests
+
+# Unit/package test gate for merges. Complements the other workflows:
+#   * conformance.yml — dual-language conformance corpus (already gating)
+#   * arm64-build.yml — aarch64 cross-build (already gating)
+# This workflow runs the project's Python package suites and the C unit
+# tests, the CI-runnable core of `scripts/test.sh`. The remaining members
+# of that chain are deliberately NOT run here because they need privileged
+# Docker networking a GitHub-hosted runner can't provide:
+#   * scripts/test-integration.sh — multi-node macvlan Docker cluster
+#   * scripts/test-sim-pkg.sh      — simulator scenarios over Docker
+# Run those locally (or on a self-hosted runner) via `scripts/test.sh`.
+#
+# The environment is provisioned identically to conformance.yml: conda
+# (Miniforge + mamba) from the project's own two env files, so CI matches
+# local dev exactly:
+#   * config/cfg/environment.yml   — runtime + C build deps (cmake, clang,
+#     libsodium, jansson, libuuid, check, OpenSSL, protobuf/protobuf-c).
+#   * config/cfg/devel_environ.yml — dev/test tooling (pytest, pytest-cov,
+#     pytest-asyncio, tox, etc.) layered on top via `conda env update`.
+#
+# Local equivalents:
+#   python-tests -> bash scripts/test-packages.sh --quick
+#   c-tests      -> bash scripts/test-c-exe.sh
+#
+# To make these block merges: in the repo's branch-protection rules (or a
+# ruleset) for master/main, mark the check names `python-tests` and
+# `c-tests` as Required status checks. See the bottom of this file.
+
+on:
+  push:
+    branches: [master, main, 'feature/**']
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+# A newer push to the same branch/PR cancels the older still-running checks
+# (a PR gate only cares about the latest commit).
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Python package test suites.
+  #
+  # test-packages.sh first builds the C library (scripts/build.sh --c, used by
+  # the native backend), then runs each package's pytest suite — the core
+  # autonomous-trust package on BOTH the native and python backends. `--quick`
+  # skips tests/b_integration/test_two_node.py, which needs a live multi-node
+  # Docker cluster that isn't available on a hosted runner. The script exits
+  # nonzero on any test failure, failing this job.
+  # ---------------------------------------------------------------------------
+  python-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        # Login shell so the conda env activated by setup-miniconda is in
+        # effect for every `run:` step.
+        shell: bash -el {0}
+    env:
+      CONDA_PKGS_DIRS: ~/conda_pkgs_dir
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache conda packages
+        uses: actions/cache@v4
+        with:
+          path: ~/conda_pkgs_dir
+          key: conda-pkgs-${{ runner.os }}-${{ hashFiles('config/cfg/environment.yml', 'config/cfg/devel_environ.yml') }}
+          restore-keys: |
+            conda-pkgs-${{ runner.os }}-
+
+      - name: Set up conda env from environment.yml (Miniforge + mamba)
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: autonomous_trust
+          environment-file: config/cfg/environment.yml
+          use-mamba: true
+          auto-activate-base: false
+
+      - name: Layer dev/test deps from devel_environ.yml
+        run: mamba env update -n autonomous_trust -f config/cfg/devel_environ.yml
+
+      - name: Show toolchain
+        run: |
+          conda info --envs
+          python --version
+          cmake --version | head -1
+          clang --version | head -1 || echo "clang missing"
+
+      - name: Run Python package test suites
+        run: |
+          # Same conda toolchain + libs the C build needs (mirrors
+          # conformance.yml): the native backend's C extension is built by
+          # scripts/build.sh --c inside test-packages.sh.
+          export CC=clang CXX=clang++
+          export CMAKE_PREFIX_PATH="${CONDA_PREFIX}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"
+          export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          bash scripts/test-packages.sh --quick
+
+  # ---------------------------------------------------------------------------
+  # C unit tests.
+  #
+  # test-c-exe.sh cmake-builds the C library + tests with -DAT_ZTA=ON (needs
+  # OpenSSL, so the ZTA unit tests are built) using clang, then runs them via
+  # ctest. It exits nonzero if any C test fails, failing this job.
+  # ---------------------------------------------------------------------------
+  c-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash -el {0}
+    env:
+      CONDA_PKGS_DIRS: ~/conda_pkgs_dir
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache conda packages
+        uses: actions/cache@v4
+        with:
+          path: ~/conda_pkgs_dir
+          key: conda-pkgs-${{ runner.os }}-${{ hashFiles('config/cfg/environment.yml', 'config/cfg/devel_environ.yml') }}
+          restore-keys: |
+            conda-pkgs-${{ runner.os }}-
+
+      - name: Set up conda env from environment.yml (Miniforge + mamba)
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: autonomous_trust
+          environment-file: config/cfg/environment.yml
+          use-mamba: true
+          auto-activate-base: false
+
+      - name: Layer dev/test deps from devel_environ.yml
+        run: mamba env update -n autonomous_trust -f config/cfg/devel_environ.yml
+
+      - name: Show toolchain
+        run: |
+          conda info --envs
+          cmake --version | head -1
+          clang --version | head -1 || echo "clang missing"
+
+      - name: Run C unit tests
+        run: |
+          # Point CMake at the active conda env so the bare conda LLVM/lib
+          # packages (OpenSSL, jansson, libsodium, check) are found at build
+          # time, and make the conda .so closure resolvable at run time.
+          export CC=clang CXX=clang++
+          export CMAKE_PREFIX_PATH="${CONDA_PREFIX}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"
+          export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          bash scripts/test-c-exe.sh
+
+# ---------------------------------------------------------------------------
+# Making these block merges (branch protection)
+# ---------------------------------------------------------------------------
+# A workflow only *runs* checks; blocking merges is a repo setting. After this
+# file is on the default branch and has run at least once (so the check names
+# are known to GitHub):
+#
+#   GitHub -> Settings -> Branches -> Branch protection rules -> add/edit the
+#   rule for `master` (and `main`):
+#     [x] Require status checks to pass before merging
+#     [x] Require branches to be up to date before merging
+#         Add required checks:  python-tests   c-tests
+#         (and, if desired, the existing: conformance, ARM64 build job names)
+#
+# Or with the gh CLI (needs repo-admin + api.github.com access):
+#   gh api -X PUT repos/OWNER/REPO/branches/master/protection \
+#     -H "Accept: application/vnd.github+json" \
+#     -f 'required_status_checks[strict]=true' \
+#     -f 'required_status_checks[contexts][]=python-tests' \
+#     -f 'required_status_checks[contexts][]=c-tests' \
+#     -f 'enforce_admins=true' \
+#     -f 'required_pull_request_reviews=' -f 'restrictions='
