@@ -9,7 +9,13 @@
 #
 # Brings up ONE C at_demo node and ONE pure-Python node on a shared Docker
 # bridge and verifies they discover + mutually admit each other over live UDP,
-# then that the C node obtains the shared GROUP KEY (group-key sync):
+# then that the C node obtains the shared GROUP KEY (group-key sync). A SECOND
+# Python node is then staggered in (after the C node settles) so the authority
+# fans a membership update out to the already-present C node -- the only way a
+# group_key_update crosses the wire (see the group_key_update block below).
+# Topology: C @ .21, Python @ .11, 2nd Python @ .12.
+#
+# What is checked:
 #   * C -> Python : the Python node reconstructs the C node's identity from the
 #                   envelope from_* fields and admits it (access_granted).
 #   * Python -> C : the C node processes the Python node's announce and unicasts
@@ -32,7 +38,7 @@
 # arm64-build.yml) and skip the native build with --c-image autonomous-trust-c.
 #
 # Usage:
-#   ./test-interop-cpython.sh                 # build C node + run, ~90s
+#   ./test-interop-cpython.sh                 # build C node + run, ~120s (3 nodes)
 #   ./test-interop-cpython.sh --skip-build    # reuse existing at-cnode-cur image
 #   ./test-interop-cpython.sh --c-image NAME  # use a prebuilt C image (e.g. from Dockerfile-c)
 #   ./test-interop-cpython.sh --keep          # leave containers running
@@ -47,9 +53,11 @@ NET=interop-cpy-net
 SUBNET=172.31.0.0/24
 C_IP=172.31.0.21
 PY_IP=172.31.0.11
+PY2_IP=172.31.0.12
 PY_IMAGE=autonomous-trust:dev
 C_IMAGE=at-cnode-cur
-DURATION=90
+DURATION=120
+STAGGER=40          # seconds to let C settle before the 2nd Python node joins
 SKIP_BUILD=false
 KEEP=false
 
@@ -69,8 +77,8 @@ while [[ $# -gt 0 ]]; do case "$1" in
 esac; done
 
 cleanup(){
-  if $KEEP; then info "leaving containers up (--keep); 'docker rm -f interop-c interop-py'"; return; fi
-  docker rm -f interop-c interop-py >/dev/null 2>&1 || true
+  if $KEEP; then info "leaving containers up (--keep); 'docker rm -f interop-c interop-py interop-py2'"; return; fi
+  docker rm -f interop-c interop-py interop-py2 >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -178,7 +186,7 @@ fi
 # ----------------------------------------------------------------------------
 # Bring up the mixed fleet
 # ----------------------------------------------------------------------------
-docker rm -f interop-c interop-py >/dev/null 2>&1 || true
+docker rm -f interop-c interop-py interop-py2 >/dev/null 2>&1 || true
 docker network rm "$NET" >/dev/null 2>&1 || true
 docker network create --subnet "$SUBNET" "$NET" >/dev/null
 
@@ -193,10 +201,32 @@ docker run -d --name interop-py --network "$NET" --ip "$PY_IP" \
   -v "$REPO/src/autonomous-trust/autonomous_trust:/app/autonomous_trust:ro" \
   "$PY_IMAGE" >/dev/null
 
-info "Running ${DURATION}s ..."
-sleep "$DURATION"
+# group_key_update needs an admission that fans out to an ALREADY-admitted
+# peer: Python's _update_group (idprocess.py) only sends the group to PRE-
+# existing group members (self.peers.hierarchy[level]), so the very first
+# peer's own admission has an empty fan-out target and emits nothing. We let
+# the C node settle, then bring up a SECOND Python node; when the established
+# authority admits it, its _update_group fans the (now larger) group to the
+# already-present C node -- the cross-runtime group_key_update under test.
+REMAIN="$DURATION"
+if [ "$DURATION" -gt "$((STAGGER + 20))" ]; then
+  info "Settling ${STAGGER}s before adding the 2nd Python node ($PY2_IP) ..."
+  sleep "$STAGGER"
+  info "Starting 2nd Python node ($PY_IMAGE @ $PY2_IP) to trigger a group_key_update fan-out ..."
+  docker run -d --name interop-py2 --network "$NET" --ip "$PY2_IP" \
+    -e AUTONOMOUS_TRUST_BACKEND=python -e AUTONOMOUS_TRUST_EXE="-m autonomous_trust" \
+    -e AUTONOMOUS_TRUST_ARGS="--live --log-level debug" -e POSTMORTEM=false \
+    -v "$REPO/src/autonomous-trust/autonomous_trust:/app/autonomous_trust:ro" \
+    "$PY_IMAGE" >/dev/null
+  REMAIN="$((DURATION - STAGGER))"
+else
+  info "DURATION ($DURATION) too short to stagger a 2nd node (need > $((STAGGER + 20))); group_key_update will NOT fire."
+fi
+info "Running ${REMAIN}s more ..."
+sleep "$REMAIN"
 PYLOG="$(docker logs interop-py 2>&1)"
 CLOG="$(docker logs interop-c 2>&1)"
+PY2LOG="$(docker logs interop-py2 2>&1 || true)"
 # Did the C node survive, or did it exit (e.g. a bundled-lib/glibc mismatch)?
 C_STATE="$(docker inspect -f '{{.State.Status}} (exit {{.State.ExitCode}})' interop-c 2>/dev/null || echo unknown)"
 info "C node container state: ${C_STATE}"
@@ -240,13 +270,23 @@ chkc "C node parsed + ADOPTED the Python group key"       "adopted mesh group .*
 # from the full_history bootstrap adoption above. Python's _update_group now
 # emits the DRY canonical flat group (to_canonical), so the C co-member's
 # handle_group_update can parse it -- pre-fix Python sent the ConfigJSONEncoder
-# form, which C could not parse and silently dropped. The C "parsed incoming
-# group update (uuid <real-uuid>, addresses N>=1)" line is the cross-runtime
-# proof: it fires on a successful canonical parse regardless of the adopt/no-op
-# outcome (a same-group equal-size no-op leaves no other trace, so the older
-# "adopting incoming group" line alone is too timing-dependent to assert on).
-# A pre-fix / non-canonical payload would instead log "uuid ?, addresses 0".
+# form, which C could not parse and silently dropped.
+#
+# This message ONLY crosses the wire once a NEW peer is admitted while an
+# earlier peer is already in the group (_update_group fans out to pre-existing
+# members only). Hence the staggered 2nd Python node above: its admission is
+# what makes the authority fan the group to the already-present C node. With
+# only the original two nodes, Python emits no group_key_update at all and
+# these checks (correctly) cannot pass.
+#
+# The C "parsed incoming group update (uuid <real-uuid>, addresses N>=1)" line
+# is the cross-runtime proof: it fires on a successful canonical parse
+# regardless of the adopt/no-op outcome (a same-group equal-size no-op leaves
+# no other trace, so the older "adopting incoming group" line alone is too
+# timing-dependent to assert on). A pre-fix / non-canonical payload would
+# instead log "uuid ?, addresses 0".
 echo "------ group_key_update (membership) ------"
+chk  "Python fanned out a group_key_update (_update_group)" "Sent group .* to "
 chkc "C node received a group_key_update from Python"      "received group update from"
 chkc "C parsed Python's canonical group_key_update"        "parsed incoming group update \(uuid [0-9a-fA-F-]{36}, addresses [1-9]"
 
@@ -257,6 +297,7 @@ if [ "$F" -gt 0 ]; then
   info "C node container state: ${C_STATE}"
   info "C node log (last 40 lines):";  echo "$CLOG"  | sed 's/\x1b\[[0-9;]*m//g' | tail -40
   info "Python log (last 40 lines):"; echo "$PYLOG" | sed 's/\x1b\[[0-9;]*m//g' | tail -40
+  info "2nd Python node log (last 20 lines):"; echo "${PY2LOG:-<not started>}" | sed 's/\x1b\[[0-9;]*m//g' | tail -20
   exit 1
 fi
 info "C <-> Python discovery + identity admission interoperate."

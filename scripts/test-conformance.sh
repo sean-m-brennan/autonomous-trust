@@ -75,10 +75,20 @@ py_dir="$here/src/autonomous-trust"
 
 run_python() {
   cd "$py_dir"
-  if command -v tox >/dev/null 2>&1; then
+  # Prefer tox unless the caller opts out. Set CONFORMANCE_SKIP_TOX=1 when the
+  # project conda env (config/cfg/environment.yml + devel_environ.yml) is
+  # already active and IS the environment under test — tox would otherwise
+  # spin up an isolated venv and pip-reinstall everything, bypassing conda
+  # (and re-introducing the pip path conda is meant to replace). The GitHub
+  # conformance workflow sets this so the harness runs in the conda interpreter.
+  if [[ -z "${CONFORMANCE_SKIP_TOX:-}" ]] && command -v tox >/dev/null 2>&1; then
     tox -e conformance -- "${pytest_args[@]}"
   else
-    echo "tox not found; falling back to direct pytest invocation." >&2
+    if [[ -n "${CONFORMANCE_SKIP_TOX:-}" ]]; then
+      echo "CONFORMANCE_SKIP_TOX set; running pytest directly in the active env." >&2
+    else
+      echo "tox not found; falling back to direct pytest invocation." >&2
+    fi
     echo "If imports fail, activate the project conda env (which supplies" >&2
     echo "protobuf and the harness deps):" >&2
     echo "  conda activate autonomous_trust" >&2
