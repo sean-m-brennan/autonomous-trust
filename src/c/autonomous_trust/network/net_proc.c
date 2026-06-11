@@ -566,7 +566,7 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
         return ret;
     }
     log_debug(logger, "Routed %s.%s from %s\n", wmsg->process, wmsg->function,
-              wmsg->from_whom.fullname);
+              wmsg->from_whom.nickname);
     if (gmsg.info.net_msg.function != NULL) free(gmsg.info.net_msg.function);
     return 0;
 }
@@ -1665,7 +1665,7 @@ static int network_run(const net_transport_t *transport,
             peers_write_lock(proc);
             bool appended = false;
             int snapshot_rtt = 0;  /* captured under lock for rtt fan-out */
-            if (new_peer->fullname[0] != '\0' &&
+            if (new_peer->nickname[0] != '\0' &&
                 proc->protocol.num_peers < MAX_PEERS) {
                 bool found = false;
                 for (size_t i = 0; i < proc->protocol.num_peers; i++) {
@@ -1698,7 +1698,7 @@ static int network_run(const net_transport_t *transport,
 
             if (appended) {
                 log_info(logger, "Network: added peer %s (%s)\n",
-                         new_peer->fullname, new_peer->address);
+                         new_peer->nickname, new_peer->address);
 
                 /* Push the freshly-computed rtt to sibling processes so their
                  * peer_rtt_ms[] arrays track net_proc's view. Local IPC only.

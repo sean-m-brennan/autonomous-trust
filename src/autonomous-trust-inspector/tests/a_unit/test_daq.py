@@ -39,8 +39,8 @@ class TestNullPeerData:
 class TestPeerDataAcq:
     def _make_peer(self):
         ident = MagicMock()
-        ident.fullname = 'Test Peer'
-        ident.nickname = 'TP'
+        ident.nickname = 'Test Peer'
+        ident.petname = 'TP'
         metadata = MagicMock()
         metadata.time = datetime.now()
         metadata.position = MagicMock()
