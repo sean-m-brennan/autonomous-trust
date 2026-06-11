@@ -52,9 +52,9 @@ def enc():
 @pytest.fixture
 def identity(sig, enc):
     return Identity(
-        uuid_mod.uuid4(), '192.168.1.1', 'Test User', 'tester',
+        uuid_mod.uuid4(), '192.168.1.1', 'Test User',
         Signature(sig.publish(), True), Encryptor(enc.publish(), True),
-        petname='me', _public_only=True
+        petname='tester', _public_only=True
     )
 
 
@@ -149,7 +149,7 @@ def test_identity_sync_roundtrip(identity):
     restored.sync_from_message()
 
     assert restored.uuid == identity.uuid
-    assert restored.fullname == identity.fullname
+    assert restored.nickname == identity.nickname
     assert restored.address == identity.address
     assert restored.signature.publish() == identity.signature.publish()
     assert restored.encryptor.publish() == identity.encryptor.publish()
@@ -243,7 +243,7 @@ def test_identity_obj_sync_roundtrip(identity):
 
     assert restored.originator == idobj.originator
     assert restored.identity.uuid == idobj.identity.uuid
-    assert restored.identity.fullname == idobj.identity.fullname
+    assert restored.identity.nickname == idobj.identity.nickname
 
 
 # ---- wire bytes roundtrips ----
@@ -269,7 +269,7 @@ def test_identity_wire_bytes(identity):
     assert isinstance(raw, bytes)
     restored = Identity.from_wire_bytes(raw)
     assert restored.uuid == identity.uuid
-    assert restored.fullname == identity.fullname
+    assert restored.nickname == identity.nickname
     assert restored.signature.publish() == identity.signature.publish()
     assert restored.encryptor.publish() == identity.encryptor.publish()
 

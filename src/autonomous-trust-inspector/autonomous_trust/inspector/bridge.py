@@ -88,11 +88,12 @@ REPUTATION_PUSH_DELTA = 0.01
 def _peer_name(identity_obj) -> str:
     """Best-effort identity -> display name.
 
-    AT Identity has .nickname, .fullname, .uuid. Prefer nickname so
-    bridge events carry the scenario's short label (e.g. 'noaa-1') when
-    AT_PEER_NAME propagation is wired. Falls back to str() if none set.
+    AT Identity has .nickname (online), .petname (local), .uuid. Prefer
+    nickname so bridge events carry the scenario's label (e.g.
+    'noaa-1@...') when AT_PEER_NAME propagation is wired. Falls back to
+    petname, then str() if none set.
     """
-    for attr in ("nickname", "fullname"):
+    for attr in ("nickname", "petname"):
         v = getattr(identity_obj, attr, None)
         if v:
             return str(v)

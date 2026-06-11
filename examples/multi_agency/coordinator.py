@@ -137,7 +137,8 @@ try:
                             msg, block=True, timeout=self.q_cadence)
                         self.logger.info(
                             "DiagDataRcvr: subscribed to %s",
-                            getattr(ident, "nickname", ident))
+                            getattr(ident, "petname", None)
+                            or getattr(ident, "nickname", ident))
                 try:
                     message = queues[self.name].get(
                         block=True, timeout=self.q_cadence)
@@ -498,7 +499,7 @@ class MultiAgencyCoordinator(AutonomousTrust):
                 "_drain_peer_readings: cohort first populated with "
                 "%d peer(s): %s",
                 len(self._cohort.peers),
-                sorted(p.nickname for p in self._cohort.peers.values()))
+                sorted(p.petname for p in self._cohort.peers.values()))
             MultiAgencyCoordinator._logged_first_peers = True
 
         if getattr(self, '_reading_drain', None) is None:
@@ -520,8 +521,8 @@ class MultiAgencyCoordinator(AutonomousTrust):
             except (TypeError, ValueError):
                 continue
             peer = peers_by_uuid.get(uuid_str)
-            peer_name = (getattr(peer, 'nickname', None)
-                         or getattr(peer, 'fullname', None)
+            peer_name = (getattr(peer, 'petname', None)
+                         or getattr(peer, 'nickname', None)
                          or uuid_str[:8])
             if not MultiAgencyCoordinator._logged_first_reading:
                 logger.info(
@@ -718,7 +719,7 @@ class MultiAgencyCoordinator(AutonomousTrust):
             if score is None:
                 continue
             peer = peers_by_uuid.get(str(peer_id_str))
-            name = getattr(peer, "nickname", None) or str(peer_id_str)
+            name = getattr(peer, "petname", None) or str(peer_id_str)
             self._reputation_cache[name] = float(score)
             self._feed_timeline(name, float(score))
             new_tier = int(getattr(peer, "_tier", 0))

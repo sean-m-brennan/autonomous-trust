@@ -523,7 +523,7 @@ static int _send_caps_query(const process_t *proc, const public_identity_t *peer
     messaging_send("network", NET_MESSAGE, &query, false);
     log_info(proc->logger,
              "Identity: sent caps_query to %s (UDP-loss recovery)\n",
-             peer->fullname);
+             peer->nickname);
     return 0;
 }
 
@@ -534,7 +534,7 @@ static int _send_caps_query(const process_t *proc, const public_identity_t *peer
  * inside `_add_peer` — see the constraint block above `handle_group_update`
  * for the tiebreaker rule that prevents an ID_UPDATE flood).
  *
- * Confirm payload carries `{uuid, fullname, address}` so the receiver can
+ * Confirm payload carries `{uuid, nickname, address}` so the receiver can
  * route a directed `caps_query` back to the new peer if its announce was
  * lost (UDP-loss recovery — see _send_caps_query).
  *
@@ -570,7 +570,7 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
         /* DRY canonical: full public-identity payload (incl. sig/enc pubkeys),
          * shared byte-shape with Python public_identity_to_canonical, so a
          * Python member can parse the confirm announcement. (Was a
-         * {uuid,fullname,address} subset that dropped the public keys.) */
+         * {uuid,nickname,address} subset that dropped the public keys.) */
         json_t *peer_json = NULL;
         if (public_identity_to_json(new_peer, &peer_json) != 0 || peer_json == NULL) {
             log_error(proc->logger, "Identity: public_identity_to_json failed (confirm broadcast)\n");
@@ -740,10 +740,10 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
 
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Identity: received access request from %s\n",
-             nmsg->from_whom.fullname);
+             nmsg->from_whom.nickname);
 
     /* Validate the new identity */
-    if (nmsg->from_whom.fullname[0] == '\0')
+    if (nmsg->from_whom.nickname[0] == '\0')
     {
         log_warn(proc->logger, "Identity: rejecting empty identity\n");
         return true;
@@ -771,7 +771,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
          * restart. Matches Python's _peer_accepted(amnesia=True). */
         log_info(proc->logger,
                  "Identity: peer %s already known (amnesia path)\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         _peer_accepted((process_t *)proc, queues, &nmsg->from_whom, true);
         return true;
     }
@@ -808,7 +808,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
                     log_warn(proc->logger,
                              "Identity: ZTA credential %s for %s: %s\n",
                              zta_status_str(zta_result.status),
-                             nmsg->from_whom.fullname, zta_result.reason);
+                             nmsg->from_whom.nickname, zta_result.reason);
                     verifier->destroy(verifier);
                     return true; /* reject */
                 }
@@ -816,13 +816,13 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
                     if (!zta_policy->allow_ddil_fallback) {
                         log_warn(proc->logger,
                                  "Identity: ZTA unavailable, DDIL fallback disabled; rejecting %s\n",
-                                 nmsg->from_whom.fullname);
+                                 nmsg->from_whom.nickname);
                         verifier->destroy(verifier);
                         return true; /* reject */
                     }
                     log_info(proc->logger,
                              "Identity: ZTA verification deferred (DDIL) for %s\n",
-                             nmsg->from_whom.fullname);
+                             nmsg->from_whom.nickname);
                 }
                 verifier->destroy(verifier);
             }
@@ -841,7 +841,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     if (bootstrap && !id_state.synchronous_dispatch)
     {
         log_info(proc->logger, "Identity: bootstrap — auto-accepting first peer %s\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         _peer_accepted((process_t *)proc, queues, &nmsg->from_whom, false);
         return true;
     }
@@ -876,7 +876,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         return true;
     }
     json_object_set_new(proposal_json, "uuid", json_string(uuid_str));
-    json_object_set_new(proposal_json, "fullname", json_string(nmsg->from_whom.fullname));
+    json_object_set_new(proposal_json, "nickname", json_string(nmsg->from_whom.nickname));
     json_object_set_new(proposal_json, "address", json_string(nmsg->from_whom.address));
     /* Carry the candidate's signature/encryptor public keys so voters can
      * run the full Sybil collision check (uuid OR signature OR encryptor),
@@ -932,7 +932,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     json_decref(proposal_json);
 
     log_info(proc->logger, "Identity: proposed peer %s for voting\n",
-             nmsg->from_whom.fullname);
+             nmsg->from_whom.nickname);
 
     /* synchronous_dispatch: inline-finalize. Production waits for inbound
      * vote messages to drive handle_count_vote → _peer_accepted; in test
@@ -945,7 +945,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     {
         log_info(proc->logger,
                  "Identity: synchronous_dispatch — self-vote majority for %s\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         _peer_accepted((process_t *)proc, queues, &nmsg->from_whom, false);
     }
     return true;
@@ -975,7 +975,7 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
 
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Identity: access granted by %s\n",
-             nmsg->from_whom.fullname);
+             nmsg->from_whom.nickname);
 
     /* Dedup + append under the write lock */
     peers_write_lock((process_t *)proc);
@@ -1435,7 +1435,7 @@ static bool handle_receive_history(const process_t *proc, directory_t *queues, g
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Identity: received history from %s\n",
-             nmsg->from_whom.fullname);
+             nmsg->from_whom.nickname);
 
     /* Unpack JSON payload and store for group selection */
     json_t *payload = NULL;
@@ -1461,7 +1461,7 @@ static bool handle_receive_history(const process_t *proc, directory_t *queues, g
         id_state.merging = true;
     pthread_mutex_unlock(&id_state.lock);
 
-    log_debug(proc->logger, "Identity: stored history from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Identity: stored history from %s\n", nmsg->from_whom.nickname);
 
     if (should_merge)
         _merge_to_mesh((process_t *)proc, queues);
@@ -1791,7 +1791,7 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
 
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Identity: received vote from %s\n",
-              nmsg->from_whom.fullname);
+              nmsg->from_whom.nickname);
 
     /* Unpack JSON payload to get the proposed peer UUID and approval flag */
     json_t *payload = NULL;
@@ -1885,12 +1885,12 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
 
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Identity: peer acceptance confirmed from %s\n",
-             nmsg->from_whom.fullname);
+             nmsg->from_whom.nickname);
 
     /* Unpack the new-peer identity from the JSON payload. DRY canonical: the
      * full public-identity form (shared byte-shape with Python
      * public_identity_to_canonical, incl. sig/enc pubkeys);
-     * public_identity_from_json also tolerates the legacy {uuid,fullname,
+     * public_identity_from_json also tolerates the legacy {uuid,nickname,
      * address} subset (sig/enc optional). */
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -1911,10 +1911,10 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
     char uuid_str_buf[UUID_STRING_LEN + 1];
     uuid_unparse_lower(new_peer.uuid, uuid_str_buf);
     const char *uuid_str = uuid_str_buf;
-    const char *fullname = new_peer.fullname;
+    const char *nickname = new_peer.nickname;
     const char *address  = (new_peer.address[0] != '\0') ? (const char *)new_peer.address : NULL;
 
-    log_info(proc->logger, "Identity: confirmed peer %s (%s)\n", fullname, uuid_str);
+    log_info(proc->logger, "Identity: confirmed peer %s (%s)\n", nickname, uuid_str);
 
     /* UDP-loss recovery: if the new peer's announce never reached us, their
      * UUID is absent from id_state.peer_potentials. The confirm broadcast is
@@ -1936,7 +1936,7 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
             log_info(proc->logger,
                      "Identity: no prior caps potential for %s (%s) — "
                      "querying directly (announce likely lost)\n",
-                     fullname, uuid_str);
+                     nickname, uuid_str);
             _send_caps_query(proc, &new_peer);
         }
     }
@@ -1965,7 +1965,7 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
 
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Identity: received history diff from %s\n",
-              nmsg->from_whom.fullname);
+              nmsg->from_whom.nickname);
 
     /* Unpack JSON step list from payload */
     json_t *payload = NULL;
@@ -1984,7 +1984,7 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
 
     log_info(proc->logger,
              "Identity: received %zu history diff step(s) from %s (DAG merge pending infrastructure)\n",
-             step_count, nmsg->from_whom.fullname);
+             step_count, nmsg->from_whom.nickname);
 
     json_decref(payload);
     return true;
@@ -2039,7 +2039,7 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
 
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Identity: received group update from %s\n",
-             nmsg->from_whom.fullname);
+             nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -2177,7 +2177,7 @@ static bool handle_caps_query(const process_t *proc, directory_t *queues, generi
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Identity: caps_query from %s\n",
-              nmsg->from_whom.fullname);
+              nmsg->from_whom.nickname);
 
     /* Build a JSON array of own capability names from the test-installed
      * allowlist for this process (NULL → empty array). */
@@ -2230,7 +2230,7 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Identity: caps_response from %s\n",
-              nmsg->from_whom.fullname);
+              nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -2962,7 +2962,7 @@ static bool handle_identity_query(const process_t *proc, directory_t *queues, ge
     probes_counter("peer.set", "identity_response_sent", "1");
     log_debug(proc->logger,
               "Identity resync: replied to identity_query from %s\n",
-              nmsg->from_whom.fullname);
+              nmsg->from_whom.nickname);
     return true;
 }
 

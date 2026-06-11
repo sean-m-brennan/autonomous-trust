@@ -121,7 +121,7 @@ static int send_to_peer(const process_t *proc, const char *function,
 static bool handle_config_propose(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Config: proposal from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Config: proposal from %s\n", nmsg->from_whom.nickname);
 
     /* Unpack proposal JSON from payload */
     json_t *payload = NULL;
@@ -147,7 +147,7 @@ static bool handle_config_propose(const process_t *proc, directory_t *queues, ge
     {
         log_warn(proc->logger,
                     "Config: REJECTED identity modification attempt from %s\n",
-                    nmsg->from_whom.fullname);
+                    nmsg->from_whom.nickname);
 
         /* Send negative reputation score */
         generic_msg_t score_msg = {0};
@@ -214,7 +214,7 @@ static bool handle_config_propose(const process_t *proc, directory_t *queues, ge
 static bool handle_config_vote_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Config: vote request from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Config: vote request from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -300,7 +300,7 @@ static bool handle_config_vote_request(const process_t *proc, directory_t *queue
 static bool handle_config_vote_grant(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Config: vote grant from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Config: vote grant from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -378,7 +378,7 @@ static bool handle_config_vote_grant(const process_t *proc, directory_t *queues,
 static bool handle_config_vote_nack(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Config: vote nack from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Config: vote nack from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     int64_t id1 = 0, id2 = 0;
@@ -415,7 +415,7 @@ static bool handle_config_vote_nack(const process_t *proc, directory_t *queues, 
 static bool handle_config_accepted(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Config: config accepted from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Config: config accepted from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)

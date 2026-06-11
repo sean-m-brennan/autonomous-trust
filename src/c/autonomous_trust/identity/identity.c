@@ -44,8 +44,8 @@ void peers_set_max_count(size_t count)
 
 
 /* Frama-C: skipped — [solver-timeout] complex multi-step initialization */
-int identity_init(uuid_t *uuid, const char *address, const char *fullname,
-                  const char *nickname, const char *petname, identity_t *identity)
+int identity_init(uuid_t *uuid, const char *address, const char *nickname,
+                  const char *petname, identity_t *identity)
 {
     if (uuid == NULL)
         uuid_generate((unsigned char *)identity->uuid);
@@ -53,8 +53,7 @@ int identity_init(uuid_t *uuid, const char *address, const char *fullname,
         memcpy(&identity->uuid, uuid, sizeof(uuid_t));
 
     strncpy(identity->address, address, ADDR_LEN);
-    strncpy(identity->fullname, fullname, NAME_LEN);
-    strncpy(identity->nickname, nickname ? nickname : "", NAME_LEN);
+    strncpy(identity->nickname, nickname, NAME_LEN);
     strncpy(identity->petname, petname ? petname : "", NAME_LEN);
 
     unsigned char *sseed = signature_generate();
@@ -77,8 +76,8 @@ int identity_init(uuid_t *uuid, const char *address, const char *fullname,
 }
 
 /* Frama-C: skipped — [solver-timeout] smrt_ptr allocation postconditions */
-int identity_create(uuid_t *uuid, const char *address, const char *fullname,
-                    const char *nickname, const char *petname, identity_t **ident)
+int identity_create(uuid_t *uuid, const char *address, const char *nickname,
+                    const char *petname, identity_t **ident)
 {
     /* WHY we call sodium_init() here rather than from a one-shot bootstrap:
      *
@@ -106,7 +105,7 @@ int identity_create(uuid_t *uuid, const char *address, const char *fullname,
     if (identity == NULL)
         return EXCEPTION(ENOMEM);
 
-    return identity_init(uuid, address, fullname, nickname, petname, identity);
+    return identity_init(uuid, address, nickname, petname, identity);
 }
 
 /* Frama-C: skipped — [solver-timeout] libsodium + hexlify preconditions */
@@ -122,8 +121,6 @@ int identity_publish(const identity_t *ident, public_identity_t **pub_copy)
     memcpy(newIdent->uuid, ident->uuid, sizeof(uuid_t));
     strncpy(newIdent->address, ident->address, ADDR_LEN);
     newIdent->address[ADDR_LEN] = '\0';
-    strncpy(newIdent->fullname, ident->fullname, NAME_LEN);
-    newIdent->fullname[NAME_LEN] = '\0';
     strncpy(newIdent->nickname, ident->nickname, NAME_LEN);
     newIdent->nickname[NAME_LEN] = '\0';
     strncpy(newIdent->petname, ident->petname, NAME_LEN);
@@ -190,10 +187,10 @@ int public_identity_to_json(const public_identity_t *p, json_t **obj_ptr)
     uuid_unparse(p->uuid, uuid_str);
     json_object_set_new(obj, "uuid", json_string(uuid_str));
     json_object_set_new(obj, "address", json_string((const char *)p->address));
-    json_object_set_new(obj, "fullname", json_string(p->fullname));
-    /* nickname/petname are Zooko local names: never emitted on the wire. Must
-       match Python public_identity_to_canonical (identity.py), which also omits
-       them, so the cross-runtime canonical form stays byte-identical. */
+    json_object_set_new(obj, "nickname", json_string(p->nickname));
+    /* petname is a Zooko local name: never emitted on the wire. Must match
+       Python public_identity_to_canonical (identity.py), which also omits it,
+       so the cross-runtime canonical form stays byte-identical. */
 
     json_t *sig = json_object();
     if (sig == NULL) return ENOMEM;
@@ -222,12 +219,11 @@ int public_identity_from_json(const json_t *obj, public_identity_t *p)
     const char *s;
     if ((s = json_string_value(json_object_get(obj, "address"))) != NULL)
         strncpy(p->address, s, ADDR_LEN);
-    if ((s = json_string_value(json_object_get(obj, "fullname"))) != NULL)
-        strncpy(p->fullname, s, NAME_LEN);
-    /* nickname/petname are local-only; never imported from the wire form.
-       Clear them (mirrors Python from_canonical) rather than reading any
-       legacy/crafted keys. A receiver assigns its own petname locally. */
-    p->nickname[0] = '\0';
+    if ((s = json_string_value(json_object_get(obj, "nickname"))) != NULL)
+        strncpy(p->nickname, s, NAME_LEN);
+    /* petname is local-only; never imported from the wire form. Clear it
+       (mirrors Python from_canonical) rather than reading any legacy/crafted
+       key. A receiver assigns its own petname locally. */
     p->petname[0] = '\0';
 
     const char *sig_hex = json_string_value(
@@ -264,7 +260,6 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr)
     json_object_set_new(obj, "uuid", json_string(uuid_str));
     json_object_set_new(obj, "rank", json_integer(ident->rank));
     json_object_set_new(obj, "address", json_string((char *)ident->address));
-    json_object_set_new(obj, "fullname", json_string(ident->fullname));
     json_object_set_new(obj, "nickname", json_string(ident->nickname));
     json_object_set_new(obj, "petname", json_string(ident->petname));
 
@@ -299,9 +294,6 @@ int identity_from_json(const json_t *obj, void *data_struct)
     const char *addr_str = json_string_value(json_object_get(obj, "address"));
     if (addr_str != NULL)
         strncpy(ident->address, addr_str, sizeof(ident->address)-1);
-    const char *fullname_str = json_string_value(json_object_get(obj, "fullname"));
-    if (fullname_str != NULL)
-        strncpy(ident->fullname, fullname_str, sizeof(ident->fullname)-1);
     const char *nickname_str = json_string_value(json_object_get(obj, "nickname"));
     if (nickname_str != NULL)
         strncpy(ident->nickname, nickname_str, sizeof(ident->nickname)-1);
@@ -331,10 +323,10 @@ int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core_
     proto->uuid.data = identity->uuid;
     proto->uuid.len = sizeof(uuid_t);
     proto->address = identity->address;
-    proto->fullname = identity->fullname;
-    /* nickname/petname are Zooko local names: never serialized. Leaving the
-       proto fields unset keeps them off the wire (proto3 omits empty), matching
-       the Python twin (identity.py sync_to_message never sets them). */
+    proto->nickname = identity->nickname;
+    /* petname is a Zooko local name: never serialized. Leaving the proto field
+       unset keeps it off the wire (proto3 omits empty), matching the Python
+       twin (identity.py sync_to_message never sets it). */
 
     proto->signature = malloc(sizeof(AutonomousTrust__Core__Protobuf__Identity__Signature));
     AutonomousTrust__Core__Protobuf__Identity__Signature tmp_s = AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__SIGNATURE__INIT;
@@ -366,12 +358,11 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
 {
     memcpy(&identity->uuid, proto->uuid.data, sizeof(uuid_t));
     strncpy(identity->address, proto->address, ADDR_LEN);
-    strncpy(identity->fullname, proto->fullname, NAME_LEN);
-    /* nickname/petname are local-only Zooko names; never imported from the
-       wire. Clear them (mirrors Python sync_from_message, which sets '') so a
-       crafted proto field 9/10 can't inject into local naming. A receiver
-       assigns its own petname locally. */
-    identity->nickname[0] = '\0';
+    strncpy(identity->nickname, proto->nickname, NAME_LEN);
+    /* petname is a local-only Zooko name; never imported from the wire. Clear
+       it (mirrors Python sync_from_message, which sets '') so a crafted proto
+       field 10 can't inject into local naming. A receiver assigns its own
+       petname locally. */
     identity->petname[0] = '\0';
     if (public_signature_init(&identity->signature, proto->signature->hex_seed.data,
                               proto->signature->hex_seed.len) != 0)

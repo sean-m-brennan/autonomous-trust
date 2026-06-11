@@ -819,8 +819,8 @@ def _make_test_identity(pid: str, addr: str) -> 'Identity':
     ns = UUID('00000000-0000-0000-0000-000000000aaa')
     uuid = uuid5(ns, f'at-conformance:{pid}')
     return Identity(
-        uuid, addr, f'{pid}.scenario', pid,
+        uuid, addr, f'{pid}.scenario',
         Signature(sig_seed, public_only=False),
         Encryptor(enc_seed, public_only=False),
-        'me', False, 0, AgreementImpl.POA.value,
+        pid, False, 0, AgreementImpl.POA.value,
     )

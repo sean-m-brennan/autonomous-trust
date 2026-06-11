@@ -31,12 +31,12 @@ GatewayMap = dict[str, GatewayUplink]
 
 
 class Ident(Configuration):
-    def __init__(self, position: Position, speed: float, kind: str, nickname: str):
+    def __init__(self, position: Position, speed: float, kind: str, petname: str):
         super().__init__(sim_data_pb2.Ident)
         self.position = position
         self.speed = speed
         self.kind = kind
-        self.nickname = nickname
+        self.petname = petname
 
 
 Map = dict[str, Ident]

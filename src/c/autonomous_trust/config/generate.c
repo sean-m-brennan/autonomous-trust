@@ -361,7 +361,8 @@ int generate_identity(const char *fullname, const char *cfg_dir,
     address[copy_len] = '\0';
 
     identity_t *ident = NULL;
-    int err = identity_create(&uuid, address, (char *)fullname, NULL, NULL, &ident);
+    /* fullname is the online nickname to embed; petname (local) defaults NULL */
+    int err = identity_create(&uuid, address, (char *)fullname, NULL, &ident);
     if (err != 0)
         return err;
 

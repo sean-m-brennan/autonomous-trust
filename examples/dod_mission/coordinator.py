@@ -184,7 +184,8 @@ try:
                             msg, block=True, timeout=self.q_cadence)
                         self.logger.info(
                             "DiagDataRcvr: subscribed to %s",
-                            getattr(ident, "nickname", ident))
+                            getattr(ident, "petname", None)
+                            or getattr(ident, "nickname", ident))
 
                 # Fallback: subscribe to admitted data-PRODUCING roster peers
                 # whose data-capability advertisement never reached us. A late
@@ -209,7 +210,8 @@ try:
                         self.logger.info(
                             "DiagDataRcvr: roster-subscribed to %s "
                             "(data advert not seen)",
-                            getattr(p, "nickname", p))
+                            getattr(p, "petname", None)
+                            or getattr(p, "nickname", p))
 
                 # Drain inbound messages (the data payloads).
                 try:
@@ -234,7 +236,7 @@ try:
 
             Pure decision half of the late-joiner fallback (see
             _patched_process): given the admitted roster, the already-
-            subscribed servicers, and the set of data-producer nicknames,
+            subscribed servicers, and the set of data-producer petnames,
             return the peers to subscribe to now. Dedups by uuid string so a
             peer the capability-advert path already serviced is never
             re-subscribed, and so the same peer isn't returned twice within
@@ -243,7 +245,7 @@ try:
             subscribed = {str(getattr(s, "uuid", s)) for s in servicers}
             pending = []
             for p in peers_all:
-                if getattr(p, "nickname", None) not in data_producers:
+                if getattr(p, "petname", None) not in data_producers:
                     continue
                 uid = str(getattr(p, "uuid", ""))
                 if not uid or uid in subscribed:
@@ -414,7 +416,7 @@ class DoDMissionCoordinator(AutonomousTrust):
         #                        trust-dynamics build-up is unaffected when it
         #                        does surface. See reputation_warmstart
         #                        .is_warm_start_member (the authoritative set).
-        # Keyed by roster name (== the AT identity nickname the reputation cache
+        # Keyed by roster name (== the AT identity petname the reputation cache
         # uses). _reputations_view / _tiers_view apply the same prior for a
         # warm-start asset that never surfaces a score at all.
         self._warm_start_peers: set[str] = {
@@ -726,7 +728,7 @@ class DoDMissionCoordinator(AutonomousTrust):
                 "_drain_peer_readings: cohort first populated with "
                 "%d peer(s): %s",
                 len(self._cohort.peers),
-                sorted(p.nickname for p in self._cohort.peers.values()))
+                sorted(p.petname for p in self._cohort.peers.values()))
             DoDMissionCoordinator._logged_first_peers = True
         if (not DoDMissionCoordinator._logged_first_drain
                 and self._tick_count % 20 == 0):
@@ -759,8 +761,8 @@ class DoDMissionCoordinator(AutonomousTrust):
                     item)
                 continue
             peer = peers_by_uuid.get(uuid_str)
-            peer_name = (getattr(peer, 'nickname', None)
-                         or getattr(peer, 'fullname', None)
+            peer_name = (getattr(peer, 'petname', None)
+                         or getattr(peer, 'nickname', None)
                          or uuid_str[:8])
             if not DoDMissionCoordinator._logged_first_reading:
                 logger.info(
@@ -845,10 +847,10 @@ class DoDMissionCoordinator(AutonomousTrust):
                     floor=0.0)
 
     def _peer_uuid(self, peer_name):
-        """Resolve a roster nickname to its peer UUID (or None)."""
+        """Resolve a bare roster name (Zooko petname) to its peer UUID."""
         try:
             for p in self.peers.all:
-                if getattr(p, "nickname", None) == peer_name:
+                if getattr(p, "petname", None) == peer_name:
                     return p.uuid
         except Exception:
             logger.debug("peer-uuid lookup failed for %s", peer_name,
@@ -969,11 +971,11 @@ class DoDMissionCoordinator(AutonomousTrust):
                 # Peers.add). Its entry lingers in latest_reputation with a
                 # frozen value; skip it so it doesn't draw an orphan line.
                 continue
-            name = peer.nickname
-            # Skip a peer that surfaced before its nickname resolved (e.g. a
+            name = peer.petname  # bare roster name (Zooko local); keys the panel
+            # Skip a peer that surfaced before its petname resolved (e.g. a
             # half-admitted identity mid-handshake): an empty name renders as a
             # spurious blank-labelled row (T0 / 0.50) at the top of the panel.
-            # It re-appears under its real name once the nickname lands.
+            # It re-appears under its real name once the petname lands.
             if not name or not str(name).strip():
                 continue
             tier = int(getattr(peer, "_tier", 0))

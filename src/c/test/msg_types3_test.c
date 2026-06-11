@@ -70,7 +70,7 @@ DEFINE_TEST(test_net_msg_proto_roundtrip)
 
     /* Set up from_whom identity */
     uuid_generate(original.from_whom.uuid);
-    strncpy(original.from_whom.fullname, "Alice", NAME_LEN);
+    strncpy(original.from_whom.nickname, "Alice", NAME_LEN);
 
     /* Pack a small JSON payload */
     json_t *payload = json_object();
@@ -89,7 +89,7 @@ DEFINE_TEST(test_net_msg_proto_roundtrip)
     ck_assert_str_eq(restored.process, "reputation");
     ck_assert(restored.encrypt == true);
     ck_assert_str_eq(restored.return_to, "reputation");
-    ck_assert_str_eq(restored.from_whom.fullname, "Alice");
+    ck_assert_str_eq(restored.from_whom.nickname, "Alice");
 
     /* Verify payload roundtripped */
     json_t *restored_payload = NULL;

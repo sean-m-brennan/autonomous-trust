@@ -81,7 +81,7 @@ class TestPeerInfoUplink:
         shape = PointData(pos)
         path = PathData(start, end, shape, Variability.UNIFORM, 0, Variability.UNIFORM)
         return PeerInfo(
-            uuid=str(uuid4()), kind='valley_relay', nickname='test_node',
+            uuid=str(uuid4()), kind='valley_relay', petname='test_node',
             ip4_addr='10.0.0.1', initial_position=pos, signal=20.0,
             antenna=Antenna.DIPOLE, iface=NetInterface.SMALL,
             initial_time=start, last_seen=end, path_list=[path],
@@ -202,7 +202,7 @@ class TestSimulatorGatewayResolution:
         path = PathData(start, end, shape, Variability.UNIFORM, 0, Variability.UNIFORM)
         from examples.appalachia.scenario import _generate_uuid
         return PeerInfo(
-            uuid=_generate_uuid(name), kind='valley_relay', nickname=name,
+            uuid=_generate_uuid(name), kind='valley_relay', petname=name,
             ip4_addr='10.0.0.1', initial_position=pos, signal=20.0,
             antenna=Antenna.DIPOLE, iface=NetInterface.SMALL,
             initial_time=start, last_seen=end, path_list=[path],
@@ -278,7 +278,7 @@ class TestAppalachianGateways:
             create_appalachian_config(output_file=cfg_path)
             with open(cfg_path, 'r') as f:
                 cfg = SimConfig.load(f.read())
-            gateways = {p.nickname: p.uplink for p in cfg.peers if p.uplink is not None}
+            gateways = {p.petname: p.uplink for p in cfg.peers if p.uplink is not None}
             assert gateways['sutton_valley_1'].technology == 'fiber'
             assert gateways['burnsville_valley_1'].technology == 'fiber'
             assert gateways['gassaway_valley'].technology == 'fiber'

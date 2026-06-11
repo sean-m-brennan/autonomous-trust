@@ -126,7 +126,7 @@ static int send_to_peer(const process_t *proc, const char *function,
 static bool handle_artifact_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Artifact: request from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Artifact: request from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -196,7 +196,7 @@ static bool handle_artifact_request(const process_t *proc, directory_t *queues, 
 static bool handle_artifact_manifest(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Artifact: manifest from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Artifact: manifest from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -619,7 +619,7 @@ static bool handle_artifact_complete(const process_t *proc, directory_t *queues,
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
     {
-        log_info(proc->logger, "Artifact: complete notification from %s\n", nmsg->from_whom.fullname);
+        log_info(proc->logger, "Artifact: complete notification from %s\n", nmsg->from_whom.nickname);
         return true;
     }
 
@@ -627,7 +627,7 @@ static bool handle_artifact_complete(const process_t *proc, directory_t *queues,
     const char *hash_hex = j_hash ? json_string_value(j_hash) : "unknown";
 
     log_info(proc->logger, "Artifact: peer %s completed download of %s\n",
-             nmsg->from_whom.fullname, hash_hex);
+             nmsg->from_whom.nickname, hash_hex);
 
     json_decref(payload);
     return true;

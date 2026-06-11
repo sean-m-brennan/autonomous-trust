@@ -47,7 +47,7 @@ def test_generate_identity(setup_teardown):
     ident_json = json.loads(ident.to_json_string())
     assert '__type__' in ident_json
     assert 'Identity' in ident_json['__type__']
-    assert '_fullname' in ident_json
+    assert '_nickname' in ident_json
     assert '_signature' in ident_json
     assert '_encryptor' in ident_json
 
@@ -97,8 +97,8 @@ def test_generate_randomize_honors_at_peer_name(setup_teardown):
                    return_value=mock_addrs):
             net, ident, subsys = generate_identity(
                 cfg_dir, randomize=True, seed=1, silent=True)
-    assert ident.nickname == 'noaa-1'
-    assert ident.fullname == 'noaa-1@tekfive.com'
+    assert ident.petname == 'noaa-1'
+    assert ident.nickname == 'noaa-1@tekfive.com'
 
 
 def test_generate_randomize_no_at_peer_name_uses_random(setup_teardown):
@@ -120,8 +120,8 @@ def test_generate_randomize_no_at_peer_name_uses_random(setup_teardown):
             net, ident, subsys = generate_identity(
                 cfg_dir, randomize=True, seed=1, silent=True)
     # Random-pool surnames; never 'noaa-1'.
-    assert ident.nickname != 'noaa-1'
-    assert '@tekfive.com' in ident.fullname
+    assert ident.petname != 'noaa-1'
+    assert '@tekfive.com' in ident.nickname
 
 
 def test_generate_randomize_verbose(setup_teardown, caplog):
@@ -226,8 +226,8 @@ def test_generate_identity_eof_honors_at_peer_name(setup_teardown):
                 net, ident, subsys = generate_identity(
                     cfg_dir, randomize=False, preserve=False,
                     defaults=True, silent=True)
-    assert ident.nickname == 'mq800'
-    assert ident.fullname == 'mq800@tekfive.com'
+    assert ident.petname == 'mq800'
+    assert ident.nickname == 'mq800@tekfive.com'
 
 
 def test_generate_identity_with_defaults(setup_teardown):
@@ -242,7 +242,7 @@ def test_generate_identity_with_defaults(setup_teardown):
         'ip6_subnet': 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
         'mac_bcast': 'ff:ff:ff:ff:ff:ff',
     }
-    inputs = iter(['testname', 'nick', ''])  # fullname, nickname, net_impl (empty=default)
+    inputs = iter(['testname', 'nick', ''])  # FQDN name (->nickname), petname, net_impl (empty=default)
     with patch('autonomous_trust.core.config.generate.Network.get_addresses', return_value=mock_addrs):
         with patch('builtins.input', side_effect=inputs):
             net, ident, subsys = generate_identity(cfg_dir, randomize=False, preserve=False, defaults=True)
@@ -287,8 +287,8 @@ def test_random_config_existing_configs(setup_teardown):
         random_config(base_dir)
 
 
-def test_generate_identity_fullname_empty_uses_hostname(setup_teardown):
-    """Test interactive path where fullname input is empty — falls back to hostname (line 108)."""
+def test_generate_identity_name_empty_uses_hostname(setup_teardown):
+    """Test interactive path where the FQDN-name input is empty — falls back to hostname (line 108)."""
     cfg_dir = os.path.join(TEST_DIR, 'gen_hostname_fallback')
     os.makedirs(cfg_dir, exist_ok=True)
     mock_addrs = {
@@ -299,8 +299,8 @@ def test_generate_identity_fullname_empty_uses_hostname(setup_teardown):
         'ip6_subnet': 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
         'mac_bcast': 'ff:ff:ff:ff:ff:ff',
     }
-    # Empty string for fullname triggers the hostname fallback (line 108).
-    # Then: nickname, net_impl (all default via empty string), and
+    # Empty string for the FQDN name triggers the hostname fallback (line 108).
+    # Then: petname, net_impl (all default via empty string), and
     # three overwrite prompts for net/ident/subsys files (answer 'y').
     inputs = iter(['', 'testnick', '', 'y', 'y', 'y'])
     with patch('autonomous_trust.core.config.generate.Network.get_addresses', return_value=mock_addrs):
@@ -322,11 +322,11 @@ def test_generate_identity_non_default_addresses(setup_teardown):
         'ip6_subnet': 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
         'mac_bcast': 'ff:ff:ff:ff:ff:ff',
     }
-    # fullname, nickname (non-interactive ident), then custom IP4, custom IP6, custom MAC,
+    # FQDN name (->nickname), petname (non-interactive ident), then custom IP4, custom IP6, custom MAC,
     # net_impl (empty = default), and three overwrite prompts for config files
     inputs = iter([
-        'custom.user@example.com',  # fullname
-        'customnick',               # nickname
+        'custom.user@example.com',  # FQDN name (->nickname)
+        'customnick',               # petname
         '10.0.0.1',                 # IP4 (non-empty, non-default)
         '::2',                      # IP6 (non-empty, non-default)
         'AA:BB:CC:DD:EE:FF',        # MAC (non-empty, non-default)
@@ -354,8 +354,8 @@ def test_generate_identity_empty_address_inputs_use_defaults(setup_teardown):
     }
     # Empty inputs for addresses exercise the "if addr == '': addr = detected" branches
     inputs = iter([
-        'user@example.com',  # fullname
-        'usernick',          # nickname
+        'user@example.com',  # FQDN name (->nickname)
+        'usernick',          # petname
         '',                  # IP4 empty -> use detected
         '',                  # IP6 empty -> use detected
         '',                  # MAC empty -> use detected
@@ -387,8 +387,8 @@ def test_generate_identity_overwrite_prompt_yes(setup_teardown):
     # Second pass: non-randomize with preserve=False so existing files trigger overwrite prompt.
     # The prompt fires once per file (3 files).  Reply 'y' to each.
     inputs = iter([
-        'user@example.com',  # fullname
-        'usernick',          # nickname
+        'user@example.com',  # FQDN name (->nickname)
+        'usernick',          # petname
         '',                  # net_impl empty -> default
         'y',                 # overwrite network config
         'y',                 # overwrite identity config
@@ -418,8 +418,8 @@ def test_generate_identity_overwrite_prompt_no(setup_teardown):
 
     # Second pass: decline overwrite for all files
     inputs = iter([
-        'user@example.com',  # fullname
-        'usernick',          # nickname
+        'user@example.com',  # FQDN name (->nickname)
+        'usernick',          # petname
         '',                  # net_impl empty -> default
         'N',                 # decline overwrite network config
         'N',                 # decline overwrite identity config

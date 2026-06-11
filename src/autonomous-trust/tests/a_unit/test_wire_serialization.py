@@ -64,8 +64,8 @@ class TestIdentityWire:
         sig = Signature.generate()
         enc = Encryptor.generate()
         uid = uuid4()
-        return Identity(uid, '127.0.0.1', 'Test User', 'tester', sig, enc,
-                        'pet', False, 0)
+        return Identity(uid, '127.0.0.1', 'Test User', sig, enc,
+                        'tester', False, 0)
 
     def test_round_trip(self, wire_format):
         ident = self._make_identity()
@@ -73,11 +73,10 @@ class TestIdentityWire:
         restored = Identity.from_string(data)
         assert str(restored.uuid) == str(ident.uuid)
         assert restored.address == ident.address
-        assert restored.fullname == ident.fullname
+        assert restored.nickname == ident.nickname
         assert restored.signature.publish() == ident.signature.publish()
         assert restored.encryptor.publish() == ident.encryptor.publish()
         # Fields lost on wire
-        assert restored._nickname == ''
         assert restored.petname == ''
         assert restored._public_only is True
 
@@ -168,12 +167,12 @@ class TestIdentityObjWire:
         sig = Signature.generate()
         enc = Encryptor.generate()
         uid = uuid4()
-        ident = Identity(uid, '127.0.0.1', 'Test User', 'tester', sig, enc, 'pet', False, 0)
+        ident = Identity(uid, '127.0.0.1', 'Test User', sig, enc, 'tester', False, 0)
         originator = uuid4()
         obj = IdentityObj(ident, originator)
         data = obj.to_string()
         restored = IdentityObj.from_string(data)
         assert restored.originator == originator
         assert str(restored.identity.uuid) == str(uid)
-        assert restored.identity.fullname == 'Test User'
+        assert restored.identity.nickname == 'Test User'
         assert restored.identity.signature.publish() == sig.publish()

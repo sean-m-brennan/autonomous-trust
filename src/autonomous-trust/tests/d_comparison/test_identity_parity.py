@@ -36,7 +36,7 @@ class TestIdentityParity:
         pub = ident.publish()
 
         assert isinstance(pub, PublicIdentity)
-        assert pub.fullname == 'Test User'
+        assert pub.nickname == 'Test User'
         assert pub.address == '192.168.1.1'
         assert isinstance(pub.uuid, uuid.UUID)
 
@@ -104,6 +104,6 @@ class TestProtoSerializationParity:
         assert len(data) > 0
 
         restored = PublicIdentity.from_proto_bytes(data)
-        assert restored.fullname == pub.fullname
+        assert restored.nickname == pub.nickname
         assert restored.address == pub.address
         assert restored.uuid == pub.uuid

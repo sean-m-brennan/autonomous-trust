@@ -69,7 +69,7 @@ void msg_test_rcv(char *key, config_t *config) {
     ck_assert_int_eq(PEER, recvd.type);
     public_identity_t *pub_ident = config->data_struct;
     ck_assert_str_eq(pub_ident->address, recvd.info.peer.address);
-    ck_assert_str_eq(pub_ident->fullname, recvd.info.peer.fullname);
+    ck_assert_str_eq(pub_ident->nickname, recvd.info.peer.nickname);
     messaging_close();
 }
 

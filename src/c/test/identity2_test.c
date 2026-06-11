@@ -70,9 +70,8 @@ DEFINE_TEST(test_identity_proto_roundtrip)
     char addr[] = "10.0.0.99";
     char name[] = "Proto Node";
     char nick[] = "PN";
-    char pet[] = "proto-n";
     identity_t *ident = NULL;
-    ck_assert_ret_ok(identity_create(&uuid, addr, name, nick, pet, &ident));
+    ck_assert_ret_ok(identity_create(&uuid, addr, name, nick, &ident));
 
     /* Publish to public identity */
     public_identity_t *pub = NULL;
@@ -90,14 +89,13 @@ DEFINE_TEST(test_identity_proto_roundtrip)
     memset(&pub2, 0, sizeof(public_identity_t));
     ck_assert_ret_ok(proto_to_peer((uint8_t *)data, data_len, &pub2));
 
-    /* Verify wire fields survive the roundtrip. nickname/petname are Zooko
-       local-only names that are deliberately never serialized (see
+    /* Verify wire fields survive the roundtrip. petname is a Zooko
+       local-only name that is deliberately never serialized (see
        public_identity_sync_out/in, mirroring the Python twin's
-       sync_to_message/sync_from_message), so they come back empty -- a
+       sync_to_message/sync_from_message), so it comes back empty -- a
        receiver assigns its own petname locally. */
     ck_assert_str_eq(pub2.address, "10.0.0.99");
-    ck_assert_str_eq(pub2.fullname, "Proto Node");
-    ck_assert_str_eq(pub2.nickname, "");
+    ck_assert_str_eq(pub2.nickname, "Proto Node");
     ck_assert_str_eq(pub2.petname, "");
     ck_assert_mem_eq(pub2.uuid, uuid, sizeof(uuid_t));
 
@@ -117,9 +115,8 @@ DEFINE_TEST(test_identity_json_nickname_petname)
     char addr[] = "192.168.0.1";
     char name[] = "Full Name";
     char nick[] = "Nicky";
-    char pet[] = "my-pet";
     identity_t *ident = NULL;
-    ck_assert_ret_ok(identity_create(&uuid, addr, name, nick, pet, &ident));
+    ck_assert_ret_ok(identity_create(&uuid, addr, name, nick, &ident));
 
     /* Serialize to JSON */
     json_t *obj = NULL;
@@ -131,16 +128,15 @@ DEFINE_TEST(test_identity_json_nickname_petname)
     const char *j_pet = json_string_value(json_object_get(obj, "petname"));
     ck_assert_ptr_nonnull(j_nick);
     ck_assert_ptr_nonnull(j_pet);
-    ck_assert_str_eq(j_nick, "Nicky");
-    ck_assert_str_eq(j_pet, "my-pet");
+    ck_assert_str_eq(j_nick, "Full Name");
+    ck_assert_str_eq(j_pet, "Nicky");
 
     /* Deserialize and verify */
     identity_t ident2;
     memset(&ident2, 0, sizeof(identity_t));
     ck_assert_ret_ok(identity_from_json(obj, &ident2));
-    ck_assert_str_eq(ident2.nickname, "Nicky");
-    ck_assert_str_eq(ident2.petname, "my-pet");
-    ck_assert_str_eq(ident2.fullname, "Full Name");
+    ck_assert_str_eq(ident2.petname, "Nicky");
+    ck_assert_str_eq(ident2.nickname, "Full Name");
     ck_assert_str_eq(ident2.address, "192.168.0.1");
 
     json_decref(obj);
@@ -158,13 +154,12 @@ DEFINE_TEST(test_identity_create_null_names)
     char addr[] = "10.0.0.1";
     char name[] = "Just Name";
     identity_t *ident = NULL;
-    ck_assert_ret_ok(identity_create(&uuid, addr, name, NULL, NULL, &ident));
+    ck_assert_ret_ok(identity_create(&uuid, addr, name, NULL, &ident));
     ck_assert_ptr_nonnull(ident);
 
     /* nickname and petname should be empty strings when NULL passed */
-    ck_assert_str_eq(ident->nickname, "");
     ck_assert_str_eq(ident->petname, "");
-    ck_assert_str_eq(ident->fullname, "Just Name");
+    ck_assert_str_eq(ident->nickname, "Just Name");
 
     identity_free(ident);
 }

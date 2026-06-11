@@ -175,7 +175,7 @@ def create_asteroid_belt_config(
         peers.append(PeerInfo(
             uuid=node_uuid,
             kind='habitat',
-            nickname=name,
+            petname=name,
             ip4_addr=ip_addr,
             initial_position=orbit_start,
             signal=hab['signal_dbm'],

@@ -73,11 +73,11 @@ class PeerDataAcq(object):
 
     @property
     def name(self):
-        return self._ident.fullname
+        return self._ident.nickname  # Zooko online name (was fullname)
 
     @property
     def nickname(self):
-        return self._ident.nickname
+        return self._ident.petname  # Zooko local display name
 
     @property
     def uuid(self):

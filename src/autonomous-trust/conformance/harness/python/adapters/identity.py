@@ -206,10 +206,10 @@ def _resolve_to_id(msg: Message) -> str:
     if isinstance(to, Group):
         return 'broadcast'  # group-encrypted broadcast; engine treats both alike
     if isinstance(to, Identity):
-        return getattr(to, 'nickname', '') or str(to.uuid)
+        return getattr(to, 'petname', '') or str(to.uuid)
     if isinstance(to, list) and to:
         first = to[0]
-        return getattr(first, 'nickname', '') or str(getattr(first, 'uuid', first))
+        return getattr(first, 'petname', '') or str(getattr(first, 'uuid', first))
     return 'broadcast'
 
 
@@ -302,10 +302,10 @@ class IdentityAdapter:
             uuid = self._derive_uuid(pid, fixtures.get('uuids', {}))
             address = addresses.get(pid, f'10.0.0.{len(identities) + 1}')
             identity = Identity(
-                uuid, address, f'{pid}.scenario', pid,
+                uuid, address, f'{pid}.scenario',
                 Signature(sig_seed, public_only=False),
                 Encryptor(enc_seed, public_only=False),
-                'me', False, 0, _DEFAULT_BLOCK_IMPL,
+                pid, False, 0, _DEFAULT_BLOCK_IMPL,
             )
             identities[pid] = identity
 

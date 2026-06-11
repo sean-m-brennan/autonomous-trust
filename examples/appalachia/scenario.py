@@ -158,7 +158,7 @@ def create_appalachian_config(
         peers.append(PeerInfo(
             uuid=node_uuid,
             kind='hilltop_relay',
-            nickname=name,
+            petname=name,
             ip4_addr=ip_addr,
             initial_position=position,
             signal=hilltop_signal,
@@ -183,7 +183,7 @@ def create_appalachian_config(
             peers.append(PeerInfo(
                 uuid=node_uuid,
                 kind='valley_relay',
-                nickname=name,
+                petname=name,
                 ip4_addr=ip_addr,
                 initial_position=position,
                 signal=valley_signal,
