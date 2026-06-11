@@ -34,4 +34,13 @@ autonomous-trust (core)
 
 The core package contains the four subsystem processes (Network, Identity, Negotiation, Reputation), the configuration system, cryptographic primitives, and data structures (DAGs, Merkle trees, agreement protocols).
 
-[Process Architecture >](process-architecture.md)
+**Dual implementation.** The core has two interoperable implementations: pure
+Python (`autonomous_trust.core._python`) and C (`src/c`, built as
+`libautonomous_trust.so` and bridged via CFFI under
+`autonomous_trust.core._native`). A backend is selected at import time via the
+`AUTONOMOUS_TRUST_BACKEND` environment variable (`auto`/`native`/`python`), and
+C nodes interoperate on the wire with Python nodes. The embedded/microdrone
+target runs the standalone C daemon (`at_demo`) with no Python on the device.
+See [Native / FFI Dual Implementation](native-ffi-dual-implementation.md).
+
+[Native / FFI Dual Implementation >](native-ffi-dual-implementation.md)

@@ -8,11 +8,11 @@ The simulator's integration testing framework runs real AutonomousTrust processe
 
 | Component | Module | Purpose |
 |-----------|--------|---------|
-| MetricsCollector | `simulator.metrics.collector` | AT Process that observes protocol events via IPC queues and produces JSON reports |
+| MetricsCollector | `autonomous_trust.evaluation.metrics.collector` | AT Process that observes protocol events via IPC queues and produces JSON reports |
 | Appalachian Compose Generator | `simulator.scenarios.appalachian_compose` | Wraps `gen_compose.py` to map scenario nodes to Docker services with terrain metadata |
 | Test Simulation Script | `config/test-simulation.sh` | Orchestrated Docker launch: simulator + compose + metric collection + teardown |
 
-All paths are relative to `src/autonomous-trust-simulator/`.
+`MetricsCollector` lives in the `src/autonomous-trust-evaluation/` package; the Appalachian compose generator and `test-simulation.sh` are relative to `src/autonomous-trust-simulator/`.
 
 ## MetricsCollector
 

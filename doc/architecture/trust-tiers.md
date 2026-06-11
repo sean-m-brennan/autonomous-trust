@@ -1,9 +1,14 @@
 # Tiered Transactions, Bootstrap Corpus, and Tier-Gated Access
 
-Status: **Design — not yet implemented.** Drafted 2026-05-22 in response
+Status: **Implemented** (Python 2026-06-03, C 2026-06-04), with symmetric
+conformance pins. Drafted 2026-05-22 in response
 to the DoD demo experience: reputations sat flat because every
 TransactionScore contributed equally and there was no baby-steps corpus
 for peers to "get acquainted" before consequential operations began.
+Tier fields, weighted reputation, the bootstrap corpus (`BootstrapWorker`),
+tier-gated negotiation, and Proof-of-Trust threshold filtering are all live;
+the `trust_ladder.yaml` loader described in §8 remains the one deferred piece
+(capabilities are currently registered in code).
 This document specifies a tiered-transaction mechanism, an AT-core
 bootstrap corpus, and tier-gated capability access — closing the gap
 between AT's TFT-to-cooperation premise and what the code actually
