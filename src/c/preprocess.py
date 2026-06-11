@@ -104,7 +104,15 @@ def preprocess(target_filepath: str, output_file: str, directory: str, rel_path:
     includes: List[str] = []
     for root, dirs, files in os.walk(os.path.abspath(directory)):
         # Prune excluded subdirectories in-place so os.walk skips them entirely.
-        dirs[:] = [d for d in dirs if d not in exclude_dirs]  
+        # Also skip CMake build trees: they hold *copies* of the source headers,
+        # so descending into build/, build-asan/, etc. would count every
+        # DECLARE_* site once per build dir present, inflating the generated
+        # table past its fixed size (e.g. error_table_size > ERROR_TABLE_MAX),
+        # which overruns the array at runtime. A dir with a CMakeCache.txt is a
+        # build directory, never source.
+        dirs[:] = [d for d in dirs
+                   if d not in exclude_dirs
+                   and not os.path.exists(os.path.join(root, d, 'CMakeCache.txt'))]
         for filename in files:
             ignore = False
             for path in ignore_list:
@@ -141,6 +149,37 @@ def preprocess(target_filepath: str, output_file: str, directory: str, rel_path:
         for idx, arg in enumerate(args):
             new_def = new_def.replace(arg, decl_tokens[idx])
         substitutions.append(new_def)
+
+    # Safety guard: a fixed-size table must not overflow its declared array
+    # bound. Tables declared `<type> <name>[CAP] = { LIST__... }` truncate the
+    # initializer silently if there are more than CAP entries, and a
+    # `for (i < *_table_size)` lookup then reads past the array end at runtime
+    # (an over-count once crashed every error-logging test with SIGSEGV).
+    # Catch it here as a clear build error. Unsized arrays (`[]`) auto-grow and
+    # are skipped.
+    with open(target_filepath, 'r') as _tf:
+        _tmpl = _strip_c_comments(_tf.read())
+    _arr = re.search(r'\[\s*([A-Za-z_][A-Za-z0-9_]*|\d+)?\s*\]\s*=\s*\{(.*?)\}\s*;',
+                     _tmpl, re.DOTALL)
+    if _arr is not None and _arr.group(1):
+        _dim = _arr.group(1)
+        if _dim.isdigit():
+            _cap = int(_dim)
+        else:
+            _m = re.search(r'#define\s+' + re.escape(_dim) + r'\s+(\d+)', _tmpl)
+            _cap = int(_m.group(1)) if _m else None
+        if _cap is not None:
+            # Literal sentinel/initializer rows already in the template body
+            # (e.g. capability_table's trailing `{ .name = "" }`) occupy slots
+            # too, so count them alongside the generated entries.
+            _sentinels = len(re.findall(r'\{\s*\.', _arr.group(2)))
+            _need = len(substitutions) + _sentinels
+            if _need > _cap:
+                print("ERROR: %s table needs %d slots (%d entries + %d sentinel) "
+                      "but %s is %d. Raise the cap or remove entries (%s)."
+                      % (target_type, _need, len(substitutions), _sentinels,
+                         _dim, _cap, target_filepath), file=sys.stderr)
+                sys.exit(1)
 
     with open(output_file, 'w') as o_file:
         with open(target_filepath, 'r') as i_file:
