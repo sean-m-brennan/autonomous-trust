@@ -343,8 +343,8 @@ def _make_signer_identity(pid: str):
         b'at-conformance:neg:enc:' + pid.encode('utf-8'),
     ).hexdigest().encode('ascii')
     return Identity(
-        uuid, '10.0.90.1', f'{pid}.neg', pid,
+        uuid, '10.0.90.1', f'{pid}.neg',
         Signature(sig_seed, public_only=False),
         Encryptor(enc_seed, public_only=False),
-        'me', False, 0, AgreementImpl.POA.value,
+        pid, False, 0, AgreementImpl.POA.value,
     )

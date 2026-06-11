@@ -337,10 +337,10 @@ static int _make_signer_identity(const char *pid, identity_t **out) {
     uuid[8] = (uuid[8] & 0x3F) | 0x80;
 
     char addr[ADDR_LEN + 1] = "10.0.90.1";
-    char fullname[NAME_LEN + 1] = {0};
-    snprintf(fullname, sizeof(fullname), "%s.neg", pid);
+    char nickname[NAME_LEN + 1] = {0};
+    snprintf(nickname, sizeof(nickname), "%s.neg", pid);
 
-    if (identity_create(&uuid, addr, fullname, pid, "me", out) != 0 || *out == NULL) {
+    if (identity_create(&uuid, addr, nickname, pid, out) != 0 || *out == NULL) {
         return -1;
     }
 

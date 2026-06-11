@@ -49,7 +49,7 @@ class IdentityObj(SimplestBlob, Configuration):
 
     @property
     def designation(self):
-        return (str(self.originator) + str(self.identity.uuid) + self.identity.fullname).encode(encoding) + \
+        return (str(self.originator) + str(self.identity.uuid) + self.identity.nickname).encode(encoding) + \
             self.identity.signature.publish()
 
     def validate(self):
@@ -60,7 +60,7 @@ class IdentityObj(SimplestBlob, Configuration):
             return False
         if self.identity.uuid is None:
             return False
-        if not self.identity.fullname:
+        if not self.identity.nickname:
             return False
         if self.identity.signature is None:
             return False
@@ -118,7 +118,7 @@ class IdentityHistory(StepDAG, VoterTracker):
         return self._timeout
 
     def insert_peer(self, who, level=None):
-        if who.uuid is None or not who.fullname or who.signature is None:
+        if who.uuid is None or not who.nickname or who.signature is None:
             self.logger.warning(f'Rejecting peer with incomplete identity')
             return
         existing = self._find_identity(who)

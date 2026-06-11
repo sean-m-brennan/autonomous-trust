@@ -142,9 +142,9 @@ static int _make_identity(const char *id, size_t idx, identity_t **out) {
     uuid[8] = (uuid[8] & 0x3F) | 0x80;
     char addr[ADDR_LEN + 1] = {0};
     snprintf(addr, sizeof(addr), "10.0.70.%zu", idx + 1);
-    char fullname[NAME_LEN + 1] = {0};
-    snprintf(fullname, sizeof(fullname), "%s.scenario", id);
-    return identity_create(&uuid, addr, fullname, id, "me", out);
+    char nickname[NAME_LEN + 1] = {0};
+    snprintf(nickname, sizeof(nickname), "%s.scenario", id);
+    return identity_create(&uuid, addr, nickname, id, out);
 }
 
 static ic_impl_t *_build_participant_impl(const char *id, size_t idx) {
@@ -512,7 +512,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     }
 
     /* propose_peer — drives the receiver's handle_vote_on_peer. The payload
-     * carries the candidate's full public identity (uuid + fullname +
+     * carries the candidate's full public identity (uuid + nickname +
      * address + signature/encryptor hex), exactly the shape the production
      * welcoming_committee emits, so the receiver can run the sybil/blacklist
      * guards. public_identity_to_json produces a superset of those keys. The

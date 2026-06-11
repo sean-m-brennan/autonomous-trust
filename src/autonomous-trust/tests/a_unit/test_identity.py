@@ -41,9 +41,9 @@ def test_sig(setup_teardown):
 
 def test_peers(setup_teardown):
     t3 = Peers()
-    p1 = Identity(uuid_mod.uuid4(), '123.4.5.67', 'peer1', 'p1', Signature.generate(), Encryptor.generate())
-    p2 = Identity(uuid_mod.uuid4(), '123.5.6.78', 'peer2', 'p2', Signature.generate(), Encryptor.generate())
-    p3 = Identity(uuid_mod.uuid4(), '123.6.7.89', 'peer3', 'p3', Signature.generate(), Encryptor.generate())
+    p1 = Identity(uuid_mod.uuid4(), '123.4.5.67', 'peer1', Signature.generate(), Encryptor.generate(), 'p1')
+    p2 = Identity(uuid_mod.uuid4(), '123.5.6.78', 'peer2', Signature.generate(), Encryptor.generate(), 'p2')
+    p3 = Identity(uuid_mod.uuid4(), '123.6.7.89', 'peer3', Signature.generate(), Encryptor.generate(), 'p3')
     assert p1 != p2
     assert p2 != p3
     t3.promote(p1)
@@ -59,11 +59,11 @@ def test_peers(setup_teardown):
 
 
 def test_identity_properties(setup_teardown):
-    """Test property accessors for uuid, fullname, nickname (lines 86, 88, 90)."""
+    """Test property accessors for uuid, nickname, petname (lines 86, 88, 90)."""
     t1 = Identity.initialize('me.myself.i', 'myself', '127.0.0.1')
     assert t1.uuid is not None
-    assert t1.fullname == 'me.myself.i'
-    assert t1.nickname == 'myself'
+    assert t1.nickname == 'me.myself.i'
+    assert t1.petname == 'myself'
 
 
 def test_verify_with_string(setup_teardown):
@@ -121,8 +121,8 @@ def test_publish(setup_teardown):
     pub = t1.publish()
     assert pub._public_only is True
     assert pub.uuid == t1.uuid
-    assert pub.fullname == t1.fullname
     assert pub.nickname == t1.nickname
+    assert pub.petname == t1.petname
 
 
 def test_signature_eq():
@@ -195,14 +195,14 @@ def test_public_identity_canonical_roundtrip(setup_teardown):
     assert can['typename'] == 'identity'
     assert len(can['signature']['hex_seed']) == 64
     assert len(can['encryptor']['hex_seed']) == 64
-    assert set(can) >= {'uuid', 'address', 'fullname', 'signature', 'encryptor'}
-    # nickname/petname are Zooko local names: must NOT appear in the wire form.
-    assert 'nickname' not in can and 'petname' not in can
+    assert set(can) >= {'uuid', 'address', 'nickname', 'signature', 'encryptor'}
+    # petname is a Zooko local name: must NOT appear in the wire form.
+    assert 'petname' not in can
     back = public_identity_from_canonical(can)
     assert str(back.uuid) == str(ident.uuid)
     assert back.signature.publish() == ident.signature.publish()
     assert back.encryptor.publish() == ident.encryptor.publish()
-    assert back.fullname == ident.fullname
+    assert back.nickname == ident.nickname
     # malformed input → None (no crash)
     assert public_identity_from_canonical({'uuid': 'x'}) is None
     assert public_identity_from_canonical('nope') is None

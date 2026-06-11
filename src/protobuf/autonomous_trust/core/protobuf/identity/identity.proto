@@ -29,17 +29,20 @@ message Signature {
 message Identity {
   bytes uuid = 1;
   string address = 2;
-  string fullname = 3;
+  // Zooko ONLINE name (global, human-meaningful, not unique). This is the only
+  // name carried on the wire (was `fullname`).
+  string nickname = 3;
   Signature signature = 4;
   Encryptor encryptor = 5;
   bytes zta_credential_hash = 6;   // SHA-256 of ZTA credential at admission
   string zta_issuer = 7;           // Credential issuer identifier
   bytes zta_credential = 8;        // Raw credential for peer verification
-  // nickname/petname are Zooko LOCAL names — intentionally never populated by
-  // either runtime (identity.c sync_out / identity.py sync_to_message leave
-  // them unset, so proto3 omits them). Kept reserved here for field-number
-  // stability; do NOT start serializing them.
-  string nickname = 9;
+  // Field 9 previously held a LOCAL nickname; removed. Reserved so the field
+  // number is never reused.
+  reserved 9;
+  // petname is a Zooko LOCAL name — intentionally never populated on the wire
+  // (identity.c sync_out / identity.py sync_to_message leave it unset, so
+  // proto3 omits it). A receiver assigns its own petname locally.
   string petname = 10;
   uint32 rank = 11;                // Voter rank for AgreementByAuthority;
                                    // 0 by default, future elevation

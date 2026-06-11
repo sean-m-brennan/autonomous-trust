@@ -35,13 +35,15 @@ class Identity(InitializableConfig, AgreementVoter):
     _msg_class = identity_pb2.Identity
     enc = encoding
 
-    def __init__(self, _uuid, address, _fullname, _nickname, _signature, _encryptor, petname='',
+    def __init__(self, _uuid, address, _nickname, _signature, _encryptor, petname='',
                  _public_only=True, _rank=0, _block_impl=agreement_impl, _tier=0,
                  zta_credential=b'', zta_issuer='', zta_credential_hash=b''):
         Configuration.__init__(self, identity_pb2.Identity)
         AgreementVoter.__init__(self, str(_uuid), _rank, _tier=_tier)
         self.address = address  # corresponds to one address in Network config
-        self._fullname = _fullname
+        # Zooko ONLINE name (global, human-meaningful, not unique) -- the only
+        # name carried on the wire. (Formerly `fullname`; the old local
+        # `nickname` has been removed -- `petname` is the local name.)
         self._nickname = _nickname
         self._signature = _signature  # signatures are for one-to-many verification
         self._encryptor = _encryptor  # one-to-one encryption
@@ -74,16 +76,12 @@ class Identity(InitializableConfig, AgreementVoter):
     def __eq__(self, other):
         return self.__class__.__name__ == other.__class__.__name__ and self.uuid == other.uuid and \
             self.address == other.address and \
-            self.fullname == other.fullname and self.nickname == other.nickname and \
+            self.nickname == other.nickname and \
             self.signature == other.signature and self.encryptor == other.encryptor
 
     @property
     def uuid(self):
         return self._uuid
-
-    @property
-    def fullname(self):
-        return self._fullname
 
     @property
     def nickname(self):
@@ -165,7 +163,7 @@ class Identity(InitializableConfig, AgreementVoter):
         return Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)
 
     def publish(self):
-        return Identity(self.uuid, self.address, self.fullname, self.nickname,
+        return Identity(self.uuid, self.address, self.nickname,
                         Signature(self.signature.publish(), True), Encryptor(self.encryptor.publish(), True),
                         self.petname, True, _rank=self._rank,
                         _block_impl=self._block_impl,
@@ -175,7 +173,7 @@ class Identity(InitializableConfig, AgreementVoter):
     def sync_to_message(self):
         self.message.uuid = str(self.uuid).encode('utf-8')
         self.message.address = self.address
-        self.message.fullname = self._fullname
+        self.message.nickname = self._nickname
         self.message.rank = self._rank
         self._signature.message = self.message.signature
         self._signature.sync_to_message()
@@ -193,8 +191,7 @@ class Identity(InitializableConfig, AgreementVoter):
     def sync_from_message(self):
         self._uuid = self.message.uuid.decode('utf-8')
         self.address = self.message.address
-        self._fullname = self.message.fullname
-        self._nickname = ''
+        self._nickname = self.message.nickname
         self.petname = ''
         self._public_only = True
         self._rank = self.message.rank
@@ -214,11 +211,12 @@ class Identity(InitializableConfig, AgreementVoter):
 
     @staticmethod
     def initialize(my_name, my_nickname, my_address):
+        # my_name -> online nickname; my_nickname -> local petname.
         if '/' in my_address:
             my_address = my_address.split('/')[0]
         time.sleep(secrets.randbelow(1000) / 1000.0)  # reduce chance of collision
-        return Identity(uuid_mod.uuid4(), my_address, my_name, my_nickname,
-                        Signature.generate(), Encryptor.generate(), 'me', False)
+        return Identity(uuid_mod.uuid4(), my_address, my_name,
+                        Signature.generate(), Encryptor.generate(), my_nickname, False)
 
 
 def public_identity_to_canonical(identity):
@@ -238,9 +236,9 @@ def public_identity_to_canonical(identity):
         'typename': 'identity',
         'uuid': str(identity.uuid),
         'address': getattr(identity, 'address', '') or '',
-        'fullname': getattr(identity, 'fullname', '') or '',
-        # nickname/petname are Zooko local names -- never serialized (omitted
-        # here to match C public_identity_to_json so the canonical form stays
+        'nickname': getattr(identity, 'nickname', '') or '',
+        # petname is a Zooko local name -- never serialized (omitted here to
+        # match C public_identity_to_json so the canonical form stays
         # byte-identical cross-runtime).
         'signature': {'hex_seed': identity.signature.publish().decode('ascii')},
         'encryptor': {'hex_seed': identity.encryptor.publish().decode('ascii')},
@@ -260,10 +258,10 @@ def public_identity_from_canonical(d):
             return None
         sig = Signature(sig_hex.encode('ascii'), public_only=True)
         enc = Encryptor(enc_hex.encode('ascii'), public_only=True)
-        # nickname/petname intentionally NOT read from the wire form: they are
-        # local-only Zooko names. A receiver assigns its own petname locally.
+        # petname intentionally NOT read from the wire form: it is a local-only
+        # Zooko name. A receiver assigns its own petname locally.
         return Identity(d['uuid'], d.get('address', '') or '',
-                        d.get('fullname', '') or '', '',
+                        d.get('nickname', '') or '',
                         sig, enc, '')
     except (ValueError, TypeError, RuntimeError, KeyError):
         return None

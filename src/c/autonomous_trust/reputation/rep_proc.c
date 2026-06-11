@@ -412,7 +412,7 @@ static void _publish_tier_change(const uuid_t peer_uuid, double score)
 static bool handle_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: permission request from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: permission request from %s\n", nmsg->from_whom.nickname);
 
     /* Unpack (id1, id2, peer_uuid) from JSON payload */
     json_t *payload = NULL;
@@ -538,7 +538,7 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
 static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: grant from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: grant from %s\n", nmsg->from_whom.nickname);
 
     /* Unpack (id1, id2, peer_uuid, last_id, chain_len) */
     json_t *payload = NULL;
@@ -666,7 +666,7 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
 static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: nack from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: nack from %s\n", nmsg->from_whom.nickname);
 
     /* Unpack (id1, id2) from payload for retry capability */
     json_t *payload = NULL;
@@ -748,7 +748,7 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
 static bool handle_backdate(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Reputation: backdate notification from %s\n", nmsg->from_whom.fullname);
+    log_info(proc->logger, "Reputation: backdate notification from %s\n", nmsg->from_whom.nickname);
 
     /* Request chain update from this peer */
     generic_msg_t update_req = {0};
@@ -778,7 +778,7 @@ static bool handle_backdate(const process_t *proc, directory_t *queues, generic_
 static bool handle_transaction(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: transaction from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: transaction from %s\n", nmsg->from_whom.nickname);
 
     /* Reject unverified Paxos proposals. Mirrors Python
      * repprocess.handle_transaction:390 — without this guard a peer
@@ -791,7 +791,7 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     {
         log_warn(proc->logger,
                     "Reputation: rejecting unverified Paxos proposal from %s\n",
-                    nmsg->from_whom.fullname);
+                    nmsg->from_whom.nickname);
         return true;
     }
 
@@ -891,7 +891,7 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
 static bool handle_accepted(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: tx accepted by %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: tx accepted by %s\n", nmsg->from_whom.nickname);
 
     /* Reject unverified Paxos acceptances. Mirrors Python
      * repprocess.handle_accepted:439 — a forged ACCEPTED can push
@@ -901,7 +901,7 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
     {
         log_warn(proc->logger,
                     "Reputation: rejecting unverified Paxos acceptance from %s\n",
-                    nmsg->from_whom.fullname);
+                    nmsg->from_whom.nickname);
         return true;
     }
 
@@ -1147,7 +1147,7 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
 static bool handle_outdated(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Reputation: update requested by %s\n", nmsg->from_whom.fullname);
+    log_info(proc->logger, "Reputation: update requested by %s\n", nmsg->from_whom.nickname);
 
     pthread_mutex_lock(&rep_state.lock);
 
@@ -1191,7 +1191,7 @@ static bool handle_outdated(const process_t *proc, directory_t *queues, generic_
 static bool handle_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Reputation: chain update from %s\n", nmsg->from_whom.fullname);
+    log_info(proc->logger, "Reputation: chain update from %s\n", nmsg->from_whom.nickname);
 
     /* Unpack chain JSON from payload */
     json_t *chain_json = NULL;
@@ -1314,7 +1314,7 @@ static bool handle_consensus_rep_request(const process_t *proc, directory_t *que
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Reputation: consensus rep request from %s\n",
-              nmsg->from_whom.fullname);
+              nmsg->from_whom.nickname);
     probes_counter("rep.consensus", "enter", NULL);
 
     json_t *payload = NULL;
@@ -1402,7 +1402,7 @@ static bool handle_consensus_rep_request(const process_t *proc, directory_t *que
 static bool handle_rep_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: rep request from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: rep request from %s\n", nmsg->from_whom.nickname);
     /* Mirrors Python's `_probes.counter('rep.compute', 'enter')` at
      * repprocess.py:429; the rep.compute layer correlates handle_req
      * → compute → forward across the reputation pipeline. */
@@ -1531,7 +1531,7 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
 static bool handle_rep_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: rep response from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: rep response from %s\n", nmsg->from_whom.nickname);
 
     /* Unpack and store in requested_reps array */
     json_t *payload = NULL;
@@ -1777,7 +1777,7 @@ static bool handle_slash_propose(const process_t *proc, directory_t *queues, gen
     {
         log_warn(proc->logger,
                  "Reputation: rejecting unverified slash_propose from %s\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         return true;
     }
     json_t *payload = NULL;
@@ -1918,7 +1918,7 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
     {
         log_warn(proc->logger,
                  "Reputation: rejecting unverified slash_final from %s\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         return true;
     }
     json_t *payload = NULL;
@@ -1977,7 +1977,7 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
     {
         log_warn(proc->logger,
                  "Reputation: rejecting unverified checkpoint_propose from %s\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         return true;
     }
     json_t *payload = NULL;
@@ -2121,7 +2121,7 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
     {
         log_warn(proc->logger,
                  "Reputation: rejecting unverified checkpoint_final from %s\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         return true;
     }
     json_t *payload = NULL;

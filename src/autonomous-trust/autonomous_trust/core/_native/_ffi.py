@@ -233,9 +233,9 @@ ffi.cdef("""
         bool alloc; size_t refs;  /* smrt_ptr_t */
         unsigned char uuid[16];
         char address[33];
-        char fullname[129];
-        char nickname[129];   /* NAME_LEN+1; local-only Zooko names -- never */
-        char petname[129];    /* serialized (see identity.c sync_out/sync_in). */
+        char nickname[129];   /* NAME_LEN+1; Zooko ONLINE name (was fullname) */
+        char petname[129];    /* NAME_LEN+1; local-only Zooko name -- never */
+                              /* serialized (see identity.c sync_out/sync_in). */
         signature_t signature;
         encryptor_t encryptor;
         /* ZTA credential binding (identity.h, #ifdef AT_ZTA_ENABLED). The
@@ -254,12 +254,10 @@ ffi.cdef("""
         unsigned long long len;
     } msg_str_t;
 
-    int  identity_create(unsigned char *uuid, char *address, char *fullname,
-                         char *nickname, char *petname,
-                         identity_t **ident);
-    int  identity_init(unsigned char *uuid, char *address, char *fullname,
-                       char *nickname, char *petname,
-                       identity_t *identity);
+    int  identity_create(unsigned char *uuid, char *address, char *nickname,
+                         char *petname, identity_t **ident);
+    int  identity_init(unsigned char *uuid, char *address, char *nickname,
+                       char *petname, identity_t *identity);
     int  identity_publish(const identity_t *ident, public_identity_t **pub_copy);
     int  identity_sign(const identity_t *ident, const msg_str_t *in,
                        msg_str_t *out);

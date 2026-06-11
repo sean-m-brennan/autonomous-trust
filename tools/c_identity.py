@@ -49,9 +49,8 @@ from autonomous_trust.core._python.identity.encrypt import Encryptor
 
 
 def make_c_node_identity(peer_name: str, address: str, *,
-                         fullname: Optional[str] = None,
                          nickname: Optional[str] = None,
-                         petname: str = "me",
+                         petname: Optional[str] = None,
                          rank: int = 0) -> tuple[dict, Identity]:
     """Build a fresh seed-based identity for a C ``at_demo`` node.
 
@@ -63,8 +62,10 @@ def make_c_node_identity(peer_name: str, address: str, *,
     ``address`` must be the node's real runtime IP (its compose-assigned address);
     the C node preserves the stored identity and does not re-discover it.
     """
-    fullname = fullname or f"{peer_name}@dod-demo"
-    nickname = nickname or peer_name
+    # Zooko: nickname is the ONLINE name (carried on the wire); petname is the
+    # LOCAL short/bare name (what the coordinator roster matches on).
+    nickname = nickname or f"{peer_name}@dod-demo"
+    petname = petname or peer_name
 
     # Signature: ed25519. SigningKey.encode() IS the 32-byte seed (sign.py:57),
     # which is exactly what C's signature_init expects (crypto_sign_SEEDBYTES*2).
@@ -88,7 +89,6 @@ def make_c_node_identity(peer_name: str, address: str, *,
         "uuid": uuid_str,
         "rank": rank,
         "address": address,
-        "fullname": fullname,
         "nickname": nickname,
         "petname": petname,
         "signature": {"hex_seed": sig_seed_hex},
@@ -96,15 +96,15 @@ def make_c_node_identity(peer_name: str, address: str, *,
     }
 
     return c_json, _public_identity_from_parts(
-        uuid_str, address, fullname, nickname, petname, rank,
+        uuid_str, address, nickname, petname, rank,
         sig_pub_hex, enc_pub_hex)
 
 
-def _public_identity_from_parts(uuid_str, address, fullname, nickname, petname,
+def _public_identity_from_parts(uuid_str, address, nickname, petname,
                                 rank, sig_pub_hex, enc_pub_hex) -> Identity:
     """Public-only Identity (pubkeys only) for the cohort's peer views."""
     return Identity(
-        uuid_str, address, fullname, nickname,
+        uuid_str, address, nickname,
         Signature(sig_pub_hex.encode("ascii"), True),
         Encryptor(enc_pub_hex.encode("ascii"), True),
         petname, True, _rank=rank,

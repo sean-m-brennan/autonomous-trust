@@ -107,7 +107,7 @@ static uint8_t *build_inner_wire(const uuid_t announcer_uuid,
     wmsg.data_len = 0;
     wmsg.to_whom.type = RECIPIENT_BROADCAST;
     memcpy(wmsg.from_whom.uuid, announcer_uuid, 16);
-    snprintf(wmsg.from_whom.fullname, sizeof(wmsg.from_whom.fullname), "remote-peer");
+    snprintf(wmsg.from_whom.nickname, sizeof(wmsg.from_whom.nickname), "remote-peer");
     snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
              "%s", self_reported_addr);
     wmsg.encrypt = false;

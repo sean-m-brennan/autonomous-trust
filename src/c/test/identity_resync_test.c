@@ -112,7 +112,7 @@ static identity_t *_mk_identity(const char *name, const char *addr)
     uuid_t uuid;
     uuid_generate(uuid);
     identity_t *ident = NULL;
-    ck_assert_ret_ok(identity_create(&uuid, addr, name, name, "me", &ident));
+    ck_assert_ret_ok(identity_create(&uuid, addr, name, name, &ident));
     ck_assert_ptr_nonnull(ident);
     return ident;
 }

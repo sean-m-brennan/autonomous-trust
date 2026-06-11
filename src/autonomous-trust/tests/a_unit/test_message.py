@@ -157,12 +157,12 @@ def _real_identity(pid):
     ns = UUID('00000000-0000-0000-0000-000000000aaa')
     return Identity(
         uuid5(ns, f'test:{pid}'),
-        '10.0.0.1', f'{pid}.test', pid,
+        '10.0.0.1', f'{pid}.test',
         Signature(hashlib.sha256(b'test:sig:' + pid.encode()).hexdigest().encode('ascii'),
                   public_only=False),
         Encryptor(hashlib.sha256(b'test:enc:' + pid.encode()).hexdigest().encode('ascii'),
                   public_only=False),
-        'me', False, 0, AgreementImpl.POA.value,
+        pid, False, 0, AgreementImpl.POA.value,
     )
 
 

@@ -111,7 +111,7 @@ DEFINE_TEST(test_wire_roundtrip_with_identity)
 
     /* Set from_whom with UUID, name, and address */
     uuid_generate(msg.from_whom.uuid);
-    strncpy(msg.from_whom.fullname, "Node Alpha", NAME_LEN);
+    strncpy(msg.from_whom.nickname, "Node Alpha", NAME_LEN);
     strncpy(msg.from_whom.address, "172.27.3.14", ADDR_LEN);
 
     uint8_t *wire    = NULL;
@@ -126,7 +126,7 @@ DEFINE_TEST(test_wire_roundtrip_with_identity)
 
     ck_assert_str_eq(out.process, "identity");
     ck_assert_str_eq(out.function, "request_access");
-    ck_assert_str_eq(out.from_whom.fullname, "Node Alpha");
+    ck_assert_str_eq(out.from_whom.nickname, "Node Alpha");
     ck_assert_str_eq(out.from_whom.address, "172.27.3.14");
 
     /* UUID must match */
@@ -150,7 +150,7 @@ DEFINE_TEST(test_wire_peer_overrides_json_identity)
     msg.encrypt  = true;
 
     uuid_generate(msg.from_whom.uuid);
-    strncpy(msg.from_whom.fullname, "Wire Name", NAME_LEN);
+    strncpy(msg.from_whom.nickname, "Wire Name", NAME_LEN);
     strncpy(msg.from_whom.address, "1.2.3.4", ADDR_LEN);
 
     uint8_t *wire    = NULL;
@@ -161,7 +161,7 @@ DEFINE_TEST(test_wire_peer_overrides_json_identity)
     public_identity_t peer;
     memset(&peer, 0, sizeof(peer));
     uuid_generate(peer.uuid);
-    strncpy(peer.fullname, "Known Peer", NAME_LEN);
+    strncpy(peer.nickname, "Known Peer", NAME_LEN);
     strncpy(peer.address, "10.0.0.99", ADDR_LEN);
 
     net_wire_msg_t out;
@@ -169,7 +169,7 @@ DEFINE_TEST(test_wire_peer_overrides_json_identity)
     ck_assert_ret_ok(net_message_from_wire(wire, wire_len, &peer, &out));
 
     /* from_whom should be the peer, not the wire data */
-    ck_assert_str_eq(out.from_whom.fullname, "Known Peer");
+    ck_assert_str_eq(out.from_whom.nickname, "Known Peer");
     ck_assert_str_eq(out.from_whom.address, "10.0.0.99");
     ck_assert_mem_eq(out.from_whom.uuid, peer.uuid, sizeof(uuid_t));
 
@@ -185,7 +185,7 @@ DEFINE_TEST(test_wire_signed_message)
     /* create a full identity for signing */
     identity_t *signer = NULL;
     ck_assert_ret_ok(identity_create(NULL, "127.0.0.1", "Signer",
-                                     "signer", "signer", &signer));
+                                     "signer", &signer));
 
     const uint8_t payload[] = {0xAA, 0xBB};
     net_wire_msg_t msg;

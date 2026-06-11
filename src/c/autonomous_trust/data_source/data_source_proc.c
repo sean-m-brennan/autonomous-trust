@@ -132,7 +132,7 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
             pthread_mutex_unlock(&ds_state.lock);
             log_info(proc->logger,
                      "data-source: subscriber '%s' (%s) registered (%zu total)\n",
-                     sub_proc, nmsg->from_whom.fullname, ds_state.num_subs);
+                     sub_proc, nmsg->from_whom.nickname, ds_state.num_subs);
             return true;
         }
     }

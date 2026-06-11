@@ -754,7 +754,7 @@ static int run_wv_signature(json_t *case_data, json_t *input, json_t *expected,
 
     uuid_t uuid;
     uuid_generate(uuid);
-    if (identity_create(&uuid, "10.0.0.1", "alice.scenario", "alice", "me",
+    if (identity_create(&uuid, "10.0.0.1", "alice.scenario", "alice",
                         &ident) != 0 || ident == NULL) {
         snprintf(err, err_len, "wv/signature: identity_create failed");
         goto cleanup;
@@ -950,7 +950,7 @@ static int _make_deterministic_identity(const char *pid, const char *addr,
     hash[8] = (hash[8] & 0x3F) | 0x80;
     memcpy(uuid, hash, 16);
 
-    int rc = identity_create(&uuid, addr, "x.scenario", pid, "me", out);
+    int rc = identity_create(&uuid, addr, "x.scenario", pid, out);
     if (rc != 0 || *out == NULL) return -1;
 
     /* Overwrite the randomly-generated keypairs with deterministic ones

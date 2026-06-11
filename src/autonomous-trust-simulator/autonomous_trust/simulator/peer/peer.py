@@ -29,12 +29,12 @@ from .path import PathData, Path
 
 class PeerConnection(Configuration):
     """Snapshot in time of peer connectivity"""
-    def __init__(self, uuid: str, kind: str, nickname: str, ip4_addr: str, position: Position, signal: float,
+    def __init__(self, uuid: str, kind: str, petname: str, ip4_addr: str, position: Position, signal: float,
                  antenna: Antenna, iface: NetInterface):
         super().__init__()
         self.uuid = uuid
         self.kind = kind
-        self.nickname = nickname
+        self.petname = petname
         self.ip4_addr = ip4_addr
         self.position = position
         self.signal = signal
@@ -103,11 +103,11 @@ class DataStream(Configuration):
 
 class PeerInfo(PeerConnection):
     """Artificial, high-level hardware simulation data fed directly into a peer's system. Serializable."""
-    def __init__(self, uuid: str, kind: str, nickname: str, ip4_addr: str, initial_position: Position,
+    def __init__(self, uuid: str, kind: str, petname: str, ip4_addr: str, initial_position: Position,
                  signal: float, antenna: Antenna, iface: NetInterface,
                  initial_time: datetime, last_seen: datetime, path_list: list[PathData],
                  data_streams: list[DataStream], uplink: Optional[GatewayUplink] = None):
-        super().__init__(uuid, kind, nickname, ip4_addr, initial_position, signal, antenna, iface)
+        super().__init__(uuid, kind, petname, ip4_addr, initial_position, signal, antenna, iface)
         self.initial_time = initial_time
         self.last_seen = last_seen
         self.initial_position = initial_position

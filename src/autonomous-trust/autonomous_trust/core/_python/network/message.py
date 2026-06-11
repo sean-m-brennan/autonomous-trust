@@ -62,9 +62,10 @@ def _identity_from_wire(wire):
     travels in the envelope, NOT the payload (the payload carries only
     ``[package_hash, capabilities]``). The hex fields are the hex-encoded
     public keys, exactly what ``Signature``/``Encryptor`` accept with
-    ``public_only=True``. nickname is unknown over the wire (the envelope
-    has no nickname slot) and is left empty; equality/lookup for a new peer
-    keys on uuid + public keys, which are all present."""
+    ``public_only=True``. The online nickname rides the envelope ``from_name``
+    slot (may be empty); the local petname is never on the wire and is left
+    empty. Equality/lookup for a new peer keys on uuid + public keys, which are
+    all present."""
     from ..identity import Identity, Signature, Encryptor
     from_uuid = wire.get('from_uuid') or ''
     from_sig = wire.get('from_sig_hex') or ''
@@ -75,7 +76,7 @@ def _identity_from_wire(wire):
         sig = Signature(from_sig.encode('ascii'), public_only=True)
         enc = Encryptor(from_enc.encode('ascii'), public_only=True)
         return Identity(from_uuid, wire.get('from_address', '') or '',
-                        wire.get('from_name', '') or '', '', sig, enc)
+                        wire.get('from_name', '') or '', sig, enc)
     except (ValueError, TypeError, RuntimeError):
         return None
 
@@ -204,7 +205,7 @@ class Message(object):
 
         if self.from_whom is not None and isinstance(self.from_whom, Identity):
             wire['from_uuid'] = str(self.from_whom.uuid)
-            wire['from_name'] = getattr(self.from_whom, 'fullname', '')
+            wire['from_name'] = getattr(self.from_whom, 'nickname', '')
             wire['from_address'] = getattr(self.from_whom, 'address', '')
             # publish() already returns the HEX-encoded public key (bytes), e.g.
             # b'45cf..' (64 ASCII hex chars). Just decode to str — do NOT hex

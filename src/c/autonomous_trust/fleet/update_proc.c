@@ -560,7 +560,7 @@ static bool handle_update_status(const process_t *proc, directory_t *queues, gen
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
     {
         log_info(proc->logger, "Update: status from %s (no payload)\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         return true;
     }
 
@@ -569,7 +569,7 @@ static bool handle_update_status(const process_t *proc, directory_t *queues, gen
     const char *detail = json_string_value(json_object_get(payload, "detail"));
 
     log_info(proc->logger, "Update: peer %s status=%s version=%s detail=%s\n",
-             nmsg->from_whom.fullname,
+             nmsg->from_whom.nickname,
              status  ? status  : "?",
              version ? version : "?",
              detail  ? detail  : "?");

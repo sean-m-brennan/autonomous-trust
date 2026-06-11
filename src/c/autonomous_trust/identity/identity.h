@@ -65,9 +65,9 @@ typedef struct
     smrt_ptr_t;
     uuid_t uuid;
     char address[ADDR_LEN+1];
-    char fullname[NAME_LEN+1];
-    char nickname[NAME_LEN+1];
-    char petname[NAME_LEN+1];
+    char nickname[NAME_LEN+1];  /* Zooko ONLINE name (was fullname); the only
+                                  name carried on the wire. */
+    char petname[NAME_LEN+1];   /* Zooko LOCAL name -- never serialized. */
     signature_t signature;
     encryptor_t encryptor;
 #ifdef AT_ZTA_ENABLED
@@ -115,11 +115,10 @@ typedef struct
 /*@
   requires uuid == \null || \valid(uuid);
   requires address != \null && \valid_read(address);
-  requires fullname != \null && \valid_read(fullname);
+  requires nickname != \null && \valid_read(nickname);
   requires \valid(identity);
   assigns identity->uuid[0 .. UUID_LEN - 1],
           identity->address[0 .. ADDR_LEN],
-          identity->fullname[0 .. NAME_LEN],
           identity->nickname[0 .. NAME_LEN],
           identity->petname[0 .. NAME_LEN],
           identity->signature, identity->encryptor;
@@ -129,13 +128,13 @@ typedef struct
     ensures \result == -1;
   disjoint behaviors;
 */
-int identity_init(uuid_t *uuid, const char *address, const char *fullname,
-                  const char *nickname, const char *petname, identity_t *identity);
+int identity_init(uuid_t *uuid, const char *address, const char *nickname,
+                  const char *petname, identity_t *identity);
 
 /*@
   requires uuid == \null || \valid(uuid);
   requires address != \null && \valid_read(address);
-  requires fullname != \null && \valid_read(fullname);
+  requires nickname != \null && \valid_read(nickname);
   requires \valid(ident);
   allocates *ident;
   behavior success:
@@ -145,8 +144,8 @@ int identity_init(uuid_t *uuid, const char *address, const char *fullname,
     ensures \result != 0;
   disjoint behaviors;
 */
-int identity_create(uuid_t *uuid, const char *address, const char *fullname,
-                    const char *nickname, const char *petname, identity_t **ident);
+int identity_create(uuid_t *uuid, const char *address, const char *nickname,
+                    const char *petname, identity_t **ident);
 
 /**
  * @brief Produce a shareable public copy of an identity.

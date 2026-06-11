@@ -157,7 +157,7 @@ int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
         uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
     }
     json_object_set_new(root, "from_uuid", json_string(uuid_str));
-    json_object_set_new(root, "from_name", json_string(msg->from_whom.fullname));
+    json_object_set_new(root, "from_name", json_string(msg->from_whom.nickname));
     json_object_set_new(root, "from_address", json_string(msg->from_whom.address));
     json_object_set_new(root, "from_sig_hex",
                         json_string((const char *)msg->from_whom.signature.public_hex));
@@ -267,7 +267,7 @@ int net_message_from_wire(const uint8_t *data, size_t len,
         if (from_uuid != NULL)
             uuid_parse(from_uuid, msg_out->from_whom.uuid);
         if (from_name != NULL)
-            strncpy(msg_out->from_whom.fullname, from_name, NAME_LEN);
+            strncpy(msg_out->from_whom.nickname, from_name, NAME_LEN);
         if (from_addr != NULL)
             strncpy(msg_out->from_whom.address, from_addr, ADDR_LEN);
         const char *from_sig = json_string_value(json_object_get(root, "from_sig_hex"));

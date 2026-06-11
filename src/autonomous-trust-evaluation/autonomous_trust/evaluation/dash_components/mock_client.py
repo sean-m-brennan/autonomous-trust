@@ -43,9 +43,9 @@ def clamp(n, min_n, max_n):
 
 
 class MockIdentity(object):
-    def __init__(self, nickname, fullname):
-        self.nickname = nickname
-        self.fullname = fullname
+    def __init__(self, nickname, petname):
+        self.nickname = nickname  # Zooko online name
+        self.petname = petname    # Zooko local display name
 
 
 class SimCohort(CohortInterface):

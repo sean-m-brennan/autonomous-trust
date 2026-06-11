@@ -44,10 +44,10 @@ def _mk_identity(name: str, tier: int = 0) -> Identity:
     ident = Identity(
         _uuid=uuid4(),
         address=name,
-        _fullname=f"{name}@test",
-        _nickname=name,
+        _nickname=f"{name}@test",  # Zooko online name (decorated)
         _signature=Signature.generate(),
         _encryptor=Encryptor.generate(),
+        petname=name,              # Zooko local name (bare roster label)
     )
     ident._tier = tier  # noqa: SLF001
     return ident
@@ -98,7 +98,7 @@ def test_peers_filtered_for_persist_keeps_only_listed_uuids():
         peers.add(ident)
     keep = {alice.uuid, bob.uuid}
     filtered = peers.filtered_for_persist(keep)
-    assert {p.nickname for p in filtered.all} == {"alice", "bob"}
+    assert {p.petname for p in filtered.all} == {"alice", "bob"}
     # Hierarchy + valuation both filtered
     assert all("carol" not in level for level in filtered.hierarchy)
     assert all("carol" not in tier for tier in filtered.valuation)
@@ -183,7 +183,7 @@ def test_seed_cohort_mutual_recognition(tmp_path, scenario_factory):
         peers_file = tmp_path / peer / "etc" / "at" / "peers.cfg.json"
         with peers_file.open() as f:
             peers = json.load(f, object_hook=config_json_decoder)
-        names = {p.nickname for p in peers.all}
+        names = {p.petname for p in peers.all}  # bare roster label (Zooko local)
         for other in seeded:
             if other == peer:
                 assert other not in names, "self should not be in peers"

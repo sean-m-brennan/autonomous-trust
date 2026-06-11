@@ -71,8 +71,10 @@ class MetaIdentity(object):
         return self.meta.peer_kind
 
     @property
-    def nickname(self):
-        return self.ident.nickname
+    def petname(self):
+        # Simulator-local display name; sourced from the core identity's
+        # local petname (the short/bare human label).
+        return self.ident.petname
 
     @property
     def address(self):
@@ -145,7 +147,7 @@ def create_config(path: str = None, output_file: str = None, duration: timedelta
             path_data2 = PathData(one_third, two_thirds, shape2, Variability.GAUSSIAN, 2.0, Variability.UNIFORM)
             path_data3 = PathData(two_thirds, end, shape3, Variability.GAUSSIAN, 2.0, Variability.UNIFORM)
             path_data = [path_data1, path_data2, path_data3]
-            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.nickname, meta_id.address, shape1.start, grd_sig,
+            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.petname, meta_id.address, shape1.start, grd_sig,
                                   Antenna.DIPOLE, NetInterface.SMALL, start, end, path_data, data_streams))
 
         elif meta_id.kind == 'soldier':
@@ -156,13 +158,13 @@ def create_config(path: str = None, output_file: str = None, duration: timedelta
             path_data2 = PathData(one_third, two_thirds, shape2, Variability.GAUSSIAN, 0, Variability.UNIFORM)
             path_data3 = PathData(two_thirds, end, shape3, Variability.GAUSSIAN, 1.6, Variability.UNIFORM)
             path_data = [path_data1, path_data2, path_data3]
-            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.nickname, meta_id.address, shape1.start, grd_sig,
+            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.petname, meta_id.address, shape1.start, grd_sig,
                                   Antenna.DIPOLE, NetInterface.SMALL, start, end, path_data, data_streams))
 
         elif meta_id.kind == 'recon':
             shape = EllipseData(uah_alt, *recon_info[recon_num], 3)
             path_data = PathData(start, end, shape, Variability.GAUSSIAN, 90.2, Variability.UNIFORM)
-            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.nickname, meta_id.address, path_data.shape.start,
+            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.petname, meta_id.address, path_data.shape.start,
                                   aer_sig, Antenna.PARABOLIC, NetInterface.LARGE, start, end, [path_data],
                                   data_streams))
             recon_num += 1
@@ -170,7 +172,7 @@ def create_config(path: str = None, output_file: str = None, duration: timedelta
         elif meta_id.kind == 'jet':
             shape = EllipseData(uah_alt2,  *jet_info, 1)
             path_data = PathData(last_minute, end, shape, Variability.GAUSSIAN, 203.4, Variability.UNIFORM)
-            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.nickname, meta_id.address, path_data.shape.start,
+            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.petname, meta_id.address, path_data.shape.start,
                                   aer_sig, Antenna.YAGI, NetInterface.LARGE, last_minute, end, [path_data],
                                   data_streams))
 
