@@ -31,7 +31,7 @@ static public_identity_t *make_test_peer(const char *name)
     public_identity_t *peer = malloc(sizeof(public_identity_t));
     memset(peer, 0, sizeof(public_identity_t));
     uuid_generate(peer->uuid);
-    strncpy(peer->fullname, name, NAME_LEN);
+    strncpy(peer->nickname, name, NAME_LEN);
     strncpy(peer->address, "127.0.0.1", ADDR_LEN);
     /* generate signing keypair */
     crypto_sign_keypair(peer->signature.public, peer->signature.private);
@@ -107,7 +107,7 @@ DEFINE_TEST(test_identity_history_share_hear)
     /* create a full identity for signing */
     identity_t *signer = NULL;
     ck_assert_ret_ok(identity_create(NULL, "127.0.0.1", "Sharer",
-                                     "sharer", "sharer", &signer));
+                                     "sharer", &signer));
 
     peers_t peers;
     memset(&peers, 0, sizeof(peers_t));

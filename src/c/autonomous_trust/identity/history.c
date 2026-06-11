@@ -44,12 +44,12 @@ static int _identity_obj_designation(const merkle_blob_t *blob, uint8_t **out, s
     char uuid_str[37];
     uuid_unparse_lower(obj->identity->uuid, uuid_str);
 
-    /* originator + uuid + fullname + public_key.  Use strnlen throughout
+    /* originator + uuid + nickname + public_key.  Use strnlen throughout
      * so a wire-sourced identity that lacks a NUL terminator cannot walk
      * past the field and read adjacent memory. */
     size_t orig_len = strnlen(obj->originator_uuid, MERKLE_UUID_LEN);
     size_t uuid_len = strnlen(uuid_str, sizeof(uuid_str));
-    size_t name_len = strnlen(obj->identity->fullname, NAME_LEN + 1);
+    size_t name_len = strnlen(obj->identity->nickname, NAME_LEN + 1);
     if (orig_len >= MERKLE_UUID_LEN || uuid_len >= sizeof(uuid_str) ||
         name_len > NAME_LEN)
         return EINVAL;
@@ -65,7 +65,7 @@ static int _identity_obj_designation(const merkle_blob_t *blob, uint8_t **out, s
     offset += orig_len;
     memcpy(buf + offset, uuid_str, uuid_len);
     offset += uuid_len;
-    memcpy(buf + offset, obj->identity->fullname, name_len);
+    memcpy(buf + offset, obj->identity->nickname, name_len);
     offset += name_len;
     memcpy(buf + offset, obj->identity->signature.public, key_len);
 
@@ -705,18 +705,18 @@ bool identity_history_verify_object(identity_history_t *history,
         return false;
 
     /* Shape check: blob must carry a non-null identity with at least
-     * uuid + fullname + signature populated. Mirrors Python's
+     * uuid + nickname + signature populated. Mirrors Python's
      * IdentityObj.validate() (history.py:55-69). The C identity_obj_t
-     * stores `identity` as a pointer; null or zero-fullname rejects. */
+     * stores `identity` as a pointer; null or zero-nickname rejects. */
     const identity_obj_t *idobj = (const identity_obj_t *)blob;
     if (idobj->identity == NULL) {
         if (history->logger != NULL)
             log_debug(history->logger, "verify_object: no identity\n");
         return false;
     }
-    if (idobj->identity->fullname[0] == '\0') {
+    if (idobj->identity->nickname[0] == '\0') {
         if (history->logger != NULL)
-            log_debug(history->logger, "verify_object: identity has no fullname\n");
+            log_debug(history->logger, "verify_object: identity has no nickname\n");
         return false;
     }
     /* Signature key presence: the ed25519 public key is a fixed-size

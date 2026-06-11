@@ -172,9 +172,9 @@ static int _make_identity(const char *id, size_t idx, identity_t **out)
     _uuid5("rep:", id, uuid);
     char addr[ADDR_LEN + 1] = {0};
     snprintf(addr, sizeof(addr), "10.0.60.%zu", idx + 1);
-    char fullname[NAME_LEN + 1] = {0};
-    snprintf(fullname, sizeof(fullname), "%s.rep", id);
-    return identity_create(&uuid, addr, fullname, id, "me", out);
+    char nickname[NAME_LEN + 1] = {0};
+    snprintf(nickname, sizeof(nickname), "%s.rep", id);
+    return identity_create(&uuid, addr, nickname, id, out);
 }
 
 static rp_impl_t *_build_participant_impl(const char *id, size_t idx)

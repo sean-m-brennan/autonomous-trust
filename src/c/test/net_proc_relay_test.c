@@ -153,7 +153,7 @@ static void init_proc_min(process_t *proc, const uuid_t my_uuid,
     public_identity_t *b = &proc->protocol.peers[0];
     memcpy(b->uuid, peer_b_uuid, 16);
     snprintf(b->address, sizeof(b->address), "%s", peer_b_addr);
-    snprintf(b->fullname, sizeof(b->fullname), "peer-B");
+    snprintf(b->nickname, sizeof(b->nickname), "peer-B");
     proc->protocol.num_peers = 1;
     proc->protocol.peer_rtt_ms[0] = 50;
     (void)my_uuid;  /* identity carries my_uuid; the proc's own uuid isn't read */
