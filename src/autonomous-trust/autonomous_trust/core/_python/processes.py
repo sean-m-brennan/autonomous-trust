@@ -29,6 +29,7 @@ from enum import IntEnum
 from typing import Any
 
 from .config import Configuration
+from .config.configuration import atomic_write
 from .system import cadence, queue_cadence, now, QueueType
 
 
@@ -83,7 +84,9 @@ class ProcessTracker(Mapping):
     to_yaml_string = to_json_string
 
     def to_file(self, filename=None):
-        with open(self._validate_path(filename), 'w') as spec:
+        # Atomic write: load_configs may read subsystems.cfg.json concurrently;
+        # a raw open(...,'w') exposes an empty window mid-write.
+        with atomic_write(self._validate_path(filename)) as spec:
             json.dump(self.classes, spec, indent=2)
 
     def from_json_string(self, data):
