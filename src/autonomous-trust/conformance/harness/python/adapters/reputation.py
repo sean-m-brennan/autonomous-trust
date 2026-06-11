@@ -208,12 +208,12 @@ def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
 def _resolve_to_id(msg: Message) -> str:
     to = msg.to_whom
     if isinstance(to, Identity):
-        return getattr(to, 'nickname', '') or str(to.uuid)
+        return getattr(to, 'petname', '') or str(to.uuid)
     if isinstance(to, Group):
         return 'broadcast'
     if isinstance(to, list) and to:
         first = to[0]
-        return getattr(first, 'nickname', '') or str(getattr(first, 'uuid', first))
+        return getattr(first, 'petname', '') or str(getattr(first, 'uuid', first))
     return 'broadcast'
 
 
@@ -313,10 +313,10 @@ class ReputationAdapter:
             enc = hashlib.sha256(b'rep:enc:' + pid.encode()).hexdigest().encode('ascii')
             identity = Identity(
                 uuid5(_NS, f'rep:{pid}'), f'10.0.60.{idx + 1}',
-                f'{pid}.rep', pid,
+                f'{pid}.rep',
                 Signature(sig, public_only=False),
                 Encryptor(enc, public_only=False),
-                'me', False, 0, 'authority',
+                pid, False, 0, 'authority',
             )
             identities[pid] = identity
 

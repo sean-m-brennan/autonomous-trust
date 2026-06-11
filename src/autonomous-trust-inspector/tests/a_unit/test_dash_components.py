@@ -46,8 +46,8 @@ def _make_ctl(**kwargs):
 
 def _make_peer(uuid='uuid-1', index=0):
     ident = MagicMock()
-    ident.fullname = 'Test Peer'
-    ident.nickname = 'TP'
+    ident.nickname = 'Test Peer'
+    ident.petname = 'TP'
     metadata = MagicMock()
     metadata.time = datetime.now()
     metadata.position = MagicMock()

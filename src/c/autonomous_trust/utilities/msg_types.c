@@ -227,7 +227,7 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
     json_object_set_new(root, "from_uuid", json_string(uuid_str));
-    json_object_set_new(root, "from_name", json_string(msg->from_whom.fullname));
+    json_object_set_new(root, "from_name", json_string(msg->from_whom.nickname));
     json_object_set_new(root, "from_address", json_string(msg->from_whom.address));
     json_object_set_new(root, "from_sig_hex",
                         json_string((const char *)msg->from_whom.signature.public_hex));
@@ -236,7 +236,7 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
 
     uuid_unparse_lower(msg->to_whom.uuid, uuid_str);
     json_object_set_new(root, "to_uuid", json_string(uuid_str));
-    json_object_set_new(root, "to_name", json_string(msg->to_whom.fullname));
+    json_object_set_new(root, "to_name", json_string(msg->to_whom.nickname));
     json_object_set_new(root, "to_address", json_string(msg->to_whom.address));
     json_object_set_new(root, "to_sig_hex",
                         json_string((const char *)msg->to_whom.signature.public_hex));
@@ -496,7 +496,7 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
         uuid_parse(from_uuid, net_msg->from_whom.uuid);
     const char *from_name = json_string_value(json_object_get(root, "from_name"));
     if (from_name)
-        strncpy(net_msg->from_whom.fullname, from_name, NAME_LEN);
+        strncpy(net_msg->from_whom.nickname, from_name, NAME_LEN);
     const char *from_addr = json_string_value(json_object_get(root, "from_address"));
     if (from_addr)
         strncpy(net_msg->from_whom.address, from_addr, ADDR_LEN);
@@ -514,7 +514,7 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
         uuid_parse(to_uuid, net_msg->to_whom.uuid);
     const char *to_name = json_string_value(json_object_get(root, "to_name"));
     if (to_name)
-        strncpy(net_msg->to_whom.fullname, to_name, NAME_LEN);
+        strncpy(net_msg->to_whom.nickname, to_name, NAME_LEN);
     const char *to_addr = json_string_value(json_object_get(root, "to_address"));
     if (to_addr)
         strncpy(net_msg->to_whom.address, to_addr, ADDR_LEN);

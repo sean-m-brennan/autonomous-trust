@@ -25,7 +25,7 @@ message Ident {
   services.GeoPosition position = 1;
   double speed = 2;
   string kind = 3;
-  string nickname = 4;
+  string petname = 4;  // local display name for this sim node
 }
 
 message ReachabilityRow {

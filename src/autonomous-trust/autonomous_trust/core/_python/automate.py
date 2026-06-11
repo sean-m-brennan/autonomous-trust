@@ -313,7 +313,7 @@ class AutonomousTrust(Protocol):
             self._banner()
         self.logger.info(self.name + ':  Package signature %s' % configs[PackageHash.key])
         self.logger.info(self.name + ":  Configuring '%s' at %s for %s" %
-                         (self.identity.fullname, self.identity.address, '(unknown domain)'))
+                         (self.identity.nickname, self.identity.address, '(unknown domain)'))
         self.logger.info(self.name + ':  Signature: %s' % self.identity.signature.publish())
         self.logger.info(self.name + ':  Public key: %s' % self.identity.encryptor.publish())
 

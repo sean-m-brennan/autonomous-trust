@@ -67,7 +67,7 @@ class TestAsteroidBeltScenario:
         """All peers use LASER_COMMS or DEEP_SPACE."""
         space_ifaces = {NetInterface.LASER_COMMS, NetInterface.DEEP_SPACE}
         for peer in config.peers:
-            assert peer.iface in space_ifaces, f"{peer.nickname} has non-space iface {peer.iface}"
+            assert peer.iface in space_ifaces, f"{peer.petname} has non-space iface {peer.iface}"
 
     def test_orbits_are_belt_scale(self, config):
         """Orbital semi-major axes should be in the 2-4 AU range."""
@@ -77,7 +77,7 @@ class TestAsteroidBeltScenario:
                 # EllipseData semi_major should be 2-4 AU
                 semi_major_au = shape.semi_major / AU_M
                 assert 1.5 < semi_major_au < 5.0, \
-                    f"{peer.nickname} orbit {semi_major_au:.2f} AU outside belt range"
+                    f"{peer.petname} orbit {semi_major_au:.2f} AU outside belt range"
 
     def test_habitats_have_distinct_orbits(self, config):
         """No two habitats should have identical orbital parameters."""
@@ -85,7 +85,7 @@ class TestAsteroidBeltScenario:
         for peer in config.peers:
             shape = peer.path_list[0].shape
             key = (shape.semi_major, shape.semi_minor, shape.angle)
-            assert key not in seen, f"Duplicate orbit for {peer.nickname}"
+            assert key not in seen, f"Duplicate orbit for {peer.petname}"
             seen.add(key)
 
 

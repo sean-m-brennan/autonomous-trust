@@ -117,7 +117,7 @@ class Simulator(net.SelectServer):
             if peer.initial_time <= current_time <= peer.last_seen:
                 active.append(peer.uuid)
             position, speed = self.peers[peer.uuid].move(tick)
-            mapp[peer.uuid] = Ident(position, speed, peer.kind, peer.nickname)
+            mapp[peer.uuid] = Ident(position, speed, peer.kind, peer.petname)
         # All must move first before looping for connectivity.
         # Note: The nested loop below is O(n^2) by necessity -- it computes
         # pairwise reachability and signal quality between every pair of peers.

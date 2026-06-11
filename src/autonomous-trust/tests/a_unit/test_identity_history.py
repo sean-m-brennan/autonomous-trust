@@ -34,7 +34,7 @@ def _make_mock_identity(nickname='test', address='10.0.0.1', uid=None):
     ident.uuid = uid or uuid4()
     ident.nickname = nickname
     ident.address = address
-    ident.fullname = 'Test User'
+    ident.petname = 'Test User'
     sig = Signature.generate()
     ident.signature = MagicMock()
     ident.signature.publish.return_value = sig.publish()
