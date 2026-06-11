@@ -36,7 +36,7 @@ from ..algorithms.impl import AgreementImpl
 from ..capabilities import PeerCapabilities
 import json
 from ..config import Configuration, to_json_string, from_json_string, names
-from ..config.configuration import ConfigJSONEncoder
+from ..config.configuration import ConfigJSONEncoder, atomic_write
 from ..processes import Process, ProcMeta
 from ..network import Message, Network
 from .history import IdentityByWork, IdentityByStake, IdentityByAuthority
@@ -237,7 +237,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.update(obj, queues)
                 else:
                     self.configs[name] = obj[0]
-                    with open(filename, 'w') as cfg:
+                    # Atomic write: load_configs may read this snapshot
+                    # concurrently; a raw open(...,'w') exposes an empty window.
+                    with atomic_write(filename) as cfg:
                         if isinstance(obj[0], Group):
                             json.dump((obj[0], obj[1].to_dict()), cfg, cls=ConfigJSONEncoder, indent=2)
                         else:
