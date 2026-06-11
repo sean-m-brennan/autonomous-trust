@@ -774,7 +774,9 @@ function(preprocess _file_in)
         OUTPUT ${_header_file}
         COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust ${_exclude_args}
         COMMENT "Preprocessing table header from ${_file_in}"
-        DEPENDS ${_fullpath}
+        # Depend on the generator too: a change to preprocess.py (e.g. which
+        # directories it scans) must re-run generation, or stale tables linger.
+        DEPENDS ${_fullpath} ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py
     )
     set(table_hdrs ${table_hdrs} ${_header_file} PARENT_SCOPE)
 endfunction()
