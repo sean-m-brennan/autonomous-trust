@@ -90,11 +90,15 @@ DEFINE_TEST(test_identity_proto_roundtrip)
     memset(&pub2, 0, sizeof(public_identity_t));
     ck_assert_ret_ok(proto_to_peer((uint8_t *)data, data_len, &pub2));
 
-    /* Verify all fields survive roundtrip */
+    /* Verify wire fields survive the roundtrip. nickname/petname are Zooko
+       local-only names that are deliberately never serialized (see
+       public_identity_sync_out/in, mirroring the Python twin's
+       sync_to_message/sync_from_message), so they come back empty -- a
+       receiver assigns its own petname locally. */
     ck_assert_str_eq(pub2.address, "10.0.0.99");
     ck_assert_str_eq(pub2.fullname, "Proto Node");
-    ck_assert_str_eq(pub2.nickname, "PN");
-    ck_assert_str_eq(pub2.petname, "proto-n");
+    ck_assert_str_eq(pub2.nickname, "");
+    ck_assert_str_eq(pub2.petname, "");
     ck_assert_mem_eq(pub2.uuid, uuid, sizeof(uuid_t));
 
     free(data);
