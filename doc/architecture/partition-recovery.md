@@ -1,8 +1,10 @@
 # Group Partition Recovery
 
-Status: **Design — not yet implemented.** Drafted 2026-05-20 in response to
+Status: **Implemented (2026-06-02).** Drafted 2026-05-20 in response to
 the dod_mission demo split-brain (`project_dod_demo_status.md` — coordinator
-forms a size-1 group and rejects squad traffic as "not in group").
+forms a size-1 group and rejects squad traffic as "not in group"); shipped in
+commit `072b1ff` with conformance pins (see §9). The layer-3 identity-resync
+backfill and the periodic caps-resync sweep landed subsequently (see §12).
 
 This document specifies an extension to the Identity protocol that lets a
 peer detect it is in a different group than one or more of its neighbors
@@ -100,7 +102,7 @@ to discover what the *other* group looks like.
 
 ```
 msg.obj = {
-    "from_uuid":         <sender peer uuid, str>,
+    "from_identity":     <sender's published Identity, dict>,
     "from_address":      <sender ip:port, str>,
     "my_group_uuid":     <sender's local group uuid, str>,
     "my_group_size":     <int, len(self.group.addresses)>,
@@ -108,6 +110,10 @@ msg.obj = {
                           under sender's identity private key, bytes>,
 }
 ```
+
+> The probe carries the sender's **full published Identity**
+> (`self.identity.publish()`), not a bare uuid, so the recipient has the
+> public key needed to verify `signature` without a prior table lookup.
 
 The signature binds the sender's claim ("I see you as not in my group;
 my group looks like this") to their identity. A Sybil with no real
@@ -122,7 +128,7 @@ not recognize as a group member.
 
 ```
 msg.obj = {
-    "from_uuid":         <responder peer uuid, str>,
+    "from_identity":     <responder's published Identity, dict>,
     "from_address":      <responder ip:port, str>,
     "in_response_to":    <probe sender uuid, str>,
     "my_group_uuid":     <responder's local group uuid, str>,
@@ -206,6 +212,17 @@ A new handler `handle_partition_probe(self, queues, message)`:
 3. Rate limit: at most **one response per probing peer uuid per 30
    seconds**. Prevents a malicious flood-probe from forcing us to
    re-sign and re-broadcast.
+
+> **As implemented — symmetric probe-adopt.** The probe already advertises the
+> prober's `my_group_size`, so `handle_partition_probe` *also* runs the same
+> adoption test as §5.4 (strictly larger, or equal size with smaller uuid),
+> guarded by the in-flight lock, before building the response. Without this, a
+> node that never receives a foreign GROUP-channel message — e.g. the
+> dod_mission coordinator, which sits in no other group's address map and so
+> only ever *responds* to probes — could never initiate a merge into a larger
+> group and would stay wedged on the losing side (the size-1-coordinator case in
+> §1). Exactly one side's adopt test is true, so the two peers don't ping-pong.
+> Pinned by `conformance/scenarios/identity/group-partition-recovery-probe-adopt.yaml`.
 
 ### 5.4 IdentityProcess side (response receipt — the merge initiator)
 
@@ -480,3 +497,38 @@ Approximate effort (subject to revision once we start):
   no — gateways skip the probe/response handlers entirely. The
   `is_gateway` check at `net_proc.c:1233-1234` already exists; use
   the same gate.**
+
+## 12. Layer 3 — post-admission state recovery (implemented)
+
+The probe/response merge (§§4–5) reunites split *groups*. A second, narrower
+failure mode is a peer that is correctly *admitted* but missing per-peer state
+because a directed UDP round-trip was lost (common over the Docker bridge, and
+for cold/late joiners). Two periodic Identity sweeps backstop this. Both are
+one-shot-with-retry: they re-fire until the state arrives, and the responses are
+idempotent.
+
+### 12.1 Caps-resync sweep
+
+`_periodic_caps_resync` (idprocess.py) runs every `_CAPS_RESYNC_INTERVAL_SEC`
+(~20 s). It queries each admitted peer that has no entry in `peer_capabilities`
+over the **reliable** channel (not UDP broadcast), rate-limited to a bounded
+number of queries per sweep. `handle_caps_query` answers and `handle_caps_response`
+registers caps with per-capability dedup. This backstops the confirm-time
+directed `caps_query`, which is a one-shot — if it or its response is dropped,
+the peer stays in `self.peers` yet absent from `peer_capabilities`, silently
+blocking cap-driven paths (subscription, negotiation). Tests:
+`test_late_joiner_caps_resync.py` (Python) and `late_joiner_caps_resync_test.c` (C).
+
+### 12.2 Identity-resync backfill
+
+`_periodic_identity_resync` (idprocess.py) handles the cold/late-joiner case
+where a peer holds a group address map but is missing the `Identity` objects for
+some co-members. When the known-peer count is below the group address count it
+broadcasts a `peer_identity_query`; `handle_identity_query` responds with the
+published identity (if the sender is a group member) and `handle_identity_response`
+backfills the peer table for addresses already in the group. Pinned by
+`conformance/scenarios/identity/identity-resync-backfill.yaml` (Python in
+`idprocess.py`, C mirror in `src/c/.../id_proc.c`).
+
+These sweeps are also surfaced from the node's perspective in
+[Node Lifecycle → Post-admission Recovery](node-lifecycle.md).
