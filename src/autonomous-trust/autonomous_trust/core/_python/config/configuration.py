@@ -20,6 +20,7 @@ import sys
 import json
 import base64
 import tempfile
+from contextlib import contextmanager
 from io import StringIO
 from datetime import datetime, timedelta
 from dateutil import parser
@@ -35,6 +36,43 @@ from ..util import ClassEnumMeta
 
 _ALLOWED_CONFIG_TYPES: set = set()
 _ALLOWED_ENUM_TYPES: set = set()
+
+
+@contextmanager
+def atomic_write(filepath, mode='w'):
+    """Write a file atomically: serialize into a temp file in the same
+    directory, then os.replace() it onto the target.
+
+    A plain open(filepath, 'w') truncates the file to empty *before* the new
+    contents are written, so a concurrent reader (e.g.
+    discover.load_configs -> Configuration.from_file -> json.load, often in
+    another process) can catch the empty/partial window and raise
+    "JSONDecodeError: Expecting value: line 1 column 1". os.replace is atomic
+    on POSIX, so readers always see either the previous complete file or the
+    new complete file. The temp name does not end in Configuration.file_ext,
+    so discover.load_configs' os.listdir filter ignores it even if it races
+    the rename.
+
+    Use as a drop-in for open(path, 'w') when writing config snapshots:
+
+        with atomic_write(path) as f:
+            json.dump(obj, f, ...)
+    """
+    directory = os.path.dirname(filepath) or '.'
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(filepath) + '.',
+                               suffix='.tmp', dir=directory)
+    try:
+        with os.fdopen(fd, mode) as f:
+            yield f
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, filepath)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def register_config_type(cls):
@@ -158,31 +196,10 @@ class Configuration(object):
         return cls.from_string(data.decode('utf-8'))
 
     def to_file(self, filepath):
-        # Atomic write: serialize into a temp file in the same directory, then
-        # os.replace() it onto the target. A plain open(filepath, 'w') truncates
-        # the file to empty *before* json.dump fills it, so a concurrent reader
-        # (discover.load_configs -> from_file -> json.load, often in another
-        # process) can catch the empty/partial window and raise
-        # "JSONDecodeError: Expecting value: line 1 column 1". os.replace is
-        # atomic on POSIX, so readers always see either the previous complete
-        # file or the new complete file. The temp name does not end in
-        # Configuration.file_ext, so load_configs' os.listdir filter ignores it
-        # even if it races the rename.
-        directory = os.path.dirname(filepath) or '.'
-        fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(filepath) + '.',
-                                   suffix='.tmp', dir=directory)
-        try:
-            with os.fdopen(fd, 'w') as cfg:
-                json.dump(self, cfg, cls=ConfigJSONEncoder, indent=2)
-                cfg.flush()
-                os.fsync(cfg.fileno())
-            os.replace(tmp, filepath)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        # Atomic write (see atomic_write): a plain open(filepath, 'w') would
+        # expose an empty/partial file to a concurrent load_configs reader.
+        with atomic_write(filepath) as cfg:
+            json.dump(self, cfg, cls=ConfigJSONEncoder, indent=2)
 
     def sync_from_message(self):
         raise NotImplementedError
