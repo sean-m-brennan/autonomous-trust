@@ -8,7 +8,7 @@ When `AutonomousTrust.run_forever()` is called, the node goes through a determin
 
 1. **Configure**: Load configuration files from `$AUTONOMOUS_TRUST_ROOT/etc/at/`. Required configs: network, identity, peers, capabilities. The `ProcessTracker` reads `subsystems.cfg.json` to determine which process classes to instantiate.
 
-2. **Spawn processes**: The orchestrator creates a process pool and starts each subsystem process (`NetworkProcess`, `IdentityProcess`, `NegotiationProcess`, `ReputationProcess`) as an async worker, each with access to the shared queue dict.
+2. **Spawn processes**: The orchestrator creates a process pool and starts each subsystem process (`NetworkProcess`, `IdentityProcess`, `NegotiationProcess`, `ReputationProcess`) as an async worker, each with access to the shared queue dict. An additional worker, `BootstrapWorker`, is also registered (see [Process Architecture](process-architecture.md)) to run the bootstrap-capability corpus once peers begin to join.
 
 3. **Network bind**: `NetworkProcess` binds its sockets (peer on port N, group on port N+1, broadcast) and starts four receiver threads.
 
@@ -78,6 +78,20 @@ In the active state, four activities run concurrently:
 - **Task negotiation** (Negotiation): Processes incoming task invitations, manages the job queue, handles haggling, and forwards results.
 - **Reputation tracking** (Reputation): Runs Paxos rounds for new transaction scores, responds to reputation queries, and synchronizes history with peers.
 - **Autonomous tasking** (Main): User-defined logic in `autonomous_tasking()` that assigns tasks to peers based on capabilities and reputation.
+
+Two further mechanisms run as backstops in the active state:
+
+- **Bootstrap corpus** (`BootstrapWorker`): drives the bilateral bootstrap-capability exchanges that warm up a freshly-admitted peer's transaction history. See [Trust Tiers §6](trust-tiers.md).
+- **Resync sweeps** (Identity): periodic caps-resync and identity-resync queries that backfill state lost to dropped UDP — capabilities for admitted-but-capless peers, and Identities for group addresses with no known peer object. See [Partition Recovery §12](partition-recovery.md).
+
+## Post-admission Recovery
+
+Admission is not assumed to be lossless. A new peer can end up *admitted* (in the group address map) yet missing either its capabilities (`caps_query`/response dropped) or, for a late/cold joiner, the Identity objects of co-members. Two periodic Identity sweeps converge these:
+
+- **Caps-resync**: every ~20 s, query admitted peers that have no entry in `peer_capabilities` over the reliable channel (rate-limited; idempotent per-capability dedup).
+- **Identity-resync backfill**: when the known-peer count is below the group address count, broadcast a peer-identity query and backfill responses for addresses already in the group.
+
+These are the "layer 3" of partition recovery; their state machine and the symmetric **probe-adopt** merge path are documented in [Partition Recovery](partition-recovery.md).
 
 ## Process Monitoring
 
