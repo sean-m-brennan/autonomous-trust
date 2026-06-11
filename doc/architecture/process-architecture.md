@@ -6,6 +6,13 @@
 
 The `AutonomousTrust` class (in `core/automate.py`) is the main orchestrator. It spawns a pool of `Process` subclasses, each running in its own OS process (or thread, configurable), communicating via `multiprocessing.Queue`.
 
+> **Applies to both backends.** This Python `multiprocessing.Queue` process
+> model is retained even when the native (C/CFFI) backend is selected — C
+> functions are called *within* these Python subsystem processes via CFFI, not
+> by a C-driven process tree. The standalone C daemon (`run_autonomous_trust()`,
+> wrapped by `NativeAutonomousTrust`) is a separate runtime used by the embedded
+> build. See [Native / FFI Dual Implementation](native-ffi-dual-implementation.md).
+
 The orchestrator itself extends `Protocol`, giving it message-handling capabilities for task results, reputation responses, and external control commands.
 
 ## Core Processes
@@ -23,7 +30,7 @@ Four subsystem processes are registered via `ProcessTracker` and listed in `subs
 
 Processes self-register via the `ProcMeta` metaclass. Each `Process` subclass declares its `proc_name` and `description` in the metaclass arguments. The `ProcessTracker` reads `subsystems.cfg.json` to determine which process classes to instantiate and in what order (respecting dependency declarations).
 
-Additional worker processes can be added at runtime via `AutonomousTrust.add_worker()`.
+Additional worker processes can be added at runtime via `AutonomousTrust.add_worker()`. One such worker is the **`BootstrapWorker`** (`core/_python/bootstrap_worker.py`), auto-registered to run the bootstrap-capability corpus that lets freshly-admitted peers accumulate a baby-steps transaction history. See [Trust Tiers §6](trust-tiers.md) and [Node Lifecycle](node-lifecycle.md).
 
 ## IPC and Queue Routing
 

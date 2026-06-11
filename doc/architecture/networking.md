@@ -4,6 +4,12 @@
 
 The network layer handles all wire communication between nodes. It provides three logical channels with different security properties, runs receiver threads for concurrent I/O, and routes messages between the network and internal process queues.
 
+> This describes the Python `NetworkProcess`. The C implementation
+> (`src/c/autonomous_trust/network/`) implements the **same wire protocol**, and
+> C and Python nodes interoperate on the same network — provided both sides use
+> the DRY canonical JSON wire form for identity/group payloads (see
+> [Native / FFI Dual Implementation](native-ffi-dual-implementation.md) §6).
+
 ## Communication Channels
 
 | Channel | Transport | Encryption | Use Case |

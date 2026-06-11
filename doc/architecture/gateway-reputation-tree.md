@@ -1,6 +1,8 @@
 # Tree-structured reputation blockchain for gateway nodes
 
-> Status: Design (approved 2026-05-29). Implementation in progress.
+> Status: Implemented — Phases 0–2 complete (commit `472527b`, 2026-06-01).
+> Phase 3 (C-parity + persistence) is deferred. The phasing described below
+> reflects the shipped design.
 
 ## Context
 

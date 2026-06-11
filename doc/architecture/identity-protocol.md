@@ -45,9 +45,21 @@ Once in a group, the node enters border guard mode and concurrently:
 - **Sends** identity acceptance and history to newly admitted peers on **encrypted peer-to-peer**
 - **Handles** history diffs, group updates, and peer confirmations from other group members
 
+### Post-admission: bootstrap corpus and recovery (concurrent)
+
+After a node is in a group, two further mechanisms run alongside border guard mode:
+
+- **Bootstrap corpus.** A `BootstrapWorker` issues bilateral bootstrap-capability exchanges (`at.handshake`, `at.time-attest`, `at.echo-challenge`) shortly after the first peer joins, so freshly-admitted peers accumulate a baby-steps transaction history and don't sit at flat reputation. See [Trust Tiers §6](trust-tiers.md) and [Node Lifecycle](node-lifecycle.md).
+- **Capability & identity resync.** Because the confirm-time directed `caps_query` and the announce broadcast can be lost (UDP over a Docker bridge, late joiners), `IdentityProcess` runs periodic backstop sweeps: a caps-resync that re-queries admitted peers with no registered capabilities, and an identity-resync that backfills missing peer Identities for addresses already in the group. See [Partition Recovery §12](partition-recovery.md).
+
+## Cross-runtime serialization
+
+- **Canonical wire form.** Identity and `Group` payloads are serialized in a **DRY canonical flat-dict JSON form** (`to_canonical()` / `from_canonical()`) that is byte-parseable by the C implementation. Python's default `ConfigJSONEncoder` form — with `__type__` / `_uuid` markers and a base64-wrapped hex seed — is *not* C-parseable, so all cross-runtime deliveries (`full_history`, `group_key_update`, accept/confirm) emit the canonical form. The C twin's `group_to_json` produces a byte-identical shape. See [Native / FFI Dual Implementation](native-ffi-dual-implementation.md) §6.
+- **Local names are never serialized.** Nicknames and petnames are Zooko-triangle *local* names. They are explicitly excluded from the canonical form and never transmitted (`public_identity_to_canonical()` in `_python/identity/identity.py`, mirrored in `src/c/.../identity/identity.c`); a conformance test asserts `'nickname' not in canonical and 'petname' not in canonical`.
+
 ## Peer Hierarchy
 
-Peers are organized into 3 levels with a 10-level valuation scale. New peers enter at the middle level. Peers can be demoted for bad behavior (sending invalid messages, persistent failures).
+Peers are organized into 3 levels with a 10-level valuation scale. New peers enter at the middle level. Peers can be demoted for bad behavior (sending invalid messages, persistent failures). Reputation-derived **trust tiers** layer on top of this — see [Trust Tiers](trust-tiers.md).
 
 ## Identity Protocol Sequence
 

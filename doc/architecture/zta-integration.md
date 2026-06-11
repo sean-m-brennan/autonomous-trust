@@ -411,7 +411,7 @@ The demo creates:
 
 1. **Retroactive reputation adjustment.** When a peer operates for an extended period without ZTA verification and then verification fails, how far back should reputation be unwound? The current implementation applies a single penalty at detection time; historical unwinding is not yet implemented.
 2. **Multi-operator ZTA.** In coalition/multi-agency scenarios (LunaNet, joint ops), peers may have certs from different CAs. The verifier interface supports this in principle (multiple CA bundles), but cross-certification verification and CA trust negotiation are not yet implemented.
-3. **Python implementation.** The current ZTA integration is C-only. The Python identity process (`idprocess.py`) does not yet perform ZTA checks.
+3. **Python implementation.** ~~The current ZTA integration is C-only.~~ **Closed (2026-06-03, commit `f6250c8`).** The Python identity process (`idprocess.py`) now performs ZTA checks at admission time (`_zta_admit`, gated in `welcoming_committee`), with X.509 verification, DDIL reputation capping, and wire-level credential binding at parity with C. See [ZTA Python Parity](zta-python-parity.md) for the implementation and the features that remain C-only (background re-verification process, audit log, delegated verification).
 
 ---
 
