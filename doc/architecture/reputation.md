@@ -69,13 +69,19 @@ sequenceDiagram
 
 ## Reputation Computation
 
-When a reputation query arrives (`rep_req`), the score is computed using one of two strategies based on the peer's current standing:
+When a reputation query arrives (`rep_req`), the score is computed using one of two strategies based on the peer's current standing. The mode switch uses **hysteresis** to prevent oscillation (a peer hovering near the boundary used to flip modes every tick — e.g. 0.9 ↔ 0.4): a peer must climb above `COOP_ENTER = 0.55` to enter Cooperation Mode and must fall below `COOP_EXIT = 0.45` to drop back to Tit-for-Tat. Within the `[0.45, 0.55]` band the previously-selected mode is retained.
 
-### Cooperation Mode (prior score > 0.5)
+### Cooperation Mode (`prior > COOP_ENTER` to enter, retained until `prior <= COOP_EXIT`)
 
-Pure reputation: weighted average of all transaction scores involving this peer, where each score is weighted by the scoring peer's own reputation.
+Pure reputation: a weighted average of every transaction score involving this peer. Each transaction score is weighted by **two** factors — the counterparty's own reputation and the transaction's capability `transaction_weight` (a higher-tier capability counts for more):
 
-### Tit-for-Tat Mode (prior score <= 0.5)
+```
+score = Σ (counterparty_score · counterparty_rep · task_weight) / Σ task_weight
+```
+
+(returns the neutral `0.5` when there is no weighted history). The `transaction_weight` factor ties this directly into the tiered-transaction model — see [Trust Tiers §5](trust-tiers.md).
+
+### Tit-for-Tat Mode (`prior <= COOP_EXIT` to enter, retained until `prior > COOP_ENTER`)
 
 Contrite Tit-for-Tat: examines the bilateral transaction history between the local node and the queried peer.
 
@@ -84,6 +90,31 @@ Contrite Tit-for-Tat: examines the bilateral transaction history between the loc
 - Otherwise: cooperate
 
 This encourages mutual recovery from low-trust situations while punishing sustained defection.
+
+## Warm-start and cold-start baseline
+
+A peer with no bilateral transaction history would otherwise read as the flat
+neutral `0.5` ("forming…") until enough rounds accumulate. Two mechanisms avoid
+that dead zone:
+
+- **Seeded warm-start.** At startup the process loads any persisted/seeded
+  reputation snapshot (`self.configs.get(CfgIds.reputation)`). A seeded prior
+  overrides the flat `0.5` for known-trusted peers so they read "trusted"
+  immediately rather than spending the warm-up window looking untrusted. See
+  [Persistent Cohort](persistent-cohort.md) for how the snapshot is written and
+  restored.
+- **Consensus baseline.** When a peer has no transactions on the chain,
+  `_consensus_reputation` falls back to `_consensus_baseline()` instead of the
+  neutral default, deriving a starting score from available consensus state.
+
+The dod_mission demo layers a domain-specific **warm-start cohort** on top of
+this for constrained-duration assets (squad, microdrones, jet) that may be
+present too briefly to build consensus history: `is_pre_trusted` /
+`is_warm_start_member` gate which peers receive seeded priors, and
+`reconcile_rep_score` returns the seeded `(score, tier)` for a warm-start member
+whose only readings are neutral. This lives in `examples/dod_mission`
+(`reputation_warmstart.py`, `tools/seed_dod_cohort.py`), not in core, but is the
+reference pattern for warm-starting brief-lived peers.
 
 ## Expiration
 
