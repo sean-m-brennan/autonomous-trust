@@ -72,6 +72,25 @@ def test_idempotent_once_subscribed():
     assert _pending(roster, first, PRODUCERS) == []
 
 
+def test_retries_until_data_received():
+    """Retry path: keyed on readings actually received, not on a prior send.
+
+    The producer-side subscribe is fire-and-forget (server.handle_requests
+    registers a client only if the request lands, no ack), so a single
+    lost/early request strands a late joiner at clients=0. The caller now
+    passes _received_data_uuids (uuid strings of peers that have delivered a
+    reading) as the 'already-satisfied' set, so an un-heard producer stays
+    pending on every pass and is dropped only once its data arrives."""
+    roster = [_Peer("u-mq", "mq800")]
+    received: set = set()
+    # No reading yet -> still pending on repeated passes (NOT one-shot).
+    assert _nicks(_pending(roster, received, PRODUCERS)) == ["mq800"]
+    assert _nicks(_pending(roster, received, PRODUCERS)) == ["mq800"]
+    # A reading arrives (uuid recorded) -> stop re-subscribing.
+    received.add("u-mq")
+    assert _pending(roster, received, PRODUCERS) == []
+
+
 def test_empty_producer_set_is_noop():
     roster = [_Peer("u-mq", "mq800")]
     assert _pending(roster, [], set()) == []

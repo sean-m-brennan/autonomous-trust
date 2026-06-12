@@ -26,10 +26,19 @@ import pytest
 pytest.importorskip("cryptography")
 
 _REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_REPO / "tools"))
-sys.path.insert(0, str(_REPO / "src" / "autonomous-trust"))
+# Set up import paths WITHOUT shadowing the repo-root ``tools`` package: there
+# is ALSO a src/autonomous-trust/tools package, so inserting AT's src at the
+# FRONT of sys.path makes ``import tools`` resolve there instead -- which breaks
+# ``tools.*`` imports (e.g. tools.seed_dod_cohort) for other tests later in the
+# same pytest run. Keep the repo root ahead of AT's src, and import the cert
+# tool via its package path rather than as a bare top-level module.
+_AT_SRC = str(_REPO / "src" / "autonomous-trust")
+if _AT_SRC not in sys.path:
+    sys.path.append(_AT_SRC)
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
-from provision_zta_certs import (  # noqa: E402
+from tools.provision_zta_certs import (  # noqa: E402
     make_ca, make_leaf_cert, cert_der, ca_bundle_pem, forged_credential)
 from autonomous_trust.core.identity.idprocess import IdentityProcess  # noqa: E402
 from autonomous_trust.core.identity.zta import ZtaPolicy  # noqa: E402
@@ -92,7 +101,7 @@ def test_self_signed_hacked_sensor_rejected(mission):
 def test_provision_roster_round_trips(tmp_path):
     # The CLI-level provisioner writes legit creds that verify and forged ones
     # that don't, under a realistic per-peer layout.
-    from provision_zta_certs import provision
+    from tools.provision_zta_certs import provision
     from autonomous_trust.core.identity.zta import X509Verifier, ZtaStatus
     peers = {"squad-captain": None, "sensor-1": "unsigned", "sensor-2": "self_signed"}
     provision(tmp_path, peers)

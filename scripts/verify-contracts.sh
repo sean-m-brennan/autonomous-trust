@@ -173,6 +173,22 @@ if [[ -n "$module" ]]; then
 fi
 
 ####################
+# Require the conda env
+####################
+# Frama-C is invoked below with `-I $CONDA_PREFIX/include` for the OpenSSL +
+# toolchain headers the project's `autonomous_trust` env supplies. Under
+# `set -u` an inactive env leaves $CONDA_PREFIX unbound and the script would
+# die with a cryptic "CONDA_PREFIX: unbound variable"; gate up-front instead,
+# matching scripts/build-native.sh. Deferred past --help/module validation so
+# usage still works without the env active.
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-autonomous_trust}"
+if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV_NAME" ]]; then
+    echo "ERROR: conda environment '$CONDA_ENV_NAME' is not active." >&2
+    echo "  Run: conda activate $CONDA_ENV_NAME" >&2
+    exit 1
+fi
+
+####################
 # Locate frama-c
 ####################
 
