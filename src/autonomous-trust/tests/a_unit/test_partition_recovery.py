@@ -310,6 +310,45 @@ class TestPartitionProbe:
                 rp['in_response_to']),
             resp_sig_raw)
 
+    def test_c_originated_probe_canonical_identity(self):
+        # A C / cross-runtime sender serializes from_identity as the flat
+        # canonical form (no __type__), so from_json_string leaves it a
+        # plain dict. The handler must normalize it to an Identity rather
+        # than crash on `'dict' object has no attribute 'signature'`, which
+        # otherwise strands cross-runtime group merges (the dod_mission
+        # coordinator never merges and stays wedged in its size-1 group).
+        from autonomous_trust.core.config import to_json_string
+        from autonomous_trust.core.identity.identity import (
+            public_identity_to_canonical)
+        me = _new_identity('captain', '10.0.0.10')
+        other = _new_identity('lieutenant', '10.0.0.11')
+        my_group = _group_of_size(me, [other])
+        my_peers = Peers()
+        my_peers.all.append(other)
+        proc = _build_process(me, my_group, my_peers)
+        queues = _build_queues()
+
+        sender = _new_identity('lone-coord', '10.0.0.3')
+        sender_group_uuid = str(uuid_mod.uuid4())
+        sig_bytes = IdentityProcess._partition_probe_canonical(
+            sender_group_uuid, 1)
+        signed = sender.sign(sig_bytes)
+        payload = to_json_string({
+            'from_identity': public_identity_to_canonical(sender.publish()),
+            'from_address': sender.address,
+            'my_group_uuid': sender_group_uuid,
+            'my_group_size': 1,
+            'signature': signed.signature.decode('ascii'),
+        })
+        probe = Message(CfgIds.identity, IdentityProtocol.partition_probe,
+                        payload, encrypt=False)
+        handled = proc.handle_partition_probe(queues, probe)
+        assert handled is True
+        # A well-formed response was emitted (signature verified, no crash).
+        out = queues[CfgIds.network].items
+        assert len(out) == 1
+        assert out[0].function == IdentityProtocol.partition_response
+
     def test_rejects_bad_signature(self):
         me = _new_identity('captain', '10.0.0.10')
         my_group = _group_of_size(me, [])

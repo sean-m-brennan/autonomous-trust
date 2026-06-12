@@ -1521,7 +1521,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 if isinstance(message.obj, (str, bytes)) else message.obj
             if not isinstance(payload, dict) or self.group is None:
                 return True
-            ident = payload.get('from_identity')
+            ident = self._as_identity(payload.get('from_identity'))
             if ident is None or getattr(ident, 'uuid', None) is None:
                 _probes.counter('peer.set', 'identity_response_no_identity')
                 return True
@@ -1628,6 +1628,25 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     _PARTITION_PROBE_COOLDOWN_SEC = 10.0   # per from_addr (§5.2)
     _PARTITION_RESPONSE_COOLDOWN_SEC = 30.0  # per probe-sender uuid (§5.3)
     _PARTITION_RECOVERY_TIMEOUT_SEC = 15.0  # in-progress lockout (§5.4)
+
+    @staticmethod
+    def _as_identity(obj):
+        """Normalize a payload's ``from_identity`` to an Identity (or None).
+
+        A Python sender's identity round-trips through ``from_json_string``
+        back into an Identity (its publish() form carries ``__type__``), but a
+        C / cross-runtime sender serializes it as the flat *canonical* form
+        (no ``__type__``), so ``from_json_string`` leaves it a plain dict.
+        Reconstruct that via ``public_identity_from_canonical`` so the
+        signature/uuid checks downstream work for both. Without this a
+        C-originated partition_probe/response crashes the handler
+        (``'dict' object has no attribute 'signature'``) and an id_response is
+        silently dropped, stranding cross-runtime group merges."""
+        if isinstance(obj, dict):
+            return public_identity_from_canonical(obj)
+        if getattr(obj, 'uuid', None) is not None:
+            return obj
+        return None
 
     @staticmethod
     def _partition_probe_canonical(group_uuid, group_size):
@@ -1752,7 +1771,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if not isinstance(payload, dict):
                 _probes.counter('peer.set', 'partition_probe_bad_payload')
                 return True
-            sender_id = payload.get('from_identity')
+            sender_id = self._as_identity(payload.get('from_identity'))
             group_uuid = payload.get('my_group_uuid')
             group_size = payload.get('my_group_size')
             sig_hex = payload.get('signature')
@@ -1760,9 +1779,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     or group_size is None or sig_hex is None):
                 _probes.counter('peer.set', 'partition_probe_missing_fields')
                 return True
-            # sender_id arrived deserialized as an Identity (Configuration
-            # auto-deserialization in Message.__init__). Verify signature
-            # using the raw-bytes path that message.py:228-243 documents
+            # sender_id normalized to an Identity by _as_identity (a Python
+            # sender round-trips to Identity; a C sender's flat canonical
+            # dict is rebuilt). Verify signature using the raw-bytes path
+            # that message.py:228-243 documents
             # — Identity.verify's two-arg form double-encodes under nacl.
             try:
                 sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
@@ -1870,7 +1890,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 message.obj, (str, bytes)) else message.obj
             if not isinstance(payload, dict):
                 return True
-            sender_id = payload.get('from_identity')
+            sender_id = self._as_identity(payload.get('from_identity'))
             in_response_to = payload.get('in_response_to')
             their_group_uuid = payload.get('my_group_uuid')
             their_group_size = payload.get('my_group_size')

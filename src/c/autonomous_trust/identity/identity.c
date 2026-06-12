@@ -15,6 +15,7 @@
  *******************/
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 
@@ -40,6 +41,33 @@ void peers_set_max_count(size_t count)
 {
     if (count > 0 && count <= DEFAULT_MAX_PEERS)
         _max_peers = count;
+}
+
+
+/* Mint a LOCAL, arbitrary Zooko petname for a *received* identity.
+ *
+ * petname is local-only and never carried on the wire (see
+ * public_identity_from_json / public_identity_sync_in), so a receiver must
+ * assign its own when it learns a peer. We seed it from the online nickname's
+ * local-part (the text before '@') for human readability, then append a random
+ * suffix so the result is locally-unique and -- deliberately -- NOT equal to
+ * any global identifier. Nothing may depend on a peer's petname matching its
+ * roster/online name; peer matching keys off the online nickname. Mirrors
+ * Python Identity.derive_local_petname. */
+static void derive_local_petname(const char *nickname, char *out, size_t outlen)
+{
+    char local[NAME_LEN + 1] = {0};
+    size_t n = 0;
+    size_t cap = (NAME_LEN > 6) ? (NAME_LEN - 6) : 0;  /* room for "-NNNN" */
+    if (nickname != NULL) {
+        for (; n < cap && nickname[n] != '\0' && nickname[n] != '@'; n++)
+            local[n] = nickname[n];
+    }
+    local[n] = '\0';
+    if (n == 0)
+        snprintf(local, sizeof(local), "peer");
+    snprintf(out, outlen, "%s-%04u", local,
+             (unsigned)randombytes_uniform(10000));
 }
 
 
@@ -221,10 +249,10 @@ int public_identity_from_json(const json_t *obj, public_identity_t *p)
         strncpy(p->address, s, ADDR_LEN);
     if ((s = json_string_value(json_object_get(obj, "nickname"))) != NULL)
         strncpy(p->nickname, s, NAME_LEN);
-    /* petname is local-only; never imported from the wire form. Clear it
-       (mirrors Python from_canonical) rather than reading any legacy/crafted
-       key. A receiver assigns its own petname locally. */
-    p->petname[0] = '\0';
+    /* petname is local-only; never imported from the wire form (so a
+       legacy/crafted key can't inject into local naming). The receiver mints
+       its own local petname -- mirrors Python from_canonical. */
+    derive_local_petname(p->nickname, p->petname, sizeof(p->petname));
 
     const char *sig_hex = json_string_value(
         json_object_get(json_object_get(obj, "signature"), "hex_seed"));
@@ -359,11 +387,11 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
     memcpy(&identity->uuid, proto->uuid.data, sizeof(uuid_t));
     strncpy(identity->address, proto->address, ADDR_LEN);
     strncpy(identity->nickname, proto->nickname, NAME_LEN);
-    /* petname is a local-only Zooko name; never imported from the wire. Clear
-       it (mirrors Python sync_from_message, which sets '') so a crafted proto
-       field 10 can't inject into local naming. A receiver assigns its own
-       petname locally. */
-    identity->petname[0] = '\0';
+    /* petname is a local-only Zooko name; never imported from the wire (so a
+       crafted proto field 10 can't inject into local naming). The receiver
+       mints its own -- mirrors Python sync_from_message. */
+    derive_local_petname(identity->nickname, identity->petname,
+                         sizeof(identity->petname));
     if (public_signature_init(&identity->signature, proto->signature->hex_seed.data,
                               proto->signature->hex_seed.len) != 0)
         return -1;

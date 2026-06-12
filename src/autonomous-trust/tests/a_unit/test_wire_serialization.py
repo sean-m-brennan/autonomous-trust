@@ -76,8 +76,13 @@ class TestIdentityWire:
         assert restored.nickname == ident.nickname
         assert restored.signature.publish() == ident.signature.publish()
         assert restored.encryptor.publish() == ident.encryptor.publish()
-        # Fields lost on wire
-        assert restored.petname == ''
+        # petname is local-only and NOT carried on the wire: the original
+        # ('tester') is dropped and the receiver mints its own from the online
+        # nickname's local-part plus a random suffix (Identity.derive_local_
+        # petname), so it is non-empty, deliberately != the sender's petname,
+        # and never a globalized name.
+        assert restored.petname != ident.petname
+        assert restored.petname.startswith('Test User-')
         assert restored._public_only is True
 
 

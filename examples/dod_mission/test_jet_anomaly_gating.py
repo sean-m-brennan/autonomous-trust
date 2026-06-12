@@ -5,9 +5,10 @@
 """Tests for gating the fighter-jet strike on the MQ-800 rogue's exposure.
 
 The jet must never overfly the objective before the rogue's reputation
-collapses (the anomaly the strike is a response to). It holds off-map until
-``gate_jet_on_anomaly`` fires, then strikes >= JET_ANOMALY_HOLD_SEC later and
-never before its authored time.
+collapses (the anomaly the strike is a response to). It flies a visible holding
+loiter (on-map, east of the objective) until ``gate_jet_on_anomaly`` fires,
+then breaks into the strike run >= JET_ANOMALY_HOLD_SEC later and never before
+its authored time.
 
 Run from the repo root:
     pytest examples/dod_mission/test_jet_anomaly_gating.py
@@ -21,12 +22,16 @@ from datetime import timedelta
 from examples.dod_mission.scenario import (
     DoDMissionScenario,
     GROUND_MID,
-    JET_INGRESS,
+    JET_LOITER,
+    JET_LOITER_RADIUS_M,
+    JET_LOITER_PERIOD_S,
+    JET_LOITER_BASE_ANGLE,
     JET_LAUNCH_SEC,
     JET_STRIKE_SEC,
     JET_ANOMALY_HOLD_SEC,
     JET_HOLD_CEILING_SEC,
     _JET_INGRESS_RUN_SEC,
+    _orbit_position,
     ROGUE_PEER_NAME,
 )
 
@@ -57,11 +62,21 @@ def _target(sc, strike_sec):
     return (lat, lon, GROUND_MID[2])
 
 
-def _ingress(sc, strike_sec):
-    """The jet's ingress hold during a flown pass: off-map east at the target's
-    (strike-time) latitude, so the whole run is straight east-west on target."""
-    lat, _ = sc.true_target_latlon(strike_sec)
-    return (lat, JET_INGRESS[1], JET_INGRESS[2])
+def _loiter_at(secs):
+    """The exact point on the holding-loiter orbit at ``secs`` — the jet breaks
+    from here into the strike run (so launch is continuous with the hold)."""
+    return _orbit_position(JET_LOITER, JET_LOITER_RADIUS_M,
+                           JET_LOITER_PERIOD_S, JET_LOITER_BASE_ANGLE, secs)
+
+
+def _is_loitering(pos):
+    """True if the jet is on its holding loiter: ~one radius from the loiter
+    centre and clearly east of the objective (i.e. on-map, not overflying)."""
+    dlat = (pos.lat - JET_LOITER[0]) * 111320.0
+    dlon = ((pos.lon - JET_LOITER[1]) * 111320.0
+            * math.cos(math.radians(JET_LOITER[0])))
+    r = math.hypot(dlat, dlon)
+    return abs(r - JET_LOITER_RADIUS_M) <= 50.0 and pos.lon > GROUND_MID[1]
 
 
 def test_no_rogue_uses_authored_timing():
@@ -71,12 +86,15 @@ def test_no_rogue_uses_authored_timing():
     assert _near(_jet_at(sc, JET_STRIKE_SEC), _target(sc, JET_STRIKE_SEC))
 
 
-def test_holds_offmap_until_anomaly():
-    # Rogue present but not yet exposed -> jet holds at the ingress point even
-    # past its authored strike time, instead of overflying early.
+def test_loiters_until_anomaly():
+    # Rogue present but not yet exposed -> jet flies a visible holding loiter
+    # (on-map, east of the objective) even past its authored strike time,
+    # instead of overflying early.
     sc = _scenario()
-    assert _near(_jet_at(sc, JET_STRIKE_SEC), JET_INGRESS)
-    assert _near(_jet_at(sc, JET_STRIKE_SEC + 60), JET_INGRESS)
+    assert _is_loitering(_jet_at(sc, JET_STRIKE_SEC))
+    assert _is_loitering(_jet_at(sc, JET_STRIKE_SEC + 60))
+    # ...and never over the target while holding.
+    assert not _near(_jet_at(sc, JET_STRIKE_SEC), _target(sc, JET_STRIKE_SEC))
 
 
 def test_strikes_after_late_anomaly_flies_in():
@@ -87,7 +105,7 @@ def test_strikes_after_late_anomaly_flies_in():
     # ingress run in; strike = launch + ingress run, no teleport.
     launch = collapse + JET_ANOMALY_HOLD_SEC
     strike = launch + _JET_INGRESS_RUN_SEC
-    assert _near(_jet_at(sc, launch), _ingress(sc, strike))  # at the hold, just launching
+    assert _near(_jet_at(sc, launch), _loiter_at(launch))  # breaking from the loiter
     assert not _near(_jet_at(sc, strike - 5), _target(sc, strike))  # still inbound
     assert _near(_jet_at(sc, strike), _target(sc, strike))          # over the target
 
@@ -104,7 +122,7 @@ def test_early_anomaly_never_pulls_strike_before_authored():
 def test_gate_ignores_non_rogue_and_is_first_wins():
     sc = _scenario()
     sc.gate_jet_on_anomaly("sensor-1", 300.0)   # not the rogue -> ignored
-    assert _near(_jet_at(sc, JET_STRIKE_SEC), JET_INGRESS)  # still holding
+    assert _is_loitering(_jet_at(sc, JET_STRIKE_SEC))  # still holding (loiter)
     sc.gate_jet_on_anomaly(ROGUE_PEER_NAME, 420.0)  # first real collapse wins
     sc.gate_jet_on_anomaly(ROGUE_PEER_NAME, 999.0)  # later call cannot move it
     strike = 420.0 + JET_ANOMALY_HOLD_SEC + _JET_INGRESS_RUN_SEC
@@ -125,5 +143,5 @@ def test_ceiling_releases_a_never_exposed_rogue():
     sc = _scenario()
     strike = JET_HOLD_CEILING_SEC + _JET_INGRESS_RUN_SEC
     assert _near(_jet_at(sc, JET_HOLD_CEILING_SEC),
-                 _ingress(sc, strike))  # released, launching
+                 _loiter_at(JET_HOLD_CEILING_SEC))  # released, breaking from loiter
     assert _near(_jet_at(sc, strike), _target(sc, strike))  # flies in to the target

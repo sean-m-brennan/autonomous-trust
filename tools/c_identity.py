@@ -8,7 +8,7 @@ differently:
     output with ``_uuid`` / ``__type__`` wrappers; the encryptor stores the *raw*
     Curve25519 private key (``PrivateKey(hex)`` uses the bytes directly).
   * **C** (``identity.c:248-286``): flat jansson object — ``typename`` / ``uuid`` /
-    ``fullname`` + ``signature.hex_seed`` / ``encryptor.hex_seed``; the reader
+    ``nickname`` / ``petname`` + ``signature.hex_seed`` / ``encryptor.hex_seed``; the reader
     (``identity_from_json`` -> ``signature_init`` / ``encryptor_init``) treats
     ``hex_seed`` as a 32-byte **seed** and runs ``crypto_sign_seed_keypair`` /
     ``crypto_box_seed_keypair``.
@@ -47,11 +47,13 @@ from autonomous_trust.core._python.identity import Identity
 from autonomous_trust.core._python.identity.sign import Signature
 from autonomous_trust.core._python.identity.encrypt import Encryptor
 
+_domain = 'tekfive.com'
 
 def make_c_node_identity(peer_name: str, address: str, *,
                          nickname: Optional[str] = None,
                          petname: Optional[str] = None,
-                         rank: int = 0) -> tuple[dict, Identity]:
+                         rank: int = 0,
+                         domain: str = _domain) -> tuple[dict, Identity]:
     """Build a fresh seed-based identity for a C ``at_demo`` node.
 
     Returns ``(c_json, public_identity)``:
@@ -64,7 +66,7 @@ def make_c_node_identity(peer_name: str, address: str, *,
     """
     # Zooko: nickname is the ONLINE name (carried on the wire); petname is the
     # LOCAL short/bare name (what the coordinator roster matches on).
-    nickname = nickname or f"{peer_name}@dod-demo"
+    nickname = nickname or f"{peer_name}@{domain}"
     petname = petname or peer_name
 
     # Signature: ed25519. SigningKey.encode() IS the 32-byte seed (sign.py:57),
@@ -125,6 +127,6 @@ def public_identity_from_c_json(c_json: dict) -> Identity:
     enc_pub_hex = PrivateKey.from_seed(enc_seed).public_key.encode(
         encoder=HexEncoder).decode("ascii")
     return _public_identity_from_parts(
-        c_json["uuid"], c_json["address"], c_json["fullname"],
-        c_json["nickname"], c_json.get("petname", "me"),
+        c_json["uuid"], c_json["address"], c_json["nickname"],
+        c_json.get("petname", "me"),
         int(c_json.get("rank", 0)), sig_pub_hex, enc_pub_hex)

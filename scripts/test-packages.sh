@@ -47,6 +47,17 @@ for arg in "$@"; do
     esac
 done
 
+# The suites below run via the bare `python -m pytest`, which expects the
+# project's `autonomous_trust` conda env to be active so the interpreter
+# carries the AT deps. Match the gating convention in scripts/build-py.sh;
+# deferred past --help so usage still works without the env active.
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-autonomous_trust}"
+if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV_NAME" ]]; then
+    echo "ERROR: conda environment '$CONDA_ENV_NAME' is not active." >&2
+    echo "  Run: conda activate $CONDA_ENV_NAME" >&2
+    exit 1
+fi
+
 echo "========== Building the C library =========="
 if $verbose; then
   scripts/build.sh --c || exit 1

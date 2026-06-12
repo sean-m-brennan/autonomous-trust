@@ -30,18 +30,19 @@ from ..network import Network, NetworkProtocol
 from ..identity import Identity
 from ..system import CfgIds, communications, core_system
 
+_domain = 'tekfive.com'
 
 _names = [
-    'j.h.watson@tekfive.com',
-    'a.hastings@tekfive.com',
-    'a.goodwin@tekfive.com',
-    'j.may@tekfive.com',
-    'a.bryant@tekfive.com',
-    't.beresford@tekfive.com',
-    'n.charles@tekfive.com',
-    'd.selby@tekfive.com',
-    'm.archer@tekfive.com',
-    'r.lewis@tekfive.com',
+    'j.h.watson@%s' % _domain,
+    'a.hastings@%s' % _domain,
+    'a.goodwin@%s' % _domain,
+    'j.may@%s' % _domain,
+    'a.bryant@%s' % _domain,
+    't.beresford@%s' % _domain,
+    'n.charles@%s' % _domain,
+    'd.selby@%s' % _domain,
+    'm.archer@%s' % _domain,
+    'r.lewis@%s' % _domain,
 ]
 
 def _subsystems(net_impl):
@@ -89,22 +90,22 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
             seed = random.randint(1, 254)
         # Assume we're running in docker or kvm, so queried addresses work
         idx = seed % len(_names)
-        fullname = _names[idx]
-        nickname = fullname.split('@')[0].rsplit('.', 1)[1]
+        nickname = _names[idx]
+        petname = nickname.split('@')[0].rsplit('.', 1)[1]
         # If the deployment supplies AT_PEER_NAME (e.g. the multi-agency
         # demo's compose generator labels each container 'noaa-1',
-        # 'fema-fusion', ...), honor it as the AT identity nickname so
+        # 'fema-fusion', ...), honor it as the AT identity petname so
         # downstream observers — the inspector bridge, dashboards,
         # scenario timelines — can match an AT peer to its scenario
-        # role without an extra mapping table. fullname follows so log
+        # role without an extra mapping table. nickname follows so log
         # output stays consistent.
         env_name = os.environ.get('AT_PEER_NAME', '').strip()
         if env_name:
-            nickname = env_name
-            fullname = f'{env_name}@tekfive.com'
+            petname = env_name
+            nickname = '%s@%s' % (env_name, _domain)
         # FIXME always dynamic
         net_cfg = Network.initialize(ip4_address, ip6_address, mac_address)
-        ident_cfg = Identity.initialize(fullname, nickname, address)
+        ident_cfg = Identity.initialize(nickname, petname, address)
         sub_sys_cfg = _subsystems(communications)
         if not os.path.exists(net_file):
             net_cfg.to_file(net_file)
@@ -120,13 +121,13 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         _logger.debug('Configuring an AutonomousTrust identity')
     if not os.path.exists(ident_file) or not preserve:
         try:
-            fullname = input('  Fullname (FQDN) [%s]: ' % hostname)
-            if fullname == '':
-                fullname = hostname
-            nickname = input('  Nickname: ')
+            nickname = input('  Fullname (FQDN) [%s]: ' % hostname)
+            if nickname == '':
+                nickname = hostname
+            petname = input('  Nickname: ')
         except EOFError:
-            fullname = hostname
-            nickname = random_name(sep='', cap=True)
+            nickname = hostname
+            petname = random_name(sep='', cap=True)
         # Mirror of the randomize-branch lookup above: deployment-set
         # AT_PEER_NAME (eg. compose generators that label containers
         # 'noaa-1', 'mq800', 'microdrone-1', ...) wins over the random
@@ -136,8 +137,8 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         # stays consistent across both branches.
         env_name = os.environ.get('AT_PEER_NAME', '').strip()
         if env_name:
-            nickname = env_name
-            fullname = '%s@tekfive.com' % env_name
+            petname = env_name
+            nickname = '%s@%s' % (env_name, _domain)
     if not os.path.exists(net_file) or not preserve:
         if defaults:
             ip4_addr = ip4_address
@@ -167,7 +168,7 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
     else:
         net_cfg = Network.from_file(net_file)
     if not os.path.exists(ident_file) or not preserve:
-        ident_cfg = Identity.initialize(fullname, nickname, net_cfg.ip4)  # noqa
+        ident_cfg = Identity.initialize(nickname, petname, net_cfg.ip4)  # noqa
     else:
         ident_cfg = Identity.from_file(ident_file)
     if not os.path.exists(sub_sys_file) or not preserve:
