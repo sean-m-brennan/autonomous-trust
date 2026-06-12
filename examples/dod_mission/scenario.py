@@ -65,8 +65,29 @@ MQ800_INGRESS  = (34.715000, -86.580000, 600.0)   # MQ-800 enters from the east
 # latitude at strike time by _jet_waypoints (the target drifts south off the
 # squad's GROUND_MID hold), so the jet travels straight east-west through the
 # target rather than over the paused squad. See true_target_latlon.
-JET_INGRESS    = (GROUND_MID[0], -86.453789, 400.0)   # ~17 km east hold
-JET_EGRESS     = (GROUND_MID[0], -86.825815, 400.0)   # ~17 km west exit
+# Jet altitude profile. Realistic fast-mover numbers: it loiters/ingresses/
+# egresses high (15 000 ft MSL) and only descends for the pass, never below the
+# 600 ft floor — the AOI ridges top out ~380 m MSL (~1 250 ft), so a 600 ft AGL
+# floor keeps the jet clear of terrain. All altitudes here are metres MSL.
+JET_CRUISE_ALT_M = 4572.0   # 15 000 ft — loiter / ingress / egress
+JET_MIN_ALT_M    = 182.9    # 600 ft — never descend below this AGL (terrain)
+# Strike-pass MSL: clears the AOI's ~380 m ridges by the 600 ft floor
+# (380 + 182.9 ≈ 563), rounded up so the low pass still reads as a low pass.
+JET_STRIKE_ALT_M = 565.0
+JET_INGRESS    = (GROUND_MID[0], -86.453789, JET_CRUISE_ALT_M)   # ~17 km east hold
+JET_EGRESS     = (GROUND_MID[0], -86.825815, JET_CRUISE_ALT_M)   # ~17 km west exit
+# Holding pattern flown BEFORE launch: a loiter orbit at a standoff well EAST of
+# the objective -- a true off-map hold (~12 km east, beyond the iso terrain AOI,
+# so in the iso view it clamps to the eastern edge; in the top-down map it reads
+# as the patrolling jet holding off to the east). Far enough that the gated
+# launch is a fast, dramatic ingress run, never overflying the target before the
+# anomaly. When the gate releases it, it breaks from the loiter straight into
+# the strike run (the ingress waypoint is the loiter point AT launch -- no
+# teleport; outside the AOI the iso view simply clamps that point to the edge).
+JET_LOITER         = (GROUND_MID[0], -86.500, JET_CRUISE_ALT_M)
+JET_LOITER_RADIUS_M = 1400.0
+JET_LOITER_PERIOD_S = 45.0     # one lap / 45 s -> clearly moving at 1 Hz ticks
+JET_LOITER_BASE_ANGLE = 0.0
 COMMAND_REMOTE = (33.518600, -86.810400, 200.0)   # ~135 km south (Birmingham AL)
 GROUND_EXFIL   = (34.699600, -86.668604, 198.0)   # Extraction point (SW of objective)
 
@@ -273,7 +294,7 @@ _JET_WAYPOINTS = [
     # T+6:00 narration "arrives" beat and overflies the objective at the
     # strike, matching the narration / strike annotation instead of
     # trailing ~25 s behind them.
-    (JET_STRIKE_SEC, GROUND_MID),   # high-speed pass over the objective
+    (JET_STRIKE_SEC, (GROUND_MID[0], GROUND_MID[1], JET_STRIKE_ALT_M)),  # low pass over the objective (≥600 ft AGL)
     (JET_EGRESS_SEC, JET_EGRESS),   # egresses to the west
 ]
 # Ingress-run / egress-run durations, preserved when the gated strike
@@ -460,9 +481,16 @@ class DoDMissionScenario(Scenario):
             role = self._peers.get("jet-1")
             if role is not None:
                 launch_sec = self._jet_launch_time(secs)
-                if launch_sec is None:
-                    # Rogue not yet exposed — park at the off-map ingress hold.
-                    j_lat, j_lon, j_alt = JET_INGRESS
+                if launch_sec is None or secs < launch_sec:
+                    # Holding (rogue not yet exposed, or gated but not launched):
+                    # fly a loiter orbit at the eastern standoff (off the iso
+                    # AOI -> clamps to the edge in iso; holds off-east in the
+                    # top-down map). Continuous into the strike run below --
+                    # _jet_waypoints begins the ingress from the loiter point at
+                    # launch, so the gated release is a fast run in, no teleport.
+                    j_lat, j_lon, j_alt = _orbit_position(
+                        JET_LOITER, JET_LOITER_RADIUS_M, JET_LOITER_PERIOD_S,
+                        JET_LOITER_BASE_ANGLE, secs)
                 else:
                     j_lat, j_lon, j_alt = _interp_path(
                         secs, self._jet_waypoints(launch_sec))
@@ -532,23 +560,27 @@ class DoDMissionScenario(Scenario):
         return _offset_latlon(GROUND_START[0], GROUND_START[1], east_m, north_m)
 
     def _jet_waypoints(self, launch_sec):
-        """Ingress→strike→egress waypoints anchored to ``launch_sec``,
+        """Loiter-break→strike→egress waypoints anchored to ``launch_sec``,
         preserving the authored ingress-run and egress-run durations so a
         delayed launch still flies the same visual pass, just later (strike
         = launch + ingress run).
 
-        The pass runs straight east-west at the TRUE TARGET's latitude at the
-        strike (the target drifts south off the squad's GROUND_MID hold over a
-        long run), passing through the target — not the static squad-hold
-        latitude. JET_INGRESS/EGRESS supply only the ~17 km east/west extents."""
+        The run begins at the jet's actual loiter point AT launch (so the
+        hold→strike transition is continuous, not a teleport back off-map),
+        crosses the TRUE TARGET (which drifts south off the squad's GROUND_MID
+        hold over a long run), and egresses straight west off-map at the
+        target's latitude. JET_EGRESS supplies only the ~17 km west extent."""
         strike_sec = launch_sec + _JET_INGRESS_RUN_SEC
         tgt_lat, tgt_lon = self.true_target_latlon(strike_sec)
-        ingress = (tgt_lat, JET_INGRESS[1], JET_INGRESS[2])   # off-map east, target lat
-        strike = (tgt_lat, tgt_lon, GROUND_MID[2])            # over the drifting target
-        egress = (tgt_lat, JET_EGRESS[1], JET_EGRESS[2])      # off-map west, target lat
+        # Break from the loiter at exactly where the jet is on its orbit at
+        # launch, so _update_positions' hold→run handoff is seamless.
+        loiter_at_launch = _orbit_position(
+            JET_LOITER, JET_LOITER_RADIUS_M, JET_LOITER_PERIOD_S,
+            JET_LOITER_BASE_ANGLE, launch_sec)
+        strike = (tgt_lat, tgt_lon, JET_STRIKE_ALT_M)         # low pass over the target (≥600 ft AGL)
+        egress = (tgt_lat, JET_EGRESS[1], JET_EGRESS[2])      # off-map west, target lat, back to cruise alt
         return [
-            (0.0, ingress),                                  # parked off-map
-            (launch_sec, ingress),                           # launch — begin ingress
+            (launch_sec, loiter_at_launch),                  # break from the loiter
             (strike_sec, strike),                            # pass over the target
             (strike_sec + _JET_EGRESS_RUN_SEC, egress),      # egress west
         ]

@@ -30,6 +30,23 @@ from autonomous_trust.core.system import queue_cadence, now
 from autonomous_trust.evaluation.scenarios.recording import EventRecorder
 from autonomous_trust.services.data import Reading
 
+
+def _roster_name_of(peer):
+    """Bare roster name for a peer == the local-part of its ONLINE nickname.
+
+    The online nickname (e.g. ``noaa-1@tekfive.com``) is the only globally-
+    consistent, wire-carried name; the local petname is deliberately arbitrary
+    (a random suffix is minted on receipt -- see identity.derive_local_petname)
+    and must NOT be used to match a peer to its scenario role. Strip the
+    ``@domain`` to recover the deployment-set AT_PEER_NAME (``noaa-1``). Accepts
+    a raw ``Identity`` (``.nickname``) or a peer wrapper exposing ``.identity``,
+    and tolerates a nickname with no ``@``."""
+    ident = getattr(peer, "identity", None) or peer
+    nn = (getattr(ident, "nickname", None)
+          or getattr(peer, "nickname", None) or "")
+    return str(nn).split('@', 1)[0].strip()
+
+
 try:
     from autonomous_trust.inspector.peer.daq import Cohort, CohortTracker
     HAS_INSPECTOR = True
@@ -137,8 +154,7 @@ try:
                             msg, block=True, timeout=self.q_cadence)
                         self.logger.info(
                             "DiagDataRcvr: subscribed to %s",
-                            getattr(ident, "petname", None)
-                            or getattr(ident, "nickname", ident))
+                            _roster_name_of(ident) or ident)
                 try:
                     message = queues[self.name].get(
                         block=True, timeout=self.q_cadence)
@@ -499,7 +515,8 @@ class MultiAgencyCoordinator(AutonomousTrust):
                 "_drain_peer_readings: cohort first populated with "
                 "%d peer(s): %s",
                 len(self._cohort.peers),
-                sorted(p.petname for p in self._cohort.peers.values()))
+                sorted(_roster_name_of(p)
+                       for p in self._cohort.peers.values()))
             MultiAgencyCoordinator._logged_first_peers = True
 
         if getattr(self, '_reading_drain', None) is None:
@@ -521,9 +538,7 @@ class MultiAgencyCoordinator(AutonomousTrust):
             except (TypeError, ValueError):
                 continue
             peer = peers_by_uuid.get(uuid_str)
-            peer_name = (getattr(peer, 'petname', None)
-                         or getattr(peer, 'nickname', None)
-                         or uuid_str[:8])
+            peer_name = _roster_name_of(peer) or uuid_str[:8]
             if not MultiAgencyCoordinator._logged_first_reading:
                 logger.info(
                     "_drain_peer_readings: first reading payload from "
@@ -719,7 +734,7 @@ class MultiAgencyCoordinator(AutonomousTrust):
             if score is None:
                 continue
             peer = peers_by_uuid.get(str(peer_id_str))
-            name = getattr(peer, "petname", None) or str(peer_id_str)
+            name = _roster_name_of(peer) or str(peer_id_str)
             self._reputation_cache[name] = float(score)
             self._feed_timeline(name, float(score))
             new_tier = int(getattr(peer, "_tier", 0))

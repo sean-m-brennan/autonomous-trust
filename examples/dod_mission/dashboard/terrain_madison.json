@@ -1,0 +1,13 @@
+{
+  "tile": "N34W087",
+  "south": 34.65972222222222,
+  "north": 34.77027777777778,
+  "west": -86.70027777777777,
+  "east": -86.56972222222223,
+  "rows": 150,
+  "cols": 150,
+  "row0_is_south": true,
+  "source": "https://s3.amazonaws.com/elevation-tiles-prod/skadi/N34/N34W087.hgt.gz",
+  "min_m": 171.0,
+  "max_m": 376.0
+}

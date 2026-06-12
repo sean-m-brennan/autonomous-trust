@@ -766,6 +766,10 @@ def test_map_peer_markers_carry_customdata():
             timestamp=timedelta(seconds=10), peer_name="rq86-1",
             data_type=dt, value=val, unit="m", quality=0.95,
             metadata={"world_uid": "compound-alpha"}))
+    # A reported-target marker only renders while its reporter is a currently-
+    # active platform (set_platforms), so register rq86-1 as one before drawing.
+    panel.set_platforms({"rq86-1": {"lat": 34.724, "lon": -86.640, "alt": 5000.0,
+                                    "kind": "recon-drone", "color": "#1FB8CD"}})
     fig = panel.figure()
     customs = []
     for tr in fig.data:

@@ -28,6 +28,28 @@ from .sign import Signature
 from .encrypt import Encryptor
 from autonomous_trust.core.protobuf.identity import identity_pb2
 
+def derive_local_petname(nickname):
+    """Mint a LOCAL, arbitrary Zooko petname for a *received* identity.
+
+    The petname is a local-only name: it is never carried on the wire (see
+    ``sync_from_message`` / ``public_identity_from_canonical``), so a receiver
+    must assign its own when it learns a peer. We seed it from the online
+    nickname's local-part for human readability, then append a random suffix so
+    the result is locally-unique and -- deliberately -- NOT equal to any global
+    identifier. Nothing in the system may depend on a peer's petname matching
+    its roster/online name; peer-to-role matching keys off the ONLINE nickname
+    (the only globally-consistent, wire-carried name). The petname is purely a
+    display label. The random suffix is what enforces that contract: code that
+    accidentally matches on petname will simply fail to match, surfacing the
+    bug instead of silently relying on a globalized petname."""
+    local = ''
+    if nickname:
+        local = str(nickname).split('@', 1)[0].strip()
+    if not local:
+        local = 'peer'
+    return '%s-%04d' % (local, secrets.randbelow(10000))
+
+
 class Identity(InitializableConfig, AgreementVoter):
     """
     Identity details that can be saved to file or transmitted
@@ -192,7 +214,8 @@ class Identity(InitializableConfig, AgreementVoter):
         self._uuid = self.message.uuid.decode('utf-8')
         self.address = self.message.address
         self._nickname = self.message.nickname
-        self.petname = ''
+        # petname is local-only and never on the wire -- assign our own.
+        self.petname = derive_local_petname(self._nickname)
         self._public_only = True
         self._rank = self.message.rank
         self._block_impl = agreement_impl
@@ -259,9 +282,11 @@ def public_identity_from_canonical(d):
         sig = Signature(sig_hex.encode('ascii'), public_only=True)
         enc = Encryptor(enc_hex.encode('ascii'), public_only=True)
         # petname intentionally NOT read from the wire form: it is a local-only
-        # Zooko name. A receiver assigns its own petname locally.
+        # Zooko name. A receiver assigns its own petname locally (see
+        # derive_local_petname).
+        nickname = d.get('nickname', '') or ''
         return Identity(d['uuid'], d.get('address', '') or '',
-                        d.get('nickname', '') or '',
-                        sig, enc, '')
+                        nickname,
+                        sig, enc, derive_local_petname(nickname))
     except (ValueError, TypeError, RuntimeError, KeyError):
         return None
