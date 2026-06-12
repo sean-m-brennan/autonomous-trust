@@ -966,6 +966,21 @@ tilt_args() {
     printf '%s\n' "${args[@]}"
 }
 
+# --- Conda env gate -------------------------------------------------------
+# Every backend below shells out to the host `python3` (manifest generation,
+# cohort seeding, ZTA provisioning, the multi-agency playback/record nodes),
+# all of which expect the project's `autonomous_trust` conda env to be active
+# so the interpreter carries the AT deps. Matches the gating convention in
+# scripts/build-py.sh and scripts/scale-test-dod-mission.sh. --help and --clean
+# have already short-circuited above; --teardown only drives tilt/kubectl/
+# minikube and needs no AT python, so it is exempt.
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-autonomous_trust}"
+if [[ "$BACKEND_MODE" != "teardown" && "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV_NAME" ]]; then
+    err "conda environment '$CONDA_ENV_NAME' is not active."
+    err "    Run: conda activate $CONDA_ENV_NAME"
+    exit 1
+fi
+
 # --- Tool preflight -------------------------------------------------------
 
 command -v docker  &>/dev/null || { err "docker not found"; exit 1; }

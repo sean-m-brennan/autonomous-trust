@@ -46,6 +46,19 @@ except ImportError:  # imported as a top-level module rather than a package
 
 _TICK_MS = 1000
 
+# The Tactical Map is refreshed by its OWN Interval + callback, decoupled from
+# the main _refresh tick that drives every other panel. This stops the map and
+# the rest of the dashboard from forcing each other to re-serialize + redraw on
+# the same heartbeat (the source of the "choppy" feel), and lets the heavier 3D
+# isometric view tick more slowly when desired. Defaults to the main cadence;
+# raise AT_DASH_MAP_TICK_MS (e.g. 2000) to ease load during the iso view.
+_MAP_TICK_MS = int(os.environ.get("AT_DASH_MAP_TICK_MS", str(_TICK_MS)))
+
+# Fixed Tactical-Map width (px). The map panel renders at this width in both 2D
+# and iso modes; the trust/noise charts pin to it (see _refresh). Mirrors the
+# "900px" left column in the layout grid.
+_MAP_W = 900
+
 # Bound the dashboard's HTTP worker threads. Werkzeug's dev server (what
 # Dash's app.run uses) spawns one *unbounded* thread per request; the
 # dashboard polls every tick (status bar, every chart, the reputations
@@ -315,6 +328,10 @@ def make_app(name: str, title: str,
         dcc.Store(id="playback-paused",
                   data={"paused": bool(start_paused),
                         "auto_done": bool(start_paused)}),
+        # Tactical-Map view mode: "2d" (default MapLibre top-down) or "iso"
+        # (3D orthographic terrain). The map callback threads this into the
+        # panel's set_view_mode each tick.
+        dcc.Store(id="tactical-view-mode", data={"mode": "2d"}),
         html.Div(
             id="control-bar",
             style={"display": "flex" if narration_script else "none",
@@ -355,6 +372,18 @@ def make_app(name: str, title: str,
                                    "borderRadius": "4px",
                                    "cursor": "pointer",
                                    "minWidth": "92px"}),
+                # Tactical-Map view toggle: top-down 2D <-> 3D isometric
+                # terrain. Label reflects the view the click switches TO.
+                html.Button("◢ Isometric View",
+                            id="view-toggle",
+                            n_clicks=0,
+                            style={"padding": "4px 12px",
+                                   "background": "#1E293B",
+                                   "color": "#E2E8F0",
+                                   "border": "1px solid #334155",
+                                   "borderRadius": "4px",
+                                   "cursor": "pointer",
+                                   "minWidth": "128px"}),
                 html.Span(id="presentation-status",
                           style={"color": "#94A3B8",
                                  "fontSize": "11px",
@@ -475,7 +504,16 @@ def make_app(name: str, title: str,
         # Dummy sink for the map cursor-readout clientside callback (the
         # callback only installs DOM listeners; it never feeds Dash state).
         dcc.Store(id="map-coord-hook"),
+        # True while the operator is dragging the map (rotate/zoom). A
+        # clientside listener sets it on mousedown/wheel and clears it on
+        # release; _refresh_map skips routine re-renders while it's true so the
+        # interaction stays smooth. Dummy sink for that listener-installer.
+        dcc.Store(id="map-interacting", data={"dragging": False}),
+        dcc.Store(id="map-drag-hook"),
         dcc.Interval(id="tick", interval=_TICK_MS, n_intervals=0),
+        # Dedicated cadence for the Tactical Map, decoupled from the main tick
+        # so the map and the other panels don't force mutual redraws.
+        dcc.Interval(id="map-tick", interval=_MAP_TICK_MS, n_intervals=0),
     ]
     app.layout = html.Div(
         style={"backgroundColor": "#0F172A",
@@ -487,15 +525,19 @@ def make_app(name: str, title: str,
     )
 
     chart_outputs = [Output(gid, "figure") for gid in chart_graph_ids]
+    # The Tactical Map (chart-0) is driven by its own callback/Interval (see
+    # _refresh_map below); _refresh owns every OTHER chart.
+    _non_map_chart_outputs = chart_outputs[1:]
 
     # Count of data-panel outputs preceding the pause store/button, used to
-    # size the "freeze" return (everything held with dash.no_update).
-    _n_data_outputs = 7 + len(charts)
+    # size the "freeze" return (everything held with dash.no_update). One fewer
+    # than charts because the map output now lives in its own callback.
+    _n_data_outputs = 6 + len(charts)
 
     @app.callback(
         Output("status-bar", "children"),
         Output("timeline-graph", "figure"),
-        *chart_outputs,
+        *_non_map_chart_outputs,
         Output("map-legend", "children"),
         Output("reputations", "children"),
         Output("event-log", "children"),
@@ -568,17 +610,18 @@ def make_app(name: str, title: str,
             if presentation_on:
                 narration_children = _narration_div(overlay.current_block)
                 overlay_style = {"visibility": "visible"}
-        # Pin the trust-dynamics and noise-floor charts to the map's
-        # fixed width. charts[0] is the map; its width is authoritative.
+        # Pin the trust-dynamics and noise-floor charts to the map's fixed
+        # width (_MAP_W). The map itself is built in _refresh_map now, so we
+        # use the constant rather than reading the map figure's width.
         # We override via update_layout (not the figure(width=...) arg)
         # because the sensor chart's empty-data path returns before it
         # applies the width, which would otherwise autosize to fill the
         # wider right column and not line up with the map.
-        chart_figs = [chart.figure() for chart in charts]
-        map_w = chart_figs[0].layout.width or 900
+        chart_figs = [chart.figure() for chart in charts[1:]]  # non-map charts
+        map_w = _MAP_W
         timeline_fig = timeline.figure()
         timeline_fig.update_layout(width=map_w)
-        for cf in chart_figs[1:]:
+        for cf in chart_figs:
             cf.update_layout(width=map_w)
         pause_label = "▶ Resume" if is_paused else "⏸ Pause"
         return (
@@ -593,6 +636,55 @@ def make_app(name: str, title: str,
             {"paused": is_paused, "auto_done": auto_done},
             pause_label,
         )
+
+    # ---- Tactical Map: own callback + Interval, decoupled from _refresh ----
+    # Rendering the map separately means a map redraw no longer forces every
+    # other panel to re-serialize/redraw (and vice versa), and the heavier 3D
+    # iso view can tick at its own (slower) cadence. The map panel's live
+    # platform data is still fed by _refresh's set_platforms loop above — this
+    # callback only renders whatever the shared panel object currently holds,
+    # so it must NOT call state_provider() (that would double-advance the clock).
+    if chart_graph_ids:
+        _map_panel = charts[0]
+
+        @app.callback(
+            Output(chart_graph_ids[0], "figure"),
+            Input("map-tick", "n_intervals"),
+            Input("tactical-view-mode", "data"),
+            State("playback-paused", "data"),
+            State("map-interacting", "data"),
+        )
+        def _refresh_map(_n, view_data, paused_data, interacting):
+            triggered = dash.callback_context.triggered_id
+            # While the operator is dragging to rotate/zoom, skip routine tick
+            # re-renders — a full Plotly.react each cadence would stutter the
+            # drag. A view-mode switch still re-renders (so the toggle works
+            # even mid-drag). Resumes on the next tick after release.
+            if (interacting or {}).get("dragging") and triggered == "map-tick":
+                return dash.no_update
+            paused = bool((paused_data or {}).get("paused"))
+            # While frozen, skip routine ticks (data unchanged; uirevision
+            # holds the view) but DO honor an explicit view-mode switch so the
+            # operator can flip 2D<->iso on a paused frame.
+            if paused and triggered == "map-tick" and _latest_state:
+                return dash.no_update
+            mode = (view_data or {}).get("mode", "2d")
+            if hasattr(_map_panel, "set_view_mode"):
+                _map_panel.set_view_mode(mode)
+            return _map_panel.figure(width=_MAP_W)
+
+        @app.callback(
+            Output("tactical-view-mode", "data"),
+            Output("view-toggle", "children"),
+            Input("view-toggle", "n_clicks"),
+            State("tactical-view-mode", "data"),
+            prevent_initial_call=True,
+        )
+        def _toggle_view(_n, current):
+            iso = (current or {}).get("mode") != "iso"
+            # Button label reflects the view the NEXT click switches to.
+            label = "▦ Top-down View" if iso else "◢ Isometric View"
+            return {"mode": "iso" if iso else "2d"}, label
 
     # Stretch Goal 2 / Phase 4: peer-detail drawer.
     # Dropdown change -> Store; Store + tick -> re-render the
@@ -727,6 +819,48 @@ def make_app(name: str, title: str,
         """.replace("__GRAPH_ID__", map_graph_id),
         Output("map-coord-hook", "data"),
         Input("tick", "n_intervals"),
+    )
+
+    # Drag-to-interact detector: pause the map's tick re-renders while the
+    # operator is rotating/zooming so the interaction stays smooth (esp. the
+    # 3D iso scene). Installs DOM listeners once (retrying off the tick until
+    # the Plotly graph div exists) that flip the `map-interacting` Store via
+    # dash_clientside.set_props. mousedown/touchstart begin a drag; release on
+    # `document` ends it; a wheel zoom holds the flag for a short debounce so
+    # continuous scrolling keeps updates paused until it settles.
+    app.clientside_callback(
+        """
+        function(n_intervals) {
+            var NO = window.dash_clientside.no_update;
+            if (window.__mapDragHooked) { return NO; }
+            var outer = document.getElementById('__GRAPH_ID__');
+            if (!outer) { return NO; }
+            var gd = outer.classList && outer.classList.contains('js-plotly-plot')
+                     ? outer : outer.querySelector('.js-plotly-plot');
+            if (!gd) { return NO; }  // graph not drawn yet; retry next tick
+            function setDrag(v) {
+                try {
+                    window.dash_clientside.set_props(
+                        'map-interacting', {data: {dragging: v}});
+                } catch (e) { /* older dash without set_props: no-op */ }
+            }
+            gd.addEventListener('mousedown', function() { setDrag(true); });
+            gd.addEventListener('touchstart', function() { setDrag(true); },
+                                {passive: true});
+            document.addEventListener('mouseup', function() { setDrag(false); });
+            document.addEventListener('touchend', function() { setDrag(false); });
+            var wheelTimer = null;
+            gd.addEventListener('wheel', function() {
+                setDrag(true);
+                if (wheelTimer) { clearTimeout(wheelTimer); }
+                wheelTimer = setTimeout(function() { setDrag(false); }, 500);
+            }, {passive: true});
+            window.__mapDragHooked = true;
+            return NO;
+        }
+        """.replace("__GRAPH_ID__", map_graph_id),
+        Output("map-drag-hook", "data"),
+        Input("map-tick", "n_intervals"),
     )
 
     return app

@@ -52,6 +52,25 @@ from autonomous_trust.core.config.generate import (
 from autonomous_trust.core.system import now, queue_cadence
 from autonomous_trust.evaluation.scenarios.recording import EventRecorder
 
+def _roster_name_of(peer):
+    """Bare roster name for a peer == the local-part of its ONLINE nickname.
+
+    The online nickname (e.g. ``mq800@tekfive.com``) is the only globally-
+    consistent, wire-carried name; the local petname is deliberately arbitrary
+    (a random suffix is minted on receipt -- see
+    identity.derive_local_petname) and must NOT be used to match a peer to its
+    scenario roster role. We strip the ``@domain`` to recover the deployment-set
+    AT_PEER_NAME (``mq800``) the scenario keys on.
+
+    Accepts either a raw ``Identity`` (``.nickname``) or a peer wrapper that
+    exposes ``.identity`` (the inspector's ``PeerDataAcq``), and tolerates a
+    nickname with no ``@`` (returned as-is)."""
+    ident = getattr(peer, "identity", None) or peer
+    nn = (getattr(ident, "nickname", None)
+          or getattr(peer, "nickname", None) or "")
+    return str(nn).split('@', 1)[0].strip()
+
+
 try:
     from autonomous_trust.inspector.peer.daq import Cohort, CohortTracker
     HAS_INSPECTOR = True
@@ -127,6 +146,24 @@ try:
             # subscribe fallback for late joiners whose data-cap advert was
             # lost (see _patched_process). Empty set => fallback is a no-op.
             self.data_producers = set(kwargs.pop('data_producers', None) or ())
+            # uuid strings of peers we have ACTUALLY received a reading from.
+            # The roster subscribe is fire-and-forget on the producer side
+            # (server.handle_requests registers a client only if the request
+            # lands), so a single lost/early request strands a producer at
+            # clients=0 forever. We retry the subscribe until a reading shows
+            # up here, so a late joiner (mq800) whose first request was dropped
+            # — or arrived before its group-join settled — still gets serviced.
+            self._received_data_uuids: set = set()
+            # Re-subscribe throttle: attempt every Nth process() iteration
+            # (the first attempt is on iteration 0, see _patched_process) so a
+            # lost/early request is retried within ~N * q_cadence seconds until
+            # data flows. Kept small so a late joiner whose advert was lost
+            # (mq800) appears within a few seconds, not ~10s; raise to ease
+            # network load if a deployment has many silent producers.
+            self._resub_period = max(1, int(
+                os.environ.get("AT_DATA_RESUBSCRIBE_TICKS", "6")))
+            self._resub_tick = 0
+            self._resub_logged: set = set()
             super().__init__(configurations, subsystems, log_queue,
                              dependencies, **kwargs)
 
@@ -141,6 +178,10 @@ try:
                 self.logger.exception(
                     "DiagDataRcvr.handle_data: failed to decode payload")
                 return True
+            # Mark this producer as live so the roster-subscribe retry
+            # (see _patched_process) stops re-requesting its stream.
+            if uuid_str is not None:
+                self._received_data_uuids.add(uuid_str)
             if self.reading_drain is None:
                 # Fallback: keep the legacy per-peer cohort path so
                 # we don't silently lose data if reading_drain wasn't
@@ -184,8 +225,7 @@ try:
                             msg, block=True, timeout=self.q_cadence)
                         self.logger.info(
                             "DiagDataRcvr: subscribed to %s",
-                            getattr(ident, "petname", None)
-                            or getattr(ident, "nickname", ident))
+                            _roster_name_of(ident) or ident)
 
                 # Fallback: subscribe to admitted data-PRODUCING roster peers
                 # whose data-capability advertisement never reached us. A late
@@ -194,24 +234,48 @@ try:
                 # never arrive and it is never detected — which also strands the
                 # anomaly-gated jet. The peer's DataProcess runs regardless and
                 # answers a direct request, so subscribing by roster recovers
-                # the stream. Guarded by uuid so it never double-subscribes a
-                # peer the cap path already handled.
-                if self.data_producers:
+                # the stream.
+                #
+                # The subscribe is fire-and-forget: the producer registers us
+                # as a client only if the request actually lands
+                # (server.handle_requests), and there is no ack. A single
+                # request lost to UDP — or sent before the late joiner's
+                # group-join settled — therefore leaves it at clients=0 forever
+                # (observed: mq800 emits "active=True, clients=0", its readings
+                # never arrive, no anomaly, jet never launches). So we RETRY on
+                # a throttle, keyed on whether a reading has actually arrived
+                # (_received_data_uuids, set in handle_data), not on whether we
+                # once sent a request — until the stream is live.
+                #
+                # Fire on the FIRST pass (tick 0 % period == 0) and then every
+                # _resub_period passes — incrementing AFTER the check. The
+                # increment used to run first, so the first attempt waited a
+                # whole period (~10s): mq800, whose advert is lost and which
+                # thus depends entirely on this path, appeared ~10s late while
+                # cap-advertised producers (rq86) showed immediately. Firing
+                # immediately closes that mq800-specific lag.
+                if (self.data_producers
+                        and self._resub_tick % self._resub_period == 0):
                     for p in self._pending_roster_subscriptions(
-                            self.protocol.peers.all, self.servicers,
+                            self.protocol.peers.all,
+                            self._received_data_uuids,
                             self.data_producers):
-                        self.servicers.append(p)
                         msg = _DQ_Message(
                             _DQ_DataProcess.name,
                             _DQ_DataProtocol.request,
                             self.name, p)
                         queues[_DQ_CfgIds.network].put(
                             msg, block=True, timeout=self.q_cadence)
-                        self.logger.info(
-                            "DiagDataRcvr: roster-subscribed to %s "
-                            "(data advert not seen)",
-                            getattr(p, "petname", None)
-                            or getattr(p, "nickname", p))
+                        # Log the first attempt per peer at INFO; later retries
+                        # at DEBUG so a never-reachable producer can't flood.
+                        uid = str(getattr(p, "uuid", ""))
+                        log = (self.logger.info if uid not in self._resub_logged
+                               else self.logger.debug)
+                        self._resub_logged.add(uid)
+                        log("DiagDataRcvr: roster-subscribed to %s "
+                            "(no readings yet — retrying until live)",
+                            _roster_name_of(p) or p)
+                self._resub_tick += 1
 
                 # Drain inbound messages (the data payloads).
                 try:
@@ -231,21 +295,27 @@ try:
                             type(message).__name__)
 
         @staticmethod
-        def _pending_roster_subscriptions(peers_all, servicers, data_producers):
-            """Roster peers that produce data but aren't subscribed yet.
+        def _pending_roster_subscriptions(peers_all, already, data_producers):
+            """Roster peers that produce data but aren't satisfied yet.
 
             Pure decision half of the late-joiner fallback (see
-            _patched_process): given the admitted roster, the already-
-            subscribed servicers, and the set of data-producer petnames,
-            return the peers to subscribe to now. Dedups by uuid string so a
-            peer the capability-advert path already serviced is never
-            re-subscribed, and so the same peer isn't returned twice within
-            one pass.
+            _patched_process): given the admitted roster, the set of peers
+            already satisfied, and the set of data-producer roster names,
+            return the peers to (re)subscribe to now. ``already`` may hold
+            Identity objects (the cap path's servicers) OR bare uuid strings
+            (the retry path's _received_data_uuids) — both reduce to a uuid
+            string. Dedups by uuid string so a peer already serviced / already
+            delivering data is skipped, and the same peer isn't returned twice
+            within one pass.
             """
-            subscribed = {str(getattr(s, "uuid", s)) for s in servicers}
+            subscribed = {str(getattr(s, "uuid", s)) for s in already}
             pending = []
             for p in peers_all:
-                if getattr(p, "petname", None) not in data_producers:
+                # Match on the ONLINE nickname's local-part, NOT the petname:
+                # the petname is local-only and arbitrary on the receiver side
+                # (random suffix), so it never equals a roster name like
+                # "mq800". See _roster_name_of / identity.derive_local_petname.
+                if _roster_name_of(p) not in data_producers:
                     continue
                 uid = str(getattr(p, "uuid", ""))
                 if not uid or uid in subscribed:
@@ -416,9 +486,9 @@ class DoDMissionCoordinator(AutonomousTrust):
         #                        trust-dynamics build-up is unaffected when it
         #                        does surface. See reputation_warmstart
         #                        .is_warm_start_member (the authoritative set).
-        # Keyed by roster name (== the AT identity petname the reputation cache
-        # uses). _reputations_view / _tiers_view apply the same prior for a
-        # warm-start asset that never surfaces a score at all.
+        # Keyed by roster name (== the local-part of the AT identity's online
+        # nickname; see _roster_name_of). _reputations_view / _tiers_view apply
+        # the same prior for a warm-start asset that never surfaces a score.
         self._warm_start_peers: set[str] = {
             p.name for p in scenario.peers.values()
             if is_warm_start_member(
@@ -728,7 +798,10 @@ class DoDMissionCoordinator(AutonomousTrust):
                 "_drain_peer_readings: cohort first populated with "
                 "%d peer(s): %s",
                 len(self._cohort.peers),
-                sorted(p.petname for p in self._cohort.peers.values()))
+                # Log the bare roster names (online-nickname local-part), not
+                # the arbitrary local petnames -- see _roster_name_of.
+                sorted(_roster_name_of(p)
+                       for p in self._cohort.peers.values()))
             DoDMissionCoordinator._logged_first_peers = True
         if (not DoDMissionCoordinator._logged_first_drain
                 and self._tick_count % 20 == 0):
@@ -761,9 +834,9 @@ class DoDMissionCoordinator(AutonomousTrust):
                     item)
                 continue
             peer = peers_by_uuid.get(uuid_str)
-            peer_name = (getattr(peer, 'petname', None)
-                         or getattr(peer, 'nickname', None)
-                         or uuid_str[:8])
+            # Bare roster name for log lines (online-nickname local-part); the
+            # data path itself keys off the reading payload's peer_name.
+            peer_name = _roster_name_of(peer) or uuid_str[:8]
             if not DoDMissionCoordinator._logged_first_reading:
                 logger.info(
                     "_drain_peer_readings: first reading payload from "
@@ -847,10 +920,14 @@ class DoDMissionCoordinator(AutonomousTrust):
                     floor=0.0)
 
     def _peer_uuid(self, peer_name):
-        """Resolve a bare roster name (Zooko petname) to its peer UUID."""
+        """Resolve a bare roster name to its peer UUID.
+
+        Matches on the ONLINE nickname's local-part (the wire-carried, globally
+        consistent name), NOT the local petname -- the petname is arbitrary on
+        the receiver (random suffix) and never equals a roster name."""
         try:
             for p in self.peers.all:
-                if getattr(p, "petname", None) == peer_name:
+                if _roster_name_of(p) == peer_name:
                     return p.uuid
         except Exception:
             logger.debug("peer-uuid lookup failed for %s", peer_name,
@@ -971,11 +1048,15 @@ class DoDMissionCoordinator(AutonomousTrust):
                 # Peers.add). Its entry lingers in latest_reputation with a
                 # frozen value; skip it so it doesn't draw an orphan line.
                 continue
-            name = peer.petname  # bare roster name (Zooko local); keys the panel
-            # Skip a peer that surfaced before its petname resolved (e.g. a
+            # Bare roster name from the ONLINE nickname's local-part (keys the
+            # panel + maps to the scenario role). NOT the petname: that is
+            # local-only and arbitrary on the receiver (random suffix), so it
+            # never equals a roster name like "mq800". See _roster_name_of.
+            name = _roster_name_of(peer)
+            # Skip a peer that surfaced before its nickname resolved (e.g. a
             # half-admitted identity mid-handshake): an empty name renders as a
             # spurious blank-labelled row (T0 / 0.50) at the top of the panel.
-            # It re-appears under its real name once the petname lands.
+            # It re-appears under its real name once the nickname lands.
             if not name or not str(name).strip():
                 continue
             tier = int(getattr(peer, "_tier", 0))
