@@ -114,6 +114,17 @@ void net_proc_test_reset_deferred(void);
 bool net_proc_test_deferred_matches_peer(size_t idx,
                                          const public_identity_t *new_peer);
 
+/** @brief Defer a (non-envelope) message — populate the queue without a
+ *         live socket. */
+void net_proc_test_defer(const uint8_t *data, size_t len, const char *from_addr);
+
+/** @brief Backdate every queued entry by @p secs, so a test can simulate
+ *         time passing and trigger age-out without sleeping. */
+void net_proc_test_backdate_deferred(int64_t secs);
+
+/** @brief Run the age-out sweep now; returns the number of surviving entries. */
+size_t net_proc_test_sweep_stale(void);
+
 /* ---- Test-only: route_to_process capture ----
  * Tests for AT_DISCOVERY_CROSS_CLUSTER observe whether a forwarded
  * broadcast preserved the wire payload's self-reported from_whom.address

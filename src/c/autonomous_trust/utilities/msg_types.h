@@ -120,6 +120,12 @@ typedef struct {
     uuid_t task_uuid;
     uuid_t peer_uuid;
     double score;
+    /* Name of the Capability that produced this score, so the reputation
+     * process can resolve its transaction_weight (mirrors Python
+     * TransactionScore.capability_name). Empty string == unknown/legacy →
+     * weight 1. Carried verbatim by the whole-struct memcpy in
+     * msg_types.c (TRANSACTION_SCORE ser/de), so no field-wise packing. */
+    char capability_name[CAP_NAMELEN + 1];
 } tx_score_msg_t;
 
 typedef struct {

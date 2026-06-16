@@ -69,6 +69,12 @@ static struct {
     unsigned long tick;       /* emit counter (drives synthetic oscillation) */
     char *ingest_json;        /* latest ingested batch (JSON array string), or NULL */
     size_t ingest_len;
+    /* Producer-side TransactionScore decimation/dedup. task_id of the last
+     * batch we already evaluated for a TS, so each unique batch (which the
+     * emit loop re-sends every tick until a new one is ingested) submits at
+     * most one producer-side score. ts_denom mirrors AT_TS_DECIMATION. */
+    char last_ts_task[UUID_STRING_LEN + 1];
+    int  ts_denom;
     pthread_mutex_t lock;
     bool initialized;
 } ds_state;
@@ -82,9 +88,63 @@ static void _ensure_init(void)
         ds_state.tick = 0;
         ds_state.ingest_json = NULL;
         ds_state.ingest_len = 0;
+        ds_state.last_ts_task[0] = '\0';
+        /* Default 30 matches the Python AT_TS_DECIMATION default
+         * (participant.py / coordinator.py); both sides must agree. */
+        const char *dec = getenv("AT_TS_DECIMATION");
+        ds_state.ts_denom = (dec && dec[0]) ? atoi(dec) : 30;
+        if (ds_state.ts_denom < 1)
+            ds_state.ts_denom = 1;
         pthread_mutex_init(&ds_state.lock, NULL);
         ds_state.initialized = true;
     }
+}
+
+/* Deterministic per-batch decimation for producer-side TS submission. MUST
+ * stay byte-identical to the Python _ts_keep (examples/dod_mission/
+ * participant.py & coordinator.py): int(batch_id.replace('-','')[:8],16) %
+ * denom == 0. Both the C producer and the Python coordinator run this on the
+ * same task_id + denom so they agree on which batches form a bilateral
+ * Transaction (reputation needs both halves before it enters the chain). */
+/* Non-static so data_source_test can pin cross-language parity; declared in
+ * data_source_proc_priv.h. */
+bool _ts_keep(const char *task_id_str, int denom)
+{
+    if (denom <= 1)
+        return true;
+    char hex8[9];
+    int n = 0;
+    for (const char *p = task_id_str; *p != '\0' && n < 8; ++p) {
+        if (*p != '-')
+            hex8[n++] = *p;
+    }
+    hex8[n] = '\0';
+    if (n < 8)
+        return false;  /* malformed task id — don't submit */
+    unsigned long v = strtoul(hex8, NULL, 16);
+    return (v % (unsigned long)denom) == 0;
+}
+
+/* Extract the shared batch task_id from a parsed Reading-array (it lives in
+ * each reading's metadata.task_id; all readings in a batch share it, so we
+ * read the first). Returns true and fills out (NUL-terminated, out_len) when a
+ * non-empty string task_id is present; false for synthetic/unstamped batches.
+ * Non-static for data_source_test; declared in data_source_proc_priv.h. */
+bool _batch_task_id(json_t *arr, char *out, size_t out_len)
+{
+    if (arr == NULL || out == NULL || out_len == 0
+        || !json_is_array(arr) || json_array_size(arr) == 0)
+        return false;
+    json_t *first = json_array_get(arr, 0);
+    json_t *meta = json_is_object(first) ? json_object_get(first, "metadata") : NULL;
+    json_t *tid = json_is_object(meta) ? json_object_get(meta, "task_id") : NULL;
+    if (!json_is_string(tid))
+        return false;
+    const char *task_id = json_string_value(tid);
+    if (task_id == NULL || task_id[0] == '\0')
+        return false;
+    snprintf(out, out_len, "%s", task_id);
+    return true;
 }
 
 /****************************
@@ -219,6 +279,53 @@ void data_source_set_readings(const char *readings_json, size_t len)
  * Emit loop
  ****************************/
 
+/* Producer-side reputation score for an ingested batch. The Python coordinator
+ * verdict-scores each kept batch (0.8 clean / 0.3 anomalous) keyed by the
+ * reading's metadata.task_id; this submits the matching producer half (0.9)
+ * so the bilateral Transaction completes and this C node earns reputation for
+ * the data it streams. Tagged dod.sensor-report (tier weight 4) to mirror
+ * participant.py's sender-side TS. Submitted at most once per unique batch, on
+ * the same _ts_keep-decimated subset the coordinator uses. No-op for synthetic
+ * batches (build_synthetic_readings emits no task_id). The reputation process
+ * resolves the proposer (this node's own identity) and starts the Paxos round. */
+static void _maybe_submit_producer_score(const process_t *proc, json_t *arr)
+{
+    char task_id[UUID_STRING_LEN + 1];
+    if (!_batch_task_id(arr, task_id, sizeof(task_id)))
+        return;  /* synthetic / unstamped batch — nothing to score */
+
+    /* Dedup: the emit loop re-sends the same batch every tick until a new one
+     * is ingested, so only evaluate the first sighting of each task_id. */
+    pthread_mutex_lock(&ds_state.lock);
+    bool already = (strncmp(ds_state.last_ts_task, task_id, UUID_STRING_LEN) == 0);
+    if (!already)
+        snprintf(ds_state.last_ts_task, sizeof(ds_state.last_ts_task), "%s", task_id);
+    int denom = ds_state.ts_denom;
+    pthread_mutex_unlock(&ds_state.lock);
+    if (already || !_ts_keep(task_id, denom))
+        return;
+
+    uuid_t task_uuid;
+    if (uuid_parse(task_id, task_uuid) != 0) {
+        log_warn(proc->logger, "data-source: bad task_id '%s'; no producer score\n",
+                 task_id);
+        return;
+    }
+
+    generic_msg_t msg = {0};
+    msg.type = TRANSACTION_SCORE;
+    msg.size = sizeof(tx_score_msg_t);
+    uuid_copy(msg.info.tx_score.task_uuid, task_uuid);
+    /* peer_uuid left zero: reputation is the proposer and fills in this node's
+     * own identity (it owns the producer half of the bilateral transaction). */
+    msg.info.tx_score.score = 0.9;
+    snprintf(msg.info.tx_score.capability_name,
+             sizeof(msg.info.tx_score.capability_name), "dod.sensor-report");
+    messaging_send("reputation", TRANSACTION_SCORE, &msg, false);
+    log_debug(proc->logger,
+              "data-source: submitted producer score 0.9 for batch %s\n", task_id);
+}
+
 /* Stream the current reading batch to every subscriber as a per-peer-encrypted
  * `data` message. The data message's `process` field is the subscriber's own
  * process name so the coordinator's DataRcvr (that name) receives it; `function`
@@ -268,6 +375,12 @@ static void emit_readings(const process_t *proc)
         net_msg_pack_json(o, arr);
         messaging_send("network", NET_MESSAGE, &out, false);
     }
+
+    /* Gated on n>0 (we returned early otherwise): mirror participant.py's
+     * `if self.clients` — only score batches that were actually delivered to
+     * a subscriber. Once per unique batch, on the _ts_keep subset. */
+    _maybe_submit_producer_score(proc, arr);
+
     json_decref(arr);
 }
 
