@@ -1,0 +1,78 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-membership-update-keeps-key
+byte_pinning: false
+description: |
+    Membership-only group_key_update MUST NOT drop the shared private key.
+
+    Invariant: when a co-member broadcasts a group_key_update for OUR group
+    (same uuid) that advertises a LARGER membership but carries only the
+    PUBLIC key, the receiver adopts the larger membership yet KEEPS its own
+    private encryptor. group_key_update is membership propagation, not key
+    rotation (the key is deliberately not rotated on membership change —
+    idprocess.py:1042), so a public-only update must never strip a private
+    key the receiver already holds.
+
+    Regression for the live Stretch-Goal-3 blocker: the Python
+    handle_group_update used to adopt wholesale (`self.group = theirs`),
+    which replaced a private-key-bearing group with a public-only one whose
+    membership merely happened to be larger. That dropped the shared key, so
+    a cold-joining C microdrone ended up holding the right group uuid but the
+    wrong/absent key bytes and could never decrypt group traffic
+    (`group decrypt failed (-1)`) — no ISR readings reached the coordinator,
+    no target markers on the dashboard. The C twin's handle_group_update
+    already preserved its encryptor (id_proc.c, copies only uuid/address/
+    address_map); Python now matches it.
+
+    Topology: peer_a holds OUR group (uuid G) with the shared PRIVATE key,
+    size 1. peer_b advertises the SAME group uuid G with a larger membership
+    (size 3) but PUBLIC-ONLY (the wire shape of a member that lacks the
+    private key, or a group that survived a protobuf round-trip).
+
+    Sequence:
+      1. peer_b broadcasts its public-only, size-3 view of group G to peer_a
+         via group_key_update. The wire form is the DRY canonical flat group
+         (group_to_json / to_canonical), so C and Python parse it identically.
+      2. peer_a sees the same uuid with a strictly larger membership, so it
+         adopts the membership — but because the incoming group is public-only
+         and peer_a still owns the private key for G, it keeps its own
+         encryptor.
+
+    Both impls converge: peer_a's group grows to 3 addresses AND still owns
+    the shared private key. (peer_b owning vs. not owning the key changes only
+    whether peer_a takes the keep-key branch; here it is public-only, so the
+    keep-key branch is the one under test.)
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    # Same group uuid on both sides. peer_a owns the private key (default);
+    # peer_b advertises a larger membership but only the public key.
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-00000000000a"
+      size: 1
+    peer_b:
+      uuid: "0a000000-0000-4000-8000-00000000000a"
+      size: 3
+      public_only: true
+
+steps:
+  - id: 1
+    from: peer_b
+    to: peer_a
+    function: group_key_update
+    payload: {}
+    description: |
+        peer_b sends its public-only, size-3 view of group G. peer_a adopts
+        the larger membership but keeps its private encryptor.
+
+expected_state:
+  peer_a:
+    group_owns_private_key: true
+    group_size: 3

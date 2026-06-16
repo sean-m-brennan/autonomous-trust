@@ -149,3 +149,31 @@ class TestGroup:
         assert g2._public_only is True
         assert g2.encryptor.private is None
         assert g2.encryptor.publish() == g.encryptor.publish()
+
+    def test_owns_private_key(self):
+        # owns_private_key gates whether we can decrypt group traffic; it must
+        # track both the _public_only flag and the actual private key presence.
+        owned = Group(uuid4(), {}, 'g', Encryptor.generate(), _public_only=False)
+        assert owned.owns_private_key is True
+        pub = owned.publish()
+        assert pub.owns_private_key is False
+        # A round-tripped public-only group (the protobuf/wire shape) too.
+        from_wire = Group.from_canonical(pub.to_canonical())
+        assert from_wire.owns_private_key is False
+
+    def test_adopt_membership_keeps_key(self):
+        # adopt_membership grafts another group's uuid + larger address map onto
+        # us while KEEPING our private encryptor (mirrors C handle_group_update).
+        mine = Group(uuid4(), {'me': '10.0.0.1'}, 'mine',
+                     Encryptor.generate(), _public_only=False)
+        key_before = mine.encryptor.serialize()
+        other = Group(uuid4(), {'me': '10.0.0.1', 'lt': '10.0.0.2',
+                                'sgt': '10.0.0.3'}, 'mesh',
+                      Encryptor.generate(), _public_only=True)
+        mine.adopt_membership(other)
+        assert mine.uuid == str(other.uuid)
+        assert mine.nickname == 'mesh'
+        assert set(mine.addresses) == {'10.0.0.1', '10.0.0.2', '10.0.0.3'}
+        # Our private key is untouched.
+        assert mine.owns_private_key
+        assert mine.encryptor.serialize() == key_before

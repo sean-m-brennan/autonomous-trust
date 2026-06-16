@@ -66,6 +66,33 @@ class Group(InitializableConfig):
     def encryptor(self):
         return self._encryptor
 
+    @property
+    def owns_private_key(self):
+        """True iff this Group holds the shared *private* box key (and can
+        therefore decrypt group traffic). Mirrors the ``owns_private``
+        predicate in :meth:`to_canonical` and the :meth:`encrypt` guard. A
+        public-only group — e.g. one reconstructed from a protobuf round-trip
+        (``sync_from_message`` forces ``_public_only=True``) or handed to us on
+        the wire with ``public_only`` set — returns False."""
+        return (not self._public_only) and self.encryptor.private is not None
+
+    def adopt_membership(self, other):
+        """Adopt *other*'s group identity (uuid) and membership (address map)
+        while KEEPING our own private encryptor. Used by ``handle_group_update``
+        when a group_key_update carries a larger membership but only the public
+        key: adopting *other* wholesale would drop our shared private key and
+        break group decrypt. ``group_key_update`` is membership-only (the key is
+        not rotated — see idprocess.py:1042), so retaining our encryptor is
+        correct, and it mirrors C's ``handle_group_update`` which copies only
+        uuid/address/address_map and keeps its own encryptor
+        (id_proc.c:2113-2134). See [[dod-microdrone-targets-live-vs-playback]]."""
+        self._uuid = str(other.uuid)
+        self._address_map = (dict(other._address_map)
+                             if isinstance(other._address_map, dict)
+                             else {a: a for a in other.addresses})
+        if other.nickname:
+            self._nickname = other.nickname
+
     def encrypt(self, msg, whom, nonce=None):
         """
         Encrypt my own message
