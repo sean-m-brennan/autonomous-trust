@@ -88,6 +88,20 @@ def _group_of_size(member_identity, extra_addresses):
     return Group.initialize(addrs, '%s-grp' % member_identity.nickname)
 
 
+def _public_only_twin(group, extra_addresses):
+    """A PUBLIC-ONLY Group sharing ``group``'s uuid/nickname but with a larger
+    address map — the on-the-wire shape of a membership-only group_key_update
+    sent by a peer that holds only the public key (or one that survived a
+    protobuf round-trip, which forces ``public_only=True``)."""
+    from autonomous_trust.core.identity.encrypt import Encryptor
+    addrs = dict(group._address_map)
+    for ident in extra_addresses:
+        addrs[str(ident.uuid)] = ident.address
+    return Group(group.uuid, addrs, group.nickname,
+                 Encryptor(group.encryptor.publish(), public_only=True),
+                 _public_only=True)
+
+
 class _FakeQueue:
     """List-backed queue stub that mimics the put/get_nowait interface."""
 
@@ -570,6 +584,106 @@ class TestMergeHook:
         assert proc.group.uuid == foreign_group.uuid
         assert proc._partition_recovery_in_progress is None
         assert proc._partition_probe_cooldown == {}
+
+    def test_membership_update_keeps_private_key_same_group(self):
+        """A group_key_update for OUR group that carries a larger membership
+        but only the PUBLIC key (the shape a peer without the shared private
+        key — or a protobuf round-trip — puts on the wire) must NOT drop our
+        private key. We adopt the larger membership but keep our encryptor.
+
+        Regression for the live SG3 blocker: wholesale ``self.group = theirs``
+        stripped the shared key, leaving cold-joining C nodes with the right
+        group uuid but wrong/absent key bytes (group decrypt failed). C's
+        handle_group_update already keeps its encryptor (id_proc.c:2113-2134).
+        """
+        from autonomous_trust.core.config import to_json_string
+
+        me = _new_identity('coord', '10.0.0.3')
+        my_group = _group_of_size(me, [])  # size 1, owns the private key
+        assert my_group.owns_private_key
+        key_before = my_group.encryptor.serialize()
+        proc = _build_process(me, my_group)
+        queues = _build_queues()
+        proc._record_group = MagicMock()
+        proc._update_group = MagicMock()
+
+        # Same uuid, public-only, larger membership — arrives as the C-parsable
+        # canonical wire string so we also exercise from_canonical reconstruction.
+        twin = _public_only_twin(my_group,
+                                 [_new_identity('lt', '10.0.0.11'),
+                                  _new_identity('sgt', '10.0.0.12')])
+        assert twin.uuid == my_group.uuid and not twin.owns_private_key
+        msg = Message(CfgIds.identity, IdentityProtocol.update,
+                      to_json_string(twin.to_canonical()), encrypt=False)
+        assert proc.handle_group_update(queues, msg) is True
+
+        # Key preserved (same object, same private bytes); membership grew.
+        assert proc.group is my_group
+        assert proc.group.owns_private_key
+        assert proc.group.encryptor.serialize() == key_before
+        assert len(list(proc.group.addresses)) == 3
+        proc._record_group.assert_called_once()
+
+    def test_refuse_public_only_foreign_group_over_keyed(self):
+        """A DIFFERENT, public-only group with a larger membership must NOT
+        replace our key-bearing group: adopting it would abandon a group we
+        can decrypt for one we cannot. Refuse and wait for a private-bearing
+        full_history / update to converge."""
+        from autonomous_trust.core.config import to_json_string
+
+        me = _new_identity('coord', '10.0.0.3')
+        my_group = _group_of_size(me, [])  # size 1, owns the private key
+        key_before = my_group.encryptor.serialize()
+        proc = _build_process(me, my_group)
+        queues = _build_queues()
+        proc._record_group = MagicMock()
+        proc._update_group = MagicMock()
+
+        captain = _new_identity('captain', '10.0.0.10')
+        foreign = _group_of_size(captain, [_new_identity('lt', '10.0.0.11')])
+        foreign_pub = _public_only_twin(foreign, [])  # different uuid, no key
+        assert foreign_pub.uuid != my_group.uuid and not foreign_pub.owns_private_key
+        msg = Message(CfgIds.identity, IdentityProtocol.update,
+                      to_json_string(foreign_pub.to_canonical()), encrypt=False)
+        assert proc.handle_group_update(queues, msg) is True
+
+        # Our group is untouched: same uuid, still owns the same private key.
+        assert proc.group is my_group
+        assert proc.group.uuid == my_group.uuid
+        assert proc.group.owns_private_key
+        assert proc.group.encryptor.serialize() == key_before
+        proc._record_group.assert_not_called()
+
+    def test_adopt_foreign_group_installs_its_key_when_keyless(self):
+        """A DIFFERENT, larger group whose update carries the shared PRIVATE
+        key is adopted wholesale, installing that key — we end with the foreign
+        uuid AND its usable key. Here we start public-only (hold no key), so the
+        install is directly observable. Pins parity with C, whose
+        handle_group_update now reconstructs+installs theirs' encryptor on this
+        path instead of keeping its own (id_proc.c)."""
+        from autonomous_trust.core.config import to_json_string
+
+        me = _new_identity('coord', '10.0.0.3')
+        my_group = _public_only_twin(_group_of_size(me, []), [])  # size 1, NO key
+        assert not my_group.owns_private_key
+        proc = _build_process(me, my_group)
+        queues = _build_queues()
+        proc._record_group = MagicMock()
+        proc._update_group = MagicMock()
+
+        captain = _new_identity('captain', '10.0.0.10')
+        theirs = _group_of_size(captain, [_new_identity('lt', '10.0.0.11')])
+        assert theirs.uuid != my_group.uuid and theirs.owns_private_key
+        msg = Message(CfgIds.identity, IdentityProtocol.update,
+                      to_json_string(theirs.to_canonical()), encrypt=False)
+        assert proc.handle_group_update(queues, msg) is True
+
+        # Adopted theirs: their uuid, their membership, and their PRIVATE key.
+        assert proc.group.uuid == theirs.uuid
+        assert proc.group.owns_private_key
+        assert proc.group.encryptor.serialize() == theirs.encryptor.serialize()
+        assert len(list(proc.group.addresses)) == 2
+        proc._record_group.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

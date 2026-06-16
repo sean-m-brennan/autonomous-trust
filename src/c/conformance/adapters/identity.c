@@ -345,6 +345,13 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
                     int gsize = 1;
                     json_t *gs = json_object_get(gspec, "size");
                     if (json_is_integer(gs)) gsize = (int)json_integer_value(gs);
+                    /* public_only: build a group holding ONLY the public key
+                     * (zero the private key below) — the wire shape of a
+                     * membership-only group_key_update from a peer without the
+                     * shared private key. Mirrors the Python adapter's
+                     * public_only fixture. */
+                    json_t *gpo = json_object_get(gspec, "public_only");
+                    bool gpublic_only = json_is_true(gpo);
 
                     char gaddr[ADDR_LEN + 1];
                     snprintf(gaddr, sizeof(gaddr), "239.9.%zu.1", gi);
@@ -369,6 +376,11 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
                         group_add_address(&impl->proc->protocol.group,
                                           fuuid, faddr);
                     }
+                    /* Strip the private key so group_to_json emits
+                     * public_only=true (it gates on sodium_is_zero(private)). */
+                    if (gpublic_only)
+                        sodium_memzero(impl->proc->protocol.group.encryptor.private,
+                                       crypto_box_SECRETKEYBYTES);
                 }
             }
             gi++;
@@ -658,6 +670,23 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         }
     }
 
+    /* group_key_update — serialize the SENDER's group as the DRY canonical
+     * flat form (group_to_json), matching the Python adapter which sends
+     * sender.process.group.to_canonical(). handle_group_update parses it via
+     * group_from_json and adopts/rejects. Without this the C handler would see
+     * an empty obj and no-op, diverging from Python on any non-degenerate
+     * group update. A public_only sender (key zeroed at fixture time) emits
+     * public_only=true, driving the keep-our-private-key adopt path. */
+    if (strcmp(function, "group_key_update") == 0) {
+        json_t *gj = NULL;
+        if (group_to_json(&sender_impl->proc->protocol.group, &gj) == 0
+            && gj != NULL) {
+            net_msg_pack_json(&out->info.net_msg, gj);
+            json_decref(gj);
+        }
+        return 0;
+    }
+
     /* peer_identity_query — identity-resync layer 3. {group_uuid,
      * have:[uuids]}. group_uuid is the asker's group (== the responder's in
      * a shared-group scenario); handle_identity_query gates on that match
@@ -904,6 +933,29 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                 if (got != want) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: votes_emitted=%d, expected %d", pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "group_owns_private_key") == 0) {
+                /* True iff this participant's group still holds the shared
+                 * PRIVATE box key. Mirrors Python Group.owns_private_key.
+                 * group_to_json uses the same sodium_is_zero(private) gate. */
+                bool want = json_is_true(val);
+                bool got = !sodium_is_zero(proc->protocol.group.encryptor.private,
+                                           crypto_box_SECRETKEYBYTES);
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: group_owns_private_key=%d, expected %d",
+                             pid, (int)got, (int)want);
+                    return -1;
+                }
+            } else if (strcmp(key, "group_size") == 0) {
+                /* Address-map size — proves the larger membership WAS adopted.
+                 * Mirrors Python len(group.addresses). */
+                int want = (int)json_integer_value(val);
+                int got = (int)map_size(&proc->protocol.group.address_map);
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: group_size=%d, expected %d", pid, got, want);
                     return -1;
                 }
             } else {
