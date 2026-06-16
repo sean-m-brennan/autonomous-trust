@@ -287,12 +287,15 @@ class TargetPositionMapPanel:
         self._terrain_y: Optional[np.ndarray] = None  # north metres per row
         self._iso_origin: Optional[tuple[float, float]] = None  # (lat, lon)
         self._iso_extent: Optional[tuple[float, float]] = None  # (max|x|, max|y|)
-        # The orthographic camera (default iso eye) is emitted ONLY on the
-        # first frame after entering iso; later frames omit scene.camera so
-        # scene.uirevision preserves the operator's rotate/zoom. Plotly forces
-        # the camera whenever scene.camera is present in an update — which
-        # defeats uirevision — so the fix is simply to stop re-sending it.
+        # The orthographic camera (default iso eye) frames the scene on the
+        # first frame after entering iso. Once the operator rotates/zooms, the
+        # dashboard captures the live camera off the graph's relayoutData and
+        # feeds it back via set_iso_camera(); _figure_iso then re-emits THAT
+        # camera every tick so the view persists across live/playback updates
+        # (uirevision alone proved unreliable here — the view reset between
+        # ticks). None => not yet interacted, use the default eye.
         self._iso_camera_pending = True
+        self._iso_camera_override: Optional[dict] = None
 
     def set_view_mode(self, mode: str) -> None:
         """Select the render path: "2d" (MapLibre) or "iso" (3D terrain).
@@ -302,11 +305,27 @@ class TargetPositionMapPanel:
         dashboard threads this from the iso/2d toggle Store.
         """
         new_mode = "iso" if mode == "iso" else "2d"
-        # Re-arm the default iso framing only when ENTERING iso; while staying
-        # in iso we leave the camera out so uirevision holds the user's view.
+        # Re-frame to the default eye when ENTERING iso: drop any camera the
+        # operator left from a previous iso session so a fresh entry starts
+        # from the clean compass-aligned view. While staying in iso, the
+        # captured override (set_iso_camera) is preserved so live/playback
+        # ticks keep the operator's rotate/zoom.
         if new_mode == "iso" and self._view_mode != "iso":
             self._iso_camera_pending = True
+            self._iso_camera_override = None
         self._view_mode = new_mode
+
+    def set_iso_camera(self, camera: Optional[dict]) -> None:
+        """Remember the operator's live 3D camera (from the graph relayoutData).
+
+        Subsequent iso renders re-emit this camera instead of snapping back to
+        the default orthographic eye, so rotate/zoom persists across live and
+        playback ticks. Falsy/empty input is ignored (a relayout event without
+        a ``scene.camera`` payload — e.g. an autosize — must not clear the
+        stored view).
+        """
+        if camera:
+            self._iso_camera_override = camera
 
     def add_reading(self, reading) -> None:
         """Pair target_position_x/_y readings into a (lat, lon) per peer.
@@ -860,18 +879,23 @@ class TargetPositionMapPanel:
             aspectmode="manual",
             aspectratio=dict(x=1.0, y=1.0, z=_ISO_Z_ASPECT),
         )
-        # Emit scene.camera on EVERY iso frame. scene.camera is a
-        # uirevision-governed attribute, so with scene_uirevision held constant
-        # Plotly.react preserves the operator's rotate/zoom across ticks and
-        # treats this value only as the baseline — it does NOT snap the view
-        # back. Crucially, ALWAYS sending it fixes the flash-then-revert bug:
-        # the prior one-shot emit left scene.camera absent on every later
-        # frame, and an absent camera makes react fall back to Plotly's
-        # auto-computed default — so the configured orientation flashed once,
-        # then the next tick reverted to the default direction. Always present
-        # => the configured direction is the durable default.
-        scene["camera"] = dict(projection=dict(type="orthographic"),
-                               eye=_ISO_CAMERA_EYE)
+        # Emit scene.camera on EVERY iso frame. Once the operator has rotated/
+        # zoomed, the dashboard hands us that live camera via set_iso_camera()
+        # and we re-emit it here so the view is pinned explicitly — the durable
+        # fix for the view resetting between live/playback ticks (relying on
+        # uirevision alone did not hold it). Until then we emit the default
+        # orthographic eye to frame the scene. Either way scene.camera is
+        # always present, so Plotly.react never falls back to its auto-computed
+        # default (the old flash-then-revert bug). The captured camera already
+        # carries its own projection; only the default path needs to assert
+        # orthographic.
+        if self._iso_camera_override:
+            cam = dict(self._iso_camera_override)
+            cam.setdefault("projection", dict(type="orthographic"))
+            scene["camera"] = cam
+        else:
+            scene["camera"] = dict(projection=dict(type="orthographic"),
+                                   eye=_ISO_CAMERA_EYE)
         self._iso_camera_pending = False
 
         fig.update_layout(

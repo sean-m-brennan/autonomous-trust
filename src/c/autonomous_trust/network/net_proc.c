@@ -278,12 +278,67 @@ typedef struct {
     char from_addr[ADDR_LEN + 1];
     uuid_t src_uuid;        /* Original sender's UUID (envelope mode). */
     bool   has_src_uuid;    /* True iff src_uuid is meaningful. */
+    int64_t deferred_at_s;  /* CLOCK_MONOTONIC seconds when deferred (age-out). */
     uint8_t data[];         /* Flexible: allocated with `len` bytes. */
 } deferred_msg_t;
 
 static deferred_msg_t *deferred_messages[MAX_DEFERRED];   /* owning ptrs, NULL when slot free */
 static size_t deferred_count = 0;
 static pthread_mutex_t deferred_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Age-out: a deferred entry whose sender never becomes a known peer is
+ * reclaimed after this many seconds. Mirrors Python netprocess.py's
+ * mystery_max_retries (60 retries × ~0.5s ≈ 30s) — but the C retry is
+ * event-driven (on peer admission), not a polling thread, so we bound the
+ * lifetime by wall-time instead of retry count. Without this, a burst of
+ * un-resolvable encrypted frames permanently occupies the bounded queue and
+ * starves legitimate deferrals. Overridable via AT_MYSTERY_MAX_AGE_SEC. */
+#define DEFERRED_MAX_AGE_SEC_DEFAULT 30
+static int64_t _deferred_max_age_s(void)
+{
+    const char *e = getenv("AT_MYSTERY_MAX_AGE_SEC");
+    if (e != NULL && e[0] != '\0') {
+        long v = atol(e);
+        if (v > 0)
+            return (int64_t)v;
+    }
+    return DEFERRED_MAX_AGE_SEC_DEFAULT;
+}
+
+static int64_t _deferred_now_s(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (int64_t)ts.tv_sec;
+}
+
+/* Free + compact out entries older than the age-out window, preserving
+ * insertion order (so slot 0 remains the oldest survivor). Caller MUST hold
+ * deferred_lock. Emits a net.mystery/aged_out counter per reclaimed entry,
+ * mirroring Python's _probes.counter('net.mystery', 'drop', 'max_retries'). */
+static void _deferred_sweep_stale_locked(int64_t now_s)
+{
+    int64_t max_age = _deferred_max_age_s();
+    size_t remaining = 0;
+    for (size_t i = 0; i < deferred_count; i++) {
+        deferred_msg_t *dm = deferred_messages[i];
+        if (dm == NULL)
+            continue;
+        if (now_s - dm->deferred_at_s >= max_age) {
+            probes_counter("net.mystery", "aged_out", "max_age");
+            free(dm);
+            deferred_messages[i] = NULL;
+        } else {
+            if (remaining != i) {
+                deferred_messages[remaining] = dm;
+                deferred_messages[i] = NULL;
+            }
+            remaining++;
+        }
+    }
+    deferred_count = remaining;
+}
 
 /* @p src_uuid is optional — pass NULL in non-envelope mode. When non-NULL,
  * the entry will be matched against a newly-admitted peer's UUID (the
@@ -314,14 +369,26 @@ static void defer_message(const uint8_t *data, size_t len,
         memset(dm->src_uuid, 0, 16);
         dm->has_src_uuid = false;
     }
+    int64_t now_s = _deferred_now_s();
+    dm->deferred_at_s = now_s;
     pthread_mutex_lock(&deferred_lock);
-    if (deferred_count < MAX_DEFERRED) {
-        deferred_messages[deferred_count++] = dm;
-        dm = NULL;  /* ownership transferred to the queue */
+    /* Reclaim aged-out entries first so a self-cleaning queue makes room
+     * without a polling thread. */
+    _deferred_sweep_stale_locked(now_s);
+    if (deferred_count >= MAX_DEFERRED) {
+        /* Still full of fresh (un-aged) entries: FIFO-evict the oldest (slot 0,
+         * insertion order preserved) so this fresh — possibly legitimate —
+         * deferral isn't starved by older, likely-unresolvable traffic. The
+         * prior design dropped the NEW message here, which is what let a burst
+         * starve later legitimate deferrals. */
+        probes_counter("net.mystery", "evicted", "overflow");
+        free(deferred_messages[0]);
+        memmove(&deferred_messages[0], &deferred_messages[1],
+                (MAX_DEFERRED - 1) * sizeof(deferred_messages[0]));
+        deferred_count = MAX_DEFERRED - 1;
     }
+    deferred_messages[deferred_count++] = dm;  /* ownership transferred */
     pthread_mutex_unlock(&deferred_lock);
-    /* If we hit the queue cap, dm is still owned by us — free it. */
-    free(dm);
 }
 
 /* Match predicate: a deferred entry matches a newly-admitted peer iff
@@ -367,6 +434,35 @@ bool net_proc_test_deferred_matches_peer(size_t idx,
         m = deferred_matches_peer(deferred_messages[idx], new_peer);
     pthread_mutex_unlock(&deferred_lock);
     return m;
+}
+
+/* Defer a message (non-envelope) — lets tests populate the queue without a
+ * live socket. Wraps the static defer_message. */
+void net_proc_test_defer(const uint8_t *data, size_t len, const char *from_addr)
+{
+    defer_message(data, len, from_addr, NULL);
+}
+
+/* Backdate every queued entry by @p secs so a test can simulate the passage of
+ * time without sleeping, then exercise the age-out sweep. */
+void net_proc_test_backdate_deferred(int64_t secs)
+{
+    pthread_mutex_lock(&deferred_lock);
+    for (size_t i = 0; i < deferred_count; i++)
+        if (deferred_messages[i] != NULL)
+            deferred_messages[i]->deferred_at_s -= secs;
+    pthread_mutex_unlock(&deferred_lock);
+}
+
+/* Run the age-out sweep at the current time and return how many entries
+ * survive. */
+size_t net_proc_test_sweep_stale(void)
+{
+    pthread_mutex_lock(&deferred_lock);
+    _deferred_sweep_stale_locked(_deferred_now_s());
+    size_t n = deferred_count;
+    pthread_mutex_unlock(&deferred_lock);
+    return n;
 }
 
 /* Capture of the most recent from_whom.address handed to route_to_process,
@@ -1716,6 +1812,9 @@ static int network_run(const net_transport_t *transport,
                  * decrypt-failure we keep it and compact via pointer
                  * move (no payload copy). */
                 pthread_mutex_lock(&deferred_lock);
+                /* Reclaim aged-out entries before the match pass so stale,
+                 * never-resolved mysteries don't linger across admissions. */
+                _deferred_sweep_stale_locked(_deferred_now_s());
                 size_t remaining = 0;
                 for (size_t di = 0; di < deferred_count; di++) {
                     deferred_msg_t *dm = deferred_messages[di];
