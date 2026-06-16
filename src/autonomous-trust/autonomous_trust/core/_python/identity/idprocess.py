@@ -1996,8 +1996,29 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 else:
                     adopt = str(theirs.uuid) < str(mine.uuid)
             if adopt:
-                self.logger.debug('Replace %s group with %s group' % (mine.nickname, theirs.nickname))
-                self.group = theirs
+                if theirs.owns_private_key or not mine.owns_private_key:
+                    # Normal adopt: `theirs` carries the shared private key, or
+                    # we hold no key to lose — take it wholesale.
+                    self.logger.debug('Replace %s group with %s group' % (mine.nickname, theirs.nickname))
+                    self.group = theirs
+                elif mine.uuid == theirs.uuid:
+                    # `theirs` is PUBLIC-ONLY but has a larger membership for OUR
+                    # group. Adopt the membership but KEEP our private encryptor:
+                    # group_key_update is membership-only (the key is not rotated,
+                    # idprocess.py:1042). Wholesale replacement here would drop the
+                    # shared private key and break group decrypt — the Py<->C
+                    # divergence that left cold-joining C nodes keyless (right
+                    # uuid, wrong key bytes). C's handle_group_update already
+                    # keeps its encryptor. See [[dod-microdrone-targets-live-vs-playback]].
+                    self.logger.debug('Adopt %s membership; keep our group key' % theirs.nickname)
+                    self.group.adopt_membership(theirs)
+                else:
+                    # `theirs` is a DIFFERENT, public-only group. Adopting it would
+                    # abandon our key-bearing group for one we cannot decrypt;
+                    # refuse and wait for a private-bearing full_history / update
+                    # to converge. (Quiet no-op — don't echo, that's the flood.)
+                    self.logger.debug('Refuse public-only group %s over our keyed group' % theirs.nickname)
+                    return True
                 self._record_group(queues)
                 # Partition recovery completes here whenever the adopted
                 # group matches an in-flight recovery, OR opportunistically
