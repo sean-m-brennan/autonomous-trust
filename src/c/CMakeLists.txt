@@ -1015,6 +1015,14 @@ add_executable(data_test test/data_test.c)
 set_source_files_properties(test/data_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(data_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(data_source_test test/data_source_test.c)
+set_source_files_properties(test/data_source_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(data_source_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(net_proc_ageout_test test/net_proc_ageout_test.c)
+set_source_files_properties(test/net_proc_ageout_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_proc_ageout_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(datetime_test test/datetime_test.c)
 set_source_files_properties(test/datetime_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(datetime_test PRIVATE ${AT_TEST_LIBS})
@@ -1102,6 +1110,8 @@ add_test(NAME partition_recovery_test COMMAND $<TARGET_FILE:partition_recovery_t
 add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_caps_resync_test>)
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME data_test COMMAND $<TARGET_FILE:data_test>)
+add_test(NAME data_source_test COMMAND $<TARGET_FILE:data_source_test>)
+add_test(NAME net_proc_ageout_test COMMAND $<TARGET_FILE:net_proc_ageout_test>)
 add_test(NAME datetime_test COMMAND $<TARGET_FILE:datetime_test>)
 add_test(NAME b64_test COMMAND $<TARGET_FILE:b64_test>)
 add_test(NAME group_test COMMAND $<TARGET_FILE:group_test>)

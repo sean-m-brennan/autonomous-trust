@@ -1637,12 +1637,14 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
   requires rep_state.paxos.initialized == \true;
 */
 void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
-                          const uuid_t peer_uuid, double score)
+                          const uuid_t peer_uuid, double score,
+                          const char *capability_name)
 {
     char task_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(task_uuid, task_str);
-    log_info(proc->logger, "Reputation: forwarding transaction for task %s, score %.2f\n",
-             task_str, score);
+    log_info(proc->logger, "Reputation: forwarding transaction for task %s, score %.2f (cap %s)\n",
+             task_str, score,
+             (capability_name && capability_name[0]) ? capability_name : "-");
 
     pthread_mutex_lock(&rep_state.lock);
 
@@ -1652,9 +1654,21 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
     {
         uuid_copy(tx->task_uuid, task_uuid);
         tx->score = score;
+        /* Carry the capability name so _pure_reputation weights this tx by
+         * its tier (mirrors Python TransactionScore.capability_name). */
+        if (capability_name != NULL)
+            strncpy(tx->capability_name, capability_name, CAP_NAMELEN);
+        else
+            tx->capability_name[0] = '\0';
+        tx->capability_name[CAP_NAMELEN] = '\0';
         data_t *tx_dat = object_ptr_data(tx, sizeof(tx_score_t));
         map_set(&rep_state.my_requests, task_str, tx_dat);
     }
+
+    /* Cache the weight for this task so _pure_reputation can aggregate it
+     * (mirrors Python _start_paxos → _record_task_weight). Done under the
+     * same lock as the my_requests insert. */
+    _record_task_weight_locked(task_str, _resolve_tx_weight(capability_name));
 
     pthread_mutex_unlock(&rep_state.lock);
 
@@ -2441,6 +2455,64 @@ int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out)
 /* Frama-C: skipped — [solver-timeout] state-cascade through paxos_init +
  * process_register_handler stubs prevents WP from discharging
  * valid_rw(proc) and valid_rd(signal) at downstream call sites */
+/* Resolve this node's own identity UUID from the loaded "identity" config.
+ * Same access path net_proc.c:1495 and zta_process.c:750 use — proc->configs
+ * carries the identity config for every process, so the long-standing
+ * "process doesn't carry self identity" comments above are obsolete. Returns
+ * true and fills out_uuid on success; false if identity isn't resolvable yet. */
+static bool _resolve_self_uuid(const process_t *proc, uuid_t out_uuid)
+{
+    if (proc == NULL || proc->configs == NULL)
+        return false;
+    data_t *id_dat = NULL;
+    char id_key[] = "identity";
+    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
+        return false;
+    config_t *id_cfg = NULL;
+    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL
+        || id_cfg->data_struct == NULL)
+        return false;
+    const identity_t *self = (const identity_t *)id_cfg->data_struct;
+    uuid_copy(out_uuid, self->uuid);
+    return true;
+}
+
+/* Handle a locally-submitted TransactionScore. Another process on this node
+ * (e.g. the data-source's producer-side dod.sensor-report score) posts a
+ * TRANSACTION_SCORE generic message to our queue; we are the proposer, so we
+ * start a Paxos round under our own identity. Mirrors Python automate.py
+ * putting a TransactionScore on the reputation queue → repprocess._start_paxos.
+ *
+ * The generic run_message_handlers cannot dispatch this — it only routes
+ * net_msg payloads by function name — which is why such messages were silently
+ * dropped before (and _forward_transaction was dead code).
+ *
+ * Only real (non-zero task_uuid) scores are forwarded. A zero task_uuid is the
+ * legacy ZTA/config "system score" sentinel (zta_process.c:124) whose bilateral
+ * semantics are out of scope here; it stays a no-op, unchanged from before. */
+static void _handle_local_tx_score(const process_t *proc,
+                                   const generic_msg_t *msg,
+                                   const uuid_t self_uuid, bool have_self)
+{
+    const tx_score_msg_t *ts = &msg->info.tx_score;
+    uuid_t zero;
+    uuid_clear(zero);
+    if (uuid_compare(ts->task_uuid, zero) == 0)
+    {
+        log_debug(proc->logger,
+                  "Reputation: ignoring system TRANSACTION_SCORE (zero task)\n");
+        return;
+    }
+    if (!have_self)
+    {
+        log_warn(proc->logger,
+                 "Reputation: dropping local score — self identity unavailable\n");
+        return;
+    }
+    _forward_transaction(proc, ts->task_uuid, self_uuid, ts->score,
+                         ts->capability_name);
+}
+
 int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();
@@ -2452,6 +2524,48 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
 
     reputation_register_handlers(proc);
     proc->protocol.phase = 1;
-    return process_run(proc, queues, signal, logger);
+
+    /* Custom loop (mirrors data_source_run): intercept locally-submitted
+     * TRANSACTION_SCORE messages and start a Paxos round for them; everything
+     * else flows through the registered net_msg handlers exactly as
+     * process_loop would. Without this, a node could only participate in
+     * transactions other peers initiate, never propose its own. */
+    process_ctx_t ctx = {0};
+    int err = process_setup(proc, signal, logger, &ctx);
+    if (err != 0)
+        return err;
+
+    uuid_t self_uuid;
+    bool have_self = _resolve_self_uuid(proc, self_uuid);
+
+    while (keep_running(proc, &ctx.sig_q, logger))
+    {
+        sleep_until(proc, cadence);
+
+        generic_msg_t buf = {0};
+        int rerr = messaging_recv(&buf);
+        if (rerr == -1 || rerr == ENOMSG)
+            continue;
+
+        if (buf.type == TRANSACTION_SCORE)
+        {
+            /* Self identity may not have been loaded at startup; resolve
+             * lazily on first use so an early submission isn't lost. */
+            if (!have_self)
+                have_self = _resolve_self_uuid(proc, self_uuid);
+            _handle_local_tx_score(proc, &buf, self_uuid, have_self);
+        }
+        else
+        {
+            run_message_handlers(proc, queues, buf.type, &buf);
+        }
+    }
+
+    array_free(queues);
+    if (ctx.fd1 > 0)
+        close(ctx.fd1);
+    if (ctx.fd2 > 0)
+        close(ctx.fd2);
+    return 0;
 }
 DECLARE_PROCESS(reputation, rep_proc, reputation_run);
