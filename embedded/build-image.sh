@@ -100,7 +100,9 @@ else
     info "Extracting binary from tarball ..."
     mkdir -p "$DIST_DIR/staging-static"
     tar -xzf "$STATIC_TARBALL" -C "$DIST_DIR/staging-static"
-    cp "$DIST_DIR/staging-static/usr/local/bin/at_demo" "$STATIC_BINARY"
+    # build-arm.sh stages the static binary uniformly under
+    # opt/autonomous-trust/bin/ (not the in-container /usr/local/bin path).
+    cp "$DIST_DIR/staging-static/opt/autonomous-trust/bin/at_demo" "$STATIC_BINARY"
     rm -rf "$DIST_DIR/staging-static"
 fi
 

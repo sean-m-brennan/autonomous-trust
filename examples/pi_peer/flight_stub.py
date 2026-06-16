@@ -27,6 +27,7 @@ import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Callable, Optional
+from uuid import uuid4
 
 # Dashed-package layout: import the dod_mission generators by bare name, the
 # same trick participant.py uses (examples/dod_mission/{scenario,generators}).
@@ -126,4 +127,17 @@ class FlightStub:
         readings = list(self._bundle.tick(t) or [])
         if self._detection is not None:
             readings.extend(self._detection.tick(t) or [])
-        return [r.to_dict() for r in readings]
+        dicts = [r.to_dict() for r in readings]
+        # Stamp every reading in this batch with the same task_id, exactly as
+        # the Python producer does (dod_mission/participant.py
+        # DoDDataProcess.acquire). The coordinator reads this task_id from the
+        # reading metadata to submit its verdict-side TransactionScore; the C
+        # node submits the paired producer-side 0.9 TS on the SAME task_id
+        # (data_source_proc.c). The two halves form the bilateral Transaction
+        # that lets this C microdrone earn reputation. Without the stamp the
+        # coordinator hits its "NO task_id" branch and the drone never scores.
+        batch_id = str(uuid4())
+        for d in dicts:
+            meta = d.setdefault("metadata", {})
+            meta["task_id"] = batch_id
+        return dicts

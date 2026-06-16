@@ -653,9 +653,21 @@ def make_app(name: str, title: str,
             Input("tactical-view-mode", "data"),
             State("playback-paused", "data"),
             State("map-interacting", "data"),
+            State(chart_graph_ids[0], "relayoutData"),
         )
-        def _refresh_map(_n, view_data, paused_data, interacting):
+        def _refresh_map(_n, view_data, paused_data, interacting, relayout):
             triggered = dash.callback_context.triggered_id
+            # Persist the operator's 3D rotate/zoom across ticks: a scene orbit
+            # emits the live camera in relayoutData under "scene.camera". Hand
+            # it to the panel so every subsequent iso render re-emits THAT
+            # camera rather than snapping back to the default eye. (uirevision
+            # alone did not hold the view between live/playback updates.)
+            # Captured even mid-drag, before the no_update short-circuit below,
+            # so the latest orientation is already stored when ticks resume.
+            if hasattr(_map_panel, "set_iso_camera"):
+                cam = (relayout or {}).get("scene.camera")
+                if cam:
+                    _map_panel.set_iso_camera(cam)
             # While the operator is dragging to rotate/zoom, skip routine tick
             # re-renders — a full Plotly.react each cadence would stutter the
             # drag. A view-mode switch still re-renders (so the toggle works
@@ -663,9 +675,10 @@ def make_app(name: str, title: str,
             if (interacting or {}).get("dragging") and triggered == "map-tick":
                 return dash.no_update
             paused = bool((paused_data or {}).get("paused"))
-            # While frozen, skip routine ticks (data unchanged; uirevision
-            # holds the view) but DO honor an explicit view-mode switch so the
-            # operator can flip 2D<->iso on a paused frame.
+            # While frozen, skip routine ticks (data unchanged; the captured
+            # camera + uirevision hold the view) but DO honor an explicit
+            # view-mode switch so the operator can flip 2D<->iso on a paused
+            # frame.
             if paused and triggered == "map-tick" and _latest_state:
                 return dash.no_update
             mode = (view_data or {}).get("mode", "2d")

@@ -155,6 +155,33 @@ def test_iso_camera_emitted_every_frame_with_stable_uirevision():
     assert f1.layout.scene.uirevision == f2.layout.scene.uirevision == tpm._ISO_UIREVISION
 
 
+def test_iso_camera_override_persists_operator_view():
+    """Once the operator rotates/zooms, the dashboard captures the live camera
+    (graph relayoutData["scene.camera"]) and feeds it via set_iso_camera(); the
+    panel then re-emits THAT camera on every subsequent iso render so the view
+    persists across live/playback ticks instead of snapping back to the default
+    eye. This is the durable fix (uirevision alone did not hold the view)."""
+    panel = _panel()
+    panel.set_view_mode("iso")
+    panel.set_platforms(_platforms(), t_seconds=380.0)
+    # Default eye until the operator interacts.
+    assert panel.figure().layout.scene.camera.eye.y == tpm._ISO_CAMERA_EYE["y"]
+    # Operator orbits the scene -> Plotly emits the live camera in relayoutData.
+    operator_cam = {"eye": {"x": 1.5, "y": -0.4, "z": 2.0},
+                    "projection": {"type": "orthographic"}}
+    panel.set_iso_camera(operator_cam)
+    for _ in range(3):  # every later tick keeps the operator's camera
+        cam = panel.figure().layout.scene.camera
+        assert (cam.eye.x, cam.eye.y, cam.eye.z) == (1.5, -0.4, 2.0)
+    # A relayout event without a camera payload (e.g. autosize) must not wipe it.
+    panel.set_iso_camera(None)
+    assert panel.figure().layout.scene.camera.eye.x == 1.5
+    # Re-entering iso re-frames to the default eye (fresh session).
+    panel.set_view_mode("2d")
+    panel.set_view_mode("iso")
+    assert panel.figure().layout.scene.camera.eye.y == tpm._ISO_CAMERA_EYE["y"]
+
+
 def test_asset_labels_show_altitude():
     """On-plot asset labels carry the (AGL) altitude, matching the height."""
     panel = _panel()

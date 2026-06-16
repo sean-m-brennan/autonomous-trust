@@ -156,7 +156,9 @@ class Message(object):
         # HexEncoder.encode again on self.signature or it will double-encode.
         if from_whom is not None and isinstance(from_whom, Identity):
             try:
-                signed = from_whom.sign(self._content_str())
+                signed = from_whom.sign(
+                    self._signable_content(self.process, self.function,
+                                           self._obj_b64()))
                 self.signature = signed.signature  # ASCII-hex (128 bytes)
                 self.verified = True  # we just signed it ourselves
             except (RuntimeError, AttributeError):
@@ -169,12 +171,35 @@ class Message(object):
                      trace_id=self.trace_id, process=self.process,
                      function=self.function, has_from=self.from_whom is not None)
 
-    def _content_str(self):
-        """The signable content: process|function|obj_str"""
-        obj_str = str(self.obj)
+    def _obj_str(self):
+        """The raw body as a string (Configuration uses its canonical form)."""
         if isinstance(self.obj, Configuration):
-            obj_str = self.obj.to_string()
-        return '|'.join([self.process, self.function, obj_str])
+            return self.obj.to_string()
+        return str(self.obj)
+
+    def _obj_b64(self):
+        """The body as the wire base64 string (the exact `data` field)."""
+        return b64encode(self._obj_str().encode(Network.encoding)).decode('ascii')
+
+    def _content_str(self):
+        """The legacy pipe-format content: process|function|raw_body.
+
+        This is the human/legacy serialization used by ``__str__`` and the
+        pipe-format ``parse`` fallback. It is NOT the signature pre-image — see
+        ``_signable_content`` (which signs over the *base64* body to match the
+        C / _native runtimes)."""
+        return '|'.join([self.process, self.function, self._obj_str()])
+
+    @staticmethod
+    def _signable_content(process, function, data_b64):
+        """Canonical signature pre-image shared with the C / _native runtimes:
+        ``<process>|<function>|<base64(data)>`` (net_message.c). Signing over
+        the *base64* body (not the raw body) is what lets a C ``at_demo`` peer's
+        signature verify here; the two coincide only for an empty payload
+        (base64('') == ''), so the old raw-body form silently passed
+        request_access but rejected every non-empty C-signed message as
+        "forged or corrupt"."""
+        return '|'.join([process, function, data_b64])
 
     def __str__(self):
         content = self._content_str()
@@ -185,10 +210,7 @@ class Message(object):
     def __bytes__(self):
         from ..identity import Identity
 
-        obj_str = str(self.obj)
-        if isinstance(self.obj, Configuration):
-            obj_str = self.obj.to_string()
-        data_b64 = b64encode(obj_str.encode(Network.encoding)).decode('ascii')
+        data_b64 = self._obj_b64()
 
         wire = {
             'process': self.process,
@@ -309,7 +331,13 @@ class Message(object):
                 if sig_hex and eff_sender is not None and isinstance(eff_sender, Identity):
                     try:
                         sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
-                        content = '|'.join([process, function, obj_str])
+                        # Verify over the base64 body (the exact wire `data`
+                        # string), matching the sender's _signable_content and
+                        # the C/_native canonical. Verifying over the decoded
+                        # obj_str was the bug: it rejected every non-empty
+                        # C-signed message ("forged or corrupt").
+                        content = Message._signable_content(
+                            process, function, data_b64)
                         eff_sender.signature.public.verify(
                             content.encode(Network.encoding), sig_raw,
                         )
@@ -341,9 +369,13 @@ class Message(object):
 
         if sig_hex and sender is not None and isinstance(sender, Identity):
             try:
-                # Same direct-verify path as the JSON branch above.
+                # Same direct-verify path as the JSON branch above. Sign/verify
+                # over the base64 body (the canonical pre-image), not the raw
+                # pipe-field obj_str.
                 sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
-                content = '|'.join([process, function, obj_str])
+                content = Message._signable_content(
+                    process, function,
+                    b64encode(obj_str.encode(Network.encoding)).decode('ascii'))
                 sender.signature.public.verify(
                     content.encode(Network.encoding), sig_raw,
                 )
