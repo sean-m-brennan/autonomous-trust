@@ -2112,6 +2112,31 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
 
     if (adopt)
     {
+        /* Conform to Python handle_group_update's refuse branch
+         * (idprocess.py): never abandon a group we can DECRYPT for a
+         * DIFFERENT, public-only group we cannot. A group_key_update carries
+         * the shared private key only when the sender owns it (group_to_json
+         * emits public_only=false + the raw key); a public-only update for a
+         * foreign uuid would leave us holding that uuid with no usable key, so
+         * keep our keyed group and wait for a private-bearing full_history to
+         * converge. Same-uuid public-only updates are NOT refused — those keep
+         * our key while adopting the larger membership (we already retain our
+         * encryptor below). See [[dod-microdrone-targets-live-vs-playback]]. */
+        json_t *j_encr = json_object_get(payload, "encryptor");
+        json_t *j_po = j_encr ? json_object_get(j_encr, "public_only") : NULL;
+        bool theirs_public_only = (j_po == NULL) ? true : json_boolean_value(j_po);
+        bool mine_owns_private = !sodium_is_zero(
+            proc->protocol.group.encryptor.private, crypto_box_SECRETKEYBYTES);
+        if (!same_group && theirs_public_only && mine_owns_private)
+        {
+            log_info(proc->logger,
+                     "Identity: refusing public-only group %s over our keyed "
+                     "group %s\n",
+                     theirs_uuid_str ? theirs_uuid_str : "?", mine_uuid_str);
+            json_decref(payload);
+            return true; /* quiet no-op; keep our decryptable group, no echo */
+        }
+
         log_info(proc->logger,
                  "Identity: adopting incoming group (uuid %s, addresses %zu)\n",
                  theirs_uuid_str ? theirs_uuid_str : "?", theirs_size);
@@ -2141,6 +2166,32 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
                 if (k != NULL && addr != NULL)
                     group_add_address(&((process_t *)proc)->protocol.group,
                                       k, addr);
+            }
+        }
+        /* Conform to Python branch 1 (`self.group = theirs`): when theirs
+         * carries a usable key (public_only=false) OR we held no key of our
+         * own, INSTALL theirs' encryptor so we end with theirs' uuid AND
+         * theirs' key — not theirs' uuid paired with our stale key. The
+         * remaining adopt case (same-uuid public-only update while we own the
+         * key) falls through and KEEPS our encryptor — Python's
+         * adopt_membership. Mirrors group_from_json's encryptor reconstruction
+         * (group.c:204-225). See [[dod-microdrone-targets-live-vs-playback]]. */
+        if (!theirs_public_only || !mine_owns_private)
+        {
+            json_t *encr_obj = json_object_get(payload, "encryptor");
+            const char *seed_hex = encr_obj
+                ? json_string_value(json_object_get(encr_obj, "hex_seed"))
+                : NULL;
+            if (seed_hex != NULL)
+            {
+                if (theirs_public_only)
+                    public_encryptor_init(
+                        &((process_t *)proc)->protocol.group.encryptor,
+                        (const unsigned char *)seed_hex, strlen(seed_hex));
+                else
+                    encryptor_init_from_private(
+                        &((process_t *)proc)->protocol.group.encryptor,
+                        (const unsigned char *)seed_hex, strlen(seed_hex));
             }
         }
         /* Mirror Python's _record_group: push GROUP state to local processes. */

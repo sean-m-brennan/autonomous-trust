@@ -174,6 +174,29 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: votes_emitted={actual}, expected {expected}'
                     )
+            elif key == 'group_owns_private_key':
+                # True iff this participant's group still holds the shared
+                # PRIVATE box key (can decrypt group traffic). The invariant a
+                # membership-only group_key_update must preserve: adopting a
+                # larger but public-only group must NOT drop our private key.
+                # C mirrors via sodium_is_zero(group.encryptor.private).
+                grp = self.process.group
+                actual = bool(grp is not None and grp.owns_private_key)
+                if actual != bool(expected):
+                    raise AssertionError(
+                        f'{self.id}: group_owns_private_key={actual}, '
+                        f'expected {bool(expected)}'
+                    )
+            elif key == 'group_size':
+                # Number of addresses in this participant's group address map —
+                # proves the larger membership WAS adopted (not a no-op). C
+                # mirrors via map_size(group.address_map).
+                grp = self.process.group
+                actual = len(list(grp.addresses)) if grp is not None else 0
+                if actual != int(expected):
+                    raise AssertionError(
+                        f'{self.id}: group_size={actual}, expected {int(expected)}'
+                    )
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
 
@@ -474,11 +497,25 @@ class IdentityAdapter:
         from uuid import uuid5
         group_uuid = UUID(spec['uuid']) if spec.get('uuid') else identity.uuid
         size = int(spec.get('size', 1))
+        # `public_only: true` builds a group holding ONLY the public key — the
+        # wire shape of a membership-only group_key_update from a peer that does
+        # not hold the shared private key (or one survived a protobuf
+        # round-trip). Lets a scenario drive the "adopt larger membership but
+        # KEEP our private key" path. See [[dod-microdrone-targets-live-vs-playback]].
+        public_only = bool(spec.get('public_only', False))
+        enc = Encryptor.generate()
+        if public_only:
+            enc = Encryptor(enc.publish(), public_only=True)
         grp = Group(group_uuid, {identity.uuid: identity.address},
-                    f'grp-{pid}', Encryptor.generate(), False)
+                    f'grp-{pid}', enc, public_only)
         ns = UUID('00000000-0000-0000-0000-000000000aaa')
         for k in range(max(0, size - 1)):
-            filler_uuid = uuid5(ns, f'at-conformance-fill:{pid}:{k}')
+            # str() the filler uuid: address-map keys must be strings (matches
+            # production and the C harness). A UUID-object key breaks JSON
+            # serialization once the group is put on the wire via to_canonical
+            # (e.g. group_key_update), which earlier partition scenarios never
+            # exercised (probes serialize only uuid+size, not the address map).
+            filler_uuid = str(uuid5(ns, f'at-conformance-fill:{pid}:{k}'))
             filler_addr = f'10.9.{group_index}.{k + 2}'
             grp.add_address(filler_uuid, filler_addr)
         return grp
