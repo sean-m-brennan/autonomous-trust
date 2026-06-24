@@ -87,6 +87,35 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # a few seconds of demo time while honest peers recover gradually.
     CONSENSUS_EMA_HALF_LIFE = 20
 
+    # --- Idle reputation decay (warm-start staleness) -----------------
+    # A peer's earned operational reputation is a *memory* of past
+    # AT-bounded interaction. Memory should fade: the longer since we
+    # last transacted with a peer, the closer its operational reputation
+    # relaxes toward "almost-but-not-quite neutral" — never all the way
+    # to 0.50, so a long-known asset stays faintly preferred over a true
+    # stranger, but its elevated trust tier lapses and must be re-earned
+    # on contact. The gap a peer spends out of contact between our
+    # shutdown and the next start-up counts as idle time (seeded from the
+    # persisted snapshot's mtime in _seed_idle_from_snapshot), which is
+    # exactly what makes a warm-started cohort safe: re-loaded trust is
+    # stale trust, and stale trust decays.
+    #
+    # ASYMMETRIC by design: decay only erodes reputation *above* the
+    # asymptote, pulling it down. Scores at or below the asymptote are
+    # left untouched — mere absence never rehabilitates a distrusted or
+    # corrupt node (this preserves the sticky-low-reputation intent
+    # documented at self._consensus_last). Slashed peers and self are
+    # never decayed.
+    #
+    # Tunable. ONSET is a grace period before any decay starts (brief
+    # out-of-range gaps cost nothing); HALF_LIFE sets how fast the gap
+    # above the asymptote then halves; SWEEP_INTERVAL throttles the live
+    # sweep. Defaults assume wall-clock seconds.
+    REPUTATION_DECAY_ASYMPTOTE = 0.51       # just above neutral (0.50)
+    REPUTATION_DECAY_ONSET = 3600.0         # s idle before decay begins
+    REPUTATION_DECAY_HALF_LIFE = 86400.0    # s for the above-asymptote gap to halve
+    REPUTATION_DECAY_SWEEP_INTERVAL = 60.0  # min s between live sweeps
+
     # Cap on the dedup set for committed paxos rounds (see
     # `self.committed_paxos_rounds` below). FIFO eviction, paired
     # with TransactionHistory's bounded chain so neither structure
@@ -176,6 +205,15 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.reputations = (loaded_reps
                             if isinstance(loaded_reps, Reputations)
                             else Reputations())
+        # Idle-decay bookkeeping. _last_interaction maps peer-uuid-str ->
+        # epoch seconds of our most recent committed transaction with that
+        # peer; the staleness sweep relaxes idle peers toward almost-
+        # neutral (see the REPUTATION_DECAY_* constants). _seed_idle_from_
+        # snapshot below back-dates the warm-started cohort to the persisted
+        # snapshot's mtime and applies the offline-gap decay at start-up.
+        self._last_interaction: dict[str, float] = {}
+        self._last_decay_sweep = 0.0
+        self._seed_idle_from_snapshot()
         # Sticky consensus memory: peer-uuid-str -> last real (chain-derived)
         # consensus score. The tx chain is a bounded window, so an idle
         # peer's transactions evict within ~one window of sustained
@@ -631,6 +669,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # — primary for leaf nodes, a child chain on a gateway.
                 self._chain_for_group(round_group_uuid).update(
                     score.task_id, peer_id, score.score)
+                self._note_interaction(peer_id)
                 # Bumped to info to make demo debugging tractable —
                 # without a commit log, "no movement on reputations"
                 # is indistinguishable from "no paxos commits".
@@ -697,6 +736,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 return True
             chain = self._chain_for_group(group_uuid)
             chain.update(task_id, peer_id, float(score))
+            self._note_interaction(peer_id)
             self.logger.info(
                 'Recorded committed tx from %s: task=%s score=%.2f '
                 'group=%s (chain now %d txs, %d task_maps)',
@@ -1288,6 +1328,96 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 return tier
         return 0
 
+    def _note_interaction(self, peer_uuid):
+        """Stamp 'we just transacted with peer_uuid' — resets its idle
+        clock so the staleness sweep (_decay_reputations) leaves an
+        actively-interacting peer alone. Self is ignored."""
+        key = str(peer_uuid)
+        if key == str(self.identity.uuid):
+            return
+        self._last_interaction[key] = now().timestamp()
+
+    @classmethod
+    def _decayed_score(cls, score, idle_seconds):
+        """Relax an operational reputation toward almost-neutral as a
+        function of idle time. ASYMMETRIC: a score at or below the
+        asymptote is returned unchanged (absence never rehabilitates a
+        distrusted node); a score above it decays exponentially toward
+        the asymptote after the onset grace period, never overshooting
+        below it. See the REPUTATION_DECAY_* constants."""
+        if score is None or score <= cls.REPUTATION_DECAY_ASYMPTOTE:
+            return score
+        if idle_seconds <= cls.REPUTATION_DECAY_ONSET:
+            return score
+        elapsed = idle_seconds - cls.REPUTATION_DECAY_ONSET
+        factor = 0.5 ** (elapsed / cls.REPUTATION_DECAY_HALF_LIFE)
+        decayed = cls.REPUTATION_DECAY_ASYMPTOTE + \
+            (score - cls.REPUTATION_DECAY_ASYMPTOTE) * factor
+        return max(cls.REPUTATION_DECAY_ASYMPTOTE, decayed)
+
+    def _seed_idle_from_snapshot(self):
+        """At start-up, treat the persisted reputation snapshot's mtime as
+        the moment of our last AT-bounded activity: seed every warm-started
+        peer's idle clock to it and apply the offline-gap decay up front, so
+        a long-dormant cohort comes up with faded (not stale-inflated)
+        trust. No-op on a cold start (no snapshot on disk). No queues are
+        available this early, so tier changes are not published here — the
+        first live sweep / rep_req republishes from the decayed value."""
+        try:
+            path = os.path.join(Configuration.get_cfg_dir(),
+                                CfgIds.reputation + Configuration.file_ext)
+            mtime = os.path.getmtime(path)
+        except (OSError, IOError):
+            return
+        present = now().timestamp()
+        idle = max(0.0, present - mtime)
+        self_uuid = str(self.identity.uuid)
+        for u in list(self.reputations.current.keys()):
+            if str(u) == self_uuid:
+                continue
+            self._last_interaction[str(u)] = mtime
+            score = self.reputations.current.get(u)
+            decayed = self._decayed_score(score, idle)
+            if decayed is not None:
+                self.reputations.current[u] = decayed
+
+    def _decay_reputations(self, queues, present):
+        """Periodic staleness sweep: pull idle peers' operational
+        reputation toward almost-neutral. Throttled to one pass per
+        REPUTATION_DECAY_SWEEP_INTERVAL. Skips self and slashed peers
+        (their floor is authoritative). Republishes the trust tier on a
+        floor crossing and persists if anything moved. The dashboard
+        consensus channel (_consensus_last) is decayed in lock-step so the
+        two views agree. See doc/architecture/persistent-cohort.md."""
+        if present - self._last_decay_sweep < self.REPUTATION_DECAY_SWEEP_INTERVAL:
+            return
+        self._last_decay_sweep = present
+        self_uuid = str(self.identity.uuid)
+        changed = False
+        for u in list(self.reputations.current.keys()):
+            key = str(u)
+            if key == self_uuid or key in self._slashed:
+                continue
+            score = self.reputations.current.get(u)
+            if score is None or score <= self.REPUTATION_DECAY_ASYMPTOTE:
+                continue
+            idle = max(0.0, present - self._last_interaction.get(key, present))
+            decayed = self._decayed_score(score, idle)
+            if decayed is None or abs(decayed - score) <= 1e-9:
+                continue
+            self.reputations.current[u] = decayed
+            prior = self._consensus_last.get(key)
+            if prior is not None and prior > self.REPUTATION_DECAY_ASYMPTOTE:
+                self._consensus_last[key] = self._decayed_score(prior, idle)
+            self._publish_tier_change(queues, u, decayed)
+            changed = True
+        if changed:
+            try:
+                self._persist_reputations()
+            except (OSError, IOError) as e:
+                self.logger.warning(
+                    'Could not persist reputations after decay: %s' % e)
+
     def _persist_reputations(self):
         """Write the reputation snapshot to disk, filtered by threshold.
 
@@ -1772,6 +1902,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     self._publish_tier_change(queues, peer_uuid, rep_score)
 
                 present = now().timestamp()
+                # Staleness sweep: relax idle peers' operational
+                # reputation toward almost-neutral (warm-start memory
+                # fades). Throttled internally to SWEEP_INTERVAL.
+                self._decay_reputations(queues, present)
                 for req in list(self.requests):
                     if present - req[0] > self.expiration:
                         self.requests.remove(req)

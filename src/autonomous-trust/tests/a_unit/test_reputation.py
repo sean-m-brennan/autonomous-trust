@@ -598,6 +598,7 @@ class TestProposerHistoryBilateral:
         # group_uuid, so _chain_for_group(None) resolves to the primary
         # chain — which for this leaf stub is just `history`.
         stub._chain_for_group = lambda g: history
+        stub._note_interaction = lambda *a, **k: None
         stub.identity = SimpleNamespace(uuid=self_id)
         stub.logger = SimpleNamespace(
             warning=lambda *a, **k: None, debug=lambda *a, **k: None,
@@ -653,6 +654,7 @@ class TestProposerHistoryBilateral:
             history=history,
             # Legacy 3-tuple commit -> group_uuid None -> primary chain.
             _chain_for_group=lambda g: history,
+            _note_interaction=lambda *a, **k: None,
             identity=SimpleNamespace(uuid=self_id),
             logger=SimpleNamespace(
                 warning=lambda *a, **k: None, debug=lambda *a, **k: None,
