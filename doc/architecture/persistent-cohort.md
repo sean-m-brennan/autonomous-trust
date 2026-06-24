@@ -4,6 +4,18 @@ How a node's identity, peer table, and reputation survive a restart —
 and how the DoD mission demo pre-seeds the squad / microdrone / jet
 cohort with mutual trust so they boot in a high-trust network.
 
+**What "warm-start" means.** A warm-started peer is one whose reputation
+is *a memory of its prior AT-bounded activity that becomes operational
+again at machine start-up* — the score it already earned through observed
+AT-mediated transactions, persisted here and reloaded into the live
+reputation store on restart, rather than re-earned from neutral on every
+reboot. It is not a trust grant and not an allow-list; the reloaded score
+is bound to the same cryptographic identity and stays under continuous
+re-evaluation (any transaction can move it; the slashing fast-path can
+floor it). What keeps the shortcut honest is that **re-loaded trust is
+stale trust, and stale trust decays** toward almost-neutral with time out
+of contact — see §3.1 and [Reputation › Staleness decay](reputation.md).
+
 ## 1. What gets persisted
 
 Every AT node already writes five files under `$AUTONOMOUS_TRUST_ROOT/etc/at/`
@@ -56,6 +68,37 @@ tail-of-loop persistence:
 `SIGINT` (Ctrl-C) was already handled via `KeyboardInterrupt` in the
 autonomous loop; SIGTERM is the new path — `kubectl delete pod`,
 `docker stop`, `tilt down`, supervisor restart all go through it.
+
+### 3.1 Staleness: warm-start memory fades
+
+A reloaded reputation is a *memory*, so it is not trusted indefinitely.
+`ReputationProcess` relaxes an idle peer's operational reputation toward
+*almost-but-not-quite neutral* (`0.51`, just above `0.50`) as a function
+of time since the last transaction with that peer — eroding earned trust
+above the asymptote while leaving a distrusted/corrupt node's low score
+untouched (decay is asymmetric: absence never rehabilitates a bad actor;
+slashed peers and self are never decayed). The time the peer spent out of
+contact **while the node was down counts**: `_seed_idle_from_snapshot`
+reads `reputation.cfg.json`'s mtime as the instant of last activity and
+applies the offline-gap decay at start-up, so a long-dormant cohort warm-
+starts with faded — not stale-inflated — trust. A peer's *elevated* tier
+(2–4) thus lapses over a long absence and must be re-earned on contact,
+while tier 1 (presence) persists. Tunable via `REPUTATION_DECAY_*` in
+`repprocess.py`. Local-view only (wall-clock driven, never on the wire),
+so the conformance corpus is unaffected. Full rationale in
+[Reputation › Staleness decay](reputation.md).
+
+**Planned hardening — floor, not full restoration (design, not yet
+implemented).** Decay covers *time out of contact* but not the orthogonal
+*"this session hasn't re-validated you yet"* axis: a recently-active peer
+with little decay is restored to its full earned tier the instant it is
+re-admitted. Because an *authenticated-but-compromised* asset passes
+admission by definition and a short-lived asset gives behavioral
+re-evaluation no time to bite, warm-start should restore only **low-tier**
+(presence/communication) standing instantly and require **fresh in-session
+evidence** before re-granting **elevated/safety-critical** tiers. See
+[Reputation › Planned hardening](reputation.md) for the implementation
+sketch; pairs with the human-on-the-loop safety carve-out.
 
 ## 4. The DoD demo's warm-start cohort
 
@@ -162,6 +205,7 @@ scripts/run-demo.sh --variant=dod-mission --tilt
 | What | Where |
 |---|---|
 | Threshold gate (reputation) | [`repprocess.py:_persist_reputations`](../../src/autonomous-trust/autonomous_trust/core/_python/reputation/repprocess.py) |
+| Staleness decay (idle + offline-gap) | [`repprocess.py`](../../src/autonomous-trust/autonomous_trust/core/_python/reputation/repprocess.py): `_decay_reputations`, `_decayed_score`, `_seed_idle_from_snapshot`, `_note_interaction`, `REPUTATION_DECAY_*` |
 | Threshold gate (peers + caps) | [`idprocess.py:_trusted_uuids_for_persist`](../../src/autonomous-trust/autonomous_trust/core/_python/identity/idprocess.py) |
 | `filtered_for_persist` impls | [`reputation.py`](../../src/autonomous-trust/autonomous_trust/core/_python/reputation/reputation.py), [`peers.py`](../../src/autonomous-trust/autonomous_trust/core/_python/identity/peers.py), [`capabilities.py`](../../src/autonomous-trust/autonomous_trust/core/_python/capabilities.py) |
 | Shutdown flush | [`automate.py:run_forever`](../../src/autonomous-trust/autonomous_trust/core/_python/automate.py) (SIGTERM handler) + end of each subprocess's `process()` |

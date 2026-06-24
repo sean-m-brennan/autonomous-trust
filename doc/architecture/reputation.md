@@ -93,6 +93,19 @@ This encourages mutual recovery from low-trust situations while punishing sustai
 
 ## Warm-start and cold-start baseline
 
+**Warm-start** is precisely this: *a memory of a peer's prior AT-bounded
+activity that becomes operational again at machine start-up.* It is not a grant
+of trust and not a configured allow-list — it is the reputation a peer **already
+earned** through observed, AT-mediated transactions, persisted to disk
+(`reputation.cfg.json`) and reloaded into the live `self.reputations` store when
+the node restarts. Because that score is bound to the same cryptographic
+identity and remains subject to continuous re-evaluation (every subsequent
+transaction can move it, and the slashing fast-path can floor it), a
+warm-started peer is in exactly the same regime as any other peer — it simply
+does not have to re-earn standing from neutral on every reboot. The safety of
+that shortcut rests on the staleness decay below: re-loaded trust is *stale*
+trust, and stale trust fades.
+
 A peer with no bilateral transaction history would otherwise read as the flat
 neutral `0.5` ("forming…") until enough rounds accumulate. Two mechanisms avoid
 that dead zone:
@@ -115,6 +128,61 @@ present too briefly to build consensus history: `is_pre_trusted` /
 whose only readings are neutral. This lives in `examples/dod_mission`
 (`reputation_warmstart.py`, `tools/seed_dod_cohort.py`), not in core, but is the
 reference pattern for warm-starting brief-lived peers.
+
+## Staleness decay (why warm-start is safe)
+
+Earned reputation is a memory, and memory must fade — otherwise a warm-started
+score would be trusted forever on the strength of activity that may be hours or
+days old. `ReputationProcess` therefore relaxes an idle peer's **operational**
+reputation toward *almost-but-not-quite neutral* as a function of time since the
+last transaction with that peer (`_decay_reputations`, swept periodically from
+the process loop; `_decayed_score` is the pure function). The relevant constants
+(`REPUTATION_DECAY_*` in `repprocess.py`) are tunable:
+
+- **Asymptote** (`0.51`, just above neutral `0.50`). A long-dormant peer relaxes
+  toward — but never reaches — neutral, so a previously-known asset stays
+  faintly preferred over a true stranger while its *elevated* trust tier
+  (tiers 2–4) lapses and must be re-earned on contact.
+- **Onset** grace period before any decay begins, so a brief out-of-range gap
+  costs nothing.
+- **Half-life** sets how fast the gap above the asymptote then shrinks.
+
+The decay is **asymmetric by design**: it only erodes reputation *above* the
+asymptote. A score at or below it — a distrusted or corrupt node — is left
+untouched, because mere absence must never rehabilitate a bad actor (this
+preserves the sticky-low-reputation intent noted at `self._consensus_last`).
+Slashed peers (whose floor is authoritative) and self are never decayed.
+
+**Across a restart**, the time a peer spent out of contact while we were down is
+counted: `_seed_idle_from_snapshot` treats the persisted snapshot's mtime as the
+instant of last activity, seeds each loaded peer's idle clock to it, and applies
+the offline-gap decay up front — so a cohort that warm-starts after a long
+dormancy comes up with appropriately faded, not stale-inflated, trust. This is
+local-view only: decay is wall-clock driven and never serialized onto the wire,
+so it is invisible to the Python↔C conformance corpus.
+
+### Planned hardening: floor, not full restoration
+
+**Status: design, not yet implemented.** Today warm-start reloads the persisted
+operational reputation scalar (subject to the decay above), so a *recently*-active
+peer with little decay is restored to whatever tier that scalar maps to —
+including an elevated tier — the instant it passes admission. The decay axis
+covers *time out of contact*, but not the orthogonal *"this session hasn't
+re-validated you yet"* axis.
+
+The hardening: warm-start should restore only **low-tier** standing (presence /
+communication) immediately, and require **fresh in-session behavioral evidence**
+before re-granting **elevated or safety-critical tiers**. Rationale: an
+*authenticated-but-compromised* asset passes ZTA admission *by definition* (it
+holds valid credentials — the headline threat), and for a short-lived asset there
+is no time for behavioral re-evaluation to catch it before its window closes; so
+restoring its historically-earned high tier instantly re-opens, for short-lived
+assets, exactly the compromised-but-credentialed hole the system exists to close.
+Implementation sketch: at `_seed_idle_from_snapshot` (and on readmission), clamp
+the restored operational reputation to the tier-1 ceiling until the peer accrues
+N fresh committed in-session transactions, then let it climb normally. Decay and
+this floor compose (one is the time axis, the other the in-session axis). Pairs
+with the human-on-the-loop carve-out for safety-critical capabilities.
 
 ## Expiration
 
