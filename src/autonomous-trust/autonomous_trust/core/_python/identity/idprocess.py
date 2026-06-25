@@ -42,7 +42,7 @@ from ..network import Message, Network
 from .history import IdentityByWork, IdentityByStake, IdentityByAuthority
 from .history import IdentityObj
 from .protocol import IdentityProtocol
-from .zta import ZtaPolicy, ZtaStatus
+from .zta import ZtaPolicy, ZtaStatus, ZTA_CRED_MAX
 from ..structures.dag import LinkedStep
 from ..system import CfgIds, encoding, PackageHash, now
 from .. import _probes
@@ -782,6 +782,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             cred = new_id.zta_credential or None
         except AttributeError:
             cred = None  # peer from an older/non-ZTA build carries no field
+        # Size guard BEFORE handing the blob to the verifier: an oversized
+        # credential is almost certainly hostile/corrupt and would let a remote
+        # cause an OOM / parse-time DoS. Mirrors C `ZTA_CRED_MAX` (identity.h);
+        # the C twin enforces the same cap at this admission gate (id_proc.c)
+        # AND at protobuf deserialization (identity.c). Keep the bound in
+        # lockstep -- pinned by conformance zta-x509-reject-oversized-credential.
+        if cred is not None and len(cred) > ZTA_CRED_MAX:
+            self.logger.warning('ZTA: rejecting %s at admission: credential too '
+                                'large (%d > %d)', nick, len(cred), ZTA_CRED_MAX)
+            _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
+                         zta_status=ZtaStatus.REJECTED.value,
+                         reason='credential too large')
+            _probes.counter('id.welcome', 'zta_rejected')
+            return 'reject'
         result = self._zta_verifier().verify_credential(cred)
         status = result.status
         if status is ZtaStatus.VERIFIED:

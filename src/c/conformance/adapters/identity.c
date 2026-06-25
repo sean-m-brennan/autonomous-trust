@@ -421,6 +421,42 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
         }
     }
 
+    /* capless_peers: { "<participant>": <N>, ... } -- inject N synthetic
+     * cap-less peers (present in proc->protocol.peers[] but absent from the
+     * peer_caps_map) so the periodic caps-resync sweep has more than the
+     * per-sweep cap to query. Mirrors the Python adapter's capless_peers
+     * injection; pins CAPS_RESYNC_MAX_PER_SWEEP via caps-resync-max-per-sweep.
+     * (Pair with shared_group so the sweep's in-a-group gate is satisfied.) */
+    json_t *capless = json_object_get(fixtures, "capless_peers");
+    if (json_is_object(capless)) {
+        const char *cl_pid;
+        json_t *cl_cnt;
+        json_object_foreach(capless, cl_pid, cl_cnt) {
+            sce_participant_t *part = sce_find_participant(ctx, cl_pid);
+            if (part == NULL || !json_is_integer(cl_cnt)) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            if (impl == NULL || impl->proc == NULL || impl->pub == NULL) continue;
+            process_t *p = impl->proc;
+            json_int_t n = json_integer_value(cl_cnt);
+            for (json_int_t i = 0; i < n; i++) {
+                if (p->protocol.num_peers >= DEFAULT_MAX_PEERS) break;
+                public_identity_t *slot =
+                    &p->protocol.peers[p->protocol.num_peers];
+                memcpy(slot, impl->pub, sizeof(public_identity_t));
+                /* deterministic, distinct, cap-less uuid; the 0xCA71 marker
+                 * bytes keep it from colliding with any real participant. */
+                memset(slot->uuid, 0, sizeof(slot->uuid));
+                slot->uuid[0] = (unsigned char)(i & 0xff);
+                slot->uuid[1] = (unsigned char)((i >> 8) & 0xff);
+                slot->uuid[2] = 0xCA;
+                slot->uuid[3] = 0x71;
+                snprintf(slot->nickname, sizeof(slot->nickname),
+                         "capless-%s-%lld", cl_pid, (long long)i);
+                p->protocol.num_peers++;
+            }
+        }
+    }
+
     json_t *amnesia_j = json_object_get(fixtures, "amnesia_known");
     bool amnesia_known = json_is_true(amnesia_j);
 
@@ -756,6 +792,17 @@ static int _dispatch(sce_run_ctx_t *ctx,
                      generic_msg_t *inbound) {
     (void)ctx;
     ic_impl_t *impl = (ic_impl_t *)target->impl;
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_caps_resync") == 0) {
+        /* Pseudo-function: drive the periodic caps-resync sweep directly (it is
+         * timer-gated in production, so there is no wire message to dispatch).
+         * Emitted peer_caps_query messages are captured via the messaging_send
+         * hook -> ctx->captured (attributed to current_dispatcher == target).
+         * Mirrors the Python adapter's trigger_caps_resync handling. */
+        identity_periodic_caps_resync(impl->proc);
+        return 0;
+    }
     /* directory_t is array_t of sibling-process queue names. Populate it
      * with the names handlers expect to find: _announce_identity (the
      * partition-recovery request_access re-broadcast) returns early unless
@@ -913,6 +960,26 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                 if (got != want) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: %s=%d, expected %d", pid, key, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "caps_query_emitted") == 0) {
+                /* Directed peer_caps_query emissions from the periodic caps-
+                 * resync sweep (driven by the trigger_caps_resync pseudo-step).
+                 * With more cap-less peers than the per-sweep cap, the sweep
+                 * emits exactly CAPS_RESYNC_MAX_PER_SWEEP. Mirrors the Python
+                 * emit_tally check; pins the cap cross-language. */
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->captured_count; i++) {
+                    if (strcmp(ctx->captured[i].from, pid) == 0
+                        && strcmp(ctx->captured[i].function,
+                                  "peer_caps_query") == 0)
+                        got++;
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: caps_query_emitted=%d, expected %d",
+                             pid, got, want);
                     return -1;
                 }
             } else if (strcmp(key, "propose_emitted") == 0) {

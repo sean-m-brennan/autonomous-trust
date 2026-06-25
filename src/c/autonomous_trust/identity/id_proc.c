@@ -830,6 +830,24 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
             int zrc = zta_policy_create_verifier(zta_policy, &verifier);
             if (zrc == 0 && verifier) {
                 zta_result_t zta_result;
+                /* Size guard BEFORE verify: an oversized credential is almost
+                 * certainly hostile/corrupt and would let a remote cause an OOM
+                 * / parse-time DoS. public_identity_sync_in already rejects this
+                 * at protobuf deserialization (identity.c:ZTA_CRED_MAX), but the
+                 * conformance harness attaches a live from_whom (no wire round-
+                 * trip), so the bound is enforced here at the admission gate too,
+                 * mirroring Python idprocess._zta_admit. Pinned by conformance
+                 * zta-x509-reject-oversized-credential. Keep ZTA_CRED_MAX in
+                 * lockstep with Python (identity/zta/zta_verifier.py). */
+                if (nmsg->from_whom.zta_credential_len > ZTA_CRED_MAX) {
+                    log_warn(proc->logger,
+                             "Identity: ZTA credential too large for %s "
+                             "(%zu > %u)\n", nmsg->from_whom.nickname,
+                             nmsg->from_whom.zta_credential_len,
+                             (unsigned)ZTA_CRED_MAX);
+                    verifier->destroy(verifier);
+                    return true; /* reject */
+                }
                 verifier->verify_credential(
                     verifier,
                     nmsg->from_whom.zta_credential,

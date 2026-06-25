@@ -31,6 +31,14 @@ from typing import Optional
 
 ZTA_HASH_LEN = 32  # SHA-256
 
+# Hard cap on a ZTA credential blob carried on the wire. Real X.509 chains and
+# JWTs comfortably fit; a larger value almost certainly indicates a hostile or
+# corrupted peer and would let a remote cause an OOM / parse-time DoS. MUST stay
+# in lockstep with C `ZTA_CRED_MAX` (identity.h). Enforced at the admission gate
+# (idprocess._zta_admit) so an oversized credential is rejected before the
+# verifier spends effort parsing it.
+ZTA_CRED_MAX = 64 * 1024
+
 
 class ZtaStatus(Enum):
     """Result status of a ZTA credential verification.
@@ -193,10 +201,28 @@ class X509Verifier(Verifier):
         return cert.not_valid_before_utc <= now <= cert.not_valid_after_utc
 
     def _verify_chain(self, leaf) -> ZtaResult:
-        """Walk leaf -> ... -> trusted anchor. Returns VERIFIED/EXPIRED/REJECTED."""
+        """Walk leaf -> issuer -> ... -> a self-signed root anchor in the store.
+
+        Each hop's validity window and issuer signature are verified. Only a
+        self-signed certificate present in the store terminates the chain as a
+        trust anchor; every cert strictly between the leaf and that root is an
+        intermediate CA. The number of intermediates is bounded by
+        ``_MAX_CHAIN_DEPTH`` -- the SAME quantity OpenSSL's
+        ``X509_VERIFY_PARAM_set_depth`` bounds on the C side (the max number of
+        intermediate CAs between the leaf and the trust anchor), so a chain that
+        one implementation accepts the other does too. A chain with more
+        intermediates than the bound is REJECTED ('certificate chain too long').
+
+        (Previously this returned VERIFIED after the first hop -- treating every
+        bundled cert as a terminal anchor -- so the depth bound was unreachable
+        dead code and multi-hop chains were never actually walked.)
+        """
         now = datetime.now(timezone.utc)
         cur = leaf
-        for _ in range(self._MAX_CHAIN_DEPTH):
+        intermediates = 0
+        # Hard iteration bound also defends against a cycle in a malicious
+        # bundle; _MAX_CHAIN_DEPTH + 2 is always enough for a legitimate chain.
+        for _ in range(self._MAX_CHAIN_DEPTH + 2):
             if not self._not_expired(cur, now):
                 return ZtaResult.set(ZtaStatus.EXPIRED, 'certificate has expired')
             issuer = self._store.get(cur.issuer.public_bytes())
@@ -209,8 +235,19 @@ class X509Verifier(Verifier):
                 return ZtaResult.set(ZtaStatus.REJECTED,
                                      'certificate signature failure: %s'
                                      % str(err)[:80])
-            # issuer is a trusted anchor (present in the store) -> chain complete
-            return ZtaResult.set(ZtaStatus.VERIFIED, 'certificate chain verified')
+            if issuer.subject.public_bytes() == issuer.issuer.public_bytes():
+                # Reached a self-signed root anchor: chain complete.
+                if intermediates > self._MAX_CHAIN_DEPTH:
+                    return ZtaResult.set(ZtaStatus.REJECTED,
+                                         'certificate chain too long')
+                return ZtaResult.set(ZtaStatus.VERIFIED,
+                                     'certificate chain verified')
+            # issuer is an intermediate CA -> count it and keep walking.
+            intermediates += 1
+            if intermediates > self._MAX_CHAIN_DEPTH:
+                return ZtaResult.set(ZtaStatus.REJECTED,
+                                     'certificate chain too long')
+            cur = issuer
         return ZtaResult.set(ZtaStatus.REJECTED, 'certificate chain too long')
 
     # -- vtable -----------------------------------------------------------

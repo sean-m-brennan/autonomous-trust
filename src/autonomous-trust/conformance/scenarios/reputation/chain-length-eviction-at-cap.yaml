@@ -1,0 +1,661 @@
+schema_version: '1'
+kind: scenario
+protocol: reputation
+name: chain-length-eviction-at-cap
+byte_pinning: false
+description: |
+  Pins the reputation transaction-history cap DEFAULT_MAX_CHAIN_LEN /
+  MAX_CHAIN_LEN = 200 cross-language. alice reports a hash-linked chain of
+  205 committed entries to dave via `latest update`; dave's catchup()
+  replays each through TransactionHistory.update(), which evicts the oldest
+  entry once the resident chain reaches 200 (FIFO). The window therefore
+  converges to the most-recent 200 entries (sent indices 5..204).
+
+  committed_tx_count==200 pins the cap; window_root (RFC 6962 ordered Merkle
+  root over the resident window) pins that BOTH sides retain the SAME 200
+  entries and compute byte-identical entry_hashes after eviction. If either
+  side's MAX_CHAIN_LEN drifts, or eviction keeps a different set, the count
+  or the root diverges and the cross-language diff goes asymmetric --
+  previously the two constants were aligned only by a code comment.
+
+  num_updates quorum lowered to 1 (fixture) so a single report fires the
+  chain merge; the C harness resets state per step, so the whole chain must
+  arrive in one message (same constraint as chain-catchup-verifies-links).
+participants:
+- id: alice
+  role: provider
+- id: dave
+  role: consumer
+fixtures:
+  num_updates:
+    dave: 1
+steps:
+- id: 1
+  from: alice
+  to: dave
+  function: latest update
+  payload:
+    chain:
+    - task: t000
+      p1: 0.1
+      p2: 0.1
+    - task: t001
+      p1: 0.2
+      p2: 0.2
+    - task: t002
+      p1: 0.3
+      p2: 0.3
+    - task: t003
+      p1: 0.4
+      p2: 0.4
+    - task: t004
+      p1: 0.5
+      p2: 0.5
+    - task: t005
+      p1: 0.6
+      p2: 0.6
+    - task: t006
+      p1: 0.7
+      p2: 0.7
+    - task: t007
+      p1: 0.8
+      p2: 0.1
+    - task: t008
+      p1: 0.9
+      p2: 0.2
+    - task: t009
+      p1: 0.1
+      p2: 0.3
+    - task: t010
+      p1: 0.2
+      p2: 0.4
+    - task: t011
+      p1: 0.3
+      p2: 0.5
+    - task: t012
+      p1: 0.4
+      p2: 0.6
+    - task: t013
+      p1: 0.5
+      p2: 0.7
+    - task: t014
+      p1: 0.6
+      p2: 0.1
+    - task: t015
+      p1: 0.7
+      p2: 0.2
+    - task: t016
+      p1: 0.8
+      p2: 0.3
+    - task: t017
+      p1: 0.9
+      p2: 0.4
+    - task: t018
+      p1: 0.1
+      p2: 0.5
+    - task: t019
+      p1: 0.2
+      p2: 0.6
+    - task: t020
+      p1: 0.3
+      p2: 0.7
+    - task: t021
+      p1: 0.4
+      p2: 0.1
+    - task: t022
+      p1: 0.5
+      p2: 0.2
+    - task: t023
+      p1: 0.6
+      p2: 0.3
+    - task: t024
+      p1: 0.7
+      p2: 0.4
+    - task: t025
+      p1: 0.8
+      p2: 0.5
+    - task: t026
+      p1: 0.9
+      p2: 0.6
+    - task: t027
+      p1: 0.1
+      p2: 0.7
+    - task: t028
+      p1: 0.2
+      p2: 0.1
+    - task: t029
+      p1: 0.3
+      p2: 0.2
+    - task: t030
+      p1: 0.4
+      p2: 0.3
+    - task: t031
+      p1: 0.5
+      p2: 0.4
+    - task: t032
+      p1: 0.6
+      p2: 0.5
+    - task: t033
+      p1: 0.7
+      p2: 0.6
+    - task: t034
+      p1: 0.8
+      p2: 0.7
+    - task: t035
+      p1: 0.9
+      p2: 0.1
+    - task: t036
+      p1: 0.1
+      p2: 0.2
+    - task: t037
+      p1: 0.2
+      p2: 0.3
+    - task: t038
+      p1: 0.3
+      p2: 0.4
+    - task: t039
+      p1: 0.4
+      p2: 0.5
+    - task: t040
+      p1: 0.5
+      p2: 0.6
+    - task: t041
+      p1: 0.6
+      p2: 0.7
+    - task: t042
+      p1: 0.7
+      p2: 0.1
+    - task: t043
+      p1: 0.8
+      p2: 0.2
+    - task: t044
+      p1: 0.9
+      p2: 0.3
+    - task: t045
+      p1: 0.1
+      p2: 0.4
+    - task: t046
+      p1: 0.2
+      p2: 0.5
+    - task: t047
+      p1: 0.3
+      p2: 0.6
+    - task: t048
+      p1: 0.4
+      p2: 0.7
+    - task: t049
+      p1: 0.5
+      p2: 0.1
+    - task: t050
+      p1: 0.6
+      p2: 0.2
+    - task: t051
+      p1: 0.7
+      p2: 0.3
+    - task: t052
+      p1: 0.8
+      p2: 0.4
+    - task: t053
+      p1: 0.9
+      p2: 0.5
+    - task: t054
+      p1: 0.1
+      p2: 0.6
+    - task: t055
+      p1: 0.2
+      p2: 0.7
+    - task: t056
+      p1: 0.3
+      p2: 0.1
+    - task: t057
+      p1: 0.4
+      p2: 0.2
+    - task: t058
+      p1: 0.5
+      p2: 0.3
+    - task: t059
+      p1: 0.6
+      p2: 0.4
+    - task: t060
+      p1: 0.7
+      p2: 0.5
+    - task: t061
+      p1: 0.8
+      p2: 0.6
+    - task: t062
+      p1: 0.9
+      p2: 0.7
+    - task: t063
+      p1: 0.1
+      p2: 0.1
+    - task: t064
+      p1: 0.2
+      p2: 0.2
+    - task: t065
+      p1: 0.3
+      p2: 0.3
+    - task: t066
+      p1: 0.4
+      p2: 0.4
+    - task: t067
+      p1: 0.5
+      p2: 0.5
+    - task: t068
+      p1: 0.6
+      p2: 0.6
+    - task: t069
+      p1: 0.7
+      p2: 0.7
+    - task: t070
+      p1: 0.8
+      p2: 0.1
+    - task: t071
+      p1: 0.9
+      p2: 0.2
+    - task: t072
+      p1: 0.1
+      p2: 0.3
+    - task: t073
+      p1: 0.2
+      p2: 0.4
+    - task: t074
+      p1: 0.3
+      p2: 0.5
+    - task: t075
+      p1: 0.4
+      p2: 0.6
+    - task: t076
+      p1: 0.5
+      p2: 0.7
+    - task: t077
+      p1: 0.6
+      p2: 0.1
+    - task: t078
+      p1: 0.7
+      p2: 0.2
+    - task: t079
+      p1: 0.8
+      p2: 0.3
+    - task: t080
+      p1: 0.9
+      p2: 0.4
+    - task: t081
+      p1: 0.1
+      p2: 0.5
+    - task: t082
+      p1: 0.2
+      p2: 0.6
+    - task: t083
+      p1: 0.3
+      p2: 0.7
+    - task: t084
+      p1: 0.4
+      p2: 0.1
+    - task: t085
+      p1: 0.5
+      p2: 0.2
+    - task: t086
+      p1: 0.6
+      p2: 0.3
+    - task: t087
+      p1: 0.7
+      p2: 0.4
+    - task: t088
+      p1: 0.8
+      p2: 0.5
+    - task: t089
+      p1: 0.9
+      p2: 0.6
+    - task: t090
+      p1: 0.1
+      p2: 0.7
+    - task: t091
+      p1: 0.2
+      p2: 0.1
+    - task: t092
+      p1: 0.3
+      p2: 0.2
+    - task: t093
+      p1: 0.4
+      p2: 0.3
+    - task: t094
+      p1: 0.5
+      p2: 0.4
+    - task: t095
+      p1: 0.6
+      p2: 0.5
+    - task: t096
+      p1: 0.7
+      p2: 0.6
+    - task: t097
+      p1: 0.8
+      p2: 0.7
+    - task: t098
+      p1: 0.9
+      p2: 0.1
+    - task: t099
+      p1: 0.1
+      p2: 0.2
+    - task: t100
+      p1: 0.2
+      p2: 0.3
+    - task: t101
+      p1: 0.3
+      p2: 0.4
+    - task: t102
+      p1: 0.4
+      p2: 0.5
+    - task: t103
+      p1: 0.5
+      p2: 0.6
+    - task: t104
+      p1: 0.6
+      p2: 0.7
+    - task: t105
+      p1: 0.7
+      p2: 0.1
+    - task: t106
+      p1: 0.8
+      p2: 0.2
+    - task: t107
+      p1: 0.9
+      p2: 0.3
+    - task: t108
+      p1: 0.1
+      p2: 0.4
+    - task: t109
+      p1: 0.2
+      p2: 0.5
+    - task: t110
+      p1: 0.3
+      p2: 0.6
+    - task: t111
+      p1: 0.4
+      p2: 0.7
+    - task: t112
+      p1: 0.5
+      p2: 0.1
+    - task: t113
+      p1: 0.6
+      p2: 0.2
+    - task: t114
+      p1: 0.7
+      p2: 0.3
+    - task: t115
+      p1: 0.8
+      p2: 0.4
+    - task: t116
+      p1: 0.9
+      p2: 0.5
+    - task: t117
+      p1: 0.1
+      p2: 0.6
+    - task: t118
+      p1: 0.2
+      p2: 0.7
+    - task: t119
+      p1: 0.3
+      p2: 0.1
+    - task: t120
+      p1: 0.4
+      p2: 0.2
+    - task: t121
+      p1: 0.5
+      p2: 0.3
+    - task: t122
+      p1: 0.6
+      p2: 0.4
+    - task: t123
+      p1: 0.7
+      p2: 0.5
+    - task: t124
+      p1: 0.8
+      p2: 0.6
+    - task: t125
+      p1: 0.9
+      p2: 0.7
+    - task: t126
+      p1: 0.1
+      p2: 0.1
+    - task: t127
+      p1: 0.2
+      p2: 0.2
+    - task: t128
+      p1: 0.3
+      p2: 0.3
+    - task: t129
+      p1: 0.4
+      p2: 0.4
+    - task: t130
+      p1: 0.5
+      p2: 0.5
+    - task: t131
+      p1: 0.6
+      p2: 0.6
+    - task: t132
+      p1: 0.7
+      p2: 0.7
+    - task: t133
+      p1: 0.8
+      p2: 0.1
+    - task: t134
+      p1: 0.9
+      p2: 0.2
+    - task: t135
+      p1: 0.1
+      p2: 0.3
+    - task: t136
+      p1: 0.2
+      p2: 0.4
+    - task: t137
+      p1: 0.3
+      p2: 0.5
+    - task: t138
+      p1: 0.4
+      p2: 0.6
+    - task: t139
+      p1: 0.5
+      p2: 0.7
+    - task: t140
+      p1: 0.6
+      p2: 0.1
+    - task: t141
+      p1: 0.7
+      p2: 0.2
+    - task: t142
+      p1: 0.8
+      p2: 0.3
+    - task: t143
+      p1: 0.9
+      p2: 0.4
+    - task: t144
+      p1: 0.1
+      p2: 0.5
+    - task: t145
+      p1: 0.2
+      p2: 0.6
+    - task: t146
+      p1: 0.3
+      p2: 0.7
+    - task: t147
+      p1: 0.4
+      p2: 0.1
+    - task: t148
+      p1: 0.5
+      p2: 0.2
+    - task: t149
+      p1: 0.6
+      p2: 0.3
+    - task: t150
+      p1: 0.7
+      p2: 0.4
+    - task: t151
+      p1: 0.8
+      p2: 0.5
+    - task: t152
+      p1: 0.9
+      p2: 0.6
+    - task: t153
+      p1: 0.1
+      p2: 0.7
+    - task: t154
+      p1: 0.2
+      p2: 0.1
+    - task: t155
+      p1: 0.3
+      p2: 0.2
+    - task: t156
+      p1: 0.4
+      p2: 0.3
+    - task: t157
+      p1: 0.5
+      p2: 0.4
+    - task: t158
+      p1: 0.6
+      p2: 0.5
+    - task: t159
+      p1: 0.7
+      p2: 0.6
+    - task: t160
+      p1: 0.8
+      p2: 0.7
+    - task: t161
+      p1: 0.9
+      p2: 0.1
+    - task: t162
+      p1: 0.1
+      p2: 0.2
+    - task: t163
+      p1: 0.2
+      p2: 0.3
+    - task: t164
+      p1: 0.3
+      p2: 0.4
+    - task: t165
+      p1: 0.4
+      p2: 0.5
+    - task: t166
+      p1: 0.5
+      p2: 0.6
+    - task: t167
+      p1: 0.6
+      p2: 0.7
+    - task: t168
+      p1: 0.7
+      p2: 0.1
+    - task: t169
+      p1: 0.8
+      p2: 0.2
+    - task: t170
+      p1: 0.9
+      p2: 0.3
+    - task: t171
+      p1: 0.1
+      p2: 0.4
+    - task: t172
+      p1: 0.2
+      p2: 0.5
+    - task: t173
+      p1: 0.3
+      p2: 0.6
+    - task: t174
+      p1: 0.4
+      p2: 0.7
+    - task: t175
+      p1: 0.5
+      p2: 0.1
+    - task: t176
+      p1: 0.6
+      p2: 0.2
+    - task: t177
+      p1: 0.7
+      p2: 0.3
+    - task: t178
+      p1: 0.8
+      p2: 0.4
+    - task: t179
+      p1: 0.9
+      p2: 0.5
+    - task: t180
+      p1: 0.1
+      p2: 0.6
+    - task: t181
+      p1: 0.2
+      p2: 0.7
+    - task: t182
+      p1: 0.3
+      p2: 0.1
+    - task: t183
+      p1: 0.4
+      p2: 0.2
+    - task: t184
+      p1: 0.5
+      p2: 0.3
+    - task: t185
+      p1: 0.6
+      p2: 0.4
+    - task: t186
+      p1: 0.7
+      p2: 0.5
+    - task: t187
+      p1: 0.8
+      p2: 0.6
+    - task: t188
+      p1: 0.9
+      p2: 0.7
+    - task: t189
+      p1: 0.1
+      p2: 0.1
+    - task: t190
+      p1: 0.2
+      p2: 0.2
+    - task: t191
+      p1: 0.3
+      p2: 0.3
+    - task: t192
+      p1: 0.4
+      p2: 0.4
+    - task: t193
+      p1: 0.5
+      p2: 0.5
+    - task: t194
+      p1: 0.6
+      p2: 0.6
+    - task: t195
+      p1: 0.7
+      p2: 0.7
+    - task: t196
+      p1: 0.8
+      p2: 0.1
+    - task: t197
+      p1: 0.9
+      p2: 0.2
+    - task: t198
+      p1: 0.1
+      p2: 0.3
+    - task: t199
+      p1: 0.2
+      p2: 0.4
+    - task: t200
+      p1: 0.3
+      p2: 0.5
+    - task: t201
+      p1: 0.4
+      p2: 0.6
+    - task: t202
+      p1: 0.5
+      p2: 0.7
+    - task: t203
+      p1: 0.6
+      p2: 0.1
+    - task: t204
+      p1: 0.7
+      p2: 0.2
+  description: |
+    alice reports her 205-entry hash-linked chain to dave. With the
+    quorum at 1, dave verifies the segment's prev_hash links, accepts
+    it, and replays it -- evicting down to the 200-entry cap.
+expected_state:
+  dave:
+    committed_tx_count: 200
+    window_root: 60220fa93f828b3ddda7cf6902ded8f2473b87bde61449c78f81acb69dbc5418

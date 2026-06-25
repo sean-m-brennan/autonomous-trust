@@ -51,9 +51,21 @@ typedef struct {
     bool valid;
 } cert_cache_entry_t;
 
+/* Max number of intermediate CA certificates between the leaf and the trust
+ * anchor (root). MUST stay in lockstep with Python `_MAX_CHAIN_DEPTH`
+ * (identity/zta/zta_verifier.py). OpenSSL's X509_VERIFY_PARAM_set_depth bounds
+ * exactly this quantity. Pinned by conformance zta-x509-reject-chain-depth. */
+#define AT_X509_MAX_CHAIN_DEPTH 8
+
 typedef struct {
     x509_verifier_config_t cfg;
     X509_STORE *ca_store;
+    /* Non-self-signed certs from the bundle, kept as UNTRUSTED intermediates and
+     * handed to X509_STORE_CTX_init at verify time. Only self-signed certs go
+     * into ca_store as trusted anchors -- otherwise OpenSSL would treat a bundled
+     * intermediate as a root and short-circuit the chain to depth 0, defeating
+     * the depth bound (matches Python: only a self-signed root terminates). */
+    STACK_OF(X509) *untrusted;
     cert_cache_entry_t cert_cache[CERT_CACHE_SIZE];
     int cert_cache_count;
     bool ocsp_reachable;                /* Last-known OCSP reachability */
@@ -407,7 +419,7 @@ static int x509_verify_credential(zta_verifier_t *self,
         return EZTA_INTERNAL;
     }
 
-    if (X509_STORE_CTX_init(ctx, impl->ca_store, cert, NULL) != 1) {
+    if (X509_STORE_CTX_init(ctx, impl->ca_store, cert, impl->untrusted) != 1) {
         X509_STORE_CTX_free(ctx);
         X509_free(cert);
         zta_result_set(result, ZTA_UNAVAILABLE, "failed to init verification context");
@@ -660,6 +672,8 @@ static void x509_destroy(zta_verifier_t *self)
             if (impl->cert_cache[i].valid && impl->cert_cache[i].der)
                 OPENSSL_free(impl->cert_cache[i].der);
         }
+        if (impl->untrusted)
+            sk_X509_pop_free(impl->untrusted, X509_free);
         if (impl->ca_store)
             X509_STORE_free(impl->ca_store);
         free(impl);
@@ -681,10 +695,46 @@ int x509_verifier_create(const x509_verifier_config_t *cfg,
     if (!store)
         return EX509_CALOAD;
 
+    /* Bound the chain depth (max intermediate CAs) so a pathologically deep
+     * chain is rejected -- C parity with Python _MAX_CHAIN_DEPTH. */
+    X509_STORE_set_depth(store, AT_X509_MAX_CHAIN_DEPTH);
+
+    STACK_OF(X509) *untrusted = NULL;
     if (cfg->ca_bundle_path[0] != '\0') {
-        if (X509_STORE_load_locations(store, cfg->ca_bundle_path, NULL) != 1) {
-            X509_STORE_free(store);
-            return EX509_CALOAD;
+        /* Load the bundle cert-by-cert, classifying self-signed certs as trusted
+         * roots (into the store) and the rest as UNTRUSTED intermediates. If we
+         * instead trusted every bundled cert (X509_STORE_load_locations), OpenSSL
+         * would treat a bundled intermediate as a valid anchor and the chain
+         * would verify at depth 0, making set_depth a no-op. Falls back to the
+         * bulk load for a directory / non-PEM path (no intermediates to bound).*/
+        BIO *bio = BIO_new_file(cfg->ca_bundle_path, "r");
+        int loaded = 0;
+        if (bio != NULL) {
+            X509 *c = NULL;
+            while ((c = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+                loaded++;
+                if (X509_NAME_cmp(X509_get_subject_name(c),
+                                  X509_get_issuer_name(c)) == 0) {
+                    X509_STORE_add_cert(store, c);  /* trusted root (ups ref) */
+                    X509_free(c);
+                } else {
+                    if (untrusted == NULL)
+                        untrusted = sk_X509_new_null();
+                    if (untrusted != NULL)
+                        sk_X509_push(untrusted, c); /* stack takes our ref */
+                    else
+                        X509_free(c);
+                }
+            }
+            BIO_free(bio);
+        }
+        if (loaded == 0) {
+            /* directory or non-PEM bundle: fall back to the bulk loader */
+            if (X509_STORE_load_locations(store, cfg->ca_bundle_path, NULL) != 1) {
+                if (untrusted != NULL) sk_X509_pop_free(untrusted, X509_free);
+                X509_STORE_free(store);
+                return EX509_CALOAD;
+            }
         }
     } else {
         /* Use system default CA paths */
@@ -696,14 +746,17 @@ int x509_verifier_create(const x509_verifier_config_t *cfg,
 
     x509_impl_t *impl = calloc(1, sizeof(x509_impl_t));
     if (!impl) {
+        if (untrusted != NULL) sk_X509_pop_free(untrusted, X509_free);
         X509_STORE_free(store);
         return EZTA_INTERNAL;
     }
     memcpy(&impl->cfg, cfg, sizeof(x509_verifier_config_t));
     impl->ca_store = store;
+    impl->untrusted = untrusted;
 
     zta_verifier_t *v = calloc(1, sizeof(zta_verifier_t));
     if (!v) {
+        if (untrusted != NULL) sk_X509_pop_free(untrusted, X509_free);
         X509_STORE_free(store);
         free(impl);
         return EZTA_INTERNAL;
