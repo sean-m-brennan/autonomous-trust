@@ -1,0 +1,53 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: caps-resync-max-per-sweep
+byte_pinning: false
+description: |
+    Pins CAPS_RESYNC_MAX_PER_SWEEP = 16 cross-language: the per-sweep cap on
+    directed peer_caps_query emissions from the periodic caps-resync backstop.
+
+    coord (a phase-3 border guard) is seeded with 20 synthetic cap-less peers
+    (fixtures.capless_peers) -- peers present in its roster but with no
+    capabilities registered, exactly the state the sweep targets after a
+    late-joiner UDP loss. The trigger_caps_resync pseudo-step invokes one sweep
+    (the sweep is timer-gated in production, so the harness drives it directly).
+    With 20 > 16 cap-less peers, the sweep emits exactly 16 peer_caps_query
+    messages and defers the remaining 4 to the next interval.
+
+    caps_query_emitted == 16 pins the cap on BOTH sides: if either
+    CAPS_RESYNC_MAX_PER_SWEEP drifts (Python idprocess._CAPS_RESYNC_MAX_PER_SWEEP
+    == C id_proc_priv.h CAPS_RESYNC_MAX_PER_SWEEP), the count diverges and the
+    cross-language diff goes asymmetric -- previously the two constants were
+    aligned only by inspection.
+
+    Both adapters recognize the trigger_caps_resync pseudo-function (invoke the
+    sweep) and the capless_peers fixture (inject N bare peers), and count
+    emitted peer_caps_query via caps_query_emitted.
+
+participants:
+  - id: coord
+    role: border_guard
+
+fixtures:
+  # Give coord a group so the sweep's phase-3 + in-a-group gate is satisfied on
+  # BOTH sides (the C sweep returns early without a group; the C adapter only
+  # group-inits participants via shared_group).
+  shared_group:
+    uuid: "0c000000-0000-4000-8000-000000000005"
+  capless_peers:
+    coord: 20
+
+steps:
+  - id: 1
+    from: coord
+    to: coord
+    function: trigger_caps_resync
+    description: |
+        Drive one periodic caps-resync sweep on coord. With 20 cap-less peers
+        in the roster, the sweep emits exactly CAPS_RESYNC_MAX_PER_SWEEP (16)
+        directed peer_caps_query messages and defers the rest.
+
+expected_state:
+  coord:
+    caps_query_emitted: 16
