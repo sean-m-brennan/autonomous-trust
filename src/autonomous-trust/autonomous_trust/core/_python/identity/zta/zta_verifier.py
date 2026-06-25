@@ -68,6 +68,13 @@ class Verifier(ABC):
     a NULL function pointer is treated as unavailable.
     """
 
+    #: A *secondary factor* (TOTP/FIDO2/...) is meaningful only with explicit
+    #: operator interaction at activation; it does not apply to a peer's bare
+    #: wire credential. `MfaChain` runs secondary factors only when a composite
+    #: (multi-factor) credential is presented, and skips them for the bare-cert
+    #: peer-admission path. Primary verifiers (X.509/PIV) leave this False.
+    secondary_factor: bool = False
+
     @abstractmethod
     def verify_credential(self, cred_data: Optional[bytes]) -> ZtaResult:
         """Validate a credential (signature chain, expiry, revocation status)."""

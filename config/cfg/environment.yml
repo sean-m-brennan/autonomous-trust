@@ -51,7 +51,9 @@ dependencies:
   - pyproj
   - cryptography
   - python-kaleido
+  - textual
+  - pyotp
+  - aquaveo::opensc  # not in conda-forge
   - pip
-  # pip packages currently disabled:
-  #   - mediapipe
-  #   - parrot-olympe  # uses an old version of protobuf
+  - pip:
+      - pykcs11

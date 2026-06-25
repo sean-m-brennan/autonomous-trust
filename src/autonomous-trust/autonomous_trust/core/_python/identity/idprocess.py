@@ -1278,6 +1278,38 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             _probes.counter('peer.set', 'caps_query_q_full')
             self.logger.error('_send_caps_query: Network queue full')
 
+    def _capability_descriptor(self, name: str) -> dict:
+        """Build the JSON descriptor for one capability for caps_response.
+
+        Always carries ``name``; adds required_tier/description/kind/arg_schema
+        when this node's `Capabilities` registry knows them (operator-console
+        directory metadata, PIV_MFA_OPERATOR_ACCESS_PLAN.md §3.5). Receivers are
+        tolerant of both this object form and a legacy bare name string.
+        """
+        from ..capabilities import sanitize_descriptor
+        desc = {'name': name}
+        cap = None
+        if self.capabilities is not None:
+            try:
+                cap = self.capabilities[name]
+            except KeyError:
+                cap = None
+        if cap is not None:
+            raw = {'required_tier': int(getattr(cap, 'required_tier', 0) or 0),
+                   'description': getattr(cap, 'description', '') or '',
+                   'kind': getattr(cap, 'kind', '') or ''}
+            schema = getattr(cap, 'arg_schema', None)
+            if not schema:
+                arg_names = getattr(cap, 'arg_names', None)
+                if arg_names:
+                    schema = {a: 'any' for a in arg_names}
+            if schema:
+                raw['arg_schema'] = schema
+            # Clamp to the same bounds the receiver enforces, so we never emit
+            # an oversized descriptor (defensive symmetry).
+            desc.update(sanitize_descriptor(raw))
+        return desc
+
     def handle_caps_query(self, queues, message):
         """Respond to a peer's caps_query with our own capability list."""
         if message.function != IdentityProtocol.caps_query:
@@ -1294,7 +1326,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             _probes.emit('peer.set', 'caps_query_responding',
                          caps_count=len(caps_list),
                          caps=','.join(sorted(caps_list)) if caps_list else '')
-            payload = to_json_string(caps_list)
+            # Carry per-capability descriptors (name + optional required_tier/
+            # description/kind/arg_schema). Receivers are tolerant of both this
+            # object form and a legacy bare-name string.
+            payload = to_json_string(
+                [self._capability_descriptor(n) for n in caps_list])
             sender = getattr(message, 'from_whom', None)
             if sender is None:
                 _probes.counter('peer.set', 'caps_query_no_sender')
@@ -1328,14 +1364,34 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             _probes.counter('peer.set', 'caps_response_no_sender')
             return True
         try:
-            caps_list = from_json_string(message.obj)
-            if not isinstance(caps_list, list) or not caps_list:
+            items = from_json_string(message.obj)
+            if not isinstance(items, list) or not items:
+                _probes.counter('peer.set', 'caps_response_bad_shape')
+                return True
+            # Tolerant parse: each item is either a legacy bare capability
+            # name (str) or a descriptor object {name, required_tier,
+            # description, kind, arg_schema}. Descriptors are untrusted and
+            # size-bounded by PeerCapabilities.register_descriptor.
+            caps_list = []
+            parsed_descriptors = {}
+            for item in items:
+                if isinstance(item, str):
+                    caps_list.append(item)
+                elif isinstance(item, dict) and isinstance(item.get('name'), str):
+                    nm = item['name']
+                    caps_list.append(nm)
+                    parsed_descriptors[nm] = {k: v for k, v in item.items()
+                                              if k != 'name'}
+                # else: malformed item, skip
+            if not caps_list:
                 _probes.counter('peer.set', 'caps_response_bad_shape')
                 return True
             # Compute the set of caps this peer is missing from.
             # Snapshot under lock; emit diagnostics OUTSIDE the lock to
             # avoid contention with the identity proc's fan-put path.
             with self.lock:
+                for nm, desc in parsed_descriptors.items():
+                    self.peer_capabilities.register_descriptor(nm, desc)
                 missing = [
                     c for c in caps_list
                     if sender.uuid not in self.peer_capabilities.get(c, [])

@@ -1,0 +1,70 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: peer-caps-descriptor-exchange
+byte_pinning: false
+description: |
+    Exercises the capability-DESCRIPTOR form of `peer_caps_response`
+    (PIV_MFA_OPERATOR_ACCESS_PLAN.md §3.5). Where peer-caps-exchange sends a
+    bare JSON array of capability names, this sends an array of descriptor
+    objects {name, required_tier, description, kind, arg_schema} so a peer's
+    capabilities are self-describing for the operator console's resource
+    directory.
+
+    bg sends a descriptor-form caps_response to newcomer.
+      - Python: handle_caps_response tolerantly parses each item as a name
+        (str) OR a descriptor object (dict). Names register in
+        peer_capabilities; descriptors are size-bounded (sanitize_descriptor)
+        and stored in peer_capabilities.descriptors[name].
+      - C: handle_caps_response must parse the same object/string-tolerant
+        form, register the names, and store the bounded descriptor in its
+        peer_caps map's per-cap descriptor slot.
+
+    Backward compatibility: the legacy name-only form is still covered by
+    peer-caps-exchange. A receiver MUST accept both; an item that is a bare
+    string carries only the name (no descriptor).
+
+    Size bounds (untrusted input): description <= 256 chars, kind <= 32,
+    arg_schema <= 32 entries (key <= 64, value <= 64). Receivers truncate/drop
+    oversized fields rather than rejecting the descriptor.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  capabilities:
+    bg: [sensor_validation, airquality_stream]
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_caps_response
+    payload:
+      descriptors:
+        - name: sensor_validation
+          required_tier: 0
+        - name: airquality_stream
+          required_tier: 1
+          description: live air-quality telemetry
+          kind: data_stream
+          arg_schema:
+            rate_hz: int
+    description: |
+        bg's descriptor-form caps_response delivered to newcomer.
+        handle_caps_response registers both caps under bg's uuid AND records
+        each descriptor in newcomer's peer_capabilities.descriptors.
+
+expected_state:
+  newcomer:
+    peer_caps_count: 2
+    peer_caps_descriptor:
+      airquality_stream:
+        required_tier: 1
+        description: live air-quality telemetry
+        kind: data_stream
+      sensor_validation:
+        required_tier: 0

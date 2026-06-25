@@ -130,6 +130,24 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: peer_caps_count={count}, expected {expected}'
                     )
+            elif key == 'peer_caps_descriptor':
+                # Assert a capability descriptor learned from caps_response.
+                # expected = {cap_name: {field: value, ...}}; each field must
+                # match the stored (size-bounded) descriptor. C's accessor
+                # reads the equivalent per-cap descriptor from its peer_caps map.
+                descriptors = getattr(self.process.peer_capabilities,
+                                      'descriptors', {})
+                for cap_name, fields in expected.items():
+                    stored = descriptors.get(cap_name)
+                    if stored is None:
+                        raise AssertionError(
+                            f'{self.id}: no descriptor for cap {cap_name!r}; '
+                            f'have {sorted(descriptors)}')
+                    for fk, fv in fields.items():
+                        if stored.get(fk) != fv:
+                            raise AssertionError(
+                                f'{self.id}: descriptor[{cap_name!r}][{fk!r}]='
+                                f'{stored.get(fk)!r}, expected {fv!r}')
             elif key == 'partition_probes_emitted':
                 # Number of group_partition_probe messages this participant
                 # emitted over the whole scenario. The signal-cooldown
@@ -694,10 +712,15 @@ class IdentityAdapter:
             # is something parseable but unused.
             obj = ''
         elif function == IdentityProtocol.caps_response:
-            # handle_caps_response parses `from_json_string(message.obj)`
-            # as a list of capability names. Build that native form.
-            caps_list = payload.get('caps', []) if isinstance(payload, dict) else []
-            obj = to_json_string(caps_list)
+            # handle_caps_response parses `from_json_string(message.obj)` as a
+            # list whose items are either bare capability names (legacy) or
+            # descriptor objects {name, required_tier, description, kind,
+            # arg_schema}. `caps` -> names; `descriptors` -> objects.
+            if isinstance(payload, dict) and payload.get('descriptors'):
+                obj = to_json_string(payload['descriptors'])
+            else:
+                caps_list = payload.get('caps', []) if isinstance(payload, dict) else []
+                obj = to_json_string(caps_list)
         elif function == IdentityProtocol.id_query:
             # Identity-resync query (layer 3): {group_uuid, have:[uuids]}.
             # The group_uuid is the asker's group (== the responder's in a

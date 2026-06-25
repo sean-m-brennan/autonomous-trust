@@ -336,8 +336,11 @@ class TestPlaybackEngine:
         assert "COMPROMISE_START" in seen
 
     def test_record_and_replay_roundtrip(self):
+        from unittest import mock
+
+        from autonomous_trust.evaluation.scenarios import playback_engine as pe_mod
         from autonomous_trust.evaluation.scenarios.playback_engine import (
-            PlaybackEngine,
+            PlaybackEngine, PlaybackMode,
         )
         from autonomous_trust.evaluation.scenarios.recording import (
             EventRecorder,
@@ -354,12 +357,26 @@ class TestPlaybackEngine:
             path = fh.name
         try:
             rec.save(path, scenario=s)
-            # Fresh scenario + engine, replay into it
+            # Replay the *recording* into a fresh scenario. In PLAYBACK mode
+            # load_recorded buffers the events and tick() drains them as
+            # scenario time advances -- the scripted timeline is suppressed, so
+            # whatever lands in `replayed` came from the recorded stream, not a
+            # re-run of s2. tick() is wall-clock driven, so we control the
+            # engine's monotonic clock to advance deterministically past the
+            # recording's extent in a single tick.
             s2 = DisasterResponseScenario()
-            engine2 = PlaybackEngine(s2)
+            engine2 = PlaybackEngine(s2, mode=PlaybackMode.PLAYBACK)
             replayed: list[str] = []
             engine2.on_event(lambda ev, t: replayed.append(ev.event_type.name))
             engine2.load_recorded(path)
+
+            clock = {"t": 1000.0}
+            with mock.patch.object(pe_mod.time, "monotonic",
+                                   lambda: clock["t"]):
+                engine2.play()             # anchors _last_wall at 1000
+                clock["t"] += 100_000.0    # jump past the recording's extent
+                engine2.tick()             # drains all deferred events
+
             assert replayed
             assert "COMPROMISE_START" in replayed
             assert "PEER_EXCLUDE" in replayed

@@ -23,10 +23,11 @@ unaffected.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import List, Optional
 
 from ...config.configuration import Configuration
 from .zta_verifier import Verifier, NullVerifier, OidcVerifier, X509Verifier
+from .mfa import MfaChain, CombinePolicy
 
 
 class ZtaPolicy(Configuration):
@@ -52,7 +53,10 @@ class ZtaPolicy(Configuration):
                  verifier_type: str = 'x509',
                  ca_bundle_path: str = '',
                  ocsp_url: str = '',
-                 crl_path: str = ''):
+                 crl_path: str = '',
+                 factors: Optional[List[dict]] = None,
+                 operator_allow_ddil_relay: bool = True,
+                 operator_privileged_requires_full_verify: bool = True):
         super().__init__()
         self.enabled = enabled
         self.require_at_admission = require_at_admission
@@ -67,6 +71,17 @@ class ZtaPolicy(Configuration):
         self.ca_bundle_path = ca_bundle_path
         self.ocsp_url = ocsp_url
         self.crl_path = crl_path
+        # MFA / operator-console fields (Python-only; see mfa.py and
+        # PIV_MFA_OPERATOR_ACCESS_PLAN.md §3.2/§3.4). Additive + optional:
+        # the C parser ignores unknown keys, so peer-admission policies are
+        # unaffected.
+        # Each factor dict: {"type": "piv"|"totp"|"x509"|"oidc"|"null", ...params}.
+        self.factors = list(factors) if factors else []
+        # DDIL posture for operator origination (stricter than peer admission's
+        # allow_ddil_fallback): prefer relayed PIV validation; absent any relay,
+        # cap at presence/communication and gate privileged origination.
+        self.operator_allow_ddil_relay = operator_allow_ddil_relay
+        self.operator_privileged_requires_full_verify = operator_privileged_requires_full_verify
 
     @classmethod
     def defaults(cls) -> 'ZtaPolicy':
@@ -99,4 +114,45 @@ class ZtaPolicy(Configuration):
             return X509Verifier(self.ca_bundle_path, self.ocsp_url, self.crl_path)
         if vt == 'oidc':
             return OidcVerifier()
+        if vt == 'mfa':
+            return self._create_mfa_chain()
+        return NullVerifier()
+
+    def _create_mfa_chain(self) -> MfaChain:
+        """Build an `MfaChain` from ``self.factors`` (AND-combined).
+
+        With no factors configured the chain is a single `NullVerifier` (the P0
+        no-op: enabled-in-code, verifies everything) so an ``mfa`` policy is
+        always constructible. Unknown factor types fall back to `NullVerifier`,
+        mirroring `create_verifier`'s fallback. PIV and TOTP factor types are
+        registered in later phases (P1/P2).
+        """
+        verifiers = [self._build_factor(f) for f in self.factors]
+        if not verifiers:
+            verifiers = [NullVerifier()]
+        return MfaChain(verifiers, combine=CombinePolicy.AND)
+
+    def _build_factor(self, factor: dict) -> Verifier:
+        ft = (factor.get('type') or 'null').lower()
+        if ft == 'x509':
+            return X509Verifier(factor.get('ca_bundle_path', self.ca_bundle_path),
+                                factor.get('ocsp_url', self.ocsp_url),
+                                factor.get('crl_path', self.crl_path))
+        if ft == 'piv':
+            # Imported lazily so the ZTA package loads without PKCS#11/PIV deps.
+            # No live token here (admission-gate construction): chain-only for
+            # bare peer certs; the activation helper builds its own PivVerifier
+            # with a real token to drive the challenge-response.
+            from .piv.piv_verifier import PivVerifier
+            return PivVerifier(factor.get('ca_bundle_path', self.ca_bundle_path),
+                               ocsp_url=factor.get('ocsp_url', self.ocsp_url),
+                               crl_path=factor.get('crl_path', self.crl_path))
+        if ft == 'totp':
+            # Lazy import: pyotp need not be installed unless TOTP is configured.
+            from .totp import TotpVerifier
+            return TotpVerifier(factor.get('secret', ''),
+                                valid_window=factor.get('valid_window', 1))
+        if ft == 'oidc':
+            return OidcVerifier()
+        # 'fido2' is future work; for any unknown type fall back to no-op.
         return NullVerifier()
