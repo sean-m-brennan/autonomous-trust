@@ -1,0 +1,127 @@
+# ******************
+#  Copyright 2025 Sean M. Brennan and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+"""CLI operator activation (no TUI; the Textual console is the separate
+``autonomous-trust-operator`` package).
+
+    python -m autonomous_trust.core._python.operator \
+        --module /usr/lib/opensc-pkcs11.so --ca-bundle /etc/at/agency-ca.pem \
+        --cfg-dir /etc/at
+
+(The concrete ``_python`` path is used because the backend-redirector's import
+alias does not support ``runpy``/``-m`` on a redirected submodule; ordinary
+imports of ``autonomous_trust.core.operator`` work normally.)
+
+PIN is prompted interactively (getpass) and never stored. Starting the
+discovery-capable ``OperatorNode`` lands in P3; P1 performs activation +
+credential binding + policy write.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+
+from .activate import activate
+from ..identity.zta import ZtaStatus
+
+
+def _build_token(args):
+    """Open a PivToken: a real PKCS#11 card, or a SoftwareToken for dev/test."""
+    if args.software_cert and args.software_key:
+        # Dev/CI path: a software token from a PEM cert + private key.
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, load_pem_private_key)
+        from cryptography.x509 import load_pem_x509_certificate
+        from ..identity.zta.piv.pkcs11 import SoftwareToken
+        with open(args.software_cert, 'rb') as fp:
+            cert_der = load_pem_x509_certificate(fp.read()).public_bytes(Encoding.DER)
+        with open(args.software_key, 'rb') as fp:
+            key = load_pem_private_key(fp.read(), password=None)
+        return SoftwareToken(cert_der, key)
+    import getpass
+    from ..identity.zta.piv.pkcs11 import PyKcs11Token
+    pin = getpass.getpass('PIV PIN: ')
+    return PyKcs11Token(args.module, pin, slot=args.slot)
+
+
+def main(argv=None) -> int:
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--module', help='PKCS#11 module path (e.g. opensc-pkcs11.so)')
+    ap.add_argument('--slot', type=int, default=None, help='PKCS#11 slot index')
+    ap.add_argument('--ca-bundle', required=True,
+                    help='agency root/intermediate CA bundle (PEM)')
+    ap.add_argument('--cfg-dir', default=None,
+                    help='config dir to bind the credential + write the policy')
+    ap.add_argument('--identity-id', default='',
+                    help='AT identity id to bind the challenge to')
+    ap.add_argument('--crl-path', default='', help='CRL path (PEM)')
+    ap.add_argument('--ocsp-url', default='', help='OCSP responder URL')
+    # TOTP second factor (RFC 6238).
+    ap.add_argument('--enroll-totp', action='store_true',
+                    help='first-activation: generate + enroll a new TOTP secret')
+    ap.add_argument('--totp-code', default=None,
+                    help='TOTP code (prompted if omitted when a factor is enrolled)')
+    # Dev/CI software-token path (no card).
+    ap.add_argument('--software-cert', default=None,
+                    help='dev only: PEM cert for a SoftwareToken')
+    ap.add_argument('--software-key', default=None,
+                    help='dev only: PEM private key for a SoftwareToken')
+    args = ap.parse_args(argv)
+
+    if not (args.software_cert and args.software_key) and not args.module:
+        ap.error('one of --module (real card) or --software-cert/--software-key '
+                 '(dev) is required')
+
+    # Resolve the TOTP second factor: enroll a fresh secret, or load the one
+    # already in the operator policy.
+    from .activate import enroll_totp, load_totp_secret
+    totp_secret = ''
+    if args.enroll_totp:
+        totp_secret, uri = enroll_totp(args.identity_id or 'operator')
+        print('TOTP enrollment -- add this to your authenticator, then enter a '
+              'code:\n  %s' % uri)
+    elif args.cfg_dir:
+        totp_secret = load_totp_secret(args.cfg_dir)
+    totp_code = args.totp_code
+    if totp_secret and totp_code is None:
+        import getpass
+        totp_code = getpass.getpass('TOTP code: ')
+
+    try:
+        token = _build_token(args)
+    except Exception as err:
+        print('ERROR: could not open PIV token: %s' % err, file=sys.stderr)
+        return 2
+    try:
+        result = activate(token, args.ca_bundle, cfg_dir=args.cfg_dir,
+                          identity_id=args.identity_id,
+                          crl_path=args.crl_path, ocsp_url=args.ocsp_url,
+                          totp_secret=totp_secret, totp_code=totp_code or '')
+    finally:
+        token.close()
+
+    if result.status is ZtaStatus.VERIFIED:
+        print('ACTIVATED: %s (cred sha256=%s)'
+              % (result.issuer, result.credential_hash.hex()[:16]))
+        return 0
+    print('DENIED [%s]: %s' % (result.status.value, result.reason), file=sys.stderr)
+    return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

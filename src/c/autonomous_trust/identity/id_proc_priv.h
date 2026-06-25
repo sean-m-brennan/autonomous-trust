@@ -71,6 +71,14 @@ void identity_set_own_capabilities(const process_t *proc,
  *  `peer_caps_count` expected_state key. */
 int identity_get_peer_caps_count(const uuid_t uuid);
 
+/** Copy the size-bounded capability descriptor recorded for @p cap_name (from
+ *  the descriptor form of `peer_caps_response`) into @p buf as a JSON string
+ *  ({required_tier, description, kind, arg_schema}; name excluded). Returns 0
+ *  on success, -1 if no descriptor is stored for that name (or on bad args).
+ *  Output is NUL-terminated and truncated to @p buflen. Conformance scenarios
+ *  assert against this via the `peer_caps_descriptor` expected_state key. */
+int identity_get_peer_cap_descriptor(const char *cap_name, char *buf, size_t buflen);
+
 /** Test accessor: install @p n_caps capability names for @p uuid directly
  *  into the shared peer_caps_map, bypassing the caps_response wire path.
  *  Mirrors how handle_caps_response populates the map. Used by the
