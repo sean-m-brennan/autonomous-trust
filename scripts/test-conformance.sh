@@ -233,12 +233,56 @@ run_diff() {
 # ---------------------------------------------------------------------------
 # Drive
 # ---------------------------------------------------------------------------
+#
+# Each harness and the diff run to completion independently: a harness that
+# reports failing cases (or a C build/run that exits nonzero) must NOT abort the
+# script before the cross-language diff prints its verdict. Both harnesses still
+# write their results JSON on the way out (pytest via teardown_module, the C
+# runner unconditionally), so the diff always has something to compare. We
+# capture each step's exit code and fold them into the final status, so CI stays
+# strict (nonzero on ANY harness failure OR asymmetry) while the
+# "N asymmetric" line is always visible.
+
+py_rc=0
+c_rc=0
+diff_rc=0
 
 if (( ! c_only )); then
+  set +e
   run_python
+  py_rc=$?
+  set -e
+  (( py_rc != 0 )) && echo "note: python harness reported failing/errored cases (rc=$py_rc)." >&2
 fi
 
 if (( run_c )); then
+  set +e
   run_c_harness
+  c_rc=$?
+  set -e
+  (( c_rc != 0 )) && echo "note: C harness reported failing/errored cases (rc=$c_rc)." >&2
+
+  set +e
   run_diff
+  diff_rc=$?
+  set -e
 fi
+
+echo
+echo "==== conformance summary ===="
+(( ! c_only )) && echo "  python harness : rc=$py_rc"
+if (( run_c )); then
+  echo "  c harness      : rc=$c_rc"
+  echo "  asymmetry diff : rc=$diff_rc   (0 = 0 asymmetric pass/fail)"
+fi
+if (( py_rc != 0 || c_rc != 0 )); then
+  echo "  NOTE: a harness had failing cases; 'asymmetry diff rc=0' means the two" >&2
+  echo "        sides AGREE per case, NOT that every case passed. Check the rc"  >&2
+  echo "        lines above for actual pass/fail." >&2
+fi
+
+# Fail on any harness failure OR a true cross-language asymmetry.
+if (( py_rc != 0 || c_rc != 0 || diff_rc != 0 )); then
+  exit 1
+fi
+exit 0

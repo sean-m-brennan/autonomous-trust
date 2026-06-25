@@ -71,11 +71,19 @@ def make_ca(common_name: str, org: str = "AT Mission PKI"
     return key, cert
 
 
-def make_leaf_cert(common_name: str,
-                   ca_key: ec.EllipticCurvePrivateKey,
-                   ca_cert: x509.Certificate,
-                   org: str = "AT Mission") -> x509.Certificate:
-    """Mint a leaf certificate for ``common_name`` signed by the given CA."""
+def make_leaf_keypair(common_name: str,
+                      ca_key: ec.EllipticCurvePrivateKey,
+                      ca_cert: x509.Certificate,
+                      org: str = "AT Mission",
+                      not_before: Optional[datetime.datetime] = None,
+                      not_after: Optional[datetime.datetime] = None
+                      ) -> Tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
+    """Mint a leaf cert for ``common_name`` and return ``(leaf_key, cert)``.
+
+    The private key is required for PIV challenge-response (the operator console
+    signs a nonce with it); `make_leaf_cert` drops it for the X.509-only path.
+    Pass ``not_after`` in the past to mint an expired leaf.
+    """
     leaf_key = ec.generate_private_key(ec.SECP256R1())
     cert = (
         x509.CertificateBuilder()
@@ -83,12 +91,53 @@ def make_leaf_cert(common_name: str,
         .issuer_name(ca_cert.subject)
         .public_key(leaf_key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(_NOT_BEFORE)
-        .not_valid_after(_NOT_AFTER)
+        .not_valid_before(not_before or _NOT_BEFORE)
+        .not_valid_after(not_after or _NOT_AFTER)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .sign(ca_key, hashes.SHA256())
     )
-    return cert
+    return leaf_key, cert
+
+
+def make_leaf_cert(common_name: str,
+                   ca_key: ec.EllipticCurvePrivateKey,
+                   ca_cert: x509.Certificate,
+                   org: str = "AT Mission") -> x509.Certificate:
+    """Mint a leaf certificate for ``common_name`` signed by the given CA."""
+    return make_leaf_keypair(common_name, ca_key, ca_cert, org)[1]
+
+
+def make_crl(ca_key: ec.EllipticCurvePrivateKey,
+             ca_cert: x509.Certificate,
+             revoked_serials,
+             this_update: Optional[datetime.datetime] = None,
+             next_update: Optional[datetime.datetime] = None) -> bytes:
+    """Build a CRL (PEM) signed by the CA revoking ``revoked_serials``.
+
+    `X509Verifier.check_revocation` loads PEM CRLs and matches **by serial
+    number** against certs already in its cache (i.e. ones that passed
+    `verify_credential` first), so this is the producer side of that path
+    (PIV_MFA_OPERATOR_ACCESS_PLAN.md §7.1 -- no CRL-minting helper existed
+    before).
+    """
+    this_update = this_update or _NOT_BEFORE
+    next_update = next_update or _NOT_AFTER
+    builder = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca_cert.subject)
+        .last_update(this_update)
+        .next_update(next_update)
+    )
+    for serial in revoked_serials:
+        revoked = (
+            x509.RevokedCertificateBuilder()
+            .serial_number(int(serial))
+            .revocation_date(this_update)
+            .build()
+        )
+        builder = builder.add_revoked_certificate(revoked)
+    crl = builder.sign(private_key=ca_key, algorithm=hashes.SHA256())
+    return crl.public_bytes(serialization.Encoding.PEM)
 
 
 def cert_der(cert: x509.Certificate) -> bytes:
@@ -101,12 +150,16 @@ def ca_bundle_pem(*ca_certs: x509.Certificate) -> bytes:
 
 def forged_credential(mode: str, peer_name: str,
                       rogue_ca: Optional[Tuple[ec.EllipticCurvePrivateKey,
-                                               x509.Certificate]] = None) -> bytes:
+                                               x509.Certificate]] = None,
+                      mission_ca: Optional[Tuple[ec.EllipticCurvePrivateKey,
+                                                 x509.Certificate]] = None) -> bytes:
     """Return the DER credential a forged sensor presents for ``mode``.
 
       * "unsigned"    -> b'' (no credential at all)
       * "self_signed" -> a cert signed by a rogue CA NOT in the mission bundle
                          (i.e. "self-signed / not chained to the mission roster")
+      * "expired"     -> a cert signed by the *mission* CA but past its validity
+                         window (requires ``mission_ca``); EXPIRED, not REJECTED
       * "sybil"       -> handled by uuid-collision, not the cert gate; returns b''
 
     The rogue CA may be supplied for determinism; otherwise a fresh one is made.
@@ -118,6 +171,15 @@ def forged_credential(mode: str, peer_name: str,
             rogue_ca = make_ca("AT Rogue Root", org="Rogue CA")
         rkey, rcert = rogue_ca
         return cert_der(make_leaf_cert(peer_name, rkey, rcert, org="Rogue"))
+    if mode == "expired":
+        if mission_ca is None:
+            raise ValueError("expired mode requires mission_ca=(key, cert)")
+        mkey, mcert = mission_ca
+        past_before = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+        past_after = datetime.datetime(2021, 1, 1, tzinfo=datetime.timezone.utc)
+        _, cert = make_leaf_keypair(peer_name, mkey, mcert,
+                                    not_before=past_before, not_after=past_after)
+        return cert_der(cert)
     raise ValueError("unknown forgery mode: %r" % mode)
 
 

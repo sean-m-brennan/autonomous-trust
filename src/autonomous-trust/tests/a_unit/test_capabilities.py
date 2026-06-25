@@ -17,7 +17,9 @@ import pytest
 from uuid import uuid4
 from unittest.mock import MagicMock, patch
 
-from autonomous_trust.core.capabilities import Capability, Capabilities, PeerCapabilities
+from autonomous_trust.core.capabilities import (
+    Capability, Capabilities, PeerCapabilities, sanitize_descriptor,
+    MAX_DESCRIPTION_LEN, MAX_KIND_LEN, MAX_ARG_SCHEMA_ENTRIES)
 
 
 class TestCapability:
@@ -37,6 +39,18 @@ class TestCapability:
         cap = Capability('task1')
         d = cap.to_dict()
         assert d == {'name': 'task1', 'required_tier': 0, 'transaction_weight': 1}
+
+    def test_descriptor_fields_are_runtime_only_not_on_wire(self):
+        # Descriptor metadata must not ride the wire (no conformance impact):
+        # it survives sync_to_message but a wire round-trip clears it.
+        cap = Capability('task1', required_tier=2, description='desc',
+                         kind='service', arg_schema={'a': 'int'})
+        restored = Capability.from_wire_bytes(cap.to_wire_bytes())
+        assert restored.name == 'task1'
+        assert restored.required_tier == 2          # this IS on the wire
+        assert restored.description == ''            # runtime-only, cleared
+        assert restored.kind == ''
+        assert restored.arg_schema is None
 
     def test_execute(self):
         func = MagicMock(return_value=42)
@@ -63,6 +77,17 @@ class TestCapabilities:
         caps.register_ability('task1', lambda: None)
         assert len(caps) == 1
         assert caps['task1'].name == 'task1'
+
+    def test_register_ability_with_descriptor(self):
+        caps = Capabilities()
+        caps.register_ability('video', lambda: None, required_tier=1,
+                              description='live video feed', kind='data_stream',
+                              arg_schema={'fps': 'int'})
+        cap = caps['video']
+        assert cap.description == 'live video feed'
+        assert cap.kind == 'data_stream'
+        assert cap.arg_schema == {'fps': 'int'}
+        assert cap.required_tier == 1
 
     def test_contains(self):
         caps = Capabilities()
@@ -114,3 +139,63 @@ class TestPeerCapabilities:
     def test_init_with_listing(self):
         pc = PeerCapabilities(_listing={'cap1': [uuid4()]})
         assert len(pc) == 1
+
+
+class TestSanitizeDescriptor:
+    def test_description_truncated(self):
+        out = sanitize_descriptor({'description': 'x' * 10_000})
+        assert len(out['description']) == MAX_DESCRIPTION_LEN
+
+    def test_kind_truncated(self):
+        out = sanitize_descriptor({'kind': 'k' * 1000})
+        assert len(out['kind']) == MAX_KIND_LEN
+
+    def test_arg_schema_entry_cap_and_field_lengths(self):
+        big_schema = {('k%d' % i): 'v' for i in range(100)}
+        big_schema['x' * 500] = 'y' * 500
+        out = sanitize_descriptor({'arg_schema': big_schema})
+        assert len(out['arg_schema']) <= MAX_ARG_SCHEMA_ENTRIES
+        for k, v in out['arg_schema'].items():
+            assert len(k) <= 64
+            assert len(v) <= 64
+
+    def test_required_tier_int_only(self):
+        assert sanitize_descriptor({'required_tier': 3})['required_tier'] == 3
+        # bools and non-ints are rejected
+        assert 'required_tier' not in sanitize_descriptor({'required_tier': True})
+        assert 'required_tier' not in sanitize_descriptor({'required_tier': 'hi'})
+
+    def test_unknown_keys_dropped(self):
+        out = sanitize_descriptor({'evil': 'x' * 10_000, 'description': 'ok'})
+        assert out == {'description': 'ok'}
+
+    def test_non_dict_returns_empty(self):
+        assert sanitize_descriptor('not a dict') == {}
+
+
+class TestPeerCapabilitiesDescriptors:
+    def test_register_descriptor_sanitizes(self):
+        pc = PeerCapabilities()
+        pc.register_descriptor('video', {'required_tier': 1,
+                                         'description': 'd' * 10_000,
+                                         'kind': 'data_stream'})
+        d = pc.descriptors['video']
+        assert d['required_tier'] == 1
+        assert len(d['description']) == MAX_DESCRIPTION_LEN
+        assert d['kind'] == 'data_stream'
+
+    def test_empty_descriptor_ignored(self):
+        pc = PeerCapabilities()
+        pc.register_descriptor('video', {})
+        pc.register_descriptor('video', None)
+        assert 'video' not in pc.descriptors
+
+    def test_descriptors_not_serialized(self):
+        # Descriptors are runtime-only: not on the protobuf wire / persist form.
+        pc = PeerCapabilities()
+        pid = uuid4()
+        pc.register(pid, ['video'])
+        pc.register_descriptor('video', {'required_tier': 2})
+        restored = PeerCapabilities.from_wire_bytes(pc.to_wire_bytes())
+        assert 'video' in restored          # name survives (in _listing)
+        assert restored.descriptors == {}   # descriptor does not

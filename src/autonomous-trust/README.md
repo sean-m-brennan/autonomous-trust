@@ -77,6 +77,31 @@ Downloads/installs (local to working dir):
   * libffi
 
 
+Development setup
+-----------------
+
+Dependencies are managed with **conda** (not pip/venv). Two environment files
+under `config/cfg/` are authoritative:
+
+  * [`config/cfg/environment.yml`](../../config/cfg/environment.yml) --- **runtime**
+    dependencies.
+  * [`config/cfg/devel_environ.yml`](../../config/cfg/devel_environ.yml) --- **build
+    and test** dependencies (compilers, `pytest`, conformance tooling, etc.).
+
+```bash
+# runtime environment
+conda env create -f config/cfg/environment.yml
+# add the build/test toolchain into the same env
+conda env update -n autonomous_trust -f config/cfg/devel_environ.yml
+conda activate autonomous_trust
+```
+
+When you add a dependency, declare it in the appropriate file: runtime deps go
+in `environment.yml`; test/build-only deps go in `devel_environ.yml`. The
+per-package `pyproject.toml` files mirror these for packaging, but the conda
+env files are the source of truth for local development.
+
+
 Documentation
 -------------
 
