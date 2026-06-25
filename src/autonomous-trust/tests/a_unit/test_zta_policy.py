@@ -15,7 +15,8 @@
 # ******************
 import os
 
-from autonomous_trust.core.identity.zta import ZtaPolicy, NullVerifier, OidcVerifier
+from autonomous_trust.core.identity.zta import (
+    ZtaPolicy, NullVerifier, OidcVerifier, MfaChain)
 from autonomous_trust.core.config.configuration import from_json_string, to_json_string
 
 
@@ -40,6 +41,32 @@ class TestZtaPolicy:
         assert isinstance(ZtaPolicy(enabled=True, verifier_type='bogus')
                           .create_verifier(), NullVerifier)
 
+    def test_mfa_no_factors_builds_null_chain(self):
+        # P0 exit criterion: enabled mfa with no factors -> MfaChain([NullVerifier]).
+        v = ZtaPolicy(enabled=True, verifier_type='mfa').create_verifier()
+        assert isinstance(v, MfaChain)
+        assert len(v.factors) == 1
+        assert isinstance(v.factors[0], NullVerifier)
+
+    def test_mfa_builds_factor_chain(self):
+        v = ZtaPolicy(enabled=True, verifier_type='mfa',
+                      factors=[{'type': 'oidc'}, {'type': 'null'}]).create_verifier()
+        assert isinstance(v, MfaChain)
+        assert len(v.factors) == 2
+        assert isinstance(v.factors[0], OidcVerifier)
+
+    def test_mfa_disabled_still_null_verifier(self):
+        assert isinstance(ZtaPolicy(enabled=False, verifier_type='mfa')
+                          .create_verifier(), NullVerifier)
+
+    def test_mfa_piv_factor_builds_piv_verifier(self):
+        from autonomous_trust.core.identity.zta.piv.piv_verifier import PivVerifier
+        v = ZtaPolicy(enabled=True, verifier_type='mfa',
+                      ca_bundle_path='/etc/pki/agency.pem',
+                      factors=[{'type': 'piv'}]).create_verifier()
+        assert isinstance(v, MfaChain)
+        assert isinstance(v.factors[0], PivVerifier)
+
     def test_json_roundtrip(self):
         p = ZtaPolicy(enabled=True, verifier_type='x509',
                       ca_bundle_path='/etc/pki/ca.pem',
@@ -51,6 +78,26 @@ class TestZtaPolicy:
         assert restored.ca_bundle_path == '/etc/pki/ca.pem'
         assert restored.ddil_fallback_reputation_cap == 0.3
         assert restored.reverify_interval_sec == 900
+
+    def test_json_roundtrip_mfa_fields(self):
+        p = ZtaPolicy(enabled=True, verifier_type='mfa',
+                      factors=[{'type': 'piv', 'slot': 0},
+                               {'type': 'totp', 'issuer': 'AT'}],
+                      operator_allow_ddil_relay=False,
+                      operator_privileged_requires_full_verify=True)
+        restored = from_json_string(to_json_string(p))
+        assert isinstance(restored, ZtaPolicy)
+        assert restored.verifier_type == 'mfa'
+        assert restored.factors == [{'type': 'piv', 'slot': 0},
+                                     {'type': 'totp', 'issuer': 'AT'}]
+        assert restored.operator_allow_ddil_relay is False
+        assert restored.operator_privileged_requires_full_verify is True
+
+    def test_new_fields_default(self):
+        p = ZtaPolicy.defaults()
+        assert p.factors == []
+        assert p.operator_allow_ddil_relay is True
+        assert p.operator_privileged_requires_full_verify is True
 
     def test_load_absent_returns_defaults(self, tmp_path):
         p = ZtaPolicy.load(str(tmp_path))

@@ -120,6 +120,15 @@ static struct {
      * lowercased uuid string; values are array_t* of cap-name strings.
      * Conformance assertion surface via identity_get_peer_caps_count. */
     map_t peer_caps_map;
+    /* Optional per-capability descriptors learned from the descriptor form
+     * of caps_response (PIV_MFA_OPERATOR_ACCESS_PLAN.md §3.5). Keyed by
+     * capability NAME (not peer uuid — a descriptor is a property of the
+     * capability); values are JSON-string data of the size-bounded
+     * descriptor object {required_tier, description, kind, arg_schema}
+     * (name excluded; caller keys by it). Mirrors Python's runtime-only
+     * PeerCapabilities.descriptors. Conformance assertion surface via
+     * identity_get_peer_cap_descriptor. */
+    map_t peer_cap_descriptors_map;
     /* Reputation-derived per-peer trust tier. Keyed by lowercased uuid
      * string; values are int data. Written by handle_tier_update on
      * local IPC from ReputationProcess. Mirrors Python's per-peer
@@ -169,6 +178,7 @@ static void _ensure_id_init(void)
         map_init(&id_state.vote_collection);
         map_init(&id_state.own_caps_by_proc);
         map_init(&id_state.peer_caps_map);
+        map_init(&id_state.peer_cap_descriptors_map);
         map_init(&id_state.peer_tiers);
         map_init(&id_state.partition_probe_cooldown);
         map_init(&id_state.partition_response_cooldown);
@@ -319,6 +329,28 @@ int identity_get_peer_caps_count(const uuid_t uuid)
     int n = (arr != NULL) ? (int)array_size(arr) : 0;
     pthread_mutex_unlock(&id_state.lock);
     return n;
+}
+
+int identity_get_peer_cap_descriptor(const char *cap_name, char *buf, size_t buflen)
+{
+    if (!id_state.initialized || cap_name == NULL || buf == NULL || buflen == 0)
+        return -1;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    int rc = -1;
+    if (map_get(&id_state.peer_cap_descriptors_map, (map_key_t)cap_name, &dat) == 0
+        && dat != NULL)
+    {
+        char *s = NULL;
+        if (data_string_ptr(dat, &s) == 0 && s != NULL)
+        {
+            strncpy(buf, s, buflen - 1);
+            buf[buflen - 1] = '\0';
+            rc = 0;
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return rc;
 }
 
 void identity_install_peer_caps(const uuid_t uuid,
@@ -1757,6 +1789,8 @@ void identity_reset_state(void)
     map_init(&id_state.own_caps_by_proc);
     map_free(&id_state.peer_caps_map);
     map_init(&id_state.peer_caps_map);
+    map_free(&id_state.peer_cap_descriptors_map);
+    map_init(&id_state.peer_cap_descriptors_map);
     map_free(&id_state.peer_tiers);
     map_init(&id_state.peer_tiers);
     map_free(&id_state.partition_probe_cooldown);
@@ -2263,16 +2297,120 @@ static bool handle_caps_query(const process_t *proc, directory_t *queues, generi
     return true;
 }
 
+/* Strict bounds on capability-descriptor fields received over the wire.
+ * A descriptor is untrusted peer input, so cap every string/collection to
+ * keep a malicious or buggy peer from inflating memory / slowing parsing.
+ * Oversized values are truncated/dropped, not rejected. MUST stay in lockstep
+ * with Python capabilities.sanitize_descriptor (MAX_DESCRIPTION_LEN etc.). */
+#define AT_DESC_MAX_DESCRIPTION_LEN  256
+#define AT_DESC_MAX_KIND_LEN          32
+#define AT_DESC_MAX_ARG_SCHEMA_ENTRIES 32
+#define AT_DESC_MAX_ARG_KEY_LEN       64
+#define AT_DESC_MAX_ARG_VALUE_LEN     64
+
+/* Build a size-bounded descriptor object from an untrusted caps_response item.
+ * Returns a NEW json reference (caller decrefs) holding only the recognized,
+ * clamped keys (required_tier/description/kind/arg_schema) — `name` is excluded
+ * (the caller keys the map by it). Returns NULL if nothing worth storing.
+ * Mirrors Python capabilities.sanitize_descriptor. */
+/* Frama-C: skipped — JSON sanitation. */
+static json_t *_sanitize_descriptor(json_t *item)
+{
+    if (!json_is_object(item)) return NULL;
+    json_t *clean = json_object();
+    if (clean == NULL) return NULL;
+
+    /* required_tier: int only. jansson json_is_integer() is false for
+     * booleans, so this naturally rejects bool-as-int like Python does. */
+    json_t *rt = json_object_get(item, "required_tier");
+    if (json_is_integer(rt))
+        json_object_set_new(clean, "required_tier",
+                            json_integer(json_integer_value(rt)));
+
+    json_t *desc = json_object_get(item, "description");
+    if (json_is_string(desc))
+    {
+        const char *s = json_string_value(desc);
+        if (s != NULL && s[0] != '\0')
+        {
+            char b[AT_DESC_MAX_DESCRIPTION_LEN + 1];
+            strncpy(b, s, AT_DESC_MAX_DESCRIPTION_LEN);
+            b[AT_DESC_MAX_DESCRIPTION_LEN] = '\0';
+            json_object_set_new(clean, "description", json_string(b));
+        }
+    }
+
+    json_t *kind = json_object_get(item, "kind");
+    if (json_is_string(kind))
+    {
+        const char *s = json_string_value(kind);
+        if (s != NULL && s[0] != '\0')
+        {
+            char b[AT_DESC_MAX_KIND_LEN + 1];
+            strncpy(b, s, AT_DESC_MAX_KIND_LEN);
+            b[AT_DESC_MAX_KIND_LEN] = '\0';
+            json_object_set_new(clean, "kind", json_string(b));
+        }
+    }
+
+    json_t *schema = json_object_get(item, "arg_schema");
+    if (json_is_object(schema) && json_object_size(schema) > 0)
+    {
+        json_t *bounded = json_object();
+        if (bounded != NULL)
+        {
+            const char *k = NULL;
+            json_t *v = NULL;
+            size_t cnt = 0;
+            json_object_foreach(schema, k, v)
+            {
+                if (cnt >= AT_DESC_MAX_ARG_SCHEMA_ENTRIES) break;
+                char kb[AT_DESC_MAX_ARG_KEY_LEN + 1];
+                strncpy(kb, k, AT_DESC_MAX_ARG_KEY_LEN);
+                kb[AT_DESC_MAX_ARG_KEY_LEN] = '\0';
+                if (json_is_string(v))
+                {
+                    const char *vs = json_string_value(v);
+                    char vb[AT_DESC_MAX_ARG_VALUE_LEN + 1];
+                    strncpy(vb, vs != NULL ? vs : "", AT_DESC_MAX_ARG_VALUE_LEN);
+                    vb[AT_DESC_MAX_ARG_VALUE_LEN] = '\0';
+                    json_object_set_new(bounded, kb, json_string(vb));
+                }
+                else
+                {
+                    /* non-string value: keep as-is (Python passes it through) */
+                    json_object_set(bounded, kb, v);
+                }
+                cnt++;
+            }
+            if (json_object_size(bounded) > 0)
+                json_object_set_new(clean, "arg_schema", bounded);
+            else
+                json_decref(bounded);
+        }
+    }
+
+    if (json_object_size(clean) == 0)
+    {
+        json_decref(clean);
+        return NULL;
+    }
+    return clean;
+}
+
 /****************************
  * Handler: handle_caps_response (peer_caps_response)
  *
- * Parse a JSON array of capability names and store under the sender's
- * uuid in id_state.peer_caps_map. Mirrors Python's
- * handle_caps_response (idprocess.py:832 — registers received caps
- * under sender.uuid in self.peer_capabilities, with per-cap dedup;
- * this C analog stores the full set verbatim, dedup with subsequent
- * responses by replacement). Conformance scenarios observe via
- * identity_get_peer_caps_count.
+ * Tolerant parse: each array item is either a legacy bare capability NAME
+ * (JSON string) or a descriptor OBJECT {name, required_tier, description,
+ * kind, arg_schema} (PIV_MFA_OPERATOR_ACCESS_PLAN.md §3.5). Names register
+ * under the sender's uuid in id_state.peer_caps_map (per-cap count observed
+ * via identity_get_peer_caps_count); descriptors are size-bounded
+ * (_sanitize_descriptor) and stored by cap name in peer_cap_descriptors_map
+ * (observed via identity_get_peer_cap_descriptor). Mirrors Python's
+ * handle_caps_response (idprocess.py — tolerant item parse + descriptor
+ * registration). A receiver MUST accept both forms; a bare string carries
+ * only the name.
  ****************************/
 
 /* Frama-C: skipped — JSON parsing + map mutation. */
@@ -2307,8 +2445,24 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
     size_t n = json_array_size(payload);
     for (size_t i = 0; i < n; i++)
     {
-        const char *name = json_string_value(json_array_get(payload, i));
-        if (name == NULL) continue;
+        json_t *item = json_array_get(payload, i);
+        const char *name = NULL;
+        json_t *desc_src = NULL;   /* non-NULL only for the object form */
+        if (json_is_string(item))
+        {
+            name = json_string_value(item);
+        }
+        else if (json_is_object(item))
+        {
+            json_t *nm = json_object_get(item, "name");
+            if (json_is_string(nm))
+            {
+                name = json_string_value(nm);
+                desc_src = item;
+            }
+        }
+        if (name == NULL) continue;   /* malformed item: skip */
+
         size_t len = strlen(name);
         char *dup = smrt_create(len + 1);
         if (dup == NULL) continue;
@@ -2316,6 +2470,41 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
         data_t *str_dat = string_data(dup, len + 1);
         if (str_dat == NULL) { smrt_deref(dup); continue; }
         array_append(arr, str_dat);
+
+        /* Object form: record the size-bounded descriptor keyed by cap name.
+         * An empty/None descriptor is ignored so a legacy name-only item never
+         * clobbers a known descriptor (Python register_descriptor semantics). */
+        if (desc_src != NULL)
+        {
+            json_t *clean = _sanitize_descriptor(desc_src);
+            if (clean != NULL)
+            {
+                char *djson = json_dumps(clean, JSON_COMPACT | JSON_SORT_KEYS);
+                json_decref(clean);
+                if (djson != NULL)
+                {
+                    size_t dl = strlen(djson);
+                    char *ddup = smrt_create(dl + 1);
+                    if (ddup != NULL)
+                    {
+                        memcpy(ddup, djson, dl + 1);
+                        data_t *ddat = string_data(ddup, dl + 1);
+                        if (ddat != NULL)
+                        {
+                            pthread_mutex_lock(&id_state.lock);
+                            map_set(&id_state.peer_cap_descriptors_map,
+                                    (map_key_t)name, ddat);
+                            pthread_mutex_unlock(&id_state.lock);
+                        }
+                        else
+                        {
+                            smrt_deref(ddup);
+                        }
+                    }
+                    free(djson);   /* jansson json_dumps() uses malloc */
+                }
+            }
+        }
     }
     json_decref(payload);
 

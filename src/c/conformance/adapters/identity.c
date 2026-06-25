@@ -475,10 +475,25 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     out->info.net_msg.encrypt = false;
     memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
 
-    /* peer_caps_response — pack the YAML `caps: [...]` list as a JSON
-     * array so handle_caps_response can parse + register it. Without
-     * this, the C handler sees no payload and silently no-ops. */
+    /* peer_caps_response — pack the payload as the JSON array
+     * handle_caps_response expects. Two YAML forms (mirrors the Python
+     * adapter):
+     *   - `descriptors: [{name, required_tier, description, kind, arg_schema}]`
+     *     → packed verbatim as an array of objects (descriptor form).
+     *   - `caps: [name, ...]` → packed as an array of name strings (legacy).
+     * Without this the C handler sees no payload and silently no-ops. */
     if (strcmp(function, "peer_caps_response") == 0 && json_is_object(payload)) {
+        json_t *descs = json_object_get(payload, "descriptors");
+        if (json_is_array(descs)) {
+            /* deep-copy so the body is independent of the scenario JSON's
+             * lifetime; net_msg_pack_json serializes the array of objects. */
+            json_t *body = json_deep_copy(descs);
+            if (body != NULL) {
+                net_msg_pack_json(&out->info.net_msg, body);
+                json_decref(body);
+            }
+            return 0;
+        }
         json_t *src = json_object_get(payload, "caps");
         if (json_is_array(src)) {
             json_t *body = json_array();
@@ -957,6 +972,58 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: group_size=%d, expected %d", pid, got, want);
                     return -1;
+                }
+            } else if (strcmp(key, "peer_caps_descriptor") == 0) {
+                /* `peer_caps_descriptor: {cap_name: {field: value, ...}}` —
+                 * assert each field matches the size-bounded descriptor
+                 * recorded by handle_caps_response (stored by cap name in the
+                 * shared id_state.peer_cap_descriptors_map; read via
+                 * identity_get_peer_cap_descriptor). Mirrors the Python
+                 * adapter's peer_caps_descriptor check. */
+                if (!json_is_object(val)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: peer_caps_descriptor must be an object", pid);
+                    return -1;
+                }
+                const char *cap_name = NULL;
+                json_t *fields = NULL;
+                json_object_foreach(val, cap_name, fields) {
+                    /* descriptors are small; bound the buffer generously and
+                     * note that expected_state targets compact descriptors. */
+                    char dbuf[2048];
+                    if (identity_get_peer_cap_descriptor(cap_name, dbuf,
+                                                         sizeof(dbuf)) != 0) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: no descriptor for cap %s", pid, cap_name);
+                        return -1;
+                    }
+                    json_error_t jerr;
+                    json_t *stored = json_loads(dbuf, 0, &jerr);
+                    if (stored == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: descriptor for %s unparseable", pid,
+                                 cap_name);
+                        return -1;
+                    }
+                    const char *fk = NULL;
+                    json_t *fv = NULL;
+                    char bad_field[128] = {0};
+                    int mismatch = 0;
+                    json_object_foreach(fields, fk, fv) {
+                        json_t *sv = json_object_get(stored, fk);
+                        if (sv == NULL || !json_equal(sv, fv)) {
+                            mismatch = 1;
+                            snprintf(bad_field, sizeof(bad_field), "%s", fk);
+                            break;
+                        }
+                    }
+                    json_decref(stored);
+                    if (mismatch) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: descriptor[%s][%s] mismatch", pid,
+                                 cap_name, bad_field);
+                        return -1;
+                    }
                 }
             } else {
                 snprintf(ctx->err, sizeof(ctx->err),
