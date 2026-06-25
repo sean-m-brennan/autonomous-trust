@@ -1,0 +1,60 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-x509-reject-chain-depth
+byte_pinning: false
+description: |
+    ZTA X.509 admission — the cert-chain-depth bound (_MAX_CHAIN_DEPTH = 8
+    intermediate CAs). newcomer announces a leaf whose chain to the trusted root
+    runs through 9 intermediate CAs (leaf <- int9 <- ... <- int1 <- root). The
+    bundle trusts the self-signed root and carries the intermediates, so the
+    verifier WALKS the full chain; every hop's signature + validity is valid, so
+    WITHOUT the depth bound the chain would verify and the peer be admitted
+    (propose_emitted == 1). With the bound (max 8 intermediates) both sides
+    reject ('certificate chain too long') and no propose is emitted.
+
+    This pins the depth bound cross-language. The two implementations bound the
+    SAME quantity -- the number of intermediate CAs between the leaf and the
+    trust anchor:
+      - Python zta_verifier._verify_chain walks leaf -> ... -> self-signed root,
+        counting intermediates, rejecting when the count exceeds _MAX_CHAIN_DEPTH.
+      - C x509_verify_credential uses OpenSSL X509_VERIFY_PARAM_set_depth(8),
+        loading self-signed certs as trusted roots and the rest as untrusted
+        intermediates so the depth is actually counted (not short-circuited by
+        treating every bundled cert as an anchor).
+    A boundary chain of exactly 8 intermediates verifies; 9 is rejected. Keep
+    _MAX_CHAIN_DEPTH in lockstep (Python zta_verifier.py == C x509_verifier).
+
+    Cross-impl: pinned on BOTH sides. The C conformance adapter wires the ZTA
+    policy + credentials (_apply_zta_fixtures) when built with -DAT_ZTA=ON;
+    scripts/test-conformance.sh enables that automatically when OpenSSL is
+    present (build-zta/). Without OpenSSL the C side skips this scenario, which
+    is still non-asymmetric (diff_results.py treats a one-side skip as a match).
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/ca-bundle-deepchain.pem
+  credentials:
+    newcomer: testdata/zta/certs/deep_chain_leaf.der
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces a leaf 9 intermediate CAs deep. bg walks the chain,
+        exceeds the 8-intermediate bound, and rejects; no propose is emitted.
+
+expected_state:
+  bg:
+    propose_emitted: 0
