@@ -66,6 +66,12 @@ from ..scenario_engine import (
 # scenario runs.
 _DEFAULT_BLOCK_IMPL = AgreementImpl.POA.value
 
+# Pseudo-function (not a wire message): a scenario step with this `function`
+# drives the periodic caps-resync sweep on the target participant instead of
+# dispatching a handler. Used by caps-resync-max-per-sweep to pin
+# CAPS_RESYNC_MAX_PER_SWEEP. The C adapter recognizes the same string.
+_TRIGGER_CAPS_RESYNC = 'trigger_caps_resync'
+
 
 @dataclass
 class _Participant:
@@ -166,6 +172,19 @@ class _Participant:
                 if actual != expected:
                     raise AssertionError(
                         f'{self.id}: partition_responses_emitted={actual}, '
+                        f'expected {expected}'
+                    )
+            elif key == 'caps_query_emitted':
+                # Number of directed `peer_caps_query` messages this participant
+                # emitted -- driven by the periodic caps-resync sweep (triggered
+                # via the trigger_caps_resync pseudo-step). With more cap-less
+                # peers than the per-sweep cap, the sweep emits exactly
+                # CAPS_RESYNC_MAX_PER_SWEEP and defers the rest. C mirrors by
+                # scanning captured[] for (from==self, peer_caps_query).
+                actual = self.emit_tally.get(IdentityProtocol.caps_query, 0)
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: caps_query_emitted={actual}, '
                         f'expected {expected}'
                     )
             elif key == 'propose_emitted':
@@ -464,6 +483,22 @@ class IdentityAdapter:
             for cap_name in cap_fix.get(pid, []):
                 participant.process.protocol.capabilities.register_ability(
                     cap_name, None, [], {})
+            # Inject N synthetic cap-less peers (fixtures.capless_peers[pid])
+            # directly into this participant's roster: present in self.peers but
+            # absent from peer_capabilities -- exactly the state the periodic
+            # caps-resync sweep targets. caps-resync-max-per-sweep uses this to
+            # drive > CAPS_RESYNC_MAX_PER_SWEEP cap-less peers and assert the
+            # per-sweep cap. Mirrors the C adapter's capless_peers injection.
+            capless_fix: dict[str, int] = fixtures.get('capless_peers', {}) or {}
+            for i in range(int(capless_fix.get(pid, 0))):
+                syn_pid = f'capless-{pid}-{i}'
+                syn = Identity(
+                    self._derive_uuid(syn_pid, {}),
+                    f'10.90.{i // 256}.{i % 256}', f'{syn_pid}.scenario',
+                    Signature(_stretch_seed(syn_pid, b'sig'), public_only=False),
+                    Encryptor(_stretch_seed(syn_pid, b'enc'), public_only=False),
+                    syn_pid, False, 0, _DEFAULT_BLOCK_IMPL)
+                peers.add(syn)
             handles[pid] = ParticipantHandle(
                 id=pid, role=role, impl=participant,
                 dispatch=lambda msg, p=participant: self._dispatch(p, msg),
@@ -622,6 +657,13 @@ class IdentityAdapter:
     def _dispatch(self, participant: _Participant, inbound: Any) -> list[CapturedMessage]:
         if not isinstance(inbound, Message):
             raise AssertionError(f'expected a Message, got {type(inbound).__name__}')
+        if inbound.function == _TRIGGER_CAPS_RESYNC:
+            # Pseudo-function: invoke the periodic caps-resync sweep directly
+            # (it is timer-gated in production, so there is no wire message to
+            # dispatch). The emitted caps_query messages are captured in
+            # emit_tally; caps_query_emitted asserts the per-sweep cap.
+            participant.process._periodic_caps_resync(participant.queues)
+            return participant.drain_outbox()
         # The protocol's handler dispatch is run synchronously. Threads
         # spawned via _spawn() are inlined because synchronous_dispatch is on.
         participant.process.protocol.run_message_handlers(participant.queues, inbound)
@@ -782,6 +824,11 @@ class IdentityAdapter:
             })
         else:
             obj = to_json_string(payload)
+
+        if function == _TRIGGER_CAPS_RESYNC:
+            # Pseudo-function: no wire payload; _dispatch invokes the periodic
+            # caps-resync sweep instead of a handler.
+            obj = ''
 
         msg = Message(CfgIds.identity, function, obj,
                       from_whom=sender_identity,

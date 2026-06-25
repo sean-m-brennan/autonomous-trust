@@ -18,7 +18,8 @@
 See doc/architecture/zta-python-parity.md and doc/architecture/zta-integration.md.
 """
 from .zta_verifier import (ZtaStatus, ZtaResult, Verifier, NullVerifier,
-                           OidcVerifier, X509Verifier, ZTA_HASH_LEN)
+                           OidcVerifier, X509Verifier, ZTA_HASH_LEN,
+                           ZTA_CRED_MAX)
 from .mfa import MfaChain, CombinePolicy, MfaCredential
 from .totp import (TotpVerifier, generate_totp_secret, totp_provisioning_uri,
                    totp_now)
@@ -27,4 +28,4 @@ from .zta_policy import ZtaPolicy
 __all__ = ['ZtaStatus', 'ZtaResult', 'Verifier', 'NullVerifier', 'OidcVerifier',
            'X509Verifier', 'MfaChain', 'CombinePolicy', 'MfaCredential',
            'TotpVerifier', 'generate_totp_secret', 'totp_provisioning_uri',
-           'totp_now', 'ZtaPolicy', 'ZTA_HASH_LEN']
+           'totp_now', 'ZtaPolicy', 'ZTA_HASH_LEN', 'ZTA_CRED_MAX']
