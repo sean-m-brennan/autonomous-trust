@@ -390,6 +390,12 @@ class IdentityAdapter:
             spec = dict(zta_fix)
             if spec.get('ca_bundle_path'):
                 spec['ca_bundle_path'] = str(self.corpus_root / spec['ca_bundle_path'])
+            # crl_path resolves against the corpus root too, so a revocation
+            # scenario's CRL is loadable (mirrors the C adapter; without it the
+            # verifier reports UNAVAILABLE -> admit and diverges from C's
+            # REVOKED). See zta-x509-reject-revoked-credential.
+            if spec.get('crl_path'):
+                spec['crl_path'] = str(self.corpus_root / spec['crl_path'])
             zta_policy = ZtaPolicy(**spec)
 
         # Distinct-group mode (partition-recovery scenarios): when

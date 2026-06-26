@@ -265,6 +265,19 @@ static void _apply_zta_fixtures(sce_run_ctx_t *ctx, json_t *fixtures) {
                 snprintf(pol->ca_bundle_path, sizeof(pol->ca_bundle_path),
                          "%.*s", (int)(sizeof(pol->ca_bundle_path) - 1), abs);
             }
+            /* Same corpus-relative -> absolute fixup for the CRL path, so a
+             * revocation scenario's CRL is fopen-able from any CWD (mirrors
+             * Python, whose crl_path is resolved relative to the corpus root).
+             * Without this the C verifier silently fails to load the CRL and
+             * reports UNAVAILABLE -> admit, diverging from Python's REVOKED. */
+            if (root != NULL && pol->crl_path[0] != '\0'
+                && pol->crl_path[0] != '/') {
+                char abs[1024];
+                snprintf(abs, sizeof(abs), "%.700s/%.255s", root,
+                         pol->crl_path);
+                snprintf(pol->crl_path, sizeof(pol->crl_path),
+                         "%.*s", (int)(sizeof(pol->crl_path) - 1), abs);
+            }
             config_t *cfg = calloc(1, sizeof(config_t));
             if (cfg == NULL) { free(pol); continue; }
             cfg->name = "zta_policy";
