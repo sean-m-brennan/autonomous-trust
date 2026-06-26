@@ -21,7 +21,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from typing import Any, Callable, Optional
 
@@ -263,7 +263,7 @@ class Scenario(ABC):
     def _emit(self, event: ScenarioEvent):
         """Dispatch an event to all listeners and record it."""
         record = event.to_dict()
-        record["wall_time"] = datetime.utcnow().isoformat()
+        record["wall_time"] = datetime.now(timezone.utc).isoformat()
         self._event_log.append(record)
 
         for listener in self._listeners:
@@ -379,7 +379,7 @@ class Scenario(ABC):
             realtime_factor: Speed multiplier (1.0 = real time, 10.0 = 10x)
             tick_callback:   Called each tick with (scenario, elapsed_timedelta)
         """
-        self._start_time = datetime.utcnow()
+        self._start_time = datetime.now(timezone.utc)
         self._running = True
         self._current_phase_idx = 0
 
@@ -396,7 +396,7 @@ class Scenario(ABC):
         total_seconds = self.duration.total_seconds()
 
         while self._running:
-            wall_elapsed = (datetime.utcnow() - self._start_time).total_seconds()
+            wall_elapsed = (datetime.now(timezone.utc) - self._start_time).total_seconds()
             scenario_elapsed = wall_elapsed * realtime_factor
             elapsed_td = timedelta(seconds=scenario_elapsed)
 
