@@ -147,6 +147,35 @@ class TestPeers:
         peer = _mock_peer()
         p.delete(peer)  # should not crash
 
+    def test_delete_when_in_hierarchy_but_not_valuation(self):
+        # A wire-reconstructed Peers populates all/listing/hierarchy from the
+        # `hierarchy` arg but leaves `valuation` empty. delete() must guard the
+        # valuation removal independently of the hierarchy one, or it indexes
+        # valuation[None] (TypeError: list indices ... not NoneType) on the
+        # add()->delete(prior) resync path (handle_identity_response).
+        peer = _mock_peer(nickname='node-x', address='10.0.0.5')
+        hier = [dict({}) for _ in range(Peers.LEVELS)]
+        hier[Peers.LEVELS // 2]['node-x'] = peer
+        p = Peers(hierarchy=hier)        # valuation left empty
+        assert p.find_by_index('node-x') is peer
+        assert not any('node-x' in v for v in p.valuation)
+        p.delete(peer)                   # must not raise
+        assert 'node-x' not in p.hierarchy[p.mid_level]
+
+    def test_add_same_nickname_on_wire_reconstructed_peers(self):
+        # The exact crash path: a Peers rebuilt from the wire (hierarchy only),
+        # then a new identity for the same nickname arrives and add() evicts
+        # the prior holder via delete(). Regression for the two-node protocol
+        # IdentityProcess.handle_identity_response TypeError.
+        old = _mock_peer(nickname='node-x', address='10.0.0.5')
+        hier = [dict({}) for _ in range(Peers.LEVELS)]
+        hier[Peers.LEVELS // 2]['node-x'] = old
+        p = Peers(hierarchy=hier)
+        new = _mock_peer(nickname='node-x', address='10.0.0.6')
+        p.add(new)                       # must not raise
+        assert len(p.all) == 1
+        assert p.find_by_index('node-x') is new
+
     def test_find_top_n_all(self):
         p = Peers()
         peers = [_mock_peer(nickname='p%d' % i, address='10.0.0.%d' % i) for i in range(5)]

@@ -3,26 +3,40 @@ channels:
   - conda-forge
 dependencies:
   - python==3.13.*
+
+  # core (autonomous-trust): the shared build / test / C-toolchain / formal-
+  # verification / docs tooling. The other packages (services, simulator,
+  # evaluation, operator, behavior) develop against this same toolchain and add
+  # no dev deps of their own; only inspector adds web-specific tooling (below).
+
+  # packaging / build
   - poetry
-  - maturin
-  - docker-py
-  - gitpython>=3.1.35
+  - maturin            # builds the Rust extension under src/autonomous-trust/rust
   - types-protobuf>=6.32.1
+  - go
+  - napkin
+
+  # lint / test
+  - pylint
+  - tox
+  - pytest
+  - pytest-asyncio
+  - pytest-cov
+  - docker-py          # container-backed integration / conformance tests
+  - testcontainers
+  - jsonschema         # conformance corpus schema validation
+  - ruamel.yaml
+  - gitpython>=3.1.35
   - pexpect
+
+  # misc build helpers / docs
   - rsync
   - curl
   - libffi
-  - tox
   - pandoc
-  - beautifulsoup4
-  - pytest
-  - pytest-aiohttp
-  - pytest-asyncio
-  - pytest-cov
-  - go
-  - napkin
-  - pylint
-  - nodejs
+
+  # C / C++ toolchain + coverage (the C library build)
+  - git
   - clang
   - clangxx
   # libstdc++ for clang++. The bare `clangxx` package ships no C++ stdlib, and
@@ -34,24 +48,28 @@ dependencies:
   # links against -- it does NOT switch the compiler to g++.
   - gxx_linux-64
   - lld
-  - git
   - lcov
   - llvmdev
+
+  # formal verification (Frama-C via OCaml/opam) + autotools C build
   - opam
   - autoconf
-  - gmp
-  - pcre2
-  - sqlite
   - automake
   - libtool
   - pkg-config
+  - gmp
+  - pcre2
+  - sqlite
   - libexpat
-  - testcontainers
-  - jsonschema
-  - ruamel.yaml
+
+  # inspector (autonomous-trust-inspector): web dashboard e2e + async test tooling.
+  - pytest-aiohttp
+  - nodejs
+  - beautifulsoup4
   - playwright
   - pyee
+
   - pip
   - pip:
-      - mermaid-cli
-      - jcs
+      - mermaid-cli    # core: docs diagram rendering
+      - jcs            # core: JSON canonicalization (conformance / identity)
