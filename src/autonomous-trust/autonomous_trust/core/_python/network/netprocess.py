@@ -198,11 +198,26 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     @property
     def net_stats(self):
         cumulative = {}
-        for uuid in self.statistics:
-            elapsed = self.statistics[uuid].times[-1] - self.statistics[uuid].times[0]
-            up, down = sum(self.statistics[uuid].send) / elapsed, sum(self.statistics[uuid].recv) / elapsed
-            cumulative[uuid] = (up, down, self.statistics[uuid].send_total, self.statistics[uuid].recv_total,
-                                self.statistics[uuid].err_out, self.statistics[uuid].err_in)
+        # Snapshot the keys: track_send/recv_* run in the sender/receiver
+        # threads and add new peers to self.statistics, so iterating it live
+        # raised "dictionary changed size during iteration". Keys are only ever
+        # added (never deleted), so a key snapshot is sufficient. Likewise
+        # snapshot each NetStat's deques before summing -- a deque mutated by a
+        # concurrent send/rcvd mid-iteration raises in the same way.
+        for uuid in list(self.statistics):
+            stat = self.statistics.get(uuid)
+            if stat is None:
+                continue
+            times = list(stat.times)
+            if len(times) < 2:
+                continue  # need two samples to span an interval
+            elapsed = (times[-1] - times[0]).total_seconds()
+            if elapsed <= 0:
+                continue  # same-instant samples -> no meaningful rate
+            up = sum(list(stat.send)) / elapsed
+            down = sum(list(stat.recv)) / elapsed
+            cumulative[uuid] = (up, down, stat.send_total, stat.recv_total,
+                                stat.err_out, stat.err_in)
         return cumulative
 
     def send_peer(self, msg, whom):

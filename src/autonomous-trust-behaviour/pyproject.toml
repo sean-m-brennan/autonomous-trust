@@ -1,0 +1,30 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "autonomous_trust_behaviour"
+version = "0.2.1"
+description = "AutonomousTrust Behaviour - in-built streaming behavioral-anomaly layer (SOW Task 3 / O3); ML proposes, deterministic consensus disposes"
+authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
+readme = "README.md"
+packages = [{include = "autonomous_trust"}]
+#license = "Proprietary"
+exclude = ["**/__pycache__"]
+
+[project]
+name = "autonomous_trust_behaviour"
+version = "0.2.1"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+#autonomous_trust.core = {path = "../autonomous-trust"}
+autonomous-trust = ">=0.2.1"
+# The streaming anomaly detectors are built via River/PyOD (SOW Task 3.2; the
+# AI/ML survey's reference runtimes): river.anomaly.HalfSpaceTrees (multivariate
+# isolation) + pyod.models.hbos.HBOS (per-feature, explainable; made streaming
+# via a sliding-window refit). Both are unsupervised, online, and deterministic
+# under a fixed seed. The deferred formally-verified C core is the "owned"
+# reimplementation, pinned to this prototype by the conformance corpus (Task 3.5).
+river = ">=0.21"
+pyod = ">=2.0"

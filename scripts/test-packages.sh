@@ -65,7 +65,7 @@ else
   scripts/build.sh --c >/dev/null || exit 1
 fi
 
-for pkg in autonomous-trust autonomous-trust-services autonomous-trust-inspector autonomous-trust-simulator; do
+for pkg in autonomous-trust autonomous-trust-services autonomous-trust-inspector autonomous-trust-simulator autonomous-trust-behaviour; do
     pkg_dir="$here/src/$pkg"
     if [ -d "$pkg_dir/tests" ]; then
         echo "========== Testing $pkg =========="
