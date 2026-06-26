@@ -862,6 +862,29 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
                     verifier->destroy(verifier);
                     return true; /* reject */
                 }
+                if (zta_result.status == ZTA_VERIFIED && verifier->check_revocation) {
+                    /* A chain-valid certificate may nonetheless have been
+                     * revoked. verify_credential only walks the chain + expiry
+                     * (x509_verify_credential), so the admission gate must check
+                     * revocation explicitly before admitting. Only an
+                     * affirmative ZTA_REVOKED blocks: ZTA_UNAVAILABLE — the
+                     * default when no CRL/OCSP source is configured — keeps the
+                     * peer admitted, so deployments without a revocation source
+                     * are unchanged. Mirrors Python idprocess._zta_admit; pinned
+                     * by conformance zta-x509-reject-revoked-credential. */
+                    zta_result_t rev_result;
+                    verifier->check_revocation(verifier,
+                                               zta_result.credential_hash,
+                                               &rev_result);
+                    if (rev_result.status == ZTA_REVOKED) {
+                        log_warn(proc->logger,
+                                 "Identity: ZTA credential %s for %s: %s\n",
+                                 zta_status_str(rev_result.status),
+                                 nmsg->from_whom.nickname, rev_result.reason);
+                        verifier->destroy(verifier);
+                        return true; /* reject */
+                    }
+                }
                 if (zta_result.status == ZTA_UNAVAILABLE || zta_result.status == ZTA_DEFERRED) {
                     if (!zta_policy->allow_ddil_fallback) {
                         log_warn(proc->logger,

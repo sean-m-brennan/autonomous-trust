@@ -316,10 +316,12 @@ The ZTA check occurs during Phase 3 (Border Guard Mode) of the [identity protoco
 
 1. Validates the AT identity (UUID, keys, package hash) -- unchanged.
 2. If `require_at_admission` is true, verifies the peer's ZTA credential via the configured verifier.
-3. If verification returns `ZTA_VERIFIED`, the peer is proposed for group voting with no reputation cap (starts at 0.5 neutral, can earn higher).
+3. If verification returns `ZTA_VERIFIED`, the gate then **checks revocation** (`check_revocation` on the verified credential's hash). `verify_credential` walks only the chain + expiry, so a chain-valid but revoked certificate would otherwise admit; the explicit revocation check closes that gap. Only an affirmative `ZTA_REVOKED` blocks — `ZTA_UNAVAILABLE` (the default when no CRL/OCSP source is configured) does **not**, so deployments without a revocation source are unaffected. A surviving credential is proposed for group voting with no reputation cap (starts at 0.5 neutral, can earn higher).
 4. If verification returns `ZTA_DEFERRED` and `allow_ddil_fallback` is true, the peer is admitted with a reputation cap of `ddil_fallback_reputation_cap`. The deferral is recorded in the audit log.
-5. If verification returns `ZTA_REJECTED`, `ZTA_EXPIRED`, or `ZTA_REVOKED`, the peer is not proposed.
+5. If verification returns `ZTA_REJECTED` or `ZTA_EXPIRED` (or the revocation check in step 3 returns `ZTA_REVOKED`), the peer is not proposed.
 6. If `require_at_admission` is false, the ZTA check is skipped entirely.
+
+Both implementations match here: Python `idprocess._zta_admit` and C `welcoming_committee` (`id_proc.c`) both run the revocation check after a `VERIFIED` chain result, and the CRL serial match itself is at parity (`X509Verifier.check_revocation` ↔ `x509_check_revocation`). Pinned cross-language by conformance `zta-x509-reject-revoked-credential`. The human-operator analogue of this gate is described in [Operator Access](operator-access.md).
 
 ---
 

@@ -24,5 +24,46 @@ PKCS#11 test middleware (`softhsm2`, `opensc`) is in
 [`config/cfg/devel_environ.yml`](../../config/cfg/devel_environ.yml). The
 `pyproject.toml` here mirrors the runtime deps for packaging only.
 
+## Running
+
+Use the launcher (sets `PYTHONPATH` + `AUTONOMOUS_TRUST_BACKEND=python` for you);
+needs an interactive terminal:
+
+```sh
+scripts/run-operator.sh --demo     # mock node + software-token PIV, no card/cohort
+scripts/run-operator.sh            # real node bridge
+# or: python -m autonomous_trust.operator [--demo]
+```
+
+Tabs: **a**ctivate · **d**irectory · request (**b**uild) · acti**v**ity · **s**tatus ·
+**r**efresh · **q**uit.
+
+### Demo credentials (`--demo`)
+
+**There is no PIN/MFA to look up — in `--demo` both fields are ignored.** The demo
+mints a throwaway software token (no card, so no PIN) and enrolls **no** TOTP
+secret, so activation runs single-factor. On the **Activate** tab just press
+**Activate** (the PIN and MFA boxes can hold anything or be left blank); it runs a
+real PIV challenge-response against the self-minted CA and returns **VERIFIED**.
+Then submit a request from the **Request** tab and watch the **Activity** tab —
+the mock `DemoNode` answers it with a result. (Proof badges show `— none` unless
+the ZK-STARK backend is available.)
+
+### Dev activation with files / real 2FA
+
+To exercise the real activation path without the demo node, point the console at a
+software token on disk (e.g. the leaf files `--demo` writes to its temp dir, or
+any test PKI):
+
+```sh
+python -m autonomous_trust.operator \
+  --software-cert leaf.crt --software-key leaf.key --ca-bundle ca_bundle.pem \
+  [--totp-secret <base32>]
+```
+
+With `--totp-secret`, MFA is **enforced**: enter the **current TOTP code** in the
+MFA box (the PIN box is still ignored for a software token; a real PyKCS11 card
+uses the PIN to unlock the key). Without it, activation is single-factor PIV.
+
 See `doc/NV059/work/PIV_MFA_OPERATOR_ACCESS_PLAN.md` for the full design and
-phasing. This package is scaffolding at P0; screens land in P4/P5.
+phasing (TUI core = P4, request/results = P5; software-token mock = §7.1).
