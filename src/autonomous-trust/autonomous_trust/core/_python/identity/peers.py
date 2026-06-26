@@ -146,11 +146,18 @@ class Peers(Configuration):
             _probes.counter('peer.set', 'added')
 
     def delete(self, who):
+        # hierarchy and valuation are independent structures; a peer can be
+        # present in one but not the other (e.g. a wire-reconstructed Peers,
+        # whose __init__ rebuilds all/listing from `hierarchy` but does not
+        # backfill `valuation`). Guard each removal on its own lookup — gating
+        # both on `idx is not None` indexed self.valuation[None] and crashed
+        # the add()->delete(prior) resync path with a TypeError.
         index = self._index_by(who)
         idx = self._find(index)
         v_idx = self._find_v(index)
         if idx is not None:
             del self.hierarchy[idx][index]
+        if v_idx is not None:
             del self.valuation[v_idx][index]
 
     def move(self, who, level):

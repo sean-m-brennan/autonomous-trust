@@ -3,57 +3,75 @@ channels:
   - conda-forge
 dependencies:
   - python==3.13.*
+
+  # core (autonomous-trust): Python runtime + the C library build/runtime.
   - icontract
   - psutil
   - pynacl
   - python-dateutil
+  - cryptography
+  - numpy
+  - pyyaml
+  - dill
+  - setuptools
   - protobuf>=6.33.5
   - libprotobuf>=6.33.5
   - protobuf-c>=1.5.2
-  - aenum
-  - libsass
-  - setuptools
-  - networkx
-  - quart>=0.19.5
-  - numpy
-  - dill
-  - py-opencv
-  - imutils
-  - msgpack-numpy
-  - geopy
-  - utm
-  - dash>=4.0.0
-  - dash-bootstrap-components>=2.0.0
-  - more-itertools>=10.6.0
-  - jsbeautifier>=1.15.4
-  - dash-extensions>=2.0.4
-  - dash-iconify
-  - plotly
-  - werkzeug>=3.0.3
-  - flask>=3.0,<3.2
-  - flask-caching>=2.3.1
-  - eventlet
-  - absl-py
-  - python-flatbuffers
-  - python-sounddevice
   - cmake
   - libuuid
   - libsodium
   - jansson
   - check
+
+  # inspector (autonomous-trust-inspector): the web dashboard / live visualization.
+  - aenum
+  - libsass
+  - networkx
+  - quart>=0.19.5
+  - flask>=3.0,<3.2
+  - werkzeug>=3.0.3
+  - flask-caching>=2.3.1
+  - eventlet
   - websockets
+  - plotly
+  - python-kaleido
+  - dash>=4.0.0
+  - dash-bootstrap-components>=2.0.0
+  - dash-extensions>=2.0.4
+  - dash-iconify
+  - more-itertools>=10.6.0
+  - jsbeautifier>=1.15.4
   - pydantic
-  - pyyaml
+
+  # services (autonomous-trust-services): sensor data, geo, and the vision stack
+  # (mediapipe pulls absl-py + flatbuffers; torch/ultralytics are the detector backend).
+  - geopy
+  - utm
+  - pyproj
+  - py-opencv
+  - imutils
+  - msgpack-numpy
+  - absl-py
+  - python-flatbuffers
+  - python-sounddevice
   - pytorch
   - torchvision
   - ultralytics
   - ultralytics-thop
-  - pyproj
-  - cryptography
-  - python-kaleido
+
+  # simulator (autonomous-trust-simulator) + evaluation (autonomous-trust-evaluation):
+  # no additional runtime deps -- both are covered by core + inspector + services above.
+
+  # operator (autonomous-trust-operator): PIV+MFA terminal UI and smartcard stack.
   - textual
   - pyotp
-  - aquaveo::opensc  # not in conda-forge
+  - aquaveo::opensc  # PKCS#11 / PIV smartcard middleware; not in conda-forge
+
+  # behavior (autonomous-trust-behaviour): streaming anomaly detectors
+  # via River (Half-Space Trees) + PyOD (HBOS).
+  - river
+  - pyod
+
   - pip
   - pip:
-      - pykcs11
+      - pykcs11  # operator: PKCS#11 second-factor binding

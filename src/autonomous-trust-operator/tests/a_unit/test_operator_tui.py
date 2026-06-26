@@ -346,9 +346,15 @@ def test_directory_row_selection_shows_provider_detail():
             await pilot.pause()
             assert 'alpha' in str(detail.content)
 
-            # select 'orphan' (row 1): exercises the no-providers branch
-            table.move_cursor(row=1)
-            await pilot.press('enter')
+            # select 'orphan' (row 1): exercises the no-providers branch. Drive
+            # it by posting the row's RowSelected message rather than moving the
+            # cursor + pressing enter: DataTable.move_cursor is a no-op in some
+            # headless Textual versions (e.g. 7.0.0 pins the cursor to row 0
+            # regardless of row_count), which would silently re-select row 0.
+            # The (data_table, cursor_row, row_key) RowSelected signature is
+            # stable across versions, so this drives the real handler reliably.
+            orphan_key = table.ordered_rows[1].key  # sorted: analyze, orphan
+            table.post_message(DataTable.RowSelected(table, 1, orphan_key))
             await pilot.pause()
             text = str(detail.content)
             assert 'orphan' in text
