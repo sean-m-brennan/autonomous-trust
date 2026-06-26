@@ -32,6 +32,7 @@ Targets:
   c-demo     Run the demo with the C variant (run-demo.sh --variant=c).
   demo       Run the demo (run-demo.sh).
   mission    Run the mission (run-mission.sh).
+  operator   Run the operator console TUI (run-operator.sh).
 
 Pass --help to the underlying script (e.g. 'run.sh demo --help') for its
 target-specific options.
@@ -54,4 +55,6 @@ elif [ "$WHAT" = "demo" ]; then
   scripts/run-demo.sh $@
 elif [ "$WHAT" = "mission" ]; then
   scripts/run-mission.sh $@
+elif [ "$WHAT" = "operator" ]; then
+  scripts/run-operator.sh $@
 fi

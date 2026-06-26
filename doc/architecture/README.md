@@ -24,3 +24,4 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Security Hardening](security-hardening.md) -- Memory safety, RCE prevention, and input validation
 - [ZTA Integration](zta-integration.md) -- Zero Trust credential verification, DDIL fallback, and audit logging
 - [ZTA Python Parity](zta-python-parity.md) -- Python implementation of the ZTA admission gate and wire binding
+- [Operator Access](operator-access.md) -- Human operator authentication via PIV/CAC + MFA, session lifecycle, and the request-only operator node

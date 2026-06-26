@@ -36,6 +36,8 @@ _ROOT = os.path.abspath(os.path.join(_HERE, '..', '..', '..', '..'))
 _CA_DIR = os.path.join(_ROOT, 'src', 'c', 'test', 'zta_test_ca', 'output')
 _BUNDLE = os.path.join(_CA_DIR, 'ca-bundle.pem')
 _CERTS = os.path.join(_CA_DIR, 'certs')
+_REVOKED_CRL = os.path.join(_CA_DIR, 'crl', 'intermediate-revoked.crl.pem')
+_EMPTY_CRL = os.path.join(_CA_DIR, 'crl', 'intermediate.crl.pem')
 _have_ca = os.path.isfile(_BUNDLE) and os.path.isdir(_CERTS)
 requires_ca = pytest.mark.skipif(not _have_ca, reason="test CA not generated")
 
@@ -97,6 +99,36 @@ class TestZtaAdmissionX509:
 
     def test_expired_rejected(self):
         assert self._proc()._zta_admit(_peer(_cred('expired'))) == 'reject'
+
+
+@requires_ca
+class TestZtaAdmissionRevocation:
+    """§7.1 caveat 2: a chain-valid but CRL-revoked cert must be rejected at
+    admission. drone_alpha is the cert revoked in intermediate-revoked.crl.pem;
+    it is otherwise valid (admitted above when no CRL is configured)."""
+
+    def _proc(self, **kw):
+        return _GateProc(ZtaPolicy(enabled=True, require_at_admission=True,
+                                   verifier_type='x509', ca_bundle_path=_BUNDLE, **kw))
+
+    @pytest.mark.skipif(not os.path.isfile(_REVOKED_CRL),
+                        reason="revoked CRL not generated")
+    def test_revoked_credential_rejected(self):
+        proc = self._proc(crl_path=_REVOKED_CRL)
+        assert proc._zta_admit(_peer(_cred('drone_alpha'))) == 'reject'
+
+    @pytest.mark.skipif(not os.path.isfile(_EMPTY_CRL),
+                        reason="empty CRL not generated")
+    def test_unrevoked_credential_admitted_with_crl(self):
+        # Same cert, an (empty) CRL configured -> not on the list -> admit.
+        proc = self._proc(crl_path=_EMPTY_CRL)
+        assert proc._zta_admit(_peer(_cred('drone_alpha'))) == 'admit'
+
+    def test_no_crl_source_still_admits(self):
+        # Backward compat: no revocation source -> check_revocation is
+        # UNAVAILABLE, which does NOT block (only an affirmative REVOKED does).
+        proc = self._proc()
+        assert proc._zta_admit(_peer(_cred('drone_alpha'))) == 'admit'
 
 
 class TestZtaDdilFallback:
