@@ -239,12 +239,15 @@ class TestTickWindow:
     def test_stops_after_window_closes(self, setup_teardown):
         worker, _ = _make_worker(env_overrides={
             'AT_BOOTSTRAP_PAIRS': '999',           # cap not the limit
-            'AT_BOOTSTRAP_DURATION_SEC': '0.0001',
+            'AT_BOOTSTRAP_DURATION_SEC': '999',    # window open for the 1st tick
         })
         queues = {CfgIds.negotiation: queue.Queue()}
         worker._tick(queues)  # opens window + issues 1 pair
-        # Force window-elapsed clock past duration; the next tick
-        # should be a no-op despite peers + pairs_remaining. Use
+        # Force the window closed by backdating its start well past the
+        # duration; the next ticks must be no-ops despite peers +
+        # pairs_remaining. (Backdating is the deterministic way to close the
+        # window — a tiny DURATION_SEC instead races the first tick's own
+        # open->issue, since two now() calls + a log straddle it.) Use a
         # tz-aware datetime since system.now() returns one.
         worker._window_start = datetime(2020, 1, 1, tzinfo=timezone.utc)
         for _ in range(5):
