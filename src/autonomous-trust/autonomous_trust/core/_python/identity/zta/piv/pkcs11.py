@@ -89,6 +89,33 @@ class SoftwareToken(PivToken):
         self._key = private_key
         self._present = True
 
+    @classmethod
+    def from_files(cls, cert_path: str, key_path: str,
+                   key_password: Optional[bytes] = None) -> 'SoftwareToken':
+        """Build a software token from a cert + private-key file (PEM or DER).
+
+        The dev/CI activation hook (operator console ``--software-cert/-key``)
+        and SoftHSM2-less tests use this to stand in for a PKCS#11 card -- plan
+        §7.1 stage 1-2: same challenge-response, zero hardware.
+        """
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import (
+            load_der_private_key, load_pem_private_key)
+        with open(cert_path, 'rb') as fp:
+            cert_bytes = fp.read()
+        try:
+            cert = x509.load_pem_x509_certificate(cert_bytes)
+        except ValueError:
+            cert = x509.load_der_x509_certificate(cert_bytes)
+        with open(key_path, 'rb') as fp:
+            key_bytes = fp.read()
+        try:
+            key = load_pem_private_key(key_bytes, password=key_password)
+        except ValueError:
+            key = load_der_private_key(key_bytes, password=key_password)
+        from cryptography.hazmat.primitives.serialization import Encoding
+        return cls(cert.public_bytes(Encoding.DER), key)
+
     def certificate_der(self) -> bytes:
         if not self._present:
             raise PivTokenError('software token removed')

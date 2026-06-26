@@ -799,6 +799,23 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         result = self._zta_verifier().verify_credential(cred)
         status = result.status
         if status is ZtaStatus.VERIFIED:
+            # A chain-valid certificate may nonetheless have been revoked.
+            # verify_credential does NOT consult the CRL/OCSP source (it mirrors
+            # C x509_verify_credential, which only walks the chain + expiry), so
+            # the admission gate must explicitly check revocation before
+            # admitting. Only an affirmative REVOKED blocks: UNAVAILABLE — the
+            # default when no crl_path/ocsp_url is configured — keeps the peer
+            # admitted, so deployments without a revocation source see no change
+            # in behavior. Mirrors the C welcoming_committee revocation gate;
+            # pinned by conformance zta-x509-reject-revoked-credential.
+            rev = self._zta_verifier().check_revocation(result.credential_hash)
+            if rev.status is ZtaStatus.REVOKED:
+                self.logger.warning('ZTA: rejecting %s at admission: %s (%s)',
+                                    nick, rev.status.value, rev.reason)
+                _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
+                             zta_status=rev.status.value, reason=rev.reason)
+                _probes.counter('id.welcome', 'zta_rejected')
+                return 'reject'
             return 'admit'
         if status in (ZtaStatus.REJECTED, ZtaStatus.EXPIRED, ZtaStatus.REVOKED):
             self.logger.warning('ZTA: rejecting %s at admission: %s (%s)',

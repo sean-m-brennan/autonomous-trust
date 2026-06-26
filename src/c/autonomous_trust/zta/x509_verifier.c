@@ -460,15 +460,33 @@ static int x509_check_revocation(zta_verifier_t *self,
             fclose(fp);
             if (crl) {
                 /*
-                 * Full CRL checking requires matching serial numbers.
-                 * For now, having a loadable CRL means the infrastructure
-                 * is reachable. Detailed serial matching is done during
-                 * verify_credential via X509_STORE flags.
+                 * Match the previously-verified cert's serial against the CRL,
+                 * mirroring Python X509Verifier.check_revocation
+                 * (crl.get_revoked_certificate_by_serial_number). The cert was
+                 * cached by verify_credential keyed on cred_hash; without it we
+                 * cannot match a serial, so fall through to "not revoked"
+                 * (matching Python, whose cache miss likewise yields a non-
+                 * revoked verdict). This explicit serial match — rather than the
+                 * old "CRL loaded => reachable" stub — is what lets the admission
+                 * gate reject a revoked-but-chain-valid cert; pinned cross-impl
+                 * by conformance zta-x509-reject-revoked-credential.
                  */
-                X509_STORE_set_flags(impl->ca_store, X509_V_FLAG_CRL_CHECK);
-                X509_STORE_add_crl(impl->ca_store, crl);
+                X509 *cert = _cache_lookup(impl, cred_hash);
+                bool revoked = false;
+                if (cert != NULL) {
+                    X509_REVOKED *rev = NULL;
+                    if (X509_CRL_get0_by_cert(crl, &rev, cert) == 1)
+                        revoked = true;
+                    X509_free(cert);
+                }
                 X509_CRL_free(crl);
-                zta_result_set(result, ZTA_VERIFIED, "CRL loaded; not revoked");
+                if (revoked) {
+                    zta_result_set(result, ZTA_REVOKED,
+                                   "certificate revoked (CRL)");
+                } else {
+                    zta_result_set(result, ZTA_VERIFIED,
+                                   "CRL loaded; not revoked");
+                }
                 memcpy(result->credential_hash, cred_hash, ZTA_HASH_LEN);
                 return 0;
             }

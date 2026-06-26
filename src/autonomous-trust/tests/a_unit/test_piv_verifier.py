@@ -198,8 +198,11 @@ class TestPivVerifier:
 
 
 class TestCheckRevocation:
-    """X509Verifier.check_revocation against a minted CRL (plan §7.1 caveat:
-    check_revocation is implemented but never invoked at admission today)."""
+    """X509Verifier.check_revocation against a minted CRL. As of P6 the
+    admission gate invokes this after a VERIFIED chain result (idprocess.
+    _zta_admit / C welcoming_committee); the end-to-end admission rejection is
+    covered by test_zta_admission.TestZtaAdmissionRevocation and conformance
+    zta-x509-reject-revoked-credential."""
 
     def setup_method(self):
         from autonomous_trust.core.identity.zta import X509Verifier
