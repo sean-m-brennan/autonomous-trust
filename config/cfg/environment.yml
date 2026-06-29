@@ -66,6 +66,7 @@ dependencies:
   - textual
   - pyotp
   - aquaveo::opensc  # PKCS#11 / PIV smartcard middleware; not in conda-forge
+  #- conda-pypi::pykcs11  # operator: PKCS#11 second-factor binding
 
   # behavior (autonomous-trust-behaviour): streaming anomaly detectors
   # via River (Half-Space Trees) + PyOD (HBOS).
