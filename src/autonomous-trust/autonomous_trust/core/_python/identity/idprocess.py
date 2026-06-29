@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import hashlib
 import hmac
 import os
 import sys
@@ -766,6 +767,47 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self._zta_verifier_cache = self._zta_policy().create_verifier()
         return self._zta_verifier_cache
 
+    def _zta_credential_replayed(self, new_id, cred) -> bool:
+        """True if this exact credential is already bound to a DIFFERENT network
+        identity — a harvested/replayed credential (closes ISSUES §1.5).
+
+        The chain-only verifier accepts a chain-valid certificate regardless of
+        WHO presents it, so a credential lifted from one peer's (clear-text)
+        announce could be re-announced under a different uuid/signing key and
+        still pass. Here we enforce a credential↔identity uniqueness invariant: a
+        credential is a one-per-identity binding. "Previously seen" = present in
+        this node's peer roster (or our own identity); since rosters are built
+        from announces propagated across the mesh, this is the "seen by other
+        nodes" check. It is first-use-wins (TOFU): the first identity to bind a
+        credential keeps it, and a later, different identity presenting the same
+        credential is treated as a replay/clone and refused.
+
+        Fingerprints are recomputed from the actual credential bytes, never the
+        peer-advertised ``zta_credential_hash`` (which the announcer controls).
+        Defensive about missing ``peers``/``identity`` so the gate works when
+        invoked on a lightweight stand-in (no roster → no prior binding).
+        """
+        if not cred:
+            return False
+        fp = hashlib.sha256(cred).digest()
+        new_uuid = getattr(new_id, 'uuid', None)
+        # Our own credential must not be worn by anyone else.
+        own_id = getattr(self, 'identity', None)
+        if own_id is not None:
+            own = getattr(own_id, 'zta_credential', b'') or b''
+            if (own and getattr(own_id, 'uuid', None) != new_uuid
+                    and hashlib.sha256(own).digest() == fp):
+                return True
+        peers = getattr(self, 'peers', None)
+        roster = list(getattr(peers, 'all', []) or []) if peers is not None else []
+        for peer in roster:
+            if getattr(peer, 'uuid', None) == new_uuid:
+                continue  # same identity re-announcing its own credential: fine
+            pc = getattr(peer, 'zta_credential', b'') or b''
+            if pc and hashlib.sha256(pc).digest() == fp:
+                return True
+        return False
+
     def _zta_admit(self, new_id) -> str:
         """ZTA admission decision for a newly-announced peer.
 
@@ -794,6 +836,22 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
                          zta_status=ZtaStatus.REJECTED.value,
                          reason='credential too large')
+            _probes.counter('id.welcome', 'zta_rejected')
+            return 'reject'
+        # Credential↔identity uniqueness (ISSUES §1.5 replay mitigation): a
+        # chain-valid credential harvested from another peer's announce and
+        # re-presented under a different identity is a replay/clone. Reject it
+        # before chain verification — the cert may verify fine; the point is it
+        # is already bound elsewhere. C parity (handle_welcoming_committee) is a
+        # tracked follow-up; the deeper fix (binding the cert to the identity via
+        # SAN/challenge-response) remains open in ISSUES §1.5.
+        if cred is not None and self._zta_credential_replayed(new_id, cred):
+            self.logger.warning('ZTA: rejecting %s at admission: credential '
+                                'already bound to a different identity (replay)',
+                                nick)
+            _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
+                         zta_status=ZtaStatus.REJECTED.value,
+                         reason='credential bound to a different identity (replay)')
             _probes.counter('id.welcome', 'zta_rejected')
             return 'reject'
         result = self._zta_verifier().verify_credential(cred)
