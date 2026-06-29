@@ -52,13 +52,18 @@ class _GateProc:
     _zta_policy = IdentityProcess._zta_policy
     _zta_verifier = IdentityProcess._zta_verifier
     _zta_admit = IdentityProcess._zta_admit
+    _zta_credential_replayed = IdentityProcess._zta_credential_replayed
 
-    def __init__(self, policy: ZtaPolicy):
+    def __init__(self, policy: ZtaPolicy, peers=None, identity=None):
         self.configs = {ZtaPolicy.CONFIG_KEY: policy}
         self._zta_policy_cache = None
         self._zta_verifier_cache = None
         self._zta_capped = set()
         self.logger = logging.getLogger('test.zta')
+        # Roster / own identity for the credential-uniqueness gate. Default
+        # empty (no prior binding), matching the original single-peer tests.
+        self.peers = peers if peers is not None else SimpleNamespace(all=[])
+        self.identity = identity
 
 
 def _peer(cred: bytes = b'', nick='sensor-2', uuid='uuid-sensor-2'):
@@ -129,6 +134,53 @@ class TestZtaAdmissionRevocation:
         # UNAVAILABLE, which does NOT block (only an affirmative REVOKED does).
         proc = self._proc()
         assert proc._zta_admit(_peer(_cred('drone_alpha'))) == 'admit'
+
+
+@requires_ca
+class TestZtaCredentialReplay:
+    """ISSUES §1.5: a chain-valid credential harvested from one peer's announce
+    and re-presented under a DIFFERENT identity must be rejected as a replay.
+    Uniqueness is enforced against credentials already bound to known peers (the
+    roster, built from announces propagated across the mesh) and our own
+    identity."""
+
+    def _proc(self, peers=None, identity=None):
+        return _GateProc(ZtaPolicy(enabled=True, require_at_admission=True,
+                                   verifier_type='x509', ca_bundle_path=_BUNDLE),
+                         peers=peers, identity=identity)
+
+    def test_same_credential_different_identity_rejected(self):
+        cred = _cred('drone_alpha')
+        incumbent = _peer(cred, nick='drone-alpha', uuid='uuid-A')
+        proc = self._proc(peers=SimpleNamespace(all=[incumbent]))
+        # A different identity presents the SAME (valid) credential -> replay.
+        attacker = _peer(cred, nick='drone-alpha-clone', uuid='uuid-B')
+        assert proc._zta_admit(attacker) == 'reject'
+
+    def test_same_identity_reannounce_admitted(self):
+        cred = _cred('drone_alpha')
+        incumbent = _peer(cred, nick='drone-alpha', uuid='uuid-A')
+        proc = self._proc(peers=SimpleNamespace(all=[incumbent]))
+        # The SAME identity re-announcing its own credential is not a replay.
+        assert proc._zta_admit(_peer(cred, nick='drone-alpha', uuid='uuid-A')) == 'admit'
+
+    def test_distinct_credentials_admitted(self):
+        incumbent = _peer(_cred('drone_alpha'), nick='drone-alpha', uuid='uuid-A')
+        proc = self._proc(peers=SimpleNamespace(all=[incumbent]))
+        # A different identity with its OWN distinct valid credential is fine.
+        newcomer = _peer(_cred('drone_bravo'), nick='drone-bravo', uuid='uuid-B')
+        assert proc._zta_admit(newcomer) == 'admit'
+
+    def test_replay_of_own_credential_rejected(self):
+        cred = _cred('drone_alpha')
+        me = _peer(cred, nick='me', uuid='uuid-self')
+        proc = self._proc(identity=me)
+        # Someone else wearing OUR credential -> replay.
+        assert proc._zta_admit(_peer(cred, nick='impostor', uuid='uuid-X')) == 'reject'
+
+    def test_no_roster_admits_valid_credential(self):
+        # Empty roster + no own identity: nothing previously seen -> admit.
+        assert self._proc()._zta_admit(_peer(_cred('drone_alpha'))) == 'admit'
 
 
 class TestZtaDdilFallback:
