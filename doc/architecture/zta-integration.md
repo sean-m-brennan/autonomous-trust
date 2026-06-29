@@ -10,7 +10,7 @@ Certificate-based trust is the foundation of Zero Trust Architecture (ZTA). NIST
 Trust -> PDP decision -> Identity verification -> Certificate validation -> CA/OCSP/CRL availability
 ```
 
-Break any link -- the CA is unreachable, the OCSP responder is down, the CRL is stale -- and trust collapses. SP 800-207 acknowledges this: "If the PE and PA are not available, no new connection requests can be approved" (SS7.3) [1]. The standard offers redundancy as the only mitigation, but redundancy still requires connectivity to at least one instance.
+Break any link -- the CA is unreachable, the OCSP responder is down, the CRL is stale -- and trust collapses. SP 800-207 acknowledges this in S5.2 (Denial-of-Service or Network Disruption): "Enterprise resources cannot connect to each other without the PA's permission," and an attacker who "disrupts or denies access to the PEP(s) or PE/PA ... can adversely impact enterprise operations" [1]. The standard offers replication/cyber-resiliency as the mitigation, but that still requires connectivity to at least one instance.
 
 This is not an implementation bug. It is structural:
 
@@ -55,7 +55,7 @@ A peer needs valid ZTA credentials to reach an AT agent (satisfying the mandate)
 | **Compromised cert** | Full access until revocation propagates | Attacker has neutral reputation (new identity) or divergent behavior (existing identity) -- AT detects it |
 | **CA compromise** | Catastrophic trust collapse across all relying parties | AT trust is independent of CA; network continues on behavioral trust |
 | **OCSP/CRL unreachable** | Fail-open (insecure) or fail-closed (outage) | AT trust evaluation continues unimpaired |
-| **PDP unavailable** | No new connections approved (SP 800-207 SS7.3) | AT peers continue operating on behavioral trust |
+| **PDP unavailable** | Enterprise operations impacted; PA's permission required to connect (SP 800-207 S5.2) | AT peers continue operating on behavioral trust |
 | **Cross-cert lapse** | Inter-agency authentication fails | AT trust between peers persists; re-established when connectivity returns |
 | **Stale cached revocation** | False sense of security | AT behavioral scoring detects changed behavior regardless of credential state |
 
@@ -328,6 +328,12 @@ Both implementations match here: Python `idprocess._zta_admit` and C `welcoming_
 ## 12. Compliance Alignment
 
 Implementing AT with ZTA does not conflict with ZTA mandates. It extends them.
+
+> The full per-tenet / per-pillar **traceability matrix** (SP 800-207, DoD ZT RA
+> v2.0, SP 800-160 Vol. 2, CSF 2.0, CISA ZTMM, OMB M-22-09, DoD ZT Strategy →
+> AT mechanism, with I/IP/P/D status and gap→Option mapping) is the SOW Task 1.4
+> deliverable at `doc/NV059/work/NIST_DOD_ZT_TRACEABILITY.md`. The summary below
+> is the high-level alignment; that document is authoritative.
 
 | Standard/Framework | Requirement | AT Alignment |
 |---|---|---|
