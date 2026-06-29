@@ -90,6 +90,10 @@ class MissionCoordinator(AutonomousTrust):
 
 
 if __name__ == '__main__':
+    # Default to forkserver: 'fork' (Linux default through 3.13) forks a
+    # multi-threaded process and can deadlock the child. Harmless on 3.14+.
+    import multiprocessing as _mp
+    _mp.set_start_method('forkserver', force=True)
     # There can be only one
     os.environ[Configuration.ROOT_VARIABLE_NAME] = os.path.dirname(__file__)
     cfg_dir = Configuration.get_cfg_dir()

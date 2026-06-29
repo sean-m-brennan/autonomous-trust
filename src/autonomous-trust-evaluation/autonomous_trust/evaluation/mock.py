@@ -35,6 +35,9 @@ from autonomous_trust.simulator.simulator import Simulator
 from .dash_components.map_display import MapDisplay
 
 if __name__ == '__main__':
+    # Default to forkserver: 'fork' (Linux default through 3.13) forks a
+    # multi-threaded process and can deadlock the child. Harmless on 3.14+.
+    multiprocessing.set_start_method('forkserver', force=True)
     host: str = '127.0.0.1'
     port: int = 8050
     sim_port = default_port
@@ -47,7 +50,7 @@ if __name__ == '__main__':
     os.environ[Configuration.ROOT_VARIABLE_NAME] = coord_cfg
     ctx = multiprocessing.get_context('forkserver')
     manager = ctx.Manager()
-    with multiprocessing.Pool(5) as pool:
+    with ctx.Pool(5) as pool:
         # pool.apply_async(target=Simulator(config, max_time_steps=steps, log_level=log_level).run, args=(sim_port,))
 
         queue_pool = QueuePool(manager.Queue)

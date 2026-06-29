@@ -396,4 +396,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # Default to forkserver: 'fork' (Linux default through 3.13) forks a
+    # multi-threaded process and can deadlock the child. Harmless on 3.14+.
+    import multiprocessing as _mp
+    _mp.set_start_method('forkserver', force=True)
     main()
