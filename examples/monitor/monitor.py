@@ -42,5 +42,9 @@ class Monitor(AutonomousTrust):
 
 
 if __name__ == '__main__':
+    # Default to forkserver: 'fork' (Linux default through 3.13) forks a
+    # multi-threaded process and can deadlock the child. Harmless on 3.14+.
+    import multiprocessing as _mp
+    _mp.set_start_method('forkserver', force=True)
     random_config(os.path.join(os.path.dirname(__file__)))
     Monitor(log_level=LogLevel.INFO, logfile=Configuration.log_stdout).run_forever()
