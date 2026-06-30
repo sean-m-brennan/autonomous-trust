@@ -80,6 +80,17 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     COOP_ENTER = 0.55
     COOP_EXIT = 0.45
 
+    # Pre-reputation cold-start (CTFT no-bilateral-history-with-us branch).
+    # PREREP_NEUTRAL is the historical flat "no information" value; the
+    # transaction-memory prior (_prereputation_prior) shrinks the peer's
+    # observed third-party standing toward it by a pseudo-count of
+    # PREREP_SHRINKAGE_K, so a truly-unknown peer (zero observations) still
+    # reads exactly PREREP_NEUTRAL while a peer others have already scored
+    # gets a better-than-flat prior. Mirror: reputation.c
+    # reputation_prereputation_prior. Disable via AT_PREREP_HEURISTIC=0.
+    PREREP_NEUTRAL = 0.49
+    PREREP_SHRINKAGE_K = 3.0
+
     # EMA half-life (in committed bilateral txs) for the dashboard
     # consensus-reputation channel.  Smaller → faster crash on a peer
     # that starts producing bad scores, slower rebuild for the rest.
@@ -239,6 +250,16 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # only saw the committed broadcast). Bounded by tying eviction to
         # the TransactionHistory chain (see _evict_task_weight below).
         self.task_weights: dict[str, int] = {}
+        # Per-task capability tier, populated alongside task_weights from the
+        # TS capability_name. Feeds the per-tier consensus view
+        # (_consensus_reputation_by_tier, trust-tiers §12 / deferred.md §2.3).
+        # Same FIFO bound as task_weights. Default tier 0 when the capability
+        # is unknown locally.
+        self.task_tiers: dict[str, int] = {}
+        # Last computed {tier: score} per peer (str uuid -> dict), refreshed by
+        # _consensus_reputation_by_tier so a dashboard / query can read the
+        # per-tier breakdown without recomputing.
+        self._per_tier_last: dict[str, dict[int, float]] = {}
         # (peer_uuid, score) pairs produced by _compute_reputation in
         # spawned threads, drained by the main `process` loop where
         # `queues` is in scope. Same pattern as `requested_reps`.
@@ -557,6 +578,32 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         while len(self.task_weights) > self._TASK_WEIGHTS_CAP:
             self.task_weights.pop(next(iter(self.task_weights)))
 
+    def _resolve_tx_tier(self, score: TransactionScore) -> int:
+        """Map a TS's capability_name to the capability's required_tier, with
+        a graceful default of 0 (mirrors _resolve_tx_weight). Peers that don't
+        have the capability registered locally treat the tier as 0. Used to
+        bucket transactions for the per-tier consensus view."""
+        cap_name = getattr(score, 'capability_name', None)
+        if not cap_name:
+            return 0
+        try:
+            cap = self.protocol.capabilities[cap_name]
+        except (KeyError, AttributeError, TypeError):
+            return 0
+        t = getattr(cap, 'required_tier', 0) or 0
+        return max(0, int(t))
+
+    def _record_task_tier(self, task_id, tier: int) -> None:
+        """Insert into self.task_tiers with the same FIFO eviction as
+        task_weights (kept in lockstep so a task's weight and tier evict
+        together)."""
+        key = str(task_id)
+        if key in self.task_tiers:
+            del self.task_tiers[key]
+        self.task_tiers[key] = int(tier)
+        while len(self.task_tiers) > self._TASK_WEIGHTS_CAP:
+            self.task_tiers.pop(next(iter(self.task_tiers)))
+
     def _start_paxos(self, queues, score: TransactionScore, group_uuid=None):
         id1 = int(now().timestamp() * 1000)
         id2 = len(self.history) + 1
@@ -577,8 +624,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         queues[CfgIds.network].put(pax_msg, block=True, timeout=self.q_cadence)
         self.proposals[idx] = score
         # Cache the weight for this task so _pure_reputation can later
-        # aggregate it correctly (Slice 3 / trust-tiers.md §5).
+        # aggregate it correctly (Slice 3 / trust-tiers.md §5), and the tier
+        # so the per-tier consensus view can bucket it (§2.3).
         self._record_task_weight(score.task_id, self._resolve_tx_weight(score))
+        self._record_task_tier(score.task_id, self._resolve_tx_tier(score))
         self.logger.debug('Start a Paxos round')
 
     def handle_transaction(self, queues, message):
@@ -599,6 +648,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # capability locally fall back to weight 1.
             if hasattr(score, 'task_id'):
                 self._record_task_weight(score.task_id, self._resolve_tx_weight(score))
+                self._record_task_tier(score.task_id, self._resolve_tx_tier(score))
             msg = Message(self.name, ReputationProtocol.accepted,
                           to_json_string((id1, id2, peer_id)),
                           message.from_whom, from_whom=self.identity)
@@ -1302,8 +1352,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     my_scores.append(tx.p1_score)
         except KeyError:
             self.logger.debug('No transaction history for peer %s' % peer_uuid)
-        if len(peer_scores) < 1 or len(my_scores) < 1:  # not enough info
-            return 0.49
+        if len(peer_scores) < 1 or len(my_scores) < 1:  # no bilateral w/ us
+            # Cold-start: before any bilateral history WITH us exists, fall
+            # back to a transaction-memory prior rather than a flat neutral.
+            return self._prereputation_prior(peer_uuid)
         peer_standing = sum(peer_scores) / len(peer_scores)
         my_standing = sum(my_scores) / len(my_scores)
         if peer_scores[-1] < 0.5 and my_standing < 0.5:  # peer defected, but my standing sucks
@@ -1314,7 +1366,70 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             rep_score = max(0.51, peer_standing)
         return rep_score
 
-    # TODO can we use the transaction memory to do better than CTFT before reputation kicks in?
+    def _prereputation_prior(self, peer_uuid):
+        """Transaction-memory prior for the CTFT cold-start window.
+
+        Before any *bilateral* history with us exists, a flat 0.49 throws
+        away what the chain already knows about the peer: the scores third
+        parties have assigned it. Mine those (the counterparty-submitted
+        score on each committed transaction the peer took part in — the same
+        "assessment OF the peer" axis _pure_reputation uses), weight each by
+        the counterparty's reputation and the task weight, and shrink the
+        result toward PREREP_NEUTRAL by a pseudo-count of PREREP_SHRINKAGE_K.
+
+        With zero usable observations this returns PREREP_NEUTRAL exactly, so
+        a genuinely-unknown peer behaves exactly as before; a peer others
+        have already transacted with gets an informed, conservatively-shrunk
+        prior instead. Pure function of the chain + local reputations, so it
+        stays deterministic across nodes with the same state.
+
+        Mirror: reputation.c reputation_prereputation_prior.
+        Kill switch: AT_PREREP_HEURISTIC=0 restores the flat default."""
+        neutral = self.PREREP_NEUTRAL
+        if os.environ.get('AT_PREREP_HEURISTIC') == '0':
+            return neutral
+        try:
+            txs = list(self.history.by_peer(peer_uuid))
+        except (KeyError, AttributeError):
+            return neutral
+        self_uuid = getattr(self.identity, 'uuid', None)
+        total = 0.0
+        total_weight = 0.0
+        count = 0
+        seen = set()  # by_peer can list a tx twice (mapped under p1 and p2);
+        #               one transaction is one observation for the prior.
+        for tx in txs:
+            if tx.task_id in seen:
+                continue
+            if tx.p1_id == peer_uuid and tx.p2_id is not None:
+                about_peer, counterparty_id = tx.p2_score, tx.p2_id
+            elif tx.p2_id == peer_uuid and tx.p1_id is not None:
+                about_peer, counterparty_id = tx.p1_score, tx.p1_id
+            else:
+                continue
+            if about_peer is None or counterparty_id == self_uuid:
+                continue
+            seen.add(tx.task_id)
+            # Weight each third-party observation by the counterparty's
+            # reputation (an assessment from a trusted peer counts for more).
+            # Unlike _pure_reputation we deliberately omit the capability
+            # task-weight here: during cold-start the task-weight cache is
+            # sparse, and keeping the prior a pure function of (chain, reps)
+            # makes the C mirror a straight port of CTFT's inputs.
+            cp_rep = self.reputations[counterparty_id] \
+                if counterparty_id in self.reputations else 0.5
+            if cp_rep <= 0:
+                continue
+            total += about_peer * cp_rep
+            total_weight += cp_rep
+            count += 1
+        if count < 1 or total_weight <= 0:
+            return neutral
+        observed = total / total_weight
+        n = float(count)
+        k = self.PREREP_SHRINKAGE_K
+        prior = (n * observed + k * neutral) / (n + k)
+        return min(1.0, max(0.0, prior))
 
     @classmethod
     def _trust_tier(cls, score: float) -> int:
@@ -1669,6 +1784,63 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # txs from the bounded chain window.
         self._consensus_last[str(peer_uuid)] = ema
         return ema
+
+    def _consensus_reputation_by_tier(self, peer_uuid, chain=None):
+        """Per-tier consensus reputation (trust-tiers §12 / deferred.md §2.3).
+
+        Instead of collapsing every transaction into a single EMA, partition
+        the peer's committed bilateral transactions by the **tier of the
+        capability** that produced each one (``self.task_tiers``, populated
+        alongside ``task_weights`` from the TS ``capability_name``) and fold
+        each partition into its own weighted EMA. Returns ``{tier: score}``
+        for every tier with at least one observation — e.g. ``{1: 0.92,
+        3: 0.41}`` ("trusted at tier 1, untrusted at tier 3") — instead of one
+        number.
+
+        Additive: the collapsed ``_consensus_reputation`` is untouched and
+        remains the system's single-number score. Same EMA/weighting as the
+        collapsed view, applied within each tier bucket; deduped by task
+        (``by_peer`` can list a tx twice). Pure function of the chain +
+        ``task_tiers``/``task_weights`` caches, mirroring the collapsed view's
+        dependence on ``task_weights``.
+
+        Mirror: reputation.c ``reputation_consensus_by_tier``."""
+        history = self.history if chain is None else chain
+        try:
+            txs = list(history.by_peer(peer_uuid))
+        except KeyError:
+            return {}
+        alpha = 1.0 - 0.5 ** (1.0 / float(self.CONSENSUS_EMA_HALF_LIFE))
+        ordered = sorted(
+            txs, key=lambda t: (t.index if t.index is not None else 0))
+        ema_by_tier: dict[int, float] = {}
+        seen = set()
+        for tx in ordered:
+            if tx.p1_id is None or tx.p2_id is None:
+                continue
+            if tx.task_id in seen:
+                continue
+            if tx.p1_id == peer_uuid:
+                cp_score = tx.p2_score
+            elif tx.p2_id == peer_uuid:
+                cp_score = tx.p1_score
+            else:
+                continue
+            if cp_score is None:
+                continue
+            seen.add(tx.task_id)
+            tier = self.task_tiers.get(str(tx.task_id), 0)
+            w = self.task_weights.get(str(tx.task_id), 1)
+            ema = ema_by_tier.get(tier)
+            for _ in range(max(1, int(w))):
+                if ema is None:
+                    ema = float(cp_score)
+                else:
+                    ema = alpha * float(cp_score) + (1.0 - alpha) * ema
+            ema_by_tier[tier] = ema
+        if ema_by_tier:
+            self._per_tier_last[str(peer_uuid)] = dict(ema_by_tier)
+        return ema_by_tier
 
     def _subtree_roster(self, gateway_uuid):
         """Reputation roster for a node and everything below it in the

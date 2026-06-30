@@ -212,5 +212,34 @@ DEFINE_TEST(test_originator_auto_approve)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_voter_effective_rank)
+{
+    /* Dynamic topology-rank source (deferred.md §2.2): operational rank =
+     * signed rank + one-hop-reachability adjustment, floored at 0. Mirror of
+     * Python TestAgreementVoterEffectiveRank. */
+    agreement_voter_t v = {.rank = 5};
+    ck_assert_int_eq(agreement_voter_effective_rank(&v), 5);
+
+    /* unreachable (e.g. gateway loss) -> demote to 0; signed rank untouched */
+    ck_assert(agreement_voter_observe_reachability(&v, false));
+    ck_assert_int_eq(agreement_voter_effective_rank(&v), 0);
+    ck_assert_int_eq(v.rank, 5);
+
+    /* reachable again -> restore the signed rank */
+    ck_assert(agreement_voter_observe_reachability(&v, true));
+    ck_assert_int_eq(agreement_voter_effective_rank(&v), 5);
+
+    /* idempotent reachable -> no change */
+    ck_assert(!agreement_voter_observe_reachability(&v, true));
+
+    /* graded adjustment + floor at 0 */
+    v.rank_adjustment = -2;
+    ck_assert_int_eq(agreement_voter_effective_rank(&v), 3);
+    v.rank_adjustment = -100;
+    ck_assert_int_eq(agreement_voter_effective_rank(&v), 0);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(agreement, test_proof_create, test_authority_voting,
-          test_stake_voting, test_work_voting, test_originator_auto_approve)
+          test_stake_voting, test_work_voting, test_originator_auto_approve,
+          test_voter_effective_rank)

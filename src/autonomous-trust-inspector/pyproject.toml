@@ -31,6 +31,7 @@ networkx = ">=3.0"
 quart = ">=0.19.5"
 flask = '>=3.0,<3.2'
 plotly = ">=5.9.0"
+kaleido = ">=0.2.1,<1.0"        # static PNG export of figures (0.2.x is headless; 1.x needs Chrome)
 dash = '>=3.0'                 # code only uses dash.Patch (>=2.9); dash-extensions needs >=3
 dash-bootstrap-components = '>=2.0.0'
 dash-extensions = '>=2.0'      # dash_components.core + dashboard modules import dash_extensions.enrich
