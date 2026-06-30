@@ -83,7 +83,7 @@ deploy
 /src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/async_update/
 
 # C build
-/src/c/build
+/src/c/build*
 # Defense against accidental in-place cmake/make under src/c (use src/c/build)
 /src/c/CMakeCache.txt
 /src/c/CMakeFiles/

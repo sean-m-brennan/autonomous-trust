@@ -230,10 +230,13 @@ DEFINE_TEST(test_reputation_contrite_tft_contrition)
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_reputation_contrite_tft_third_party_ignored)
+DEFINE_TEST(test_reputation_contrite_tft_third_party_informs_prior)
 {
-    /* Transactions involving the queried peer but not self must not
-     * enter the bilateral computation → no-history default. */
+    /* Transactions involving the queried peer but not self do not enter the
+     * *bilateral* CTFT computation, but with no bilateral history WITH us
+     * they now feed the cold-start prior (reputation_prereputation_prior)
+     * instead of a flat 0.49. Mirrors Python
+     * test_third_party_transactions_inform_prior (deferred.md §2.4). */
     tx_history_t hist;
     reputations_t reps;
     ck_assert_ret_ok(tx_history_init(&hist));
@@ -245,12 +248,14 @@ DEFINE_TEST(test_reputation_contrite_tft_third_party_ignored)
     uuid_generate(other);
     uuid_generate(task);
 
-    /* peer ↔ other tx, no self involvement. */
+    /* peer ↔ other tx, no self involvement; other scores the peer 0.1. */
     ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.1));
     ck_assert_ret_ok(tx_history_update(&hist, task, other,   0.1));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    ck_assert_double_eq_tol(score, 0.49, 0.001);
+    /* observed=0.1, cp_rep(other)=0.5 default, n=1:
+     * (1*0.1 + 3*0.49) / (1+3) = 0.3925. */
+    ck_assert_double_eq_tol(score, 0.3925, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);
@@ -441,7 +446,7 @@ RUN_TESTS(Reputation3, test_tx_history_json_roundtrip, test_tx_two_peer_transact
           test_reputation_contrite_tft_cooperative_self_p2,
           test_reputation_contrite_tft_retaliation,
           test_reputation_contrite_tft_contrition,
-          test_reputation_contrite_tft_third_party_ignored,
+          test_reputation_contrite_tft_third_party_informs_prior,
           test_reputation_pure_with_counterparty,
           test_reputation_pure_unknown_counterparty_default_0_5,
           test_reputation_pure_weighted_by_task,

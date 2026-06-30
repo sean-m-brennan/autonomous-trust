@@ -277,6 +277,59 @@ class TestHandleMessages:
         assert len(at.unhandled_messages) == 1
 
 
+class TestHandleResults:
+    """The completed-task path is the principled TS producer: it should tag
+    the TransactionScore with the executed capability's name so the reputation
+    process applies that capability's transaction_weight (deferred.md §1.2)."""
+
+    def _make_at(self):
+        at = AutonomousTrust(multiproc=False, testing=True, silent=True,
+                             logfile=Configuration.log_stdout)
+        at.proc_name = CfgIds.main
+        return at
+
+    def test_completed_task_ts_carries_capability_name(self, setup_teardown):
+        at = self._make_at()
+        at.capabilities.register_ability('weighted_cap', lambda x: x,
+                                         transaction_weight=4)
+        task = Task(TaskParameters(Capability('weighted_cap')), 'req')
+        key = str(task.uuid)
+        at.active_tasks[key] = task
+        mock_result = MagicMock()
+        mock_result.ready.return_value = True
+        mock_result.get.return_value = 42
+        q_neg, q_rep = queue.Queue(), queue.Queue()
+        at._handle_results({CfgIds.negotiation: q_neg,
+                            CfgIds.reputation: q_rep},
+                           {key: mock_result})
+        tr = q_neg.get_nowait()
+        assert isinstance(tr, TaskResult)
+        ts = q_rep.get_nowait()
+        assert isinstance(ts, TransactionScore)
+        assert ts.task_id == tr.uuid
+        assert ts.capability_name == 'weighted_cap'
+
+    def test_completed_task_without_capability_is_unweighted(self,
+                                                             setup_teardown):
+        # Defensive: a task whose capability can't be resolved must fall back
+        # to capability_name=None (weight 1), the historical behavior.
+        at = self._make_at()
+        task = MagicMock()
+        task.uuid = uuid4()
+        task.capability = None
+        key = str(task.uuid)
+        at.active_tasks[key] = task
+        mock_result = MagicMock()
+        mock_result.ready.return_value = True
+        mock_result.get.return_value = 1
+        q_rep = queue.Queue()
+        at._handle_results({CfgIds.negotiation: queue.Queue(),
+                            CfgIds.reputation: q_rep},
+                           {key: mock_result})
+        ts = q_rep.get_nowait()
+        assert ts.capability_name is None
+
+
 class TestMonitorProcesses:
     def test_ready_success(self, setup_teardown):
         at = AutonomousTrust(multiproc=False, silent=True, logfile=Configuration.log_stdout)
