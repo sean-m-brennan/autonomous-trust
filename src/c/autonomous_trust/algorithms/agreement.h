@@ -48,12 +48,31 @@ typedef struct {
 typedef struct {
     char uuid[AGREEMENT_UUID_LEN];
     int rank;
+    /* Operational (dynamic) topology-rank adjustment layered on the static,
+     * signed `rank`. Driven by one-hop reachability (see
+     * agreement_voter_observe_reachability; the live source is
+     * PEER_RTT_UPDATE / peer_rtt_ms in processes.h). 0 ⇒ no adjustment, so
+     * the effective rank equals the signed rank and every rank-pinned
+     * conformance fixture (which zero-inits voters) is unchanged. Mirror of
+     * Python AgreementVoter._rank_adjustment. See deferred.md §2.2. */
+    int rank_adjustment;
     /* Reputation-derived trust tier (0..4). Distinct from rank
      * (network topology); read by AgreementByTrust (PoT). PoA/PoS/PoW
      * leave this 0 — they all key off rank or stake instead. See
      * doc/architecture/trust-tiers.md §1. */
     int tier;
 } agreement_voter_t;
+
+/** Operational rank = signed rank + dynamic adjustment, floored at 0.
+ * Authority voting / leader selection key off this rather than the raw
+ * signed rank (mirror of Python AgreementVoter.effective_rank). */
+int agreement_voter_effective_rank(const agreement_voter_t *voter);
+
+/** Fold a one-hop reachability observation into the operational rank:
+ * unreachable fully demotes to effective rank 0; reachable restores the
+ * signed rank. Returns true if the effective rank changed. Mirror of
+ * Python AgreementVoter.observe_reachability. */
+bool agreement_voter_observe_reachability(agreement_voter_t *voter, bool reachable);
 
 typedef enum {
     AGREEMENT_AUTHORITY,

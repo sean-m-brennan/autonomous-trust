@@ -1,0 +1,149 @@
+# ******************
+#  Copyright 2025 Sean M. Brennan and contributors
+#  Licensed under the Apache License, Version 2.0
+# ******************
+"""Tests for the generic AT-core trust-ladder loader.
+
+Run from the repo root:
+    pytest src/autonomous-trust/tests/a_unit/test_trust_ladder.py
+"""
+
+from __future__ import annotations
+
+import textwrap
+
+import pytest
+
+from autonomous_trust.core.capabilities import Capabilities
+from autonomous_trust.core.trust_ladder import (
+    BootstrapParams, CapMeta, TrustLadder, default_ladder,
+    load_trust_ladder, register_trust_ladder,
+)
+from autonomous_trust.core.bootstrap_capabilities import (
+    BOOTSTRAP_FUNCTIONS, register_bootstrap_capabilities,
+)
+
+
+_SAMPLE = textwrap.dedent("""\
+    version: 1
+    bootstrap:
+      enabled: true
+      duration_sec: 45
+      pairs: 12
+    capabilities:
+      at.handshake:       { required_tier: 0, transaction_weight: 1 }
+      at.time-attest:     { required_tier: 0, transaction_weight: 1 }
+      dod.sensor-report:  { required_tier: 2, transaction_weight: 4 }
+    tier_demotion_epsilon: 0.05
+""")
+
+
+def _write(tmp_path, text):
+    p = tmp_path / 'trust_ladder.yaml'
+    p.write_text(text)
+    return p
+
+
+def test_defaults_when_absent(monkeypatch):
+    # No path, no env -> documented all-defaults ladder (§8).
+    monkeypatch.delenv('AT_TRUST_LADDER', raising=False)
+    ladder = load_trust_ladder()
+    assert ladder == default_ladder()
+    assert ladder.capabilities == {}
+    assert ladder.bootstrap == BootstrapParams()
+    assert ladder.bootstrap.duration_sec == 30
+    assert ladder.tier_demotion_epsilon == pytest.approx(0.02)
+
+
+def test_load_parses_schema(tmp_path):
+    ladder = load_trust_ladder(_write(tmp_path, _SAMPLE))
+    assert isinstance(ladder, TrustLadder)
+    assert ladder.bootstrap == BootstrapParams(
+        enabled=True, duration_sec=45, pairs=12)
+    assert ladder.tier_demotion_epsilon == pytest.approx(0.05)
+    assert ladder['dod.sensor-report'] == CapMeta(
+        'dod.sensor-report', required_tier=2, transaction_weight=4)
+    assert 'at.handshake' in ladder
+    assert len(ladder) == 3
+
+
+def test_capability_defaults_fill_missing_fields(tmp_path):
+    text = "capabilities:\n  bare.cap: {}\n"
+    ladder = load_trust_ladder(_write(tmp_path, text))
+    assert ladder['bare.cap'] == CapMeta(
+        'bare.cap', required_tier=0, transaction_weight=1)
+
+
+def test_explicit_missing_path_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_trust_ladder(tmp_path / 'nope.yaml')
+
+
+def test_env_missing_path_falls_back(monkeypatch, tmp_path):
+    monkeypatch.setenv('AT_TRUST_LADDER', str(tmp_path / 'nope.yaml'))
+    assert load_trust_ladder() == default_ladder()
+
+
+def test_malformed_entry_raises(tmp_path):
+    text = "capabilities:\n  bad.cap: { required_tier: not-an-int }\n"
+    with pytest.raises(ValueError):
+        load_trust_ladder(_write(tmp_path, text))
+
+
+def test_register_metadata_only(tmp_path):
+    caps = Capabilities()
+    register_trust_ladder(caps, _write(tmp_path, _SAMPLE))
+    cap = caps['dod.sensor-report']
+    assert cap.required_tier == 2
+    assert cap.transaction_weight == 4
+    assert cap.function is None  # no function supplied -> metadata only
+
+
+def test_register_attaches_supplied_functions(tmp_path):
+    caps = Capabilities()
+    register_trust_ladder(caps, _write(tmp_path, _SAMPLE),
+                          functions=BOOTSTRAP_FUNCTIONS)
+    assert caps['at.handshake'].function is BOOTSTRAP_FUNCTIONS['at.handshake']
+    # dod.sensor-report is not in the function map -> still metadata-only.
+    assert caps['dod.sensor-report'].function is None
+
+
+def test_register_idempotent(tmp_path):
+    caps = Capabilities()
+    p = _write(tmp_path, _SAMPLE)
+    a = register_trust_ladder(caps, p)
+    b = register_trust_ladder(caps, p)
+    assert a == b
+    assert sorted(caps.to_list()) == sorted(
+        ['at.handshake', 'at.time-attest', 'dod.sensor-report'])
+
+
+# --- bootstrap integration -------------------------------------------------
+
+def test_bootstrap_defaults_unchanged(monkeypatch):
+    # No ladder configured -> the three caps at tier 0 / weight 1, nothing
+    # else (the historical contract).
+    monkeypatch.delenv('AT_TRUST_LADDER', raising=False)
+    caps = Capabilities()
+    register_bootstrap_capabilities(caps)
+    assert sorted(caps.to_list()) == sorted(BOOTSTRAP_FUNCTIONS)
+    for name in BOOTSTRAP_FUNCTIONS:
+        assert caps[name].required_tier == 0
+        assert caps[name].transaction_weight == 1
+        assert caps[name].function is BOOTSTRAP_FUNCTIONS[name]
+
+
+def test_bootstrap_ladder_overrides_tier_weight(tmp_path):
+    # A ladder reweights the bootstrap caps and adds a domain cap.
+    caps = Capabilities()
+    ladder = load_trust_ladder(_write(tmp_path, _SAMPLE))
+    register_bootstrap_capabilities(caps, ladder)
+    # at.handshake keeps its function but takes tier/weight from the ladder.
+    assert caps['at.handshake'].function is BOOTSTRAP_FUNCTIONS['at.handshake']
+    assert caps['at.handshake'].required_tier == 0
+    # at.echo-challenge isn't in the sample ladder -> code default tier/weight.
+    assert caps['at.echo-challenge'].required_tier == 0
+    assert caps['at.echo-challenge'].transaction_weight == 1
+    # the domain cap is registered metadata-only.
+    assert caps['dod.sensor-report'].required_tier == 2
+    assert caps['dod.sensor-report'].function is None
