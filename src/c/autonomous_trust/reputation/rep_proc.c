@@ -178,6 +178,13 @@ static struct {
     char  task_weights_ring[2 * MAX_CHAIN_LEN][UUID_STRING_LEN + 1];
     int   task_weights_ring_head;
     int   task_weights_ring_len;
+    /* Per-task capability tier cache (task_uuid_str -> int), parallel to
+     * task_weights and evicted in lockstep with it (every task_tiers key is
+     * also a task_weights key; _record_task_weight_locked removes both at the
+     * same points, so no separate ring is needed). Feeds the per-tier
+     * consensus view (reputation_consensus_by_tier). Mirrors Python's
+     * self.task_tiers (deferred.md §2.3). */
+    map_t task_tiers;
     /* --- Slashing (fast-penalty path) ---
      * Mirrors Python ReputationProcess._slashed / _slash_sigs /
      * _slash_pending. A finalized slash floors the target's reputation
@@ -224,6 +231,7 @@ static void _ensure_init(void)
         map_init(&rep_state.task_weights);
         rep_state.task_weights_ring_head = 0;
         rep_state.task_weights_ring_len = 0;
+        map_init(&rep_state.task_tiers);
         map_init(&rep_state.slashed);
         map_init(&rep_state.slash_sigs);
         map_init(&rep_state.slash_pending);
@@ -256,6 +264,21 @@ static int _resolve_tx_weight(const char *cap_name)
     return w > 0 ? w : 1;
 }
 
+/* Look up the required_tier for a capability by name (deferred.md §2.3).
+ * Mirrors Python's _resolve_tx_tier: empty name → 0, unknown cap → 0,
+ * otherwise the cap's required_tier (clamped to ≥0). Feeds the per-tier
+ * consensus view via the task_tiers cache. */
+static int _resolve_tx_tier(const char *cap_name)
+{
+    if (cap_name == NULL || cap_name[0] == '\0')
+        return 0;
+    capability_t *cap = find_capability(cap_name);
+    if (cap == NULL)
+        return 0;
+    int t = cap->required_tier;
+    return t > 0 ? t : 0;
+}
+
 /* Insert into rep_state.task_weights with FIFO eviction at the cap.
  * Caller must hold rep_state.lock. Refreshes order on re-insert so a
  * recent update isn't immediately evicted by an unrelated insert —
@@ -275,6 +298,7 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
         && existing != NULL)
     {
         map_remove(&rep_state.task_weights, task_uuid_str);
+        map_remove(&rep_state.task_tiers, task_uuid_str);  /* lockstep (§2.3) */
         /* Best-effort ring compaction: walk and remove matching slot.
          * O(N) but N <= 2*MAX_CHAIN_LEN, and refresh hits are rare. */
         for (int i = 0; i < rep_state.task_weights_ring_len; i++)
@@ -314,6 +338,8 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
         {
             map_remove(&rep_state.task_weights,
                        rep_state.task_weights_ring[evict_slot]);
+            map_remove(&rep_state.task_tiers,           /* lockstep (§2.3) */
+                       rep_state.task_weights_ring[evict_slot]);
             rep_state.task_weights_ring[evict_slot][0] = '\0';
         }
     }
@@ -326,6 +352,19 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
     strncpy(rep_state.task_weights_ring[rep_state.task_weights_ring_head],
             task_uuid_str, UUID_STRING_LEN);
     rep_state.task_weights_ring[rep_state.task_weights_ring_head][UUID_STRING_LEN] = '\0';
+}
+
+/* Record a task's capability tier into rep_state.task_tiers (deferred.md
+ * §2.3). No own ring: every tier key is recorded together with its weight
+ * key, and _record_task_weight_locked removes both at the same eviction
+ * points, so the tier map stays bounded in lockstep with task_weights.
+ * Caller must hold rep_state.lock. */
+static void _record_task_tier_locked(char *task_uuid_str, int tier)
+{
+    if (task_uuid_str == NULL || task_uuid_str[0] == '\0') return;
+    data_t *t_dat = integer_data(tier > 0 ? tier : 0);
+    if (t_dat == NULL) return;
+    map_set(&rep_state.task_tiers, task_uuid_str, t_dat);
 }
 
 static void _publish_tier_change(const uuid_t peer_uuid, double score)
@@ -845,6 +884,7 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
         task_uuid_buf[UUID_STRING_LEN] = '\0';
         pthread_mutex_lock(&rep_state.lock);
         _record_task_weight_locked(task_uuid_buf, _resolve_tx_weight(cap_name));
+        _record_task_tier_locked(task_uuid_buf, _resolve_tx_tier(cap_name));
         pthread_mutex_unlock(&rep_state.lock);
     }
 
@@ -1669,6 +1709,7 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
      * (mirrors Python _start_paxos → _record_task_weight). Done under the
      * same lock as the my_requests insert. */
     _record_task_weight_locked(task_str, _resolve_tx_weight(capability_name));
+    _record_task_tier_locked(task_str, _resolve_tx_tier(capability_name));
 
     pthread_mutex_unlock(&rep_state.lock);
 
@@ -2231,6 +2272,8 @@ void reputation_reset_state(int num_peers)
     rep_state.task_weights_ring_head = 0;
     rep_state.task_weights_ring_len = 0;
     memset(rep_state.task_weights_ring, 0, sizeof(rep_state.task_weights_ring));
+    map_free(&rep_state.task_tiers);   /* lockstep with task_weights (§2.3) */
+    map_init(&rep_state.task_tiers);
     map_free(&rep_state.slashed);
     map_init(&rep_state.slashed);
     map_free(&rep_state.slash_sigs);

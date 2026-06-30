@@ -107,6 +107,16 @@ extern char REP_PROTO_CHECKPOINT_FINAL[];
 #define COOP_ENTER 0.55
 #define COOP_EXIT  0.45
 
+/* Pre-reputation cold-start prior (deferred.md §2.4). PREREP_NEUTRAL is the
+ * historical flat "no information" value the CTFT no-bilateral-history branch
+ * used to return; the transaction-memory prior shrinks the peer's observed
+ * third-party standing toward it by a pseudo-count of PREREP_SHRINKAGE_K, so
+ * a genuinely-unknown peer (zero observations) still reads exactly
+ * PREREP_NEUTRAL. Mirror of repprocess.py PREREP_NEUTRAL / PREREP_SHRINKAGE_K.
+ * Disable via AT_PREREP_HEURISTIC=0. */
+#define PREREP_NEUTRAL 0.49
+#define PREREP_SHRINKAGE_K 3.0
+
 /* EMA half-life (in committed bilateral txs) for reputation_consensus.
  * Smaller → faster crash on a peer that begins producing bad scores,
  * slower rebuild for the rest. 20 gives α ≈ 0.034. */
@@ -508,6 +518,25 @@ double reputation_compute(const tx_history_t *hist, const reputations_t *reps,
  *  ReputationProcess._consensus_reputation. */
 double reputation_consensus(const tx_history_t *hist, const uuid_t peer_uuid,
                             const map_t *task_weights);
+
+/* One {tier, score} pair from the per-tier consensus view. */
+typedef struct {
+    int    tier;
+    double score;
+} tier_score_t;
+
+/** Per-tier consensus reputation (trust-tiers §12 / deferred.md §2.3).
+ *  Partition @p peer_uuid's committed bilateral txs by the tier of the
+ *  capability that produced each (@p task_tiers: uuid_str -> integer tier,
+ *  default 0) and fold each partition into its own weighted EMA — same
+ *  alpha/weighting as reputation_consensus. Writes one {tier, score} entry
+ *  per tier with >=1 observation into @p out (up to @p max_out) and returns
+ *  the entry count. Additive: reputation_consensus (the collapsed score) is
+ *  unchanged. Deduped by task. Mirrors Python
+ *  ReputationProcess._consensus_reputation_by_tier. */
+int reputation_consensus_by_tier(const tx_history_t *hist, const uuid_t peer_uuid,
+                                 const map_t *task_tiers, const map_t *task_weights,
+                                 tier_score_t *out, int max_out);
 
 /* paxos_id_index is provided by algorithms/paxos.h */
 

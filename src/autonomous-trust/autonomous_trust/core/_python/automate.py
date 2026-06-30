@@ -591,10 +591,21 @@ class AutonomousTrust(Protocol):
                     self.logger.debug(self.name + ': %s Task' % key)
                     result = results[key].get()
                     self.logger.debug(self.name + ': %s Task completed %s' % (key, result))
-                    tr = TaskResult(self.active_tasks[str(key)], result)
+                    orig_task = self.active_tasks[str(key)]
+                    tr = TaskResult(orig_task, result)
                     tr.generate_proof()
                     queues[CfgIds.negotiation].put(tr, block=True, timeout=queue_cadence)
-                    tx = TransactionScore(tr.uuid, 0.9)
+                    # Tag the TS with the capability that produced it so the
+                    # reputation process's _resolve_tx_weight applies the
+                    # capability's configured transaction_weight. The executor
+                    # holds the original Task (active_tasks), so the name comes
+                    # "for free" off the negotiation-driven path — this is the
+                    # principled producer the DoD coordinator stop-gap hand-tags
+                    # by hand (see doc/NV059/work/deferred.md §1.2). A None name
+                    # falls back to weight 1, the prior behavior.
+                    cap_name = getattr(
+                        getattr(orig_task, 'capability', None), 'name', None)
+                    tx = TransactionScore(tr.uuid, 0.9, capability_name=cap_name)
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                 except KeyboardInterrupt:
                     pass

@@ -16,6 +16,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include <errno.h>
 #include <sodium.h>
@@ -1123,6 +1124,91 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
 }
 
 /**
+ * Pre-reputation cold-start prior — mirrors repprocess.py
+ * ReputationProcess._prereputation_prior (deferred.md §2.4).
+ *
+ * Before any *bilateral* history with us exists, mine the scores third
+ * parties have assigned the peer (the counterparty-submitted side of each
+ * committed transaction the peer took part in), weight each by the
+ * counterparty's reputation, and shrink the mean toward PREREP_NEUTRAL by a
+ * pseudo-count of PREREP_SHRINKAGE_K. Zero usable observations returns
+ * PREREP_NEUTRAL exactly, so a genuinely-unknown peer is unchanged.
+ *
+ * Pure function of (hist, reps) like its Python twin; deliberately omits the
+ * capability task-weight (sparse during cold-start) so the two sides stay a
+ * straight port. Kill switch: AT_PREREP_HEURISTIC=0 restores the flat value.
+ */
+static double reputation_prereputation_prior(const tx_history_t *hist,
+                                             const reputations_t *reps,
+                                             const uuid_t self_uuid,
+                                             const uuid_t peer_uuid)
+{
+    const char *kill = getenv("AT_PREREP_HEURISTIC");
+    if (kill != NULL && strcmp(kill, "0") == 0)
+        return PREREP_NEUTRAL;
+
+    transaction_t txns[MAX_CHAIN_LEN];
+    int count = 0;
+    tx_history_by_peer(hist, peer_uuid, txns, &count, MAX_CHAIN_LEN);
+
+    uuid_t seen[MAX_CHAIN_LEN];
+    int    seen_count = 0;
+    double total = 0.0;
+    double total_weight = 0.0;
+    int    n = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        const transaction_t *tx = &txns[i];
+        if (!tx->p1_set || !tx->p2_set)
+            continue;
+
+        bool peer_is_p1 = (uuid_compare(tx->p1_uuid, peer_uuid) == 0);
+        bool peer_is_p2 = (uuid_compare(tx->p2_uuid, peer_uuid) == 0);
+        double about_peer;
+        const unsigned char *counterparty;
+        if (peer_is_p1) {
+            about_peer = tx->p2_score;
+            counterparty = tx->p2_uuid;
+        } else if (peer_is_p2) {
+            about_peer = tx->p1_score;
+            counterparty = tx->p1_uuid;
+        } else {
+            continue;
+        }
+        /* A bilateral-with-us tx is CTFT's job, not the cold-start prior. */
+        if (uuid_compare(counterparty, self_uuid) == 0)
+            continue;
+        /* by_peer can list one tx under both p1 and p2; one tx == one obs. */
+        bool dup = false;
+        for (int j = 0; j < seen_count; j++)
+            if (uuid_compare(seen[j], tx->task_uuid) == 0) { dup = true; break; }
+        if (dup)
+            continue;
+        uuid_copy(seen[seen_count++], tx->task_uuid);
+
+        double cp_rep = 0.5;  /* reputations_get leaves this if peer absent */
+        reputations_get(reps, counterparty, &cp_rep);
+        if (cp_rep <= 0.0)
+            continue;
+        total += about_peer * cp_rep;
+        total_weight += cp_rep;
+        n++;
+    }
+
+    if (n < 1 || total_weight <= 0.0)
+        return PREREP_NEUTRAL;
+
+    double observed = total / total_weight;
+    double nn = (double)n;
+    double prior = (nn * observed + PREREP_SHRINKAGE_K * PREREP_NEUTRAL)
+                   / (nn + PREREP_SHRINKAGE_K);
+    if (prior < 0.0) prior = 0.0;
+    if (prior > 1.0) prior = 1.0;
+    return prior;
+}
+
+/**
  * Contrite tit-for-tat — ports repprocess.py:363-386.
  *
  * Collects ALL direct peer↔self interactions, computes the peer's running
@@ -1131,7 +1217,8 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
  * in [0.0, 1.0], not the binary 0.0/1.0 the previous implementation
  * returned from the last direct tx alone.
  *
- *   - No direct history → 0.49 (slightly defect, lets reputation kick in)
+ *   - No bilateral history with us → reputation_prereputation_prior (§2.4),
+ *       which is PREREP_NEUTRAL (0.49) when the chain knows nothing of the peer
  *   - peer defected last AND my standing is poor → max(0.51, peer_standing)
  *   - peer defected last AND my standing is good  → min(0.49, peer_standing)
  *   - cooperative case                            → max(0.51, peer_standing)
@@ -1139,7 +1226,6 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
 double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *reps,
                                const uuid_t self_uuid, const uuid_t peer_uuid)
 {
-    (void)reps;
     transaction_t txns[MAX_CHAIN_LEN];
     int count = 0;
     tx_history_by_peer(hist, peer_uuid, txns, &count, MAX_CHAIN_LEN);
@@ -1177,7 +1263,9 @@ double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *re
     }
 
     if (n < 1)
-        return 0.49;
+        /* Cold-start: no bilateral history WITH us. Fall back to a
+         * transaction-memory prior rather than a flat neutral (§2.4). */
+        return reputation_prereputation_prior(hist, reps, self_uuid, peer_uuid);
 
     double peer_standing = peer_sum / (double)n;
     double my_standing   = my_sum   / (double)n;
@@ -1284,6 +1372,110 @@ double reputation_consensus(const tx_history_t *hist, const uuid_t peer_uuid,
         }
     }
     return seeded ? ema : 0.5;
+}
+
+/**
+ * Per-tier consensus reputation — ports repprocess.py
+ * _consensus_reputation_by_tier (trust-tiers §12 / deferred.md §2.3).
+ *
+ * Like reputation_consensus, but instead of collapsing every tx into one
+ * EMA it partitions the peer's committed bilateral txs by the tier of the
+ * capability that produced each (@p task_tiers, default tier 0) and folds
+ * each partition into its own weighted EMA. Writes one {tier, score} entry
+ * per non-empty tier into @p out and returns the count. Deduped by task
+ * (tx_history_by_peer can list a tx twice). Additive: reputation_consensus
+ * is unchanged.
+ */
+int reputation_consensus_by_tier(const tx_history_t *hist, const uuid_t peer_uuid,
+                                 const map_t *task_tiers, const map_t *task_weights,
+                                 tier_score_t *out, int max_out)
+{
+    if (out == NULL || max_out <= 0)
+        return 0;
+    transaction_t txns[MAX_CHAIN_LEN];
+    int count = 0;
+    tx_history_by_peer(hist, peer_uuid, txns, &count, MAX_CHAIN_LEN);
+    if (count == 0)
+        return 0;
+
+    const double alpha = 1.0 - pow(0.5, 1.0 / (double)CONSENSUS_EMA_HALF_LIFE);
+
+    /* Per-tier accumulators. Trust tiers are small (0..4); clamp into a
+     * bounded table and bucket anything larger into the top slot. */
+    enum { TIER_TABLE = 16 };
+    double ema[TIER_TABLE];
+    bool   seeded[TIER_TABLE];
+    for (int i = 0; i < TIER_TABLE; i++) { ema[i] = 0.0; seeded[i] = false; }
+
+    uuid_t seen[MAX_CHAIN_LEN];
+    int seen_count = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        const transaction_t *tx = &txns[i];
+        if (!tx->p1_set || !tx->p2_set)
+            continue;
+        double cp_score;
+        if (uuid_compare(tx->p1_uuid, peer_uuid) == 0)
+            cp_score = tx->p2_score;
+        else if (uuid_compare(tx->p2_uuid, peer_uuid) == 0)
+            cp_score = tx->p1_score;
+        else
+            continue;
+        /* dedup by task: by_peer can list a tx under both p1 and p2. */
+        bool dup = false;
+        for (int j = 0; j < seen_count; j++)
+            if (uuid_compare(seen[j], tx->task_uuid) == 0) { dup = true; break; }
+        if (dup)
+            continue;
+        uuid_copy(seen[seen_count++], tx->task_uuid);
+
+        char tk[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->task_uuid, tk);
+
+        int tier = 0;
+        if (task_tiers != NULL)
+        {
+            data_t *t_dat = NULL;
+            if (map_get((map_t *)task_tiers, tk, &t_dat) == 0 && t_dat != NULL)
+            {
+                int tv = 0;
+                if (data_integer(t_dat, &tv) == 0 && tv > 0)
+                    tier = tv;
+            }
+        }
+        if (tier < 0) tier = 0;
+        if (tier >= TIER_TABLE) tier = TIER_TABLE - 1;
+
+        int w = 1;
+        if (task_weights != NULL)
+        {
+            data_t *w_dat = NULL;
+            if (map_get((map_t *)task_weights, tk, &w_dat) == 0 && w_dat != NULL)
+            {
+                int wv = 0;
+                if (data_integer(w_dat, &wv) == 0 && wv > 0)
+                    w = wv;
+            }
+        }
+        for (int k = 0; k < w; k++)
+        {
+            if (!seeded[tier]) { ema[tier] = cp_score; seeded[tier] = true; }
+            else ema[tier] = alpha * cp_score + (1.0 - alpha) * ema[tier];
+        }
+    }
+
+    int n = 0;
+    for (int t = 0; t < TIER_TABLE && n < max_out; t++)
+    {
+        if (seeded[t])
+        {
+            out[n].tier = t;
+            out[n].score = ema[t];
+            n++;
+        }
+    }
+    return n;
 }
 
 /* paxos_id_index is now provided by algorithms/paxos.c */

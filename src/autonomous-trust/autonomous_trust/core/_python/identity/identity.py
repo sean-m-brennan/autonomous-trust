@@ -95,6 +95,19 @@ class Identity(InitializableConfig, AgreementVoter):
         # serialized attribute. Distinct from `_rank` (network
         # topology); see doc/architecture/trust-tiers.md §1.
 
+    def to_dict(self):
+        # `_rank_adjustment` (AgreementVoter) is ephemeral, locally-observed
+        # operational state — the dynamic one-hop-reachability delta on top of
+        # the signed `_rank` (deferred.md §2.2). It is NOT part of the wire/
+        # config identity: the protobuf form has no such field, and a peer's
+        # reachability is the observer's view, not the subject's claim. Drop it
+        # so the serialized key-set is unchanged (config_json_decoder rebuilds
+        # via cls(**kwargs), so a stray key would also break the round-trip).
+        # Each node re-derives the adjustment from its own observations.
+        d = super().to_dict()
+        d.pop('_rank_adjustment', None)
+        return d
+
     def __eq__(self, other):
         return self.__class__.__name__ == other.__class__.__name__ and self.uuid == other.uuid and \
             self.address == other.address and \

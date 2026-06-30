@@ -1826,11 +1826,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         group is size-1 — the dod_mission coordinator case.
         """
         candidates = []
-        our_rank = getattr(self.identity, '_rank', 0)
+        # Use operational (effective) rank so a peer that has dropped off the
+        # one-hop mesh isn't picked as welcomer; falls back to the static
+        # rank when no reachability adjustment is in play (deferred.md §2.2).
+        our_rank = getattr(self.identity, 'effective_rank',
+                           getattr(self.identity, '_rank', 0))
         for peer in self.peers.all:
             if str(getattr(peer, 'uuid', '')) == str(self.identity.uuid):
                 continue
-            if getattr(peer, '_rank', 0) < our_rank:
+            peer_rank = getattr(peer, 'effective_rank',
+                                getattr(peer, '_rank', 0))
+            if peer_rank < our_rank:
                 continue
             candidates.append(peer)
         if not candidates:
