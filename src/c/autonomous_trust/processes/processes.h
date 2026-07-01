@@ -159,10 +159,25 @@ extern int process_child_extra_flags;
 */
 int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies);
 
-int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
-                  map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger);
+/**
+ * @brief Process-management context shared by (re)start_process.
+ *
+ * Bundles the live pid->process registry, its lock, the queue directory,
+ * and the logger so these four collaborators travel together instead of as
+ * loose positional parameters.
+ */
+typedef struct
+{
+    map_t *procs;
+    pthread_mutex_t *procs_lock;
+    directory_t *queues;
+    logger_t *logger;
+} proc_context_t;
 
-int restart_process(pid_t orig, char *pname, map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger);
+int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
+                  proc_context_t *ctx);
+
+int restart_process(pid_t orig, char *pname, proc_context_t *ctx);
 
 
 /**

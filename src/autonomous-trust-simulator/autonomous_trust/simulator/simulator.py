@@ -249,11 +249,11 @@ class Simulator(net.SelectServer):
         pass  # do nothing
 
     def process(self, **kwargs):  # synchronous alternative
-        # Feature decision open: continuous run vs. bounded by
-        # `self.tick < self.max_time_steps`. Current behavior runs
-        # forever until `self.halt` is set; restoring the tick bound
-        # (commented out) would make scenarios finite. Pick one as
-        # the supported mode and document.
+        # Supported mode: continuous run until `self.halt` is set (decided
+        # 2026-07-01). The synchronous server streams state open-endedly for
+        # live demos and does NOT self-terminate at `max_time_steps`; callers
+        # stop it via `halt`. (The asynchronous `send_state` path is the one
+        # that bounds itself at `max_time_steps` and emits 'end'.)
         while not self.halt:
             if not isinstance(self, net.SelectServer):
                 for client_socket in self.clients:
