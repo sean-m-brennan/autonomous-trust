@@ -23,14 +23,27 @@ class SybilAttack(AttackScenario):
 
     These attempt admission via identity voting. The AT identity
     system should reject unknown identities via voting.
+
+    Measurement (``collect``) uses a *distinct-identity bound check*: the
+    admission layer must not grant access to more identities than the
+    legitimate roster. Any identity admitted beyond ``expected_admitted``
+    is counted as a Sybil that slipped past the gate. Sybil UUIDs are
+    generated inside the attacker containers at runtime and are therefore
+    not known to this scenario, so precise name matching is infeasible; the
+    count bound is the observable invariant (cf. ISSUES.md §8.1).
     """
 
     name = "sybil_attack"
     description = "Fabricated identities attempting admission via voting"
 
-    def __init__(self, num_sybil_nodes: int = 3, base_ip_offset: int = 30):
+    def __init__(self, num_sybil_nodes: int = 3, base_ip_offset: int = 30,
+                 expected_admitted: int = None):
         self.num_sybil_nodes = num_sybil_nodes
         self.base_ip_offset = base_ip_offset
+        # Number of legitimate identities expected to be admitted (the
+        # honest topology size). When set, ``collect`` derives a pass/fail
+        # bound; when None, the count-based metrics are reported as None.
+        self.expected_admitted = expected_admitted
 
     def setup(self, sim_config: dict, compose_config: dict) -> None:
         """Patch compose config to add Sybil node containers."""
@@ -59,9 +72,29 @@ class SybilAttack(AttackScenario):
         pass
 
     def collect(self, metrics: dict) -> dict:
+        # Distinct identities the mesh actually granted access to, as
+        # observed by the metrics collector. Prefer the explicit id list
+        # (added to the report so the bound is auditable) and fall back to
+        # the count for older metrics payloads.
+        admitted_ids = metrics.get('identity_admitted_ids')
+        if admitted_ids is not None:
+            total_admitted = len(admitted_ids)
+        else:
+            total_admitted = metrics.get('identity_peers_admitted')
+
+        sybil_admitted = None
+        bounded = None
+        if total_admitted is not None and self.expected_admitted is not None:
+            # Anything admitted beyond the legitimate roster got past the
+            # admission gate and is, by definition, a Sybil.
+            sybil_admitted = max(0, total_admitted - self.expected_admitted)
+            bounded = sybil_admitted == 0
+
         metrics['attack_specific'] = {
             'sybil_identities_attempted': self.num_sybil_nodes,
-            'sybil_identities_admitted': None,
-            'identity_count_bounded': None,
+            'expected_legitimate_admitted': self.expected_admitted,
+            'total_identities_admitted': total_admitted,
+            'sybil_identities_admitted': sybil_admitted,
+            'identity_count_bounded': bounded,
         }
         return metrics

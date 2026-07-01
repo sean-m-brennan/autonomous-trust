@@ -18,7 +18,6 @@ import sys
 from datetime import datetime, timedelta
 import os
 
-from autonomous_trust.services.data.server import DataConfig
 from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.identity import Identity
@@ -33,10 +32,9 @@ base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 
 class MetaIdentity(object):
-    def __init__(self, ident, meta, data):
+    def __init__(self, ident, meta):
         self.ident = ident
         self.meta = meta
-        self.data = data
 
     @classmethod
     def from_directory(cls, path: str) -> 'MetaIdentity':
@@ -45,22 +43,12 @@ class MetaIdentity(object):
         if ident._uuid != meta.uuid:  # noqa
             raise RuntimeError('Identity and Metadata configs are inconsistent for %s (%s vs %s)' %
                                (path, ident._uuid, meta.uuid))  # noqa
-        data = None
-        data_cfg = os.path.join(path, 'data-source' + Configuration.file_ext)
-        if os.path.exists(data_cfg):
-            data = DataConfig.from_file(data_cfg)
-            # Open: the consistency check below is commented out
-            # because `data.channels` and `meta.data_meta` carry
-            # duplicate-but-shaped-differently info. Resolution path
-            # is one of: (a) drop the DataSrc files and let
-            # Metadata.data_meta be the single source of truth, or
-            # (b) keep DataSrc and remove the redundant field from
-            # Metadata. Until we pick, the check stays disabled so
-            # legitimate configs don't trip it.
-            #if data.channels != meta.data_meta:
-            #   raise RuntimeError('DataSource and Metadata configs are inconsistent for %s (%s vs %s)' %
-            #                      (path, data.channels, meta.data_channels))
-        return cls(ident, meta, data)
+        # Channel info comes solely from Metadata.data_meta (decided
+        # 2026-07-01: Metadata is the single source of truth). The former
+        # per-peer `data-source` DataConfig file duplicated this in a
+        # different shape and was only ever used for a disabled consistency
+        # check, so it is no longer loaded here.
+        return cls(ident, meta)
 
     @property
     def uuid(self):

@@ -95,8 +95,12 @@ int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *confi
 
 /* Frama-C: skipped — [solver-timeout] process lifecycle preconditions */
 int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
-                   map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger)
+                   proc_context_t *ctx)
 {
+    map_t *procs = ctx->procs;
+    pthread_mutex_t *procs_lock = ctx->procs_lock;
+    directory_t *queues = ctx->queues;
+    logger_t *logger = ctx->logger;
     process_t *proc;
     if (orig > 0)
     {
@@ -153,14 +157,14 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
 }
 
 int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
-                  map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger)
+                  proc_context_t *ctx)
 {
-    return _process_start(-1, pname, runner, configs, tracker, procs, procs_lock, queues, logger);
+    return _process_start(-1, pname, runner, configs, tracker, ctx);
 }
 
-int restart_process(pid_t orig, char *pname, map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger)
+int restart_process(pid_t orig, char *pname, proc_context_t *ctx)
 {
-    return _process_start(orig, pname, NULL, NULL, NULL, procs, procs_lock, queues, logger);
+    return _process_start(orig, pname, NULL, NULL, NULL, ctx);
 }
 
 /*@

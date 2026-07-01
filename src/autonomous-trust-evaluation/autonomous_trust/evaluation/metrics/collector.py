@@ -150,6 +150,10 @@ class MetricsCollector(Process, metaclass=ProcMeta,
         else:
             result['identity_convergence_s'] = None
         result['identity_peers_admitted'] = len(self._identity_admitted)
+        # Distinct identities that were granted access, so downstream
+        # consumers (e.g. the Sybil red-team scenario) can perform a
+        # bound check against the expected legitimate roster.
+        result['identity_admitted_ids'] = sorted(self._identity_admitted.keys())
 
         # Reputation stability (mean std dev across peers)
         stddevs = []

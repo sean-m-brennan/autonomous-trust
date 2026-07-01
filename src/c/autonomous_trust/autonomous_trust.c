@@ -206,6 +206,12 @@ int run_autonomous_trust(char *q_in, char *q_out,
         log_exception(&logger);
         return -1;
     }
+    proc_context_t proc_ctx = {
+        .procs = &procs,
+        .procs_lock = &procs_lock,
+        .queues = &queues,
+        .logger = &logger,
+    };
     int num_err = 0;
     map_entries_for_each(tracker.registry, key, impl_val)
     {
@@ -224,7 +230,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
         }
 
         log_info(&logger, "%s:  Starting %s:%s ...\n", name, key, impl);
-        if (start_process(key, runner, &configs, &tracker, &procs, &procs_lock, &queues, &logger))
+        if (start_process(key, runner, &configs, &tracker, &proc_ctx))
         {
             log_exception_extra(&logger, " for process %s:%s\n", name, key);
             num_err++;
@@ -296,7 +302,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
                 continue;
             }
             pid_t dead_pid = (pid_t)atoi(dead_key);
-            if (restart_process(dead_pid, dead_key, &procs, &procs_lock, &queues, &logger))
+            if (restart_process(dead_pid, dead_key, &proc_ctx))
             {
                 log_exception_extra(&logger, " restarting process '%s'\n", dead_key);
                 active--; // give up on this process
