@@ -76,3 +76,4 @@ dependencies:
   - pip
   - pip:
       - pykcs11  # operator: PKCS#11 second-factor binding
+      - mediapipe>=0.10.5  # services: on-node EfficientDet object detection (VideoProcessor)

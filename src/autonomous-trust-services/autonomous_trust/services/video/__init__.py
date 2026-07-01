@@ -16,3 +16,4 @@
 
 from .server import VideoProcess
 from .client import VideoRcvr
+from .processor import VideoProcessor  # on-node object detection (optional mediapipe)

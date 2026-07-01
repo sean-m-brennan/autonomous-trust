@@ -216,6 +216,13 @@ class RedTeamHarness:
             if rep_a > 0.15:
                 return 'FAIL'
 
+        # Attack-specific hard invariants. The Sybil scenario reports an
+        # explicit distinct-identity bound; an admitted Sybil is a failure
+        # regardless of convergence/reputation deltas.
+        specific = attack_metrics.get('attack_specific') or {}
+        if specific.get('identity_count_bounded') is False:
+            return 'FAIL'
+
         return 'PASS'
 
     # ------------------------------------------------------------------

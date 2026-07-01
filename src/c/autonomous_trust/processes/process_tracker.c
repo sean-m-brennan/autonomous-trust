@@ -127,8 +127,13 @@ int tracker_to_json(const void *data_struct, json_t **obj_ptr)
     if (err != 0)
         return EXCEPTION(EJSN_OBJ_SET);
     
-    // TODO: Refactor to use map_to_json() once it supports simple key-value
-    // JSON encoding (current map_to_json serializes internal structure)
+    /* Intentional (not a TODO): emit "subsystems" as a FLAT array of
+     * {type: impl} objects that mirrors the Python ProcessTracker wire
+     * format, so a Python peer can parse it and vice versa. map_to_json()
+     * is deliberately NOT used here because it serializes the map's verbose
+     * internal structure (length/capacity/hashkey/bucket slots) for
+     * full-fidelity round-tripping, which is a different, incompatible
+     * format. Same convention as group.c's address_map encoding. */
     json_t *array_obj = json_array();
     if (array_obj == NULL) {
         json_decref(top_obj);
