@@ -100,6 +100,17 @@ class TestPeerDataAcq:
     def test_max_history(self):
         assert PeerDataAcq.max_history == 20
 
+    def test_reputation_of_unknown_is_none(self):
+        p = self._make_peer()
+        assert p.reputation_of('nobody') is None
+
+    def test_record_and_read_reputation_of(self):
+        p = self._make_peer()
+        p.record_reputation_of('other-1', 0.4)
+        p.record_reputation_of('other-1', 0.7)
+        assert p.reputation_of('other-1') == 0.7               # latest wins
+        assert p.reputation_by_other['other-1'].maxlen == PeerDataAcq.max_history
+
     def test_reputation_history_deque(self):
         p = self._make_peer()
         assert isinstance(p.reputation_history, deque)
@@ -369,3 +380,27 @@ class TestCohortTracker:
         tracker = MagicMock(spec=CohortTracker)
         tracker.handle_reputation = CohortTracker.handle_reputation.__get__(tracker)
         assert tracker.handle_reputation(object()) is False
+
+    def test_handle_reputation_records_transitive_view(self):
+        # A rep_resp routed back FROM observer 'peer-1' ABOUT subject 'peer-2'
+        # is peer-1's per-other view of peer-2 (§4.2:159); peer-2 still gets the
+        # direct aggregate append.
+        def _pda(uuid):
+            return PeerDataAcq(uuid, 0, MagicMock(), MagicMock(), MagicMock(),
+                               Queue(), Queue())
+        observer = _pda('peer-1')
+        subject = _pda('peer-2')
+        tracker = MagicMock(spec=CohortTracker)
+        tracker.handle_reputation = CohortTracker.handle_reputation.__get__(tracker)
+        tracker.cohort = MagicMock()
+        tracker.cohort.peers = {'peer-1': observer, 'peer-2': subject}
+        rep = MagicMock()
+        rep.peer_id = 'peer-2'
+        rep.score = 0.6
+        msg = Message(CfgIds.reputation, ReputationProtocol.rep_resp, rep)
+        msg.from_whom = MagicMock()
+        msg.from_whom.uuid = 'peer-1'
+        assert tracker.handle_reputation(msg) is True
+        assert list(subject.reputation_history) == [0.6]     # direct aggregate
+        assert observer.reputation_of('peer-2') == 0.6        # transitive/per-other
+        assert list(observer.reputation_history) == []        # observer's own untouched

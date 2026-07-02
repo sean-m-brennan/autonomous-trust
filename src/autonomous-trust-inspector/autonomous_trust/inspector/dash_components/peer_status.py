@@ -165,13 +165,12 @@ class PeerStatus(DashComponent):
                 trust_gauge = self.trust_figs[idx]
             except KeyError:
                 trust_gauge = self.add_trust_gauge(idx)
-            # TODO per-other reputation requires PeerDataAcq.reputation_history
-            #  to be keyed by peer uuid (dict[str, deque]) instead of a single deque.
-            #  For now, use the aggregate reputation as a stand-in for all others.
-            if self.peer.reputation_history:
-                rep = self.peer.reputation_history[-1]
-            else:
-                rep = 0.0
+            # Per-other (transitive) trust when available (§4.2:159): this
+            # peer's own reputation of `other`, keyed by uuid. Falls back to the
+            # aggregate reputation stand-in when no per-other view has arrived.
+            rep = self.peer.reputation_of(other)
+            if rep is None:
+                rep = self.peer.reputation_history[-1] if self.peer.reputation_history else 0.0
             trust_gauge.update_traces(selector=dict(name=f'trust-gauge-{idx}'),
                                       value=rep, overwrite=True)
             #if self.parent.displayed_detail == self.idx:
