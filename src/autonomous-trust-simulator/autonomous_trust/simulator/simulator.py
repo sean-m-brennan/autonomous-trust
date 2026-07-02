@@ -15,6 +15,7 @@
 # ******************
 
 import logging
+import math
 import os.path
 import random
 import socket
@@ -38,6 +39,16 @@ class Simulator(net.SelectServer):
     """Given a scenario config, simulate peer movement and connectivity."""
     seq_fmt = SimClient.seq_fmt
     time_resolution = 'seconds'
+
+    # Default finite comms-range cutoff in metres (ISSUES.md §6). Applied when
+    # a scenario leaves SimConfig.max_range_m unset (opt-OUT: finite range is
+    # the default). 200 km is generous enough to leave every current
+    # terrestrial demo fully connected (the widest, dod_mission, spans ~135 km)
+    # while bounding the legacy inverse-square model's effectively-infinite
+    # reach so the reachability graph reflects real radio range. Beyond this
+    # distance a pair is treated as unreachable. Set max_range_m <= 0 in a
+    # scenario to disable the cutoff entirely.
+    DEFAULT_MAX_RANGE_M = 200_000.0
 
     # Periodic heartbeat in send_state: log one INFO line every N ticks
     # so operators can tell the simulator is alive and which sim-time
@@ -104,13 +115,116 @@ class Simulator(net.SelectServer):
         for peer_info in self.cfg.peers:
             self.peers[peer_info.uuid] = PeerMovement(self.start_time, self.cadence, peer_info.path_list)
 
+    def _effective_max_range(self) -> float:
+        """Finite comms-range cutoff in metres (ISSUES.md §6, opt-OUT).
+
+        `SimConfig.max_range_m` unset (None) -> ``DEFAULT_MAX_RANGE_M``; a
+        positive value overrides it; a value <= 0 DISABLES the cutoff, returning
+        ``inf`` to restore the legacy all-pairs, infinite-range behaviour.
+        """
+        r = getattr(self.cfg, 'max_range_m', None)
+        if r is None:
+            return self.DEFAULT_MAX_RANGE_M
+        if r <= 0:
+            return math.inf
+        return float(r)
+
+    @staticmethod
+    def _grid_candidate_pairs(eligible, mapp, cell):
+        """Yield ordered (peer, other) pairs that a finite-range link could
+        connect, using a uniform spatial grid (cell edge = comms range).
+
+        Any pair whose separation is <= ``cell`` differs by at most one grid
+        index on each axis, so it is guaranteed to be emitted; distant pairs are
+        never enumerated. This is the O(n + candidates) replacement for the
+        O(n^2) all-pairs scan. Correctness never depends on the grid — the
+        caller still applies the exact distance/``can_reach`` test — so if
+        positions are not planar metres (e.g. raw GeoPosition), the grid merely
+        degrades toward O(n^2) while staying correct. Keyed on position .x/.y
+        (UTM easting/northing for the simulator's internal frame).
+        """
+        grid: dict[tuple[int, int], list] = {}
+        for peer in eligible:
+            pos = mapp[peer.uuid].position
+            grid.setdefault((int(pos.x // cell), int(pos.y // cell)), []).append(peer)
+        for peer in eligible:
+            pos = mapp[peer.uuid].position
+            cx, cy = int(pos.x // cell), int(pos.y // cell)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for other in grid.get((cx + dx, cy + dy), ()):
+                        if other.uuid != peer.uuid:
+                            yield peer, other
+
+    def _connectivity_space(self, eligible, mapp, matrix, sig_quality, delay_matrix):
+        """Space mode: dynamic FSPL + light-delay for EVERY pair. Interplanetary
+        links span AUs, so no range pruning applies -- this stays the full
+        all-pairs computation and emits a dense matrix (True/False per pair)."""
+        max_dist = 0
+        for peer in eligible:
+            matrix[peer.uuid] = {}
+            sig_quality[peer.uuid] = {}
+            delay_matrix[peer.uuid] = {}
+            for other in eligible:
+                if peer.uuid == other.uuid:
+                    continue
+                dist = mapp[peer.uuid].position.distance(mapp[other.uuid].position)
+                if max_dist < dist:
+                    max_dist = dist
+                delay_matrix[peer.uuid][other.uuid] = light_delay_s(dist)
+                if self.cfg.sun_position and sun_occluded(
+                        mapp[peer.uuid].position, mapp[other.uuid].position,
+                        self.cfg.sun_position):
+                    # Sun occultation: link blocked
+                    fspl = 999.0
+                else:
+                    fspl = free_space_path_loss_db(dist, self.cfg.comm_freq_hz or 8.4e9)
+                sig_quality[peer.uuid][other.uuid] = fspl
+                matrix[peer.uuid][other.uuid] = peer.can_reach(other, fspl)
+        return max_dist
+
+    def _connectivity_terrestrial(self, eligible, mapp, matrix, sig_quality, path_loss):
+        """Terrestrial mode (ISSUES.md §6): emit a SPARSE, reachable-only matrix.
+
+        With a finite comms range (the opt-out default) a uniform spatial grid
+        limits candidate pairs to spatial neighbours, so cost scales with actual
+        connectivity rather than O(n^2); pairs beyond the range are simply
+        omitted (absent == unreachable, which routing.py default-denies). With
+        the range disabled (max_range_m <= 0) it falls back to the exact
+        all-pairs scan. Within range, reachability is unchanged from before
+        (per-pair `can_reach`, terrain path-loss when available).
+        """
+        max_range = self._effective_max_range()
+        finite = not math.isinf(max_range)
+        if finite:
+            candidate_pairs = self._grid_candidate_pairs(eligible, mapp, max_range)
+        else:
+            candidate_pairs = ((peer, other) for peer in eligible for other in eligible
+                               if peer.uuid != other.uuid)
+        max_dist = 0
+        for peer, other in candidate_pairs:
+            dist = mapp[peer.uuid].position.distance(mapp[other.uuid].position)
+            if finite and dist > max_range:
+                continue  # beyond radio range -> unreachable (omitted == sparse)
+            if max_dist < dist:
+                max_dist = dist
+            terrain_loss = None
+            if path_loss is not None:
+                peer_row = path_loss.get(peer.uuid)
+                if peer_row is not None:
+                    terrain_loss = peer_row.get(other.uuid)
+            if peer.can_reach(other, terrain_loss):
+                matrix.setdefault(peer.uuid, {})[other.uuid] = True
+                if terrain_loss is not None:
+                    sig_quality.setdefault(peer.uuid, {})[other.uuid] = terrain_loss
+        return max_dist
+
     def compute_step(self, tick):
         current_time = self.start_time + timedelta(seconds=self.cadence * tick)
         mapp: Map = {}
         matrix: Matrix = {}
         sig_quality: SignalMatrix = {}
         delay_matrix: DelayMatrix = {}
-        max_dist = 0
         active = []
         path_loss = self.cfg.path_loss_matrix
         for peer in self.cfg.peers:
@@ -118,49 +232,16 @@ class Simulator(net.SelectServer):
                 active.append(peer.uuid)
             position, speed = self.peers[peer.uuid].move(tick)
             mapp[peer.uuid] = Ident(position, speed, peer.kind, peer.petname)
-        # All must move first before looping for connectivity.
-        # Note: The nested loop below is O(n^2) by necessity -- it computes
-        # pairwise reachability and signal quality between every pair of peers.
-        for peer in self.cfg.peers:
-            if current_time < peer.initial_time or current_time > peer.last_seen or \
-                    mapp[peer.uuid].position is None:
-                continue
-            matrix[peer.uuid] = {}
-            sig_quality[peer.uuid] = {}
-            if self.cfg.space_mode:
-                delay_matrix[peer.uuid] = {}
-            for other in self.cfg.peers:
-                if peer == other or current_time < other.initial_time or current_time > other.last_seen or \
-                        mapp[other.uuid].position is None:
-                    continue
-
-                dist = mapp[peer.uuid].position.distance(mapp[other.uuid].position)
-                if max_dist < dist:
-                    max_dist = dist
-
-                if self.cfg.space_mode:
-                    # Space mode: compute dynamic FSPL and LOS per pair
-                    delay_matrix[peer.uuid][other.uuid] = light_delay_s(dist)
-                    if self.cfg.sun_position and sun_occluded(
-                            mapp[peer.uuid].position, mapp[other.uuid].position,
-                            self.cfg.sun_position):
-                        # Sun occultation: link blocked
-                        fspl = 999.0
-                    else:
-                        fspl = free_space_path_loss_db(
-                            dist, self.cfg.comm_freq_hz or 8.4e9)
-                    sig_quality[peer.uuid][other.uuid] = fspl
-                    matrix[peer.uuid][other.uuid] = peer.can_reach(other, fspl)
-                else:
-                    # Terrestrial mode: use static terrain path loss if available
-                    terrain_loss = None
-                    if path_loss is not None:
-                        peer_row = path_loss.get(peer.uuid)
-                        if peer_row is not None:
-                            terrain_loss = peer_row.get(other.uuid)
-                    matrix[peer.uuid][other.uuid] = peer.can_reach(other, terrain_loss)
-                    if terrain_loss is not None:
-                        sig_quality[peer.uuid][other.uuid] = terrain_loss
+        # All must move first before computing connectivity. Reachability is
+        # computed only among peers active in this window and with a known
+        # position (the "eligible" set).
+        eligible = [peer for peer in self.cfg.peers
+                    if peer.initial_time <= current_time <= peer.last_seen
+                    and mapp[peer.uuid].position is not None]
+        if self.cfg.space_mode:
+            max_dist = self._connectivity_space(eligible, mapp, matrix, sig_quality, delay_matrix)
+        else:
+            max_dist = self._connectivity_terrestrial(eligible, mapp, matrix, sig_quality, path_loss)
 
         positions = [v.position for v in mapp.values() if v.position is not None]
         mid = UTMPosition.middle(positions)

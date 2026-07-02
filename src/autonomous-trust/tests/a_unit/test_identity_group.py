@@ -139,6 +139,38 @@ class TestGroup:
         assert g2.encryptor.serialize() == g.encryptor.serialize()
         assert str(g2.uuid) == str(g.uuid)
 
+    def test_proto_roundtrip_address_map_created(self):
+        # ISSUES.md §1.4: the protobuf Group carries the FULL address_map (not
+        # just a single `address`) and the §3.1-b `created` age, matching the
+        # canonical JSON form. Exercises to_wire_bytes/from_wire_bytes (the
+        # binary-proto path -> sync_to_message/sync_from_message).
+        from autonomous_trust.core.protobuf.identity import identity_pb2
+        fields = [f.name for f in identity_pb2.Group.DESCRIPTOR.fields]
+        if 'address_map' not in fields or 'created' not in fields:
+            pytest.skip('identity_pb2 not regenerated for §1.4 '
+                        '(run scripts/build-py.sh proto-only)')
+        g = Group(uuid4(), {'u1': '10.0.0.1', 'u2': '10.0.0.2'}, 'squad',
+                  Encryptor.generate(), _public_only=False, _created=1700000000.5)
+        g2 = Group.from_wire_bytes(g.to_wire_bytes())
+        assert dict(g2._address_map) == {'u1': '10.0.0.1', 'u2': '10.0.0.2'}
+        assert g2.created == 1700000000.5
+        assert str(g2.uuid) == str(g.uuid)
+
+    def test_proto_legacy_address_only(self):
+        # Back-compat: a proto Group from an older peer that set only the single
+        # `address` (no address_map) reconstructs a one-entry map keyed by uuid.
+        from autonomous_trust.core.protobuf.identity import identity_pb2
+        if 'address_map' not in [f.name for f in identity_pb2.Group.DESCRIPTOR.fields]:
+            pytest.skip('identity_pb2 not regenerated for §1.4')
+        msg = identity_pb2.Group()
+        msg.uuid = b'grp-legacy'
+        msg.address = '10.9.9.9'
+        enc = Encryptor.generate()
+        enc.sync_to_message()
+        msg.encryptor.CopyFrom(enc.message)
+        g = Group.from_wire_bytes(msg.SerializeToString())
+        assert dict(g._address_map) == {'grp-legacy': '10.9.9.9'}
+
     def test_canonical_public_only(self):
         # A published (public-only) group emits the public key + public_only=true
         # and reconstructs with no private key.
