@@ -205,6 +205,59 @@ class TestIdentityHistory:
         result = h._pre_verify(blob, proof, b'sig')
         assert result is True
 
+    # --- §3.2 divergence detection (proof-digest consistency) ---
+
+    def _make_proof(self, blob, uuid, digest=None, nonce=None):
+        from autonomous_trust.core.algorithms.agreement import AgreementProof
+        if digest is None:
+            digest = blob.get_hash(nonce)
+        return AgreementProof(uuid, digest, True, nonce)
+
+    def test_verify_object_matching_digest_accepted(self):
+        """A proof whose digest matches the canonical blob hash is accepted."""
+        h = self._make_history()
+        blob = IdentityObj(_make_mock_identity(), uuid4())
+        proof = self._make_proof(blob, h.myself.uuid)  # digest = blob.get_hash()
+        assert h.verify_object(blob, proof, b'sig') is True
+
+    def test_verify_object_mismatched_digest_rejected(self):
+        """A proof committing to a DIFFERENT view (wrong digest) is rejected —
+        the voter holds a divergent history view of this candidate."""
+        h = self._make_history()
+        blob = IdentityObj(_make_mock_identity(), uuid4())
+        proof = self._make_proof(blob, h.myself.uuid,
+                                 digest=b'\x00' * len(blob.get_hash()))
+        assert h.verify_object(blob, proof, b'sig') is False
+
+    def test_verify_object_nonce_aware_digest(self):
+        """PoW-style proofs carry the nonce in the digest; the check must
+        recompute with the proof nonce, not reject a legitimate mined digest."""
+        h = self._make_history()
+        blob = IdentityObj(_make_mock_identity(), uuid4())
+        nonce = b'12345'
+        proof = self._make_proof(blob, h.myself.uuid, nonce=nonce)
+        assert h.verify_object(blob, proof, b'sig') is True
+        # ...and the same digest without accounting for the nonce would mismatch
+        stale = self._make_proof(blob, h.myself.uuid,
+                                 digest=blob.get_hash(), nonce=nonce)
+        assert h.verify_object(blob, stale, b'sig') is False
+
+    def test_verify_object_empty_digest_tolerated(self):
+        """An absent/empty digest falls through (prior behavior) — the check
+        only fires when a voter actually committed a digest."""
+        h = self._make_history()
+        blob = IdentityObj(_make_mock_identity(), uuid4())
+        proof = self._make_proof(blob, h.myself.uuid, digest=b'')
+        assert h.verify_object(blob, proof, b'sig') is True
+
+    def test_branch_heads_exposes_all_heads(self):
+        h = self._make_history()
+        heads = h.branch_heads()
+        assert h.main_branch in heads
+        # snapshot is a copy — mutating it must not affect the DAG
+        heads['bogus'] = None
+        assert 'bogus' not in h.branch_heads()
+
     def test_populate(self):
         h = self._make_history()
         steps = h.recite()

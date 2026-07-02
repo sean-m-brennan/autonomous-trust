@@ -31,6 +31,10 @@ typedef struct
     char address[ADDR_LEN+1];
     map_t address_map;  /* UUID string -> address string (mirrors Python _address_map) */
     encryptor_t encryptor;
+    /* Group age (ISSUES.md §3.1-b): comparable creation epoch (seconds), or 0
+     * if unknown. Merge size-tie tiebreaker — the OLDER group wins. Mirrors
+     * Python Group._created. Carried on the wire by group_to_json. */
+    double created;
 } group_t;
 
 /**

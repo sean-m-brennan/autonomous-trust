@@ -25,7 +25,8 @@
         "required": ["id", "role"],
         "properties": {
           "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$"},
-          "role": {"type": "string", "minLength": 1}
+          "role": {"type": "string", "minLength": 1},
+          "border_guard": {"type": "boolean"}
         }
       }
     },
