@@ -119,7 +119,7 @@ def _await_peers():
     except ValueError:
         secs = 0
     if secs > 0:
-        print('Inspector: waiting %ds for peers to bind...' % secs, flush=True)
+        print(f'Inspector: waiting {secs}s for peers to bind...', flush=True)
         time.sleep(secs)
 
 
