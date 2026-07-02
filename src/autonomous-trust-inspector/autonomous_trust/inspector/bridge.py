@@ -52,6 +52,7 @@ from autonomous_trust.core._python import _probes
 from autonomous_trust.services.data.server import DataProtocol
 
 from .inspector import Inspector
+from .transitive_trust import PEER_PAIR_QUERY_SEC
 
 
 logger = logging.getLogger(__name__)
@@ -71,10 +72,10 @@ logger = logging.getLogger(__name__)
 #   ("peer_gone",  name:str)   # future
 BRIDGE_QUEUE_MAX = 1024
 
-# Send a peer-to-peer reputation-query round every PEER_PAIR_QUERY_SEC.
-# O(N²) round-trips per round, but typical N is small (~10 peers) and
-# the network can absorb 100 messages/min easily.
-PEER_PAIR_QUERY_SEC = 60.0
+# PEER_PAIR_QUERY_SEC (the peer-to-peer query cadence) and the query round
+# itself now live in transitive_trust.TransitiveTrustMixin, shared with the
+# stock Inspector. O(N²) round-trips per round, but typical N is small
+# (~10 peers) and the network can absorb 100 messages/min easily.
 
 # Minimum score delta that triggers a `reputation` / `rep_pair` push to
 # the bridge queue. The bridge polls latest_reputation every ~5s; with
@@ -402,30 +403,14 @@ class InspectorBridge(Inspector):
         # forward_reputation can route the rep_resp back over the
         # network (else requestor=None and the response stays local).
         if self.tasking_tick(3, PEER_PAIR_QUERY_SEC):
+            # Peer-to-peer reputation queries (shared TransitiveTrustMixin):
+            # ask each observer for its view of every other subject, routed
+            # over the network; responses are captured into
+            # latest_reputation_pairs by automate.py.
             _probes.counter('bridge.task', 'tick3_fired')
-            peers = list(self.peers.all)
-            _probes.counter('bridge.task', 'tick3_peers', str(len(peers)))
-            for observer in peers:
-                for subject in peers:
-                    if str(observer.uuid) == str(subject.uuid):
-                        continue
-                    try:
-                        query = Message(
-                            CfgIds.reputation,
-                            ReputationProtocol.rep_req,
-                            to_json_string((subject, self.proc_name)),
-                            observer,  # routed over the network
-                            from_whom=self.identity,
-                        )
-                        _probes.counter('bridge.task', 'tick3_msg_built')
-                        queues[CfgIds.network].put(
-                            query, block=True, timeout=queue_cadence)
-                        _probes.counter('bridge.task', 'tick3_msg_queued')
-                    except Exception:
-                        _probes.counter('bridge.task', 'tick3_exc')
-                        logger.exception(
-                            "[bridge] failed peer-pair rep_req %r->%r",
-                            observer, subject)
+            _probes.counter('bridge.task', 'tick3_peers', str(len(self.peers.all)))
+            sent = self.query_peer_pairs(queues, logger=logger)
+            _probes.counter('bridge.task', 'tick3_msg_queued', str(sent))
 
         if self.tasking_tick(2, 5.0):  # ~5s
             now = time.time()

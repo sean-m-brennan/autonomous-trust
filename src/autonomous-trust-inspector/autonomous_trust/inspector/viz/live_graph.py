@@ -95,7 +95,11 @@ class LiveData(object, metaclass=ClassEnumMeta):
             o = cls._peer_node(graph, observer)
             s = cls._peer_node(graph, subject)
             graph.add_edge(o, s)
-            graph.edges[o, s].setdefault('trust', {})[observer] = score
+            trust = graph.edges[o, s].setdefault('trust', {})
+            trust[observer] = score
+            # Scalar summary for rendering/diffing (dicts aren't hashable and
+            # can't be styled directly): worst-case of the directional views.
+            graph.edges[o, s]['trust_level'] = min(trust.values())
             return
         # Direct: a rep object with .peer_id / .score -> node reputation attr.
         peer_id = getattr(data, 'peer_id', None)
@@ -120,7 +124,10 @@ class LiveNetwork(ng.NetworkGraph):
     cadence_ms = 1000
 
     def __init__(self, _, **kwargs):
-        self.node_data = list(self.node_data) + ['persist']
+        # Track reputation (node) + trust_level (edge) in the diff keys so a
+        # change in transitive trust triggers an update emit to the client.
+        self.node_data = list(self.node_data) + ['persist', 'reputation']
+        self.link_data = list(self.link_data) + ['trust_level']
         self.iteration = 0
         self._stopped = False
         groups = ['a', '', ' ', 'trouble']

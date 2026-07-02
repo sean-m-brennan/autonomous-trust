@@ -26,6 +26,7 @@ from autonomous_trust.core.reputation.protocol import ReputationProtocol
 
 from .viz.server import VizServer, default_port as _viz_default_port
 from .viz.live_graph import LiveData
+from .transitive_trust import TransitiveTrustMixin, PEER_PAIR_QUERY_SEC
 
 
 class InspectorProcess(Process, metaclass=ProcMeta,
@@ -49,7 +50,7 @@ class InspectorProcess(Process, metaclass=ProcMeta,
                 pass
 
 
-class Inspector(AutonomousTrust):
+class Inspector(TransitiveTrustMixin, AutonomousTrust):
     def __init__(self, port=None, **kwargs):
         super().__init__(**kwargs)
         self.add_worker(InspectorProcess, self.system_dependencies)
@@ -71,16 +72,26 @@ class Inspector(AutonomousTrust):
                 queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
                 ping = Message(CfgIds.network, Network.ping, 5, peer, return_to=self.proc_name)
                 queues[CfgIds.network].put(ping, block=True, timeout=queue_cadence)
+        if self.tasking_tick(3, PEER_PAIR_QUERY_SEC):
+            # Transitive trust (resolves the former open design question):
+            # ask each observer for its view of every other subject. Responses
+            # land in self.latest_reputation_pairs (automate.py), which we
+            # forward to the live graph below as (observer, subject, score)
+            # triples — run_data_handlers folds those into per-observer edge
+            # trust. One-hop for now; deeper walking would need peers to share
+            # their own rosters.
+            self.query_peer_pairs(queues, logger=self.logger)
         if self.tasking_tick(2, 5.0):  # every 5 sec
-            # Open design question: should the inspector visualize
-            # transitive trust — peers-of-peers? Currently only direct
-            # peers appear in self.latest_reputation. Adding a
-            # transitive view needs (a) a way for each peer to share
-            # its own peer list with the inspector, (b) a UI decision
-            # on how deep to walk + how to render layered trust.
+            # Direct trust: our own view of each peer -> node reputation.
             for peer_id in self.latest_reputation:
                 self.data_queue.put((LiveData.reputation, self.latest_reputation[peer_id]),
                                     block=True, timeout=queue_cadence)
+            # Transitive trust: each observer's view of each subject -> edge.
+            for (obs_uuid, sub_uuid), rep in list(self.latest_reputation_pairs.items()):
+                score = getattr(rep, 'score', rep)
+                self.data_queue.put(
+                    (LiveData.reputation, (str(obs_uuid), str(sub_uuid), score)),
+                    block=True, timeout=queue_cadence)
             for message in list(self.unhandled_messages):
                 # unhandled_messages may contain non-Message objects
                 # (e.g. IdentityByAuthority); skip anything without .function.
