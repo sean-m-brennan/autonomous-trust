@@ -20,7 +20,7 @@
  * the source file later does #include <stdio.h>, the include guard
  * makes it a no-op — the macros only affect call sites, not decls.
  *
- * Copyright 2025 Sean M. Brennan and contributors
+ * Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  * SPDX-License-Identifier: Apache-2.0
  *******************/
 

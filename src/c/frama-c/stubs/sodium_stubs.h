@@ -6,7 +6,7 @@
  *
  * Only functions actually referenced in src/c/autonomous_trust/ are stubbed.
  *
- * Copyright 2025 Sean M. Brennan and contributors
+ * Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  * SPDX-License-Identifier: Apache-2.0
  */
 

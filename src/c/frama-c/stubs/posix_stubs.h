@@ -7,7 +7,7 @@
  * Note: mq_* (POSIX message queues) are NOT used in the current codebase,
  * so they are omitted.  The project uses sockets (UDP/TCP) for IPC instead.
  *
- * Copyright 2025 Sean M. Brennan and contributors
+ * Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  * SPDX-License-Identifier: Apache-2.0
  */
 
