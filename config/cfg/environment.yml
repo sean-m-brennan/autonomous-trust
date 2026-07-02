@@ -10,6 +10,7 @@ dependencies:
   - pynacl
   - python-dateutil
   - cryptography
+  - ntplib  # optional NTP client for distributed clock sync (core network/ntp.py + services NtpTimeSource)
   - numpy
   - pyyaml
   - dill

@@ -234,6 +234,17 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: group_size={actual}, expected {int(expected)}'
                     )
+            elif key == 'provisional_peer_count':
+                # Peers this participant is holding PROVISIONAL under two-phase
+                # admission (§3.1-a): confirm(s) received but the distinct-
+                # confirmer quorum not yet met, so the group key is withheld.
+                # Cleared on promotion. C mirrors via identity_provisional_count.
+                actual = len(getattr(self.process, '_provisional_confirmations', {}))
+                if actual != int(expected):
+                    raise AssertionError(
+                        f'{self.id}: provisional_peer_count={actual}, '
+                        f'expected {int(expected)}'
+                    )
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
 
@@ -480,6 +491,21 @@ class IdentityAdapter:
                 this_group = group
             participant = self._build_one(pid, role, identity, peers, this_group,
                                           zta_policy=zta_policy)
+            # Border-guard flag (ISSUES.md §3.1-c, Policy B). Optional
+            # per-participant `border_guard: false` makes this peer abstain
+            # from voting on received proposals; defaults true (set in
+            # _build_one) so existing scenarios are unaffected. Mirrors the C
+            # adapter's identity_set_border_guard_mode plumbing.
+            if 'border_guard' in spec:
+                participant.process.border_guard_mode = bool(spec['border_guard'])
+            # Two-phase admission quorum (§3.1-a). fixtures.admission_quorum is
+            # {participant_id: int}; a member withholds the group key until that
+            # many distinct border-guards confirm. Default 1 (no fixture) keeps
+            # single-confirm admission. Mirrors the C adapter's
+            # identity_set_admission_quorum plumbing.
+            aq_fix: dict[str, int] = fixtures.get('admission_quorum', {}) or {}
+            if pid in aq_fix:
+                participant.process._admission_quorum = int(aq_fix[pid])
             # Install own-capability allowlist from fixtures.capabilities;
             # mirrors the C adapter's `identity_set_own_capabilities`
             # plumbing. handle_caps_query reads

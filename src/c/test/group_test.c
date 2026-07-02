@@ -202,6 +202,57 @@ DEFINE_TEST(test_group_canonical_private_roundtrip)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_group_created_age_roundtrip)
+{
+    /* ISSUES.md §3.1-b: the group "created" age (merge size-tie tiebreaker,
+     * older group wins) must survive the canonical JSON round-trip so a peer
+     * can compare our group's age against its own. Also pins two invariants:
+     *   - group_init leaves created == 0 (its callers include the conformance
+     *     adapter, which must stay age-agnostic → the uuid tiebreak; a nonzero
+     *     stamp here would make C conformance non-deterministic). The real
+     *     genesis mint stamps created separately (id_proc.c choose_group).
+     *   - an incoming payload with no "created" key deserializes to 0.0
+     *     (unknown age → uuid tiebreak), keeping older-build peers compatible.
+     * Mirrors Python test_group_age_merge.py. */
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t u1;
+    uuid_generate(u1);
+    char addr1[] = "10.0.0.7";
+    group_t *g1 = NULL;
+    ck_assert_ret_ok(group_create(&u1, addr1, &g1));
+
+    /* group_init/group_create leave age unknown (0.0). */
+    ck_assert(g1->created == 0.0);
+
+    /* Stamp a known epoch and round-trip it through the canonical form. */
+    g1->created = 1700000000.5;   /* arbitrary comparable epoch (seconds) */
+    json_t *obj = NULL;
+    ck_assert_ret_ok(group_to_json(g1, &obj));
+    ck_assert_ptr_nonnull(obj);
+    json_t *j_created = json_object_get(obj, "created");
+    ck_assert_ptr_nonnull(j_created);
+    ck_assert(json_is_number(j_created));
+    ck_assert(json_number_value(j_created) == 1700000000.5);
+
+    group_t g2;
+    memset(&g2, 0, sizeof(group_t));
+    ck_assert_ret_ok(group_from_json(obj, &g2));
+    ck_assert(g2.created == 1700000000.5);
+
+    /* A payload with "created" removed must default to 0.0 (unknown age). */
+    ck_assert(json_object_del(obj, "created") == 0);
+    group_t g3;
+    memset(&g3, 0, sizeof(group_t));
+    ck_assert_ret_ok(group_from_json(obj, &g3));
+    ck_assert(g3.created == 0.0);
+
+    json_decref(obj);
+    group_free(g1);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Group, test_group_create, test_group_encrypt_decrypt,
           test_group_proto_roundtrip, test_group_init_stack,
-          test_group_canonical_private_roundtrip)
+          test_group_canonical_private_roundtrip,
+          test_group_created_age_roundtrip)
