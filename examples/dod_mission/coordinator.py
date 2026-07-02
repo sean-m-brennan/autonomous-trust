@@ -50,6 +50,8 @@ from autonomous_trust.core.config.generate import (
     generate_identity, generate_worker_config,
 )
 from autonomous_trust.core.system import now, queue_cadence
+from autonomous_trust.inspector.transitive_trust import (
+    TransitiveTrustMixin, PEER_PAIR_QUERY_SEC)
 from autonomous_trust.evaluation.scenarios.recording import EventRecorder
 
 def _roster_name_of(peer):
@@ -439,7 +441,7 @@ def _reading_from_dict(d: dict) -> Reading:
     )
 
 
-class DoDMissionCoordinator(AutonomousTrust):
+class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
     """Coordinator node for the DoD squad infiltration demo.
 
     Extends AutonomousTrust with:
@@ -685,7 +687,7 @@ class DoDMissionCoordinator(AutonomousTrust):
             name=__name__,
             title=self.scenario.name,
             panels=self._panels,
-            chart_keys=["target_x_chart", "noise_chart"],
+            chart_keys=["target_x_chart", "noise_chart", "trust_network"],
             state_provider=lambda: self._latest_state,
             port=self._dashboard_port,
             narration_script=DOD_NARRATION,
@@ -719,6 +721,14 @@ class DoDMissionCoordinator(AutonomousTrust):
         # the cold-bootstrap field peers (sensors / rq86 / mq800).
         if self._tick_count % 20 == 0:
             self._query_reputations(queues)
+        # Peer-of-peer (transitive) trust: ask each observer for its view of
+        # every other subject over the network (TransitiveTrustMixin). Replies
+        # land in self.latest_reputation_pairs (automate.py); _build_trust_matrix
+        # turns them into the dashboard's Trust Network edges. Cadence ~= 60s
+        # (PEER_PAIR_QUERY_SEC) at the 500ms tick, kept off the 20-tick direct
+        # cadence since it is O(N^2).
+        if self._tick_count % int(PEER_PAIR_QUERY_SEC / 0.5) == 0:
+            self.query_peer_pairs(queues, logger=logger)
         # Flush the recording on its own (slower) cadence so a hard kill (or a
         # missed graceful-shutdown window — e.g. k8s teardown wiping the node)
         # can't discard the whole run; it's a durability backstop, not a display
@@ -1295,6 +1305,35 @@ class DoDMissionCoordinator(AutonomousTrust):
                 tiers[role.name] = SEED_TIER
         return tiers
 
+    def _build_trust_matrix(self):
+        """Undirected bilateral trust edges for the dashboard Trust Network.
+
+        Built from ``self.latest_reputation_pairs`` (populated by the peer-pair
+        query round): each ``(observer_uuid, subject_uuid) -> rep`` is resolved
+        to roster names and the two directional views of a pair are min-combined
+        (skepticism-wins). Returns ``list[(observer, subject, score)]`` — the
+        shape ``build_graph_from_scenario(trust_matrix=...)`` consumes. Empty
+        until the first peer-pair round lands.
+        """
+        pairs = getattr(self, "latest_reputation_pairs", None)
+        if not pairs:
+            return []
+        name_of = {str(p.uuid): (_roster_name_of(p) or str(p.uuid))
+                   for p in self.peers.all}
+        combined: dict[tuple[str, str], float] = {}
+        for (obs_uuid, subj_uuid), rep in list(pairs.items()):
+            obs = name_of.get(str(obs_uuid))
+            subj = name_of.get(str(subj_uuid))
+            if not obs or not subj or obs == subj:
+                continue
+            try:
+                score = float(getattr(rep, "score", rep))
+            except (TypeError, ValueError):
+                continue
+            key = tuple(sorted((obs, subj)))
+            combined[key] = min(combined[key], score) if key in combined else score
+        return [(a, b, s) for (a, b), s in combined.items()]
+
     def _push_dashboard_update(self):
         # Scenario seconds since tasking_start — falls back to tick-derived
         # estimate (AT runs at ~500ms cadence) until tasking_start is set.
@@ -1305,6 +1344,8 @@ class DoDMissionCoordinator(AutonomousTrust):
         self._latest_state = {
             "reputations": self._reputations_view(t_seconds),
             "tiers": self._tiers_view(t_seconds),
+            # Peer-of-peer trust edges for the Trust Network panel (Stage 5).
+            "trust_matrix": self._build_trust_matrix(),
             # Live narration gates for beats whose real moment floats. The jet
             # strike is gated on the jet actually reaching the objective (its
             # launch is gated on the MQ-800 collapse, so the strike time floats

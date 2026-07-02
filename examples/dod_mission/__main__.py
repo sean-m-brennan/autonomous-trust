@@ -376,7 +376,7 @@ def main(argv=None):
         name=_HERE_FOR_LOG,
         title=f"{scenario.name} — canned playback",
         panels=panels,
-        chart_keys=["target_x_chart", "noise_chart"],
+        chart_keys=["target_x_chart", "noise_chart", "trust_network"],
         state_provider=state_provider,
         narration_script=narration,
         # Canned playback is meant for presentations; default to on so

@@ -162,10 +162,16 @@ def build_dashboard(scenario: DoDMissionScenario) -> dict:
     streams = DataStreamsPanel(peer_colors=colors)
     detail = PeerDetailPanel()
 
+    # Trust Network (transitive-trust Stage 5): peer-of-peer bilateral trust,
+    # fed by the coordinator's live trust_matrix.
+    from .trust_network_panel import TrustNetworkPanel
+    trust_network = TrustNetworkPanel(scenario)
+
     return {
         "trust_timeline": timeline,
         "target_x_chart": target_x_chart,
         "noise_chart": noise_chart,
+        "trust_network": trust_network,
         "event_log": event_log,
         "data_streams": streams,
         "peer_detail": detail,

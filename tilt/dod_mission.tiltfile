@@ -191,15 +191,30 @@ build_args["GIT_VERSION"] = git_version
 #                               — lean, no Dash, no .inspector)
 #
 # Tilt's docker_build manages each image: content-hash caching, FROM
-# chain resolution (preflight in run-demo.sh seeds the daemon with the
-# canonical :dev tags so the Dockerfile defaults resolve), and image-
-# ref rewriting in k8s_yaml() so Deployments auto-roll when their
-# image rebuilds.
+# chain resolution, and image-ref rewriting in k8s_yaml() so Deployments
+# auto-roll when their image rebuilds.
+#
+# The derived images use `FROM ${BASE_IMAGE}` with a `:dev` default, which
+# defeats Tilt's *static* FROM-chain detection (it can't see through the ARG).
+# Passing BASE_IMAGE as a build_arg whose value is the parent's docker_build
+# ref lets Tilt resolve the chain itself (autonomous-trust -> -inspector ->
+# at-dod-mission-demo, and autonomous-trust -> at-dod-mission-peer) and inject
+# each freshly-built parent. This is what lets run-demo.sh SKIP the pre-seed
+# for the tilt path (see ensure_demo_images / the tilt dispatch); the
+# compose/k8s paths still pre-build since there's no Tilt to drive the chain.
 #
 # An earlier revision wrapped each build in a local_resource for
 # per-image build rows in the Tilt UI, but that broke auto-rollout
 # (Tilt couldn't see the image change) and the multi-agency pattern
 # turned out smoother in practice.
+
+# Per-image build_args: shared args + the parent image ref so `FROM
+# ${BASE_IMAGE}` resolves to a Tilt-managed image. Copy (don't mutate the
+# shared dict). Root images (autonomous-trust, autonomous-trust-c) omit it.
+def _with_base(parent):
+    d = dict(build_args)
+    d["BASE_IMAGE"] = parent
+    return d
 
 docker_build(
     "autonomous-trust",
@@ -214,7 +229,7 @@ docker_build(
     repo_root,
     dockerfile=repo_root + "/src/autonomous-trust-inspector/Dockerfile",
     network="host",
-    build_args=build_args,
+    build_args=_with_base("autonomous-trust"),
 )
 
 docker_build(
@@ -222,7 +237,7 @@ docker_build(
     repo_root,
     dockerfile=repo_root + "/examples/dod_mission/deploy/Dockerfile",
     network="host",
-    build_args=build_args,
+    build_args=_with_base("autonomous-trust-inspector"),
 )
 
 docker_build(
@@ -230,7 +245,7 @@ docker_build(
     repo_root,
     dockerfile=repo_root + "/examples/dod_mission/deploy/Dockerfile-peer",
     network="host",
-    build_args=build_args,
+    build_args=_with_base("autonomous-trust"),
 )
 
 # Embedded C at_demo image — only built when --c-microdrones names at least one
@@ -295,6 +310,30 @@ watch_file(repo_root + "/src/autonomous-trust-inspector/autonomous_trust")
 watch_file(repo_root + "/src/autonomous-trust-simulator/autonomous_trust")
 watch_file(repo_root + "/examples/dod_mission")
 
-# Don't fight ourselves over the generated tree: the local_resource
-# above is the only thing that should write under k8s_dir.
-watch_settings(ignore=[k8s_dir, repo_root + "/examples/dod_mission/simulator/scenario.yaml"])
+# --- Only rebuild on git-tracked changes ----------------------------------
+# The docker_build contexts (repo_root) and the watch_file() trees above
+# otherwise watch the WHOLE repo, so untracked cruft
+# (src/autonomous-trust-inspector/.rustup, __pycache__, .venv, .demo-state,
+# doc/research PDFs, ...) triggers spurious image rebuilds. Instead of
+# hand-maintaining an exhaustive ignore list, let git enumerate it:
+#   `ls-files --others`  -> every untracked path (NO --exclude-standard, so
+#                           gitignored paths are included too)
+#   `--directory`        -> collapse a fully-untracked dir to one entry
+# Paths are git-root-relative (== repo_root), so prefix repo_root to make
+# them Tiltfile-relative. watch_settings(ignore=) is a GLOBAL ignore that
+# covers the docker_build contexts and the watch_file() trees alike.
+# NB: this is snapshotted at Tiltfile eval — a brand-new file only starts
+# triggering rebuilds after `git add` + a Tiltfile reload.
+_untracked = str(local(
+    "git -C " + repo_root + " ls-files --others --directory",
+    quiet=True, echo_off=True,
+)).split("\n")
+_git_ignore = [repo_root + "/" + p for p in _untracked if p]
+
+# Also don't fight ourselves over the generated tree: the local_resource
+# above is the only thing that should write under k8s_dir, and the
+# scenario.yaml (tracked) is regenerated on every eval.
+watch_settings(ignore=[
+    k8s_dir,
+    repo_root + "/examples/dod_mission/simulator/scenario.yaml",
+] + _git_ignore)

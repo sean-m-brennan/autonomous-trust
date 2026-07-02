@@ -61,7 +61,7 @@ AT_SRC_PATHS="$here/src/autonomous-trust:$here/src/autonomous-trust-evaluation:$
 export PYTHONPATH="${AT_SRC_PATHS}:${here}${PYTHONPATH:+:$PYTHONPATH}"
 
 # Project is conda-based; the canonical interpreter lives in the
-# `autonomous_trust` env (see environment.yaml + scripts/setup-dev.sh).
+# `autonomous_trust` env (see environment.yml + scripts/setup-dev.sh).
 # Match the gating convention used by scripts/build-py.sh: refuse to
 # run when that env isn't active. The actual check is deferred until after
 # argument parsing so that --help works without the env active.
@@ -215,7 +215,7 @@ fi
 log "Using python: $AT_PYTHON"
 
 # The compose + scenario generators import a handful of conda-installed
-# deps (pyyaml at minimum; environment.yaml is the canonical source).
+# deps (pyyaml at minimum; environment.yml is the canonical source).
 # Probe up front so the error message points the user at the fix
 # instead of producing a traceback per scale point.
 ensure_py_deps() {
@@ -260,7 +260,7 @@ ensure_py_deps() {
     err "Missing python deps in $CONDA_ENV_NAME env: ${missing[*]}"
     err "    Re-run with --install-deps, OR install them manually:"
     err "    mamba install -n $CONDA_ENV_NAME -c conda-forge ${pkgs[*]}"
-    err "    (or: conda env update -n $CONDA_ENV_NAME --file environment.yaml)"
+    err "    (or: conda env update -n $CONDA_ENV_NAME --file environment.yml)"
     exit 1
 }
 ensure_py_deps

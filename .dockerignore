@@ -1,6 +1,7 @@
 **/__pycache__/
 **/*.pyc
 **/*.pyo
+**/.tox/
 .git/
 .tilt/
 *.egg-info/
