@@ -122,6 +122,19 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             raise RuntimeError('Invalid identity history implementation: %s' % impl)
         self.messages: list[Message] = []
         self.border_guard_mode = True
+        # Two-phase admission (ISSUES.md §3.1-a). A member receiving a
+        # `confirm` broadcast holds the peer PROVISIONAL — known in
+        # self.peers/history for reputation/routing, but the group key is NOT
+        # propagated to it (no group.add_address + _update_group) — until
+        # `_admission_quorum` DISTINCT border-guards have independently
+        # confirmed the admission, at which point it is promoted to CONFIRMED.
+        # The default quorum of 1 promotes on the first confirm, reproducing
+        # the historical single-welcomer behavior exactly (no regression); a
+        # deployment sets it higher for corroborated key handover. Local policy
+        # only — no wire field. `_provisional_confirmations` maps a peer uuid
+        # (str) to the set of confirmer uuids (str) seen so far.
+        self._admission_quorum = 1
+        self._provisional_confirmations: dict[str, set] = {}
         # 3-tuple: (group, history-steps, peer-identities). The peer
         # list rides along to seed self.peers with welcomer-known peers
         # whose admission confirm broadcasts predated our join. Older
@@ -701,8 +714,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # New-peer identity rides as the DRY canonical public-identity payload
         # (shared byte-shape with C public_identity_to_json) so a C member can
         # parse it — the new peer is a third party, so it can't use from_*.
+        # from_whom carries the CONFIRMER (us) so a member can count distinct
+        # confirmers for the two-phase admission quorum (§3.1-a). The new-peer
+        # identity is the payload; the confirmer rides the envelope (idiomatic,
+        # mirrors `accept`). Harmless at the default quorum of 1.
         msg_str = to_json_string(public_identity_to_canonical(blob.identity))
-        message = Message(self.name, IdentityProtocol.confirm, msg_str, to_whom=self.group)
+        message = Message(self.name, IdentityProtocol.confirm, msg_str, to_whom=self.group,
+                          from_whom=self.identity)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
         # send my identity in the open to enable encryption — the new peer needs
@@ -1115,7 +1133,33 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.logger.debug(
                 'Announced self to %d bundled peers' % sent)
 
-    def _add_peer(self, queues, identity, amnesia=False):
+    def _confirm_group_membership(self, queues, identity, level=None):
+        """Propagate group membership + key to a CONFIRMED peer (§3.1-a).
+
+        Adds the peer's address to our group and re-publishes the group —
+        which carries the shared private key (Group.to_canonical) — to the
+        mid-level hierarchy. Split out of _add_peer so a PROVISIONAL member
+        can be tracked (known in self.peers/history) without the group key
+        ever leaving this node until the admission quorum is met. Only reached
+        for confirmed peers; see handle_confirm_peer for the state machine."""
+        if self.group is None:
+            return
+        if level is None:
+            level = self.peers.mid_level
+        self.group.add_address(identity.uuid, identity.address)
+        self._record_group(queues)
+        # DEFERRED DESIGN: adopting the new peer's group key when
+        # they come from an older/larger group (group-merge
+        # protocol). Today we always retain our own group identity
+        # and add the joiner's address to it. Inverting this would
+        # require: (a) a comparable size/age signal on Group, (b)
+        # a peer-key handover handshake, (c) C-side parity. Tracked
+        # alongside the broader group-merge discussion in
+        # divergence.md context (see also the M2 / late-history
+        # paths that already merge histories without merging keys).
+        self._update_group(queues, self.group, level)
+
+    def _add_peer(self, queues, identity, amnesia=False, confirmed=True):
         # The `amnesia` parameter is currently a structural placeholder.
         # All callers either pass the default (`False`) or are guarded
         # by `if not amnesia` above. The actual amnesia recovery flow
@@ -1126,29 +1170,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # late-joiner-caps four-layer defense pattern for context.
         # The parameter is retained so future per-callsite recovery
         # policy can plug in here without changing the signature.
+        #
+        # `confirmed` (§3.1-a two-phase admission): when False, the peer is
+        # recorded in history/peers/caps but the group key is NOT propagated
+        # (the group-address add + _update_group are withheld) — the
+        # PROVISIONAL state. handle_confirm_peer promotes to confirmed once
+        # the admission quorum of distinct confirmers is met. The welcomer
+        # (post-finalize) and single-confirm default (quorum 1) pass True, so
+        # existing behavior is unchanged.
         level = self.peers.mid_level
-        if self.group is not None:
-            # DEFERRED DESIGN: delaying group-update vs. exposing group
-            # key. Current behavior adds the new peer's address and
-            # publishes the group BEFORE the peer is fully validated by
-            # the welcoming-committee vote. This trades a brief window
-            # of premature group-key visibility for simpler ordering —
-            # if the peer is later rejected, group_remove cleans up.
-            # Tightening this requires a multi-phase admission protocol
-            # (provisional vs. confirmed group membership) that both
-            # the Python and C implementations would need to agree on.
-            self.group.add_address(identity.uuid, identity.address)
-            self._record_group(queues)
-            # DEFERRED DESIGN: adopting the new peer's group key when
-            # they come from an older/larger group (group-merge
-            # protocol). Today we always retain our own group identity
-            # and add the joiner's address to it. Inverting this would
-            # require: (a) a comparable size/age signal on Group, (b)
-            # a peer-key handover handshake, (c) C-side parity. Tracked
-            # alongside the broader group-merge discussion in
-            # divergence.md context (see also the M2 / late-history
-            # paths that already merge histories without merging keys).
-            self._update_group(queues, self.group, level)
+        if confirmed:
+            self._confirm_group_membership(queues, identity, level)
         self._history.insert_peer(identity, level)
         with self.lock:
             has_potential = identity.uuid in self.peer_potentials
@@ -1202,22 +1234,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.propose:
             self.logger.debug('Received peer proposal')
-            # DEFERRED DESIGN: should non-border-guards vote on
-            # proposals? `welcoming_committee` only emits `propose`
-            # when `self.border_guard_mode` is True (line ~587), but
-            # any peer in phase 3 that receives the broadcast
-            # currently votes. Two viable policies:
-            #   A. Current: everyone in phase 3 votes — wider quorum,
-            #      but a non-border-guard's view of the candidate is
-            #      necessarily shallower (no welcoming-committee
-            #      validation context).
-            #   B. Border-guards-only: gate this branch on
-            #      `if self.border_guard_mode:` to mirror the emit
-            #      side. Tighter security model, smaller quorum.
-            # Policy B requires C-side parity — the C implementation
-            # has no `border_guard_mode` concept yet (greppable: no
-            # matches in src/c/autonomous_trust/identity/). Land
-            # cross-impl before changing the Python behavior.
+            # Policy B — border-guards-only voting (ISSUES.md §3.1-c).
+            # `welcoming_committee` only *emits* a proposal when this peer is a
+            # border guard; the vote side now mirrors that: only border guards
+            # vote on a received proposal. A non-border-guard has no
+            # welcoming-committee validation context for the candidate, so its
+            # vote would carry the same weight on a shallower view — Policy B is
+            # the tighter security model. border_guard_mode defaults True (every
+            # peer is a guard) so this is a no-op unless a deployment designates
+            # non-guards; the C `handle_vote_on_peer` mirrors this gate. The
+            # message is still consumed (returns True) — a non-guard simply
+            # abstains rather than leaving it unhandled.
+            if not self.border_guard_mode:
+                self.logger.debug('Not a border guard; abstaining from vote')
+                return True
             blob = message.obj  # from self.welcoming_committee()
             if isinstance(blob, str):
                 blob = Configuration.from_string(blob)
@@ -1340,11 +1370,45 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # but missing from peer_capabilities, so DataRcvr never
                 # subscribes to their streams.
                 self._send_caps_query(queues, peer)
+            # Two-phase admission (§3.1-a). Count DISTINCT confirmers for this
+            # peer; propagate the group key only once the quorum is met.
+            #   - quorum 1 (default): first confirm promotes immediately —
+            #     identical to the historical single-welcomer behavior.
+            #   - quorum >1: hold PROVISIONAL (peer known, key withheld) until
+            #     that many distinct border-guards have independently
+            #     confirmed, then CONFIRM (propagate the group key).
+            peer_key = str(peer.uuid)
+            confirmer = message.from_whom
+            confirmer_uuid = str(confirmer.uuid) if isinstance(confirmer, Identity) else None
+            with self.lock:
+                confirmers = self._provisional_confirmations.setdefault(peer_key, set())
+                # No confirmer identity on the envelope (e.g. quorum 1, or a
+                # sender that didn't stamp from_whom): treat this confirm as a
+                # distinct anonymous corroboration so single-confirm admission
+                # still promotes.
+                confirmers.add(confirmer_uuid if confirmer_uuid is not None
+                               else '<anon:%d>' % len(confirmers))
+                reached = len(confirmers) >= max(1, self._admission_quorum)
+            first_add = self.peers.find_by_uuid(peer.uuid) is None
             _probes.emit('peer.set', 'add_request',
                          peer_uuid=str(peer.uuid),
                          peer_addr=getattr(peer, 'address', None),
                          source='handle_confirm_peer')
-            self._add_peer(queues, peer)
+            if first_add:
+                # Record the peer (history/peers/caps); propagate the group
+                # key only if the quorum is already satisfied.
+                self._add_peer(queues, peer, confirmed=reached)
+            elif reached:
+                # Already provisionally known; the quorum is now met —
+                # propagate the group key (promotion).
+                self._confirm_group_membership(queues, peer)
+            if reached:
+                with self.lock:
+                    self._provisional_confirmations.pop(peer_key, None)
+            else:
+                self.logger.debug(
+                    'Peer %s provisional: %d/%d confirms' %
+                    (peer.nickname, len(confirmers), max(1, self._admission_quorum)))
             return True
         return False
 
@@ -2145,7 +2209,18 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 elif len(theirs.addresses) < len(mine.addresses):
                     adopt = False
                 else:
-                    adopt = str(theirs.uuid) < str(mine.uuid)
+                    # Size tie (ISSUES.md §3.1-b): the OLDER group wins — the
+                    # more-established group absorbs the younger one — so we
+                    # adopt theirs iff it is older. Only when both carry a known
+                    # age (created > 0) that differs; otherwise fall back to the
+                    # deterministic uuid tiebreaker (historical behavior, which
+                    # prevents the equal-size group_key_update flood). "Adopt
+                    # the older/larger group": larger is primary above, older
+                    # breaks the tie here.
+                    if theirs.created and mine.created and theirs.created != mine.created:
+                        adopt = theirs.created < mine.created
+                    else:
+                        adopt = str(theirs.uuid) < str(mine.uuid)
             if adopt:
                 if theirs.owns_private_key or not mine.owns_private_key:
                     # Normal adopt: `theirs` carries the shared private key, or

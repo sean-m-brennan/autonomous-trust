@@ -294,6 +294,30 @@ static void _apply_zta_fixtures(sce_run_ctx_t *ctx, json_t *fixtures) {
  * participants' peer lists with the newcomer (so welcoming_committee's
  * already-known branch is reachable). */
 static void _apply_fixtures(sce_run_ctx_t *ctx) {
+    /* border_guard: optional per-participant bool on the participant spec
+     * (ISSUES.md §3.1-c, Policy B). Default true (set in
+     * identity_register_handlers); `border_guard: false` makes that peer
+     * abstain from voting on received proposals. Read here — before the
+     * fixtures early-return — because it lives on the participant entry, not
+     * under `fixtures`. Mirrors the Python adapter reading spec['border_guard']. */
+    json_t *participants = json_object_get(ctx->case_data, "participants");
+    if (json_is_array(participants)) {
+        size_t np = json_array_size(participants);
+        for (size_t i = 0; i < np; i++) {
+            json_t *pj = json_array_get(participants, i);
+            if (!json_is_object(pj)) continue;
+            json_t *bg = json_object_get(pj, "border_guard");
+            if (!json_is_boolean(bg)) continue;  /* absent => keep default */
+            const char *pid = json_string_value(json_object_get(pj, "id"));
+            if (pid == NULL) continue;
+            sce_participant_t *part = sce_find_participant(ctx, pid);
+            if (part == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            if (impl == NULL || impl->proc == NULL) continue;
+            identity_set_border_guard_mode(impl->proc, json_is_true(bg));
+        }
+    }
+
     json_t *fixtures = json_object_get(ctx->case_data, "fixtures");
     if (!json_is_object(fixtures)) return;
 
@@ -328,6 +352,25 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
             }
             identity_set_own_capabilities(impl->proc, names, k);
             free((void *)names);
+        }
+    }
+
+    /* admission_quorum: { "<participant>": <int>, ... } — two-phase admission
+     * (ISSUES.md §3.1-a). A member withholds the group key until this many
+     * DISTINCT border-guards confirm. Default 1 (no fixture). Mirrors the
+     * Python adapter reading fixtures.admission_quorum. */
+    json_t *quorums = json_object_get(fixtures, "admission_quorum");
+    if (json_is_object(quorums))
+    {
+        const char *qpid;
+        json_t *qval;
+        json_object_foreach(quorums, qpid, qval) {
+            if (!json_is_integer(qval)) continue;
+            sce_participant_t *part = sce_find_participant(ctx, qpid);
+            if (part == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            if (impl == NULL || impl->proc == NULL) continue;
+            identity_set_admission_quorum(impl->proc, (int)json_integer_value(qval));
         }
     }
 
@@ -1104,6 +1147,18 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                                  cap_name, bad_field);
                         return -1;
                     }
+                }
+            } else if (strcmp(key, "provisional_peer_count") == 0) {
+                /* Two-phase admission (§3.1-a): peers held provisional
+                 * (confirm seen, quorum not met, group key withheld). Mirrors
+                 * the Python adapter's provisional_peer_count. */
+                int want = (int)json_integer_value(val);
+                int got = (int)identity_provisional_count(proc);
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: provisional_peer_count=%d, expected %d",
+                             pid, got, want);
+                    return -1;
                 }
             } else {
                 snprintf(ctx->err, sizeof(ctx->err),
