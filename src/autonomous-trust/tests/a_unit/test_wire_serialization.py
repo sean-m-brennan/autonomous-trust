@@ -96,9 +96,10 @@ class TestGroupWire:
         restored = Group.from_string(data)
         assert str(restored.uuid) == str(grp.uuid)
         assert restored.encryptor.publish() == enc.publish()
-        # Proto format stores only a single address, not the full map;
-        # address_map is lossy on the wire
-        assert restored._address_map == {}
+        # §1.4: the full address_map now round-trips on the wire — the proto
+        # gained a `map<string,string> address_map` field (and JSON carries it),
+        # so it is no longer lossy.
+        assert restored._address_map == addr_map
 
 
 class TestAgreementProofWire:

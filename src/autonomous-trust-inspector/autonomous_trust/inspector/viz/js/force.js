@@ -37,8 +37,8 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
     let ws = null;
     let group_ids = null;
 
-    const node_metadata = ["group"];
-    const link_metadata = ["group", "weight"];
+    const node_metadata = ["group", "reputation"];
+    const link_metadata = ["group", "weight", "trust_level"];
    
     let graph = {
         nodes: [],
@@ -76,6 +76,15 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
     const weightScale = d3.scaleLinear()
         .domain([1, max_link_weight])
         .range([.1, 1])
+
+    // Transitive-trust / reputation color ramp: 0 (red, distrust) -> 0.5
+    // (amber) -> 1 (green, trust). Colors edges by their `trust_level`
+    // (worst-case peer-of-peer view) and node rings by direct `reputation`.
+    const trustColor = d3.scaleLinear()
+        .domain([0, 0.5, 1])
+        .range(["#d62728", "#e8c000", "#2ca02c"])
+        .clamp(true);
+    const hasTrust = function (v) { return v !== undefined && v !== null; };
 
     const linkFactor = 1000;
 
@@ -145,6 +154,10 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
                 return d.weight / 2.0;
             })
             .style("stroke", function (d) {
+                // Transitive trust (when known) dominates the edge color; fall
+                // back to the group color for edges with no trust observation.
+                if (hasTrust(d.trust_level))
+                    return trustColor(d.trust_level);
                 if (d.group === 0)
                     return "#777";
                 return ordinal(d.group);
@@ -192,8 +205,14 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
             .style("fill", function (d) {
                 return ordinal(d.group);
             })
-            .style("stroke", "white")
-            .attr("stroke-width", "1")
+            // Node ring encodes this peer's direct reputation (green=trusted,
+            // red=distrusted); plain white when no reputation has arrived.
+            .style("stroke", function (d) {
+                return hasTrust(d.reputation) ? trustColor(d.reputation) : "white";
+            })
+            .attr("stroke-width", function (d) {
+                return hasTrust(d.reputation) ? "2.5" : "1";
+            })
             .call(d3.drag()
                   .on("start", drag_started)
                   .on("drag", dragged)

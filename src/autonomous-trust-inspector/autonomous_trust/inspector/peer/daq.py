@@ -54,6 +54,11 @@ class PeerDataAcq(object):
         self.network_history: dict[str, deque[NetworkStats]] = {}
         self.total_network_history: deque[NetworkStats] = deque(maxlen=self.max_history)
         self.reputation_history: deque[float] = deque(maxlen=self.max_history)
+        # Per-other (transitive) trust: THIS peer's reputation of each other
+        # peer, keyed by the other's uuid. Populated from peer-pair rep_resp
+        # (§4.2:159) so the per-other trust gauges are precise rather than the
+        # aggregate stand-in.
+        self.reputation_by_other: dict[str, deque[float]] = {}
 
     @property
     def time(self):
@@ -86,6 +91,17 @@ class PeerDataAcq(object):
     @property
     def identity(self):
         return self._ident
+
+    def record_reputation_of(self, other_uuid: str, score: float):
+        """Record this peer's reputation of ``other_uuid`` (per-other trust)."""
+        self.reputation_by_other.setdefault(
+            other_uuid, deque(maxlen=self.max_history)).append(score)
+
+    def reputation_of(self, other_uuid: str):
+        """Latest reputation this peer assigns to ``other_uuid``, or None if this
+        peer has no recorded view of that other."""
+        hist = self.reputation_by_other.get(other_uuid)
+        return hist[-1] if hist else None
 
 
 class CohortInterface(object):
@@ -253,9 +269,17 @@ class CohortTracker(Process, metaclass=ProcMeta,
         if not (isinstance(message, Message) and message.function == ReputationProtocol.rep_resp):
             return False
         rep = message.obj
-        if rep.peer_id in self.cohort.peers:
-            peer = self.cohort.peers[rep.peer_id]
-            peer.reputation_history.append(rep.score)
+        subject = rep.peer_id
+        # Direct view: append to the subject's aggregate history (what the
+        # micrograph + the fallback trust-gauge read).
+        if subject in self.cohort.peers:
+            self.cohort.peers[subject].reputation_history.append(rep.score)
+        # Transitive view (§4.2:159): a rep_resp routed back from a peer
+        # (observer != subject) is THAT observer's opinion of the subject —
+        # record it as the observer's per-other reputation of the subject.
+        observer = getattr(getattr(message, 'from_whom', None), 'uuid', None)
+        if observer is not None and observer != subject and observer in self.cohort.peers:
+            self.cohort.peers[observer].record_reputation_of(subject, rep.score)
         return True
 
     def process(self, queues, signal):
