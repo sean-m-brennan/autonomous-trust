@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: propose-vote-non-border-guard-abstains
+byte_pinning: false
+description: |
+    Border-guards-only voting (ISSUES.md §3.1-c, Policy B). This is the
+    negative control for propose-vote-admit: same happy-path propose→vote
+    topology, but the recipient bob is designated a NON-border-guard
+    (`border_guard: false`). A non-border-guard consumes the proposal but
+    abstains — it has no welcoming-committee validation context for the
+    candidate — so votes_emitted == 0.
+
+    Pairs with propose-vote-admit (bob a border_guard, votes_emitted == 1):
+    together they show the border_guard flag is what gates the vote, not some
+    unrelated short-circuit. The default is border-guard everywhere
+    (border_guard_mode = True in both impls), so only this scenario exercises
+    the abstain path.
+
+    Cross-impl: Python gates handle_vote_on_peer on
+    IdentityProcess.border_guard_mode; C gates handle_vote_on_peer on the
+    per-process protocol.border_guard_mode (set by identity_register_handlers,
+    cleared here by the adapters reading the participant's border_guard field).
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+    border_guard: false
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: propose_peer
+    payload:
+      candidate: newcomer
+    description: |
+        alice proposes newcomer to bob. bob is not a border guard, so it
+        abstains from voting despite passing the collision/blacklist guards —
+        votes_emitted == 0.
+
+expected_state:
+  bob:
+    votes_emitted: 0

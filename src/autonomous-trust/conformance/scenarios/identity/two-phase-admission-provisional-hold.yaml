@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: two-phase-admission-provisional-hold
+byte_pinning: false
+description: |
+    Two-phase (provisional→confirmed) admission — ISSUES.md §3.1-a. A member
+    withholds the group key from a newly-confirmed peer until a QUORUM of
+    distinct border-guards have independently confirmed the admission.
+
+    bob is a group member with admission_quorum = 2. It receives ONE confirm
+    (from border-guard alice) naming the newcomer. Because only one distinct
+    confirmer has been seen (< 2), bob holds the newcomer PROVISIONAL: it is
+    recorded for tracking but the group key is NOT propagated to it. The
+    observable is provisional_peer_count == 1 — exactly one peer awaiting
+    corroboration.
+
+    A second confirm from a DISTINCT border-guard would meet the quorum and
+    promote the peer (provisional_peer_count → 0, group membership propagated);
+    that promotion path is unit-tested (test_two_phase_admission.py /
+    history-side C tests). The default quorum of 1 (every other scenario)
+    promotes on the first confirm, so this is the only scenario exercising the
+    provisional hold.
+
+    Cross-impl: Python IdentityProcess._admission_quorum /
+    _provisional_confirmations; C protocol.admission_quorum +
+    id_state.provisional_confirmations, set via identity_set_admission_quorum.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: group_member
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  admission_quorum:
+    bob: 2
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: peer_accepted
+    payload:
+      peer: newcomer
+    description: |
+        alice (one border-guard) confirms newcomer to bob. bob's quorum is 2,
+        so a single confirm is insufficient — newcomer is held provisional and
+        the group key is withheld.
+
+expected_state:
+  bob:
+    provisional_peer_count: 1
