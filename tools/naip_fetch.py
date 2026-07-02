@@ -14,7 +14,7 @@ Source: USGS NAIPImagery ImageServer ``exportImage`` REST endpoint.
 Public-domain imagery (NAIP is a USDA product distributed by USGS).
 
 Dependencies (provided by the ``autonomous_trust`` conda env --
-see environment.yaml; ``conda activate autonomous_trust``)::
+see environment.yml; ``conda activate autonomous_trust``)::
 
     pyproj Pillow
 

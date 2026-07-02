@@ -37,8 +37,8 @@ COPY --chown=user:user src/autonomous-trust-inspector/autonomous_trust/inspector
 COPY --chown=user:user src/autonomous-trust-services/autonomous_trust/services autonomous_trust/services
 COPY --chown=user:user src/autonomous-trust-simulator/autonomous_trust/simulator autonomous_trust/simulator
 
-# update and install any new dependencies from environment.yaml
-COPY --chown=user:user config/cfg/environment.yaml /build/config/cfg/environment.yaml
-COPY --chown=user:user config/cfg/environment.yaml ./environment.yaml
+# update and install any new dependencies from environment.yml
+COPY --chown=user:user config/cfg/environment.yml /build/config/cfg/environment.yml
+COPY --chown=user:user config/cfg/environment.yml ./environment.yml
 COPY --chown=user:user scripts/*.sh scripts/
 RUN scripts/setup-dev.sh --update

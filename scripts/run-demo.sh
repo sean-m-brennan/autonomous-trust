@@ -1075,16 +1075,28 @@ case "$BACKEND_MODE" in
         if [[ "$VARIANT" == "multi-agency" || "$VARIANT" == "dod-mission" ]]; then
             ensure_minikube_running
             if (( NO_BUILD == 0 )); then
-                # Both k8s scenario variants now use Tilt's native
-                # docker_build, which caches by input-content hash and
-                # doesn't notice when the user `docker rmi`s the image
-                # out from under it. Preflight against the cluster's
-                # daemon so a `rmi + relaunch` always produces a fresh
-                # build, and seed the chain so the Dockerfile FROM
-                # references resolve to local :dev tags.
-                log "Preflight image check ..."
+                # Switch to the cluster's daemon so Tilt's docker_build lands
+                # where the pods pull from.
                 use_cluster_docker_env
-                ensure_demo_images
+                # dod-mission: its tiltfile now wires BASE_IMAGE per image, so
+                # Tilt owns the whole FROM chain (base -> inspector -> demo/peer)
+                # and rebuilds on content change. Pre-seeding here just built
+                # every image a second time (Tilt rebuilds them all on `up`), so
+                # it's skipped — matching the python/c variants which never
+                # pre-build. multi-agency still pre-seeds (:dev tags) because its
+                # tiltfile doesn't pass BASE_IMAGE yet.
+                #
+                # NOTE (trade-off): this drops the old preflight's two side
+                # effects for dod-mission — (1) forcing a fresh build after a
+                # `docker rmi` (Tilt's content-hash cache doesn't notice a
+                # daemon-side rmi), and (2) the base_image_identity_stale
+                # guard. Tilt's content-hash caching rebuilds when the copied
+                # source changes, so a normal edit is covered; a manual `rmi`
+                # mid-session may need `tilt trigger` / `--rebuild`.
+                if [[ "$VARIANT" == "multi-agency" ]]; then
+                    log "Preflight image check ..."
+                    ensure_demo_images
+                fi
             fi
         fi
 

@@ -31,13 +31,24 @@ ARG IMAGE_TAG
 FROM ${REGISTRY_URL}autonomous-trust${IMAGE_TAG}
 
 WORKDIR /app
-RUN --mount=source=dist,target=/app/dist \
+RUN --mount=source=src/dist/conda-repo,target=/app/dist \
     conda install -y -c file:///app/dist autonomous_trust_inspector && conda clean -afy
-RUN --mount=source=dist,target=/app/dist \
+RUN --mount=source=src/dist/conda-repo,target=/app/dist \
     conda install -y -c file:///app/dist autonomous_trust_services && conda clean -afy
-RUN --mount=source=dist,target=/app/dist \
+RUN --mount=source=src/dist/conda-repo,target=/app/dist \
     conda install -y -c file:///app/dist autonomous_trust_simulator && conda clean -afy
 
-# update and install any new (i.e. pip) dependencies from environment.yaml
-COPY --chown=user:user config/cfg/environment.yaml /app/environment.yaml
-RUN --mount=type=cache,target=/opt/conda/pkgs conda env update -n autonomous_trust --file /app/environment.yaml
+# pykcs11 (a pip dep in environment.yml) ships no cp313 wheel, so pip compiles
+# its C++/SWIG extension at env-update time and needs g++ on PATH. (SWIG itself
+# is supplied by pykcs11's own pip build isolation; only the compiler is
+# missing -- the base image ships clang, not g++.) Install it just for the
+# build and purge it afterward so the release image stays lean: the compiled
+# .so links only libstdc++6, which is part of the base runtime and is retained.
+# update and install any new (i.e. pip) dependencies from environment.yml
+COPY --chown=user:user config/cfg/environment.yml /app/environment.yml
+RUN --mount=type=cache,target=/opt/conda/pkgs \
+    (apt-get update -y -o Acquire::AllowInsecureRepositories=true || true) && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated g++ && \
+    conda env update -n autonomous_trust --file /app/environment.yml && \
+    apt-get purge -y --auto-remove g++ && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*

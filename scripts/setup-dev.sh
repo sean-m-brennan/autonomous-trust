@@ -102,12 +102,12 @@ create_conda_env() {
     fi
 
     info "Creating conda environment '$ENV_NAME' ..."
-    conda env create -n "$ENV_NAME" --file "$REPO_DIR/environment.yaml"
+    conda env create -n "$ENV_NAME" --file "$REPO_DIR/environment.yml"
 
     # Overlay development dependencies
-    if [ -f "$CFG_DIR/devel_environ.yaml" ]; then
+    if [ -f "$CFG_DIR/devel_environ.yml" ]; then
         info "Installing development dependencies ..."
-        conda env update -n "$ENV_NAME" --file "$CFG_DIR/devel_environ.yaml"
+        conda env update -n "$ENV_NAME" --file "$CFG_DIR/devel_environ.yml"
     fi
 
     # Platform-specific compiler packages
@@ -130,9 +130,9 @@ update_conda_env() {
     conda update -n base -c conda-forge conda
     activate_conda
     info "Updating conda environment '$ENV_NAME' ..."
-    conda env update -n "$ENV_NAME" --file "$REPO_DIR/environment.yaml" --prune
-    if [ -f "$CFG_DIR/devel_environ.yaml" ]; then
-        conda env update -n "$ENV_NAME" --file "$CFG_DIR/devel_environ.yaml"
+    conda env update -n "$ENV_NAME" --file "$REPO_DIR/environment.yml" --prune
+    if [ -f "$CFG_DIR/devel_environ.yml" ]; then
+        conda env update -n "$ENV_NAME" --file "$CFG_DIR/devel_environ.yml"
     fi
     info "Environment updated"
 }
