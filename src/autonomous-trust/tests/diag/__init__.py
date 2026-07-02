@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Apache-2.0 — see source headers in autonomous_trust/.../core/_python/_probes/
 # ******************
 """

@@ -17,7 +17,7 @@
  * The actual generated headers (*.pb-c.h) supply the real prototypes;
  * these contracts are applied via Frama-C's -wp-model or merge headers.
  *
- * Copyright 2025 Sean M. Brennan and contributors
+ * Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  * SPDX-License-Identifier: Apache-2.0
  */
 

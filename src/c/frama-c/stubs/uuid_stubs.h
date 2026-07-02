@@ -7,7 +7,7 @@
  * uuid_t is defined as unsigned char[16] by libuuid.
  * uuid_unparse_lower writes a 36-character string plus NUL (37 bytes).
  *
- * Copyright 2025 Sean M. Brennan and contributors
+ * Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  * SPDX-License-Identifier: Apache-2.0
  */
 

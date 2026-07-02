@@ -16,7 +16,7 @@
  * Same redirection pattern as fc_stdio_spec.h.  Force-included via
  * -include so it runs before any source file.
  *
- * Copyright 2025 Sean M. Brennan and contributors
+ * Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  * SPDX-License-Identifier: Apache-2.0
  *******************/
 
