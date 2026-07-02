@@ -21,11 +21,22 @@ import pytest
 
 try:
     from autonomous_trust.services.peer.metadata import (
-        PeerData, MetadataProtocol, TimeSource, PositionSource, Metadata,
+        PeerData, MetadataProtocol, TimeSource, NtpTimeSource, PositionSource, Metadata,
     )
     from autonomous_trust.services.peer.position import GeoPosition
 except ImportError as _e:
     pytestmark = pytest.mark.skip(reason=f"missing dependency: {_e}")
+
+
+class _ParamPositionSource(PositionSource):
+    """Parameterized position source used to exercise Metadata kwargs pass-through."""
+
+    def __init__(self, origin: str = '0,0', device: str = None):
+        self.origin = origin
+        self.device = device
+
+    def acquire(self):
+        return GeoPosition(0.0, 0.0), 0.0
 
 
 # --- PeerData ---
@@ -63,6 +74,76 @@ class TestTimeSource:
         ts = TimeSource()
         result = ts.acquire()
         assert isinstance(result, datetime)
+
+    def test_acquire_delegates_to_core_now(self):
+        """acquire() must consume the core NTP-adjusted clock, not raw wall-clock."""
+        sentinel = datetime(2030, 1, 2, 3, 4, 5)
+        with patch('autonomous_trust.core.system.now', return_value=sentinel) as mock_now:
+            result = TimeSource().acquire()
+        mock_now.assert_called_once()
+        assert result == sentinel
+
+    def test_acquire_falls_back_on_import_error(self):
+        """If the core time authority is unavailable, degrade to local UTC."""
+        real_import = __import__
+
+        def _boom(name, *args, **kwargs):
+            if name == 'autonomous_trust.core.system':
+                raise ImportError('simulated')
+            return real_import(name, *args, **kwargs)
+
+        with patch('builtins.__import__', side_effect=_boom):
+            result = TimeSource().acquire()
+        assert isinstance(result, datetime)
+
+
+# --- NtpTimeSource ---
+
+class TestNtpTimeSource:
+    def setup_method(self):
+        NtpTimeSource._started.clear()
+
+    def teardown_method(self):
+        NtpTimeSource._started.clear()
+
+    def test_is_registered(self):
+        # name_to_class resolves it -> proves it's in the allowlist
+        klass = Metadata.name_to_class(
+            'autonomous_trust.services.peer.metadata.NtpTimeSource')
+        assert klass is NtpTimeSource
+
+    def test_construction_starts_sync(self):
+        with patch('autonomous_trust.core.network.ntp.start_sync') as mock_sync:
+            src = NtpTimeSource('ntp.example.mil', 42)
+        mock_sync.assert_called_once_with('ntp.example.mil', 42.0)
+        assert src.server == 'ntp.example.mil'
+        assert src.interval == 42.0
+
+    def test_sync_started_once_per_server_interval(self):
+        with patch('autonomous_trust.core.network.ntp.start_sync') as mock_sync:
+            NtpTimeSource('ntp.example.mil', 42)
+            NtpTimeSource('ntp.example.mil', 42)  # duplicate -> no new thread
+            NtpTimeSource('ntp.example.mil', 99)  # different interval -> new thread
+        assert mock_sync.call_count == 2
+
+    def test_sync_import_error_is_tolerated(self):
+        real_import = __import__
+
+        def _boom(name, *args, **kwargs):
+            if name == 'autonomous_trust.core.network.ntp':
+                raise ImportError('simulated')
+            return real_import(name, *args, **kwargs)
+
+        with patch('builtins.__import__', side_effect=_boom):
+            src = NtpTimeSource('ntp.example.mil', 5)  # must not raise
+        assert src.server == 'ntp.example.mil'
+
+    def test_acquire_inherits_ntp_adjusted_clock(self):
+        sentinel = datetime(2031, 6, 6, 6, 6, 6)
+        with patch('autonomous_trust.core.network.ntp.start_sync'):
+            src = NtpTimeSource('ntp.example.mil', 5)
+        with patch('autonomous_trust.core.system.now', return_value=sentinel):
+            assert src.acquire() == sentinel
 
 
 # --- PositionSource ---
@@ -114,6 +195,65 @@ class TestMetadata:
         m = Metadata('uuid-123', 'drone', {}, PositionSource, TimeSource)
         ts = m.time_source
         assert isinstance(ts, TimeSource)
+
+    def test_no_kwargs_defaults_to_empty(self):
+        m = Metadata('uuid-123', 'drone', {}, PositionSource)
+        assert m.position_src_kwargs == {}
+        assert m.time_src_kwargs == {}
+
+    def test_position_source_receives_kwargs(self):
+        Metadata.register_metadata_class(_ParamPositionSource)
+        m = Metadata('uuid-123', 'drone', {}, _ParamPositionSource,
+                     position_src_kwargs={'origin': '34,-86', 'device': '/dev/gps0'})
+        ps = m.position_source
+        assert isinstance(ps, _ParamPositionSource)
+        assert ps.origin == '34,-86'
+        assert ps.device == '/dev/gps0'
+
+    def test_time_source_receives_kwargs(self):
+        NtpTimeSource._started.clear()
+        m = Metadata('uuid-123', 'drone', {}, PositionSource, NtpTimeSource,
+                     time_src_kwargs={'server': 'ntp.example.mil', 'interval': 30})
+        with patch('autonomous_trust.core.network.ntp.start_sync') as mock_sync:
+            ts = m.time_source
+        assert isinstance(ts, NtpTimeSource)
+        assert ts.server == 'ntp.example.mil'
+        assert ts.interval == 30.0
+        mock_sync.assert_called_once_with('ntp.example.mil', 30.0)
+        NtpTimeSource._started.clear()
+
+    def test_kwargs_copied_not_aliased(self):
+        payload = {'origin': '1,2'}
+        m = Metadata('uuid-123', 'drone', {}, _ParamPositionSource,
+                     position_src_kwargs=payload)
+        payload['origin'] = 'mutated'
+        assert m.position_src_kwargs == {'origin': '1,2'}
+
+    def test_serialization_round_trip_preserves_kwargs(self):
+        from autonomous_trust.core.config import from_json_string
+        Metadata.register_metadata_class(_ParamPositionSource)
+        m = Metadata('uuid-123', 'drone', {'video': 3}, _ParamPositionSource,
+                     position_src_kwargs={'origin': '34,-86'},
+                     time_src_kwargs={'server': 'ntp.example.mil', 'interval': 30})
+        restored = from_json_string(m.to_json_string())
+        assert restored.uuid == 'uuid-123'
+        assert restored.data_meta == {'video': 3}
+        assert restored.position_src_kwargs == {'origin': '34,-86'}
+        assert restored.time_src_kwargs == {'server': 'ntp.example.mil', 'interval': 30}
+
+    def test_legacy_config_without_kwargs_decodes(self):
+        """A pre-existing config lacking the kwargs fields must still load."""
+        from autonomous_trust.core.config import from_json_string
+        legacy = (
+            '{"__type__": "autonomous_trust.services.peer.metadata.Metadata", '
+            '"uuid": "uuid-123", "peer_kind": "drone", "data_meta": {"video": 3}, '
+            '"position_src_class": "autonomous_trust.services.peer.metadata.PositionSource", '
+            '"time_src_class": "autonomous_trust.services.peer.metadata.TimeSource"}'
+        )
+        restored = from_json_string(legacy)
+        assert restored.uuid == 'uuid-123'
+        assert restored.position_src_kwargs == {}
+        assert restored.time_src_kwargs == {}
 
 
 class TestMetadataSourceHandlers:

@@ -210,7 +210,38 @@ class IdentityHistory(StepDAG, VoterTracker):
             except (BadSignatureError, Exception) as e:
                 self.logger.warning(f'Signature verification failed: {e}')
                 return False
+        # Divergence detection (ISSUES.md §3.2): the proof commits the voter
+        # to a specific view of the candidate via its digest. Recompute the
+        # blob's hash — with the proof's nonce, so PoW's mined digest also
+        # matches — and reject a proof whose digest disagrees: that voter is
+        # voting on a conflicting history view of this blob. `get_hash` is
+        # byte-identical Python<->C (pinned by pow-cross-language-byte-pin),
+        # so this is interop-safe. Enforced only when a digest is present
+        # (empty-digest proofs fall through, matching prior behavior). This
+        # is the actionable divergence guard; branch-level forks are NOT an
+        # error here (independent bootstraps fork at Genesis, concurrent
+        # extension is reconciled by merge() — see branch_heads()).
+        proof_digest = getattr(proof, 'digest', None)
+        if isinstance(proof_digest, (bytes, bytearray)) and proof_digest:
+            nonce = getattr(proof, 'nonce', None)
+            if nonce is not None and not isinstance(nonce, (bytes, bytearray)):
+                nonce = None
+            expected = blob.get_hash(nonce)
+            if bytes(proof_digest) != expected:
+                self.logger.warning(
+                    'Divergent history view: proof digest mismatch for %s'
+                    % blob.identity.nickname)
+                return False
         return True
+
+    def branch_heads(self):
+        """All current DAG branch heads (branch name -> head step), not just
+        main. Divergence detection proper compares a voter's committed view
+        (the proof digest, checked in verify_object) against the canonical
+        blob hash; this accessor surfaces the raw heads so an observer can
+        inspect an unmerged/forked DAG. More than one head is not itself an
+        error — see verify_object for why branch-level forks are normal."""
+        return dict(self.heads)
 
     def share(self):
         """
@@ -264,8 +295,14 @@ class IdentityHistory(StepDAG, VoterTracker):
         if peer is not None and proof != peer.verify(sig):
             self.logger.error(f'Invalid proof signature.')
             return False
-        # TODO: Handle divergence in branches — check other branch heads
-        # to detect conflicting history views from different peers. This
-        # requires comparing the blob's previous hash against all known
-        # branch heads, not just the main branch.
+        # Divergence detection (ISSUES.md §3.2) is implemented as proof-digest
+        # consistency in verify_object(), which every concrete agreement
+        # subclass (PoA/PoS/PoW) funnels through — so the check applies
+        # uniformly on the live path. This base _pre_verify is shadowed by
+        # those overrides (kept for the generic-agreement contract), so it
+        # deliberately does not duplicate the digest check here. Branch-level
+        # divergence (multiple DAG heads) is intentionally NOT a conflict:
+        # independently-bootstrapped peers always fork at Genesis and
+        # concurrent same-history extension is reconciled by merge();
+        # branch_heads() exposes the heads for observability.
         return True

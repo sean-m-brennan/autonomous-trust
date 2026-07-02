@@ -45,12 +45,54 @@ class MetadataProtocol(Protocol):
 
 class TimeSource(object):
     def acquire(self) -> datetime:
-        # Open: tap into custom NTP. Currently returns local
-        # wall-clock UTC; for distributed-trust scenarios a
-        # peer-shared time source (or the C-side native RFC 5905
-        # client at network/ntp.c) would let participants agree on
-        # event ordering across drift.
-        return datetime.now(UTC)
+        """Return the current time, NTP-adjusted when a sync is running.
+
+        Delegates to the core time authority
+        (``autonomous_trust.core.system.now``), which adds the running NTP
+        offset maintained by ``core/network/ntp.py`` (the Python mirror of the
+        C-side native RFC 5905 client at ``network/ntp.c``). With no NTP sync
+        active the offset is zero, so this is identical to ``datetime.now(UTC)``;
+        but once a peer-shared time source is syncing, all participants order
+        events on a common clock despite local drift. See ``NtpTimeSource`` to
+        drive that sync from the metadata config.
+        """
+        try:
+            from autonomous_trust.core.system import now
+            return now()
+        except ImportError:  # core time authority unavailable — local fallback
+            return datetime.now(UTC)
+
+
+class NtpTimeSource(TimeSource):
+    """Time source that also drives a background NTP sync.
+
+    Constructing one ensures a daemon thread is querying ``server`` every
+    ``interval`` seconds and maintaining the process-global offset that
+    ``TimeSource.acquire`` (inherited) then applies. The sync is started at
+    most once per ``(server, interval)`` pair, so repeated construction — e.g.
+    on every config reload — never spawns duplicate threads. If NTP is
+    unavailable (no ``ntplib``, no reachable server) the offset stays zero and
+    ``acquire`` degrades to the local UTC clock.
+
+    This is the parameterized counterpart enabled by ``Metadata``'s per-source
+    kwargs payload: register it as a metadata class and give the metadata a
+    ``time_src_kwargs`` of e.g. ``{'server': 'ntp.mil', 'interval': 60}``.
+    """
+
+    _started: set = set()
+
+    def __init__(self, server: str = 'pool.ntp.org', interval: float = 300.0):
+        self.server = server
+        self.interval = float(interval)
+        key = (self.server, self.interval)
+        if key in NtpTimeSource._started:
+            return
+        try:
+            from autonomous_trust.core.network.ntp import start_sync
+            start_sync(self.server, self.interval)
+            NtpTimeSource._started.add(key)
+        except ImportError:  # NTP support absent — acquire() falls back to local clock
+            pass
 
 
 class PositionSource(object):
@@ -60,6 +102,7 @@ class PositionSource(object):
 
 _ALLOWED_METADATA_CLASSES = {
     'autonomous_trust.services.peer.metadata.TimeSource',
+    'autonomous_trust.services.peer.metadata.NtpTimeSource',
     'autonomous_trust.services.peer.metadata.PositionSource',
     'autonomous_trust.services.peer.position.Position',
     'autonomous_trust.services.peer.position.GeoPosition',
@@ -69,7 +112,8 @@ _ALLOWED_METADATA_CLASSES = {
 
 class Metadata(InitializableConfig):
     def __init__(self, uuid: str, peer_kind: str, data_meta: dict[str, int],
-                 position_src_class: type, time_src_class: type = None):
+                 position_src_class: type, time_src_class: type = None,
+                 position_src_kwargs: dict = None, time_src_kwargs: dict = None):
         self.uuid = uuid
         self.peer_kind = peer_kind
         self.data_meta = data_meta
@@ -78,19 +122,22 @@ class Metadata(InitializableConfig):
             self.time_src_class = self.class_to_name(TimeSource)
         else:
             self.time_src_class = self.class_to_name(time_src_class)
+        # Constructor params for the source classes. These serialize with the
+        # rest of the config (plain dicts of scalars) and are passed through by
+        # the source properties, so a registered source may be parameterized
+        # (e.g. a GPS device path / GeoPosition origin for the position source,
+        # or an NTP server/interval for NtpTimeSource) instead of being limited
+        # to a no-arg __init__.
+        self.position_src_kwargs = dict(position_src_kwargs) if position_src_kwargs else {}
+        self.time_src_kwargs = dict(time_src_kwargs) if time_src_kwargs else {}
 
     @property
     def position_source(self):
-        # Open: position-source constructor params. Today every
-        # registered class must accept no-arg __init__. If position
-        # sources need configuration (e.g. GPS device path,
-        # GeoPosition origin reference), Metadata would need to carry
-        # an additional kwargs payload and pass it through here.
-        return self.name_to_class(self.position_src_class)()
+        return self.name_to_class(self.position_src_class)(**(self.position_src_kwargs or {}))
 
     @property
     def time_source(self):
-        return self.name_to_class(self.time_src_class)()
+        return self.name_to_class(self.time_src_class)(**(self.time_src_kwargs or {}))
 
     @classmethod
     def register_metadata_class(cls, klass):
@@ -117,9 +164,11 @@ class Metadata(InitializableConfig):
 
     @classmethod
     def initialize(cls, peer_kind: str, data_meta: dict[str, int],
-                   position_source: type, time_source: type = None):
+                   position_source: type, time_source: type = None,
+                   position_src_kwargs: dict = None, time_src_kwargs: dict = None):
         uuid = cls.get_assoc_ident().uuid
-        return Metadata(uuid, peer_kind, data_meta, position_source, time_source)
+        return Metadata(uuid, peer_kind, data_meta, position_source, time_source,
+                        position_src_kwargs, time_src_kwargs)
 
 
 class MetadataSource(Process, metaclass=ProcMeta,

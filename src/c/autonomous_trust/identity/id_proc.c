@@ -165,6 +165,12 @@ static struct {
      *                                independently in the handlers. */
     map_t partition_probe_cooldown;
     map_t partition_response_cooldown;
+    /* Two-phase admission (ISSUES.md §3.1-a). Key "<proc>|<peer_uuid>",
+     * value array_t* of DISTINCT confirmer uuid strings. A peer stays
+     * PROVISIONAL (group key withheld in _add_peer) until the entry reaches
+     * proc->protocol.admission_quorum, then handle_confirm_peer promotes it
+     * and clears the entry. Mirrors Python's _provisional_confirmations. */
+    map_t provisional_confirmations;
     char partition_recovery_target[64];
     int64_t partition_recovery_started_us;
 } id_state;
@@ -182,6 +188,7 @@ static void _ensure_id_init(void)
         map_init(&id_state.peer_tiers);
         map_init(&id_state.partition_probe_cooldown);
         map_init(&id_state.partition_response_cooldown);
+        map_init(&id_state.provisional_confirmations);
         id_state.partition_recovery_target[0] = '\0';
         id_state.partition_recovery_started_us = 0;
         id_state.self_tier = 0;
@@ -331,6 +338,32 @@ int identity_get_peer_caps_count(const uuid_t uuid)
     return n;
 }
 
+size_t identity_provisional_count(const process_t *proc)
+{
+    /* Two-phase admission observable (ISSUES.md §3.1-a): number of peers this
+     * process is holding PROVISIONAL (confirm seen, quorum not yet met, group
+     * key withheld). Counts provisional_confirmations keys prefixed "<proc>|".
+     * Mirrors the Python adapter's provisional_peer_count. */
+    if (!id_state.initialized || proc == NULL) return 0;
+    char prefix[64];
+    int plen = snprintf(prefix, sizeof(prefix), "%p|", (const void *)proc);
+    if (plen <= 0) return 0;
+    size_t n = 0;
+    pthread_mutex_lock(&id_state.lock);
+    array_t *keys = map_keys(&id_state.provisional_confirmations);  /* map-owned */
+    if (keys != NULL) {
+        for (size_t i = 0; i < array_size(keys); i++) {
+            data_t *kd = NULL; char *k = NULL;
+            if (array_get(keys, (int)i, &kd) == 0 && kd != NULL
+                && data_string_ptr(kd, &k) == 0 && k != NULL
+                && strncmp(k, prefix, (size_t)plen) == 0)
+                n++;
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return n;
+}
+
 int identity_get_peer_cap_descriptor(const char *cap_name, char *buf, size_t buflen)
 {
     if (!id_state.initialized || cap_name == NULL || buf == NULL || buflen == 0)
@@ -474,8 +507,39 @@ static int _update_group(const process_t *proc, directory_t *queues)
  * peer's address in the group map and emitting ID_UPDATE to existing peers.
  ****************************/
 
+/* Helper: _confirm_group_membership — the CONFIRMED half of two-phase
+ * admission (ISSUES.md §3.1-a). Records the peer's address in our group's
+ * address_map and propagates the updated group (which carries the shared
+ * private key) to existing peers. Split out of _add_peer so a PROVISIONAL
+ * member can be tracked without the group key ever leaving this node until
+ * the admission quorum is met. Mirrors Python _confirm_group_membership. */
+/* Frama-C: skipped — [solver-timeout] group/messaging preconditions */
+static void _confirm_group_membership(process_t *proc, directory_t *queues,
+                                      const public_identity_t *new_peer)
+{
+    /* Phase-3 group churn — parity with Python's _add_peer (idprocess.py:705).
+     * Record the new peer's address in our group's address_map, then broadcast
+     * the updated group to existing peers via _update_group. The receive-side
+     * tiebreaker prevents an ID_UPDATE ping-pong flood. */
+    if (proc->protocol.group.address_map.items == NULL)
+        map_init(&proc->protocol.group.address_map);
+    char new_uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(new_peer->uuid, new_uuid_str);
+    if (group_add_address(&proc->protocol.group, new_uuid_str, (char *)new_peer->address) == 0)
+    {
+        /* Local-process broadcast of the updated group (Python: _record_group). */
+        generic_msg_t group_msg = {0};
+        group_msg.type = GROUP;
+        memcpy(&group_msg.info.group, &proc->protocol.group, sizeof(group_t));
+        _remember_activity(proc, queues, &group_msg);
+        /* Push the updated group to our peers. */
+        _update_group(proc, queues);
+    }
+}
+
 /* Frama-C: skipped — [solver-timeout] logging/identity/peers preconditions */
-static int _add_peer(process_t *proc, directory_t *queues, const public_identity_t *new_peer)
+static int _add_peer(process_t *proc, directory_t *queues,
+                     const public_identity_t *new_peer, bool confirmed)
 {
     peers_write_lock(proc);
     /* Idempotency: an amnesia path may revisit a peer already in the list
@@ -502,24 +566,11 @@ static int _add_peer(process_t *proc, directory_t *queues, const public_identity
     memcpy(&peer_msg.info.peer, new_peer, sizeof(public_identity_t));
     _remember_activity(proc, queues, &peer_msg);
 
-    /* Phase-3 group churn — parity with Python's _add_peer (idprocess.py:705).
-     * Record the new peer's address in our group's address_map, then broadcast
-     * the updated group to existing peers via _update_group. The receive-side
-     * tiebreaker prevents an ID_UPDATE ping-pong flood. */
-    if (proc->protocol.group.address_map.items == NULL)
-        map_init(&proc->protocol.group.address_map);
-    char new_uuid_str[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(new_peer->uuid, new_uuid_str);
-    if (group_add_address(&proc->protocol.group, new_uuid_str, (char *)new_peer->address) == 0)
-    {
-        /* Local-process broadcast of the updated group (Python: _record_group). */
-        generic_msg_t group_msg = {0};
-        group_msg.type = GROUP;
-        memcpy(&group_msg.info.group, &proc->protocol.group, sizeof(group_t));
-        _remember_activity(proc, queues, &group_msg);
-        /* Push the updated group to our peers. */
-        _update_group(proc, queues);
-    }
+    /* Two-phase admission (§3.1-a): propagate the group key only for a
+     * CONFIRMED peer. A provisional add records the peer above (visibility /
+     * reputation) but withholds the group key until the quorum is met. */
+    if (confirmed)
+        _confirm_group_membership(proc, queues, new_peer);
     return 0;
 }
 
@@ -745,7 +796,8 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
      * list and re-adding would emit a redundant group update. */
     if (amnesia)
         return 0;
-    return _add_peer(proc, queues, new_peer);
+    /* Welcomer path — post-finalize, so this admission is CONFIRMED. */
+    return _add_peer(proc, queues, new_peer, true);
 }
 
 /****************************
@@ -1605,6 +1657,17 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
     if (proc->protocol.phase != 3)
         return false;
 
+    /* Policy B — border-guards-only voting (ISSUES.md §3.1-c). Mirrors the
+     * Python handle_vote_on_peer gate: a non-border-guard consumes the
+     * proposal but abstains rather than voting on a candidate it has no
+     * welcoming-committee validation context for. Default is border-guard
+     * (set in identity_register_handlers), so this is a no-op unless a
+     * deployment/harness designates a non-guard. */
+    if (!proc->protocol.border_guard_mode) {
+        log_debug(proc->logger, "Identity: not a border guard; abstaining from vote\n");
+        return true;
+    }
+
     net_msg_t *nmsg = &msg->info.net_msg;
 
     /* Extract proposed peer identity from JSON payload (not from_whom,
@@ -1812,6 +1875,22 @@ void identity_set_synchronous_dispatch(bool enabled)
     pthread_mutex_unlock(&id_state.lock);
 }
 
+void identity_set_border_guard_mode(process_t *proc, bool enabled)
+{
+    /* Per-process (not global id_state) — mirrors Python's per-instance
+     * IdentityProcess.border_guard_mode. See ISSUES.md §3.1-c. */
+    if (proc != NULL)
+        proc->protocol.border_guard_mode = enabled;
+}
+
+void identity_set_admission_quorum(process_t *proc, int quorum)
+{
+    /* Per-process two-phase admission quorum (ISSUES.md §3.1-a). Mirrors
+     * Python's per-instance IdentityProcess._admission_quorum. */
+    if (proc != NULL)
+        proc->protocol.admission_quorum = quorum > 0 ? quorum : 1;
+}
+
 void identity_reset_state(void)
 {
     _ensure_id_init();
@@ -1838,6 +1917,8 @@ void identity_reset_state(void)
     map_init(&id_state.partition_probe_cooldown);
     map_free(&id_state.partition_response_cooldown);
     map_init(&id_state.partition_response_cooldown);
+    map_free(&id_state.provisional_confirmations);
+    map_init(&id_state.provisional_confirmations);
     id_state.partition_recovery_target[0] = '\0';
     id_state.partition_recovery_started_us = 0;
     id_state.self_tier = 0;
@@ -1953,6 +2034,65 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
   requires \valid(msg);
   requires proc->logger == \null || \valid(proc->logger);
 */
+/* Two-phase admission bookkeeping (ISSUES.md §3.1-a). Record `confirmer_uuid`
+ * as having confirmed `peer_uuid` for `proc`; return the count of DISTINCT
+ * confirmers so far. Keyed "<proc>|<peer_uuid>" in id_state so per-participant
+ * conformance runs don't collide. A NULL confirmer is stored as a distinct
+ * anonymous token so single-confirm (quorum 1) admission still promotes.
+ * Mirrors Python IdentityProcess._provisional_confirmations. */
+static size_t _record_confirmation(const process_t *proc, const char *peer_uuid,
+                                   const char *confirmer_uuid)
+{
+    char key[128];
+    snprintf(key, sizeof(key), "%p|%s", (const void *)proc, peer_uuid);
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    array_t *confirmers = NULL;
+    if (map_get(&id_state.provisional_confirmations, (map_key_t)key, &dat) == 0
+        && dat != NULL) {
+        data_object_ptr(dat, (ptr_t *)&confirmers);
+    } else {
+        if (array_create(&confirmers) != 0 || confirmers == NULL) {
+            pthread_mutex_unlock(&id_state.lock);
+            return 0;
+        }
+        data_t *arr_dat = object_ptr_data(confirmers, sizeof(array_t));
+        map_set(&id_state.provisional_confirmations, (map_key_t)key, arr_dat);
+    }
+    const char *cid = (confirmer_uuid != NULL && confirmer_uuid[0] != '\0')
+                      ? confirmer_uuid : NULL;
+    bool present = false;
+    if (cid != NULL) {
+        for (size_t i = 0; i < array_size(confirmers); i++) {
+            data_t *e = NULL; char *s = NULL;
+            if (array_get(confirmers, (int)i, &e) == 0 && e != NULL
+                && data_string_ptr(e, &s) == 0 && s != NULL
+                && strcmp(s, cid) == 0) { present = true; break; }
+        }
+    }
+    if (!present) {
+        char anon[32];
+        if (cid == NULL) {
+            snprintf(anon, sizeof(anon), "<anon:%zu>", array_size(confirmers));
+            cid = anon;
+        }
+        data_t *sd = string_data((char *)cid, strlen(cid) + 1);
+        if (sd != NULL) array_append(confirmers, sd);
+    }
+    size_t count = array_size(confirmers);
+    pthread_mutex_unlock(&id_state.lock);
+    return count;
+}
+
+static void _clear_confirmations(const process_t *proc, const char *peer_uuid)
+{
+    char key[128];
+    snprintf(key, sizeof(key), "%p|%s", (const void *)proc, peer_uuid);
+    pthread_mutex_lock(&id_state.lock);
+    map_remove(&id_state.provisional_confirmations, (map_key_t)key);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
 static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -2016,7 +2156,45 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
         }
     }
 
-    _add_peer(proc, queues, &new_peer);
+    /* Two-phase admission (ISSUES.md §3.1-a). Count DISTINCT confirmers; the
+     * group key is propagated only once the quorum is met. The confirmer is
+     * the message sender (nmsg->from_whom, populated on receive / auto-stamped
+     * by the net layer). Quorum 1 (default) promotes on the first confirm =
+     * historical single-welcomer behavior. Mirrors Python handle_confirm_peer. */
+    char confirmer_uuid[UUID_STRING_LEN + 1] = "";
+    if (nmsg->from_whom.nickname[0] != '\0')
+        uuid_unparse_lower(nmsg->from_whom.uuid, confirmer_uuid);
+    size_t count = _record_confirmation(proc, uuid_str,
+                                        confirmer_uuid[0] ? confirmer_uuid : NULL);
+    int quorum = proc->protocol.admission_quorum > 0
+                 ? proc->protocol.admission_quorum : 1;
+    bool reached = count >= (size_t)quorum;
+
+    bool already = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        if (uuid_compare(proc->protocol.peers[i].uuid, new_peer.uuid) == 0) {
+            already = true;
+            break;
+        }
+    }
+    peers_read_unlock(proc);
+
+    if (!already) {
+        /* First time we hear of this peer via confirm: record it
+         * (peers/activity), propagating the group key only if the quorum is
+         * already satisfied (PROVISIONAL when it is not). */
+        _add_peer(proc, queues, &new_peer, reached);
+    } else if (reached) {
+        /* Already provisionally known; the quorum is now met — promote. */
+        _confirm_group_membership(proc, queues, &new_peer);
+    }
+    if (reached) {
+        _clear_confirmations(proc, uuid_str);
+    } else {
+        log_debug(proc->logger, "Identity: peer %s provisional: %zu/%d confirms\n",
+                  nickname, count, quorum);
+    }
 
     return true;
 }
@@ -2087,8 +2265,10 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
  *   different uuid:
  *     theirs > mine  → adopt
  *     theirs < mine  → push our group (we are larger; canonical winner)
- *     equal size     → adopt iff strcmp(theirs.uuid, mine.uuid) < 0;
- *                      otherwise push our group (we are uuid-tiebreak winner)
+ *     equal size     → older group wins (ISSUES.md §3.1-b): adopt iff
+ *                      theirs.created < mine.created when both ages known
+ *                      and differ; else adopt iff strcmp(theirs.uuid,
+ *                      mine.uuid) < 0. Otherwise push our group (we win).
  *
  * The emit-side is in _update_group; the natural call site is _add_peer
  * (via _peer_accepted) on every new admission. That path also exercises
@@ -2130,6 +2310,13 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
     json_t *j_addr_map = json_object_get(payload, "address_map");
     size_t theirs_size = (j_addr_map != NULL && json_is_object(j_addr_map))
                          ? json_object_size(j_addr_map) : 0;
+
+    /* Group age (ISSUES.md §3.1-b): the size-tie tiebreaker. Absent/non-
+     * numeric defaults to 0 (unknown → uuid tiebreak). Mirrors Python
+     * from_canonical's "created" default. */
+    json_t *j_created = json_object_get(payload, "created");
+    double theirs_created = (j_created != NULL && json_is_number(j_created))
+                            ? json_number_value(j_created) : 0.0;
 
     /* Cross-runtime proof point: the incoming canonical group payload parsed
      * (Python's to_canonical / C's group_to_json flat form, shared field
@@ -2175,7 +2362,21 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
         else if (theirs_size < mine_size)
             adopt = false;
         else if (theirs_uuid_valid)
-            adopt = (strcmp(theirs_uuid_str, mine_uuid_str) < 0);
+        {
+            /* Size tie (ISSUES.md §3.1-b): the OLDER group wins — the more-
+             * established group absorbs the younger one — so adopt theirs iff
+             * it is older. Only when both carry a known age (created > 0) that
+             * differs; otherwise fall back to the deterministic uuid tiebreak
+             * (historical behavior, which prevents the equal-size ID_UPDATE
+             * flood). "Adopt the older/larger group": larger is primary above,
+             * older breaks the tie here. Mirrors Python handle_group_update. */
+            double mine_created = proc->protocol.group.created;
+            if (theirs_created > 0.0 && mine_created > 0.0
+                && theirs_created != mine_created)
+                adopt = (theirs_created < mine_created);
+            else
+                adopt = (strcmp(theirs_uuid_str, mine_uuid_str) < 0);
+        }
         else
         {
             /* No comparable uuid — cannot tiebreak deterministically. Treat
@@ -2226,6 +2427,11 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
                     incoming_addr, ADDR_LEN);
             ((process_t *)proc)->protocol.group.address[ADDR_LEN] = '\0';
         }
+        /* Inherit the adopted group's age (ISSUES.md §3.1-b) when known, so
+         * subsequent merges compare against the established group's creation
+         * epoch, not ours. Mirrors Python Group.update_from. */
+        if (theirs_created > 0.0)
+            ((process_t *)proc)->protocol.group.created = theirs_created;
         /* Replace address_map: free any existing entries, then ingest theirs
          * by walking the JSON object so we never need map_priv.h here. */
         if (((process_t *)proc)->protocol.group.address_map.items != NULL)
@@ -3751,6 +3957,15 @@ static bool handle_partition_response(const process_t *proc, directory_t *queues
 int identity_register_handlers(process_t *proc)
 {
     if (proc == NULL) return -1;
+    /* Default to border-guard (mirrors Python IdentityProcess.border_guard_mode
+     * = True). A deployment/harness may clear it via
+     * identity_set_border_guard_mode to make this peer abstain from voting
+     * (Policy B, ISSUES.md §3.1-c). */
+    proc->protocol.border_guard_mode = true;
+    /* Two-phase admission quorum (ISSUES.md §3.1-a). Default 1 = promote on
+     * the first confirm (historical behavior); a deployment/harness sets it
+     * higher via identity_set_admission_quorum for corroborated key handover. */
+    proc->protocol.admission_quorum = 1;
     process_register_handler(proc, ID_ANNOUNCE, (handler_ptr_t)handle_welcoming_committee);
     process_register_handler(proc, ID_ACCEPT,   (handler_ptr_t)handle_acceptance);
     process_register_handler(proc, ID_HISTORY,  (handler_ptr_t)handle_receive_history);
@@ -3947,6 +4162,15 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                 char uuid_str[UUID_STRING_LEN + 1];
                 uuid_unparse_lower(pub->uuid, uuid_str);
                 group_add_address(&proc->protocol.group, uuid_str, pub->address);
+                /* Stamp a real creation epoch (ISSUES.md §3.1-b) so a group
+                 * minted at genesis carries a comparable age for the merge
+                 * size-tie tiebreaker. Unix epoch seconds, directly
+                 * comparable to Python initialize's now().timestamp() on the
+                 * wire. group_init leaves created=0 (its callers include the
+                 * conformance adapter, which must stay age-agnostic → uuid
+                 * tiebreak), so the stamp lives here at the runtime genesis
+                 * mint only. Mirrors Python Group.initialize. */
+                proc->protocol.group.created = (double)time(NULL);
             }
             if (pub != NULL)
                 smrt_deref(pub);

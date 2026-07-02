@@ -162,6 +162,11 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
     free(hex);
     json_object_set_new(obj, "encryptor", encr);
 
+    /* Group age (§3.1-b) for the merge size-tie tiebreaker. Mirrors Python
+     * to_canonical's "created". Omitted-on-read defaults to 0 (unknown → uuid
+     * tiebreak), so a peer that doesn't send it stays compatible. */
+    json_object_set_new(obj, "created", json_real(ident->created));
+
     return 0;
 }
 
@@ -222,6 +227,11 @@ int group_from_json(const json_t *obj, void *data_struct)
                                                (const unsigned char *)seed_hex, strlen(seed_hex));
     if (rc != 0)
         return -1;
+
+    /* Group age (§3.1-b): absent defaults to 0 (unknown → uuid tiebreak). */
+    json_t *created_obj = json_object_get(obj, "created");
+    group->created = (created_obj != NULL && json_is_number(created_obj))
+                     ? json_number_value(created_obj) : 0.0;
     return 0;
 }
 

@@ -79,6 +79,12 @@ int identity_get_peer_caps_count(const uuid_t uuid);
  *  assert against this via the `peer_caps_descriptor` expected_state key. */
 int identity_get_peer_cap_descriptor(const char *cap_name, char *buf, size_t buflen);
 
+/** Number of peers @p proc is holding PROVISIONAL under two-phase admission
+ *  (ISSUES.md §3.1-a) — a confirm was seen but the distinct-confirmer quorum
+ *  is not yet met, so the group key is withheld. Conformance scenarios assert
+ *  against this via the `provisional_peer_count` expected_state key. */
+size_t identity_provisional_count(const process_t *proc);
+
 /** Test accessor: install @p n_caps capability names for @p uuid directly
  *  into the shared peer_caps_map, bypassing the caps_response wire path.
  *  Mirrors how handle_caps_response populates the map. Used by the
@@ -157,6 +163,21 @@ int identity_partition_canonical_response(const char *group_uuid,
  *  call that goes through the file-scope state init), as it consults the
  *  same id_state struct. Production code MUST leave this off. */
 void identity_set_synchronous_dispatch(bool enabled);
+
+/** Set a participant's border-guard flag (ISSUES.md §3.1-c, Policy B).
+ *  Per-process (mirrors Python's per-instance
+ *  IdentityProcess.border_guard_mode), so it takes the target @p proc rather
+ *  than touching the global id_state. Defaults true in
+ *  identity_register_handlers; clear it to make @p proc abstain from voting on
+ *  received proposals (border-guards-only quorum). */
+void identity_set_border_guard_mode(process_t *proc, bool enabled);
+
+/** Set a participant's two-phase admission quorum (ISSUES.md §3.1-a).
+ *  Per-process (mirrors Python's per-instance
+ *  IdentityProcess._admission_quorum). Default 1 = promote on the first
+ *  confirm; higher values withhold the group key until that many DISTINCT
+ *  border-guards have confirmed the admission. Values < 1 clamp to 1. */
+void identity_set_admission_quorum(process_t *proc, int quorum);
 
 /** Wipe the entire identity singleton state (histories, peer_potentials,
  *  vote_collection, peer_caps_map, and conformance-only override maps),

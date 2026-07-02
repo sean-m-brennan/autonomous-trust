@@ -31,13 +31,22 @@ class Group(InitializableConfig):
     """
     _msg_class = identity_pb2.Group
 
-    def __init__(self, _uuid, _address_map, _nickname, _encryptor, _public_only=True):
+    def __init__(self, _uuid, _address_map, _nickname, _encryptor, _public_only=True,
+                 _created=0.0):
         super().__init__(identity_pb2.Group)
         self._uuid = str(_uuid)
         self._address_map = _address_map
         self._nickname = _nickname
         self._encryptor = _encryptor  # group-shared key
         self._public_only = _public_only
+        # Group age (ISSUES.md §3.1-b): a comparable creation epoch (seconds).
+        # Used only as the group-merge tiebreaker on a MEMBERSHIP-SIZE TIE — the
+        # OLDER (smaller `created`) group wins, so the more-established group
+        # absorbs the younger one. 0.0 = "unknown age" (the default for
+        # wire/test-constructed groups), in which case the merge falls back to
+        # the historical uuid tiebreaker so behavior is unchanged. Only groups
+        # minted via `initialize` carry a real age. Local/merge signal only.
+        self._created = float(_created) if _created else 0.0
 
     def __eq__(self, other):
         if not isinstance(other, self.__class__):
@@ -47,6 +56,11 @@ class Group(InitializableConfig):
     @property
     def uuid(self):
         return self._uuid
+
+    @property
+    def created(self):
+        """Comparable creation epoch (seconds); 0.0 if unknown. See §3.1-b."""
+        return getattr(self, '_created', 0.0)
 
     @property
     def nickname(self):
@@ -92,6 +106,10 @@ class Group(InitializableConfig):
                              else {a: a for a in other.addresses})
         if other.nickname:
             self._nickname = other.nickname
+        # Inherit the adopted group's age (§3.1-b) so subsequent merges compare
+        # against the established group's creation epoch, not ours.
+        if other.created:
+            self._created = other.created
 
     def encrypt(self, msg, whom, nonce=None):
         """
@@ -169,6 +187,10 @@ class Group(InitializableConfig):
             'nickname': self._nickname or '',
             'address_map': addr_map,
             'encryptor': {'hex_seed': seed, 'public_only': not owns_private},
+            # Group age (§3.1-b) for the merge size-tie tiebreaker. Omitted-on-
+            # read defaults to 0.0 (unknown → uuid tiebreak), so a peer on an
+            # older build that doesn't send it stays compatible.
+            'created': self.created,
         }
 
     @staticmethod
@@ -183,12 +205,19 @@ class Group(InitializableConfig):
         public_only = bool(encr.get('public_only', True))
         return Group(d.get('uuid'), dict(d.get('address_map', {}) or {}),
                      d.get('nickname', ''),
-                     Encryptor(seed, public_only=public_only), public_only)
+                     Encryptor(seed, public_only=public_only), public_only,
+                     _created=d.get('created', 0.0) or 0.0)
 
     @staticmethod
     def initialize(address_map, our_nickname):
         time.sleep(random.random())  # reduce chance of collision
-        return Group(uuid_mod.uuid4(), address_map, our_nickname, Encryptor.generate(), False)
+        # Stamp a real creation epoch (§3.1-b) so a group minted here carries a
+        # comparable age for the merge tiebreaker. now() is the NTP-adjusted
+        # clock (autonomous_trust.core.system.now).
+        from ..system import now
+        created = now().timestamp()
+        return Group(uuid_mod.uuid4(), address_map, our_nickname,
+                     Encryptor.generate(), False, _created=created)
 
 
 class ChildGroupSet(object):
