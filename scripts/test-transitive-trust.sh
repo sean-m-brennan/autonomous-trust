@@ -7,7 +7,8 @@
 # demo stack; do NOT run the docker demos in the Claude sandbox).
 # ******************
 set -uo pipefail
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Script lives in scripts/; the repo root is one level up.
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "=================================================================="
 echo " GATE A — automated: server-side pipeline (no browser needed)"
@@ -68,13 +69,17 @@ echo "=================================================================="
 cat <<'EOF'
     cd examples/dod_mission/deploy && ./run-demo.sh [--playback <file>]
 
-The DoD "Trust Network" panel (disaster_response_graph.build_graph_from_scenario)
-already renders a `trust_matrix` as colored bilateral edges, and dod_mission's
-coordinator uses Cohort/CohortTracker, so the Stage-3 per-other capture
-(PeerDataAcq.reputation_by_other) is populated once peer-pair queries flow.
+Stage 5 is now wired end-to-end:
+  * Coordinator (DoDMissionCoordinator) mixes in TransitiveTrustMixin and runs a
+    peer-pair reputation query round (~every PEER_PAIR_QUERY_SEC); replies land
+    in latest_reputation_pairs. _build_trust_matrix() min-combines the two
+    directional views per pair (skepticism-wins), resolves uuids to roster
+    names, and publishes it in dashboard state as `trust_matrix`.
+  * The new "Trust Network" chart panel (dashboard/trust_network_panel.py,
+    keyed "trust_network") renders it via build_graph_from_scenario.
 
-*** REMAINING WORK (Stage 5): the coordinator does not yet (a) send peer-pair
-    reputation queries, nor (b) pass a trust_matrix built from the cohort's
-    per-other data into build_graph_from_scenario. Until that feed is wired,
-    the DoD Trust Network shows direct reputation only, not transitive. ***
+WHAT TO LOOK FOR: a Trust Network graph in the chart column. Initially just the
+roster (no trust edges); after the first peer-pair round (~1 min), colored
+bilateral edges appear between peers (red=distrust .. green=trust), and a
+compromised peer's edges shift red as its neighbors' opinions sour.
 EOF
