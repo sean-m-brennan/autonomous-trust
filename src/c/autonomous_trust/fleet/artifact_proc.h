@@ -40,8 +40,26 @@ extern char ARTIFACT_PROTO_CHUNK[];
 extern char ARTIFACT_PROTO_COMPLETE[];
 extern char ARTIFACT_PROTO_READY[];
 
-/* Chunk payload size: MAX_MSG_SIZE(1024) - 64 bytes for JSON header overhead */
-#define ARTIFACT_CHUNK_SIZE 960
+/* Raw payload bytes per artifact chunk (§7).
+ *
+ * NB: this is the *raw* payload size, not the on-wire size. A chunk reply
+ * hex-encodes the payload (2x expansion) inside a small JSON envelope
+ * (artifact hash + per-chunk hash + index + length), so the resulting
+ * datagram is roughly (ARTIFACT_CHUNK_SIZE * 2) + ~200 bytes. The historical
+ * `MAX_MSG_SIZE(1024) - 64` comment was wrong on two counts: it ignored the
+ * hex doubling, and MAX_MSG_SIZE (1024) is not the transport limit — the UDP
+ * receive path buffers a full datagram (UDP_PACKET_SIZE = 65507, see
+ * net_transport_priv.h) and nothing enforces MAX_MSG_SIZE on the artifact
+ * path. The chunk count was therefore self-imposed, not a UDP constraint.
+ *
+ * 4096 keeps each datagram ~8 KB (~6 IP fragments at a 1500-byte MTU): a large
+ * reduction in message count vs. the historical 960 (a 3.5 MB artifact drops
+ * from ~3,646 chunks to ~855) while bounding the per-datagram fragment count
+ * that governs loss probability — one dropped fragment loses the whole chunk.
+ * Raise toward the transport ceiling on reliable links; lower it for lossy
+ * ones. Both peers agree on the size via the manifest (chunk_size), so it can
+ * change without a wire-format break. */
+#define ARTIFACT_CHUNK_SIZE 4096
 
 /* State for an in-progress download */
 typedef struct {
@@ -96,6 +114,37 @@ bool artifact_download_state_record(download_state_t *state);
 */
 int artifact_verify_chunk_hash(const uint8_t *data, size_t len,
                                const uint8_t *chunk_hash);
+
+/* Base64-encode a chunk payload (§7). Standard variant, so the output is safe
+ * inside a JSON string. `b64_max` must be at least
+ * `sodium_base64_ENCODED_LEN(len, sodium_base64_VARIANT_ORIGINAL)`. Returns 0
+ * on success, -1 if `b64_out` is NULL or `b64_max` is too small (the buffer is
+ * checked up front so libsodium never aborts on an undersized buffer). */
+/*@
+  requires \valid_read(data + (0 .. len - 1));
+  requires \valid(b64_out + (0 .. b64_max - 1));
+  assigns b64_out[0 .. b64_max - 1];
+  ensures \result == 0 || \result == -1;
+*/
+int artifact_encode_chunk(const uint8_t *data, size_t len,
+                          char *b64_out, size_t b64_max);
+
+/* Decode a base64 chunk payload into `out` (capacity `out_max`) and verify it
+ * matches the advertised `expected_len`. The decode is bounded by `out_max`,
+ * so an oversized payload fails rather than overflowing. On success returns 0
+ * and sets `*out_len` to the decoded length (which equals `expected_len`).
+ * Returns -1 on NULL input, invalid base64, over-capacity, or a length
+ * mismatch — so a bogus `expected_len` can never drive an over-read of `out`
+ * by a downstream consumer. */
+/*@
+  requires \valid_read(b64);
+  requires \valid(out + (0 .. out_max - 1));
+  requires out_len == \null || \valid(out_len);
+  assigns out[0 .. out_max - 1], *out_len;
+  ensures \result == 0 || \result == -1;
+*/
+int artifact_decode_chunk(const char *b64, size_t expected_len,
+                          uint8_t *out, size_t out_max, size_t *out_len);
 
 /*@
   requires \valid(proc);

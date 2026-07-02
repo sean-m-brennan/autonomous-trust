@@ -51,6 +51,15 @@ message Identity {
 
 message Group {
   bytes uuid = 1;
-  string address = 2;  // Identity UUID to address
+  string address = 2;  // Legacy single address (first of address_map); kept so
+                       // an older peer that only reads this field still works.
   Encryptor encryptor = 3;  // group-shared key
+  // Full UUID->address membership map (§1.4). Mirrors Python Group._address_map
+  // and C group_t.address_map; the single `address` above is just its first
+  // value. Proto3 map — absent on read decodes to an empty map, so an older
+  // peer that only sends `address` stays compatible.
+  map<string, string> address_map = 4;
+  // Group age for the merge size-tie tiebreaker (§3.1-b): epoch seconds, or 0
+  // when unknown. Mirrors the canonical JSON `created`.
+  double created = 5;
 }

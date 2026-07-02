@@ -2371,10 +2371,13 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
              * flood). "Adopt the older/larger group": larger is primary above,
              * older breaks the tie here. Mirrors Python handle_group_update. */
             double mine_created = proc->protocol.group.created;
-            if (theirs_created > 0.0 && mine_created > 0.0
-                && theirs_created != mine_created)
-                adopt = (theirs_created < mine_created);
+            bool both_aged = (theirs_created > 0.0 && mine_created > 0.0);
+            if (both_aged && theirs_created < mine_created)
+                adopt = true; /* theirs is older -> it absorbs us */
+            else if (both_aged && theirs_created > mine_created)
+                adopt = false; /* theirs is younger -> we keep ours */
             else
+                /* equal age or age unknown: deterministic uuid tiebreak */
                 adopt = (strcmp(theirs_uuid_str, mine_uuid_str) < 0);
         }
         else

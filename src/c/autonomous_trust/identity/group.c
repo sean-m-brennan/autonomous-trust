@@ -242,6 +242,42 @@ int group_sync_out(group_t *group, AutonomousTrust__Core__Protobuf__Identity__Gr
     proto->uuid.data = group->uuid;
     proto->uuid.len = sizeof(uuid_t);
     proto->address = group->address;
+    proto->created = group->created;  /* §3.1-b group age */
+
+    /* Full address_map (§1.4) as a proto3 map (repeated key/value entries).
+     * Keys/values are SHARED with group->address_map: group_to_proto packs
+     * immediately, and group_proto_free releases only the entry structs + the
+     * array, never the shared strings (which the map still owns). */
+    size_t n = map_size(&group->address_map);
+    proto->n_address_map = 0;
+    proto->address_map = NULL;
+    if (n > 0)
+    {
+        proto->address_map = calloc(
+            n, sizeof(AutonomousTrust__Core__Protobuf__Identity__Group__AddressMapEntry *));
+        if (proto->address_map == NULL)
+            return EXCEPTION(ENOMEM);
+        map_key_t key;
+        data_t *value;
+        size_t i = 0;
+        map_entries_for_each(&group->address_map, key, value)
+            string_t addr_s = NULL;
+            if (data_string_ptr(value, &addr_s) == 0 && addr_s != NULL)
+            {
+                AutonomousTrust__Core__Protobuf__Identity__Group__AddressMapEntry *entry =
+                    calloc(1, sizeof(*entry));
+                if (entry == NULL)
+                    return EXCEPTION(ENOMEM);
+                AutonomousTrust__Core__Protobuf__Identity__Group__AddressMapEntry tmp_m =
+                    AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__GROUP__ADDRESS_MAP_ENTRY__INIT;
+                memcpy(entry, &tmp_m, sizeof(tmp_m));
+                entry->key = (char *)key;       /* shared, not freed here */
+                entry->value = (char *)addr_s;  /* shared, not freed here */
+                proto->address_map[i++] = entry;
+            }
+        map_end_for_each
+        proto->n_address_map = i;
+    }
 
     proto->encryptor = malloc(sizeof(AutonomousTrust__Core__Protobuf__Identity__Encryptor));
     AutonomousTrust__Core__Protobuf__Identity__Encryptor tmp_e = AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__ENCRYPTOR__INIT;
@@ -257,12 +293,28 @@ int group_sync_in(AutonomousTrust__Core__Protobuf__Identity__Group *proto, group
     memcpy(group->uuid, proto->uuid.data, sizeof(uuid_t));
     strncpy(group->address, proto->address, ADDR_LEN);
     group->address[ADDR_LEN] = '\0';  /* strncpy does not terminate when src is >= ADDR_LEN */
+    group->created = proto->created;  /* §3.1-b group age */
+
+    /* Rebuild the full address_map (§1.4). proto_to_group deserializes into a
+     * fresh (zeroed) group, so initialise the map before populating it. */
+    map_init(&group->address_map);
+    for (size_t i = 0; i < proto->n_address_map; i++)
+    {
+        AutonomousTrust__Core__Protobuf__Identity__Group__AddressMapEntry *entry = proto->address_map[i];
+        if (entry != NULL && entry->key != NULL && entry->value != NULL)
+            group_add_address(group, entry->key, entry->value);
+    }
     memcpy(group->encryptor.public_hex, proto->encryptor->hex_seed.data, crypto_box_PUBLICKEYBYTES * 2);
     return 0;
 }
 
 void group_proto_free(AutonomousTrust__Core__Protobuf__Identity__Group *proto)
 {
+    /* Free the entry structs + the array only; the key/value strings are shared
+     * with group->address_map (see group_sync_out) and are owned by the map. */
+    for (size_t i = 0; i < proto->n_address_map; i++)
+        free(proto->address_map[i]);
+    free(proto->address_map);
     free(proto->encryptor);
 }
 
