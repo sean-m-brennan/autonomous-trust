@@ -40,6 +40,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
+import networkx as nx
 import plotly.graph_objects as go
 
 
@@ -88,16 +89,42 @@ class _Edge:
 class TrustNetworkGraph:
     """Scenario-driven trust-network figure builder.
 
-    Layout: agencies pinned at fixed angular sectors on a ring so the
-    viewer can pattern-match agency clusters between runs. Within a
-    sector, peers are spread evenly on a small arc. We don't use a true
-    force-directed layout because:
-      (a) jitter between updates distracts from the trust dynamics,
-      (b) with 10 peers the pinned ring is legible without simulation.
+    Layout: an *agency-anchored hybrid* force-directed layout. Each agency
+    owns a fixed 'home' anchor on a ring (so clusters stay recognizable and
+    stable between runs), and then a spring simulation lays the peers out:
+      - every peer is spring-tethered to its agency's anchor (soft
+        clustering — keeps the sector recognizable),
+      - every trust edge is a spring whose strength scales with reputation,
+        so high-trust pairs pull *closer* (and low-trust / compromised peers,
+        held only by weak springs, get pushed toward the periphery by the
+        repulsion below),
+      - all nodes repel one another, spreading the bunching apart.
+
+    The solve is warm-started from the previous frame's positions and run
+    for only a few iterations per tick (see WARM_ITERS), so the graph glides
+    smoothly as reputation shifts instead of jittering — which is why a live
+    per-tick panel should hold ONE persistent instance and call
+    apply_scenario_state()/figure() each frame (see TrustNetworkPanel) rather
+    than rebuilding via the one-shot build_graph_from_scenario().
     """
 
     RING_RADIUS = 1.0
     SUB_RADIUS = 0.6
+    # --- Agency-anchored hybrid force layout tuning ---------------------
+    SPRING_K = 0.55           # target node separation; larger => more spread
+    ANCHOR_WEIGHT = 1.2       # spring pulling a peer to its agency home sector
+    TRUST_WEIGHT_BASE = 0.15  # floor attraction present on any trust edge
+    TRUST_WEIGHT_SCALE = 1.9  # reputation-scaled pull (high trust => stronger)
+    WARM_ITERS = 8            # relaxation steps/frame when warm-started (smooth)
+    COLD_ITERS = 60           # steps for the first, cold solve
+    LAYOUT_SEED = 42          # deterministic placement (no per-frame RNG jitter)
+    # spring_layout re-heats its cooling temperature on every call, so even on
+    # unchanged input the raw solve wiggles ~0.1/frame. Low-pass the write-back
+    # (glide a fraction of the way to the solved point) and freeze motion below
+    # a deadband, so the graph animates on real reputation changes but goes
+    # still once settled.
+    LAYOUT_EASE = 0.45        # fraction of the solved step to apply per frame
+    SETTLE_DEADBAND = 0.12    # skip sub-threshold moves (kills residual wiggle)
 
     def __init__(self,
                  agency_colors: Optional[dict[str, str]] = None,
@@ -130,30 +157,79 @@ class TrustNetworkGraph:
         # renders as peers are added incrementally.
         return sorted({n.agency for n in self._nodes.values()})
 
-    def _relayout(self):
-        """Recompute node (x, y) coordinates."""
+    def _agency_anchors(self) -> dict[str, tuple[float, float]]:
+        """Fixed 'home sector' point per agency, evenly spaced on the ring."""
         agencies = self._sorted_agencies()
         n_agencies = max(1, len(agencies))
+        anchors = {}
         for i, agency in enumerate(agencies):
-            # Base angle for this agency's sector.
             theta = 2 * math.pi * i / n_agencies - math.pi / 2  # start at top
-            cx = self.RING_RADIUS * math.cos(theta)
-            cy = self.RING_RADIUS * math.sin(theta)
-            peers = [n for n in self._nodes.values() if n.agency == agency]
-            if len(peers) == 1:
-                peers[0].x, peers[0].y = cx, cy
+            anchors[agency] = (self.RING_RADIUS * math.cos(theta),
+                               self.RING_RADIUS * math.sin(theta))
+        return anchors
+
+    def _relayout(self):
+        """Recompute node (x, y) via the agency-anchored force layout.
+
+        Warm-starts from the current node coordinates when they exist (the
+        previous frame), so the graph relaxes smoothly rather than jumping;
+        a fresh graph (all coords still 0) instead seeds each peer near its
+        agency anchor with a deterministic offset and solves cold.
+        """
+        peers = list(self._nodes.values())
+        if not peers:
+            return
+        anchors = self._agency_anchors()
+
+        g = nx.Graph()
+        # Anchor nodes are pinned; each peer is spring-tethered to its
+        # agency's anchor (soft clustering).
+        for agency in anchors:
+            g.add_node(("anchor", agency))
+        for n in peers:
+            g.add_node(n.name)
+            g.add_edge(n.name, ("anchor", n.agency), weight=self.ANCHOR_WEIGHT)
+        # Reputation springs: higher trust => larger weight => stronger pull.
+        for edge in self._edges.values():
+            if edge.a in self._nodes and edge.b in self._nodes:
+                w = self.TRUST_WEIGHT_BASE + self.TRUST_WEIGHT_SCALE * edge.trust
+                g.add_edge(edge.a, edge.b, weight=w)
+
+        # Initial positions: anchors fixed at their ring points; peers
+        # warm-start from their current coords, else seed near the anchor.
+        init_pos = {("anchor", a): p for a, p in anchors.items()}
+        warm = False
+        for idx, n in enumerate(peers):
+            if n.x != 0.0 or n.y != 0.0:
+                init_pos[n.name] = (n.x, n.y)
+                warm = True
+            else:
+                ax, ay = anchors[n.agency]
+                ang = 2 * math.pi * idx / max(1, len(peers))
+                init_pos[n.name] = (ax + 0.25 * math.cos(ang),
+                                    ay + 0.25 * math.sin(ang))
+
+        pos = nx.spring_layout(
+            g,
+            pos=init_pos,
+            fixed=[("anchor", a) for a in anchors],
+            weight="weight",
+            k=self.SPRING_K,
+            iterations=self.WARM_ITERS if warm else self.COLD_ITERS,
+            seed=self.LAYOUT_SEED,
+        )
+        for n in peers:
+            sx, sy = pos[n.name]
+            if n.x == 0.0 and n.y == 0.0:
+                # First placement (cold solve, or a freshly-added late joiner):
+                # snap to the solved point rather than gliding in from origin.
+                n.x, n.y = float(sx), float(sy)
                 continue
-            # Spread peers on a small arc inside the sector. Arc spans
-            # +/- pi/3.5 around the sector midline -- wide enough that
-            # 4-peer agencies (NOAA) keep clean elbow room between
-            # markers (chord per 12-15° gap > marker size at typical
-            # render scales).
-            spread = math.pi / 3.5
-            for j, peer in enumerate(sorted(peers, key=lambda p: p.name)):
-                frac = (j - (len(peers) - 1) / 2) / max(1, len(peers) - 1)
-                a = theta + spread * frac
-                peer.x = cx + self.SUB_RADIUS * math.cos(a)
-                peer.y = cy + self.SUB_RADIUS * math.sin(a)
+            dx, dy = float(sx) - n.x, float(sy) - n.y
+            if math.hypot(dx, dy) < self.SETTLE_DEADBAND:
+                continue  # settled — hold still (no perpetual wiggle)
+            n.x += self.LAYOUT_EASE * dx
+            n.y += self.LAYOUT_EASE * dy
 
     # ------------------------------------------------------------------
     # Runtime mutations (callback layer)
@@ -229,6 +305,42 @@ class TrustNetworkGraph:
             # Low-trust / compromised edges go red with the trust-based fade.
             return _trust_color(min(edge.trust, 0.3))
         return _trust_color(edge.trust)
+
+    def apply_scenario_state(self, scenario,
+                             trust_matrix: Optional[list] = None,
+                             stream_counts: Optional[dict[str, int]] = None,
+                             compromised: Optional[set[str]] = None,
+                             excluded: Optional[set[str]] = None,
+                             peer_opacity: Optional[dict[str, float]] = None):
+        """(Re)apply a full scenario + runtime snapshot in place.
+
+        Idempotent across frames: peers are *upserted* so their laid-out
+        positions survive (that's what lets the layout warm-start and glide),
+        while edges and status are rebuilt from the snapshot each call. This
+        is the per-tick entry point for a persistent panel; the one-shot
+        build_graph_from_scenario() calls it once on a fresh instance.
+        """
+        for name, role in scenario.peers.items():
+            if name not in self._nodes:
+                self.add_peer_from_role(name, role)
+        for name, op in (peer_opacity or {}).items():
+            self.set_opacity(name, op)
+        for name, cnt in (stream_counts or {}).items():
+            self.set_stream_count(name, cnt)
+        # Trust edges live only on _edges (positions are on nodes), so it's
+        # safe to rebuild the edge set from scratch each frame.
+        self._edges.clear()
+        for a, b, score in (trust_matrix or ()):
+            self.set_trust(a, b, score)
+        # Status is monotonic in the demo, but reset+re-mark keeps us correct
+        # if a snapshot ever clears a flag.
+        for node in self._nodes.values():
+            node.status = "active"
+        for name in (compromised or ()):
+            self.mark_compromised(name)
+        for name in (excluded or ()):
+            self.mark_excluded(name)
+            self.deactivate_edges_for(name)
 
     def figure(self) -> go.Figure:
         self._relayout()
@@ -311,8 +423,10 @@ class TrustNetworkGraph:
             margin=dict(l=10, r=10, t=10, b=10),
             paper_bgcolor="#121a2e",
             plot_bgcolor="#121a2e",
-            xaxis=dict(visible=False, range=[-1.9, 1.9]),
-            yaxis=dict(visible=False, range=[-1.9, 1.9],
+            # A touch wider than the RING_RADIUS=1.0 anchors so peers that
+            # the repulsion / reputation forces push outward stay in frame.
+            xaxis=dict(visible=False, range=[-2.0, 2.0]),
+            yaxis=dict(visible=False, range=[-2.0, 2.0],
                        scaleanchor="x", scaleratio=1),
             legend=dict(
                 orientation="h",
@@ -339,19 +453,21 @@ def build_graph_from_scenario(scenario,
                               peer_opacity: Optional[dict[str, float]] = None,
                               agency_colors: Optional[dict[str, str]] = None
                               ) -> go.Figure:
-    """Build a complete trust-network figure from a scenario + state."""
+    """Build a complete trust-network figure from a scenario + state.
+
+    One-shot: a fresh graph each call, so the force layout solves *cold*
+    (still deterministic via LAYOUT_SEED). A live per-tick panel that wants
+    smooth, warm-started motion should instead hold one persistent
+    TrustNetworkGraph and call apply_scenario_state()/figure() each frame —
+    see TrustNetworkPanel.
+    """
     g = TrustNetworkGraph(agency_colors=agency_colors)
-    for name, role in scenario.peers.items():
-        g.add_peer_from_role(name, role)
-        if peer_opacity and name in peer_opacity:
-            g.set_opacity(name, peer_opacity[name])
-    for name, n in (stream_counts or {}).items():
-        g.set_stream_count(name, n)
-    for a, b, score in (trust_matrix or ()):
-        g.set_trust(a, b, score)
-    for name in (compromised or ()):
-        g.mark_compromised(name)
-    for name in (excluded or ()):
-        g.mark_excluded(name)
-        g.deactivate_edges_for(name)
+    g.apply_scenario_state(
+        scenario,
+        trust_matrix=trust_matrix,
+        stream_counts=stream_counts,
+        compromised=compromised,
+        excluded=excluded,
+        peer_opacity=peer_opacity,
+    )
     return g.figure()

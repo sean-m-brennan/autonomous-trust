@@ -52,7 +52,7 @@ export PYTHONPATH="/app:$PYTHONPATH"
 # autonomous_trust` printed `EnvironmentNameNotFound` on every
 # container start and polluted stderr / our diagnostics. See BUGS.md
 # entry "Dockerfile-native does not create autonomous_trust conda env"
-# for the proper fix (RUN `conda env create -f environment.yaml`).
+# for the proper fix (RUN `conda env create -f environment.yml`).
 if conda env list 2>/dev/null | awk '{print $1}' | grep -qx autonomous_trust; then
     conda activate autonomous_trust
 fi

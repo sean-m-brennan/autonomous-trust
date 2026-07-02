@@ -597,6 +597,12 @@ def make_app(name: str, title: str,
         for chart in charts:
             if hasattr(chart, "set_platforms"):
                 chart.set_platforms(platforms, plat_t, target_latlon)
+        # Feed peer-of-peer trust edges to the Trust Network panel (Stage 5).
+        for chart in charts:
+            if hasattr(chart, "set_trust_matrix"):
+                chart.set_trust_matrix(state.get("trust_matrix"),
+                                       state.get("compromised"),
+                                       state.get("excluded"))
         # External HTML legend for the map panel (first chart exposing
         # legend_groups). Rebuilt each tick so it tracks the live markers.
         map_legend: Any = []
