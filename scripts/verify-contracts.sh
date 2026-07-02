@@ -714,8 +714,10 @@ for src in "${files[@]}"; do
             skip_fns="config_run,handle_config_accepted,handle_config_artifact_ready,send_to_peer" ;;
         artifact_proc_helpers.c)
             # [solver-timeout] artifact_download_state_init: struct init
-            # with memset/logging preconditions
-            skip_fns="artifact_download_state_init" ;;
+            # with memset/logging preconditions. artifact_encode_chunk /
+            # artifact_decode_chunk: base64 stub reasoning (weak encoded_len
+            # postcondition) is not WP-dischargeable.
+            skip_fns="artifact_download_state_init,artifact_encode_chunk,artifact_decode_chunk" ;;
         artifact_proc.c)
             # artifact_run: [solver-timeout] state-cascade through
             # getenv/path_join/artifact_store_init prevents discharging

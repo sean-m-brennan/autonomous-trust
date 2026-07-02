@@ -232,9 +232,31 @@ class CohortTracker(Process, metaclass=ProcMeta,
                 if total is not None:
                     peer.total_network_history.append(total)
                 for peer_uuid in data:
-                    peer.network_history[peer_uuid].append(data[peer_uuid])
+                    # network_history is a plain dict; create the per-other deque
+                    # on first sight of a peer_uuid (bounded like the others),
+                    # otherwise the first stat for a new other raises KeyError.
+                    peer.network_history.setdefault(
+                        peer_uuid, deque(maxlen=PeerDataAcq.max_history)).append(data[peer_uuid])
             return True
         return False
+
+    def handle_reputation(self, message):
+        """Record a reputation response into the peer's reputation_history.
+
+        Returns True if the message was a reputation response (i.e. consumed
+        here), False otherwise so the caller can try other dispatch. Appends to
+        the history the renderers actually read (peer_status micrograph + the
+        per-other trust-gauge stand-in); the former inline `peer.reputation =
+        rep.score` set an attribute no renderer consumes, leaving the history
+        permanently empty.
+        """
+        if not (isinstance(message, Message) and message.function == ReputationProtocol.rep_resp):
+            return False
+        rep = message.obj
+        if rep.peer_id in self.cohort.peers:
+            peer = self.cohort.peers[rep.peer_id]
+            peer.reputation_history.append(rep.score)
+        return True
 
     def process(self, queues, signal):
         while self.keep_running(signal):
@@ -252,11 +274,8 @@ class CohortTracker(Process, metaclass=ProcMeta,
             except Empty:
                 message = None
             if message:
-                if isinstance(message, Message) and message.function == ReputationProtocol.rep_resp:
-                    rep = message.obj
-                    if rep.peer_id in self.cohort.peers:
-                        peer = self.cohort.peers[rep.peer_id]
-                        peer.reputation = rep.score
+                if self.handle_reputation(message):
+                    pass
                 elif isinstance(message, Peers):
                     peer_idents = {p.uuid: p for p in message.listing.values()}
                     self.cohort.update_group(peer_idents)

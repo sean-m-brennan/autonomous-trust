@@ -71,3 +71,40 @@ int artifact_verify_chunk_hash(const uint8_t *data, size_t len,
         return 0;
     return -1;
 }
+
+/* Frama-C: skipped — [solver-timeout] base64 stub reasoning */
+int artifact_encode_chunk(const uint8_t *data, size_t len,
+                          char *b64_out, size_t b64_max)
+{
+    if (!b64_out)
+        return -1;
+    /* sodium_bin2base64 aborts (sodium_misuse) on an undersized buffer, so
+     * check the required length up front and fail gracefully instead. */
+    if (b64_max < sodium_base64_encoded_len(len, sodium_base64_VARIANT_ORIGINAL))
+        return -1;
+    sodium_bin2base64(b64_out, b64_max, data, len,
+                      sodium_base64_VARIANT_ORIGINAL);
+    return 0;
+}
+
+/* Frama-C: skipped — [solver-timeout] base64 stub reasoning */
+int artifact_decode_chunk(const char *b64, size_t expected_len,
+                          uint8_t *out, size_t out_max, size_t *out_len)
+{
+    if (!b64 || !out)
+        return -1;
+    size_t bin_len = 0;
+    /* Bounded by out_max: sodium_base642bin fails rather than overflowing if
+     * the payload would exceed the buffer. */
+    if (sodium_base642bin(out, out_max, b64, strlen(b64),
+                          NULL, &bin_len, NULL,
+                          sodium_base64_VARIANT_ORIGINAL) != 0)
+        return -1;
+    /* Integrity gate: the advertised length must match what actually decoded,
+     * so a bogus expected_len can never drive an over-read downstream. */
+    if (bin_len != expected_len)
+        return -1;
+    if (out_len)
+        *out_len = bin_len;
+    return 0;
+}

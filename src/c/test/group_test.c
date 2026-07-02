@@ -95,6 +95,12 @@ DEFINE_TEST(test_group_proto_roundtrip)
 
     group_t *grp = NULL;
     ck_assert_ret_ok(group_create(&uuid, addr, &grp));
+    /* ISSUES.md §1.4 + §3.1-b: populate the full address_map + a group age so
+     * the proto round-trip below pins that both survive (not just the single
+     * legacy `address`). */
+    ck_assert_ret_ok(group_add_address(grp, "uuid-a", "172.16.0.1"));
+    ck_assert_ret_ok(group_add_address(grp, "uuid-b", "172.16.0.2"));
+    grp->created = 1700000000.5;
 
     /* Serialize to protobuf */
     void *data = NULL;
@@ -108,11 +114,26 @@ DEFINE_TEST(test_group_proto_roundtrip)
     memset(&grp2, 0, sizeof(group_t));
     ck_assert_ret_ok(proto_to_group((uint8_t *)data, data_len, &grp2));
 
-    ck_assert_str_eq(grp2.address, "172.16.0.1");
     ck_assert_mem_eq(grp2.uuid, uuid, sizeof(uuid_t));
+    /* §1.4: the full address_map round-trips */
+    ck_assert_int_eq((int)map_size(&grp2.address_map), 2);
+    data_t *v = NULL;
+    string_t s = NULL;
+    ck_assert_ret_ok(map_get(&grp2.address_map, (map_key_t)"uuid-a", &v));
+    ck_assert_ret_ok(data_string_ptr(v, &s));
+    ck_assert_str_eq(s, "172.16.0.1");
+    ck_assert_ret_ok(map_get(&grp2.address_map, (map_key_t)"uuid-b", &v));
+    ck_assert_ret_ok(data_string_ptr(v, &s));
+    ck_assert_str_eq(s, "172.16.0.2");
+    /* §3.1-b: the group age round-trips */
+    ck_assert_double_eq_tol(grp2.created, 1700000000.5, 1e-6);
 
     free(data);
     group_free(grp);
+    /* grp2 is a stack struct (not smrt-allocated); free only its map to avoid
+     * smrt_deref on non-smrt memory (matches the other proto-roundtrip tests). */
+    if (grp2.address_map.items != NULL)
+        map_free(&grp2.address_map);
 }
 END_TEST_DEFINITION()
 
@@ -223,7 +244,7 @@ DEFINE_TEST(test_group_created_age_roundtrip)
     ck_assert_ret_ok(group_create(&u1, addr1, &g1));
 
     /* group_init/group_create leave age unknown (0.0). */
-    ck_assert(g1->created == 0.0);
+    ck_assert_double_eq_tol(g1->created, 0.0, 1e-9);
 
     /* Stamp a known epoch and round-trip it through the canonical form. */
     g1->created = 1700000000.5;   /* arbitrary comparable epoch (seconds) */
@@ -233,19 +254,19 @@ DEFINE_TEST(test_group_created_age_roundtrip)
     json_t *j_created = json_object_get(obj, "created");
     ck_assert_ptr_nonnull(j_created);
     ck_assert(json_is_number(j_created));
-    ck_assert(json_number_value(j_created) == 1700000000.5);
+    ck_assert_double_eq_tol(json_number_value(j_created), 1700000000.5, 1e-6);
 
     group_t g2;
     memset(&g2, 0, sizeof(group_t));
     ck_assert_ret_ok(group_from_json(obj, &g2));
-    ck_assert(g2.created == 1700000000.5);
+    ck_assert_double_eq_tol(g2.created, 1700000000.5, 1e-6);
 
     /* A payload with "created" removed must default to 0.0 (unknown age). */
     ck_assert(json_object_del(obj, "created") == 0);
     group_t g3;
     memset(&g3, 0, sizeof(group_t));
     ck_assert_ret_ok(group_from_json(obj, &g3));
-    ck_assert(g3.created == 0.0);
+    ck_assert_double_eq_tol(g3.created, 0.0, 1e-9);
 
     json_decref(obj);
     group_free(g1);

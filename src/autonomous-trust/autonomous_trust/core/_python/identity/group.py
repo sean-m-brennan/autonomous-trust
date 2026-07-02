@@ -143,20 +143,27 @@ class Group(InitializableConfig):
 
     def sync_to_message(self):
         self.message.uuid = str(self._uuid).encode('utf-8')
-        # Proto has a single address string; take first value from map or empty
-        if self._address_map:
-            if isinstance(self._address_map, dict):
-                self.message.address = next(iter(self._address_map.values()), '')
-            else:
-                self.message.address = next(iter(self._address_map), '')
-        else:
-            self.message.address = ''
+        addr_map = dict(self._address_map) if isinstance(self._address_map, dict) \
+            else {a: a for a in (self._address_map or [])}
+        # Full UUID->address map (§1.4).
+        self.message.address_map.clear()
+        for uuid, addr in addr_map.items():
+            self.message.address_map[str(uuid)] = str(addr)
+        # Legacy single address = first value, for older peers that only read it.
+        self.message.address = next(iter(addr_map.values()), '')
+        self.message.created = float(self.created)  # §3.1-b group age
         self._encryptor.sync_to_message()
         self.message.encryptor.CopyFrom(self._encryptor.message)
 
     def sync_from_message(self):
         self._uuid = self.message.uuid.decode('utf-8')
-        self._address_map = {}
+        # Prefer the full map (§1.4); fall back to the legacy single `address`
+        # from an older peer (keyed by the group uuid, the best we can do
+        # without the original key).
+        self._address_map = dict(self.message.address_map)
+        if not self._address_map and self.message.address:
+            self._address_map = {self._uuid: self.message.address}
+        self._created = float(self.message.created) if self.message.created else 0.0
         self._nickname = ''
         self._public_only = True
         # Reconstruct nested Encryptor

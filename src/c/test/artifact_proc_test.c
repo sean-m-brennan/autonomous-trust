@@ -116,9 +116,126 @@ DEFINE_TEST(test_manifest_json_roundtrip)
 }
 END_TEST_DEFINITION()
 
+/* ---------------------------------------------------------------
+ * test_chunk_base64_roundtrip (§7)
+ * Encode a chunk payload and decode it back through the production
+ * helpers; the bytes must survive intact for representative sizes.
+ * --------------------------------------------------------------- */
+DEFINE_TEST(test_chunk_base64_roundtrip)
+{
+    ck_assert_int_eq(sodium_init() < 0 ? -1 : 0, 0);
+
+    /* Full-size chunk covering all 256 byte values (catches any
+     * alphabet/padding mishandling). */
+    uint8_t orig[ARTIFACT_CHUNK_SIZE];
+    for (size_t i = 0; i < sizeof(orig); i++)
+        orig[i] = (uint8_t)(i & 0xFF);
+
+    /* Full, a partial length not divisible by 3 (exercises padding), and 1. */
+    size_t sizes[] = { ARTIFACT_CHUNK_SIZE, 1000, 1 };
+    for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++)
+    {
+        size_t len = sizes[s];
+        char b64[sodium_base64_ENCODED_LEN(ARTIFACT_CHUNK_SIZE,
+                                           sodium_base64_VARIANT_ORIGINAL)];
+        ck_assert_int_eq(artifact_encode_chunk(orig, len, b64, sizeof(b64)), 0);
+
+        uint8_t out[ARTIFACT_CHUNK_SIZE];
+        size_t out_len = 0;
+        ck_assert_int_eq(artifact_decode_chunk(b64, len, out, sizeof(out), &out_len), 0);
+        ck_assert_uint_eq(out_len, len);
+        ck_assert_mem_eq(out, orig, len);
+    }
+}
+END_TEST_DEFINITION()
+
+/* ---------------------------------------------------------------
+ * test_chunk_decode_rejects_length_mismatch (§7 over-read guard)
+ * A decoded payload whose length disagrees with the advertised
+ * expected_len must be rejected, so a bogus data_len can never drive
+ * an over-read downstream.
+ * --------------------------------------------------------------- */
+DEFINE_TEST(test_chunk_decode_rejects_length_mismatch)
+{
+    ck_assert_int_eq(sodium_init() < 0 ? -1 : 0, 0);
+
+    uint8_t orig[256];
+    randombytes_buf(orig, sizeof(orig));
+
+    char b64[sodium_base64_ENCODED_LEN(256, sodium_base64_VARIANT_ORIGINAL)];
+    ck_assert_int_eq(artifact_encode_chunk(orig, sizeof(orig), b64, sizeof(b64)), 0);
+
+    uint8_t out[256];
+    size_t out_len = 0;
+
+    /* Honest length decodes. */
+    ck_assert_int_eq(artifact_decode_chunk(b64, 256, out, sizeof(out), &out_len), 0);
+    ck_assert_uint_eq(out_len, 256);
+
+    /* Over/under/zero advertised lengths are all rejected. */
+    ck_assert(artifact_decode_chunk(b64, 257, out, sizeof(out), &out_len) != 0);
+    ck_assert(artifact_decode_chunk(b64, 255, out, sizeof(out), &out_len) != 0);
+    ck_assert(artifact_decode_chunk(b64, 0,   out, sizeof(out), &out_len) != 0);
+}
+END_TEST_DEFINITION()
+
+/* ---------------------------------------------------------------
+ * test_chunk_decode_bounded_by_capacity (§7)
+ * Decoding into a buffer smaller than the payload must fail rather
+ * than overflow.
+ * --------------------------------------------------------------- */
+DEFINE_TEST(test_chunk_decode_bounded_by_capacity)
+{
+    ck_assert_int_eq(sodium_init() < 0 ? -1 : 0, 0);
+
+    uint8_t orig[200];
+    randombytes_buf(orig, sizeof(orig));
+
+    char b64[sodium_base64_ENCODED_LEN(200, sodium_base64_VARIANT_ORIGINAL)];
+    ck_assert_int_eq(artifact_encode_chunk(orig, sizeof(orig), b64, sizeof(b64)), 0);
+
+    uint8_t small[100];
+    size_t out_len = 0;
+    ck_assert(artifact_decode_chunk(b64, 200, small, sizeof(small), &out_len) != 0);
+}
+END_TEST_DEFINITION()
+
+/* ---------------------------------------------------------------
+ * test_chunk_decode_rejects_invalid_base64 (§7)
+ * --------------------------------------------------------------- */
+DEFINE_TEST(test_chunk_decode_rejects_invalid_base64)
+{
+    ck_assert_int_eq(sodium_init() < 0 ? -1 : 0, 0);
+    uint8_t out[64];
+    size_t out_len = 0;
+    /* '!' and '-' are outside the standard base64 alphabet. */
+    ck_assert(artifact_decode_chunk("!!!not-base64!!!", 8, out, sizeof(out), &out_len) != 0);
+}
+END_TEST_DEFINITION()
+
+/* ---------------------------------------------------------------
+ * test_chunk_encode_rejects_small_buffer (§7)
+ * An undersized output buffer must yield a graceful -1, not a
+ * libsodium abort.
+ * --------------------------------------------------------------- */
+DEFINE_TEST(test_chunk_encode_rejects_small_buffer)
+{
+    ck_assert_int_eq(sodium_init() < 0 ? -1 : 0, 0);
+    uint8_t orig[100];
+    randombytes_buf(orig, sizeof(orig));
+    char tiny[8];
+    ck_assert(artifact_encode_chunk(orig, sizeof(orig), tiny, sizeof(tiny)) != 0);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(ArtifactProc,
     test_chunk_size_calculation,
     test_download_state_tracking,
     test_per_chunk_hash_verification,
-    test_manifest_json_roundtrip
+    test_manifest_json_roundtrip,
+    test_chunk_base64_roundtrip,
+    test_chunk_decode_rejects_length_mismatch,
+    test_chunk_decode_bounded_by_capacity,
+    test_chunk_decode_rejects_invalid_base64,
+    test_chunk_encode_rejects_small_buffer
 )
