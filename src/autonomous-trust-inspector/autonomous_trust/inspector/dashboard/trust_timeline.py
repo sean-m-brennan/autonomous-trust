@@ -54,6 +54,23 @@ class PhaseMarker:
     dash: str = "dash"   # plotly line dash style
 
 
+def _time_ticks(t_max):
+    """Clean ``m:ss`` x-axis ticks spanning ``[0, t_max]`` seconds.
+
+    Picks the smallest "nice" interval that yields at most ~10 ticks so the
+    labels stay legible as the live timeline grows. Returns
+    ``(tickvals_seconds, ticktext_mmss)``. Pure."""
+    span = max(float(t_max), 1.0)
+    step = 3600
+    for candidate in (10, 15, 30, 60, 120, 300, 600, 900, 1800):
+        if span / candidate <= 10:
+            step = candidate
+            break
+    vals = list(range(0, int(span) + 1, step)) or [0]
+    text = ["%d:%02d" % (int(v) // 60, int(v) % 60) for v in vals]
+    return vals, text
+
+
 class TrustTimeline:
     """Builds and updates a Plotly figure showing reputation over time.
 
@@ -132,9 +149,21 @@ class TrustTimeline:
                 annotation_font_color=marker.color,
             )
 
+        # Explicit m:ss time ticks + vertical gridlines so a reader can drop a
+        # line from any feature (e.g. a sawtooth) straight to a readable time.
+        # x is elapsed seconds since tasking_start (see ReputationSample.t).
+        xtickvals, xticktext = _time_ticks(t_max)
+
         fig.update_layout(
             title=dict(text=self._title, font=dict(size=14)),
-            xaxis_title="Time (seconds)",
+            xaxis=dict(
+                title="Time (m:ss)",
+                tickvals=xtickvals,
+                ticktext=xticktext,
+                showgrid=True,
+                gridcolor="rgba(148, 163, 184, 0.18)",
+                range=[0, t_max] if self._samples else None,
+            ),
             yaxis_title="Reputation",
             yaxis=dict(range=[0, 1.05]),
             template="plotly_dark",
@@ -147,6 +176,11 @@ class TrustTimeline:
                 xanchor="center",
                 x=0.5,
                 font=dict(size=9),
+                # Transparent so it doesn't paint over the m:ss x-axis tick
+                # labels it sits on top of (legend is anchored below the plot).
+                bgcolor="rgba(0, 0, 0, 0)",
+                bordercolor="rgba(0, 0, 0, 0)",
+                borderwidth=0,
             ),
             margin=dict(l=50, r=20, t=40, b=80),
         )

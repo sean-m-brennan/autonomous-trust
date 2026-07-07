@@ -108,13 +108,19 @@ extern char REP_PROTO_CHECKPOINT_FINAL[];
 #define COOP_EXIT  0.45
 
 /* Pre-reputation cold-start prior (deferred.md §2.4). PREREP_NEUTRAL is the
- * historical flat "no information" value the CTFT no-bilateral-history branch
- * used to return; the transaction-memory prior shrinks the peer's observed
- * third-party standing toward it by a pseudo-count of PREREP_SHRINKAGE_K, so
- * a genuinely-unknown peer (zero observations) still reads exactly
- * PREREP_NEUTRAL. Mirror of repprocess.py PREREP_NEUTRAL / PREREP_SHRINKAGE_K.
+ * "no information" STARTING reputation: a peer we know nothing about starts at
+ * the BOTTOM of the tit-for-tat band (0.0) and must EARN its way up, rather
+ * than being handed a near-threshold ~0.5 for free (which let unknown peers
+ * read as almost-trusted and made the trust graph a flat all-to-all mesh).
+ * The transaction-memory prior shrinks a peer's observed third-party standing
+ * toward this value by a pseudo-count of PREREP_SHRINKAGE_K, so a
+ * genuinely-unknown peer (zero observations) still reads exactly
+ * PREREP_NEUTRAL. This is the STARTING point only -- the CTFT bilateral pivots
+ * (min(0.49,.)/max(0.51,.) around the 0.5 cooperate threshold) are the earned
+ * near-threshold outputs and are deliberately unchanged. Mirror of
+ * repprocess.py PREREP_NEUTRAL / PREREP_SHRINKAGE_K.
  * Disable via AT_PREREP_HEURISTIC=0. */
-#define PREREP_NEUTRAL 0.49
+#define PREREP_NEUTRAL 0.0
 #define PREREP_SHRINKAGE_K 3.0
 
 /* EMA half-life (in committed bilateral txs) for reputation_consensus.

@@ -81,14 +81,20 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     COOP_EXIT = 0.45
 
     # Pre-reputation cold-start (CTFT no-bilateral-history-with-us branch).
-    # PREREP_NEUTRAL is the historical flat "no information" value; the
-    # transaction-memory prior (_prereputation_prior) shrinks the peer's
-    # observed third-party standing toward it by a pseudo-count of
-    # PREREP_SHRINKAGE_K, so a truly-unknown peer (zero observations) still
-    # reads exactly PREREP_NEUTRAL while a peer others have already scored
-    # gets a better-than-flat prior. Mirror: reputation.c
-    # reputation_prereputation_prior. Disable via AT_PREREP_HEURISTIC=0.
-    PREREP_NEUTRAL = 0.49
+    # PREREP_NEUTRAL is the "no information" starting reputation: a peer we
+    # know nothing about starts at the BOTTOM of the tit-for-tat band (0.0)
+    # and must EARN its way up, rather than being handed a near-threshold
+    # ~0.5 for free (which let unknown/newcomer peers read as almost-trusted
+    # and made the trust graph a flat all-to-all mesh). The transaction-memory
+    # prior (_prereputation_prior) shrinks a peer's observed third-party
+    # standing toward this value by a pseudo-count of PREREP_SHRINKAGE_K, so a
+    # truly-unknown peer (zero observations) reads exactly PREREP_NEUTRAL while
+    # a peer others have already scored gets an informed, conservatively-shrunk
+    # prior. This is the STARTING point only -- the CTFT bilateral pivots
+    # (min(0.49, .)/max(0.51, .) around the 0.5 cooperate threshold) are the
+    # earned near-threshold outputs and are deliberately unchanged. Mirror:
+    # reputation.c PREREP_NEUTRAL. Disable via AT_PREREP_HEURISTIC=0.
+    PREREP_NEUTRAL = 0.0
     PREREP_SHRINKAGE_K = 3.0
 
     # EMA half-life (in committed bilateral txs) for the dashboard
@@ -234,6 +240,16 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # interacting (out of range) keeps its earned reputation (incl. a
         # low one for a corrupt node) instead of decaying to neutral.
         self._consensus_last: dict[str, float] = {}
+        # Persistent per-peer running consensus EMA over the PRIMARY chain
+        # (peer-uuid-str -> ema), folded once per committed bilateral tx and
+        # tracked by the highest chain index already folded
+        # (_consensus_folded_idx). Unlike the from-scratch recompute in
+        # _consensus_reputation, this retains history that has since evicted
+        # from the bounded window, so a sliding window can no longer reshape a
+        # peer's score — which is what produced the synchronized dashboard
+        # "Trust Dynamics" sawtooth. See _running_consensus.
+        self._consensus_ema: dict[str, float] = {}
+        self._consensus_folded_idx: dict[str, int] = {}
         self.requested_reps = []
         self.updates = {}
         self.num_updates = 3
@@ -719,6 +735,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # — primary for leaf nodes, a child chain on a gateway.
                 self._chain_for_group(round_group_uuid).update(
                     score.task_id, peer_id, score.score)
+                # Fold-on-commit: keep the dashboard running consensus EMA
+                # current the moment a tx completes (primary chain only).
+                self._fold_committed_tx(
+                    score.task_id, self._chain_for_group(round_group_uuid))
                 self._note_interaction(peer_id)
                 # Bumped to info to make demo debugging tractable —
                 # without a commit log, "no movement on reputations"
@@ -786,6 +806,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 return True
             chain = self._chain_for_group(group_uuid)
             chain.update(task_id, peer_id, float(score))
+            # Fold-on-commit: advance the dashboard running consensus EMA as
+            # soon as this tx completes (primary chain only; idempotent).
+            self._fold_committed_tx(task_id, chain)
             self._note_interaction(peer_id)
             self.logger.info(
                 'Recorded committed tx from %s: task=%s score=%.2f '
@@ -1369,8 +1392,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def _prereputation_prior(self, peer_uuid):
         """Transaction-memory prior for the CTFT cold-start window.
 
-        Before any *bilateral* history with us exists, a flat 0.49 throws
-        away what the chain already knows about the peer: the scores third
+        Before any *bilateral* history with us exists, a flat PREREP_NEUTRAL
+        throws away what the chain already knows about the peer: the scores third
         parties have assigned it. Mine those (the counterparty-submitted
         score on each committed transaction the peer took part in — the same
         "assessment OF the peer" axis _pure_reputation uses), weight each by
@@ -1703,6 +1726,103 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             pass
         return 0.5
 
+    def _fold_tx_for_peer(self, peer_uuid, tx, alpha):
+        """Fold one completed tx's counterparty-side score into ``peer_uuid``'s
+        persistent running consensus EMA, exactly once (guarded by chain
+        index). No-op for an incomplete/one-sided tx (index None), a peer not
+        party to it, a missing counterparty score, an already-folded tx, or a
+        slashed peer (its floor is authoritative — folding would drift the
+        stored value the slash override masks, breaking resume-from-floor).
+        Updates ``_consensus_ema``/``_consensus_folded_idx`` and keeps
+        ``_consensus_last`` in step (read by the baseline path + idle decay)."""
+        if tx is None or tx.index is None:
+            return
+        key = str(peer_uuid)
+        if key in self._slashed:
+            return
+        if tx.index <= self._consensus_folded_idx.get(key, -1):
+            return
+        if tx.p1_id == peer_uuid:
+            cp_score = tx.p2_score
+        elif tx.p2_id == peer_uuid:
+            cp_score = tx.p1_score
+        else:
+            return
+        if cp_score is None:
+            return
+        ema = self._consensus_ema.get(key)
+        # transaction_weight applied as w single-step folds (see
+        # _consensus_reputation for why this preserves the [0,1] range).
+        w = self.task_weights.get(str(tx.task_id), 1)
+        for _ in range(max(1, int(w))):
+            if ema is None:
+                ema = float(cp_score)
+            else:
+                ema = alpha * float(cp_score) + (1.0 - alpha) * ema
+        self._consensus_ema[key] = ema
+        self._consensus_folded_idx[key] = tx.index
+        self._consensus_last[key] = ema
+
+    def _fold_committed_tx(self, task_id, chain):
+        """Fold-on-commit hook: when a tx completes on the PRIMARY chain, fold
+        it into BOTH counterparties' running consensus EMAs immediately, so the
+        dashboard value is retained independently of when consensus is next
+        queried. Idempotent (index-guarded), so it is safe to call after every
+        chain.update — a still-incomplete tx (index None) folds nothing.
+        Child-chain (gateway) commits are ignored here: those peers score via
+        the pure from-scratch recompute in _consensus_reputation."""
+        if chain is not self.history:
+            return
+        tx = chain._task_mapping.get(task_id)
+        if tx is None or tx.index is None:
+            return
+        alpha = 1.0 - 0.5 ** (1.0 / float(self.CONSENSUS_EMA_HALF_LIFE))
+        self._fold_tx_for_peer(tx.p1_id, tx, alpha)
+        self._fold_tx_for_peer(tx.p2_id, tx, alpha)
+
+    def _running_consensus(self, peer_uuid):
+        """Persistent per-peer running consensus EMA over the PRIMARY chain.
+
+        The value is built by folding each committed bilateral tx exactly once
+        (``_fold_tx_for_peer``, tracked by chain index). Folding happens
+        eagerly ON COMMIT (``_fold_committed_tx`` from the accept/commit
+        handlers), so already-folded transactions stay reflected in the stored
+        value even after they evict from the bounded window — the score changes
+        ONLY when new transactions commit and never wobbles as the shared
+        window slides. That is the fix for the synchronized "Trust Dynamics"
+        sawtooth (the old from-scratch recompute, still used for gateway child
+        chains in _consensus_reputation, re-derived the EMA over whatever subset
+        of a peer's txs was resident, so every line rose/fell on the global
+        eviction beat).
+
+        This method just RETURNS the stored value; the resident-tx scan below
+        is an idempotent safety net that folds any resident tx a commit handler
+        missed (e.g. a catchup/replay path that appended without folding),
+        while it is still resident.
+
+        Equivalence: for a chain that has not yet evicted, the folded set/order/
+        seed match the from-scratch recompute exactly, so the conformance/parity
+        corpora (small, non-evicting) are unaffected. Determinism note: after
+        eviction the value depends on which txs THIS node folded — a deliberate
+        trade for a stable timeline. Slash override and cold-start baseline are
+        handled by the caller / _consensus_baseline. C twin keeps the
+        from-scratch form for now (parity follow-up)."""
+        key = str(peer_uuid)
+        alpha = 1.0 - 0.5 ** (1.0 / float(self.CONSENSUS_EMA_HALF_LIFE))
+        try:
+            txs = list(self.history.by_peer(peer_uuid))
+        except KeyError:
+            txs = []
+        # Ascending chain-index order == commit order; already-folded txs are
+        # skipped by the index guard, so this is a no-op on the normal path.
+        for tx in sorted(txs, key=lambda t: (t.index if t.index is not None else 0)):
+            self._fold_tx_for_peer(peer_uuid, tx, alpha)
+        if key in self._consensus_ema:
+            return self._consensus_ema[key]
+        # No committed bilateral history folded yet -> cold-start baseline
+        # (sticky last / seeded prior / neutral), same as the recompute.
+        return self._consensus_baseline(peer_uuid)
+
     def _consensus_reputation(self, peer_uuid, chain=None):
         """Deterministic reputation score over a consensus tx chain.
 
@@ -1741,8 +1861,18 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if slashed is not None:
             floor = float(slashed[0])
             self._consensus_last[str(peer_uuid)] = floor
+            # Keep the running EMA in step so a later rehabilitation resumes
+            # from the floor rather than a stale pre-slash value.
+            self._consensus_ema[str(peer_uuid)] = floor
             return floor
-        history = self.history if chain is None else chain
+        # Primary chain (the dashboard/timeline path): a persistent per-peer
+        # running EMA that folds each committed tx exactly once, so evicting
+        # old txs can't reshape the score (no sawtooth). Gateway child-chain
+        # scoring (chain is not None) keeps the pure from-scratch recompute
+        # below, which the rep-tree/conformance path depends on.
+        if chain is None:
+            return self._running_consensus(peer_uuid)
+        history = chain
         try:
             txs = list(history.by_peer(peer_uuid))
         except KeyError:

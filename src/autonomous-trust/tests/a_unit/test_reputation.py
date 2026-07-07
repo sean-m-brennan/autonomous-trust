@@ -434,11 +434,14 @@ def _stub_proc(self_uuid, reputations=None):
 
 
 class TestContriteTitForTat:
-    def test_empty_history_returns_0_49(self):
+    def test_empty_history_returns_neutral(self):
+        # No bilateral history AND nothing on the chain → cold-start prior
+        # returns PREREP_NEUTRAL (0.0): an unknown peer starts at the bottom
+        # of the TFT band and must earn its way up.
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         peer = SimpleNamespace(uuid=peer_id)
-        assert ReputationProcess._contrite_tit_for_tat(stub, peer) == 0.49
+        assert ReputationProcess._contrite_tit_for_tat(stub, peer) == 0.0
 
     def test_cooperative_self_p1(self):
         """Self enters as p1, peer as p2, both cooperate. Falls into
@@ -501,7 +504,7 @@ class TestContriteTitForTat:
         """Third-party transactions (peer ↔ other, no self involvement) do
         not enter the *bilateral* CTFT computation, but with no bilateral
         history WITH us they now feed the cold-start prior
-        (_prereputation_prior) instead of a flat 0.49 (deferred.md §2.4)."""
+        (_prereputation_prior) instead of a flat neutral (deferred.md §2.4)."""
         self_id, peer_id, other = uuid4(), uuid4(), uuid4()
         stub = _stub_proc(self_id)
         t = uuid4()
@@ -510,8 +513,8 @@ class TestContriteTitForTat:
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
         # observed standing = other's score about peer = 0.1, cp_rep(other)=0.5,
-        # shrunk: (1*0.1 + 3*0.49) / (1+3) = 0.3925.
-        assert score == pytest.approx(0.3925, abs=0.001)
+        # shrunk toward neutral 0.0: (1*0.1 + 3*0.0) / (1+3) = 0.025.
+        assert score == pytest.approx(0.025, abs=0.001)
 
 
 class TestPrereputationPrior:
@@ -522,7 +525,7 @@ class TestPrereputationPrior:
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         assert ReputationProcess._prereputation_prior(stub, peer_id) \
-            == pytest.approx(0.49, abs=1e-9)
+            == pytest.approx(0.0, abs=1e-9)
 
     def test_self_counterparty_excluded(self):
         # A one-sided tx where WE are the counterparty must not seed the
@@ -534,7 +537,7 @@ class TestPrereputationPrior:
         stub.history.update(t, self_id, 0.2)   # self → p2 (we score peer)
         # self is excluded → no third-party observation → neutral.
         assert ReputationProcess._prereputation_prior(stub, peer_id) \
-            == pytest.approx(0.49, abs=1e-9)
+            == pytest.approx(0.0, abs=1e-9)
 
     def test_shrinks_toward_neutral_with_sample_size(self):
         # More consistent third-party evidence pulls the prior further from
@@ -548,9 +551,9 @@ class TestPrereputationPrior:
             stub.history.update(t, peer_id, 0.9)  # peer → p1
             stub.history.update(t, o, 0.9)        # other scores peer 0.9
         prior = ReputationProcess._prereputation_prior(stub, peer_id)
-        # observed=0.9, n=4, k=3 → (4*0.9 + 3*0.49)/7 = 0.7242857...
-        assert prior == pytest.approx((4 * 0.9 + 3 * 0.49) / 7, abs=0.001)
-        assert 0.49 < prior < 0.9
+        # observed=0.9, n=4, k=3, neutral=0.0 → (4*0.9 + 3*0.0)/7 = 0.5142857...
+        assert prior == pytest.approx((4 * 0.9 + 3 * 0.0) / 7, abs=0.001)
+        assert 0.0 < prior < 0.9
 
     def test_kill_switch_restores_flat_neutral(self, monkeypatch):
         monkeypatch.setenv('AT_PREREP_HEURISTIC', '0')
@@ -559,7 +562,7 @@ class TestPrereputationPrior:
         t = uuid4()
         stub.history.update(t, peer_id, 0.9)
         stub.history.update(t, other, 0.9)
-        assert ReputationProcess._prereputation_prior(stub, peer_id) == 0.49
+        assert ReputationProcess._prereputation_prior(stub, peer_id) == 0.0
 
 
 class TestPureReputation:
@@ -656,6 +659,7 @@ class TestProposerHistoryBilateral:
         # chain — which for this leaf stub is just `history`.
         stub._chain_for_group = lambda g: history
         stub._note_interaction = lambda *a, **k: None
+        stub._fold_committed_tx = lambda *a, **k: None
         stub.identity = SimpleNamespace(uuid=self_id)
         stub.logger = SimpleNamespace(
             warning=lambda *a, **k: None, debug=lambda *a, **k: None,
@@ -712,6 +716,7 @@ class TestProposerHistoryBilateral:
             # Legacy 3-tuple commit -> group_uuid None -> primary chain.
             _chain_for_group=lambda g: history,
             _note_interaction=lambda *a, **k: None,
+            _fold_committed_tx=lambda *a, **k: None,
             identity=SimpleNamespace(uuid=self_id),
             logger=SimpleNamespace(
                 warning=lambda *a, **k: None, debug=lambda *a, **k: None,
