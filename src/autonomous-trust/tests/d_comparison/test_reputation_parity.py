@@ -98,8 +98,8 @@ class TestReputationParity:
         peer_id = uuid.uuid4()
 
         score = reputation_compute(hist, reps, self_id, peer_id)
-        # No history → contrite TFT → 0.49
-        assert abs(score - 0.49) < 0.01
+        # No history → contrite TFT cold-start prior → PREREP_NEUTRAL 0.0
+        assert abs(score - 0.0) < 0.01
 
     def test_reputation_compute_with_history(self):
         """Reputation after recording transactions."""

@@ -343,7 +343,7 @@ class TestContriteTitForTat:
         rp = _make_rep_process()
         peer = _make_mock_peer()
         result = rp._contrite_tit_for_tat(peer)
-        assert result == 0.49
+        assert result == 0.0  # cold-start prior: PREREP_NEUTRAL
 
     def test_with_history(self):
         rp = _make_rep_process()
@@ -1288,7 +1288,8 @@ class TestContriteTitForTatBranches2:
         assert result >= 0.51
 
     def test_no_matching_transactions(self):
-        """Transactions with neither peer being the target peer return 0.49."""
+        """Transactions with neither peer being the target peer return the
+        cold-start prior PREREP_NEUTRAL (0.0)."""
         rp = _make_rep_process()
         peer = _make_mock_peer()
         other1 = _make_mock_peer(nickname='o1', address='10.0.0.2')
@@ -1298,7 +1299,7 @@ class TestContriteTitForTatBranches2:
         rp.history.update(tid, other1.uuid, 0.7)
         rp.history.update(tid, other2.uuid, 0.8)
         result = rp._contrite_tit_for_tat(peer)
-        assert result == 0.49  # not enough info
+        assert result == 0.0  # not enough info → cold-start neutral
 
 
 class TestForwardReputationFullException:
@@ -1336,3 +1337,109 @@ class TestForwardReputationFullException:
         rp.forward_reputation({proc_name: queue.Queue(), CfgIds.network: net_q})
         assert len(rp.requested_reps) == 0
         assert net_q.qsize() == 3
+
+
+class TestRunningConsensus:
+    """Primary-chain consensus is a persistent per-peer running EMA (folded
+    once per committed tx), so a sliding bounded window can't reshape a peer's
+    score — the fix for the synchronized dashboard "Trust Dynamics" sawtooth.
+    The scored peer is committed as the shared p2 (counterparty p1 carries the
+    'observed about P' score), matching the eviction pattern in
+    test_reputation.py so p2 is mapped once per tx."""
+
+    @staticmethod
+    def _commit(rp, peer, observed):
+        tid = uuid4()
+        rp.history.update(tid, uuid4(), observed)  # counterparty (p1) score
+        rp.history.update(tid, peer, 0.9)          # scored peer as p2
+        # Mirror what handle_accepted / handle_committed do on a real commit:
+        # fold the completed tx into the running consensus EMA immediately.
+        rp._fold_committed_tx(tid, rp.history)
+
+    def test_equivalent_to_recompute_without_eviction(self):
+        # No eviction (chain far under the cap): the running EMA folds the same
+        # txs in the same order from the same seed as the from-scratch
+        # recompute, so the value is identical. This is what keeps the
+        # conformance/parity corpora (small, non-evicting) unaffected.
+        rp = _make_rep_process()
+        P = uuid4()
+        for sc in [0.3, 0.8, 0.8, 0.5, 0.8, 0.2, 0.8, 0.8]:
+            self._commit(rp, P, sc)
+        running = rp._consensus_reputation(P)                  # chain=None path
+        recompute = rp._consensus_reputation(P, chain=rp.history)
+        assert abs(running - recompute) < 1e-12
+
+    def test_no_wobble_between_commits(self):
+        # Repeated queries with no new tx return the exact same value — the
+        # sawtooth was the value changing between commits as the window slid.
+        rp = _make_rep_process()
+        rp.history = TransactionHistory(max_chain_len=4)
+        P = uuid4()
+        trace = []
+        for sc in [0.3, 0.3, 0.3, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8]:
+            self._commit(rp, P, sc)
+            vals = [rp._consensus_reputation(P) for _ in range(4)]
+            assert len(set(vals)) == 1          # identical between commits
+            trace.append(vals[0])
+        # On monotonically-improving input the running score rises smoothly and
+        # never reverses (no teeth), even though the 4-entry window slides.
+        tail = trace[3:]
+        assert all(b >= a - 1e-9 for a, b in zip(tail, tail[1:]))
+
+    def test_retains_history_after_eviction_without_querying(self):
+        # Early defections (0.3) evict from the 4-entry window. Because folding
+        # happens ON COMMIT (not on query), the running EMA still reflects the
+        # early lows even though consensus is queried ONLY at the end — whereas
+        # a from-scratch recompute sees only the resident (all-0.8) tail and
+        # snaps up, the jump that made the teeth. This is query-independence.
+        rp = _make_rep_process()
+        rp.history = TransactionHistory(max_chain_len=4)
+        P = uuid4()
+        for sc in [0.3, 0.3, 0.3, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8]:
+            self._commit(rp, P, sc)             # NO query during the sequence
+        running = rp._consensus_reputation(P)
+        resident_only = rp._consensus_reputation(P, chain=rp.history)
+        assert abs(running - resident_only) > 1e-6
+        assert running < resident_only          # remembers the early lows
+
+    def test_fold_on_commit_matches_query_folding(self):
+        # Folding on commit (no queries during) yields exactly the same value
+        # as folding lazily on every-cycle queries — the hook is just eager.
+        seq = [0.3, 0.3, 0.8, 0.5, 0.8, 0.8, 0.2, 0.8, 0.8, 0.8]
+        rp_eager = _make_rep_process()
+        rp_eager.history = TransactionHistory(max_chain_len=4)
+        P = uuid4()
+        for sc in seq:
+            self._commit(rp_eager, P, sc)       # fold-on-commit only
+        rp_lazy = _make_rep_process()
+        rp_lazy.history = TransactionHistory(max_chain_len=4)
+        Q = uuid4()
+        for sc in seq:
+            self._commit(rp_lazy, Q, sc)
+            rp_lazy._consensus_reputation(Q)    # also query every cycle
+        assert abs(rp_eager._consensus_reputation(P)
+                   - rp_lazy._consensus_reputation(Q)) < 1e-12
+
+    def test_child_chain_commit_not_folded_into_primary(self):
+        # A commit routed to a gateway CHILD chain must not touch the primary
+        # running EMA (child peers score via the from-scratch recompute).
+        rp = _make_rep_process()
+        child = TransactionHistory()
+        P = uuid4()
+        tid = uuid4()
+        child.update(tid, uuid4(), 0.8)
+        child.update(tid, P, 0.9)
+        rp._fold_committed_tx(tid, child)       # child chain, not self.history
+        assert str(P) not in rp._consensus_ema
+
+    def test_slash_override_still_floors(self):
+        # A finalized slash floors the score regardless of the running EMA, and
+        # syncs the stored EMA so a later lift resumes from the floor.
+        rp = _make_rep_process()
+        P = uuid4()
+        for sc in [0.8, 0.8, 0.8]:
+            self._commit(rp, P, sc)
+        assert rp._consensus_reputation(P) > 0.5
+        rp._slashed[str(P)] = (0.05, 'test')
+        assert rp._consensus_reputation(P) == 0.05
+        assert rp._consensus_ema[str(P)] == 0.05

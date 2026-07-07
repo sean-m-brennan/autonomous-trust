@@ -22,6 +22,12 @@
 # or examples/dod_mission/ trigger image rebuild and rolling-update of
 # affected Deployments.
 
+# restart_process ext: wraps an image's entrypoint so a live_update sync can
+# restart the process in-place (the Dash app runs with use_reloader=False, so
+# a synced .py won't take effect without a restart). Fetched from Tilt's
+# extension registry on first `tilt up` (needs network once; cached after).
+load('ext://restart_process', 'docker_build_with_restart')
+
 namespace = os.getenv("_TILT_NAMESPACE", "dod-demo")
 log_level = os.getenv("_TILT_LOG_LEVEL", "info")
 # DoD-specific scaling knobs (no multi-agency equivalent).
@@ -49,6 +55,39 @@ c_microdrones = os.getenv("_TILT_C_MICRODRONES", "")
 # kind, k3d, etc. all work — the manifests are NodePort-based with no
 # cluster-specific networking assumptions beyond a flat pod network.
 allow_k8s_contexts(k8s_context())
+
+# --- Image delivery via minikube's built-in registry ----------------------
+# Opt-in (set _TILT_REGISTRY=1) delivery through `minikube addons enable
+# registry`. On the docker driver (Linux) that registry is reachable from
+# BOTH the host and the nodes at $(minikube ip):5000 (registry-proxy
+# DaemonSet hostPort), so a single ref both pushes (from the host) and pulls
+# (by the kubelet). Benefits: images push once and pull by-layer, the same
+# refs resolve for the `run-demo.sh --k8s` (kubectl) path, and images survive
+# `minikube stop/start` -- so the Tilt and kubectl paths stop invalidating
+# each other's caches.
+#
+# It is OPT-IN because (a) with the live_update blocks below, ordinary Python
+# edits hot-sync into the running pods and never rebuild/push, so the registry
+# only helps the rarer dep/Dockerfile/C rebuilds and the kubectl path; and
+# (b) on the docker driver Tilt otherwise builds straight into minikube's
+# daemon (no push), which is fine as a default. Leaving it off keeps the
+# current, known-good behavior untouched.
+#
+# Host prereqs (run ONCE before `_TILT_REGISTRY=1 tilt up`):
+#   minikube addons enable registry
+#   # let the host docker daemon push over plain HTTP to the node subnet;
+#   # add to /etc/docker/daemon.json (CIDR tolerates minikube IP changes):
+#   #   {"insecure-registries": ["192.168.49.0/24"]}
+#   sudo systemctl restart docker
+#   # recreate the cluster so its runtime also trusts the insecure registry:
+#   minikube start --insecure-registry "192.168.49.0/24"
+if os.getenv("_TILT_REGISTRY", "") == "1" and "minikube" in k8s_context():
+    _mk_ip = str(local("minikube ip", quiet=True, echo_off=True)).strip()
+    if _mk_ip:
+        # Tilt rewrites both the image tags AND the BASE_IMAGE build_arg refs
+        # (they name known docker_build images), so the FROM-chain still
+        # resolves to registry-qualified parents.
+        default_registry(_mk_ip + ":5000")
 
 repo_root = ".."
 deploy_dir = repo_root + "/examples/dod_mission/deploy"
@@ -216,6 +255,37 @@ def _with_base(parent):
     d["BASE_IMAGE"] = parent
     return d
 
+# --- live_update sync sets ------------------------------------------------
+# Sync host Python source straight into the running containers instead of
+# rebuilding the FROM-chain on every edit. Container paths mirror the COPY
+# targets in the two Dockerfiles (inspector: /opt/at-*, /app/...core;
+# demo overlay: /app/examples/*). A changed .py that matches a sync makes
+# Tilt live_update that image INSTEAD of rebuilding it -- which is what
+# breaks the base->inspector->demo rebuild cascade for code edits. Non-code
+# changes (Dockerfile, deps, the C library) aren't synced, so they still
+# fall back to a normal image rebuild.
+_inspector_syncs = [
+    sync(repo_root + "/src/autonomous-trust/autonomous_trust/core",
+         "/app/autonomous_trust/core"),
+    sync(repo_root + "/src/autonomous-trust-inspector/autonomous_trust",
+         "/opt/at-inspector/autonomous_trust"),
+    sync(repo_root + "/src/autonomous-trust-evaluation/autonomous_trust",
+         "/opt/at-evaluation/autonomous_trust"),
+    sync(repo_root + "/src/autonomous-trust-services/autonomous_trust",
+         "/opt/at-services/autonomous_trust"),
+    sync(repo_root + "/src/autonomous-trust-simulator/autonomous_trust",
+         "/opt/at-simulator/autonomous_trust"),
+]
+# The coordinator/simulator pod runs the demo image (FROM inspector), so it
+# needs the inherited inspector/core trees kept fresh AND the demo-side
+# examples/ overlays. Syncing the inspector trees here too means an inspector
+# edit hot-syncs into the coordinator rather than cascading a demo rebuild.
+_demo_syncs = _inspector_syncs + [
+    sync(repo_root + "/examples/multi_agency", "/app/examples/multi_agency"),
+    sync(repo_root + "/examples/dod_mission",  "/app/examples/dod_mission"),
+    sync(repo_root + "/examples/pi_peer",      "/app/examples/pi_peer"),
+]
+
 docker_build(
     "autonomous-trust",
     repo_root,
@@ -230,12 +300,27 @@ docker_build(
     dockerfile=repo_root + "/src/autonomous-trust-inspector/Dockerfile",
     network="host",
     build_args=_with_base("autonomous-trust"),
+    # This image doesn't COPY the DoD/pi examples, but the context is the
+    # whole repo, so without this an edit under them would still rebuild it
+    # (and cascade into the demo). Exclude them from its rebuild trigger.
+    ignore=["examples/dod_mission", "examples/pi_peer"],
+    # Hot-sync the AT package source; edits live_update instead of rebuilding
+    # the inspector layer (and thus avoid cascading a demo rebuild). Applies
+    # to containers built FROM this image too (the coordinator/simulator).
+    live_update=_inspector_syncs,
 )
 
-docker_build(
+# Coordinator/simulator pod. docker_build_with_restart wraps the entrypoint
+# so a live_update sync restarts the process (the Dash app runs with
+# use_reloader=False, so a synced .py won't take effect otherwise). The
+# entrypoint mirrors the image's own ENTRYPOINT -- AUTONOMOUS_TRUST_EXE (set
+# per-pod in the manifests) still selects coordinator vs. simulator.
+docker_build_with_restart(
     "at-dod-mission-demo",
     repo_root,
     dockerfile=repo_root + "/examples/dod_mission/deploy/Dockerfile",
+    entrypoint=["/bin/entrypoint.sh"],
+    live_update=_demo_syncs,
     network="host",
     build_args=_with_base("autonomous-trust-inspector"),
 )

@@ -477,9 +477,13 @@ def make_app(name: str, title: str,
             html.Div(children=[
                 dcc.Graph(id="timeline-graph",
                           config={"displayModeBar": False}),
+                # Each chart may expose its own dcc.Graph ``config`` (the Trust
+                # Network opts into a pan/zoom modebar); default is a bare graph
+                # with no modebar, as before.
                 *[dcc.Graph(id=gid,
-                            config={"displayModeBar": False})
-                  for gid in chart_graph_ids[1:]],
+                            config=(getattr(chart, "graph_config", None)
+                                    or {"displayModeBar": False}))
+                  for gid, chart in zip(chart_graph_ids[1:], charts[1:])],
                 # Stretch Goal 2 / Phase 4: peer-detail drawer slot.
                 # Rendered as a self-contained HTML document inside an
                 # Iframe so the drawer's <details>/<svg>/<style>
