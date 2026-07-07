@@ -104,6 +104,82 @@ def test_seed_constants_are_consistent():
     assert rw.SEED_TIER == 2
 
 
+# ---- is_cold_start_reading / warm_start_edge_score (bilateral graph) ----
+
+def test_both_cold_start_neutrals_recognized():
+    # The bilateral (peer-pair) path can return either neutral: 0.5 (a
+    # warm-start-seeded observer in pure mode with no history) or PREREP_NEUTRAL
+    # 0.0 (a cold observer in tit-for-tat mode). Both mean "no earned info".
+    assert rw.is_cold_start_reading(0.5)
+    assert rw.is_cold_start_reading(0.0)
+    assert rw.is_cold_start_reading(rw.PREREP_NEUTRAL)
+
+
+def test_earned_bilateral_scores_are_not_cold_start():
+    # CTFT pivots and computed pure scores are earned, never cold-start.
+    for s in (0.49, 0.51, 0.3, 0.7, 0.8, 0.62):
+        assert not rw.is_cold_start_reading(s), s
+
+
+def test_warm_start_edge_substitutes_prior_for_pretrusted_subject():
+    # A pre-trusted subject with no earned bilateral history reads a cold-start
+    # neutral on BOTH the pure (0.5) and CTFT (0.0) paths -> show the seeded
+    # prior so it draws a trust edge instead of dropping off the graph.
+    assert rw.warm_start_edge_score(0.0, True) == rw.SEED_REPUTATION
+    assert rw.warm_start_edge_score(0.5, True) == rw.SEED_REPUTATION
+
+
+def test_warm_start_edge_preserves_real_score_for_pretrusted_subject():
+    # A real (earned) reading for a warm-start subject is NOT overridden, so the
+    # skepticism-wins min-combine still lets genuine low trust win: a compromised
+    # microdrone's earned 0.3 must survive to render as a weak/red edge.
+    assert rw.warm_start_edge_score(0.3, True) == 0.3
+    assert rw.warm_start_edge_score(0.8, True) == 0.8
+
+
+def test_warm_start_edge_never_substitutes_cold_boot_subject():
+    # A non-pre-trusted subject (rq86 gateway, mq800, ground sensor) is never
+    # warm-started on the graph, even at a cold-start neutral -> stays 0.0 and
+    # its edge is pruned unless it earns real bilateral trust.
+    assert rw.warm_start_edge_score(0.0, False) == 0.0
+    assert rw.warm_start_edge_score(0.5, False) == 0.5
+    assert rw.warm_start_edge_score(0.3, False) == 0.3
+
+
+# ---- reconcile_rep_score_sticky (cross-cycle timeline stickiness) -------
+
+def test_sticky_retains_earned_value_on_all_neutral_cycle():
+    # A re-key / churn cycle where the only candidate is the cold-start
+    # baseline must NOT drop the earned 0.82 the peer showed before.
+    score, tier = rw.reconcile_rep_score_sticky(
+        [(0.5, 0)], is_warm_start=False, cached_score=0.82, cached_tier=3)
+    assert (score, tier) == (0.82, 3)
+
+
+def test_sticky_real_reading_still_wins():
+    # A real (non-neutral) reading is never masked, even with a cache — genuine
+    # movement (up or down) shows.
+    assert rw.reconcile_rep_score_sticky(
+        [(0.9, 3)], is_warm_start=False, cached_score=0.5, cached_tier=0) == (0.9, 3)
+
+
+def test_sticky_earned_drop_and_slash_not_masked():
+    # An earned drop and a slash floor are non-neutral -> shown, not held.
+    assert rw.reconcile_rep_score_sticky(
+        [(0.35, 0)], is_warm_start=False, cached_score=0.8, cached_tier=2) == (0.35, 0)
+    assert rw.reconcile_rep_score_sticky(
+        [(0.05, 0)], is_warm_start=True, cached_score=0.7, cached_tier=2) == (0.05, 0)
+
+
+def test_sticky_no_cache_matches_plain_reconcile():
+    # First appearance (no cache): identical to reconcile_rep_score, so a
+    # warm-start peer still surfaces its seeded prior on an all-neutral cycle.
+    assert rw.reconcile_rep_score_sticky(
+        [(0.5, 0)], is_warm_start=True) == (rw.SEED_REPUTATION, rw.SEED_TIER)
+    assert rw.reconcile_rep_score_sticky(
+        [(0.5, 0)], is_warm_start=False) == (0.5, 0)
+
+
 # ---- is_warm_start_member ----------------------------------------------
 
 def test_late_joiner_jet_is_warm_started():

@@ -38,6 +38,16 @@ SEED_TIER = 2
 # 0.5 reading means "no information yet", not an earned score.
 NEUTRAL_REP = 0.5
 
+# The OTHER cold-start neutral, seen on the bilateral (peer-pair / rep_req)
+# query path that feeds the Trust Network graph. An observer's rep_req of a
+# subject it has no local history with returns 0.5 when it is in pure mode
+# (a warm-start-seeded observer whose stored prior 0.7 > COOP_ENTER) or
+# ``ReputationProcess.PREREP_NEUTRAL`` (0.0) when it is in tit-for-tat mode
+# (a cold observer). Both mean "no earned bilateral info yet". Mirrors
+# ``PREREP_NEUTRAL`` in repprocess.py / reputation.c — kept in sync by hand
+# (this module stays dependency-free); the tests assert consistency.
+PREREP_NEUTRAL = 0.0
+
 
 def is_pre_trusted(peer_name: str) -> bool:
     """True for a warm-start cohort member (name matches a pre-trusted prefix)."""
@@ -79,6 +89,34 @@ def is_neutral_rep(score: float) -> bool:
     return abs(score - NEUTRAL_REP) < 1e-9
 
 
+def is_cold_start_reading(score: float) -> bool:
+    """True if a *bilateral* (peer-pair) reputation reading is a cold-start
+    neutral — i.e. carries no earned bilateral information. Recognizes BOTH
+    neutrals a ``rep_req`` can return: the pure-mode/no-history 0.5
+    (``NEUTRAL_REP``) and the tit-for-tat ``PREREP_NEUTRAL`` 0.0. An earned
+    score (CTFT pivots min(0.49)/max(0.51), or a computed pure score) is not
+    cold-start. Pure."""
+    return (abs(score - NEUTRAL_REP) < 1e-9
+            or abs(score - PREREP_NEUTRAL) < 1e-9)
+
+
+def warm_start_edge_score(score: float, is_warm_start_subject: bool) -> float:
+    """Trust-Network (bilateral) analog of ``reconcile_rep_score`` for a single
+    directional edge reading. Substitute the seeded prior when the SUBJECT of
+    the reading is a warm-start asset AND the reading is a cold-start neutral
+    (no earned bilateral history yet), so a pre-trusted peer draws a trust edge
+    instead of dropping off the graph as a disconnected node (0.0-trust edges
+    are pruned by the renderer).
+
+    A real reading — including earned skepticism (a CTFT-floored low score) — is
+    returned unchanged, so the skepticism-wins min-combine over a pair's two
+    directions still lets genuine low trust override the prior. Non-warm-start
+    subjects are never substituted. Pure."""
+    if is_warm_start_subject and is_cold_start_reading(score):
+        return SEED_REPUTATION
+    return score
+
+
 def reconcile_rep_score(vals, is_warm_start):
     """Pick a peer's representative ``(score, tier)`` from one cycle's readings.
 
@@ -97,3 +135,29 @@ def reconcile_rep_score(vals, is_warm_start):
     if is_warm_start:
         return (SEED_REPUTATION, SEED_TIER)
     return vals[-1]
+
+
+def reconcile_rep_score_sticky(vals, is_warm_start,
+                               cached_score=None, cached_tier=None):
+    """``reconcile_rep_score`` with CROSS-CYCLE stickiness for the timeline.
+
+    The name-keyed twin of the per-peer running consensus EMA: when NO reading
+    this cycle carries real (non-neutral) evidence — every candidate is the
+    cold-start baseline — and the peer has already earned a value on a prior
+    cycle (``cached_score`` is not None), retain that value (and ``cached_tier``)
+    rather than regressing to the placeholder. This bridges the gap when a
+    peer's live identity uuid briefly drops out of the roster or a re-keyed /
+    "forming" uuid surfaces alone for a cycle, which otherwise drew a per-peer
+    timeline sawtooth (drop to baseline, then re-climb).
+
+    A REAL reading always wins — an earned climb, an earned drop, or a slash
+    floor are all non-neutral, so genuine trust movement is never masked. With
+    no cache this is exactly ``reconcile_rep_score`` (warm-start peers still
+    surface their seeded prior on a first all-neutral cycle). Pure.
+    """
+    has_real = any(not is_neutral_rep(s) for s, _ in vals)
+    if not has_real and cached_score is not None:
+        _, fallback_tier = reconcile_rep_score(vals, is_warm_start)
+        return (cached_score,
+                cached_tier if cached_tier is not None else fallback_tier)
+    return reconcile_rep_score(vals, is_warm_start)

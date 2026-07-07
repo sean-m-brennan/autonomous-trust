@@ -1218,7 +1218,7 @@ static double reputation_prereputation_prior(const tx_history_t *hist,
  * returned from the last direct tx alone.
  *
  *   - No bilateral history with us → reputation_prereputation_prior (§2.4),
- *       which is PREREP_NEUTRAL (0.49) when the chain knows nothing of the peer
+ *       which is PREREP_NEUTRAL (0.0) when the chain knows nothing of the peer
  *   - peer defected last AND my standing is poor → max(0.51, peer_standing)
  *   - peer defected last AND my standing is good  → min(0.49, peer_standing)
  *   - cooperative case                            → max(0.51, peer_standing)

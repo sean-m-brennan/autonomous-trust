@@ -165,7 +165,9 @@ def build_dashboard(scenario: DoDMissionScenario) -> dict:
     # Trust Network (transitive-trust Stage 5): peer-of-peer bilateral trust,
     # fed by the coordinator's live trust_matrix.
     from .trust_network_panel import TrustNetworkPanel
-    trust_network = TrustNetworkPanel(scenario)
+    # Pass the per-peer role colors so trust-network nodes render in their role
+    # color (squad green, microdrone cyan, ...) instead of a fallback grey.
+    trust_network = TrustNetworkPanel(scenario, peer_colors=colors)
 
     return {
         "trust_timeline": timeline,
