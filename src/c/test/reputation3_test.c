@@ -116,9 +116,9 @@ DEFINE_TEST(test_reputation_contrite_tft)
     uuid_generate(peer_id);
     uuid_generate(task);
 
-    /* No history: should return 0.49 */
+    /* No history: cold-start prior returns PREREP_NEUTRAL (0.0) */
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    ck_assert_double_eq_tol(score, 0.49, 0.001);
+    ck_assert_double_eq_tol(score, 0.0, 0.001);
 
     /* Add a cooperative transaction (both peers, high scores) */
     ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.9));
@@ -235,7 +235,7 @@ DEFINE_TEST(test_reputation_contrite_tft_third_party_informs_prior)
     /* Transactions involving the queried peer but not self do not enter the
      * *bilateral* CTFT computation, but with no bilateral history WITH us
      * they now feed the cold-start prior (reputation_prereputation_prior)
-     * instead of a flat 0.49. Mirrors Python
+     * instead of a flat neutral. Mirrors Python
      * test_third_party_transactions_inform_prior (deferred.md §2.4). */
     tx_history_t hist;
     reputations_t reps;
@@ -253,9 +253,9 @@ DEFINE_TEST(test_reputation_contrite_tft_third_party_informs_prior)
     ck_assert_ret_ok(tx_history_update(&hist, task, other,   0.1));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    /* observed=0.1, cp_rep(other)=0.5 default, n=1:
-     * (1*0.1 + 3*0.49) / (1+3) = 0.3925. */
-    ck_assert_double_eq_tol(score, 0.3925, 0.001);
+    /* observed=0.1, cp_rep(other)=0.5 default, n=1, neutral=0.0:
+     * (1*0.1 + 3*0.0) / (1+3) = 0.025. */
+    ck_assert_double_eq_tol(score, 0.025, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);

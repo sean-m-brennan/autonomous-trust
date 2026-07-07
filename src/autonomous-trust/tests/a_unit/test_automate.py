@@ -17,8 +17,11 @@
 import os
 import queue
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import uuid4
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.config.generate import generate_identity
@@ -488,6 +491,52 @@ class TestRepResponsePeer:
         queues = {CfgIds.main: q_main}
         at._handle_messages(queues, MagicMock(), {})
 
+    def test_remote_observer_response_excluded_from_own_view(self, setup_teardown):
+        # A transitive peer-pair rep_resp from a REMOTE observer (from_whom !=
+        # us) is that observer's bilateral CTFT reading -- cold-start 0.0 for a
+        # no-shared-history pair. It must land ONLY in latest_reputation_pairs
+        # (the Trust Network graph), NOT in latest_reputation (this node's own
+        # view -> reputations table + Trust Dynamics timeline); writing it there
+        # dragged the majority of nodes to 0.00.
+        at = AutonomousTrust(multiproc=False, testing=True, silent=True,
+                             logfile=Configuration.log_stdout)
+        at.identity = MagicMock()
+        at.identity.uuid = uuid4()
+        at.peers = MagicMock()
+        at.peers.find_by_uuid = MagicMock(return_value=None)
+        observer = MagicMock()
+        observer.uuid = uuid4()          # a remote observer, != us
+        subject = uuid4()
+        rep = MagicMock()
+        rep.peer_id = subject
+        rep.score = 0.0                  # CTFT cold-start for no shared history
+        msg = Message(CfgIds.main, ReputationProtocol.rep_resp, rep,
+                      from_whom=observer)
+        q_main = queue.Queue()
+        q_main.put(msg)
+        at._handle_messages({CfgIds.main: q_main}, MagicMock(), {})
+        assert str(subject) not in at.latest_reputation          # own view clean
+        assert (str(observer.uuid), str(subject)) in at.latest_reputation_pairs
+
+    def test_own_view_response_populates_latest_reputation(self, setup_teardown):
+        # Our own computation (from_whom == us) IS our view -> latest_reputation.
+        at = AutonomousTrust(multiproc=False, testing=True, silent=True,
+                             logfile=Configuration.log_stdout)
+        at.identity = MagicMock()
+        at.identity.uuid = uuid4()
+        at.peers = MagicMock()
+        at.peers.find_by_uuid = MagicMock(return_value=None)
+        subject = uuid4()
+        rep = MagicMock()
+        rep.peer_id = subject
+        rep.score = 0.72
+        msg = Message(CfgIds.main, ReputationProtocol.rep_resp, rep,
+                      from_whom=at.identity)
+        q_main = queue.Queue()
+        q_main.put(msg)
+        at._handle_messages({CfgIds.main: q_main}, MagicMock(), {})
+        assert str(subject) in at.latest_reputation
+
 
 class TestTaskCapabilityNotFound:
     def test_task_with_unknown_capability(self, setup_teardown):
@@ -705,3 +754,95 @@ class TestConfigureErrorPaths:
             # No processes should be in result when start=False
             from autonomous_trust.core.processes import Process
             assert Process.key not in result or result[Process.key] == []
+
+
+class _FakeConn:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeProxy:
+    """Mimics a manager Queue proxy: carries a thread-local ``_tls.connection``
+    and can be told to raise a transport error once (as a dropped manager
+    connection would) before behaving like a normal queue."""
+
+    def __init__(self, items=None, raise_exc=None):
+        self._tls = SimpleNamespace(connection=_FakeConn())
+        self._items = list(items or [])
+        self._raise_exc = raise_exc
+
+    def get_nowait(self):
+        if self._raise_exc is not None:
+            exc, self._raise_exc = self._raise_exc, None
+            raise exc
+        if not self._items:
+            raise queue.Empty
+        return self._items.pop(0)
+
+    def get(self, block=True, timeout=None):
+        return self.get_nowait()
+
+
+class TestMqGet:
+    """_mq_get returns the main loop to a receptive state on a dropped
+    manager-proxied connection instead of spinning on it (see automate
+    _mq_get / _reset_proxy_connection / _manager_alive)."""
+
+    def _make_at(self):
+        at = AutonomousTrust(multiproc=False, testing=True, silent=True,
+                             logfile=Configuration.log_stdout)
+        at.proc_name = CfgIds.main
+        return at
+
+    def test_passthrough_item(self, setup_teardown):
+        at = self._make_at()
+        p = _FakeProxy(items=[('INFO', 'sub', 'hi')])
+        assert at._mq_get(p) == ('INFO', 'sub', 'hi')
+
+    def test_empty_passthrough(self, setup_teardown):
+        at = self._make_at()
+        with pytest.raises(queue.Empty):
+            at._mq_get(_FakeProxy(items=[]))
+
+    def test_broken_pipe_becomes_empty_and_resets_connection(self, setup_teardown):
+        at = self._make_at()
+        p = _FakeProxy(raise_exc=BrokenPipeError())
+        conn = p._tls.connection
+        with pytest.raises(queue.Empty):
+            at._mq_get(p)
+        # the wedged connection was closed and dropped so the next call
+        # reconnects (returns to a receptive state)
+        assert conn.closed is True
+        assert not hasattr(p._tls, 'connection')
+
+    def test_reconnects_after_drop(self, setup_teardown):
+        at = self._make_at()
+        # first call raises (drop -> Empty), a queued item is read on retry
+        p = _FakeProxy(items=[('INFO', 'sub', 'later')],
+                       raise_exc=EOFError())
+        with pytest.raises(queue.Empty):
+            at._mq_get(p)
+        assert at._mq_get(p) == ('INFO', 'sub', 'later')
+
+    def test_blocking_get_survives_drop(self, setup_teardown):
+        at = self._make_at()
+        p = _FakeProxy(raise_exc=ConnectionResetError())
+        with pytest.raises(queue.Empty):
+            at._mq_get(p, block=True, timeout=0.01)
+
+    def test_manager_alive_threading_mode(self, setup_teardown):
+        # multiproc=False -> no manager server; drops are treated recoverable
+        assert self._make_at()._manager_alive() is True
+
+    def test_manager_alive_reflects_dead_process(self, setup_teardown):
+        at = self._make_at()
+        at._manager = SimpleNamespace(
+            _process=SimpleNamespace(is_alive=lambda: False))
+        assert at._manager_alive() is False
+
+    def test_reset_proxy_connection_noop_on_plain_queue(self, setup_teardown):
+        # a plain queue.Queue has no _tls; reset must be a safe no-op
+        self._make_at()._reset_proxy_connection(queue.Queue())

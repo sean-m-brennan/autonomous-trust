@@ -22,7 +22,23 @@ from autonomous_trust.inspector.dashboard.disaster_response_graph import (
 
 
 class TrustNetworkPanel:
-    def __init__(self, scenario, title="Trust Network — Bilateral Trust"):
+    # dcc.Graph config the live_server chart loop picks up (the other charts
+    # pass displayModeBar=False). The Trust Network is the one panel a user
+    # pans/zooms to read a dense cohort, so it shows a modebar. Scroll-zoom is
+    # DISABLED because the panel lives in a vertically-scrolling column and
+    # wheel-zoom would hijack page scroll; zoom is via the modebar +/-
+    # (zoomIn2d / zoomOut2d) buttons instead, pan is click-drag (dragmode set in
+    # figure()), and resetScale2d returns to the fitted view. Whitelisting the
+    # buttons drops box-zoom/select/lasso/autoscale we don't want here.
+    graph_config = {
+        "displayModeBar": True,
+        "displaylogo": False,
+        "scrollZoom": False,
+        "modeBarButtons": [["pan2d", "zoomIn2d", "zoomOut2d", "resetScale2d"]],
+    }
+
+    def __init__(self, scenario, peer_colors=None,
+                 title="Trust Network — Bilateral Trust"):
         self._scenario = scenario
         self._title = title
         self._trust_matrix: list = []
@@ -33,7 +49,11 @@ class TrustNetworkPanel:
         # glides as reputation shifts instead of re-solving (and jumping) every
         # frame. Rebuilding via build_graph_from_scenario() each tick would
         # forfeit that warm start.
-        self._graph = TrustNetworkGraph()
+        #
+        # peer_colors (name -> CSS) carries the DoD role colors so nodes render
+        # in their role color instead of a fallback grey (same-agency peers
+        # differ, so agency-keyed coloring won't do -- see TrustNetworkGraph).
+        self._graph = TrustNetworkGraph(peer_colors=peer_colors)
 
     def set_trust_matrix(self, trust_matrix, compromised=None, excluded=None):
         """Feed the latest bilateral trust edges (list of (observer, subject,
@@ -44,13 +64,33 @@ class TrustNetworkPanel:
         self._excluded = excluded
 
     def figure(self):
+        # The trust network shows the WHOLE cohort at full opacity -- including
+        # late joiners (mq800 phase 4, jet-1 phase 6, which add_peer would leave
+        # at opacity 0) and disconnected peers (ECM casualties, not-yet-queried
+        # nodes). Disconnected nodes render just beyond the connected cluster
+        # (see _display_coords) -- shown, just not linked -- never faded out.
         self._graph.apply_scenario_state(
             self._scenario,
             trust_matrix=self._trust_matrix,
             compromised=self._compromised,
             excluded=self._excluded,
+            peer_opacity={name: 1.0 for name in self._scenario.peers},
         )
         fig = self._graph.figure()
         # Stable view across ticks (no zoom/pan reset), and our own title.
-        fig.update_layout(title=self._title, uirevision="dod-trust-network")
+        # The base figure uses a tight 10px top margin (no title of its own);
+        # the chart panels stack with no gap, so give the title its own band
+        # of headroom, otherwise it renders on top of the plot / collides with
+        # the chart above it.
+        fig.update_layout(
+            title=dict(text=self._title, x=0.02, xanchor="left",
+                       y=0.98, yanchor="top",
+                       font=dict(size=13, color="#e2e8f0")),
+            margin=dict(l=10, r=10, t=34, b=10),
+            # Click-drag pans (the modebar +/- buttons zoom; see graph_config).
+            # The default 'zoom' dragmode would box-select instead, which reads
+            # as broken on a graph the user expects to drag around.
+            dragmode="pan",
+            uirevision="dod-trust-network",
+        )
         return fig

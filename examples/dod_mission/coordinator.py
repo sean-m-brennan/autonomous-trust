@@ -73,6 +73,37 @@ def _roster_name_of(peer):
     return str(nn).split('@', 1)[0].strip()
 
 
+def _peer_permits_neighbor(name: str, agency: str,
+                           other: str, other_agency: str) -> bool:
+    """Trust-graph isolation policy for one endpoint of an edge (mirrors the
+    real command structure):
+
+    * **microdrones** are ODA-internal assets (flown by the squad), so they
+      only trust-link WITHIN the ODA — to soldiers and to each other.
+    * the **command** node coordinates only with the RQ-86 gateways and the
+      ODA, so it only links to ``rq86-*`` or ODA peers.
+
+    Everyone else is unrestricted (returns True). Pure — keyed on the same
+    name prefixes the warm-start cohort uses (see reputation_warmstart)."""
+    if name.startswith("microdrone-"):
+        return other_agency == "ODA"
+    if name == "command":
+        return other.startswith("rq86-") or other_agency == "ODA"
+    return True
+
+
+def _trust_edge_allowed(a: str, agency_a: str, b: str, agency_b: str) -> bool:
+    """True if a bilateral trust edge between ``a`` and ``b`` may be drawn.
+
+    Admitted iff BOTH endpoints permit the other (intersection of the two
+    isolation policies). So e.g. command<->microdrone is DROPPED: command
+    permits the ODA, but the microdrone permits only ODA members and the
+    command node is not one — command reaches the ODA via the squad, not each
+    drone. Pure."""
+    return (_peer_permits_neighbor(a, agency_a, b, agency_b)
+            and _peer_permits_neighbor(b, agency_b, a, agency_a))
+
+
 try:
     from autonomous_trust.inspector.peer.daq import Cohort, CohortTracker
     HAS_INSPECTOR = True
@@ -390,7 +421,9 @@ from dashboard.dod_app import build_dashboard  # noqa: E402
 from dashboard import live_server  # noqa: E402
 from dashboard.narration_script import DOD_NARRATION  # noqa: E402
 from reputation_warmstart import (  # noqa: E402
-    is_warm_start_member, reconcile_rep_score, SEED_REPUTATION, SEED_TIER,
+    is_warm_start_member, is_pre_trusted, reconcile_rep_score,
+    reconcile_rep_score_sticky, warm_start_edge_score,
+    SEED_REPUTATION, SEED_TIER,
 )
 sys.path.insert(0, str(_HERE / "tasks"))
 from validation import (  # noqa: E402
@@ -1078,8 +1111,19 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
             # present too briefly to build consensus) substitute its seeded
             # prior so a pre-trusted asset never reads untrusted while up.
             # Otherwise fall back to neutral (a genuinely cold/forming peer).
-            score, new_tier = reconcile_rep_score(
-                vals, name in self._warm_start_peers)
+            # Cross-cycle stickiness (the name-keyed twin of the per-peer
+            # running consensus EMA): when NO reading this cycle carries real
+            # earned evidence — every candidate is the neutral cold-start
+            # baseline — a peer that has already earned a score must NOT regress
+            # to that placeholder. This happens when a peer's live identity uuid
+            # briefly drops out of peers.all (churn) or a re-keyed/"forming"
+            # uuid surfaces alone, leaving only the 0.5 baseline for the name
+            # for a cycle or two; feeding it drew a per-peer sawtooth tooth
+            # (drop to baseline, then re-climb). A REAL drop — a lower EMA or a
+            # slash floor — is non-neutral, so it is NOT masked and still shows.
+            score, new_tier = reconcile_rep_score_sticky(
+                vals, name in self._warm_start_peers,
+                self._reputation_cache.get(name), self._tier_cache.get(name))
             self._reputation_cache[name] = score
             self._feed_timeline(name, score)
             # Stash the peer's trust tier alongside the score so the
@@ -1305,34 +1349,78 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
                 tiers[role.name] = SEED_TIER
         return tiers
 
-    def _build_trust_matrix(self):
+    def _build_trust_matrix(self, t_seconds: float = 0.0):
         """Undirected bilateral trust edges for the dashboard Trust Network.
 
         Built from ``self.latest_reputation_pairs`` (populated by the peer-pair
         query round): each ``(observer_uuid, subject_uuid) -> rep`` is resolved
         to roster names and the two directional views of a pair are min-combined
         (skepticism-wins). Returns ``list[(observer, subject, score)]`` — the
-        shape ``build_graph_from_scenario(trust_matrix=...)`` consumes. Empty
-        until the first peer-pair round lands.
+        shape ``build_graph_from_scenario(trust_matrix=...)`` consumes.
+
+        Warm-start applies at two points:
+
+        * *Substitution* — a directional reading whose SUBJECT is a pre-trusted
+          asset with no earned bilateral history yet is a cold-start neutral
+          (0.5 in pure mode, PREREP_NEUTRAL 0.0 in tit-for-tat), the same reason
+          its Reputations-panel score is warm-started (reconcile_rep_score).
+          ``warm_start_edge_score`` surfaces the seeded prior so it draws an edge
+          instead of dropping off the graph. A real reading — including earned
+          skepticism — is left as-is, so the skepticism-wins min-combine still
+          lets genuine low trust override the prior.
+
+        * *Pre-established mesh* — the seeded cohort (``is_pre_trusted``:
+          squad-/microdrone-/jet-) mutually trusts at SEED_REPUTATION from t=0
+          (tools/seed_dod_cohort writes it into each member's
+          reputation.cfg.json). That trust EXISTS before any query, so it must
+          show IMMEDIATELY — not wait for the first O(N^2) peer-pair round
+          (~tick 120) to route and return, which left the graph edgeless for the
+          first ~1–2 min. It is drawn from the scenario ROSTER and gated by
+          ``peer_reputation_visible`` (the same arrival gate _reputations_view
+          uses, so the Trust Network and Reputations panels agree on when a
+          cohort member appears — the jet stays off the graph until its launch).
+          ``setdefault`` makes it a FALLBACK: a real earned reading (or a
+          cold-start one already substituted above) always wins over the seed.
         """
-        pairs = getattr(self, "latest_reputation_pairs", None)
-        if not pairs:
-            return []
-        name_of = {str(p.uuid): (_roster_name_of(p) or str(p.uuid))
-                   for p in self.peers.all}
+        warm = self._warm_start_peers
         combined: dict[tuple[str, str], float] = {}
-        for (obs_uuid, subj_uuid), rep in list(pairs.items()):
-            obs = name_of.get(str(obs_uuid))
-            subj = name_of.get(str(subj_uuid))
-            if not obs or not subj or obs == subj:
-                continue
-            try:
-                score = float(getattr(rep, "score", rep))
-            except (TypeError, ValueError):
-                continue
-            key = tuple(sorted((obs, subj)))
-            combined[key] = min(combined[key], score) if key in combined else score
-        return [(a, b, s) for (a, b), s in combined.items()]
+        pairs = getattr(self, "latest_reputation_pairs", None)
+        if pairs:
+            name_of = {str(p.uuid): (_roster_name_of(p) or str(p.uuid))
+                       for p in self.peers.all}
+            for (obs_uuid, subj_uuid), rep in list(pairs.items()):
+                obs = name_of.get(str(obs_uuid))
+                subj = name_of.get(str(subj_uuid))
+                if not obs or not subj or obs == subj:
+                    continue
+                try:
+                    score = float(getattr(rep, "score", rep))
+                except (TypeError, ValueError):
+                    continue
+                score = warm_start_edge_score(score, subj in warm)
+                key = tuple(sorted((obs, subj)))
+                combined[key] = (min(combined[key], score)
+                                 if key in combined else score)
+        try:
+            cohort = sorted(
+                r.name for r in self.scenario.peers.values()
+                if is_pre_trusted(r.name)
+                and self.scenario.peer_reputation_visible(r.name, t_seconds))
+        except Exception:
+            logger.debug("trust-matrix warm-start mesh failed", exc_info=True)
+            cohort = []
+        for i, a in enumerate(cohort):
+            for b in cohort[i + 1:]:
+                combined.setdefault(tuple(sorted((a, b))), SEED_REPUTATION)
+        # Isolation policy: some assets are group-restricted (microdrones ->
+        # ODA-only; command -> rq86-*/ODA-only), so drop any edge the topology
+        # forbids -- whether it came from the seeded mesh or a real peer-pair
+        # reading. Applied last so it governs both sources uniformly.
+        agency_of = {r.name: getattr(r, "agency", "")
+                     for r in self.scenario.peers.values()}
+        return [(a, b, s) for (a, b), s in combined.items()
+                if _trust_edge_allowed(a, agency_of.get(a, ""),
+                                       b, agency_of.get(b, ""))]
 
     def _push_dashboard_update(self):
         # Scenario seconds since tasking_start — falls back to tick-derived
@@ -1345,7 +1433,7 @@ class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
             "reputations": self._reputations_view(t_seconds),
             "tiers": self._tiers_view(t_seconds),
             # Peer-of-peer trust edges for the Trust Network panel (Stage 5).
-            "trust_matrix": self._build_trust_matrix(),
+            "trust_matrix": self._build_trust_matrix(t_seconds),
             # Live narration gates for beats whose real moment floats. The jet
             # strike is gated on the jet actually reaching the objective (its
             # launch is gated on the MQ-800 collapse, so the strike time floats

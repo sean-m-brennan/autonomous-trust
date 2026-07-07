@@ -89,6 +89,13 @@ class AutonomousTrust(Protocol):
     external_control = 'extern_out'
     external_feedback = 'extern_in'
 
+    # Transport errors raised by a manager-proxied queue when its connection
+    # drops (peer/subprocess churn) or the manager server dies — distinct from
+    # queue.Empty / queue.Full. BrokenPipeError and ConnectionError are OSError
+    # subclasses; EOFError is not, so both are listed.
+    _MGR_CONN_ERRORS = (EOFError, OSError)
+    _IPC_DROP_LOG_INTERVAL = 30.0  # min seconds between IPC-drop log lines
+
     # default to production values
     def __init__(self, multiproc: bool = True, log_level: int = LogLevel.WARNING,
                  logfile: str = None, log_classes: list[str] = None, syslog: bool = False,
@@ -108,9 +115,14 @@ class AutonomousTrust(Protocol):
             if context == Ctx.FORKSERVER:
                 ctx.set_forkserver_preload(['autonomous_trust.core'])
             manager = ctx.Manager()
+            # Keep the manager referenced (not just via its queue proxies) so
+            # the main loop can check whether its server process is still alive
+            # when a proxy connection drops — see _mq_get / _manager_alive.
+            self._manager = manager
             self._queue_type = manager.Queue  # noqa
         else:
             # Threading
+            self._manager = None  # no manager server in threading mode
             self._pool_type = ThreadPool
             self._queue_type = queue.Queue
         self.queue_pool: QueuePool = QueuePool(self._queue_type)
@@ -156,6 +168,9 @@ class AutonomousTrust(Protocol):
         if not os.environ.get('AT_BOOTSTRAP_DISABLED'):
             register_bootstrap_capabilities(self.capabilities)
         self._output: QueueType = self.queue_type()  # subsystem logging
+        # Rate-limit for IPC-drop warnings so a churn-induced connection reset
+        # reconnects quietly instead of logging a traceback every tick.
+        self._last_ipc_drop_log: float = 0.0
         self._subsystems: ProcessTracker = ProcessTracker()
         self._additional_workers: list[tuple[type[Process], list[str], dict[str, Any]]] = []
         # Register the BootstrapWorker alongside the bootstrap caps. It
@@ -441,6 +456,63 @@ class AutonomousTrust(Protocol):
                 configs[Process.key].append(worker_cls(configs, self._subsystems, self._output, deps, **kwargs))
         return configs
 
+    @staticmethod
+    def _reset_proxy_connection(proxy) -> None:
+        """Drop a manager proxy's wedged thread-local connection so the next
+        call on it opens a fresh one. Recovers a proxy whose remote end was
+        closed (e.g. when a peer/subprocess churns) without tearing down the
+        loop. No-op for plain threading-mode queues (no ``_tls``)."""
+        tls = getattr(proxy, '_tls', None)
+        if tls is None:
+            return
+        conn = getattr(tls, 'connection', None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+            try:
+                del tls.connection
+            except AttributeError:
+                pass
+
+    def _manager_alive(self) -> bool:
+        """Whether the multiprocessing manager server process is still up.
+        True in threading mode (no manager) so callers treat drops as
+        recoverable there."""
+        mgr = getattr(self, '_manager', None)
+        proc = getattr(mgr, '_process', None) if mgr is not None else None
+        return proc is None or proc.is_alive()
+
+    def _mq_get(self, proxy, block: bool = False, timeout: float = None):
+        """``queue.get`` on a manager-proxied queue that survives a dropped
+        connection. On a transport error it resets the proxy (so the next
+        tick reconnects) and reports the queue as empty — returning the main
+        loop to a receptive state instead of spinning on a dead connection.
+        Whether the manager server itself is still alive is surfaced at most
+        once per _IPC_DROP_LOG_INTERVAL rather than as a per-tick traceback."""
+        try:
+            if block:
+                return proxy.get(block=True, timeout=timeout)
+            return proxy.get_nowait()
+        except queue.Empty:
+            raise
+        except self._MGR_CONN_ERRORS as ex:
+            self._reset_proxy_connection(proxy)
+            alive = self._manager_alive()
+            now = time.monotonic()
+            if now - self._last_ipc_drop_log >= self._IPC_DROP_LOG_INTERVAL:
+                self._last_ipc_drop_log = now
+                if alive:
+                    self.logger.warning(
+                        '%s: IPC queue connection dropped (%s); reconnecting'
+                        % (self.name, type(ex).__name__))
+                else:
+                    self.logger.error(
+                        '%s: manager server process is down; IPC lost, '
+                        'awaiting restart' % self.name)
+            raise queue.Empty from ex
+
     def _monitor_processes(self, proc_results: dict[str, AsyncResult], show_output: bool = True):
         """
         Should be included in any main-loop override function
@@ -465,10 +537,12 @@ class AutonomousTrust(Protocol):
                     self._stopped_procs.append(name)
 
         if show_output:
-            # drain subprocess outputs, if any
+            # drain subprocess outputs, if any. _mq_get treats a dropped
+            # manager connection as empty (after resetting it to reconnect
+            # next tick), so a peer/subprocess churn no longer spins here.
             while True:
                 try:
-                    level, name, msg = self._output.get_nowait()
+                    level, name, msg = self._mq_get(self._output)
                     self.logger.log(level, '%s: %s' % (name, msg))
                 except queue.Empty:
                     break
@@ -484,7 +558,7 @@ class AutonomousTrust(Protocol):
     def _handle_messages(self, queues: dict[str, QueueType], pool: PoolType, results: dict[str, AsyncResult]):
         if self.external_control in queues:
             try:
-                cmd = queues[self.external_control].get_nowait()
+                cmd = self._mq_get(queues[self.external_control])
                 if isinstance(cmd, Task):
                     message = Message(CfgIds.negotiation, NegotiationProtocol.start, cmd)
                     queues[CfgIds.negotiation].put(message, block=True, timeout=queue_cadence)
@@ -498,7 +572,7 @@ class AutonomousTrust(Protocol):
 
         message = None
         try:
-            message = queues[self.proc_name].get(block=True, timeout=queue_cadence)
+            message = self._mq_get(queues[self.proc_name], block=True, timeout=queue_cadence)
         except queue.Empty:
             pass
 
@@ -561,7 +635,21 @@ class AutonomousTrust(Protocol):
                             peer = self.peers.find_by_uuid(rep.peer_id)
                             if peer:
                                 self.print("%s's current reputation score:\033[32m %s\033[00m" % (peer.nickname, rep.score))
-                        self.latest_reputation[str(rep.peer_id)] = rep
+                        # latest_reputation is THIS node's OWN view of each
+                        # peer (fed to the reputations panel + Trust Dynamics
+                        # timeline; see the "My/X's current reputation score"
+                        # prints above). Only our own computation belongs here:
+                        # a transitive peer-pair rep_req answered by a REMOTE
+                        # observer (from_whom != us) is that observer's bilateral
+                        # CTFT reading — cold-start PREREP_NEUTRAL (0.0) for a
+                        # pair with no shared history, e.g. a consumer-only peer
+                        # nobody transacts with. Writing those here overwrote the
+                        # consensus value and dragged the timeline to 0; they are
+                        # captured below for the Trust Network graph only.
+                        own_view = (observer_uuid is None
+                                    or str(observer_uuid) == str(self.identity.uuid))
+                        if own_view:
+                            self.latest_reputation[str(rep.peer_id)] = rep
                         # Bilateral capture: track WHO computed this score.
                         if observer_uuid is not None:
                             key = (str(observer_uuid), str(rep.peer_id))
