@@ -1,0 +1,324 @@
+/* ******************
+ *  Copyright 2025 Sean M. Brennan and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ * ****************** */
+
+/* Civilian-demo dashboard theme.
+ *
+ * Federal-appropriate dark palette, data-dense, minimal chrome.
+ * Projectable on a large screen during presentations.
+ * Loaded automatically by Dash from dash_components/assets/. */
+
+/* ---- Color tokens ----------------------------------------------- */
+:root {
+    /* Surfaces */
+    --demo-bg:           #0b0f1a;
+    --demo-surface:      #121a2e;
+    --demo-surface-2:    #1e2940;
+    --demo-border:       #1f2a44;
+    --demo-border-muted: #334155;
+
+    /* Typography */
+    --demo-text:         #e2e8f0;
+    --demo-text-muted:   #94a3b8;
+    --demo-text-dim:     #64748b;
+
+    /* Accents (agency palette -- exact values match scenario module). */
+    --agency-noaa: #1f77b4;
+    --agency-usgs: #8c564b;
+    --agency-fema: #d62728;
+    --agency-epa:  #2ca02c;
+
+    /* Status */
+    --demo-ok:     #4ade80;
+    --demo-warn:   #fbbf24;
+    --demo-alert:  #ef4444;
+    --demo-info:   #60a5fa;
+
+    /* Layout */
+    --demo-gap:    10px;
+    --demo-radius: 8px;
+}
+
+/* ---- Base --------------------------------------------------------- */
+body.demo-mode,
+.demo-root {
+    background: var(--demo-bg);
+    color: var(--demo-text);
+    font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto,
+                 sans-serif;
+    font-size: 13px;
+    margin: 0;
+    /* Flex column so the grid flexes between topbar and playback bar
+       rather than relying on a hardcoded min-height that can't know
+       the playback bar's size. */
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+}
+
+/* Monospace for numeric readouts and identifiers. */
+.demo-mono,
+.demo-root .mono,
+.demo-root pre,
+.demo-root code {
+    font-family: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 12px;
+}
+
+/* ---- Top bar ------------------------------------------------------ */
+.demo-topbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 18px;
+    background: linear-gradient(180deg, #0f172a 0%, #0b0f1a 100%);
+    border-bottom: 1px solid var(--demo-border);
+}
+
+.demo-topbar__brand {
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--demo-text);
+}
+
+.demo-topbar__tagline {
+    color: var(--demo-text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.demo-topbar__clock {
+    font-family: 'JetBrains Mono', Menlo, monospace;
+    font-size: 15px;
+    color: var(--demo-text);
+    padding: 4px 10px;
+    background: var(--demo-surface);
+    border: 1px solid var(--demo-border);
+    border-radius: var(--demo-radius);
+}
+
+.demo-topbar__phase {
+    color: var(--demo-text-muted);
+    font-size: 11px;
+    margin-left: 4px;
+}
+
+.demo-topbar__keystats {
+    /* Pushes the chip row + status chip away from the phase indicator
+       so they hug the right edge. The status chip below also has
+       margin-left:auto for back-compat when keystats is empty. */
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: nowrap;
+}
+
+.demo-keystat-chip {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: var(--demo-radius);
+    background: var(--demo-surface);
+    border: 1px solid var(--demo-border);
+    font-size: 11px;
+    color: var(--demo-text-muted);
+    white-space: nowrap;
+}
+
+.demo-keystat-chip__label {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--demo-text-dim);
+    font-size: 10px;
+}
+
+.demo-keystat-chip__value {
+    font-family: 'JetBrains Mono', Menlo, monospace;
+    color: var(--demo-text);
+    font-weight: 600;
+}
+
+/* ---- Grid --------------------------------------------------------- */
+.demo-grid {
+    display: grid;
+    gap: var(--demo-gap);
+    padding: var(--demo-gap);
+    grid-template-columns: 1.2fr 1fr 0.8fr;
+    /* Peer Detail row is capped (not auto). Iframe and Sensor
+       Readings now sit side-by-side inside the row, so a single
+       panel-row height (~240px floor) is enough for both. The 8px
+       rows between panel rows are drag handles (assets/row_resize.js
+       rewrites these track sizes in px when the user drags). */
+    grid-template-rows: 1.4fr 8px 1.2fr 8px minmax(240px, 0.9fr);
+    grid-template-areas:
+        "map    graph   log"
+        "h1     h1      h1"
+        "time   time    streams"
+        "h2     h2      h2"
+        "detail detail  detail";
+    /* Fill the space between topbar and playback bar (demo-root is a
+       flex column). min-height:0 lets the grid shrink inside flex. */
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.demo-panel--map     { grid-area: map; }
+.demo-panel--graph   { grid-area: graph; }
+.demo-panel--log     { grid-area: log; }
+.demo-panel--time    { grid-area: time; }
+.demo-panel--streams { grid-area: streams; }
+.demo-panel--detail  { grid-area: detail; }
+
+/* Drag handles between panel rows. The JS (assets/row_resize.js)
+   rewrites grid-template-rows in px while dragging; CSS only owns
+   the static appearance. */
+.demo-row-handle {
+    background: transparent;
+    cursor: ns-resize;
+    border-radius: 4px;
+    transition: background 0.15s;
+}
+.demo-row-handle:hover,
+.demo-row-handle.is-dragging {
+    background: var(--demo-border, #1f2a44);
+}
+.demo-row-handle--1 { grid-area: h1; }
+.demo-row-handle--2 { grid-area: h2; }
+
+/* ---- Panel surface ------------------------------------------------ */
+.demo-panel {
+    background: var(--demo-surface);
+    border: 1px solid var(--demo-border);
+    border-radius: var(--demo-radius);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.demo-panel__header {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--demo-border);
+    color: var(--demo-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 11px;
+}
+
+.demo-panel__title {
+    flex: 1;
+    font-weight: 600;
+}
+
+.demo-panel__subtitle {
+    color: var(--demo-text-dim);
+    font-size: 10px;
+}
+
+.demo-panel__body {
+    flex: 1;
+    min-height: 0;
+    padding: 8px;
+    overflow: auto;
+}
+
+.demo-panel__body--pad0 {
+    padding: 0;
+}
+
+/* Empty-state hint for placeholders before live data arrives. */
+.demo-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--demo-text-dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+/* ---- Agency color utility classes -------------------------------- */
+.agency-noaa { color: var(--agency-noaa); }
+.agency-usgs { color: var(--agency-usgs); }
+.agency-fema { color: var(--agency-fema); }
+.agency-epa  { color: var(--agency-epa); }
+
+.agency-noaa-bg { background-color: var(--agency-noaa); }
+.agency-usgs-bg { background-color: var(--agency-usgs); }
+.agency-fema-bg { background-color: var(--agency-fema); }
+.agency-epa-bg  { background-color: var(--agency-epa); }
+
+/* ---- Playback controls bar --------------------------------------- */
+.demo-playback {
+    background: var(--demo-surface);
+    border-top: 1px solid var(--demo-border);
+    padding: 8px 12px;
+}
+
+/* ---- Event log entries -------------------------------------------- */
+.demo-event {
+    padding: 6px 8px;
+    margin-bottom: 4px;
+    border-left: 3px solid var(--demo-border-muted);
+    background: rgba(30, 41, 59, 0.35);
+    border-radius: 0 4px 4px 0;
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.demo-event__time {
+    color: var(--demo-text-dim);
+    font-family: 'JetBrains Mono', Menlo, monospace;
+    font-size: 10px;
+    margin-right: 6px;
+}
+
+.demo-event--info    { border-left-color: var(--demo-info); }
+.demo-event--data    { border-left-color: var(--demo-text-muted); }
+.demo-event--warning { border-left-color: var(--demo-warn);
+                       background: rgba(251, 191, 36, 0.06); }
+.demo-event--threat  { border-left-color: var(--demo-alert);
+                       background: rgba(239, 68, 68, 0.08); }
+.demo-event--success { border-left-color: var(--demo-ok);
+                       background: rgba(74, 222, 128, 0.06); }
+
+/* ---- Presentation mode (F11) -------------------------------------- */
+:fullscreen .demo-topbar { padding: 14px 24px; }
+:fullscreen .demo-grid   { padding: 14px; }
+:-webkit-full-screen .demo-topbar { padding: 14px 24px; }
+:-webkit-full-screen .demo-grid   { padding: 14px; }
+
+/* Larger readouts when presenting. */
+:fullscreen .demo-topbar__brand  { font-size: 16px; }
+:fullscreen .demo-topbar__clock  { font-size: 18px; }
+
+/* ---- Responsive fallback (squeezed windows) ---------------------- */
+@media (max-width: 1100px) {
+    .demo-grid {
+        grid-template-columns: 1fr 1fr;
+        grid-template-rows: 1.3fr 1.1fr 1.2fr minmax(0, 0.7fr);
+        grid-template-areas:
+            "map      graph"
+            "log      streams"
+            "time     time"
+            "detail   detail";
+    }
+    /* Row resize is wide-layout only; the handles' grid-areas don't
+       exist in this template, so suppress them to avoid auto-flow
+       placement. */
+    .demo-row-handle { display: none; }
+}

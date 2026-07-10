@@ -49,7 +49,12 @@ module.exports = (env, argv) => {
 
     const entry = overrides.entry || {main: './src/lib/index.js'};
 
-    const devtool = overrides.devtool || 'source-map';
+    // Source maps are emitted solely by the explicit SourceMapDevToolPlugin
+    // below (which carries the async-plotlyjs exclude). Leaving the string
+    // devtool as 'source-map' would register a *second* SourceMapDevToolPlugin
+    // that writes the same .map filename, which newer webpack 5 rejects with
+    // "Conflict: Multiple assets emit different content to the same filename".
+    const devtool = ('devtool' in overrides) ? overrides.devtool : false;
 
     const externals = ('externals' in overrides) ? overrides.externals : ({
         react: 'React',

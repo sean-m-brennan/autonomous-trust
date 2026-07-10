@@ -26,7 +26,7 @@ from ..network import Message
 from ..processes import Process, ProcMeta
 from .protocol import NegotiationProtocol
 from .negotiation import Job, JobQueue, Task, TaskStatus, TaskTracker, TaskCounter, TaskResult, Status
-from ..system import CfgIds, max_concurrency, now
+from ..system import CfgIds, max_concurrency, now, proc_idle_floor
 from .. import _probes
 
 
@@ -532,3 +532,8 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             except Exception as err:
                 self.logger.error(err)
                 self.logger.error(traceback.format_exc())
+            # CPU-yield floor (see repprocess): queue.get's q_cadence timeout
+            # only sleeps on a fully idle window, so under continuous traffic
+            # this loop would spin at 100%. sleep_until yields the rest of a
+            # ~10ms window when unsaturated. AT_PROC_IDLE_FLOOR_SEC=0 disables.
+            self.sleep_until(proc_idle_floor)
