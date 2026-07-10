@@ -52,10 +52,34 @@ ping_rcv_port = comm_port + 2
 ping_snd_port = ping_rcv_port + 1
 ntp_port = comm_port + 4
 preferred_proto_ver = 4
-net_cadence = 0.0001
+net_cadence = 0.005
 encoding = 'utf-8'
 cadence = 0.5
 queue_cadence = 0.01
+
+
+def _proc_idle_floor() -> float:
+    """Minimum wall-clock period (sec) for the reputation/negotiation main
+    loops. Those loops pace only via queue.get's blocking q_cadence timeout,
+    which sleeps ONLY when the queue is empty for a full window; under
+    continuous traffic (e.g. the multi-agency demo) there is never an idle
+    window, so the loop spins at 100% CPU. A small trailing sleep_until(floor)
+    guarantees the loop yields the CPU whenever it is not genuinely saturated,
+    without the old sleep_until(cadence)=0.5s throughput cap (~2 msg/s).
+
+    Tunable via AT_PROC_IDLE_FLOOR_SEC; set 0 to restore the un-throttled loop.
+    """
+    raw = os.environ.get('AT_PROC_IDLE_FLOOR_SEC')
+    if raw is None:
+        return 0.01
+    try:
+        val = float(raw)
+    except ValueError:
+        return 0.01
+    return val if val >= 0 else 0.01
+
+
+proc_idle_floor = _proc_idle_floor()
 agreement_impl = AgreementImpl.POA.value
 dev_root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 core_system = {CfgIds.network: communications,

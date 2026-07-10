@@ -687,7 +687,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     except IndexError:
                         break
                     drained_ptp += 1
-                    peers = self.configs[CfgIds.peers]
+                    # Use the LIVE roster (self.peers), not the original bootstrap
+                    # Peers object in self.configs[CfgIds.peers] (only the welcomer's
+                    # address). Every other attribution site uses self.peers; using
+                    # the stale config here missed ~100% of inbound ptp msgs, which
+                    # then churned through mystery_handler + retries (CPU + drops).
+                    peers = self.peers
                     from_whom = peers.find_by_address(from_addr)
                     if from_whom is not None:
                         try:

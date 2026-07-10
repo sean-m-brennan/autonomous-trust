@@ -31,7 +31,7 @@ from .protocol import ReputationProtocol
 from .reputation import (TransactionHistory, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
                          Checkpoint, SignedCheckpoint)
-from ..system import CfgIds, now, encoding
+from ..system import CfgIds, now, encoding, proc_idle_floor
 from .. import _probes
 
 
@@ -2217,10 +2217,14 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 for rnd in list(self.round_group):
                     if present - rnd[0] > self.expiration:
                         del self.round_group[rnd]
-                # No sleep_until here: removing the 0.5 s cadence
-                # throttle was the whole point. Pacing is already
-                # provided by queue.get's q_cadence-second blocking
-                # timeout when no work is pending.
+                # Guarantee a CPU-yield floor. queue.get's q_cadence timeout
+                # only sleeps when the queue is idle for a full window; under
+                # continuous traffic there is no idle window and this loop
+                # would spin at 100%. sleep_until(proc_idle_floor) yields the
+                # rest of a ~10ms window when the iteration wasn't saturated,
+                # without the old sleep_until(cadence)=0.5s throughput cap.
+                # (AT_PROC_IDLE_FLOOR_SEC=0 restores the un-throttled loop.)
+                self.sleep_until(proc_idle_floor)
             except Exception as err:
                 self.logger.error(err)
                 self.logger.error(traceback.format_exc())
