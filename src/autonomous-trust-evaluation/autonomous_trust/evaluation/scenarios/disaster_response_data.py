@@ -40,6 +40,7 @@ minute of onset.
 from __future__ import annotations
 
 import math
+import os
 from datetime import timedelta
 from typing import Optional, Union
 
@@ -366,6 +367,33 @@ class SituationReportGenerator(DataGenerator):
 # Roster helper: build generators for every peer in the scenario
 # ----------------------------------------------------------------------
 
+def _fast_stream_cadence_sec() -> float:
+    """Emission cadence (sec) for the continuously-sampling sensors.
+
+    Weather (temp/wind/pressure/precip), ground-motion, and air-quality each
+    emit at this cadence; every emitted reading is fanned to subscribers and
+    pays the full per-message crypto + TCP-setup cost, so this is the primary
+    lever on the demo's steady-state network/CPU load (see the
+    project_net_cpu_churn analysis: multi-agency pegs CPU precisely because it
+    streams continuously, unlike the event-driven dod-mission demo).
+
+    Raised from the original 1.0s to 3.0s (~3x fewer sensor messages) to keep
+    the co-located k8s cohort from starving the minikube apiserver. Override
+    per-deploy via AT_STREAM_CADENCE_SEC for higher-fidelity runs. The sparse
+    magnitude (5s) and situation-report (20s) generators keep their own slower
+    cadences.
+    """
+    default = 3.0
+    raw = os.environ.get("AT_STREAM_CADENCE_SEC")
+    if raw is None:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        return default
+    return val if val > 0 else default
+
+
 def build_generators_for_scenario(scenario) -> dict[str, list[TickLike]]:
     """Return {peer_name: [tick-producer, ...]} for a DisasterResponseScenario.
 
@@ -373,6 +401,7 @@ def build_generators_for_scenario(scenario) -> dict[str, list[TickLike]]:
     a DataGenerator or a CompromisedGenerator wrapping one.
     """
     out: dict[str, list[TickLike]] = {}
+    cad = _fast_stream_cadence_sec()
 
     # Deterministic per-peer seeds so playback is reproducible.
     def _seed(name: str, tag: str) -> int:
@@ -386,10 +415,13 @@ def build_generators_for_scenario(scenario) -> dict[str, list[TickLike]]:
             offset = ((hash(name) & 0xFF) - 128) / 200.0  # ~-0.6 .. +0.6 F
             honest: list[DataGenerator] = [
                 TemperatureGenerator(name, baseline_f=55.0 + offset,
-                                     seed=_seed(name, "temp")),
-                WindSpeedGenerator(name, seed=_seed(name, "wind")),
-                PressureGenerator(name, seed=_seed(name, "pressure")),
-                PrecipitationGenerator(name, seed=_seed(name, "precip")),
+                                     seed=_seed(name, "temp"), cadence_sec=cad),
+                WindSpeedGenerator(name, seed=_seed(name, "wind"),
+                                   cadence_sec=cad),
+                PressureGenerator(name, seed=_seed(name, "pressure"),
+                                  cadence_sec=cad),
+                PrecipitationGenerator(name, seed=_seed(name, "precip"),
+                                       cadence_sec=cad),
             ]
             if role.metadata.get("compromised"):
                 cfg = CompromiseConfig(
@@ -406,11 +438,14 @@ def build_generators_for_scenario(scenario) -> dict[str, list[TickLike]]:
                 gens.extend(honest)
 
         elif role.kind == "seismic-monitor":
-            gens.append(GroundMotionGenerator(name, seed=_seed(name, "gm")))
+            gens.append(GroundMotionGenerator(name, seed=_seed(name, "gm"),
+                                              cadence_sec=cad))
+            # Magnitude events are already sparse (5s); leave at its own cadence.
             gens.append(MagnitudeGenerator(name, seed=_seed(name, "mag")))
 
         elif role.kind == "air-quality-monitor":
-            gens.append(AirQualityGenerator(name, seed=_seed(name, "aqi")))
+            gens.append(AirQualityGenerator(name, seed=_seed(name, "aqi"),
+                                            cadence_sec=cad))
 
         elif role.kind in ("field-station", "fusion-node"):
             gens.append(SituationReportGenerator(name, seed=_seed(name, "sitrep")))

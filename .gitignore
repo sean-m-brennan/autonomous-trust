@@ -55,7 +55,14 @@ deploy
 /src/autonomous-trust-inspector/.local
 /*.log
 
-/src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/assets
+# Ignore generated content in the Dash assets_folder, but TRACK the source
+# assets the dashboard needs at runtime (demo.css, row_resize.js, fonts,
+# images). Without these tracked, clean builds render the dashboard unstyled
+# and the graph container reflows every tick. Add any further source asset
+# filenames as negations below.
+/src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/assets/*
+!/src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/assets/demo.css
+!/src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/assets/row_resize.js
 /src/autonomous-trust/autonomous_trust/core/protobuf
 
 # Custom Dash component
@@ -71,7 +78,7 @@ deploy
 /src/autonomous-trust-inspector/reactjs/async_update/_imports_.py
 /src/autonomous-trust-inspector/reactjs/async_update/async_update.dev.js
 /src/autonomous-trust-inspector/reactjs/async_update/async_update.dev.js.map
-/src/autonomous-trust-inspector/reactjs/async_update/async_update.min.js.LICENSE.txt
+/src/autonomous-trust-inspector/reactjs/async_update/async_update.min.js*
 /src/autonomous-trust-inspector/reactjs/async_update/bin_data_pb2.py
 /src/autonomous-trust-inspector/reactjs/async_update/metadata.json
 /src/autonomous-trust-inspector/reactjs/async_update/package-info.json
@@ -80,7 +87,10 @@ deploy
 /src/autonomous-trust-inspector/reactjs/DESCRIPTION
 /src/autonomous-trust-inspector/reactjs/NAMESPACE
 /src/autonomous-trust-inspector/reactjs/Project.toml
-/src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/async_update/
+# The built async_update Dash component package placed here by build.sh —
+# a symlink locally (no trailing slash so git matches the symlink, not just a
+# directory) and a real COPY'd dir in the Docker image.
+/src/autonomous-trust-inspector/autonomous_trust/inspector/dash_components/async_update
 
 # C build
 /src/c/build*

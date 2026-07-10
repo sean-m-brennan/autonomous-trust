@@ -120,6 +120,34 @@ warn()  { echo -e "${YELLOW}[$VARIANT]${NC} $*"; }
 err()   { echo -e "${RED}[$VARIANT]${NC} $*" >&2; }
 event() { echo -e "${GREEN}[T+${1}]${NC} $2"; }
 
+# Ensure a git submodule is checked out. Dockerfile-native COPYs the working
+# tree rather than cloning, so an uninitialized submodule surfaces as a CMake
+# "Cannot find source file" error deep in the build. `git submodule status`
+# prefixes an uninitialized entry with '-'; the optional sentinel guards the
+# edge case where the dir exists but is empty (git thinks it's fine but the
+# expected source is absent).
+#   $1 = submodule path (relative to repo root)
+#   $2 = (optional) sentinel file, relative to repo root, that must exist
+#        after checkout
+ensure_submodule() {
+    local sm_path="$1" sentinel="${2:-}"
+    command -v git &>/dev/null \
+        || { err "git not found; cannot init submodule $sm_path"; return 1; }
+    local st
+    st=$(git -C "$here" submodule status -- "$sm_path" 2>/dev/null)
+    if [[ -z "$st" || "$st" == -* ]] \
+        || { [[ -n "$sentinel" && ! -f "$here/$sentinel" ]]; }; then
+        warn "Submodule $sm_path not checked out — initializing ..."
+        git -C "$here" submodule update --init "$sm_path" \
+            || { err "failed to init submodule $sm_path (network access to its host?)"; return 1; }
+        if [[ -n "$sentinel" && ! -f "$here/$sentinel" ]]; then
+            err "submodule $sm_path init reported success but $sentinel is still missing"
+            return 1
+        fi
+    fi
+    return 0
+}
+
 # Force-reseed cleanup. The demo containers run as root and create var/at/ (and
 # the C nodes' etc/at network/subsystems configs) as root, so the Python seeder
 # — running as the host user — cannot unlink that runtime state. It then
@@ -985,6 +1013,24 @@ fi
 
 command -v docker  &>/dev/null || { err "docker not found"; exit 1; }
 command -v python3 &>/dev/null || { err "python3 not found"; exit 1; }
+
+# Ryu (d2s, JCS number formatting) is always linked into the native C library,
+# so its submodule must be present for every build path.
+ensure_submodule src/c/third_party/ryu src/c/third_party/ryu/ryu/d2s.c || exit 1
+
+# DTN transport submodules are only needed when the C build opts in
+# (AT_NET_DTN=ON with an ion/ud3tn backend — both OFF by default, so neither
+# run-demo.sh nor Dockerfile-native needs them). Fetch on request only; ION-DTN
+# in particular is a large clone. Set DEMO_INIT_DTN to ion, ud3tn, or all.
+case "${DEMO_INIT_DTN:-}" in
+    ion)        ensure_submodule src/c/third_party/ION-DTN || exit 1 ;;
+    ud3tn)      ensure_submodule src/c/third_party/ud3tn   || exit 1 ;;
+    all|1|true) ensure_submodule src/c/third_party/ION-DTN || exit 1
+                ensure_submodule src/c/third_party/ud3tn   || exit 1 ;;
+    ''|off|false|0|no) ;;
+    *) warn "Unrecognized DEMO_INIT_DTN='${DEMO_INIT_DTN}' (use ion|ud3tn|all); skipping DTN submodules" ;;
+esac
+
 if [[ "$BACKEND_MODE" == "tilt" ]]; then
     command -v tilt    &>/dev/null \
         || { err "tilt not found; install from https://docs.tilt.dev/"; exit 1; }
@@ -1093,10 +1139,10 @@ case "$BACKEND_MODE" in
                 # guard. Tilt's content-hash caching rebuilds when the copied
                 # source changes, so a normal edit is covered; a manual `rmi`
                 # mid-session may need `tilt trigger` / `--rebuild`.
-                if [[ "$VARIANT" == "multi-agency" ]]; then
-                    log "Preflight image check ..."
-                    ensure_demo_images
-                fi
+                #if [[ "$VARIANT" == "multi-agency" ]]; then
+                #    log "Preflight image check ..."
+                #    ensure_demo_images
+                #fi
             fi
         fi
 
