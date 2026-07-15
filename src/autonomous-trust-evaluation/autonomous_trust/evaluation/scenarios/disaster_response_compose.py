@@ -371,6 +371,12 @@ def _inspector_k8s_yaml(opts: ComposeOptions, namespace: str) -> str:
         val = os.environ.get(var)
         if val:
             env[var] = val
+    # Debug-probes wiring, mirroring the compose path (_inspector_entry).
+    # The probe writer self-creates AT_PROBES_DIR, so no volume is needed;
+    # output is readable via `kubectl exec`. Skipped when probes are off.
+    if opts.probes:
+        env["AT_PROBES"] = "1"
+        env["AT_PROBES_DIR"] = opts.probes_container_dir
     env.update(opts.extra_env)
 
     return f"""---
@@ -506,6 +512,12 @@ def generate_k8s_manifests(scenario, namespace: str = "disaster-demo",
                     "compromise_onset_sec", 240))
                 env["AT_COMPROMISE_MODES"] = ",".join(
                     role.metadata.get("compromise_modes") or [])
+            # Debug-probes wiring, mirroring the compose path (_peer_entry).
+            # The writer self-creates AT_PROBES_DIR, so no volume is needed;
+            # output is readable via `kubectl exec`. Skipped when probes off.
+            if opts.probes:
+                env["AT_PROBES"] = "1"
+                env["AT_PROBES_DIR"] = opts.probes_container_dir
             env.update(opts.extra_env)
 
             sections.append(_K8S_DEPLOYMENT_TEMPLATE.format(
