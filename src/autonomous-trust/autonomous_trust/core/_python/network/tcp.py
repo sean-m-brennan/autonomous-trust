@@ -101,7 +101,14 @@ class TCPNetworkProcess(UDPNetworkProcess):
             try:
                 sock.connect((host, port))
             except socket.error as err:
+                _probes.counter('net.tcp.send', 'connect_failed',
+                                err.__class__.__name__)
                 raise TransmissionError('Connect - ' + str(err))
+            # Churn metric: the protocol opens one TCP connection per
+            # message (connect/send/close), so this counter's RATE is
+            # handshakes/sec/node — the send side of the connection churn.
+            _probes.counter('net.tcp.send', 'connect',
+                            'peer' if port == self.port else 'group')
             try:
                 sent = sock.send(struct.pack('!I', len(msg)))
             except socket.error as err:

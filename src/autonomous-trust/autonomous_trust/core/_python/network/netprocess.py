@@ -709,6 +709,29 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         # are encrypt=False. If bytes don't decode, it's
                         # an encrypted message from a peer we don't know
                         # yet — defer to mystery_handler.
+                        #
+                        # CHURN DIAGNOSTIC: attribution misses on ~every
+                        # inbound (deferred_encrypted == accepted). Is it a
+                        # format mismatch (from_addr shape != listing keys)
+                        # or a timing race (address registered a beat later)?
+                        # Categorize cheaply always, and capture a bounded
+                        # sample of from_addr vs listing keys to compare shapes.
+                        # See ISSUES.md (connection churn / attribution miss).
+                        _listing = getattr(self.peers, 'listing', None) or {}
+                        _probes.counter('net.ptp', 'attrib_miss',
+                                        'listing_empty' if not _listing
+                                        else 'addr_not_in_listing')
+                        _dn = getattr(self, '_attrib_miss_diag_n', 0)
+                        if _dn < 25:
+                            self._attrib_miss_diag_n = _dn + 1
+                            try:
+                                _keys = sorted(str(k) for k in _listing)[:8]
+                            except Exception:
+                                _keys = ['<unavailable>']
+                            _probes.emit('net.ptp', 'attrib_miss_sample',
+                                         from_addr=repr(from_addr),
+                                         listing_size=len(_listing),
+                                         listing_keys=_keys)
                         try:
                             self._msg_to_queue(raw_msg, from_addr, queues, 'point-to-point', validate=False)
                             _probes.counter('net.ptp', 'unknown_sender', 'parsed_unencrypted')

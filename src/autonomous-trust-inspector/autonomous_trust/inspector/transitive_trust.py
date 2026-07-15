@@ -48,10 +48,26 @@ class TransitiveTrustMixin:
         """Send one peer-pair reputation-query round.
 
         For every ordered (observer, subject) pair of distinct peers, send a
-        ``rep_req`` addressed to the *observer* (so it is routed over the
-        network and the observer computes its own view of the subject).
+        ``consensus_rep_req`` addressed to the *observer* (so it is routed over
+        the network and the observer computes its own view of the subject).
         ``from_whom`` MUST be our identity so the observer's
         ``forward_reputation`` can route the ``rep_resp`` back to us.
+
+        We use ``consensus_rep_req`` (the deterministic, chain-derived
+        third-party view) rather than ``rep_req`` (contrite-tit-for-tat).
+        CTFT is *bilateral*: an observer with no direct shared-task history
+        with a subject reports ``PREREP_NEUTRAL`` (0.0), which the
+        trust-network graph treats as "no relationship" (``EDGE_TRUST_EPS``)
+        and draws no edge — so in a cohort whose committed transactions
+        concentrate on a few hubs, almost every pair reads 0.0 and the graph
+        stays edgeless even while per-peer consensus is healthy. The
+        consensus view has data for any peer the cohort has transacted with,
+        so it is the correct "who does the cohort trust whom" signal for the
+        graph (and matches the per-peer Trust-Dynamics timeline, which is
+        already consensus-sourced). For a leaf observer ``_subtree_roster``
+        returns exactly ``Reputation(subject, consensus)``, so the per-pair
+        query shape and ``rep_resp`` capture into
+        ``latest_reputation_pairs`` are unchanged.
 
         Returns the number of queries actually enqueued.
         """
@@ -64,7 +80,7 @@ class TransitiveTrustMixin:
                 try:
                     query = Message(
                         CfgIds.reputation,
-                        ReputationProtocol.rep_req,
+                        ReputationProtocol.consensus_rep_req,
                         to_json_string((subject, self.proc_name)),
                         observer,               # routed over the network
                         from_whom=self.identity,
@@ -75,5 +91,6 @@ class TransitiveTrustMixin:
                 except Exception:
                     if logger is not None:
                         logger.exception(
-                            "peer-pair rep_req %r->%r failed", observer, subject)
+                            "peer-pair consensus_rep_req %r->%r failed",
+                            observer, subject)
         return sent
