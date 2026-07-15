@@ -1,105 +1,93 @@
 AutonomousTrust
 ===============
 
-***AutonomousTrust*** is a high-trust cooperative computing concept --- a data messaging framework that allows for dynamic composibility, requesting and serving encrypted data *only* with trusted peers and only to the extent of that fine-grained trust.
-Said trust is dynamically evaluated in real time to rapidly eliminate incoming threats and even reclassify existing peers as their behavior changes and thus protect resources.
-Increased risk requires a greater trust threshold.
-An autonomous agent using this framework can adaptively: 1) refuse communications from severely untrusted peers, conserving bandwidth; 2) communicate with but refuse computation services to faintly trusted peers, protecting CPU time; 3) offer services but refuse data-sharing to moderately trusted peers, protecting data; _and_ 4) offer data-sharing to well trusted peers; all with a configurable gradient of access at every level, and all within the same application.
+**AutonomousTrust** (AT) is a framework for cooperative computing among machines that do not fully trust each other and cannot count on a central authority to vouch for anyone. Peers exchange encrypted data only with peers they trust, and only up to the level that trust allows. Trust is never granted once and kept. Each peer starts a new relationship at zero and earns standing through observed behavior, and that standing is re-evaluated continuously, so a peer whose behavior changes is reclassified in real time.
 
-In more concrete terms, *AutonomousTrust* is an operations framework for a vast distributed system that dynamically composes numerous individual microservices into a coherent application on-demand -- with security at its core.
-We follow the Unix philosophy: do one thing well, work together, use a universal (text) interface; yet implemented such that each microservice can choose its level of participation.
+Because trust is a live value rather than a one-time check, a node can meter access along a gradient, all within the same application:
 
+1. refuse traffic from badly-trusted peers, to save bandwidth;
+2. accept traffic but refuse compute to weakly-trusted peers, to protect CPU;
+3. offer compute but withhold data from moderately-trusted peers, to protect data;
+4. share data with well-trusted peers.
 
-Architecture
-------------
-
-For technical architecture documentation, see [doc/architecture/](doc/architecture/README.md), covering:
-
-- System overview and cryptographic foundation
-- Process architecture and IPC
-- Networking, identity protocol, and group formation
-- Task negotiation and reputation consensus
-- Space communications (DTN, orbital mechanics)
-- Security hardening
-- [Zero Trust Architecture (ZTA) integration](doc/architecture/zta-integration.md) -- pluggable credential verification, DDIL fallback, and compliance audit logging
+AT decides all of this at the node, with no round-trip to a central policy or PKI service. That is what lets it keep working when the network is jammed, degraded, or partitioned, the conditions under which conventional Zero Trust (which depends on reaching a central authority) falls back to either failing open or failing closed.
 
 
-Zero Trust Integration
-----------------------
+Quick Start
+-----------
 
-AutonomousTrust complements Zero Trust Architecture rather than replacing it. ZTA credentials gate admission; AT behavioral reputation governs ongoing trust. The ZTA plugin provides:
-
-- **Pluggable verifier interface** with X.509 (OpenSSL) and OIDC (stub) backends
-- **DDIL-aware fallback** -- peers are admitted with a reputation cap when verification infrastructure is unreachable, preserving network formation in disconnected environments
-- **Revocation as reputation event** -- certificate revocation applies a configurable reputation penalty rather than a binary disconnect
-- **Delegated verification** -- the AT group acts as a distributed PDP; peers with OCSP connectivity vouch for DDIL-admitted peers, lifting reputation caps without requiring every peer to reach external infrastructure
-- **Compliance audit trail** -- every verification, deferral, and resolution is logged to JSONL for post-incident review
-
-To build with ZTA support:
+AutonomousTrust is developed against a **conda** environment and driven through the `./at` launcher at the repository root.
 
 ```bash
-cd src/c && mkdir build && cd build
-cmake .. -DAT_ZTA=ON
-make -j$(nproc)
+# 1. Set up the dev environment (creates the conda env, installs the Rust
+#    toolchain, checks Docker).
+./at setup-dev
+conda activate autonomous_trust
+
+# 2. See it work. The multi-agency disaster-response demo runs in-process,
+#    no Docker required: ten federal sensors form a trust mesh, one is
+#    compromised, and the network excludes it on its own.
+python -m examples.multi_agency
+#    Then open the dashboard at http://localhost:8050
+
+# 3. Run the Python test suite.
+./at test-python
 ```
 
-To run the 4-peer tactical demo (requires Docker):
+For the full multi-node demos, orchestrated over Docker, Tilt, and Minikube:
 
 ```bash
-cd examples/zta
-./run_demo.sh
+./at run-demo --variant=python        # multi-node Python cohort (default)
+./at run-demo --variant=multi-agency  # disaster-response scenario
+./at run-demo --variant=dod-mission   # ISR mission with a microdrone swarm
 ```
 
-See [doc/architecture/zta-integration.md](doc/architecture/zta-integration.md) for the full technical reference.
+Run `./at help` for the full command list (build, test, and run targets).
 
 
-QuickStart
+Start here
 ----------
 
-Run `tools/toolbox emulate` from a bash shell.
+New to AutonomousTrust? Read these in order. Each builds on the last.
 
-Requires:
-  * Docker https://www.docker.com/get-started/
-  * Minikube
-
-The script downloads/installs all required software dependencies into the container(s).
+1. **[Purpose](doc/concept.md)**: why AT exists, and the access model it replaces.
+2. **[Architecture](doc/architecture/README.md)**: how a node is built, from cryptographic identity through group formation, task negotiation, and reputation consensus.
+3. **[Example application](doc/example-application.md)**: a disaster-response scenario walked through end to end, mapped back to the mechanisms that make it work.
 
 
-Alternatively, AutonomousTrust can be built as a virtual machine instead of a container.
+Zero Trust integration
+----------------------
 
-Run `tools/toolbox actuate` from a bash shell.
+AutonomousTrust complements Zero Trust Architecture (NIST SP 800-207) rather than replacing it. ZTA credentials gate admission; AT behavioral reputation governs ongoing trust once a peer is in. The ZTA overlay provides:
 
-Requires:
-  * QEMU https://wiki.qemu.org/Hosts
+- a pluggable verifier interface, with a working X.509/OCSP backend and an OIDC stub;
+- DDIL-aware fallback, admitting a peer at a capped reputation when verification infrastructure is unreachable, so the cohort still forms while disconnected;
+- revocation as a reputation event, applying a configurable penalty instead of a binary disconnect;
+- delegated verification, in which peers that can reach OCSP vouch for peers that cannot, lifting the cap without every peer needing external connectivity;
+- a JSONL audit trail recording every verification, deferral, and resolution for later review.
 
-Downloads/installs (local to working dir):
-  * pyNaCl
-  * libffi
+See [doc/architecture/zta-integration.md](doc/architecture/zta-integration.md) for the full reference. A standalone enrollment and OCSP demo lives in [`examples/zta/`](examples/zta) (`./run.sh`).
 
 
 Development setup
 -----------------
 
-Dependencies are managed with **conda** (not pip/venv). Two environment files
-under `config/cfg/` are authoritative:
+Dependencies are managed with **conda**, not pip or venv. Two environment files under `config/cfg/` are authoritative:
 
-  * [`config/cfg/environment.yml`](../../config/cfg/environment.yml) --- **runtime**
-    dependencies.
-  * [`config/cfg/devel_environ.yml`](../../config/cfg/devel_environ.yml) --- **build
-    and test** dependencies (compilers, `pytest`, conformance tooling, etc.).
+- [`config/cfg/environment.yml`](config/cfg/environment.yml): runtime dependencies (symlinked from the repo-root `environment.yml`).
+- [`config/cfg/devel_environ.yml`](config/cfg/devel_environ.yml): build and test dependencies (compilers, `pytest`, conformance tooling).
+
+`./at setup-dev` runs the whole setup. To do it by hand:
 
 ```bash
-# runtime environment
 conda env create -f config/cfg/environment.yml
-# add the build/test toolchain into the same env
 conda env update -n autonomous_trust -f config/cfg/devel_environ.yml
 conda activate autonomous_trust
 ```
 
-When you add a dependency, declare it in the appropriate file: runtime deps go
-in `environment.yml`; test/build-only deps go in `devel_environ.yml`. The
-per-package `pyproject.toml` files mirror these for packaging, but the conda
-env files are the source of truth for local development.
+When you add a dependency, declare it in the file that owns it: runtime deps in `environment.yml`, test and build-only deps in `devel_environ.yml`. The per-package `pyproject.toml` files mirror these for packaging, but the conda env files are the source of truth for local development.
+
+The core ships two interoperable implementations of the same runtime: a pure-Python core and a formally verified C core, selected at import time by the `AUTONOMOUS_TRUST_BACKEND` environment variable. Build the native library with `./at build-native`. See [doc/architecture/native-ffi-dual-implementation.md](doc/architecture/native-ffi-dual-implementation.md).
 
 
 Documentation
@@ -107,8 +95,16 @@ Documentation
 
 | Document | Description |
 |----------|-------------|
-| [doc/architecture/](doc/architecture/README.md) | Technical architecture (identity, networking, reputation, ZTA, etc.) |
-| [doc/concept.md](doc/concept.md) | Conceptual overview |
-| [doc/security.md](doc/security.md) | Security model |
-| [doc/api.md](doc/api.md) | API reference |
+| [doc/concept.md](doc/concept.md) | Purpose and access model (start here) |
+| [doc/architecture/](doc/architecture/README.md) | Technical architecture: identity, networking, negotiation, reputation, ZTA, and more |
+| [doc/example-application.md](doc/example-application.md) | Worked disaster-response example |
+| [doc/api.md](doc/api.md) | Integration API: entrypoints for embedding AT in an app |
+| [doc/security.md](doc/security.md) | Security model: properties, containment, and residual risk |
+| [examples/README.md](examples/README.md) | The example suite and how to add a scenario |
 | [doc/testing.md](doc/testing.md) | Testing approach |
+
+
+License
+-------
+
+Apache License 2.0. See [LICENSE](LICENSE).

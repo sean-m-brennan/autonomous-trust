@@ -37,11 +37,20 @@ from __future__ import annotations
 import itertools
 import logging
 import os
+import queue
+import random
 from datetime import timedelta
 from typing import Callable, Optional
 
-from autonomous_trust.core import ProcMeta
+from autonomous_trust.core import ProcMeta, CfgIds
 from autonomous_trust.core._python.automate import AutonomousTrust
+from autonomous_trust.core.capabilities import Capability
+from autonomous_trust.core.config import to_json_string
+from autonomous_trust.core.negotiation import (
+    Task, TaskParameters, NegotiationProtocol)
+from autonomous_trust.core.network import Message
+from autonomous_trust.core.reputation.protocol import ReputationProtocol
+from autonomous_trust.core.system import queue_cadence
 from autonomous_trust.services.data.reading import Reading
 from autonomous_trust.services.envdata import (
     AirQualityStreamProcess,
@@ -61,6 +70,30 @@ from .disaster_response_data import build_generators_for_scenario
 
 
 logger = logging.getLogger(__name__)
+
+
+def _demo_task_period_sec() -> float:
+    """Period (sec) between the light inter-peer negotiation rounds that
+    keep honest-peer reputation alive (see
+    ``DisasterResponseDemoAT.autonomous_tasking``).
+
+    Slow by default: the bilateral reputation transactions only need to
+    trickle in to build and hold reputation, and each round is a cheap
+    compute task — far below the per-message cost of the continuous
+    sensor streams (see ``disaster_response_data._fast_stream_cadence_sec``).
+    Override per-deploy via ``AT_DEMO_TASK_PERIOD_SEC``; set <= 0 to fall
+    back to the default rather than disabling (disable by not running
+    --test, which is out of scope here).
+    """
+    default = 10.0
+    raw = os.environ.get("AT_DEMO_TASK_PERIOD_SEC")
+    if raw is None:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        return default
+    return val if val > 0 else default
 
 
 # ----------------------------------------------------------------------
@@ -256,6 +289,10 @@ class DisasterResponseDemoAT(AutonomousTrust):
         self._demo_capabilities = [c.strip() for c in raw_caps.split(",")
                                    if c.strip()]
 
+        # Cadence for the light inter-peer negotiation that keeps
+        # honest-peer reputation alive (see autonomous_tasking).
+        self._demo_task_period = _demo_task_period_sec()
+
         # Always include the cross-validation service -- every peer in
         # the demo participates in peer-to-peer sanity checks.
         self._add_validation_worker()
@@ -338,20 +375,94 @@ class DisasterResponseDemoAT(AutonomousTrust):
 
         super().autonomous_ability(queues)
 
-    # --- tasking (minimal) -------------------------------------------
+    # --- tasking -----------------------------------------------------
+
+    # Real, cheap capabilities to exercise. The role *stream* caps are
+    # registered with a no-op announce function (_capability_announce)
+    # that returns no PID, so tasking them trips "Process failed to
+    # start"; restrict negotiation to the base compute caps, which have
+    # real executors (registered by super().autonomous_ability under
+    # --test).
+    _DEMO_TASK_CAPS = ("mult", "pow", "pi")
 
     def autonomous_tasking(self, queues):
-        """Streaming data and service discovery drive the demo.
+        """Drive light inter-peer negotiation so honest peers earn the
+        reputation the trust-network graph and Trust-Dynamics lines render.
 
-        We intentionally do NOT fire randomized negotiations like the
-        base class does in test mode -- the reputation / exclusion path
-        we're demonstrating comes from actual streaming behavior, not
-        synthetic tasks.
+        Edges/lines are fed by *bilateral* reputation transactions, which
+        form only when peers run tasks for one another: the requester
+        scores the returned TaskResult and the executor scores on
+        completion (see automate.py), both keyed to a shared task uuid.
+        Pure sensor streaming goes through DataRcvr and never touches that
+        path, so a stream-only cohort sits forever at PREREP_NEUTRAL (0.0)
+        and the graph stays edgeless -- which is exactly what "no edges,
+        no reputation lines at T+7min" was.
+
+        We therefore re-enable the base-class test-mode negotiation this
+        class previously opted out of, but throttled (AT_DEMO_TASK_PERIOD_SEC)
+        and restricted to cheap compute caps, so reputation builds and
+        holds without adding to the per-message load the continuous sensor
+        streams already carry. The validation-driven slash path (which
+        pushes a *rogue* peer's reputation down) layers on top of this
+        honest-peer baseline.
         """
-        # Tick clock so the base mechanics still run (reputation queries,
-        # peer monitoring, etc).
-        _ = self.tasking_tick(0)
+        # Prompt first-contact task + reputation sweep as new peers appear,
+        # so edges form without waiting a full period; then steady cadence.
+        if len(self.peers.all) > self.peer_count:
+            self.peer_count = len(self.peers.all)  # noqa
+            self._demo_random_task(queues)
+            self._query_peer_reputations(queues)
+        elif self.tasking_tick(0, self._demo_task_period):
+            self._demo_random_task(queues)
+            self._query_peer_reputations(queues)
         self._report_unhandled()
+
+    def _demo_random_task(self, queues) -> None:
+        """Dispatch one lightweight compute task to the cohort.
+
+        Mirrors ``AutonomousTrust._random_task`` but restricts the pick to
+        the real compute capabilities (mult/pow/pi). The negotiation
+        process selects an executor; its TaskResult flows back and both
+        ends submit a bilateral TransactionScore, which is what lifts
+        honest peers off PREREP_NEUTRAL and draws the trust edges.
+        """
+        registered = set(self.capabilities.to_list())
+        available = [n for n in self._DEMO_TASK_CAPS if n in registered]
+        if not available:
+            return
+        name = available[random.randint(0, len(available) - 1)]
+        if name == 'pi':
+            args = (random.randint(1000, 10000),)
+        elif name == 'pow':
+            args = (random.randint(2, 100), random.randint(2, 20))
+        else:  # mult
+            args = (random.randint(2, 1000000), random.randint(2, 1000000))
+        try:
+            task = Task(TaskParameters(Capability(name), args=args),
+                        self.identity)
+            msg = Message(CfgIds.negotiation, NegotiationProtocol.start, task)
+            queues[CfgIds.negotiation].put(
+                msg, block=True, timeout=queue_cadence)
+        except queue.Full:
+            self.logger.error(
+                "%s: demo task negotiation queue full", self.name)
+
+    def _query_peer_reputations(self, queues) -> None:
+        """Ask our own reputation process for its view of every known peer
+        (and ourself), populating latest_reputation for the local panels.
+        Mirrors the base test-mode sweep; reputation is *read* here, not
+        built (that is what _demo_random_task drives)."""
+        for peer in list(self.peers.all) + [self.identity]:
+            try:
+                query = Message(
+                    CfgIds.reputation, ReputationProtocol.rep_req,
+                    to_json_string((peer, self.proc_name)), self.identity,
+                    from_whom=self.identity)
+                queues[CfgIds.reputation].put(
+                    query, block=True, timeout=queue_cadence)
+            except queue.Full:
+                self.logger.error(
+                    "%s: reputation query queue full", self.name)
 
 
 # ----------------------------------------------------------------------

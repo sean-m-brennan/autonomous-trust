@@ -94,6 +94,25 @@ build_args["GIT_VERSION"] = git_version
 #   autonomous-trust-inspector  adds Dash deps + sibling AT subpackages
 # Each manifest references one of these by name; Tilt rewrites tags at
 # apply time, so the YAML's :dev tag is fine.
+#
+# The derived images use `FROM ${BASE_IMAGE}` with a `:dev` default, which
+# defeats Tilt's *static* FROM-chain detection (it can't see through the ARG).
+# Passing BASE_IMAGE as a build_arg whose value is the parent's docker_build
+# ref lets Tilt resolve the chain itself (autonomous-trust -> -disaster and
+# autonomous-trust -> -inspector) and inject each freshly-built parent. This
+# is what lets run-demo.sh SKIP the pre-seed for the tilt path (see
+# ensure_demo_images / the tilt dispatch): Tilt owns the whole chain and
+# rebuilds on content change, so the old ensure_demo_images pre-build here
+# was just building every image a second time. The compose/k8s paths still
+# pre-build since there's no Tilt to drive the chain.
+
+# Per-image build_args: shared args + the parent image ref so `FROM
+# ${BASE_IMAGE}` resolves to a Tilt-managed image. Copy (don't mutate the
+# shared dict). The root image (autonomous-trust) omits it.
+def _with_base(parent):
+    d = dict(build_args)
+    d["BASE_IMAGE"] = parent
+    return d
 
 docker_build(
     "autonomous-trust",
@@ -108,7 +127,7 @@ docker_build(
     repo_root,
     dockerfile=repo_root + "/src/autonomous-trust-evaluation/Dockerfile",
     network="host",
-    build_args=build_args,
+    build_args=_with_base("autonomous-trust"),
 )
 
 docker_build(
@@ -116,7 +135,7 @@ docker_build(
     repo_root,
     dockerfile=repo_root + "/src/autonomous-trust-inspector/Dockerfile",
     network="host",
-    build_args=build_args,
+    build_args=_with_base("autonomous-trust"),
 )
 
 # --- K8s manifests --------------------------------------------------------

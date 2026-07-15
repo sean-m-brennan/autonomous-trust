@@ -69,6 +69,12 @@ function(add_at_example target source)
     # struct layout that disagrees with the library it links against. The
     # library itself is built with -fms-extensions (src/c/CMakeLists.txt:136).
     target_compile_options(${target} PRIVATE -Wall -fms-extensions)
+    # clang still emits -Wmicrosoft-anon-tag for those deliberate anonymous
+    # typedef'd members even with -fms-extensions; the library build suppresses
+    # the same spurious warning (src/c/CMakeLists.txt:125).
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        target_compile_options(${target} PRIVATE -Wno-microsoft-anon-tag)
+    endif()
     install(TARGETS ${target} RUNTIME DESTINATION bin)
 endfunction()
 

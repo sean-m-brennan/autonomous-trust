@@ -1,4 +1,4 @@
-*[Sustainable Space](../../../../../doc/sustainable_space.md) > [MUUDD](../../../doc/muudd.md) > AutonomousTrust*
+*AutonomousTrust*
 
 # AutonomousTrust -- Cooperative Computing Framework
 
