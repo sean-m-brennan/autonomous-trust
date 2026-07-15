@@ -658,6 +658,59 @@ PY
     return 1
 }
 
+# --- Inspector capability-merge freshness guard --------------------------
+# The inspector's bridge.py capability propagation was fixed to a per-cap
+# UNION merge, replacing a size-monotonic guard that silently dropped a
+# late-arriving capability delivered in a smaller partial view (the bug where
+# airquality_stream never subscribed). A *cached* inspector image built before
+# that fix redeploys the old code and reproduces the bug -- while looking like
+# a clean run, so a stale image can quietly invalidate a whole demo / probe
+# capture. This introspects the image that is about to deploy and confirms
+# bridge.py carries the fix (the 'caps_merge' probe counter, emitted only by
+# the merge path; the source is COPY'd into the image, so inspect.getsource
+# sees it).
+#
+# Conservative like base_image_identity_stale(): it blocks ONLY on a definitive
+# miss (image exists AND bridge.py lacks the marker). No image, no importable
+# source, or any introspection/docker error -> pass, so a launch is never
+# blocked on a false negative. Bypass entirely with AT_SKIP_INSPECTOR_GUARD=1.
+guard_inspector_image() {
+    local ref="$1"
+    [[ "${AT_SKIP_INSPECTOR_GUARD:-0}" == "1" ]] && return 0
+    docker image inspect "$ref" &>/dev/null || return 0   # nothing to check yet
+    local rc=0
+    docker run --rm -i --entrypoint python3 "$ref" - >/dev/null 2>&1 <<'PY' || rc=$?
+import sys
+try:
+    import inspect
+    import autonomous_trust.inspector.bridge as m
+    src = inspect.getsource(m)
+except Exception:
+    sys.exit(2)                       # uncertain: can't introspect -> don't block
+sys.exit(0 if "caps_merge" in src else 1)
+PY
+    case "$rc" in
+        0) return 0 ;;                # fix present -> good
+        1)                            # definitively stale -> block
+            err "Inspector image '$ref' is STALE: its bridge.py predates the"
+            err "    capability-merge fix (no 'caps_merge' path), so a late-arriving"
+            err "    capability such as airquality_stream can be silently dropped."
+            err "    This image would deploy old code and quietly invalidate the run."
+            if (( REBUILD == 1 )); then
+                err "    --rebuild was requested yet the image is still stale -> Docker"
+                err "    served a cached COPY layer. Force a clean rebuild, e.g.:"
+                err "        docker rmi '$ref' && $0 --variant=$VARIANT ... --rebuild"
+            else
+                err "    Rebuild so the working-tree bridge.py propagates:"
+                err "        $0 --variant=$VARIANT ... --rebuild"
+            fi
+            err "    (Set AT_SKIP_INSPECTOR_GUARD=1 to bypass this check intentionally.)"
+            exit 1
+            ;;
+        *) return 0 ;;                # rc 2 (uncertain) or docker error -> don't block
+    esac
+}
+
 # --- Image build chains (per variant) ------------------------------------
 # Builds anything missing in the *active* docker daemon (host or
 # cluster, depending on whether use_cluster_docker_env() was called
@@ -694,6 +747,9 @@ ensure_demo_images() {
                     "${build_args[@]}" -t "$inspector_ref" \
                     -f "$here/src/autonomous-trust-inspector/Dockerfile" "$here"
             fi
+            # Whether just built or served from cache, the image that will
+            # deploy must carry the bridge.py capability-merge fix.
+            guard_inspector_image "$inspector_ref"
             ;;
         dod-mission)
             local base_ref inspector_ref demo_ref peer_ref
@@ -736,6 +792,8 @@ ensure_demo_images() {
                     "${build_args[@]}" -t "$inspector_ref" \
                     -f "$here/src/autonomous-trust-inspector/Dockerfile" "$here"
             fi
+            # Same shared inspector image -> same stale-code risk; guard it.
+            guard_inspector_image "$inspector_ref"
             # The two dod overlays are thin COPY layers; --rebuild forces
             # them to pick up edits under examples/dod_mission/ that
             # Docker's content-addressed cache might otherwise miss.
@@ -1124,25 +1182,20 @@ case "$BACKEND_MODE" in
                 # Switch to the cluster's daemon so Tilt's docker_build lands
                 # where the pods pull from.
                 use_cluster_docker_env
-                # dod-mission: its tiltfile now wires BASE_IMAGE per image, so
-                # Tilt owns the whole FROM chain (base -> inspector -> demo/peer)
-                # and rebuilds on content change. Pre-seeding here just built
-                # every image a second time (Tilt rebuilds them all on `up`), so
-                # it's skipped — matching the python/c variants which never
-                # pre-build. multi-agency still pre-seeds (:dev tags) because its
-                # tiltfile doesn't pass BASE_IMAGE yet.
+                # Both scenario tiltfiles now wire BASE_IMAGE per image, so
+                # Tilt owns the whole FROM chain (base -> inspector -> demo/peer,
+                # base -> disaster/inspector) and rebuilds on content change.
+                # Pre-seeding here just built every image a second time (Tilt
+                # rebuilds them all on `up`), so it's skipped — matching the
+                # python/c variants which never pre-build.
                 #
                 # NOTE (trade-off): this drops the old preflight's two side
-                # effects for dod-mission — (1) forcing a fresh build after a
-                # `docker rmi` (Tilt's content-hash cache doesn't notice a
-                # daemon-side rmi), and (2) the base_image_identity_stale
-                # guard. Tilt's content-hash caching rebuilds when the copied
-                # source changes, so a normal edit is covered; a manual `rmi`
+                # effects — (1) forcing a fresh build after a `docker rmi`
+                # (Tilt's content-hash cache doesn't notice a daemon-side rmi),
+                # and (2) the dod-mission base_image_identity_stale guard.
+                # Tilt's content-hash caching rebuilds when the copied source
+                # changes, so a normal edit is covered; a manual `rmi`
                 # mid-session may need `tilt trigger` / `--rebuild`.
-                #if [[ "$VARIANT" == "multi-agency" ]]; then
-                #    log "Preflight image check ..."
-                #    ensure_demo_images
-                #fi
             fi
         fi
 

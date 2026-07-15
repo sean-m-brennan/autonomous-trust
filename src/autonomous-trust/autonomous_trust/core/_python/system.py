@@ -52,6 +52,12 @@ ping_rcv_port = comm_port + 2
 ping_snd_port = ping_rcv_port + 1
 ntp_port = comm_port + 4
 preferred_proto_ver = 4
+# Network subsystem poll cadence. Was 0.0001 (100us), which made the net
+# process + its receiver threads effectively busy-wait (sleep_until no-ops
+# whenever a loop iteration exceeds the cadence), pegging a core per node —
+# pathological when the whole cohort is co-located on one host. 5ms trades
+# sub-millisecond network latency (irrelevant for this demo) for far lower
+# idle CPU. See ISSUES.md (net CPU / connection churn).
 net_cadence = 0.005
 encoding = 'utf-8'
 cadence = 0.5

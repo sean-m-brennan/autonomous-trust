@@ -262,25 +262,57 @@ class BridgeDataRcvr(Process, metaclass=ProcMeta,
                 #     which reads main proc's view of peer_capabilities.
                 # main proc's view lags behind idproc's because main is
                 # heavily backlogged (102k rep_resp messages, processed
-                # one-per-500ms), so its forwards routinely carry a
-                # smaller set of caps than idproc has. Naively replacing
-                # `self.protocol.peer_capabilities = message` lets a
-                # stale 8-key forward downgrade a freshly arrived 9-key
-                # direct fan-put — manifested as EPA's airquality_stream
-                # being seen by idproc but never reaching bridge-rcvr.
-                # Accept only updates that strictly grow (or replace
-                # nothing): if incoming has fewer keys than what we
-                # already hold, drop it.
+                # one-per-500ms). The two are DIFFERENT PARTIAL VIEWS of
+                # the same {cap_name: [peer_ids]} map: each can carry keys
+                # the other lacks. An earlier size-monotonic guard
+                # (accept only if inc_n >= cur_n) tried to protect EPA's
+                # airquality_stream but did the opposite — it rejected the
+                # airquality-bearing view whenever that view had fewer
+                # *total* keys, so airquality never reached bridge-rcvr.
+                # Reconcile by UNION instead: merge incoming per-cap peer
+                # sets into what we hold so no key is ever lost to a
+                # smaller update. (Trade-off: caps are never removed here;
+                # stale peers are harmless because the subscribe loop
+                # re-checks the peer roster via find_by_uuid.)
                 cur = self.protocol.peer_capabilities
                 cur_n = len(cur) if cur is not None else 0
                 inc_n = len(message)
-                if inc_n >= cur_n:
+                # Diagnostic: which incoming keys are NEW vs what we hold,
+                # and whether this update carries airquality_stream. Lets
+                # us distinguish "arrived-and-merged" from "never arrives".
+                cur_keys = set(cur) if cur is not None else set()
+                new_keys = set(message) - cur_keys
+                _probes.counter('bridge.rcvr', 'caps_incoming_new',
+                                ','.join(sorted(new_keys)) or '(none)')
+                _probes.counter('bridge.rcvr', 'caps_has_airq',
+                                '1' if 'airquality_stream' in set(message)
+                                else '0')
+                if cur is None or cur_n == 0:
                     self.protocol.peer_capabilities = message
                     _probes.counter('bridge.rcvr', 'caps_accept',
                                     f'{cur_n}->{inc_n}')
                 else:
-                    _probes.counter('bridge.rcvr', 'caps_reject_shrink',
-                                    f'{cur_n}->{inc_n}')
+                    merged = dict(cur._listing)
+                    for cap in message:
+                        existing = merged.get(cap)
+                        if existing is None:
+                            merged[cap] = list(message[cap])
+                            continue
+                        seen = {str(p) for p in existing}
+                        combined = list(existing)
+                        for pid in message[cap]:
+                            if str(pid) not in seen:
+                                combined.append(pid)
+                                seen.add(str(pid))
+                        merged[cap] = combined
+                    new_caps = PeerCapabilities(_listing=merged)
+                    # Preserve runtime-only descriptors from both views.
+                    new_caps.descriptors = {
+                        **getattr(cur, 'descriptors', {}),
+                        **getattr(message, 'descriptors', {})}
+                    self.protocol.peer_capabilities = new_caps
+                    _probes.counter('bridge.rcvr', 'caps_merge',
+                                    f'{cur_n}->{len(new_caps)}')
                 continue
             if isinstance(message, Peers):
                 self.protocol.peers = message
