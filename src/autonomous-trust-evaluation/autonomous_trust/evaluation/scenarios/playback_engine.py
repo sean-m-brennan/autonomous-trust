@@ -267,10 +267,18 @@ class PlaybackEngine:
 
         dt_scenario = dt_wall * self._speed
         new_t = self._scenario_time + timedelta(seconds=dt_scenario)
-        duration = self._effective_duration
-        if new_t >= duration:
-            new_t = duration
-            self._playing = False
+        # Only PLAYBACK mode has a finite transport: a recording ends at its
+        # last event/snapshot, so clamp the clock there and stop. LIVE mode
+        # free-runs -- the AT mesh keeps producing observations past the
+        # scenario's nominal duration and the live coordinator never
+        # hard-stops, so freezing at duration would just stall the demo
+        # mid-run (the scripted timeline is exhausted by the last phase, but
+        # the network keeps evolving).
+        if self._mode == PlaybackMode.PLAYBACK:
+            duration = self._effective_duration
+            if new_t >= duration:
+                new_t = duration
+                self._playing = False
 
         self._scenario_time = new_t
         if self._mode == PlaybackMode.PLAYBACK:

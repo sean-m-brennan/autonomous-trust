@@ -1047,6 +1047,27 @@ void reputations_free(reputations_t *reps)
     map_free(&reps->scores);
 }
 
+/**
+ * Read a reputation threshold from the environment, falling back to @p dflt.
+ * Mirrors repprocess.py _env_float: lets an operator re-adjust the trust
+ * thresholds (neutral, communication cut-off) without a code change. A
+ * missing or unparseable value uses the default. Called at use-time from the
+ * PREREP_NEUTRAL / COMM_CUTOFF macros; kept cheap (a getenv + strtod), like
+ * the existing per-call AT_PREREP_HEURISTIC lookup.
+ */
+double reputation_env_double(const char *name, double dflt)
+{
+    const char *raw = getenv(name);
+    if (raw == NULL || raw[0] == '\0')
+        return dflt;
+    char *end = NULL;
+    errno = 0;
+    double val = strtod(raw, &end);
+    if (errno != 0 || end == raw)
+        return dflt;
+    return val;
+}
+
 /****************************
  * Reputation algorithms
  ****************************/
@@ -1066,7 +1087,7 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
     tx_history_by_peer(hist, peer_uuid, txns, &count, MAX_CHAIN_LEN);
 
     if (count == 0)
-        return 0.5;  /* Default neutral reputation */
+        return PREREP_NEUTRAL;  /* Default neutral reputation */
 
     double sum = 0.0;
     int total_weight = 0;
@@ -1093,7 +1114,7 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
         }
 
         /* Weight by counterparty's reputation */
-        double cp_rep = 0.5;
+        double cp_rep = PREREP_NEUTRAL;
         reputations_get(reps, counterparty, &cp_rep);
 
         /* Per-task transaction_weight from the cache. Lookup failure
@@ -1118,7 +1139,7 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
     }
 
     if (total_weight == 0)
-        return 0.5;
+        return PREREP_NEUTRAL;
 
     return sum / (double)total_weight;
 }
@@ -1187,7 +1208,7 @@ static double reputation_prereputation_prior(const tx_history_t *hist,
             continue;
         uuid_copy(seen[seen_count++], tx->task_uuid);
 
-        double cp_rep = 0.5;  /* reputations_get leaves this if peer absent */
+        double cp_rep = PREREP_NEUTRAL;  /* reputations_get leaves this if peer absent */
         reputations_get(reps, counterparty, &cp_rep);
         if (cp_rep <= 0.0)
             continue;
@@ -1218,7 +1239,7 @@ static double reputation_prereputation_prior(const tx_history_t *hist,
  * returned from the last direct tx alone.
  *
  *   - No bilateral history with us → reputation_prereputation_prior (§2.4),
- *       which is PREREP_NEUTRAL (0.0) when the chain knows nothing of the peer
+ *       which is PREREP_NEUTRAL (0.2) when the chain knows nothing of the peer
  *   - peer defected last AND my standing is poor → max(0.51, peer_standing)
  *   - peer defected last AND my standing is good  → min(0.49, peer_standing)
  *   - cooperative case                            → max(0.51, peer_standing)
@@ -1291,7 +1312,7 @@ double reputation_compute(const tx_history_t *hist, const reputations_t *reps,
                           const uuid_t self_uuid, const uuid_t peer_uuid,
                           const map_t *task_weights)
 {
-    double current_score = 0.5;
+    double current_score = PREREP_NEUTRAL;
     reputations_get(reps, peer_uuid, &current_score);
 
     if (current_score > 0.5)
@@ -1309,7 +1330,7 @@ double reputation_compute(const tx_history_t *hist, const reputations_t *reps,
  * latch — so every node with the same chain arrives at the same value.
  * Drives the dashboard's consensus_rep_req channel.
  *
- *   - No history or no bilateral txs → 0.5 (neutral)
+ *   - No history or no bilateral txs → PREREP_NEUTRAL (0.2, neutral)
  *   - First tx                       → ema = counterparty_score
  *   - Subsequent txs                 → ema = α·x + (1-α)·ema,
  *                                      α = 1 - 0.5^(1/HALF_LIFE)
@@ -1321,7 +1342,7 @@ double reputation_consensus(const tx_history_t *hist, const uuid_t peer_uuid,
     int count = 0;
     tx_history_by_peer(hist, peer_uuid, txns, &count, MAX_CHAIN_LEN);
     if (count == 0)
-        return 0.5;
+        return PREREP_NEUTRAL;
 
     const double alpha = 1.0 - pow(0.5, 1.0 / (double)CONSENSUS_EMA_HALF_LIFE);
     double ema = 0.0;
@@ -1371,7 +1392,7 @@ double reputation_consensus(const tx_history_t *hist, const uuid_t peer_uuid,
             }
         }
     }
-    return seeded ? ema : 0.5;
+    return seeded ? ema : PREREP_NEUTRAL;
 }
 
 /**

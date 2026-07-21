@@ -343,7 +343,7 @@ class TestContriteTitForTat:
         rp = _make_rep_process()
         peer = _make_mock_peer()
         result = rp._contrite_tit_for_tat(peer)
-        assert result == 0.0  # cold-start prior: PREREP_NEUTRAL
+        assert result == 0.2  # cold-start prior: PREREP_NEUTRAL
 
     def test_with_history(self):
         rp = _make_rep_process()
@@ -1289,7 +1289,7 @@ class TestContriteTitForTatBranches2:
 
     def test_no_matching_transactions(self):
         """Transactions with neither peer being the target peer return the
-        cold-start prior PREREP_NEUTRAL (0.0)."""
+        cold-start prior PREREP_NEUTRAL (0.2)."""
         rp = _make_rep_process()
         peer = _make_mock_peer()
         other1 = _make_mock_peer(nickname='o1', address='10.0.0.2')
@@ -1299,7 +1299,7 @@ class TestContriteTitForTatBranches2:
         rp.history.update(tid, other1.uuid, 0.7)
         rp.history.update(tid, other2.uuid, 0.8)
         result = rp._contrite_tit_for_tat(peer)
-        assert result == 0.0  # not enough info → cold-start neutral
+        assert result == 0.2  # not enough info → cold-start neutral
 
 
 class TestForwardReputationFullException:
