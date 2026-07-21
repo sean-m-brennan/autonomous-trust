@@ -37,10 +37,11 @@
 #                 those.
 #   --k8s         Minikube + kubectl apply (one-shot). Multi-agency
 #                 and dod-mission.
-#   --playback FILE  Inspector-only replay (multi-agency only).
-#   --record FILE    Inspector-only scripted run, captures events
-#                    (multi-agency only). For dod-mission, record a *live*
-#                    run instead with --record-to FILE (see dod-mission opts).
+#   --playback FILE  Canned-playback replay, no AT runtime (multi-agency
+#                    only). A live multi-agency run is now hosted by the
+#                    coordinator (an AT mesh node); capture a recording by
+#                    running the coordinator with --record inside the stack.
+#                    For dod-mission, record a *live* run with --record-to FILE.
 #   --teardown    Stop a previous run + clean up, exit.
 #
 # Examples:
@@ -189,8 +190,7 @@ Backends (pick one, defaults to --tilt; not all valid for every variant):
   --tilt                 Tilt-managed (live rebuild on save)
   --compose              docker compose (one-shot)
   --k8s                  Minikube + kubectl (multi-agency + dod-mission)
-  --playback FILE        Inspector-only replay (multi-agency only)
-  --record FILE          Inspector-only scripted run (multi-agency only)
+  --playback FILE        Canned-playback replay, no AT runtime (multi-agency only)
   --teardown             Stop a previous run, exit
   --clean                Remove generated artifacts, exit
 
@@ -348,7 +348,7 @@ esac
 # encode as variant-suffixed plain vars.
 ALLOWED_python="tilt teardown clean"
 ALLOWED_c="tilt teardown clean"
-ALLOWED_multi_agency="tilt compose k8s playback record teardown clean"
+ALLOWED_multi_agency="tilt compose k8s playback teardown clean"
 ALLOWED_dod_mission="tilt compose k8s teardown clean"
 
 _variant_slug=${VARIANT//-/_}
@@ -1139,26 +1139,20 @@ if [[ "$BACKEND_MODE" == "teardown" ]]; then
     exit 0
 fi
 
-# --- Playback / record fast paths (multi-agency only) --------------------
+# --- Playback fast path (multi-agency only) ------------------------------
+# Canned-playback replays a recorded JSON with no AT runtime (host-side
+# demo.py). Recording is no longer a standalone host-side mode: a live run is
+# now hosted by the coordinator (an AT mesh node), so capture a recording by
+# running the coordinator with --record inside the deployed stack (future:
+# a --record-to flag mirroring dod-mission's).
 
 if [[ "$BACKEND_MODE" == "playback" ]]; then
     [[ -f "$PLAYBACK_FILE" ]] || { err "Playback file not found: $PLAYBACK_FILE"; exit 1; }
-    log "Inspector-only playback mode."
+    log "Canned-playback mode (no AT runtime)."
     export AT_DEMO_PLAYBACK_FILE="$PLAYBACK_FILE"
     exec python3 -m examples.multi_agency \
         --playback "$PLAYBACK_FILE" \
         --port "$INSPECTOR_PORT"
-fi
-
-if [[ "$BACKEND_MODE" == "record" ]]; then
-    [[ -n "$RECORD_FILE" ]] || { err "Missing --record FILE argument"; exit 1; }
-    mkdir -p "$(dirname -- "$RECORD_FILE")"
-    log "Inspector-only recording mode."
-    log "    Output: $RECORD_FILE (written on Ctrl-C)"
-    exec python3 -m examples.multi_agency \
-        --record "$RECORD_FILE" \
-        --port "$INSPECTOR_PORT" \
-        --log-level "$LOG_LEVEL"
 fi
 
 # --- Manifest generation (compose/k8s only) ------------------------------
@@ -1244,6 +1238,11 @@ case "$BACKEND_MODE" in
             log "    (this can take 5-15min on a cold cluster; tail -f $TILT_LOG)"
             wait_for_deployment "$NAMESPACE" "dod-coordinator" 1500 \
                 || warn "Coordinator deployment did not become Available."
+        elif [[ "$VARIANT" == "multi-agency" ]]; then
+            log "Waiting for tilt to build images + roll out coordinator ..."
+            log "    (this can take 5-15min on a cold cluster; tail -f $TILT_LOG)"
+            wait_for_deployment "$NAMESPACE" "multi-agency-coordinator" 1500 \
+                || warn "Coordinator deployment did not become Available."
         fi
 
         # Inspector readiness probe — only the k8s scenario variants ship
@@ -1317,7 +1316,7 @@ case "$BACKEND_MODE" in
         else
             warn "Inspector did not respond within 180s; opening anyway."
             case "$VARIANT" in
-                multi-agency) warn "  docker logs multi-agency-inspector";;
+                multi-agency) warn "  docker logs multi-agency-coordinator";;
                 dod-mission)  warn "  docker compose -f $COMPOSE_FILE logs -f coordinator";;
             esac
             open_browser "http://localhost:$INSPECTOR_PORT/"
@@ -1327,7 +1326,7 @@ case "$BACKEND_MODE" in
         log "--- Running. Ctrl-C to stop ---"
         case "$VARIANT" in
             multi-agency)
-                log "Inspector logs: docker logs -f multi-agency-inspector"
+                log "Coordinator logs: docker logs -f multi-agency-coordinator"
                 trap '(cd "$DEPLOY_DIR" && docker compose down) || true; \
                       cleanup_inspector_procs' EXIT
                 ;;
@@ -1365,8 +1364,8 @@ case "$BACKEND_MODE" in
         # name and the NodePort service name; both are captured here.
         case "$VARIANT" in
             multi-agency)
-                inspector_deploy="multi-agency-inspector"
-                inspector_svc="multi-agency-inspector"
+                inspector_deploy="multi-agency-coordinator"
+                inspector_svc="multi-agency-coordinator"
                 ;;
             dod-mission)
                 inspector_deploy="dod-coordinator"

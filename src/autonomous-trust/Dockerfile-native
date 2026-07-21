@@ -59,6 +59,34 @@ ENTRYPOINT ["/bin/entrypoint.sh"]
 COPY src/autonomous-trust/requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt && pip install protobuf cffi
 
+# --- ZK-STARK proof extension (autonomous_trust_zkp) -------------------
+# Build the PyO3/maturin Rust extension so ZKP_AVAILABLE is True at runtime
+# and task-result proofs are generated/verified instead of scored as
+# "indeterminate". Build-time only: the Rust toolchain is removed after the
+# wheel is installed, to keep the image lean. Heavy build (Plonky3 STARK
+# deps + LTO release) and needs network access to crates.io + sh.rustup.rs
+# at build time.
+#
+# Deliberately NON-FATAL: if the toolchain, registry, or build fails, the
+# image still builds and the runtime degrades gracefully — automate.py
+# scores task results on successful completion when ZKP_AVAILABLE is False
+# (see the TaskResult branch). Verify after build with:
+#   docker run --rm <image> python3 -c \
+#     "from autonomous_trust.core._zkp import ZKP_AVAILABLE; print(ZKP_AVAILABLE)"
+# To make a missing ZKP a hard build error instead, drop the `|| echo ...`.
+COPY src/autonomous-trust/rust /app/zkp-rust
+RUN ( curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal && \
+      . "$HOME/.cargo/env" && \
+      pip install "maturin>=1.0,<2.0" && \
+      maturin build --release --manifest-path /app/zkp-rust/Cargo.toml \
+        --out /app/zkp-wheels && \
+      pip install /app/zkp-wheels/*.whl ) \
+    || echo "WARNING: autonomous_trust_zkp build failed/unavailable; runtime "\
+"will run with ZKP_AVAILABLE=False (task-result scoring falls back to "\
+"completion-based)." ; \
+    rm -rf /app/zkp-rust /app/zkp-wheels "$HOME/.cargo" "$HOME/.rustup"
+
 # Build C library. CMake expects protobuf as a sibling of c-src:
 # ${CMAKE_CURRENT_SOURCE_DIR}/../protobuf
 ARG GIT_VERSION="unknown"

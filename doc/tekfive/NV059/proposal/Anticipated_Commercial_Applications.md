@@ -1,0 +1,13 @@
+The problem AutonomousTrust solves for the Navy, proving trust when the link back to a central authority is gone, shows up well beyond defense. Wherever machines outnumber people and the network cannot be assumed, a PKI round-trip to a central CA becomes a single point of failure. AT removes that dependency by deciding trust at the node: continuous, behavioral, and cryptographically auditable, working while disconnected and reconciling on reconnect, with no data-lake backhaul and a footprint small enough for a microcontroller-class device. That is the property conventional Zero Trust cannot provide, and it carries across every market below.
+
+Industrial and critical-infrastructure operators run thousands of long-lived controllers on flat networks where a stolen certificate opens every door. AT gives each PLC or sensor a behavioral envelope, so a valid but hijacked device that starts issuing off-profile commands loses reputation and is gated out locally, in milliseconds, without waiting on a security operations center that may itself be cut off. That directly limits ransomware lateral movement.
+
+Space and delay-tolerant networks live in permanent DDIL, where light-lag makes a central check impractical. AT was built for this case: cohorts vouch for one another, admit peers at capped tiers under partition, and carry signed evidence back for reconciliation. Constellations, cislunar relays, and deep-space assets need trust that survives a twenty-minute round-trip.
+
+Financial services need machine-to-machine trust that survives a data-center partition and still produces a tamper-evident record for regulators. Inter-institution settlement, ATM and point-of-sale fleets, and automated trading systems fit AT's Merkle-checkpointed ledgers, which give immutability and distributed agreement without the cost and latency of a global blockchain.
+
+Healthcare devices such as infusion pumps, imaging systems, and home telemetry must keep operating and stay verifiable when the hospital uplink drops. AT protects device and data-exchange integrity at the edge and leaves an auditable trail for safety and HIPAA review.
+
+The clearest emerging market is agentic AI. As autonomous software agents proliferate and act on our behalf, the question is no longer whether an identity is valid but whether an agent is still behaving as it should. AT evaluates exactly that, continuously and without a human in the loop, which makes it a practical trust layer for multi-agent systems.
+
+The common thread across these markets is one capability: keep Zero Trust guarantees when the central authority is unreachable, at OT scale and cost. The addressable market is every fleet of machines that cannot afford to fail open or fail closed.

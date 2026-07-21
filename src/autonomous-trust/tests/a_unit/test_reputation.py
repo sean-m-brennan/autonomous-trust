@@ -436,12 +436,13 @@ def _stub_proc(self_uuid, reputations=None):
 class TestContriteTitForTat:
     def test_empty_history_returns_neutral(self):
         # No bilateral history AND nothing on the chain → cold-start prior
-        # returns PREREP_NEUTRAL (0.0): an unknown peer starts at the bottom
-        # of the TFT band and must earn its way up.
+        # returns PREREP_NEUTRAL (0.2): an unknown peer starts at neutral
+        # (a small leeway above the 0.1 comm cut-off) and must earn its
+        # way up.
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         peer = SimpleNamespace(uuid=peer_id)
-        assert ReputationProcess._contrite_tit_for_tat(stub, peer) == 0.0
+        assert ReputationProcess._contrite_tit_for_tat(stub, peer) == 0.2
 
     def test_cooperative_self_p1(self):
         """Self enters as p1, peer as p2, both cooperate. Falls into
@@ -512,9 +513,10 @@ class TestContriteTitForTat:
         stub.history.update(t, other, 0.1)     # other → p2 (scores the peer)
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
-        # observed standing = other's score about peer = 0.1, cp_rep(other)=0.5,
-        # shrunk toward neutral 0.0: (1*0.1 + 3*0.0) / (1+3) = 0.025.
-        assert score == pytest.approx(0.025, abs=0.001)
+        # observed standing = other's score about peer = 0.1 (cp_rep cancels
+        # in the weighted mean of a single observation), shrunk toward
+        # neutral 0.2: (1*0.1 + 3*0.2) / (1+3) = 0.175.
+        assert score == pytest.approx(0.175, abs=0.001)
 
 
 class TestPrereputationPrior:
@@ -525,7 +527,7 @@ class TestPrereputationPrior:
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         assert ReputationProcess._prereputation_prior(stub, peer_id) \
-            == pytest.approx(0.0, abs=1e-9)
+            == pytest.approx(0.2, abs=1e-9)
 
     def test_self_counterparty_excluded(self):
         # A one-sided tx where WE are the counterparty must not seed the
@@ -537,7 +539,7 @@ class TestPrereputationPrior:
         stub.history.update(t, self_id, 0.2)   # self → p2 (we score peer)
         # self is excluded → no third-party observation → neutral.
         assert ReputationProcess._prereputation_prior(stub, peer_id) \
-            == pytest.approx(0.0, abs=1e-9)
+            == pytest.approx(0.2, abs=1e-9)
 
     def test_shrinks_toward_neutral_with_sample_size(self):
         # More consistent third-party evidence pulls the prior further from
@@ -551,9 +553,9 @@ class TestPrereputationPrior:
             stub.history.update(t, peer_id, 0.9)  # peer → p1
             stub.history.update(t, o, 0.9)        # other scores peer 0.9
         prior = ReputationProcess._prereputation_prior(stub, peer_id)
-        # observed=0.9, n=4, k=3, neutral=0.0 → (4*0.9 + 3*0.0)/7 = 0.5142857...
-        assert prior == pytest.approx((4 * 0.9 + 3 * 0.0) / 7, abs=0.001)
-        assert 0.0 < prior < 0.9
+        # observed=0.9, n=4, k=3, neutral=0.2 → (4*0.9 + 3*0.2)/7 = 0.6.
+        assert prior == pytest.approx((4 * 0.9 + 3 * 0.2) / 7, abs=0.001)
+        assert 0.2 < prior < 0.9
 
     def test_kill_switch_restores_flat_neutral(self, monkeypatch):
         monkeypatch.setenv('AT_PREREP_HEURISTIC', '0')
@@ -562,18 +564,19 @@ class TestPrereputationPrior:
         t = uuid4()
         stub.history.update(t, peer_id, 0.9)
         stub.history.update(t, other, 0.9)
-        assert ReputationProcess._prereputation_prior(stub, peer_id) == 0.0
+        assert ReputationProcess._prereputation_prior(stub, peer_id) == 0.2
 
 
 class TestPureReputation:
-    def test_empty_history_returns_0_5(self):
-        """Default 0.5 (mirrors reputation.c:419-420 / :454-455).
-        Returning 0.0 would route the peer right back into CTFT mode."""
+    def test_empty_history_returns_neutral(self):
+        """Default PREREP_NEUTRAL (0.2) on no history (mirrors C).
+        Returning a lower value would route the peer right back into
+        CTFT mode."""
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         score = ReputationProcess._pure_reputation(
             stub, SimpleNamespace(uuid=peer_id))
-        assert score == 0.5
+        assert score == 0.2
 
     def test_weighted_average(self):
         """Counterparty score weighted by counterparty reputation."""
@@ -589,9 +592,10 @@ class TestPureReputation:
         # counterparty_score = 0.7, cp_rep = 0.8 → 0.56.
         assert score == pytest.approx(0.56, abs=0.001)
 
-    def test_unknown_counterparty_uses_default_0_5(self):
+    def test_unknown_counterparty_uses_default_neutral(self):
         """Counterparty missing from self.reputations falls back to
-        0.5 (mirrors C); does not silently skip the transaction."""
+        PREREP_NEUTRAL (0.2, mirrors C); does not silently skip the
+        transaction."""
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)  # empty reputations dict
         t = uuid4()
@@ -599,8 +603,8 @@ class TestPureReputation:
         stub.history.update(t, self_id, 0.6)
         score = ReputationProcess._pure_reputation(
             stub, SimpleNamespace(uuid=peer_id))
-        # counterparty_score = 0.6, cp_rep = 0.5 → 0.3.
-        assert score == pytest.approx(0.3, abs=0.001)
+        # counterparty_score = 0.6, cp_rep = 0.2 → 0.12.
+        assert score == pytest.approx(0.12, abs=0.001)
 
 
 class TestProposerHistoryBilateral:

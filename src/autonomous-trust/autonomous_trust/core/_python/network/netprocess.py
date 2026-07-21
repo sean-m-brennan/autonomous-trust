@@ -111,6 +111,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.acceptance = acceptance_func
         self.pests = {}
         self.protocol = Protocol(self.name, self.logger, configurations)
+        # Reputation cut-off enforcement: ReputationProcess feeds
+        # exclude/readmit control messages here as peers cross the
+        # communication cut-off. See handle_exclude / handle_readmit and
+        # the inbound-drop / outbound-forward gates below.
+        self.protocol.register_handler(Network.exclude, self.handle_exclude)
+        self.protocol.register_handler(Network.readmit, self.handle_readmit)
         self.stop = False
         self.statistics = {}
         self._rejected_addresses: set[str] = set()
@@ -244,6 +250,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         :param address: Incoming sender
         :return: bool
         """
+        if self.reject_message(address):
+            return False
         if self.acceptance is not None:
             return self.acceptance(address)
         if self.peers.find_by_address(address) is None:
@@ -260,13 +268,47 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             return False
         return self.accept_peer_message(address)
 
+    @staticmethod
+    def _norm_addr(address):
+        """Canonicalize an address to the form used as the peer-listing
+        key (strip any '/suffix'), matching Peers.find_by_address so an
+        exclusion keyed on a peer's stored address matches the raw
+        from_addr seen at recv."""
+        if address is None:
+            return None
+        address = str(address)
+        if '/' in address:
+            address = address.split('/')[0]
+        return address
+
     def reject_message(self, address):
-        """Check if an address has been blacklisted."""
-        return address in self._rejected_addresses
+        """Check if an address is excluded (reputation cut-off) or
+        otherwise blacklisted."""
+        return self._norm_addr(address) in self._rejected_addresses
 
     def blacklist_address(self, address):
         """Add an address to the rejection list."""
-        self._rejected_addresses.add(address)
+        self._rejected_addresses.add(self._norm_addr(address))
+
+    def handle_exclude(self, queues, message):
+        """Exclude a peer's address (reputation cut-off): its inbound
+        frames are dropped and it is filtered out of outbound targets.
+        Fed by ReputationProcess._publish_exclusion. Local IPC only."""
+        addr = self._norm_addr(getattr(message, 'obj', None))
+        if addr:
+            self._rejected_addresses.add(addr)
+            _probes.counter('net.exclude', 'add')
+            self.logger.info('Reputation cut-off: excluding %s' % addr)
+        return True
+
+    def handle_readmit(self, queues, message):
+        """Reverse an exclusion (explicit rehabilitation). Local IPC."""
+        addr = self._norm_addr(getattr(message, 'obj', None))
+        if addr:
+            self._rejected_addresses.discard(addr)
+            _probes.counter('net.exclude', 'remove')
+            self.logger.info('Reputation readmit: %s' % addr)
+        return True
 
     _PARTITION_SIGNAL_COOLDOWN = 5.0  # seconds, per from_addr
 
@@ -640,6 +682,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                 for addr in message.to_whom.addresses:
                                     if addr == self.myself.address:
                                         continue
+                                    # Reputation cut-off: do not forward
+                                    # to/for an excluded member (a gateway
+                                    # thus stops relaying toward it).
+                                    if self.reject_message(addr):
+                                        _probes.counter('net.group', 'skip', 'excluded_target')
+                                        continue
                                     try:
                                         self.send_group(msg, addr)
                                         self.track_send_stats(self.unknown_peer, len(msg))
@@ -651,6 +699,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     address = who.address
                                     if '/' in address:
                                         address = address.split('/')[0]
+                                    # Reputation cut-off: skip an excluded
+                                    # recipient.
+                                    if self.reject_message(address):
+                                        _probes.counter('net.ptp', 'skip', 'excluded_target')
+                                        continue
                                     if message.encrypt:
                                         msg = self.myself.encrypt(bytes(message), who)
                                     else:
@@ -687,6 +740,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     except IndexError:
                         break
                     drained_ptp += 1
+                    # Reputation cut-off: an excluded sender is ignored --
+                    # drop its frame before any decrypt/delivery.
+                    if self.reject_message(from_addr):
+                        _probes.counter('net.ptp', 'drop', 'excluded')
+                        continue
                     # Use the LIVE roster (self.peers), not the original bootstrap
                     # Peers object in self.configs[CfgIds.peers] (only the welcomer's
                     # address). Every other attribution site uses self.peers; using
@@ -751,6 +809,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     except IndexError:
                         break
                     drained_grp += 1
+                    # Reputation cut-off: drop an excluded sender's group
+                    # frame before decrypt/delivery (a gateway thus does
+                    # not relay it onward either).
+                    if self.reject_message(from_addr):
+                        _probes.counter('net.group', 'drop', 'excluded')
+                        continue
                     # Resolve which group this sender belongs to. For a
                     # leaf node this is always the primary group (or
                     # None), so the path is identical to before. A
@@ -799,6 +863,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     except IndexError:
                         break
                     drained_unk += 1
+                    # Reputation cut-off: ignore an excluded peer even on
+                    # the stranger/multicast channel.
+                    if self.reject_message(from_addr):
+                        _probes.counter('net.multicast', 'drop', 'excluded')
+                        continue
                     self._msg_to_queue(raw_msg, from_addr, queues, 'multicast', validate=False)
                 total_inbound += drained_unk
 

@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import os
 import random
 from itertools import zip_longest
 from typing import Any
@@ -28,6 +29,15 @@ from ..peer.daq import PeerDataAcq, CohortInterface
 from .dynamic_map import DynamicMap
 from .video_feed import VideoFeed
 from .data_feed import DataFeed
+
+
+# Communication cut-off (default 0.1), synced to the reputation backend via
+# the shared AT_REP_COMM_CUTOFF override so the trust gauge's red/excluded
+# band matches a re-adjusted deployment.
+try:
+    _COMM_CUTOFF = float(os.environ.get('AT_REP_COMM_CUTOFF', '') or 0.1)
+except (TypeError, ValueError):
+    _COMM_CUTOFF = 0.1
 
 
 class PeerStatus(DashComponent):
@@ -123,18 +133,25 @@ class PeerStatus(DashComponent):
         if idx in self.trust_figs:
             return self.trust_figs[idx]
         gauge = go.Figure()
+        # Reputation is on the [0, 1] scale; the gauge value is that
+        # reputation directly (see update_trust_levels). Bands: red below
+        # the 0.1 communication cut-off (excluded from the network),
+        # amber in the low/degraded 0.1–0.5 band, green above the 0.5
+        # tier-1 trust floor. The white threshold marker sits on the 0.1
+        # cut-off so an excluded peer reads at a glance.
         gauge.add_trace(go.Indicator(mode="gauge+number",
                                      domain={'x': [0, 1], 'y': [0, 1]},
                                      title={'text': "Trust level"},
-                                     gauge={'axis': {'range': [None, 500]},
+                                     number={'valueformat': '.2f'},
+                                     gauge={'axis': {'range': [0, 1]},
                                             'bar': {'color': "royalblue"},
                                             'steps': [
-                                                {'range': [0, 45], 'color': "red"},
-                                                {'range': [55, 65], 'color': "yellow"},
-                                                {'range': [65, 100], 'color': "green"}],
+                                                {'range': [0, _COMM_CUTOFF], 'color': "red"},
+                                                {'range': [_COMM_CUTOFF, 0.5], 'color': "orange"},
+                                                {'range': [0.5, 1], 'color': "green"}],
                                             'threshold': {'line': {'color': "white", 'width': 4},
                                                           'thickness': 0.75,
-                                                          'value': 50}},
+                                                          'value': _COMM_CUTOFF}},
                                      name=f'trust-gauge-{idx}',
                                      value=0.))
         self.trust_figs[idx] = gauge

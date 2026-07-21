@@ -65,11 +65,15 @@ class ComposeOptions:
     scenario_mount: str = "/app/scenario"  # path where scenario.json is mounted
     metrics_mount: Optional[str] = None    # host path for metrics-collector dir
     extra_env: dict[str, str] = field(default_factory=dict)
-    # Multi-agency-demo inspector container. Runs the Dash server + bridge
-    # on the same demo-net so it can observe peer traffic. Shares the
-    # registry/image_tag of the peer image.
+    # Multi-agency coordinator container: an AT mesh node that hosts the
+    # demo.py dashboard in-thread (see disaster_response_compose._inspector_
+    # entry / _inspector_k8s_yaml). Reuses the autonomous-trust-inspector
+    # image (which already ships examples/multi_agency + the dashboard stack)
+    # via an explicit `-m examples.multi_agency.coordinator` command, so no
+    # dedicated image is needed. Field names retain the historical
+    # "inspector_" prefix to avoid churning callers.
     inspector_image: str = "autonomous-trust-inspector"
-    inspector_last_octet: int = 250        # subnet host byte for the inspector
+    inspector_last_octet: int = 250        # subnet host byte for the coordinator
     inspector_host_port: int = 8050        # published to host
     include_inspector: bool = True         # set False to suppress the service
     # Debug-probes wiring (see core/_python/_probes/). When `probes` is
@@ -168,25 +172,37 @@ def _peer_entry(peer_name: str, role, ip: str, delay_sec: int,
 
 
 def _inspector_entry(opts: ComposeOptions) -> list[str]:
-    """Build the compose service for the multi-agency inspector container."""
+    """Build the compose service for the multi-agency coordinator container.
+
+    The coordinator is itself an AutonomousTrust mesh node that hosts the
+    demo.py dashboard in-thread (mirroring the DoD-mission coordinator), so a
+    single container is both the mesh participant and the dashboard host — no
+    separate bridge/observer node. It reuses the ``autonomous-trust-inspector``
+    image (which already ships ``examples/multi_agency`` + the full dashboard
+    stack on PYTHONPATH) via an explicit ``-m examples.multi_agency.coordinator``
+    command, so no dedicated image is needed.
+    """
     image = f"{opts.registry}{opts.inspector_image}{opts.image_tag}"
     ip = f"{opts.subnet.rsplit('.', 1)[0]}.{opts.inspector_last_octet}"
     env_lines = [
-        f'      AT_PEER_NAME: "inspector"',
+        f'      AT_PEER_NAME: "coordinator"',
         f'      AUTONOMOUS_TRUST_BACKEND: "{opts.backend}"',
         f'      AT_TRANSPORT: "autonomous_trust.core.network.TCPNetworkProcess"',
         f'      LOG_LEVEL: "{opts.log_level}"',
-        # The inspector joins a peer mesh that's already bootstrapping;
+        # The coordinator joins a peer mesh that's already bootstrapping;
         # the default 5s choose_group window loses the race against UDP
         # broadcast + vote + finalize. 30s gives the existing peers
         # time to vote-and-respond. Peers themselves keep the default.
         f'      AT_INIT_TIMEOUT_SEC: "30"',
-        # Hold inspector startup until peer TCP listeners are bound.
+        # Hold coordinator startup until peer TCP listeners are bound.
         # Peer 5s stagger × 9 = 40s for the synchronous batch (epa-1
         # joins at scenario T+360s regardless). 45s gives a safety
-        # margin so the inspector's single request_access multicast
-        # doesn't race peers' socket bind().
+        # margin so the coordinator's single request_access multicast
+        # doesn't race peers' socket bind(). Honored by coordinator.py:main().
         f'      STARTUP_DELAY: "45"',
+        # Writable AT config/identity root (explicit command bypasses the
+        # native entrypoint's default rooting). /tmp is always writable.
+        f'      AUTONOMOUS_TRUST_ROOT: "/tmp/multi-agency-coordinator"',
     ]
     if opts.probes:
         env_lines.append(f'      AT_PROBES: "1"')
@@ -204,19 +220,19 @@ def _inspector_entry(opts: ComposeOptions) -> list[str]:
     volume_lines = [f"      - ./scenario:{opts.scenario_mount}:ro"]
     if opts.probes:
         volume_lines.append(f"      - {opts.probes_host_dir}:{opts.probes_container_dir}")
-    # Override the Dockerfile CMD so the inspector log level tracks
-    # opts.log_level (the Dockerfile bakes in --log-level info).
+    # Explicit command (bypasses the baked CMD): run the coordinator, which
+    # hosts the dashboard on 8050. log level tracks opts.log_level.
     return [
-        "  inspector:",
+        "  coordinator:",
         f"    image: {image}",
-        "    container_name: multi-agency-inspector",
-        "    hostname: multi-agency-inspector",
+        "    container_name: multi-agency-coordinator",
+        "    hostname: multi-agency-coordinator",
         "    environment:",
         *env_lines,
         "    command:",
         '      - "python3"',
         '      - "-m"',
-        '      - "examples.multi_agency"',
+        '      - "examples.multi_agency.coordinator"',
         '      - "--port"',
         '      - "8050"',
         '      - "--log-level"',
@@ -338,31 +354,37 @@ def _env_block(env: dict[str, str], indent: str = "            ") -> str:
     return "\n".join(out)
 
 
-# NodePort for the in-cluster inspector. Falls in the standard
+# NodePort for the in-cluster coordinator dashboard. Falls in the standard
 # 30000-32767 range that k8s reserves for NodePort services.
 _INSPECTOR_NODE_PORT = 30850
 
 
 def _inspector_k8s_yaml(opts: ComposeOptions, namespace: str) -> str:
-    """Deployment + NodePort Service for the multi-agency inspector.
+    """Deployment + NodePort Service for the multi-agency coordinator.
 
-    Mirrors `_inspector_entry` (compose) so behavior is identical
-    across backends. The inspector pod sits on the regular cluster
-    network, talks to peers in the same namespace via TCP, and exposes
-    its Dash UI on NodePort 30850 so `minikube service` yields a
-    browser-ready URL."""
+    Mirrors `_inspector_entry` (compose) so behavior is identical across
+    backends. The coordinator pod is an AutonomousTrust mesh node that hosts
+    the demo.py dashboard in-thread (no separate observer node); it sits on
+    the regular cluster network, talks to peers in the same namespace via
+    TCP, and exposes its Dash UI on NodePort 30850 so `minikube service`
+    yields a browser-ready URL. Reuses the autonomous-trust-inspector image
+    (which ships examples/multi_agency + the dashboard stack) via an explicit
+    `-m examples.multi_agency.coordinator` command."""
     image = f"{opts.registry}{opts.inspector_image}{opts.image_tag}"
 
     env: dict[str, str] = {
         "ROUTER": opts.router,
         "AUTONOMOUS_TRUST_BACKEND": opts.backend,
         "AT_TRANSPORT": "autonomous_trust.core.network.TCPNetworkProcess",
-        "AT_PEER_NAME": "inspector",
-        # Same race-margin tuning as the compose bridge — inspector joins
+        "AT_PEER_NAME": "coordinator",
+        # Same race-margin tuning as the compose path — the coordinator joins
         # an already-bootstrapping mesh, so the choose_group window and
         # startup delay are both lengthened.
         "AT_INIT_TIMEOUT_SEC": "30",
         "STARTUP_DELAY": "45",
+        # Writable AT config/identity root (explicit command bypasses the
+        # native entrypoint's default rooting).
+        "AUTONOMOUS_TRUST_ROOT": "/tmp/multi-agency-coordinator",
         "LOG_LEVEL": opts.log_level,
     }
     # Forward Mapbox env (host → cluster) when present, identical to the
@@ -383,36 +405,34 @@ def _inspector_k8s_yaml(opts: ComposeOptions, namespace: str) -> str:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: multi-agency-inspector
+  name: multi-agency-coordinator
   namespace: {namespace}
   labels:
-    app: multi-agency-inspector
-    role: inspector
+    app: multi-agency-coordinator
+    role: coordinator
     scenario: disaster-response
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: multi-agency-inspector
+      app: multi-agency-coordinator
   template:
     metadata:
       labels:
-        app: multi-agency-inspector
-        role: inspector
+        app: multi-agency-coordinator
+        role: coordinator
         scenario: disaster-response
     spec:
       containers:
-        - name: inspector
+        - name: coordinator
           image: {image}
           imagePullPolicy: IfNotPresent
           command:
             - "python3"
             - "-m"
-            - "examples.multi_agency"
+            - "examples.multi_agency.coordinator"
             - "--port"
             - "8050"
-            - "--namespace"
-            - "{namespace}"
             - "--log-level"
             - "{opts.log_level}"
           ports:
@@ -444,16 +464,16 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: multi-agency-inspector
+  name: multi-agency-coordinator
   namespace: {namespace}
   labels:
-    app: multi-agency-inspector
-    role: inspector
+    app: multi-agency-coordinator
+    role: coordinator
     scenario: disaster-response
 spec:
   type: NodePort
   selector:
-    app: multi-agency-inspector
+    app: multi-agency-coordinator
   ports:
     - name: http
       port: 8050
@@ -558,7 +578,7 @@ def generate_k8s_manifests(scenario, namespace: str = "disaster-demo",
     )
 
     if opts.include_inspector:
-        files["inspector.yaml"] = _inspector_k8s_yaml(opts, namespace)
+        files["coordinator.yaml"] = _inspector_k8s_yaml(opts, namespace)
 
     return files
 
