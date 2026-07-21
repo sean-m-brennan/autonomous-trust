@@ -34,6 +34,13 @@ class Network(InitializableConfig):
     ping = 'ping'
     stats_req = 'stats_req'
     stats_resp = 'stats_resp'
+    # Reputation communication cut-off control (local IPC, reputation ->
+    # network). A peer whose reputation falls below the cut-off is
+    # EXCLUDED: the network process ignores its inbound frames and does
+    # not forward to/for it. `readmit` reverses it (explicit
+    # rehabilitation only). Payload is the peer's address string.
+    exclude = 'exclude'
+    readmit = 'readmit'
     # Parser-level wire-bytes size cap. Matches the C transport's
     # NET_MSG_MAX_DATA (net_message.h:31). Enforced at envelope-parse
     # time as defense-in-depth: the TCP transport already caps inbound
