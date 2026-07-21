@@ -37,6 +37,7 @@ Usage:
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -52,7 +53,17 @@ _DEFAULT_AGENCY_COLORS = {
 }
 
 
-# Trust -> color ramp. Green at high trust, yellow mid, red low.
+# Trust -> color ramp on the [0, 1] scale. Green at high trust, yellow
+# mid, red low, and a distinct dark red below the communication cut-off
+# (default 0.1) so an excluded peer reads differently from merely
+# low-trust. Kept in sync with the reputation backend via the shared
+# AT_REP_COMM_CUTOFF override.
+try:
+    _COMM_CUTOFF = float(os.environ.get('AT_REP_COMM_CUTOFF', '') or 0.1)
+except (TypeError, ValueError):
+    _COMM_CUTOFF = 0.1
+
+
 def _trust_color(score: float) -> str:
     """Map a trust score in [0, 1] to a CSS color."""
     s = max(0.0, min(1.0, score))
@@ -62,8 +73,12 @@ def _trust_color(score: float) -> str:
     if s >= 0.4:
         # yellow band
         return f"rgba(251, 191, 36, {0.4 + 0.5 * s:.3f})"
-    # red band (low trust)
-    return f"rgba(239, 68, 68, {0.4 + 0.4 * s:.3f})"
+    if s >= _COMM_CUTOFF:
+        # red band (low but still participating)
+        return f"rgba(239, 68, 68, {0.4 + 0.4 * s:.3f})"
+    # below the communication cut-off: excluded — deep, opaque crimson
+    # distinct from the merely-low red band above.
+    return "rgba(136, 19, 55, 0.95)"
 
 
 @dataclass
@@ -286,6 +301,8 @@ class TrustNetworkGraph:
         # solving everyone when almost nothing is connected yet (pre-trust).
         linked = set()
         for edge in self._edges.values():
+            if not self._is_layout_edge(edge):
+                continue
             if edge.a in self._nodes and edge.b in self._nodes:
                 linked.add(edge.a)
                 linked.add(edge.b)
@@ -303,6 +320,8 @@ class TrustNetworkGraph:
         # Reputation springs: higher trust => larger weight => stronger pull.
         solved = {n.name for n in peers}
         for edge in self._edges.values():
+            if not self._is_layout_edge(edge):
+                continue  # null edges are display-only; no spring
             if edge.a in solved and edge.b in solved:
                 w = self.TRUST_WEIGHT_BASE + self.TRUST_WEIGHT_SCALE * edge.trust
                 g.add_edge(edge.a, edge.b, weight=w)
@@ -383,15 +402,12 @@ class TrustNetworkGraph:
         # Canonicalize so set_trust("a","b") and set_trust("b","a") share key.
         key = tuple(sorted((a, b)))
         score = max(0.0, min(1.0, score))
-        # A 0.0 reputation is "no trust relationship yet" (the cold-start /
-        # no-bilateral-history value), not a weak one -- so draw NO edge, and
-        # drop any existing edge if trust has decayed to 0. This keeps such a
-        # peer out of the force solve entirely, so it's placed as a
-        # disconnected node at the periphery (see _display_coords) rather than
-        # tethered by a null spring and colored as if a relationship existed.
-        if score <= self.EDGE_TRUST_EPS:
-            self._edges.pop(key, None)
-            return
+        # A 0.0-weight bilateral edge IS drawn (thin, sparsely dashed -- see
+        # _edge_dash), but it stays DISPLAY-ONLY: it's excluded from the force
+        # solve (see _is_layout_edge / _relayout / _display_coords) so a peer
+        # whose only edge is null still floats at the periphery rather than
+        # being tethered by a null spring. This preserves the trust-driven
+        # layout while surfacing the zero relationship visually.
         self._edges[key] = _Edge(a=key[0], b=key[1], trust=score)
 
     def clear_trust(self, a: str, b: str):
@@ -424,16 +440,36 @@ class TrustNetworkGraph:
         return (self._peer_colors.get(node.name)
                 or self._colors.get(node.agency, "#888"))
 
+    def _is_layout_edge(self, edge: _Edge) -> bool:
+        """True if the edge should exert a force-solve spring. Null
+        (zero-weight) edges are DISPLAY-ONLY: drawn, but they neither pull
+        nodes together nor count a node as "connected" for placement."""
+        return edge.trust > self.EDGE_TRUST_EPS
+
     def _edge_width(self, edge: _Edge) -> float:
         if not edge.active:
             return 0.5
+        if not self._is_layout_edge(edge):
+            return 1.0     # thin: a null (zero-weight) relationship
         # 0.5 at trust=0 up to 5.0 at trust=1
         return 0.5 + 4.5 * edge.trust
+
+    def _edge_dash(self, edge: _Edge) -> Optional[str]:
+        """Dash pattern for the edge line. Null (zero-weight) bilateral edges
+        render as a thin, sparsely dashed line (short dashes, wide gaps);
+        every other edge is solid."""
+        if edge.active and not self._is_layout_edge(edge):
+            return "3px,9px"
+        return None        # solid
 
     def _edge_color(self, edge: _Edge) -> str:
         # Inactive edges fade to very low opacity grey (cutoff visible).
         if not edge.active:
             return "rgba(148, 163, 184, 0.15)"
+        if not self._is_layout_edge(edge):
+            # Null (zero-weight) bilateral edge: faint grey so it reads as a
+            # present-but-trustless relationship, not a strong tie.
+            return "rgba(148, 163, 184, 0.45)"
         na = self._nodes.get(edge.a)
         nb = self._nodes.get(edge.b)
         if ((na and na.status in ("compromised", "excluded"))
@@ -494,11 +530,15 @@ class TrustNetworkGraph:
         nodes = list(self._nodes.values())
         if not nodes:
             return {}
-        # A node is "connected" if it appears in any trust edge (active or
-        # not). Edge-less nodes were dropped from the solve (see _relayout);
-        # we place them deterministically below.
+        # A node is "connected" if it appears in any LAYOUT trust edge. Null
+        # (zero-weight) edges are display-only and don't count -- a peer held
+        # only by null edges was dropped from the solve (see _relayout) and is
+        # placed deterministically at the periphery below, consistent with
+        # that. (Must match _relayout's linked set or the two disagree.)
         linked = set()
         for e in self._edges.values():
+            if not self._is_layout_edge(e):
+                continue
             linked.add(e.a)
             linked.add(e.b)
         ref = [n for n in nodes if n.name in linked]
@@ -585,11 +625,13 @@ class TrustNetworkGraph:
                 y=[ay, by],
                 mode="lines",
                 line=dict(color=self._edge_color(edge),
-                          width=self._edge_width(edge)),
+                          width=self._edge_width(edge),
+                          dash=self._edge_dash(edge)),
                 hoverinfo="text",
                 hovertext=(f"{edge.a} &harr; {edge.b}<br>"
                            f"trust: {edge.trust:.2f}"
-                           f"{'' if edge.active else ' (inactive)'}"),
+                           f"{'' if edge.active else ' (inactive)'}"
+                           f"{' (no trust)' if edge.active and not self._is_layout_edge(edge) else ''}"),
                 showlegend=False,
             ))
 

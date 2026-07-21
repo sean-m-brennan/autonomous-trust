@@ -56,6 +56,7 @@ from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, N
 from .network import Message
 from .reputation import TransactionScore, ReputationProtocol
 from .queue_pool import QueuePool
+from .._zkp import ZKP_AVAILABLE
 from . import _probes
 
 PoolType = Union[ProcessPool, ThreadPool]
@@ -589,10 +590,37 @@ class AutonomousTrust(Protocol):
                 elif isinstance(message, TaskResult):
                     task = message
                     self.logger.debug(self.name + ': Task result recvd: %s' % task.result)
+                    # Requestor-side score for a returned TaskResult. verify_proof()
+                    # is tri-state: True (proof verified), False (proof present but
+                    # INVALID -> genuine tamper signal), or None (indeterminate: no
+                    # proof attached, or ZKP unavailable in this process).
+                    #
+                    # None must NOT be scored as a defection. Split by cause:
+                    #   * ZKP unavailable process-wide -> proofs cannot attest
+                    #     anything, so score on the fact the task completed with a
+                    #     result; missing infrastructure is not the peer's fault.
+                    #   * ZKP available but proof absent -> suspicious; score as a
+                    #     defection, like an invalid proof.
+                    # Previously `0.8 if zkp_valid else 0.3` collapsed None into the
+                    # defection bucket, so with the ZKP extension unshipped every
+                    # requestor scored 0.3 and honest reputation cratered.
                     zkp_valid = task.verify_proof()
-                    if zkp_valid is False:
-                        self.logger.warning(self.name + ': ZKP verification FAILED for task %s' % task.uuid)
-                    score = 0.8 if zkp_valid else 0.3
+                    if zkp_valid is True:
+                        score = 0.8
+                    elif zkp_valid is False:
+                        self.logger.warning(
+                            self.name + ': ZKP verification FAILED for task %s'
+                            % task.uuid)
+                        score = 0.3
+                    elif ZKP_AVAILABLE:
+                        # Proof missing despite ZKP being available -> suspicious.
+                        self.logger.warning(
+                            self.name + ': task %s result carried no ZKP proof '
+                            'despite ZKP being available' % task.uuid)
+                        score = 0.3
+                    else:
+                        # ZKP unavailable: score on successful completion.
+                        score = 0.8 if task.result is not None else 0.3
                     tx = TransactionScore(task.uuid, score)
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                     if self.external_feedback in queues:

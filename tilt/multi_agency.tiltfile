@@ -149,17 +149,17 @@ k8s_yaml([
     deploy_dir + "/kubernetes/usgs.yaml",
     deploy_dir + "/kubernetes/fema.yaml",
     deploy_dir + "/kubernetes/epa.yaml",
-    deploy_dir + "/kubernetes/inspector.yaml",
+    deploy_dir + "/kubernetes/coordinator.yaml",
 ])
 
-# Group resources for the Tilt UI. The inspector gets a port-forward so
-# 'Open Web View' lands on http://localhost:8050. NodePort 30850 is
-# still exposed for direct cluster access (e.g. demo presenters using
-# `minikube service`).
+# Group resources for the Tilt UI. The coordinator (an AT mesh node hosting
+# the dashboard in-thread) gets a port-forward so 'Open Web View' lands on
+# http://localhost:8050. NodePort 30850 is still exposed for direct cluster
+# access (e.g. demo presenters using `minikube service`).
 k8s_resource(
-    "multi-agency-inspector",
+    "multi-agency-coordinator",
     port_forwards=["8050:8050"],
-    labels=["inspector"],
+    labels=["coordinator"],
 )
 
 # --- Watch sources --------------------------------------------------------

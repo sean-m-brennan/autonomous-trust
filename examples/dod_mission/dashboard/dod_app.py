@@ -105,11 +105,11 @@ def build_dashboard(scenario: DoDMissionScenario) -> dict:
 
     colors = build_peer_colors(scenario)
 
-    # Trust dynamics: same threshold (0.5) as multi-agency.  Phase markers
-    # come from scenario.phases — 8 of them for DoD.
+    # Trust dynamics: communication cut-off (0.1) as multi-agency.  Phase
+    # markers come from scenario.phases — 8 of them for DoD.
     timeline = TrustTimeline(
         peer_colors=colors,
-        threshold=0.5,
+        threshold=0.1,
         title="Trust Dynamics — DoD Squad Infiltration",
     )
     for phase in scenario.phases:

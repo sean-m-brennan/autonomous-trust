@@ -333,6 +333,73 @@ class TestHandleResults:
         assert ts.capability_name is None
 
 
+class TestTaskResultScoring:
+    """Requestor-side scoring of a returned TaskResult treats verify_proof()
+    as tri-state: True -> 0.8, False -> 0.3 (genuine tamper), None -> split by
+    whether ZKP is available process-wide (unavailable => score on successful
+    completion; available-but-missing => suspicious defection).
+
+    Regression guard for the ZKP-absent 0.3 flood: with the extension unshipped
+    verify_proof() returns None for every result, and the old
+    `0.8 if zkp_valid else 0.3` scored all of them 0.3, cratering honest
+    reputation.
+    """
+
+    def _make_at(self):
+        at = AutonomousTrust(multiproc=False, testing=True, silent=True,
+                             logfile=Configuration.log_stdout)
+        at.proc_name = CfgIds.main
+        return at
+
+    def _score_for(self, monkeypatch, verify_result, zkp_available,
+                   result=42):
+        at = self._make_at()
+        # A TaskResult is not a protocol Message; production falls straight
+        # through run_message_handlers to the isinstance branch. Force that
+        # here so the test doesn't depend on protocol-handler wiring.
+        monkeypatch.setattr(at, "run_message_handlers", lambda q, m: False)
+        monkeypatch.setattr(
+            "autonomous_trust.core._python.automate.ZKP_AVAILABLE",
+            zkp_available)
+        at.capabilities.register_ability("cap", lambda x: x)
+        task = Task(TaskParameters(Capability("cap")), "req")
+        tr = TaskResult(task=task, result=result)
+        monkeypatch.setattr(tr, "verify_proof", lambda: verify_result)
+        q_main, q_rep, q_neg = queue.Queue(), queue.Queue(), queue.Queue()
+        q_main.put(tr)
+        queues = {CfgIds.main: q_main,
+                  CfgIds.reputation: q_rep,
+                  CfgIds.negotiation: q_neg}
+        at._handle_messages(queues, MagicMock(), {})
+        ts = q_rep.get_nowait()
+        assert isinstance(ts, TransactionScore)
+        assert ts.task_id == tr.uuid
+        return ts.score
+
+    def test_valid_proof_scores_high(self, setup_teardown, monkeypatch):
+        assert self._score_for(monkeypatch, True, zkp_available=True) == 0.8
+
+    def test_invalid_proof_scores_defection(self, setup_teardown, monkeypatch):
+        assert self._score_for(monkeypatch, False, zkp_available=True) == 0.3
+
+    def test_indeterminate_without_zkp_scores_on_completion(
+            self, setup_teardown, monkeypatch):
+        # ZKP unavailable: a completed result is not the peer's fault for
+        # lacking a proof -> credit completion, do NOT score as defection.
+        assert self._score_for(monkeypatch, None, zkp_available=False) == 0.8
+
+    def test_indeterminate_without_zkp_failed_result_scores_low(
+            self, setup_teardown, monkeypatch):
+        # No proof AND no result -> the task did not successfully complete.
+        assert self._score_for(
+            monkeypatch, None, zkp_available=False, result=None) == 0.3
+
+    def test_indeterminate_with_zkp_is_suspicious(
+            self, setup_teardown, monkeypatch):
+        # ZKP available but no proof attached -> suspicious -> defection.
+        assert self._score_for(monkeypatch, None, zkp_available=True) == 0.3
+
+
 class TestMonitorProcesses:
     def test_ready_success(self, setup_teardown):
         at = AutonomousTrust(multiproc=False, silent=True, logfile=Configuration.log_stdout)

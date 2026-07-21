@@ -107,20 +107,37 @@ extern char REP_PROTO_CHECKPOINT_FINAL[];
 #define COOP_ENTER 0.55
 #define COOP_EXIT  0.45
 
-/* Pre-reputation cold-start prior (deferred.md §2.4). PREREP_NEUTRAL is the
- * "no information" STARTING reputation: a peer we know nothing about starts at
- * the BOTTOM of the tit-for-tat band (0.0) and must EARN its way up, rather
- * than being handed a near-threshold ~0.5 for free (which let unknown peers
- * read as almost-trusted and made the trust graph a flat all-to-all mesh).
- * The transaction-memory prior shrinks a peer's observed third-party standing
- * toward this value by a pseudo-count of PREREP_SHRINKAGE_K, so a
- * genuinely-unknown peer (zero observations) still reads exactly
- * PREREP_NEUTRAL. This is the STARTING point only -- the CTFT bilateral pivots
+/* Reputation thresholds are on the [0, 1] scale (NO negatives). Each has a
+ * compile-time DEFAULT and an environment override read at use-time via
+ * reputation_env_double(), mirroring repprocess.py _env_float so Python<->C
+ * stay byte-comparable under the SAME environment. The macros expand to the
+ * accessor so every existing PREREP_NEUTRAL/COMM_CUTOFF use keeps working as
+ * a double-valued expression.
+ *
+ * PREREP_NEUTRAL is the "no information" STARTING reputation: a peer we know
+ * nothing about starts at NEUTRAL (0.2) -- a small leeway above the
+ * COMM_CUTOFF (0.1) communication cut-off so a newcomer survives a minor
+ * mistake -- and must EARN its way up toward 1.0, rather than being handed a
+ * near-threshold ~0.5 for free (which let unknown peers read as almost-trusted
+ * and made the trust graph a flat all-to-all mesh). A catastrophically-failed
+ * peer is driven to the slash floor (0.0), below the cut-off. The
+ * transaction-memory prior shrinks a peer's observed third-party standing
+ * toward PREREP_NEUTRAL by a pseudo-count of PREREP_SHRINKAGE_K, so a
+ * genuinely-unknown peer (zero observations) reads exactly PREREP_NEUTRAL.
+ * This is the STARTING point only -- the CTFT bilateral pivots
  * (min(0.49,.)/max(0.51,.) around the 0.5 cooperate threshold) are the earned
  * near-threshold outputs and are deliberately unchanged. Mirror of
- * repprocess.py PREREP_NEUTRAL / PREREP_SHRINKAGE_K.
- * Disable via AT_PREREP_HEURISTIC=0. */
-#define PREREP_NEUTRAL 0.0
+ * repprocess.py PREREP_NEUTRAL / PREREP_SHRINKAGE_K / COMM_CUTOFF.
+ * Disable the prior heuristic via AT_PREREP_HEURISTIC=0; re-adjust values via
+ * AT_REP_NEUTRAL / AT_REP_COMM_CUTOFF. */
+double reputation_env_double(const char *name, double dflt);
+#define PREREP_NEUTRAL_DEFAULT 0.2
+#define COMM_CUTOFF_DEFAULT    0.1
+#define PREREP_NEUTRAL (reputation_env_double("AT_REP_NEUTRAL", PREREP_NEUTRAL_DEFAULT))
+/* Communication cut-off: a peer whose aggregate reputation falls BELOW this
+ * is EXCLUDED from the network (gateways stop forwarding to/for it, LAN nodes
+ * ignore it); recovery is explicit-only (rehabilitation -> PREREP_NEUTRAL). */
+#define COMM_CUTOFF (reputation_env_double("AT_REP_COMM_CUTOFF", COMM_CUTOFF_DEFAULT))
 #define PREREP_SHRINKAGE_K 3.0
 
 /* EMA half-life (in committed bilateral txs) for reputation_consensus.

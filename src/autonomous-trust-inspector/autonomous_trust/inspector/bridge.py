@@ -87,17 +87,26 @@ REPUTATION_PUSH_DELTA = 0.01
 
 
 def _peer_name(identity_obj) -> str:
-    """Best-effort identity -> display name.
+    """Best-effort identity -> bare roster display name.
 
-    AT Identity has .nickname (online), .petname (local), .uuid. Prefer
-    nickname so bridge events carry the scenario's label (e.g.
-    'noaa-1@...') when AT_PEER_NAME propagation is wired. Falls back to
-    petname, then str() if none set.
+    AT Identity has .nickname (online), .petname (local), .uuid. Prefer the
+    online nickname, then petname, then str(). The online nickname is
+    domain-qualified (e.g. 'noaa-1@tekfive.com'); strip the '@domain' so the
+    emitted name is the deployment-set AT_PEER_NAME ('noaa-1') — which is the
+    key the scenario roster (scenario.peers) and therefore every dashboard
+    panel is keyed on. Mirrors examples/*/coordinator.py:_roster_name_of.
+
+    Without the strip, the Trust Network graph — whose nodes are built from
+    scenario.peers — drops every edge (TrustNetworkGraph.set_trust ignores a
+    pair whose endpoints aren't existing nodes), and per-peer reputation
+    lookups (_latest_real_rep / _real_peer_status) never match, so the whole
+    dashboard sits empty while the raw '@domain' names still show in the log.
     """
     for attr in ("nickname", "petname"):
         v = getattr(identity_obj, attr, None)
         if v:
-            return str(v)
+            local = str(v).split('@', 1)[0].strip()
+            return local or str(v)
     return str(identity_obj)
 
 

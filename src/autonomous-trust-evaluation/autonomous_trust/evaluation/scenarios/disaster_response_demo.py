@@ -41,8 +41,9 @@ import queue
 import random
 from datetime import timedelta
 from typing import Callable, Optional
+from uuid import uuid4
 
-from autonomous_trust.core import ProcMeta, CfgIds
+from autonomous_trust.core import ProcMeta, CfgIds, to_yaml_string
 from autonomous_trust.core._python.automate import AutonomousTrust
 from autonomous_trust.core.capabilities import Capability
 from autonomous_trust.core.config import to_json_string
@@ -50,8 +51,10 @@ from autonomous_trust.core.negotiation import (
     Task, TaskParameters, NegotiationProtocol)
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
+from autonomous_trust.core.reputation.reputation import TransactionScore
 from autonomous_trust.core.system import queue_cadence
 from autonomous_trust.services.data.reading import Reading
+from autonomous_trust.services.data.server import DataProtocol
 from autonomous_trust.services.envdata import (
     AirQualityStreamProcess,
     CompromiseConfig,
@@ -158,6 +161,27 @@ def _source_for_peer(peer_name: str,
 # Role -> EnvDataProcess subclass map
 # ----------------------------------------------------------------------
 
+def _ts_keep(batch_id: str, denom: int) -> bool:
+    """Deterministic per-batch decimation for TS submission.
+
+    Both the sender (``_DemoProcessMixin.process``) and the coordinator
+    (``MultiAgencyCoordinator._maybe_submit_batch_scores``) call this with
+    the same batch_id and AT_TS_DECIMATION, so they always agree on which
+    batches produce a TransactionScore. That agreement is what preserves the
+    bilateral pairing Transaction.add / TransactionHistory.update requires
+    before a Transaction is appended to the chain — without it every
+    Transaction would stay at len==1 and never fold into the consensus EMA.
+
+    Kept byte-identical to examples/dod_mission/participant.py::_ts_keep and
+    examples/multi_agency/coordinator.py::_ts_keep (the C parity vectors in
+    src/c/test/data_source_test.c pin this exact selection)."""
+    if denom <= 1:
+        return True
+    # UUID4 is random; the first 8 hex chars are enough entropy for
+    # uniform mod-denom selection without a hash function.
+    return int(batch_id.replace('-', '')[:8], 16) % denom == 0
+
+
 class _DemoProcessMixin:
     """Mixin: lazily build a per-peer source on the first acquire() call.
 
@@ -176,10 +200,23 @@ class _DemoProcessMixin:
 
     Honors AT_PEER_NAME from the env so the source matches the scenario
     role assigned by the compose generator.
+
+    Bilateral scoring (Option C): each emitted reading is stamped with a
+    fresh ``metadata["task_id"]`` and, after broadcast, the peer submits its
+    own 0.9 "I delivered this batch" TransactionScore for that task_id
+    (decimated by _ts_keep). This pairs with the coordinator's verdict TS
+    (0.8 clean / 0.3 anomalous) on the SAME task_id, so the two Paxos commits
+    form a bilateral Transaction that folds the verdict into the subject
+    peer's consensus reputation. Without both halves the coordinator's
+    validation never reaches the scored peer. Mirrors
+    examples/dod_mission/participant.py::DoDDataProcess.
     """
 
     # Child classes inherit EnvDataProcess's self.active flag.
     active: bool
+    # Most-recent batch/task id stamped by acquire(); consumed by process().
+    _last_batch_id: Optional[str] = None
+    _logged_first_sender_ts = False
 
     def acquire(self):
         if not getattr(self, "_demo_source_wired", False):
@@ -193,7 +230,75 @@ class _DemoProcessMixin:
                     logger.exception(
                         "[%s] failed to wire demo source for %s",
                         type(self).__name__, peer_name)
-        return super().acquire()  # type: ignore[misc]
+        d = super().acquire()  # type: ignore[misc]
+        if d is None:
+            return None
+        # Stamp this reading so the coordinator groups it and submits its
+        # verdict TransactionScore against the same task_id; process() below
+        # submits the paired sender-side TS.
+        batch_id = str(uuid4())
+        meta = d.setdefault("metadata", {})
+        meta["task_id"] = batch_id
+        self._last_batch_id = batch_id
+        return d
+
+    def process(self, queues, signal):
+        """Broadcast loop mirroring DataProcess.process(), plus the paired
+        sender-side TransactionScore (see class docstring / _maybe_submit_
+        sender_ts). Kept in lockstep with DoDDataProcess.process; the only
+        addition over the base loop is the _maybe_submit_sender_ts call after
+        a batch is broadcast."""
+        while self.keep_running(signal):
+            self.process_messages(queues)  # type: ignore[attr-defined]
+            if self.active:
+                data = self.acquire()
+                if data is not None:
+                    for client_id in list(self.clients):  # type: ignore[attr-defined]
+                        proc_name, peer = self.clients[client_id]  # type: ignore[attr-defined]
+                        msg_obj = to_yaml_string(data)
+                        msg = Message(proc_name, DataProtocol.data,
+                                      msg_obj, peer)
+                        try:
+                            queues[CfgIds.network].put(
+                                msg, block=True, timeout=self.q_cadence)
+                        except queue.Full:
+                            self.logger.warning(
+                                "Queue full, dropping data message for %s",
+                                client_id)
+                    self._maybe_submit_sender_ts(queues)
+            self.sleep_until(self.cadence)  # type: ignore[attr-defined]
+
+    def _maybe_submit_sender_ts(self, queues):
+        """Submit the sender's 0.9 'I delivered this batch' TransactionScore
+        for the most recent batch, subject to the shared per-batch decimation
+        (_ts_keep with AT_TS_DECIMATION). Only fires when the coordinator has
+        actually subscribed (self.clients), so we score delivered batches and
+        stay in lockstep with the coordinator's verdict half. capability_name
+        matches the coordinator's 'multi.sensor-report' so the trust-ladder
+        weighting applies identically on both sides."""
+        batch_id = self._last_batch_id
+        self._last_batch_id = None
+        if batch_id is None or not self.clients:  # type: ignore[attr-defined]
+            return
+        denom = int(os.environ.get("AT_TS_DECIMATION", "30"))
+        if not _ts_keep(batch_id, denom):
+            return
+        ts = TransactionScore(task_id=batch_id, score=0.9,
+                              capability_name="multi.sensor-report")
+        try:
+            queues[CfgIds.reputation].put(
+                ts, block=True, timeout=self.q_cadence)
+            if not _DemoProcessMixin._logged_first_sender_ts:
+                self.logger.info(
+                    "Demo sender-side TransactionScore submitted (batch=%s, "
+                    "score=0.9, denom=%d) — pairs with coordinator verdict to "
+                    "form the bilateral tx that folds into consensus",
+                    batch_id, denom)
+                _DemoProcessMixin._logged_first_sender_ts = True
+        except queue.Full:
+            self.logger.warning(
+                "Reputation queue full; dropping sender TransactionScore "
+                "for batch %s", batch_id)
 
 
 class DisasterWeatherStreamProcess(_DemoProcessMixin, WeatherStreamProcess,

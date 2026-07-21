@@ -41,6 +41,7 @@ Two modes:
 from __future__ import annotations
 
 import logging
+import os
 from datetime import timedelta
 from typing import Optional
 
@@ -89,7 +90,19 @@ from collections import deque
 
 
 _TICK_INTERVAL_ID = "demo-tick"
-_TICK_MS = 500
+# Main dashboard cadence. 1 Hz (was 500ms / 2 Hz) — matches the DoD live
+# dashboard (live_server.py) and halves per-second callback + figure work.
+# Override with AT_DASH_TICK_MS.
+_TICK_MS = int(os.environ.get("AT_DASH_TICK_MS", "1000"))
+
+# The Tactical Map is the heaviest figure (per-peer geo traces rebuilt from
+# scratch each render). Refresh it on its OWN Interval + callback, decoupled
+# from the main data tick, so it isn't rebuilt in lockstep with the 14 other
+# outputs and can be independently throttled. Defaults to the main tick;
+# override with AT_DASH_MAP_TICK_MS (e.g. 2000 to halve map churn). Mirrors
+# live_server.py's _MAP_TICK_MS.
+_MAP_TICK_INTERVAL_ID = "demo-map-tick"
+_MAP_TICK_MS = int(os.environ.get("AT_DASH_MAP_TICK_MS", str(_TICK_MS)))
 
 # Playback-control element IDs (local to this module).
 _PB_PLAYPAUSE = "demo-pb-playpause"
@@ -185,6 +198,9 @@ class MultiAgencyDemo:
         # pair-blended trust (currently min — skepticism wins).
         self._live_trust_matrix: dict[tuple[str, str], float] = {}
         self._live_trust_seen_dir: dict[tuple[str, str], float] = {}
+        # Determination instrumentation (AT_REP_TRACE): throttle counter for
+        # the per-subject observer-distribution dump in _trace_consensus_dist.
+        self._rep_trace_tick = 0
 
         self._peer_detail_panel = PeerDetailPanel()
         # Last peer rendered into the detail iframe. The iframe
@@ -195,6 +211,14 @@ class MultiAgencyDemo:
         # peer name and from None, so the very first tick always
         # renders the empty placeholder.
         self._peer_detail_last_peer: object = "<unset>"
+        # Figure dirty-check signatures. Each Plotly figure is rebuilt only
+        # when its underlying data actually changed since the last render;
+        # otherwise the callback returns no_update and Dash skips the redraw.
+        # Sentinel object() differs from any real signature so the first
+        # render of each always fires. Reset by _on_reset.
+        self._last_map_sig: object = object()
+        self._last_timeline_sig: object = object()
+        self._last_graph_sig: object = object()
         self._event_log_panel = EventLogPanel(capacity=200)
         self._streams_panel = DataStreamsPanel(
             peer_colors=_agency_palette(iface.scenario))
@@ -345,6 +369,11 @@ class MultiAgencyDemo:
         return html.Div(children=[
             dcc.Interval(id=_TICK_INTERVAL_ID,
                          interval=_TICK_MS, n_intervals=0),
+            # Tactical Map refresh runs on its own Interval (see _MAP_TICK_MS
+            # and _refresh_map) so the heaviest figure isn't rebuilt inside
+            # the main data tick.
+            dcc.Interval(id=_MAP_TICK_INTERVAL_ID,
+                         interval=_MAP_TICK_MS, n_intervals=0),
             dcc.Store(id=_SELECTED_PEER, data={"name": None}),
             # Document-level keyboard listener for the spacebar
             # play/pause shortcut. captureKeys filters at the JS layer
@@ -434,7 +463,6 @@ class MultiAgencyDemo:
             Output(_PB_PLAYPAUSE, "children"),
             Output(_PB_TIME_LABEL, "children"),
             Output(_PB_PROGRESS_FILL, "style"),
-            Output(_MAP_GRAPH, "figure"),
             Output(_TIMELINE_GRAPH, "figure"),
             Output(_DETAIL_IFRAME, "srcDoc"),
             Output(_GRAPH_GRAPH, "figure"),
@@ -447,6 +475,14 @@ class MultiAgencyDemo:
         def _on_tick(_n, selected):
             iface.tick()
             tel = iface.telemetry()
+
+            # Determination instrumentation (AT_REP_TRACE): every ~15 ticks,
+            # dump the per-subject observer distribution feeding the Trust
+            # Dynamics line. Settles WHY honest peers trend down — see
+            # _trace_consensus_dist. No-op unless AT_REP_TRACE is set.
+            demo._rep_trace_tick += 1
+            if demo._rep_trace_tick % 15 == 0:
+                demo._trace_consensus_dist(tel.scenario_time)
 
             clock = format_clock(tel.scenario_time)
             phase_str = format_phase(tel.current_phase_idx,
@@ -471,19 +507,23 @@ class MultiAgencyDemo:
             # peer_states (see _real_peer_status): compromised = ground-truth
             # injection marker; excluded = earned reputation actually collapsed;
             # forming (faint) = mesh has produced no reputation for the peer yet.
+            # (The Tactical Map consumes the same status on its own Interval —
+            # see _refresh_map.)
             compromised, excluded, peer_opacity = demo._real_peer_status()
-            map_fig = build_map_from_scenario(
-                scenario,
-                compromised=compromised,
-                excluded=excluded,
-                peer_opacity=peer_opacity,
-            )
-            # uirevision preserves pan/zoom across frames; the figure's
-            # own autosize=True handles container fit via dcc.Graph.
-            map_fig.update_layout(uirevision="demo-map")
 
-            timeline_fig = demo._build_timeline_figure()
-            timeline_fig.update_layout(uirevision="demo-timeline")
+            # Trust timeline — rebuild only when a new reputation sample has
+            # landed. _rep_samples lists are append-only, so a change in the
+            # per-peer sample counts is a sufficient dirty signal (phase
+            # markers are static). Unchanged → skip the redraw.
+            timeline_sig = tuple(sorted(
+                (name, len(samples))
+                for name, samples in demo._rep_samples.items()))
+            if timeline_sig != demo._last_timeline_sig:
+                demo._last_timeline_sig = timeline_sig
+                timeline_fig = demo._build_timeline_figure()
+                timeline_fig.update_layout(uirevision="demo-timeline")
+            else:
+                timeline_fig = no_update
 
             peer_name = (selected or {}).get("name") if selected else None
             # Only rebuild the peer-detail iframe when the selection
@@ -503,27 +543,66 @@ class MultiAgencyDemo:
 
             # Trust graph + data streams — both driven only by real bridge
             # observations. Unobserved pairs have no edge and unobserved peers
-            # no stream count, so a forming peer floats unconnected.
+            # no stream count, so a forming peer floats unconnected. Rebuild
+            # the graph only when its inputs (edges, stream counts, or node
+            # status) changed since the last render.
             trust_matrix = demo._build_trust_matrix()
             stream_counts = demo._real_stream_counts()
-            graph_fig = build_graph_from_scenario(
-                scenario,
-                trust_matrix=trust_matrix,
-                stream_counts=stream_counts,
-                compromised=compromised,
-                excluded=excluded,
-                peer_opacity=peer_opacity,
+            graph_sig = (
+                tuple(sorted(trust_matrix)),
+                tuple(sorted(stream_counts.items())),
+                frozenset(compromised), frozenset(excluded),
+                tuple(sorted(peer_opacity.items())),
             )
-            graph_fig.update_layout(uirevision="demo-graph")
+            if graph_sig != demo._last_graph_sig:
+                demo._last_graph_sig = graph_sig
+                graph_fig = build_graph_from_scenario(
+                    scenario,
+                    trust_matrix=trust_matrix,
+                    stream_counts=stream_counts,
+                    compromised=compromised,
+                    excluded=excluded,
+                    peer_opacity=peer_opacity,
+                )
+                graph_fig.update_layout(uirevision="demo-graph")
+            else:
+                graph_fig = no_update
             demo._update_streams(excluded)
             streams_children = demo._streams_panel.to_dash_children()
 
             return (clock, phase_str, keystats_children,
                     log_children, nchildren, nstyle,
                     play_icon, time_label, progress_style,
-                    map_fig, timeline_fig, detail_html,
+                    timeline_fig, detail_html,
                     graph_fig, streams_children,
                     sensor_fig, sensor_style)
+
+        @self._dash.callback(
+            Output(_MAP_GRAPH, "figure"),
+            Input(_MAP_TICK_INTERVAL_ID, "n_intervals"),
+        )
+        def _refresh_map(_n):
+            # Tactical Map, decoupled from the main data tick. Read-only: the
+            # scenario clock is advanced solely by _on_tick's iface.tick(), so
+            # this consumes the peer status produced by the most recent data
+            # tick. Rebuild only when node status changed (position is static,
+            # so compromised/excluded/opacity fully determine the figure).
+            compromised, excluded, peer_opacity = demo._real_peer_status()
+            map_sig = (frozenset(compromised), frozenset(excluded),
+                       tuple(sorted(peer_opacity.items())))
+            if map_sig == demo._last_map_sig:
+                return no_update
+            demo._last_map_sig = map_sig
+            map_fig = build_map_from_scenario(
+                scenario,
+                compromised=compromised,
+                excluded=excluded,
+                peer_opacity=peer_opacity,
+            )
+            # uirevision preserves pan/zoom across frames; the figure's
+            # own autosize=True handles container fit via dcc.Graph.
+            map_fig.update_layout(uirevision="demo-map")
+            return map_fig
 
         @self._dash.callback(
             Output(_SELECTED_PEER, "data"),
@@ -615,6 +694,44 @@ class MultiAgencyDemo:
 
     # --- Stage 2b data derivation ---------------------------------------
 
+    def _trace_consensus_dist(self, scenario_time: float) -> None:
+        """Determination instrumentation (AT_REP_TRACE): log, per subject, the
+        distribution of the per-observer consensus scores that ``_pair_consensus``
+        averages into each Trust Dynamics line.
+
+        Reads the interpretation directly off the numbers over successive dumps:
+
+        * ``n_obs`` climbing while ``mean`` falls, ``max`` staying high, and
+          ``at_baseline`` climbing  -> DILUTION: late observers with no
+          committed bilateral history with the subject keep entering the mean
+          at the 0.5 baseline and drag every honest line down.
+        * scores clustered at ~0.5 that never rise (``at_baseline`` ~= n_obs)
+          -> STUCK BASELINE: no observer ever folds a real tx for the subject
+          (e.g. the validator verdict never reaches it) — the subject-field bug.
+        * individual scores starting high then declining -> genuine EMA decay.
+
+        Logging only; no-op unless AT_REP_TRACE is set."""
+        if not os.environ.get("AT_REP_TRACE"):
+            return
+        by_subject: dict[str, list[float]] = {}
+        for (obs, subj), s in self._live_trust_seen_dir.items():
+            if obs == subj:
+                continue
+            by_subject.setdefault(subj, []).append(s)
+        if not by_subject:
+            logger.info("REPTRACE t=%.0fs: no observed pairs yet", scenario_time)
+            return
+        for subj in sorted(by_subject):
+            scores = sorted(by_subject[subj])
+            n = len(scores)
+            mean = sum(scores) / n
+            at_baseline = sum(1 for x in scores if abs(x - 0.5) < 1e-3)
+            logger.info(
+                "REPTRACE t=%.0fs subject=%s n_obs=%d mean=%.4f min=%.3f "
+                "max=%.3f at_baseline=%d scores=[%s]",
+                scenario_time, subj, n, mean, scores[0], scores[-1],
+                at_baseline, ",".join(f"{x:.2f}" for x in scores))
+
     def _latest_real_rep(self, name: str) -> Optional[float]:
         """Latest bridge-observed reputation for a peer, or None if the mesh
         has produced no consensus reputation for it yet ("forming"). Timeline
@@ -691,6 +808,25 @@ class MultiAgencyDemo:
         no edge, so an un-observed / forming peer floats unconnected — that
         absence is the signal, not a fabricated high-trust edge."""
         return [(a, b, w) for (a, b), w in self._live_trust_matrix.items()]
+
+    def _pair_consensus(self, subject: str) -> Optional[float]:
+        """Consensus reputation of ``subject`` across the mesh = mean of every
+        observer's current directional score of it (the rep_pair stream cached
+        in ``_live_trust_seen_dir``). Self-observations are excluded. Returns
+        None when no observer has scored ``subject`` yet.
+
+        This is the Trust-Dynamics feed. The single ``reputation`` events that
+        used to fill the timeline are the bridge's OWN direct view, which a
+        passive inspector never computes (it runs no transactions; its rep
+        queries are answered by REMOTE observers and captured as pairs, not
+        own-view — see automate.py's own_view split). So the timeline reads
+        the same bilateral stream the Trust Network graph does, aggregated per
+        subject, instead of an empty own-view buffer."""
+        scores = [s for (obs, subj), s in self._live_trust_seen_dir.items()
+                  if subj == subject and obs != subject]
+        if not scores:
+            return None
+        return sum(scores) / len(scores)
 
     def _build_peer_detail_html(self, peer_name: Optional[str]) -> str:
         if peer_name is None or peer_name not in self._iface.scenario.peers:
@@ -840,6 +976,26 @@ class MultiAgencyDemo:
                 self._live_trust_matrix[key] = score
             else:
                 self._live_trust_matrix[key] = min(score, opposite)
+            # Trust Dynamics feed: append the subject's updated mesh-consensus
+            # reputation to the timeline buffer (see _pair_consensus). Skip a
+            # no-op repeat so the line only gains a point when consensus moves.
+            consensus = self._pair_consensus(subject)
+            if consensus is not None:
+                prev = self._rep_samples.get(subject)
+                if not prev or prev[-1].score != consensus:
+                    self._rep_samples.setdefault(subject, []).append(
+                        ReputationSample(
+                            t=scenario_time,
+                            peer_name=subject,
+                            score=consensus,
+                        ))
+                    self._maybe_record_snapshot({
+                        "t": scenario_time,
+                        "type": "REPUTATION_SAMPLE",
+                        "peer": subject,
+                        "score": consensus,
+                    })
+                self._live_rep_peers.add(subject)
         elif tag == "reading" and len(ev) >= 3:
             # envdata reading: forward to the streams panel and mark the
             # peer as a live stream source (it has produced a real reading).
@@ -893,6 +1049,11 @@ class MultiAgencyDemo:
         # Force a re-render of the peer detail iframe on the next tick
         # so the user sees the post-reset state if a peer was selected.
         self._peer_detail_last_peer = "<unset>"
+        # Invalidate the figure dirty-check signatures so the map, timeline,
+        # and trust graph all rebuild from the cleared state on the next tick.
+        self._last_map_sig = object()
+        self._last_timeline_sig = object()
+        self._last_graph_sig = object()
 
     def _maybe_record_snapshot(self, snapshot: dict) -> None:
         """Push a snapshot to the interface's recorder if one is

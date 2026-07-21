@@ -81,10 +81,12 @@ class TestDecayedScore:
         assert v == pytest.approx(A, abs=1e-3)
 
     def test_asymmetry_distrust_is_never_rehabilitated(self):
-        # corrupt / distrusted nodes stay put no matter how long idle
-        assert R._decayed_score(0.20, ONSET + 99 * HL) == 0.20
+        # corrupt / distrusted nodes (at or below the asymptote) stay put no
+        # matter how long idle -- so an excluded peer (< 0.1 comm cut-off)
+        # can never idle its way back above the cut-off.
+        assert R._decayed_score(0.05, ONSET + 99 * HL) == 0.05  # excluded
+        assert R._decayed_score(0.15, ONSET + 99 * HL) == 0.15  # low/degraded
         assert R._decayed_score(A, ONSET + 99 * HL) == A
-        assert R._decayed_score(0.50, ONSET + 99 * HL) == 0.50
 
     def test_none_is_safe(self):
         assert R._decayed_score(None, 99999) is None
