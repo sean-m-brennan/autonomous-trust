@@ -34,7 +34,7 @@ for N children and deeper trees).
 **Goal.** Gateways (rank > 1) become **multi-group members**, maintain a **tree of reputation
 chains** (one per group they belong to), and answer a `consensus_rep_req` with the **full recursive
 subtree roster**. The coordinator querying rq86-1 then gets back rq86-1 + every field peer in one
-reply — closing the gap without papering it with default 0.5 scores. Gateways also **continue to
+reply — closing the gap without papering it with default neutral (`PREREP_NEUTRAL`, 0.2) scores. Gateways also **continue to
 blind-relay** opaque traffic for groups they don't hold keys to (preserved, not removed).
 
 ## Key decisions
@@ -45,6 +45,15 @@ blind-relay** opaque traffic for groups they don't hold keys to (preserved, not 
 2. **Full recursive subtree** reply (gateway + children + grandchildren, flattened).
 3. **Runtime rank-based discovery** of the tree (`peer._rank` vs `self.identity._rank`).
 4. squad + microdrones = one field group.
+5. **Communication cut-off is enforced along the tree.** Reputation is on a
+   `[0, 1]` scale with neutral/cold-start at `PREREP_NEUTRAL = 0.2` and a
+   communication cut-off at `COMM_CUTOFF = 0.1`. When a field peer's aggregate
+   reputation drops below the cut-off it is **excluded**: its gateway stops
+   forwarding for it (the outbound-skip gate) and drops its inbound frames, so
+   an excluded subtree member falls out of the recursive roster the gateway
+   reports. Recovery is explicit-only (`REASON_REHABILITATE` lifts to 0.2 and
+   re-admits) and the excluded state survives a restart. See
+   [Reputation § Communication cut-off enforcement](reputation.md#communication-cut-off-enforcement).
 
 **Relay vs participate — both supported, orthogonal.** They key on whether the gateway holds the
 destination group's key:
