@@ -180,18 +180,22 @@ class TestCompromiseDetection:
         )
 
     def test_pressure_flatlines_after_onset(self):
-        # Pressure random-walks normally; the rogue freezes at onset.
+        # Pressure random-walks normally; the rogue freezes at onset (240s).
         roster = self.roster
-        rogue_vals: list[float] = []
+        # Window by simulated time, not by list index: the emission cadence
+        # (AT_STREAM_CADENCE_SEC, default 3s) means far fewer than one reading
+        # per tick, so index-based slicing put the whole run in the pre-onset
+        # bucket and left post empty. Onset is 240s; keep a buffer around it.
+        rogue_vals: list[tuple[int, float]] = []  # (ts, value)
         for ts in range(0, 400):
             t = timedelta(seconds=ts)
             for g in roster['noaa-3']:
                 r = g.tick(t)
                 if r and r.data_type == TYPE_PRESSURE:
-                    rogue_vals.append(r.value)
+                    rogue_vals.append((ts, r.value))
 
-        pre = [v for i, v in enumerate(rogue_vals) if i < 200]
-        post = [v for i, v in enumerate(rogue_vals) if i >= 240]
+        pre = [v for ts, v in rogue_vals if ts < 200]
+        post = [v for ts, v in rogue_vals if ts >= 240]
         assert pre and post
         # Post-onset stddev should be effectively zero (flatline).
         assert statistics.pstdev(post) < 0.005, (

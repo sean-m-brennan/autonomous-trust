@@ -64,6 +64,35 @@ cadence = 0.5
 queue_cadence = 0.01
 
 
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _env_num(name: str, default, cast):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+# Persistent / pooled TCP connections. The TCP transport normally opens one
+# connection per message (connect/send/close); with pooling on it reuses one
+# connection per (peer, channel) for many messages, so steady-state handshakes
+# drop from ~1/message to ~1/peer/idle-period. Framing is unchanged, so a
+# pooling node still interoperates with a per-message peer (Python or C).
+# Default OFF; opt in with AT_NET_POOL=1. See
+# doc/architecture/network-connection-pooling.md.
+net_persistent_conn = _env_bool('AT_NET_POOL')
+# Close a pooled/accepted connection after this many idle seconds, to bound fds.
+net_conn_idle_ttl = _env_num('AT_NET_CONN_IDLE_TTL', 30.0, float)
+# Cap on simultaneous live connections per direction (outbound pool / inbound
+# reader threads), so a hostile peer can't exhaust fds by holding many open.
+net_max_live_conns = _env_num('AT_NET_MAX_CONNS', 64, int)
+
+
 def _proc_idle_floor() -> float:
     """Minimum wall-clock period (sec) for the reputation/negotiation main
     loops. Those loops pace only via queue.get's blocking q_cadence timeout,

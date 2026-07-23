@@ -244,6 +244,47 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     def recv_any(self):
         raise NotImplementedError
 
+    # --- Transport lifecycle hooks -------------------------------------
+    # No-ops here; a transport that keeps long-lived connections (the TCP
+    # pool) overrides them. They run in the worker subprocess from
+    # process(), which matters because threading primitives can't survive
+    # the multiprocessing spawn pickle (see _ensure_ping_pool).
+
+    def _init_transport(self):
+        """Per-worker transport setup that can't be pickled across the
+        spawn handoff (e.g. locks). Called once before receiver threads
+        start."""
+        pass
+
+    def start_receivers(self, queues):
+        """Start the point-to-point and group receive threads. The default
+        is one accept-read-one thread per channel; a transport with
+        persistent readers overrides this."""
+        threading.Thread(target=self.peer_receiver, daemon=True).start()
+        threading.Thread(target=self.group_receiver, daemon=True).start()
+
+    def reap_idle_conns(self):
+        """Close connections idle past their TTL. Called each main-loop
+        iteration; rate-limits itself internally."""
+        pass
+
+    def close_connections(self):
+        """Close any live transport connections at shutdown."""
+        pass
+
+    def close_listeners(self):
+        """Close the bound receive sockets (peer, group, broadcast/multicast)
+        so their ports are released deterministically at shutdown rather than
+        whenever the process object is garbage-collected. Safe to call more
+        than once; a missing or already-closed socket is ignored."""
+        for name in ('recv_ptp_sock', 'recv_grp_sock', 'recv_cast_sock'):
+            sock = getattr(self, name, None)
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
     def accept_peer_message(self, address):
         """
         Accept/reject messages based on sender's address
@@ -579,12 +620,13 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 _sock.settimeout(self.socket_timeout)
             except (OSError, AttributeError):
                 pass
-        threading.Thread(target=self.peer_receiver, daemon=True).start()
-        threading.Thread(target=self.group_receiver, daemon=True).start()
+        self._init_transport()
+        self.start_receivers(queues)
         threading.Thread(target=self.unknown_receiver, daemon=True).start()
         threading.Thread(target=self.mystery_handler, args=(queues,), daemon=True).start()
         while self.keep_running(signal):
             try:
+                self.reap_idle_conns()
                 if self.diplomat:
                     if self.ping is None:
                         self.ping = PingServer(self.net_cfg.ip4, self.logger)
@@ -877,3 +919,5 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 self.logger.error(traceback.format_exc())
 
         self.stop = True
+        self.close_connections()
+        self.close_listeners()

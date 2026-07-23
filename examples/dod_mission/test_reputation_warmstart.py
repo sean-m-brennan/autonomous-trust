@@ -53,20 +53,23 @@ def test_jet_specifically_on_the_list():
 
 # ---- is_neutral_rep -----------------------------------------------------
 
-def test_exact_half_is_neutral():
-    assert rw.is_neutral_rep(0.5)
-    assert rw.is_neutral_rep(0.5 + 1e-12)
+def test_exact_neutral_is_neutral():
+    # Neutral / cold-start on the [0, 1] scale is PREREP_NEUTRAL (0.2), a small
+    # leeway above the COMM_CUTOFF (0.1). (Was 0.5 under the old scale.)
+    assert rw.is_neutral_rep(0.2)
+    assert rw.is_neutral_rep(0.2 + 1e-12)
 
 
 def test_earned_scores_are_not_neutral():
-    for s in (0.1, 0.3, 0.7, 0.8, 0.49, 0.51):
+    # 0.5 is no longer the neutral placeholder — it is an ordinary earned score.
+    for s in (0.1, 0.3, 0.5, 0.7, 0.8, 0.49, 0.51):
         assert not rw.is_neutral_rep(s), s
 
 
 # ---- reconcile_rep_score ------------------------------------------------
 
 def test_real_score_always_wins_over_neutral():
-    vals = [(0.5, 0), (0.8, 2)]
+    vals = [(0.2, 0), (0.8, 2)]
     assert rw.reconcile_rep_score(vals, is_warm_start=True) == (0.8, 2)
     assert rw.reconcile_rep_score(vals, is_warm_start=False) == (0.8, 2)
 
@@ -78,16 +81,16 @@ def test_latest_real_score_wins_when_multiple():
 
 def test_warm_start_peer_with_only_neutral_gets_seeded_prior():
     # The fighter-jet case: present too briefly for any committed history,
-    # so every reading is the cold-start 0.5 -> show the seeded prior.
-    vals = [(0.5, 0)]
+    # so every reading is the cold-start 0.2 -> show the seeded prior.
+    vals = [(0.2, 0)]
     assert rw.reconcile_rep_score(vals, is_warm_start=True) == (
         rw.SEED_REPUTATION, rw.SEED_TIER)
 
 
 def test_cold_peer_with_only_neutral_stays_neutral():
     # A non-pre-trusted peer with no history reads the neutral placeholder.
-    vals = [(0.5, 0)]
-    assert rw.reconcile_rep_score(vals, is_warm_start=False) == (0.5, 0)
+    vals = [(0.2, 0)]
+    assert rw.reconcile_rep_score(vals, is_warm_start=False) == (0.2, 0)
 
 
 def test_build_up_preserved_for_warm_start_peer_once_real():
@@ -102,31 +105,38 @@ def test_seed_constants_are_consistent():
     # 0.7 prior maps to tier 2 per the band described in repprocess.py.
     assert rw.SEED_REPUTATION == 0.7
     assert rw.SEED_TIER == 2
+    # Neutral / cold-start on the [0, 1] scale is 0.2, unified across the
+    # consensus and bilateral query paths (mirrors PREREP_NEUTRAL in
+    # repprocess.py / reputation.c).
+    assert rw.NEUTRAL_REP == 0.2
+    assert rw.PREREP_NEUTRAL == 0.2
 
 
 # ---- is_cold_start_reading / warm_start_edge_score (bilateral graph) ----
 
 def test_both_cold_start_neutrals_recognized():
-    # The bilateral (peer-pair) path can return either neutral: 0.5 (a
-    # warm-start-seeded observer in pure mode with no history) or PREREP_NEUTRAL
-    # 0.0 (a cold observer in tit-for-tat mode). Both mean "no earned info".
-    assert rw.is_cold_start_reading(0.5)
-    assert rw.is_cold_start_reading(0.0)
+    # On the [0, 1] scale the consensus and bilateral neutrals are unified at
+    # PREREP_NEUTRAL (0.2) — "no earned info" on either query path.
+    assert rw.is_cold_start_reading(0.2)
     assert rw.is_cold_start_reading(rw.PREREP_NEUTRAL)
+    assert rw.is_cold_start_reading(rw.NEUTRAL_REP)
+    # The old-scale neutrals (0.5 pure / 0.0 CTFT) are no longer cold-start.
+    assert not rw.is_cold_start_reading(0.5)
+    assert not rw.is_cold_start_reading(0.0)
 
 
 def test_earned_bilateral_scores_are_not_cold_start():
     # CTFT pivots and computed pure scores are earned, never cold-start.
-    for s in (0.49, 0.51, 0.3, 0.7, 0.8, 0.62):
+    for s in (0.49, 0.51, 0.3, 0.5, 0.7, 0.8, 0.62):
         assert not rw.is_cold_start_reading(s), s
 
 
 def test_warm_start_edge_substitutes_prior_for_pretrusted_subject():
-    # A pre-trusted subject with no earned bilateral history reads a cold-start
-    # neutral on BOTH the pure (0.5) and CTFT (0.0) paths -> show the seeded
+    # A pre-trusted subject with no earned bilateral history reads the cold-start
+    # neutral (0.2, unified across the pure and CTFT paths) -> show the seeded
     # prior so it draws a trust edge instead of dropping off the graph.
-    assert rw.warm_start_edge_score(0.0, True) == rw.SEED_REPUTATION
-    assert rw.warm_start_edge_score(0.5, True) == rw.SEED_REPUTATION
+    assert rw.warm_start_edge_score(0.2, True) == rw.SEED_REPUTATION
+    assert rw.warm_start_edge_score(rw.PREREP_NEUTRAL, True) == rw.SEED_REPUTATION
 
 
 def test_warm_start_edge_preserves_real_score_for_pretrusted_subject():
@@ -139,9 +149,9 @@ def test_warm_start_edge_preserves_real_score_for_pretrusted_subject():
 
 def test_warm_start_edge_never_substitutes_cold_boot_subject():
     # A non-pre-trusted subject (rq86 gateway, mq800, ground sensor) is never
-    # warm-started on the graph, even at a cold-start neutral -> stays 0.0 and
-    # its edge is pruned unless it earns real bilateral trust.
-    assert rw.warm_start_edge_score(0.0, False) == 0.0
+    # warm-started on the graph, even at the cold-start neutral -> stays at the
+    # neutral and its edge is pruned unless it earns real bilateral trust.
+    assert rw.warm_start_edge_score(0.2, False) == 0.2
     assert rw.warm_start_edge_score(0.5, False) == 0.5
     assert rw.warm_start_edge_score(0.3, False) == 0.3
 
@@ -152,7 +162,7 @@ def test_sticky_retains_earned_value_on_all_neutral_cycle():
     # A re-key / churn cycle where the only candidate is the cold-start
     # baseline must NOT drop the earned 0.82 the peer showed before.
     score, tier = rw.reconcile_rep_score_sticky(
-        [(0.5, 0)], is_warm_start=False, cached_score=0.82, cached_tier=3)
+        [(0.2, 0)], is_warm_start=False, cached_score=0.82, cached_tier=3)
     assert (score, tier) == (0.82, 3)
 
 
@@ -175,9 +185,9 @@ def test_sticky_no_cache_matches_plain_reconcile():
     # First appearance (no cache): identical to reconcile_rep_score, so a
     # warm-start peer still surfaces its seeded prior on an all-neutral cycle.
     assert rw.reconcile_rep_score_sticky(
-        [(0.5, 0)], is_warm_start=True) == (rw.SEED_REPUTATION, rw.SEED_TIER)
+        [(0.2, 0)], is_warm_start=True) == (rw.SEED_REPUTATION, rw.SEED_TIER)
     assert rw.reconcile_rep_score_sticky(
-        [(0.5, 0)], is_warm_start=False) == (0.5, 0)
+        [(0.2, 0)], is_warm_start=False) == (0.2, 0)
 
 
 # ---- is_warm_start_member ----------------------------------------------

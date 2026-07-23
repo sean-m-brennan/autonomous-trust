@@ -116,9 +116,9 @@ DEFINE_TEST(test_reputation_contrite_tft)
     uuid_generate(peer_id);
     uuid_generate(task);
 
-    /* No history: cold-start prior returns PREREP_NEUTRAL (0.0) */
+    /* No history: cold-start prior returns PREREP_NEUTRAL (0.2, [0,1] scale) */
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    ck_assert_double_eq_tol(score, 0.0, 0.001);
+    ck_assert_double_eq_tol(score, 0.2, 0.001);
 
     /* Add a cooperative transaction (both peers, high scores) */
     ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.9));
@@ -253,9 +253,9 @@ DEFINE_TEST(test_reputation_contrite_tft_third_party_informs_prior)
     ck_assert_ret_ok(tx_history_update(&hist, task, other,   0.1));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
-    /* observed=0.1, cp_rep(other)=0.5 default, n=1, neutral=0.0:
-     * (1*0.1 + 3*0.0) / (1+3) = 0.025. */
-    ck_assert_double_eq_tol(score, 0.025, 0.001);
+    /* observed=0.1, cp_rep(other)=PREREP_NEUTRAL (0.2) default, n=1,
+     * neutral=PREREP_NEUTRAL (0.2): (1*0.1 + 3*0.2) / (1+3) = 0.175. */
+    ck_assert_double_eq_tol(score, 0.175, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);
@@ -286,11 +286,11 @@ DEFINE_TEST(test_reputation_pure_with_counterparty)
     double score = reputation_pure(&hist, &reps, peer1, NULL);
     ck_assert_double_eq_tol(score, 0.42, 0.001);
 
-    /* No transactions: default to 0.5 */
+    /* No transactions: default to PREREP_NEUTRAL (0.2) */
     uuid_t unknown;
     uuid_generate(unknown);
     double def_score = reputation_pure(&hist, &reps, unknown, NULL);
-    ck_assert_double_eq_tol(def_score, 0.5, 0.001);
+    ck_assert_double_eq_tol(def_score, 0.2, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);
@@ -298,8 +298,9 @@ DEFINE_TEST(test_reputation_pure_with_counterparty)
 END_TEST_DEFINITION()
 
 /* Pure-reputation branch pin: counterparty missing from reputations
- * uses 0.5 fallback rather than silently skipping.  Mirrors Python
- * TestPureReputation::test_unknown_counterparty_uses_default_0_5. */
+ * uses the PREREP_NEUTRAL (0.2) fallback rather than silently skipping.
+ * (Was 0.5 under the old scale; the [0,1]-scale neutral is now 0.2.)
+ * Mirrors Python TestPureReputation::test_unknown_counterparty_uses_default. */
 DEFINE_TEST(test_reputation_pure_unknown_counterparty_default_0_5)
 {
     tx_history_t hist;
@@ -314,11 +315,11 @@ DEFINE_TEST(test_reputation_pure_unknown_counterparty_default_0_5)
 
     ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.9));
     ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.6));
-    /* No reputations set — counterparty fallback should be 0.5. */
+    /* No reputations set — counterparty fallback is PREREP_NEUTRAL (0.2). */
 
     double score = reputation_pure(&hist, &reps, peer_id, NULL);
-    /* counterparty_score = 0.6, cp_rep = 0.5 → 0.3. */
-    ck_assert_double_eq_tol(score, 0.3, 0.001);
+    /* counterparty_score = 0.6, cp_rep = PREREP_NEUTRAL (0.2) → 0.12. */
+    ck_assert_double_eq_tol(score, 0.12, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);

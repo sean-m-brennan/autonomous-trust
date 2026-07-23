@@ -65,6 +65,10 @@ typedef enum {
 extern char NET_FN_STATS_REQ[];
 extern char NET_FN_STATS_RESP[];
 extern char NET_FN_PING[];
+/* Reputation communication cut-off control (local IPC only; mirrors Python
+ * Network.exclude / Network.readmit in network.py). */
+extern char NET_FN_EXCLUDE[];
+extern char NET_FN_READMIT[];
 
 /* Python's INBOUND_BUDGET=32 per-channel drain cap (netprocess.py:581).
  * C's receive path is thread-per-channel, so OS scheduling provides the

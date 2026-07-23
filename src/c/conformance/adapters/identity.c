@@ -630,6 +630,34 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_decref(body);
     }
 
+    /* peer_accepted — drives the receiver's handle_confirm_peer (ID_CONFIRM).
+     * The payload names the newcomer by participant id in `peer` (or the
+     * `candidate` alias); pack that participant's full public identity so
+     * handle_confirm_peer's public_identity_from_json can parse it and record
+     * the two-phase-admission confirmation. Without this the C handler sees an
+     * empty payload and returns early, so no confirmation is recorded and the
+     * provisional hold never registers (provisional_peer_count stays 0).
+     * Mirrors the Python adapter's IdentityProtocol.confirm case
+     * (`payload.get('peer') or payload.get('candidate')`). */
+    if (strcmp(function, "peer_accepted") == 0 && json_is_object(payload)) {
+        json_t *p = json_object_get(payload, "peer");
+        if (!json_is_string(p)) p = json_object_get(payload, "candidate");
+        const char *peer_pid = json_is_string(p) ? json_string_value(p) : NULL;
+        sce_participant_t *pp = peer_pid ? sce_find_participant(ctx, peer_pid) : NULL;
+        if (pp != NULL) {
+            ic_impl_t *pp_impl = (ic_impl_t *)pp->impl;
+            if (pp_impl != NULL && pp_impl->pub != NULL) {
+                json_t *body = NULL;
+                if (public_identity_to_json(pp_impl->pub, &body) == 0
+                    && body != NULL) {
+                    net_msg_pack_json(&out->info.net_msg, body);
+                    json_decref(body);
+                }
+            }
+        }
+        return 0;
+    }
+
     /* propose_peer — drives the receiver's handle_vote_on_peer. The payload
      * carries the candidate's full public identity (uuid + nickname +
      * address + signature/encryptor hex), exactly the shape the production
