@@ -213,7 +213,7 @@ def _pure_reputation(self, peer):
         peer_score = tx.p1_score if tx.p1_id == peer.uuid else tx.p2_score
         total += reporter_score * peer_score
         valid += 1
-    if valid == 0: return 0.5
+    if valid == 0: return 0.2  # PREREP_NEUTRAL
     return total / valid
 ```
 
@@ -229,7 +229,7 @@ def _pure_reputation(self, peer):
         w = self._tx_weight(tx)  # transaction_weight from cached capability
         total += reporter_score * peer_score * w
         total_w += w
-    if total_w == 0: return 0.5
+    if total_w == 0: return 0.2  # PREREP_NEUTRAL
     return total / total_w
 ```
 
@@ -448,6 +448,25 @@ choice is to apply a fixed ε of 0.02 to each `TIER_FLOORS` floor on
 the way down: promotion happens at the floor, demotion happens at
 floor − 0.02. This keeps the floor-as-published value stable for
 documentation and adds a quiet 2-point buffer in the implementation.
+
+### 7.4 Communication cut-off (exclusion) — below tier 0
+
+The trust tiers sit on a `[0, 1]` scale (no negatives). Below tier 0 there is
+one further threshold that is **not a tier**: the communication cut-off
+`COMM_CUTOFF = 0.1` (`AT_REP_COMM_CUTOFF`). A peer whose reputation falls below
+it is **excluded** — dropped at the network layer, not merely demoted to tier 0.
+
+Because 0.1 lies *inside* tier 0 (`[0, 0.5)`), a 0.15 → 0.05 move is a
+tier-0 → tier-0 no-op for the ladder yet must still exclude the peer.
+`_publish_tier_change` therefore checks the cut-off crossing **before** its
+tier early-return, updating the exclusion set and emitting a `Network.exclude` /
+`Network.readmit` control message to the network process. Recovery is
+explicit-only (a `REASON_REHABILITATE` slash-lift restores the score to
+`PREREP_NEUTRAL = 0.2` and re-admits), and the excluded state persists across a
+restart. See [Reputation § Communication cut-off enforcement](reputation.md#communication-cut-off-enforcement)
+for the full mechanism. Note the neutral / cold-start reputation is now
+`0.2` (`PREREP_NEUTRAL`, `AT_REP_NEUTRAL`), a small leeway above the cut-off, so
+the slash floor can sit at `0.0`.
 
 ## 8. Domain specification — TrustLadder YAML
 

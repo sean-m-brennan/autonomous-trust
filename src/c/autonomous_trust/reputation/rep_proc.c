@@ -73,9 +73,23 @@ static int _trust_tier(double score)
 
 /* Forward declaration — definition follows _ensure_init/state struct.
  * Emits a local-IPC tier_update to the identity process queue iff the
- * peer's trust tier has changed since the last publication. Mirrors
- * Python's `_publish_tier_change` in repprocess.py:595-619. */
-static void _publish_tier_change(const uuid_t peer_uuid, double score);
+ * peer's trust tier has changed since the last publication, and an
+ * exclude/readmit control message to the network process iff the peer
+ * crossed the COMM_CUTOFF communication cut-off. Mirrors Python's
+ * `_publish_tier_change` in repprocess.py. Takes @p proc to resolve the
+ * peer's address (from proc->protocol.peers) for the exclusion message. */
+static void _publish_tier_change(const process_t *proc,
+                                 const uuid_t peer_uuid, double score);
+/* Resolve @p peer_uuid to an address and send a Network exclude/readmit
+ * control message to the network process. Mirrors Python
+ * ReputationProcess._publish_exclusion. */
+static void _publish_exclusion(const process_t *proc,
+                               const uuid_t peer_uuid, bool excluded);
+
+/* Slash "reason" that lifts (rather than floors) a target: releases the
+ * slash floor, restores the score to PREREP_NEUTRAL, and re-admits it.
+ * Recovery is explicit-only. Mirror: Python SlashAttestation.REASON_REHABILITATE. */
+#define REP_SLASH_REASON_REHABILITATE "rehabilitate"
 
 /****************************
  * Protocol-string definitions (declared `extern char[]` in
@@ -117,6 +131,13 @@ static char ID_TIER_FUNC[] = "tier_update";
  * in-flight tasks whose capability.required_tier exceeds the new tier.
  */
 static char NEG_TIER_LOST_FUNC[] = "tier_lost";
+/* Local-IPC function fields for the reputation communication cut-off:
+ * reputation emits these to the network process, which excludes/readmits the
+ * carried address. Matched by value against net_proc's NET_FN_EXCLUDE /
+ * NET_FN_READMIT (network.h) — same cross-process string-match convention as
+ * ID_TIER_FUNC above. Value must match Python Network.exclude / readmit. */
+static char NET_EXCLUDE_FUNC[] = "exclude";
+static char NET_READMIT_FUNC[] = "readmit";
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -195,6 +216,14 @@ static struct {
     map_t slash_sigs;     /* "target:epoch" -> integer_data(signer count) */
     map_t slash_pending;  /* "target:epoch" -> integer_data(floor x1000) */
     int64_t slash_epoch;
+    /* Communication cut-off exclusion set: peers whose reputation fell below
+     * COMM_CUTOFF and were excluded at the network layer. Tracks the crossing
+     * so _publish_tier_change emits exclude/readmit only on an actual
+     * transition. Mirrors Python ReputationProcess._excluded. (C has no
+     * reputation persistence, so there is no snapshot to boot-reseed from —
+     * the Python two-sided persist filter + _seed_exclusions_from_snapshot
+     * have no C counterpart; see REPUTATION_THRESHOLDS_TODO.md.) */
+    map_t excluded;       /* peer_uuid_str -> integer_data(1) */
     /* --- Phase 2: quorum-signed Merkle checkpoints ---
      * Mirrors Python ReputationProcess._checkpoint / _checkpoint_sigs /
      * _checkpoint_pending. A member co-signs a proposed checkpoint only when
@@ -236,6 +265,7 @@ static void _ensure_init(void)
         map_init(&rep_state.slash_sigs);
         map_init(&rep_state.slash_pending);
         rep_state.slash_epoch = 0;
+        map_init(&rep_state.excluded);
         map_init(&rep_state.checkpoint_sigs);
         map_init(&rep_state.checkpoint_pending);
         rep_state.checkpoint_root[0] = '\0';
@@ -367,16 +397,38 @@ static void _record_task_tier_locked(char *task_uuid_str, int tier)
     map_set(&rep_state.task_tiers, task_uuid_str, t_dat);
 }
 
-static void _publish_tier_change(const uuid_t peer_uuid, double score)
+static void _publish_tier_change(const process_t *proc,
+                                 const uuid_t peer_uuid, double score)
 {
     int new_tier = _trust_tier(score);
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(peer_uuid, uuid_str);
 
+    pthread_mutex_lock(&rep_state.lock);
+
+    /* Communication cut-off crossing. Checked BEFORE the tier dedup
+     * early-return because COMM_CUTOFF (0.1) lies WITHIN tier 0 ([0,0.5)):
+     * a 0.15 -> 0.05 move is a tier-0 -> tier-0 no-op for the tier logic
+     * yet must still exclude the peer. The exclusion set is the authority;
+     * the network process is notified only on an actual crossing. Mirrors
+     * Python repprocess._publish_tier_change. */
+    int exclusion_action = 0;  /* +1 exclude, -1 readmit, 0 unchanged */
+    bool now_excluded = (score < COMM_CUTOFF);
+    data_t *ex_dat = NULL;
+    bool was_excluded =
+        (map_get(&rep_state.excluded, uuid_str, &ex_dat) == 0);
+    (void)ex_dat;  /* membership only; value unused */
+    if (now_excluded && !was_excluded) {
+        map_set(&rep_state.excluded, uuid_str, integer_data(1));
+        exclusion_action = 1;
+    } else if (was_excluded && !now_excluded) {
+        map_remove(&rep_state.excluded, uuid_str);
+        exclusion_action = -1;
+    }
+
     /* Dedup: skip if the tier hasn't changed from the last publication
      * for this peer. Mirrors Python's `self.peer_tiers.get(key) == new_tier`
      * guard in repprocess.py. */
-    pthread_mutex_lock(&rep_state.lock);
     int prior = -1;
     data_t *prior_dat = NULL;
     if (map_get(&rep_state.peer_tiers, uuid_str, &prior_dat) == 0 &&
@@ -385,6 +437,10 @@ static void _publish_tier_change(const uuid_t peer_uuid, double score)
     }
     if (prior == new_tier) {
         pthread_mutex_unlock(&rep_state.lock);
+        /* Still enforce the cut-off crossing even when the tier is
+         * unchanged (the whole reason the cut-off check precedes this). */
+        if (exclusion_action != 0)
+            _publish_exclusion(proc, peer_uuid, exclusion_action > 0);
         return;
     }
     /* Capture demotion BEFORE we overwrite the cache so the
@@ -398,6 +454,12 @@ static void _publish_tier_change(const uuid_t peer_uuid, double score)
     if (tier_dat != NULL)
         map_set(&rep_state.peer_tiers, uuid_str, tier_dat);
     pthread_mutex_unlock(&rep_state.lock);
+
+    /* Enforce the cut-off crossing (network exclude/readmit) alongside the
+     * tier change. Done outside rep_state.lock because _publish_exclusion
+     * takes the peers read-lock and sends IPC. */
+    if (exclusion_action != 0)
+        _publish_exclusion(proc, peer_uuid, exclusion_action > 0);
 
     /* Build the tier_update payload — a 2-element JSON array
      * [uuid_str, tier_int] matching Python's
@@ -435,6 +497,51 @@ static void _publish_tier_change(const uuid_t peer_uuid, double score)
     }
 
     json_decref(arr);
+}
+
+/* Resolve @p peer_uuid to its address from the live peer roster and send a
+ * Network exclude/readmit control message to the network process. Local IPC
+ * only (no wire egress). No-op if the address is unknown (nothing to key the
+ * network-layer gate on). Mirrors Python ReputationProcess._publish_exclusion
+ * (address resolution + Message(CfgIds.network, Network.exclude/readmit, addr)). */
+static void _publish_exclusion(const process_t *proc,
+                               const uuid_t peer_uuid, bool excluded)
+{
+    if (proc == NULL)
+        return;
+    char address[ADDR_LEN + 1];
+    address[0] = '\0';
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        if (uuid_compare(proc->protocol.peers[i].uuid, peer_uuid) == 0) {
+            snprintf(address, sizeof(address), "%s",
+                     proc->protocol.peers[i].address);
+            break;
+        }
+    }
+    peers_read_unlock(proc);
+    if (address[0] == '\0') {
+        char uuid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(peer_uuid, uuid_str);
+        log_debug(proc->logger,
+                  "Reputation: exclusion %s for %s: no address, gate skipped\n",
+                  excluded ? "add" : "remove", uuid_str);
+        return;
+    }
+    generic_msg_t ipc = {0};
+    ipc.type = NET_MESSAGE;
+    strncpy(ipc.info.net_msg.process, "network", PROC_NAME_LEN);
+    ipc.info.net_msg.function = excluded ? NET_EXCLUDE_FUNC : NET_READMIT_FUNC;
+    ipc.info.net_msg.encrypt = false;  /* local IPC, no wire egress */
+    strncpy(ipc.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    json_t *body = json_string(address);
+    if (body == NULL)
+        return;
+    net_msg_pack_json(&ipc.info.net_msg, body);
+    messaging_send("network", NET_MESSAGE, &ipc, false);
+    json_decref(body);
+    log_info(proc->logger, "Reputation: %s %s at the network layer\n",
+             excluded ? "excluded" : "readmitted", address);
 }
 
 /****************************
@@ -1527,7 +1634,7 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
      * already holds the send context; Python uses a queue because its
      * _compute_reputation runs in a spawned thread without queue access. */
     if (have_uuid) {
-        _publish_tier_change(peer_uuid, score);
+        _publish_tier_change(proc, peer_uuid, score);
         probes_counter("rep.compute", "queued", NULL);
     }
 
@@ -1983,6 +2090,8 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
         json_string_value(json_object_get(payload, "target_uuid"));
     double floor = json_real_value(json_object_get(payload, "floor_score"));
     int64_t epoch = json_integer_value(json_object_get(payload, "epoch"));
+    const char *reason =
+        json_string_value(json_object_get(payload, "reason"));
     if (target_str == NULL)
     {
         json_decref(payload);
@@ -2003,9 +2112,35 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
         json_decref(payload);
         return true;
     }
+    /* Rehabilitation (explicit-only recovery): release the slash floor and
+     * LIFT the score to PREREP_NEUTRAL (above the comm cut-off) so the peer
+     * is re-admitted and must re-earn elevated trust from neutral. Mirrors
+     * Python _apply_slash's REASON_REHABILITATE branch. (Python also clears
+     * _consensus_ema/_consensus_last/_consensus_folded_idx so the lift is
+     * visible past the slash-override; the C twin keeps no such running-EMA
+     * latch — the score store is authoritative — so there is nothing to
+     * clear here.) The tier recompute below drives the readmit through
+     * _publish_tier_change (score above the cut-off -> exclusion_action -1). */
+    if (reason != NULL && strcmp(reason, REP_SLASH_REASON_REHABILITATE) == 0)
+    {
+        pthread_mutex_lock(&rep_state.lock);
+        map_remove(&rep_state.slashed, (map_key_t)target_str);
+        reputations_update(&rep_state.reputations, target_uuid, PREREP_NEUTRAL);
+        pthread_mutex_unlock(&rep_state.lock);
+        _publish_tier_change(proc, target_uuid, PREREP_NEUTRAL);
+        log_info(proc->logger,
+                 "Reputation: slash lifted (rehabilitate) target=%s -> %.2f\n",
+                 target_str, PREREP_NEUTRAL);
+        json_decref(payload);
+        return true;
+    }
     pthread_mutex_lock(&rep_state.lock);
     _apply_slash_locked(target_str, target_uuid, floor, epoch);
     pthread_mutex_unlock(&rep_state.lock);
+    /* Drive the tier/exclusion publication so a sub-cut-off floor excludes
+     * the peer at the network layer immediately (mirrors Python's
+     * pending_tiers -> _compute_reputation -> _publish_tier_change flow). */
+    _publish_tier_change(proc, target_uuid, floor);
     log_info(proc->logger, "Reputation: slash applied target=%s floor=%.2f\n",
              target_str, floor);
     json_decref(payload);
@@ -2281,6 +2416,8 @@ void reputation_reset_state(int num_peers)
     map_free(&rep_state.slash_pending);
     map_init(&rep_state.slash_pending);
     rep_state.slash_epoch = 0;
+    map_free(&rep_state.excluded);
+    map_init(&rep_state.excluded);
     map_free(&rep_state.checkpoint_sigs);
     map_init(&rep_state.checkpoint_sigs);
     map_free(&rep_state.checkpoint_pending);

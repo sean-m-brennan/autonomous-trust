@@ -541,6 +541,28 @@ class TestRecvGroup:
 
 
 # ---------------------------------------------------------------------------
+# close_listeners
+# ---------------------------------------------------------------------------
+
+class TestCloseListeners:
+    """close_listeners() releases the bound receive sockets at shutdown."""
+
+    def test_closes_bound_sockets(self):
+        proc = _make_proc()
+        TCPNetworkProcess.close_listeners(proc)
+        proc.recv_ptp_sock.close.assert_called_once()
+        proc.recv_grp_sock.close.assert_called_once()
+
+    def test_swallows_close_errors(self):
+        """A socket that raises on close (e.g. already closed) does not
+        prevent the other listeners from being closed, and does not raise."""
+        proc = _make_proc()
+        proc.recv_ptp_sock.close.side_effect = OSError('already closed')
+        TCPNetworkProcess.close_listeners(proc)      # must not raise
+        proc.recv_grp_sock.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Original integration tests (preserved, require live config via setup_teardown)
 # ---------------------------------------------------------------------------
 
@@ -555,10 +577,15 @@ def test_reject(setup_teardown):
     cfgs = at._configure(start=False)
     net_addr = cfgs[CfgIds.network].ip4
     tcp = _TCP(cfgs, dict({}), None)
-    tcp.send_peer('test1', net_addr)
-    msg_tpl = tcp.recv_peer()
-    assert msg_tpl[0] is None
-    #assert net_addr == msg_tpl[1][0]
+    try:
+        tcp.send_peer('test1', net_addr)
+        msg_tpl = tcp.recv_peer()
+        assert msg_tpl[0] is None
+        #assert net_addr == msg_tpl[1][0]
+    finally:
+        # These tests never run process(), so close the listeners explicitly
+        # to release the port for the next test rather than relying on GC.
+        tcp.close_listeners()
 
 
 def test_p2p(setup_teardown):
@@ -567,9 +594,12 @@ def test_p2p(setup_teardown):
     cfgs = at._configure(start=False)
     net_addr = cfgs[CfgIds.network].ip4
     tcp = _TCP(cfgs, dict({}), None, acceptance_func=lambda x: True)
-    tcp.send_peer('test1', net_addr)
-    msg_tpl = tcp.recv_peer()
-    assert msg_tpl == (None, None, None)
+    try:
+        tcp.send_peer('test1', net_addr)
+        msg_tpl = tcp.recv_peer()
+        assert msg_tpl == (None, None, None)
+    finally:
+        tcp.close_listeners()
 
 
 @pytest.mark.skip(reason="blocked by firewall")
@@ -577,5 +607,8 @@ def test_mcast(setup_teardown):
     at = AutonomousTrust(logfile=Configuration.log_stdout)
     cfgs = at._configure(start=False)
     tcp = _TCP(cfgs, dict({}), None)
-    tcp.send_any('test2')
-    assert 'test2' == tcp.recv_any()
+    try:
+        tcp.send_any('test2')
+        assert 'test2' == tcp.recv_any()
+    finally:
+        tcp.close_listeners()

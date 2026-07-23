@@ -67,6 +67,48 @@ sequenceDiagram
 
 **Replay invariants.** Both Phase 1 (`ask-permission-replay-rejected.yaml`, `ask-permission-lower-id-rejected.yaml`) and the chain-update path (`chain-replay-update.yaml`) are pinned against re-delivery — Paxos `last_id` advances on grant, so duplicate or out-of-order ballots are rejected idempotently. See BUGS.md §P6 for the closure of the original `last_id`-advance divergence.
 
+## Reputation scale and thresholds
+
+Reputation lives on a **`[0, 1]` scale — there are no negative values.** (An
+earlier draft drifted into a signed `[-1, 1]` framing; that was reverted.) The
+per-transaction task scores that feed the EMA/CTFT arithmetic are unchanged —
+clean ≈ 0.8, anomaly/tamper ≈ 0.3, good ≈ 0.9 — only the *interpretation
+thresholds* below define the operating bands. These constants are the single
+source of truth and live in `repprocess.py` (mirrored in `reputation.h` /
+`reputation.c`):
+
+| Value | Name | Meaning | Env override (default) |
+|-------|------|---------|------------------------|
+| 1.0 | — | maximally trusted | — |
+| 0.5 | tier-1 floor / CTFT pivot | elevated-trust floor & per-transaction cooperate/defect pivot (unchanged) | — |
+| 0.2 | `PREREP_NEUTRAL` | neutral / cold-start ("no information yet") | `AT_REP_NEUTRAL` (0.2) |
+| 0.1 | `COMM_CUTOFF` | communication cut-off — a peer below this is **excluded** | `AT_REP_COMM_CUTOFF` (0.1) |
+| 0.0 | slash floor | catastrophic failure (a slash's `floor_score`) | — |
+| — | decay asymptote | idle-decay floor, just above neutral | `AT_REP_DECAY_ASYMPTOTE` (0.21) |
+| — | persist gate | trusted-cohort persist threshold | `AT_REP_PERSIST_THRESHOLD` (0.5) |
+
+The 0.2 neutral and 0.1 cut-off exist precisely so the **slash floor can sit at
+0.0** with the participation cut-off just above it: a peer we know nothing about
+starts at neutral (0.2), a small leeway above the cut-off, and only a peer that
+actively earns a sub-cut-off score is excluded.
+
+**Exclusion and recovery.** A peer whose aggregate reputation falls **below
+`COMM_CUTOFF` (0.1) is excluded**: gateways stop forwarding for it, the network
+process drops its inbound frames and filters it out of outbound targets (see
+[§ Communication cut-off](#communication-cut-off-enforcement) below), and it is
+ignored. Because it is ignored, an excluded peer **cannot transact its way back**
+— recovery is **explicit-only**, via a `REASON_REHABILITATE` slash-lift
+(operator/quorum) that restores the score to `PREREP_NEUTRAL` (0.2) and
+re-admits it, after which it must re-earn elevated trust from neutral. The
+excluded state **persists across a restart** (see the two-sided persist filter
+under [Persistent Cohort](persistent-cohort.md)) so a reboot cannot silently
+rehabilitate a bad actor.
+
+All four thresholds honor environment overrides (`AT_REP_NEUTRAL`,
+`AT_REP_COMM_CUTOFF`, `AT_REP_DECAY_ASYMPTOTE`, `AT_REP_PERSIST_THRESHOLD`), read
+once via `_env_float`; the inspector dashboard reads the same
+`AT_REP_COMM_CUTOFF` so its cut-off line tracks a re-adjusted backend.
+
 ## Reputation Computation
 
 When a reputation query arrives (`rep_req`), the score is computed using one of two strategies based on the peer's current standing. The mode switch uses **hysteresis** to prevent oscillation (a peer hovering near the boundary used to flip modes every tick — e.g. 0.9 ↔ 0.4): a peer must climb above `COOP_ENTER = 0.55` to enter Cooperation Mode and must fall below `COOP_EXIT = 0.45` to drop back to Tit-for-Tat. Within the `[0.45, 0.55]` band the previously-selected mode is retained.
@@ -79,7 +121,7 @@ Pure reputation: a weighted average of every transaction score involving this pe
 score = Σ (counterparty_score · counterparty_rep · task_weight) / Σ task_weight
 ```
 
-(returns the neutral `0.5` when there is no weighted history). The `transaction_weight` factor ties this directly into the tiered-transaction model — see [Trust Tiers §5](trust-tiers.md).
+(returns the neutral `PREREP_NEUTRAL` = `0.2` when there is no weighted history). The `transaction_weight` factor ties this directly into the tiered-transaction model — see [Trust Tiers §5](trust-tiers.md).
 
 ### Tit-for-Tat Mode (`prior <= COOP_EXIT` to enter, retained until `prior > COOP_ENTER`)
 
@@ -107,12 +149,12 @@ that shortcut rests on the staleness decay below: re-loaded trust is *stale*
 trust, and stale trust fades.
 
 A peer with no bilateral transaction history would otherwise read as the flat
-neutral `0.5` ("forming…") until enough rounds accumulate. Two mechanisms avoid
-that dead zone:
+neutral `PREREP_NEUTRAL` = `0.2` ("forming…") until enough rounds accumulate.
+Two mechanisms avoid that dead zone:
 
 - **Seeded warm-start.** At startup the process loads any persisted/seeded
   reputation snapshot (`self.configs.get(CfgIds.reputation)`). A seeded prior
-  overrides the flat `0.5` for known-trusted peers so they read "trusted"
+  overrides the flat `0.2` neutral for known-trusted peers so they read "trusted"
   immediately rather than spending the warm-up window looking untrusted. See
   [Persistent Cohort](persistent-cohort.md) for how the snapshot is written and
   restored.
@@ -139,8 +181,9 @@ last transaction with that peer (`_decay_reputations`, swept periodically from
 the process loop; `_decayed_score` is the pure function). The relevant constants
 (`REPUTATION_DECAY_*` in `repprocess.py`) are tunable:
 
-- **Asymptote** (`0.51`, just above neutral `0.50`). A long-dormant peer relaxes
-  toward — but never reaches — neutral, so a previously-known asset stays
+- **Asymptote** (`AT_REP_DECAY_ASYMPTOTE`, default `0.21`, just above neutral
+  `0.20` and above the `0.1` cut-off). A long-dormant peer relaxes toward — but
+  never reaches — neutral, so a previously-known asset stays
   faintly preferred over a true stranger while its *elevated* trust tier
   (tiers 2–4) lapses and must be re-earned on contact.
 - **Onset** grace period before any decay begins, so a brief out-of-range gap
@@ -183,6 +226,32 @@ the restored operational reputation to the tier-1 ceiling until the peer accrues
 N fresh committed in-session transactions, then let it climb normally. Decay and
 this floor compose (one is the time axis, the other the in-session axis). Pairs
 with the human-on-the-loop carve-out for safety-critical capabilities.
+
+## Communication cut-off enforcement
+
+When a peer's reputation crosses `COMM_CUTOFF` (0.1), the exclusion is enforced
+at the network layer, not merely reflected in a score:
+
+- **Detection.** `_publish_tier_change` checks the cut-off crossing *before* its
+  tier early-return, because 0.1 lies inside tier 0 (`[0, 0.5)`) — a 0.15 → 0.05
+  move is a tier-0 → tier-0 no-op for the tier logic yet must still exclude the
+  peer. On a crossing it updates `self._excluded` and calls `_publish_exclusion`,
+  which resolves the peer's address and sends a `Network.exclude` (or
+  `Network.readmit`) local-IPC control message to the network process.
+- **Enforcement.** The network process (`netprocess.py`) registers
+  `handle_exclude` / `handle_readmit`, which add/remove the (address-normalized)
+  peer from `_rejected_addresses`. The **inbound-drop** gate in
+  `accept_peer_message` (and the ptp/group/multicast drain loops) drops frames
+  from an excluded address; the **outbound-skip** gate in the group-send and
+  pseudo-multicast loops stops forwarding to it — so gateways stop relaying for
+  an excluded peer.
+- **Boot & sync.** Exclusions re-seeded at boot from the persisted snapshot
+  (`_seed_exclusions_from_snapshot`) are flushed to the network process once, on
+  the first `process()` iteration (guarded by `self._exclusions_synced`), since
+  no queues exist at construction time.
+- **Recovery.** Only a `REASON_REHABILITATE` slash-lift clears the exclusion:
+  it lifts the score to `PREREP_NEUTRAL` (0.2), whose tier recompute publishes
+  the readmit through the same `_publish_tier_change` path.
 
 ## Expiration
 

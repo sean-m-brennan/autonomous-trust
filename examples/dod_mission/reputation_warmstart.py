@@ -33,20 +33,27 @@ SEED_REPUTATION = 0.7
 SEED_TIER = 2
 
 # Cold-start neutral placeholder a consensus query returns for a peer with no
-# committed bilateral history yet. A real EMA over the demo's transaction
-# scores (0.3 anomalous / 0.8 clean) never lands exactly here, so an exact
-# 0.5 reading means "no information yet", not an earned score.
-NEUTRAL_REP = 0.5
+# committed bilateral history yet. On the [0, 1] scale the neutral / cold-start
+# reputation is PREREP_NEUTRAL (0.2) — a small leeway above the COMM_CUTOFF
+# (0.1) communication cut-off — so _consensus_baseline returns 0.2 for a peer
+# with no committed history. A real EMA over the demo's transaction scores
+# (0.3 anomalous / 0.8 clean) never lands exactly here, so an exact 0.2 reading
+# means "no information yet", not an earned score. Mirrors PREREP_NEUTRAL in
+# repprocess.py / reputation.c — kept in sync by hand (this module stays
+# dependency-free); the tests assert consistency.
+NEUTRAL_REP = 0.2
 
-# The OTHER cold-start neutral, seen on the bilateral (peer-pair / rep_req)
-# query path that feeds the Trust Network graph. An observer's rep_req of a
-# subject it has no local history with returns 0.5 when it is in pure mode
-# (a warm-start-seeded observer whose stored prior 0.7 > COOP_ENTER) or
-# ``ReputationProcess.PREREP_NEUTRAL`` (0.0) when it is in tit-for-tat mode
-# (a cold observer). Both mean "no earned bilateral info yet". Mirrors
-# ``PREREP_NEUTRAL`` in repprocess.py / reputation.c — kept in sync by hand
-# (this module stays dependency-free); the tests assert consistency.
-PREREP_NEUTRAL = 0.0
+# The bilateral (peer-pair / rep_req) query path that feeds the Trust Network
+# graph returns the SAME neutral on the [0, 1] scale: an observer's rep_req of a
+# subject it has no local history with returns ``ReputationProcess.PREREP_NEUTRAL``
+# (0.2) in both pure mode (a warm-start-seeded observer whose stored prior
+# 0.7 > COOP_ENTER) and tit-for-tat mode (a cold observer). Both mean "no earned
+# bilateral info yet". Since the earlier signed-scale framing was reverted, the
+# consensus and bilateral neutrals are unified at PREREP_NEUTRAL (0.2); this
+# constant is kept as a distinct name for the two documented query paths but
+# holds the same value. Mirrors ``PREREP_NEUTRAL`` in repprocess.py /
+# reputation.c.
+PREREP_NEUTRAL = 0.2
 
 
 def is_pre_trusted(peer_name: str) -> bool:

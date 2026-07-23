@@ -146,6 +146,10 @@ DEFINE_ERROR(ENET_RECV, "Network receive failed");
 char NET_FN_STATS_REQ[]  = "stats_req";
 char NET_FN_STATS_RESP[] = "stats_resp";
 char NET_FN_PING[]       = "ping";
+/* Reputation communication cut-off control (local IPC from rep_proc's
+ * _publish_exclusion). Mirror: Python Network.exclude / Network.readmit. */
+char NET_FN_EXCLUDE[]    = "exclude";
+char NET_FN_READMIT[]    = "readmit";
 
 static const int RECV_POLL_TIMEOUT_MS = 100;
 
@@ -158,12 +162,30 @@ static char rejected_addresses[MAX_REJECTED][ADDR_LEN + 1];
 static size_t rejected_count = 0;
 static pthread_mutex_t rejected_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Canonicalize an address to the peer-listing key form (strip any
+ * '/suffix', e.g. a CIDR mask), so an exclusion keyed on a peer's stored
+ * address matches the raw from_addr seen at recv. Mirrors Python
+ * NetworkProcess._norm_addr. @p out must hold ADDR_LEN + 1 bytes. */
+static void _norm_addr(const char *address, char *out, size_t outlen)
+{
+    if (address == NULL || out == NULL || outlen == 0) {
+        if (out != NULL && outlen > 0) out[0] = '\0';
+        return;
+    }
+    size_t i = 0;
+    for (; address[i] != '\0' && address[i] != '/' && i < outlen - 1; i++)
+        out[i] = address[i];
+    out[i] = '\0';
+}
+
 static bool reject_message(const char *address)
 {
+    char norm[ADDR_LEN + 1];
+    _norm_addr(address, norm, sizeof(norm));
     bool found = false;
     pthread_mutex_lock(&rejected_lock);
     for (size_t i = 0; i < rejected_count; i++) {
-        if (strcmp(rejected_addresses[i], address) == 0) {
+        if (strcmp(rejected_addresses[i], norm) == 0) {
             found = true;
             break;
         }
@@ -172,20 +194,42 @@ static bool reject_message(const char *address)
     return found;
 }
 
-__attribute__((unused))
 static void blacklist_address(const char *address)
 {
+    char norm[ADDR_LEN + 1];
+    _norm_addr(address, norm, sizeof(norm));
     pthread_mutex_lock(&rejected_lock);
     for (size_t i = 0; i < rejected_count; i++) {
-        if (strcmp(rejected_addresses[i], address) == 0) {
+        if (strcmp(rejected_addresses[i], norm) == 0) {
             pthread_mutex_unlock(&rejected_lock);
             return;
         }
     }
     if (rejected_count < MAX_REJECTED) {
         snprintf(rejected_addresses[rejected_count], sizeof(rejected_addresses[0]),
-                 "%s", address);
+                 "%s", norm);
         rejected_count++;
+    }
+    pthread_mutex_unlock(&rejected_lock);
+}
+
+/* Reverse a blacklist/exclusion (explicit rehabilitation / readmit).
+ * Removes @p address (normalized) from the rejection list, compacting the
+ * fixed array. Mirrors Python NetworkProcess.handle_readmit's discard. */
+static void remove_rejected_address(const char *address)
+{
+    char norm[ADDR_LEN + 1];
+    _norm_addr(address, norm, sizeof(norm));
+    pthread_mutex_lock(&rejected_lock);
+    for (size_t i = 0; i < rejected_count; i++) {
+        if (strcmp(rejected_addresses[i], norm) == 0) {
+            for (size_t j = i + 1; j < rejected_count; j++)
+                snprintf(rejected_addresses[j - 1], sizeof(rejected_addresses[0]),
+                         "%s", rejected_addresses[j]);
+            rejected_count--;
+            rejected_addresses[rejected_count][0] = '\0';
+            break;
+        }
     }
     pthread_mutex_unlock(&rejected_lock);
 }
@@ -1700,6 +1744,52 @@ static int network_run(const net_transport_t *transport,
                                  nmsg->to_whom.address);
                     continue;
                 }
+                /* Reputation communication cut-off enforcement. rep_proc's
+                 * _publish_exclusion feeds an exclude/readmit control message
+                 * carrying the peer's address (JSON string). An excluded
+                 * address's inbound frames are dropped (reject_message gate in
+                 * the ptp/group/any recv loops) and it is skipped as an
+                 * outbound target. Mirrors Python netprocess handle_exclude /
+                 * handle_readmit. Never leaves on the wire. */
+                if (strcmp(nmsg->function, NET_FN_EXCLUDE) == 0 ||
+                    strcmp(nmsg->function, NET_FN_READMIT) == 0) {
+                    json_t *body = NULL;
+                    char addr[ADDR_LEN + 1];
+                    addr[0] = '\0';
+                    if (net_msg_unpack_json(nmsg, &body) == 0 && body != NULL) {
+                        const char *a = json_string_value(body);
+                        if (a != NULL)
+                            snprintf(addr, sizeof(addr), "%s", a);
+                        json_decref(body);
+                    }
+                    if (addr[0] != '\0') {
+                        if (strcmp(nmsg->function, NET_FN_EXCLUDE) == 0) {
+                            blacklist_address(addr);
+                            log_info(logger,
+                                     "Network: reputation cut-off, excluding %s\n",
+                                     addr);
+                        } else {
+                            remove_rejected_address(addr);
+                            log_info(logger,
+                                     "Network: reputation readmit %s\n", addr);
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            /* Outbound-skip gate (reputation cut-off): never forward a
+             * targeted (unicast) message to an excluded peer. Broadcasts
+             * (empty to_whom) are unaffected — a receiver-side inbound-drop
+             * gate handles those. Mirrors Python netprocess's outbound-skip
+             * in the group-send / pseudo-multicast loops. */
+            if (nmsg->to_whom.address[0] != '\0' &&
+                reject_message(nmsg->to_whom.address)) {
+                log_debug(logger,
+                          "Network: outbound skip to excluded %s (%s.%s)\n",
+                          nmsg->to_whom.address, nmsg->process,
+                          nmsg->function ? nmsg->function : "?");
+                continue;
             }
 
             net_wire_msg_t wmsg = {0};
