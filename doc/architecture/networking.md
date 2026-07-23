@@ -28,7 +28,7 @@ The `UDPNetworkProcess` binds three UDP sockets:
 | `recv_grp_sock` | Node IP | N+1 | Group receive |
 | `recv_cast_sock` | Broadcast/multicast addr | N | Open broadcast receive |
 
-The `TCPNetworkProcess` extends this by replacing peer and group UDP with TCP (using `listen`/`accept`), while keeping UDP for broadcast/multicast. TCP uses `[length]\|[data]` framing for reliable delivery.
+The `TCPNetworkProcess` extends this by replacing peer and group UDP with TCP (using `listen`/`accept`), while keeping UDP for broadcast/multicast. TCP uses `[length]\|[data]` framing for reliable delivery. By default it opens one connection per message; it can optionally reuse one connection per peer for many messages, described in [TCP Connection Pooling](network-connection-pooling.md).
 
 ## Wire Message Format
 
