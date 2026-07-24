@@ -47,6 +47,16 @@ message Identity {
   uint32 rank = 11;                // Voter rank for AgreementByAuthority;
                                    // 0 by default, future elevation
                                    // mechanism may bump it.
+  // Operator-attended signal (ethne guardian edge, D8). Advertises whether a
+  // node has a human behind it. operator_bound is durable ("has a human
+  // guardian", backed by the ZTA operator credential the receiver verifies);
+  // operator_attested_at is a live freshness stamp (epoch seconds of the last
+  // verified operator session; 0 = none) from which peers derive attended-now.
+  // Like the zta_* fields, these are NOT part of identity equality (rotation
+  // and attestation must not change identity). See
+  // lib/muudd/lib/ethne/doc/design.md D8/Q9.
+  bool operator_bound = 12;        // durable: node has a human guardian
+  double operator_attested_at = 13;  // live: epoch secs of last operator session
 }
 
 message Group {

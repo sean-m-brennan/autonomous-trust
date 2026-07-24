@@ -581,7 +581,19 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
 
     int64_t id1 = json_integer_value(j_id1);
     int64_t id2 = json_integer_value(j_id2);
-    const char *peer_uuid_str = json_string_value(j_peer_uuid);
+    /* peer_uuid_str is a borrowed pointer into `payload`; copy it out before
+     * the json_decref below so the GRANT branch can echo it back without a
+     * use-after-free. Preserve NULL (non-string field) so the grant payload
+     * omits the key exactly as before rather than emitting an empty string. */
+    const char *peer_uuid_borrowed = json_string_value(j_peer_uuid);
+    char peer_uuid_buf[UUID_STRING_LEN + 1];
+    bool have_peer_uuid = peer_uuid_borrowed != NULL;
+    if (have_peer_uuid)
+    {
+        strncpy(peer_uuid_buf, peer_uuid_borrowed, UUID_STRING_LEN);
+        peer_uuid_buf[UUID_STRING_LEN] = '\0';
+    }
+    const char *peer_uuid_str = have_peer_uuid ? peer_uuid_buf : NULL;
 
     int64_t out_last_id = 0;
     int out_chain_len = 0;
@@ -964,8 +976,32 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     int64_t id2 = json_integer_value(j_id2);
     int64_t id1 = json_integer_value(j_id1);
     double score = json_real_value(j_score);
-    const char *peer_uuid_str = json_string_value(j_peer_uuid);
-    const char *task_uuid_str = json_string_value(json_object_get(payload, "task_uuid"));
+    /* peer_uuid / task_uuid are borrowed from `payload` but are echoed back
+     * into the ACCEPTED reply AFTER json_decref(payload) below; copy them out
+     * now to avoid a use-after-free. Preserve NULL so an absent field stays
+     * absent in the reply rather than becoming an empty string. cap_name is
+     * only consumed before the decref, so it can stay borrowed. */
+    const char *peer_uuid_borrowed = json_string_value(j_peer_uuid);
+    char peer_uuid_buf[UUID_STRING_LEN + 1];
+    bool have_peer_uuid = peer_uuid_borrowed != NULL;
+    if (have_peer_uuid)
+    {
+        strncpy(peer_uuid_buf, peer_uuid_borrowed, UUID_STRING_LEN);
+        peer_uuid_buf[UUID_STRING_LEN] = '\0';
+    }
+    const char *peer_uuid_str = have_peer_uuid ? peer_uuid_buf : NULL;
+
+    const char *task_uuid_borrowed =
+        json_string_value(json_object_get(payload, "task_uuid"));
+    char task_uuid_str_buf[UUID_STRING_LEN + 1];
+    bool have_task_uuid = task_uuid_borrowed != NULL;
+    if (have_task_uuid)
+    {
+        strncpy(task_uuid_str_buf, task_uuid_borrowed, UUID_STRING_LEN);
+        task_uuid_str_buf[UUID_STRING_LEN] = '\0';
+    }
+    const char *task_uuid_str = have_task_uuid ? task_uuid_str_buf : NULL;
+
     const char *cap_name = json_string_value(
         json_object_get(payload, "capability_name"));
 

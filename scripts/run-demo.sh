@@ -93,6 +93,9 @@ IMAGE_NAME="${IMAGE_NAME:-autonomous-trust}"
 PLAYBACK_FILE=""                     # multi-agency only
 RECORD_FILE=""                       # multi-agency only (inspector-only mode)
 RECORD_TO=""                         # dod-mission: record a live run to a file
+PORT_EXPLICIT=0                      # 1 once the user passes --port
+HARVEST_RUNTIME="docker"             # log-harvest: docker | k8s
+HARVEST_CONTAINERS=""                # log-harvest: comma-list override (default: scenario peers)
 
 # DoD scenario knobs (only honored when --variant=dod-mission).
 SQUAD_SIZE=4
@@ -191,12 +194,26 @@ Backends (pick one, defaults to --tilt; not all valid for every variant):
   --compose              docker compose (one-shot)
   --k8s                  Minikube + kubectl (multi-agency + dod-mission)
   --playback FILE        Canned-playback replay, no AT runtime (multi-agency only)
+  --log-harvest          Reputation log-harvest debug lens (multi-agency only).
+                         Tails a RUNNING mesh's logs (nodes started with
+                         AT_REP_DUMP_SEC set) as a background subprocess and
+                         serves the reconstructed observer->subject matrix.
+                         Bring the mesh up with dumps enabled first, e.g.:
+                           AT_REP_DUMP_SEC=2 $0 --variant=multi-agency --compose
+  --triage               One-shot: print a per-subject exclusion triage table
+                         from the running mesh's logs (real AT exclusion vs
+                         cold-start baseline vs earned decline) and exit.
+                         Multi-agency only; honors --runtime/--namespace/--containers.
   --teardown             Stop a previous run, exit
   --clean                Remove generated artifacts, exit
 
 Common options:
   --namespace NS         K8s namespace (multi-agency/dod-mission only)
-  --port PORT            Inspector port (default: $INSPECTOR_PORT)
+  --port PORT            Inspector port (default: $INSPECTOR_PORT; log-harvest
+                         defaults to 8060 to avoid the coordinator's 8050)
+  --runtime R            log-harvest log source: docker | k8s (default: docker)
+  --containers LIST      log-harvest: comma-list of container/pod names to tail
+                         (default: the scenario's peer names)
   --log-level LEVEL      info | debug | warning (default: $LOG_LEVEL)
   --registry PREFIX      Image registry (include trailing /)
   --image-tag TAG        Image tag, include leading : (default: $IMAGE_TAG)
@@ -262,13 +279,19 @@ while [[ $# -gt 0 ]]; do
         --teardown)              BACKEND_MODE="teardown";    shift;;
         --clean)                 BACKEND_MODE="clean";       shift;;
         --playback)              BACKEND_MODE="playback"; PLAYBACK_FILE="$2"; shift 2;;
+        --log-harvest)           BACKEND_MODE="log-harvest"; shift;;
+        --triage)                BACKEND_MODE="triage";      shift;;
+        --runtime=*)             HARVEST_RUNTIME="${1#*=}";  shift;;
+        --runtime)               HARVEST_RUNTIME="$2";       shift 2;;
+        --containers=*)          HARVEST_CONTAINERS="${1#*=}"; shift;;
+        --containers)            HARVEST_CONTAINERS="$2";    shift 2;;
         --record)                BACKEND_MODE="record";   RECORD_FILE="$2";   shift 2;;
         --record-to=*)           RECORD_TO="${1#*=}";        shift;;
         --record-to)             RECORD_TO="$2";             shift 2;;
         --namespace=*)           NAMESPACE="${1#*=}";        shift;;
         --namespace)             NAMESPACE="$2";             shift 2;;
-        --port=*)                INSPECTOR_PORT="${1#*=}";   shift;;
-        --port)                  INSPECTOR_PORT="$2";        shift 2;;
+        --port=*)                INSPECTOR_PORT="${1#*=}"; PORT_EXPLICIT=1; shift;;
+        --port)                  INSPECTOR_PORT="$2"; PORT_EXPLICIT=1; shift 2;;
         --log-level=*)           LOG_LEVEL="${1#*=}";        shift;;
         --log-level)             LOG_LEVEL="$2";             shift 2;;
         --registry=*)            REGISTRY="${1#*=}";         shift;;
@@ -348,7 +371,7 @@ esac
 # encode as variant-suffixed plain vars.
 ALLOWED_python="tilt teardown clean"
 ALLOWED_c="tilt teardown clean"
-ALLOWED_multi_agency="tilt compose k8s playback teardown clean"
+ALLOWED_multi_agency="tilt compose k8s playback log-harvest triage teardown clean"
 ALLOWED_dod_mission="tilt compose k8s teardown clean"
 
 _variant_slug=${VARIANT//-/_}
@@ -1153,6 +1176,101 @@ if [[ "$BACKEND_MODE" == "playback" ]]; then
     exec python3 -m examples.multi_agency \
         --playback "$PLAYBACK_FILE" \
         --port "$INSPECTOR_PORT"
+fi
+
+# --- Log-harvest fast path (multi-agency only) ---------------------------
+# Reputation debug lens: reconstruct the observer->subject matrix by tailing
+# a RUNNING mesh's container/pod logs (nodes must have been started with
+# AT_REP_DUMP_SEC set — the compose/k8s generators forward it host->container
+# when it's set on the host). The harvester (python -m examples.multi_agency
+# --log-harvest) is launched as a MANAGED BACKGROUND SUBPROCESS — not exec'd —
+# so this script keeps its EXIT/INT/TERM traps and reaps the subprocess (and
+# any stale host-side leftovers) on the way out. It does NOT bring the mesh
+# up or down; that stays with --compose / --k8s / --tilt.
+
+if [[ "$BACKEND_MODE" == "log-harvest" ]]; then
+    # Default the lens dashboard to 8060 so it doesn't collide with the
+    # coordinator's own dashboard on 8050 unless --port was given.
+    (( PORT_EXPLICIT == 1 )) || INSPECTOR_PORT=8060
+
+    case "$HARVEST_RUNTIME" in
+        docker) ;;  # docker already preflighted above
+        k8s)
+            command -v kubectl &>/dev/null \
+                || { err "kubectl not found (needed for --runtime k8s)"; exit 1; } ;;
+        *)  err "Unknown --runtime '$HARVEST_RUNTIME' (use docker | k8s)"; exit 1 ;;
+    esac
+
+    # The python entrypoint's --log-level choices don't include 'verbose'.
+    hlevel="$LOG_LEVEL"; [[ "$hlevel" == "verbose" ]] && hlevel="debug"
+
+    harvest_args=(-m examples.multi_agency --log-harvest
+                  --runtime "$HARVEST_RUNTIME"
+                  --port "$INSPECTOR_PORT"
+                  --log-level "$hlevel")
+    [[ "$HARVEST_RUNTIME" == "k8s" && -n "$NAMESPACE" ]] \
+        && harvest_args+=(--namespace "$NAMESPACE")
+    [[ -n "$HARVEST_CONTAINERS" ]] && harvest_args+=(--containers "$HARVEST_CONTAINERS")
+
+    log "Reputation log-harvest lens ($HARVEST_RUNTIME; host-side, no AT runtime)."
+    log "    Mesh must be running with AT_REP_DUMP_SEC set, e.g.:"
+    log "      AT_REP_DUMP_SEC=2 $0 --variant=multi-agency --compose"
+    log "    If nothing renders, confirm the nodes are emitting AT_REPDUMP lines:"
+    if [[ "$HARVEST_RUNTIME" == "k8s" ]]; then
+        log "      kubectl logs -n ${NAMESPACE:-<ns>} <pod> | grep AT_REPDUMP"
+    else
+        log "      docker logs noaa-sensor-1 | grep AT_REPDUMP"
+    fi
+
+    cleanup_inspector_procs   # clear any stale harvester on the port
+    log "Launching harvester subprocess: python3 ${harvest_args[*]}"
+    python3 "${harvest_args[@]}" &
+    HARVEST_PID=$!
+
+    # Managed subprocess: EXIT reaps it; INT/TERM just exit so the signal
+    # propagates and the EXIT trap runs the cleanup once.
+    trap 'kill "$HARVEST_PID" 2>/dev/null || true; \
+          wait "$HARVEST_PID" 2>/dev/null || true; \
+          cleanup_inspector_procs' EXIT
+    trap 'echo; log "Stopping harvester..."; exit 130' INT
+    trap 'echo; log "Stopping harvester..."; exit 143' TERM
+
+    harvest_url="http://localhost:$INSPECTOR_PORT/"
+    log "Waiting for harvest dashboard at $harvest_url ..."
+    if wait_for_http "$harvest_url" 120 "harvest dashboard" "$INSPECTOR_PORT"; then
+        open_browser "$harvest_url"
+    else
+        warn "Harvest dashboard did not respond within 120s."
+        warn "    Check the subprocess above imported cleanly (dash/plotly present)."
+    fi
+
+    echo ""
+    log "--- Harvesting (subprocess PID $HARVEST_PID). Ctrl-C to stop. ---"
+    # Hold the foreground on the subprocess; if it dies on its own, fall
+    # through so the EXIT trap cleans up.
+    wait "$HARVEST_PID"
+    exit 0
+fi
+
+# --- Triage fast path (multi-agency only) --------------------------------
+# One-shot read of a RUNNING mesh's logs -> per-subject exclusion triage
+# table, then exit. No dashboard, no background process (exec is fine —
+# it reads and returns). Same runtime/selection knobs as --log-harvest.
+
+if [[ "$BACKEND_MODE" == "triage" ]]; then
+    case "$HARVEST_RUNTIME" in
+        docker) ;;
+        k8s)
+            command -v kubectl &>/dev/null \
+                || { err "kubectl not found (needed for --runtime k8s)"; exit 1; } ;;
+        *)  err "Unknown --runtime '$HARVEST_RUNTIME' (use docker | k8s)"; exit 1 ;;
+    esac
+    triage_args=(-m examples.multi_agency --triage --runtime "$HARVEST_RUNTIME")
+    [[ "$HARVEST_RUNTIME" == "k8s" && -n "$NAMESPACE" ]] \
+        && triage_args+=(--namespace "$NAMESPACE")
+    [[ -n "$HARVEST_CONTAINERS" ]] && triage_args+=(--containers "$HARVEST_CONTAINERS")
+    log "One-shot reputation exclusion triage ($HARVEST_RUNTIME) ..."
+    exec python3 "${triage_args[@]}"
 fi
 
 # --- Manifest generation (compose/k8s only) ------------------------------

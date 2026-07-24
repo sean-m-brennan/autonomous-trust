@@ -80,6 +80,14 @@ class IdentityProtocol(Protocol):
     # dod-coordinator-partition-nonconvergence.md (layer 3).
     id_query = 'peer_identity_query'  # msg.obj <- json list[uuid_str] we lack
     id_response = 'peer_identity_response'  # msg.obj <- json {'from_identity': publish()}
+    # Subtree member-roster enumeration (hierarchy-aware membership). A node
+    # asks a gateway to enumerate its subtree; the gateway replies with its
+    # LOCAL members plus the child gateways to recurse into, and the requestor
+    # aggregates breadth-first across the tree (aggregate_subtree_roster). This
+    # surfaces community members hidden behind member gateways, at any depth.
+    # See doc/architecture/gateway-reputation-tree.md.
+    roster_req = 'subtree_roster_query'  # msg.obj <- json {'requestor': uuid_str}
+    roster_resp = 'subtree_roster_response'  # msg.obj <- json {'members': [...], 'child_gateways': [uuid_str]}
     # Local-only IPC (no wire egress). ReputationProcess emits these to
     # CfgIds.identity when a peer's reputation crosses a TIER_FLOORS
     # boundary so IdentityProcess can update the peer's trust tier on

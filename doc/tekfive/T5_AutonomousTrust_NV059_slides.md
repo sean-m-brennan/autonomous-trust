@@ -1,13 +1,17 @@
 ---
-span
+marp: true
+theme: tekfive
+paginate: true
+header: 'AutonomousTrust'
 ---
 <!-- _class: lead -->
+<!-- _header: ' ' -->
 
 # AutonomousTrust
 
 ## Behavior-aware Zero Trust for comms-denied combat systems
 
-A technical companion: the ideas behind the proposal, in the order they build.
+A technical companion: the ideas behind the proposal.
 
 <!--
 Speaker: This is a companion to the written volume. The goal isn't to re-read the
@@ -27,11 +31,11 @@ Zero Trust (NIST SP 800-207) as normally built is **policy-driven → human-driv
 That assumption fails in exactly three ways at the tactical edge:
 
 
-| Failure mode                    | Why it happens                                                                                                                            |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Failure mode                    | Why it happens                                                                                                                              |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Dies when comms drop (DDIL)** | §5.2: unreachable policy engine → no new connection. CRLs are tens of MB; SATCOM is 9.6 to 256 kbps. Result:**fail-open or fail-closed.** |
-| **Can't see behavior**          | A compromised endpoint with valid credentials**passes every check.** SP 800-207's blind spot.                                             |
-| **Doesn't scale by policy**     | Every asset / flow / partner multiplies the human policy surface**combinatorially.**                                                      |
+| **Can't see behavior**          | A compromised endpoint with valid credentials**passes every check.** SP 800-207's blind spot.                                               |
+| **Doesn't scale by policy**     | Every asset / flow / partner multiplies the human policy surface**combinatorially.**                                                        |
 
 <!--
 Speaker: The point to land here is that these aren't bugs you patch; they follow
@@ -92,13 +96,13 @@ work onto a gateway. We measure and report the footprint rather than hand-waving
 A real-time system must judge assets **before behavioral history exists.** So AT layers five bases:
 
 
-| # | Basis                                                                                    | Needs history?       |
-| - | ---------------------------------------------------------------------------------------- | -------------------- |
-| 1 | **Authentication / provenance** (ICAM)                                                   | No                   |
-| 2 | **Hardware attestation**: TPM / secure element, measured boot (captured-asset defense)   | No                   |
-| 3 | **Least-privilege containment**                                                          | No                   |
-| 4 | **Delegated / transferred trust**                                                        | No                   |
-| 5 | **Behavioral reputation**                                                                | Yes, iterated game   |
+| # | Basis                                                                                  | Needs history?     |
+| - | -------------------------------------------------------------------------------------- | ------------------ |
+| 1 | **Authentication / provenance** (ICAM)                                                 | No                 |
+| 2 | **Hardware attestation**: TPM / secure element, measured boot (captured-asset defense) | No                 |
+| 3 | **Least-privilege containment**                                                        | No                 |
+| 4 | **Delegated / transferred trust**                                                      | No                 |
+| 5 | **Behavioral reputation**                                                              | Yes, iterated game |
 
 Two facts shrink the "one-shot stranger" problem: a fleet is a **small, persistent population of repeat players**, and **constraint beats detection.**
 
@@ -275,6 +279,8 @@ matters, on safety-critical fires, while routine trust decisions run autonomousl
 -->
 
 ---
+
+<!-- _class: small -->
 
 ## How we prove it: validation methodology
 

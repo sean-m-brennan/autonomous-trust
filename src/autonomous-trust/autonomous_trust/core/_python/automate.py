@@ -45,6 +45,7 @@ from .config import Configuration, to_json_string, from_json_string, ConfigMap
 from .config.discover import get_cfg_type, load_configs
 from .processes import Process, LogLevel, ProcessTracker
 from .identity import Peers
+from .identity.protocol import IdentityProtocol
 from .bootstrap_capabilities import (
     register_bootstrap_capabilities,
     BOOTSTRAP_CAPABILITY_NAMES,
@@ -198,6 +199,22 @@ class AutonomousTrust(Protocol):
         # info; consumers that want a peer-to-peer matrix (the multi-agency
         # demo's trust graph, for one) read from the pair dict.
         self.latest_reputation_pairs: dict[tuple[str, str], Any] = {}
+        # Subtree member-roster enumeration (requestor-side BFS). The app
+        # calls request_subtree_roster(queues, gateway) to start a walk of a
+        # gateway's cohort tree; each roster_resp is merged here and, for any
+        # newly-named child gateway we can route to, a follow-up roster_req is
+        # sent — unrolling the recursion across message ticks WITHOUT blocking
+        # a handler. `subtree_roster` maps member-uuid -> member dict; the walk
+        # is complete once `_roster_pending` drains. A child gateway we cannot
+        # resolve to a peer (or that never answers) leaves the roster marked
+        # incomplete; a gateway that opted out (AT_ROSTER_PRIVATE) is recorded
+        # in `subtree_roster_private` as an intentional boundary, NOT a failure.
+        # See doc/architecture/gateway-reputation-tree.md.
+        self.subtree_roster: dict[str, Any] = {}
+        self.subtree_roster_complete: bool = True
+        self.subtree_roster_private: list[str] = []
+        self._roster_visited: set[str] = set()
+        self._roster_pending: set[str] = set()
         self.unhandled_messages: list[Message] = []
         self.peer_count = 0
 
@@ -286,6 +303,97 @@ class AutonomousTrust(Protocol):
 
     def cleanup(self):
         pass
+
+    # --- Subtree member-roster enumeration (requestor-side BFS) --------------
+
+    def _resolve_gateway(self, gateway_uuid):
+        """Resolve a gateway node uuid to an addressable Identity via the
+        requestor's own peer view (mirrors how reputation resolves peers).
+        Returns the Identity, or None if this node cannot route to it — in
+        which case the enumeration is marked incomplete rather than hanging."""
+        key = str(gateway_uuid)
+        if self.identity is not None and key == str(self.identity.uuid):
+            return self.identity
+        try:
+            return self.peers.find_by_uuid(gateway_uuid)
+        except Exception:
+            return None
+
+    def _send_roster_req(self, queues, gateway):
+        """Send a roster_req to one gateway Identity and mark it pending.
+        The gateway's identity process answers via handle_roster_request."""
+        try:
+            req = Message(CfgIds.identity, IdentityProtocol.roster_req,
+                          to_json_string({'requestor': str(self.identity.uuid)}),
+                          to_whom=gateway, from_whom=self.identity)
+            queues[CfgIds.network].put(req, block=True, timeout=queue_cadence)
+            self._roster_pending.add(str(gateway.uuid))
+            return True
+        except queue.Full:
+            self.logger.error('_send_roster_req: network queue full')
+            self.subtree_roster_complete = False
+            return False
+
+    def request_subtree_roster(self, queues, gateway):
+        """Begin enumerating a gateway's cohort tree (any depth).
+
+        Resets the accumulator and sends the first roster_req to ``gateway``
+        (an Identity, or a node-uuid resolvable via this node's peer view).
+        Subsequent levels are pursued automatically as each roster_resp
+        arrives (see the roster_resp branch in autonomous_loop). Read the
+        result off ``subtree_roster`` / ``subtree_roster_complete`` /
+        ``subtree_roster_private`` once the walk settles."""
+        self.subtree_roster = {}
+        self.subtree_roster_complete = True
+        self.subtree_roster_private = []
+        self._roster_visited = set()
+        self._roster_pending = set()
+        if not isinstance(gateway, str) and gateway is not None:
+            target = gateway
+        else:
+            target = self._resolve_gateway(gateway)
+        if target is None:
+            self.subtree_roster_complete = False
+            return
+        self._roster_visited.add(str(target.uuid))
+        self._send_roster_req(queues, target)
+
+    def _consume_roster_resp(self, queues, message):
+        """Merge one roster_resp and pursue any newly-named child gateways —
+        the per-tick unroll of the requestor-side breadth-first walk."""
+        responder = getattr(message, 'from_whom', None)
+        responder_uuid = getattr(responder, 'uuid', None)
+        if responder_uuid is not None:
+            self._roster_pending.discard(str(responder_uuid))
+        payload = message.obj
+        if isinstance(payload, str):
+            payload = from_json_string(payload)
+        if not isinstance(payload, dict):
+            self.subtree_roster_complete = False
+            return
+        if payload.get('private'):
+            # Intentional opaque boundary — do not recurse, not a failure.
+            if responder_uuid is not None:
+                uid = str(responder_uuid)
+                if uid not in self.subtree_roster_private:
+                    self.subtree_roster_private.append(uid)
+            return
+        for member in payload.get('members') or []:
+            if isinstance(member, dict):
+                key = str(member.get('uuid'))
+                if key and key not in self.subtree_roster:
+                    self.subtree_roster[key] = member
+        for child_uuid in payload.get('child_gateways') or []:
+            key = str(child_uuid)
+            if key in self._roster_visited:
+                continue
+            self._roster_visited.add(key)
+            target = self._resolve_gateway(key)
+            if target is None:
+                # Cannot route to this gateway — partial, not a hang.
+                self.subtree_roster_complete = False
+                continue
+            self._send_roster_req(queues, target)
 
     def autonomous_loop(self, results: dict[str, AsyncResult], queues: dict[str, QueueType],
                         signals: dict[str, QueueType]) -> None:
@@ -682,6 +790,11 @@ class AutonomousTrust(Protocol):
                         if observer_uuid is not None:
                             key = (str(observer_uuid), str(rep.peer_id))
                             self.latest_reputation_pairs[key] = rep
+                elif isinstance(message, Message) and message.function == IdentityProtocol.roster_resp:
+                    # One level of the requestor-side subtree-roster walk:
+                    # merge this gateway's members and fan out roster_req to
+                    # any child gateways it named (see _consume_roster_resp).
+                    self._consume_roster_resp(queues, message)
                 else:
                     self.unhandled_messages.append(message)
         return True

@@ -1,1 +1,1 @@
-{"data":"bGluZTEicVxiCmxpbmUy","encrypt":false,"from_address":"","from_enc_hex":"","from_name":"","from_sig_hex":"","from_uuid":"","function":"log_event","process":"logger","trace_id":"1234567890abcdef1234567890abcdef"}
+{"data":"bGluZTEicVxiCmxpbmUy","encrypt":false,"from_address":"","from_enc_hex":"","from_name":"","from_rank":0,"from_sig_hex":"","from_uuid":"","function":"log_event","process":"logger","trace_id":"1234567890abcdef1234567890abcdef"}

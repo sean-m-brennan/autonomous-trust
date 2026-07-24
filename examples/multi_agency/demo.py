@@ -192,6 +192,13 @@ class MultiAgencyDemo:
         # _live_rep_peers are "forming" — no synthetic fallback fills them.
         self._rep_samples: dict[str, list[ReputationSample]] = {}
         self._live_rep_peers: set[str] = set()
+        # Authoritative per-peer (excluded, forming) status from the
+        # log-harvest lens ("rep_status" bridge tuple). Derived from real
+        # _excluded membership + committed-tx counts, not a score
+        # threshold — so a cold-start peer at the 0.2 baseline shows as
+        # forming, not excluded. Empty in coordinator-hosted-live /
+        # playback modes, where _real_peer_status falls back to the score.
+        self._live_status: dict[str, tuple[bool, bool]] = {}
         # Bilateral observation matrix. Keys are canonical (a, b)
         # tuples (sorted) so a's view of b and b's view of a collapse
         # into one undirected edge weight. Value is the latest
@@ -764,6 +771,24 @@ class MultiAgencyDemo:
         excluded: set[str] = set()
         peer_opacity: dict[str, float] = {}
         for name in scenario.peers:
+            # Authoritative status (log-harvest lens) wins when present: it
+            # distinguishes real AT exclusion (_excluded membership) from the
+            # 0.2 cold-start baseline, which the score-threshold fallback
+            # below cannot. See _on_bridge_event 'rep_status'.
+            status = self._live_status.get(name)
+            if status is not None:
+                is_excluded, is_forming = status
+                if is_forming:
+                    peer_opacity[name] = _FORMING_OPACITY
+                else:
+                    peer_opacity[name] = 1.0
+                    if is_excluded:
+                        excluded.add(name)
+                continue
+            # Fallback (coordinator-hosted live / playback): infer from the
+            # consensus score. _EXCLUSION_THRESHOLD (0.5) is a DISPLAY gate,
+            # not AT's real COMM_CUTOFF (0.1), so a cold peer at the 0.2
+            # baseline can show excluded here — exactly what the lens fixes.
             rep = self._latest_real_rep(name)
             if rep is None:
                 peer_opacity[name] = _FORMING_OPACITY
@@ -840,8 +865,14 @@ class MultiAgencyDemo:
         # Real mesh state only. latest is None until the bridge observes a
         # consensus reputation for this peer → "forming…".
         latest = self._latest_real_rep(peer_name)
-        forming = latest is None
-        excluded = (not forming) and latest <= _EXCLUSION_THRESHOLD
+        # Prefer the lens's authoritative status so the drawer agrees with
+        # the graph (see _real_peer_status); fall back to the score gate.
+        status_auth = self._live_status.get(peer_name)
+        if status_auth is not None:
+            excluded, forming = status_auth[0], status_auth[1]
+        else:
+            forming = latest is None
+            excluded = (not forming) and latest <= _EXCLUSION_THRESHOLD
         status = ("onboarding" if forming
                   else "excluded" if excluded
                   else "active")
@@ -996,6 +1027,14 @@ class MultiAgencyDemo:
                         "score": consensus,
                     })
                 self._live_rep_peers.add(subject)
+        elif tag == "rep_status" and len(ev) >= 4:
+            # Authoritative per-subject status from the log-harvest lens:
+            # (excluded, forming) computed from real _excluded membership +
+            # committed-tx counts, not inferred from a score threshold. Lets
+            # _real_peer_status stop mislabeling cold-start baseline peers as
+            # excluded. See log_harvest.RepMatrix._status_updates.
+            name = str(ev[1])
+            self._live_status[name] = (bool(ev[2]), bool(ev[3]))
         elif tag == "reading" and len(ev) >= 3:
             # envdata reading: forward to the streams panel and mark the
             # peer as a live stream source (it has produced a real reading).
@@ -1035,6 +1074,7 @@ class MultiAgencyDemo:
         self._rep_samples.clear()
         self._sensor_history.clear()
         self._live_rep_peers.clear()
+        self._live_status.clear()
         self._live_trust_matrix.clear()
         self._live_trust_seen_dir.clear()
         self._live_stream_peers.clear()

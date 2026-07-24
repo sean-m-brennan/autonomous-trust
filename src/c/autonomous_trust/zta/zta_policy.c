@@ -70,6 +70,8 @@ int zta_policy_to_json(const void *data_struct, json_t **obj_ptr)
     json_object_set_new(obj, "ca_bundle_path", json_string(p->ca_bundle_path));
     json_object_set_new(obj, "ocsp_url", json_string(p->ocsp_url));
     json_object_set_new(obj, "crl_path", json_string(p->crl_path));
+    json_object_set_new(obj, "operator_ca_bundle_path",
+                        json_string(p->operator_ca_bundle_path));
 
     *obj_ptr = obj;
     return 0;
@@ -138,6 +140,12 @@ int zta_policy_from_json(const json_t *obj, void *data_struct)
     if (json_is_string(val))
         snprintf(p->crl_path, ZTA_PATH_LEN, "%s", json_string_value(val));
 
+    /* Optional (additive) operator trust anchor; older configs / the Python
+     * side omitting it leave the zeroed default (no operator classification). */
+    val = json_object_get(obj, "operator_ca_bundle_path");
+    if (json_is_string(val))
+        snprintf(p->operator_ca_bundle_path, ZTA_PATH_LEN, "%s", json_string_value(val));
+
     return 0;
 }
 
@@ -170,4 +178,26 @@ int zta_policy_create_verifier(const zta_policy_t *policy, zta_verifier_t **out)
 
     /* Unknown type: fall back to null */
     return zta_null_verifier_create(out);
+}
+
+int zta_policy_create_operator_verifier(const zta_policy_t *policy, zta_verifier_t **out)
+{
+    if (!policy || !out)
+        return EZTA_INTERNAL;
+    *out = NULL;
+    /* No operator anchor configured (or ZTA disabled) => cannot classify a
+     * credential as operator-class; caller treats a NULL verifier as
+     * "operator_bound stays false" (fail-safe). Mirrors Python
+     * ZtaPolicy.create_operator_verifier returning None. */
+    if (!policy->enabled || policy->operator_ca_bundle_path[0] == '\0')
+        return EZTA_INTERNAL;
+
+    x509_verifier_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.ca_bundle_path, sizeof(cfg.ca_bundle_path), "%s",
+             policy->operator_ca_bundle_path);
+    snprintf(cfg.ocsp_url, sizeof(cfg.ocsp_url), "%s", policy->ocsp_url);
+    snprintf(cfg.crl_path, sizeof(cfg.crl_path), "%s", policy->crl_path);
+    cfg.connect_timeout_ms = 2000;
+    return x509_verifier_create(&cfg, out);
 }

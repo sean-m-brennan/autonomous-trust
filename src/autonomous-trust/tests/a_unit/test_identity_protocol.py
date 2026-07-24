@@ -42,11 +42,12 @@ class TestIdentityProtocol:
         - group-partition recovery (partition_signal,
           partition_probe, partition_response)
         - peer identity backfill (id_query, id_response)
+        - subtree member-roster enumeration (roster_req, roster_resp)
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 17
+        assert len(values) == 19
         assert 'announce' in values

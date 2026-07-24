@@ -22,6 +22,7 @@
  */
 
 #include <stdlib.h>
+#include <stdbool.h>
 
 #include <uuid/uuid.h>
 #include <sodium.h>
@@ -70,6 +71,17 @@ typedef struct
     char petname[NAME_LEN+1];   /* Zooko LOCAL name -- never serialized. */
     signature_t signature;
     encryptor_t encryptor;
+    /* Operator-attended signal (proto fields 12-13; parity with Python
+       Identity). Kept OUTSIDE the AT_ZTA_ENABLED guard so the fields always
+       exist and default false/0 even in non-ZTA builds (mirrors from_rank);
+       only the operator-class VERIFICATION is ZTA-gated. Advertises whether a
+       node has a human behind it (ethne guardian edge, D8/Q9). operator_bound
+       is durable ("has a human guardian", authoritative only after the receiver
+       verifies the operator credential); operator_attended_at is a live
+       freshness stamp (epoch secs of the last verified operator session, 0 =
+       none). NOT part of identity equality. */
+    bool operator_bound;
+    double operator_attested_at;
 #ifdef AT_ZTA_ENABLED
     uint8_t zta_credential_hash[32];  /* SHA-256 of ZTA credential at admission */
     char zta_issuer[64];              /* Credential issuer identifier */

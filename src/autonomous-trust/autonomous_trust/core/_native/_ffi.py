@@ -238,6 +238,13 @@ ffi.cdef("""
                               /* serialized (see identity.c sync_out/sync_in). */
         signature_t signature;
         encryptor_t encryptor;
+        /* Operator-attended signal (identity.h:83-84). Kept OUTSIDE the AT_ZTA
+           guard in C, so these fields are always present regardless of build
+           flags and must appear here in the same position (between encryptor
+           and the ZTA fields) or the struct layout — and every trailing field
+           offset — is wrong. */
+        bool operator_bound;
+        double operator_attested_at;
         /* ZTA credential binding (identity.h, #ifdef AT_ZTA_ENABLED). The
            native lib is built AT_ZTA=ON (build-native.sh -DAT_ZTA=ON), so these
            are part of the ABI layout and must be present here to match. */

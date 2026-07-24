@@ -1,0 +1,129 @@
+% ******************
+%  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
+%
+%   Licensed under the Apache License, Version 2.0 (the "License");
+%   you may not use this file except in compliance with the License.
+%   You may obtain a copy of the License at
+%
+%     http://www.apache.org/licenses/LICENSE-2.0
+%
+%   Unless required by applicable law or agreed to in writing, software
+%   distributed under the License is distributed on an "AS IS" BASIS,
+%   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%   See the License for the specific language governing permissions and
+%   limitations under the License.
+% ******************
+
+% TekFive branding for LaTeX slides (Beamer).
+%
+% Sibling of tekfive.sty (which brands normal fancyhdr documents). This file
+% brands Beamer presentations to match: T5blue structure, a headline with the
+% logo (left) and an "a TekFive <type>" caption (right) over a thick blue rule,
+% and a footline with the TekFive contact line and "Page X of Y". It mirrors the
+% look of the Marp deck theme in doc/tekfive/tekfive.css.
+%
+% Usage:
+%   \documentclass[aspectratio=169]{beamer}   % 16:9; drop for 4:3
+%   \usepackage[type=briefing]{tekfive_slides}
+%   ...
+%   \begin{frame}[plain]\titlepage\end{frame}  % [plain] hides header/footer
+%   \begin{frame}{Slide title} ... \end{frame}
+%
+% Package options:
+%   type=<word>   caption suffix, "a TekFive <word>"   (default: briefing)
+%   logo=<file>   graphic for header/title (no extension) (default: t5logo)
+
+\NeedsTeXFormat{LaTeX2e}[1994/06/01]
+\ProvidesPackage{tekfive_slides}[2026/07/24 v0.01 LaTeX (Beamer) package for TekFive slide branding]
+
+\RequirePackage{graphicx}
+\RequirePackage{color}
+\RequirePackage{xcolor}
+\RequirePackage{xkeyval}
+% Helvetica-like sans throughout, matching the deck's Helvetica/Arial stack.
+\RequirePackage[scaled]{helvet}
+\renewcommand{\familydefault}{\sfdefault}
+
+% parameter defaults
+\newcommand{\tfSlideType}{briefing}
+\newcommand{\tfLogo}{t5logo}
+
+\DeclareOptionX{type}{\renewcommand{\tfSlideType}{#1}}
+\DeclareOptionX{logo}{\renewcommand{\tfLogo}{#1}}
+\DeclareOptionX*{\PackageWarning{tekfive_slides}{Unknown option ‘\CurrentOption’}}
+\ProcessOptionsX\relax
+
+\definecolor{T5blue}{HTML}{1d6186}
+
+% ----- Beamer colors / fonts: blue structure, no navigation clutter -----
+\setbeamercolor{structure}{fg=T5blue}
+\setbeamercolor{frametitle}{fg=T5blue}
+\setbeamercolor{title}{fg=T5blue}
+\setbeamercolor{subtitle}{fg=T5blue}
+\setbeamercolor{item}{fg=T5blue}
+\setbeamercolor{normal text}{fg=black}
+\setbeamerfont{frametitle}{series=\bfseries,size=\Large}
+\setbeamertemplate{navigation symbols}{}
+
+% Shared side margin so the header rule, body, and footer line up.
+\newlength{\tfSideMargin}
+\setlength{\tfSideMargin}{8mm}
+\setbeamersize{text margin left=\tfSideMargin, text margin right=\tfSideMargin}
+
+% ----- Header: logo (left), "a TekFive <type>" (right), thick blue rule under -----
+\setbeamertemplate{headline}{%
+  \vskip4pt%
+  \hbox to\paperwidth{%
+    \hskip\tfSideMargin
+    \includegraphics[height=9mm]{\tfLogo}%
+    \hfill
+    \raisebox{2mm}{\bfseries\color{T5blue}\large a TekFive \tfSlideType}%
+    \hskip\tfSideMargin}%
+  \vskip3pt%
+  \hbox to\paperwidth{%
+    \hskip\tfSideMargin
+    \color{T5blue}\rule{\dimexpr\paperwidth-2\tfSideMargin\relax}{0.9mm}%
+    \hskip\tfSideMargin}%
+  \vskip6pt%
+}
+
+% ----- Footer: thin blue rule over TekFive contact line + "Page X of Y" -----
+\setbeamertemplate{footline}{%
+  \hbox to\paperwidth{%
+    \hskip\tfSideMargin
+    \color{T5blue}\rule{\dimexpr\paperwidth-2\tfSideMargin\relax}{0.25mm}%
+    \hskip\tfSideMargin}%
+  \vskip2pt%
+  \hbox to\paperwidth{%
+    \hskip\tfSideMargin
+    {\scriptsize\color{T5blue} TekFive, Inc.\ \textperiodcentered\ 850 Ben Graves Dr NW, Huntsville, AL 35816 USA \textperiodcentered\ info@tekfive.com \textperiodcentered\ 256.213.1060}%
+    \hfill
+    {\scriptsize\bfseries\color{T5blue} Page \insertframenumber\ of \inserttotalframenumber}%
+    \hskip\tfSideMargin}%
+  \vskip4pt%
+}
+
+% ----- Branded title page: logo over blue title/subtitle, then author/date.
+%       Put the title frame in [plain] mode so the header/footer are hidden. -----
+\setbeamertemplate{title page}{%
+  \vbox to\textheight{%
+    \vfill
+    \centering
+    \includegraphics[height=16mm]{\tfLogo}\par
+    \vskip1.2em
+    {\usebeamerfont{title}\color{T5blue}\bfseries\inserttitle\par}%
+    \vskip0.4em
+    {\usebeamerfont{subtitle}\color{T5blue}\insertsubtitle\par}%
+    \vskip1.2em
+    {\usebeamerfont{author}\insertauthor\par}%
+    \vskip0.3em
+    {\usebeamerfont{institute}\insertinstitute\par}%
+    \vskip0.3em
+    {\usebeamerfont{date}\insertdate\par}%
+    \vfill
+  }%
+}
+
+\endinput
+%%
+%% End of file `tekfive_slides.sty'.

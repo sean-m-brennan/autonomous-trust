@@ -458,10 +458,9 @@ static void tx_history_evict_oldest(tx_history_t *hist)
                 void *arr_ptr = NULL;
                 data_object_ptr(pval, &arr_ptr);
                 if (arr_ptr != NULL)
-                {
+                    /* array_free already smrt_derefs the array_t; a second
+                     * smrt_deref here would double-free it. */
                     array_free((array_t *)arr_ptr);
-                    smrt_deref(arr_ptr);
-                }
             }
             map_remove(&hist->peer_map, pkey);
         }
@@ -769,17 +768,17 @@ int tx_history_len(const tx_history_t *hist)
 void tx_history_free(tx_history_t *hist)
 {
     map_free(&hist->task_map);
-    /* peer_map values are arrays that were smrt_created */
+    /* peer_map values are arrays that were smrt_created. array_free already
+     * releases the array_t itself (its trailing smrt_deref(a)), so we must
+     * NOT smrt_deref(arr_ptr) again here — that is a double-free of the
+     * (refs==1) array_t. */
     map_key_t key = NULL;
     data_t *val = NULL;
     map_entries_for_each(&hist->peer_map, key, val)
     {
         void *arr_ptr = NULL;
         if (data_object_ptr(val, &arr_ptr) == 0 && arr_ptr != NULL)
-        {
             array_free((array_t *)arr_ptr);
-            smrt_deref(arr_ptr);
-        }
     }
     map_end_for_each
     map_free(&hist->peer_map);

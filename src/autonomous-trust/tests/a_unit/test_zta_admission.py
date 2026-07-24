@@ -51,6 +51,13 @@ class _GateProc:
     """Minimal stand-in carrying the real ZTA gate methods."""
     _zta_policy = IdentityProcess._zta_policy
     _zta_verifier = IdentityProcess._zta_verifier
+    # Operator-attended classification helpers (ethne D8/Q9) that _zta_admit now
+    # calls in the VERIFIED branch — bind them so the stand-in behaves like the
+    # real IdentityProcess (no operator anchor configured => operator_bound
+    # stays False, which does not affect any admit/reject decision here).
+    _zta_operator_verifier = IdentityProcess._zta_operator_verifier
+    _is_operator_credential = IdentityProcess._is_operator_credential
+    _mark_operator_bound = staticmethod(IdentityProcess._mark_operator_bound)
     _zta_admit = IdentityProcess._zta_admit
     _zta_credential_replayed = IdentityProcess._zta_credential_replayed
 
@@ -58,6 +65,8 @@ class _GateProc:
         self.configs = {ZtaPolicy.CONFIG_KEY: policy}
         self._zta_policy_cache = None
         self._zta_verifier_cache = None
+        self._zta_operator_verifier_cache = None
+        self._operator_verified = set()
         self._zta_capped = set()
         self.logger = logging.getLogger('test.zta')
         # Roster / own identity for the credential-uniqueness gate. Default

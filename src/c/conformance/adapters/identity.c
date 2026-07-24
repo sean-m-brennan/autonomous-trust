@@ -72,6 +72,11 @@ typedef struct {
     identity_t *full;
     public_identity_t *pub;
     process_t *proc;
+    /* Result of a trigger_subtree_roster enumeration: a json array of the
+     * flattened subtree's member participant ids (sorted). Read by the
+     * subtree_roster expected-state check. Mirrors the Python adapter's
+     * _Participant.subtree_roster. */
+    json_t *subtree_roster;
 } ic_impl_t;
 
 /* The engine ctx is global because the messaging-hook signature has no
@@ -194,6 +199,7 @@ fail:
 
 static void _free_participant_impl(ic_impl_t *impl) {
     if (impl == NULL) return;
+    if (impl->subtree_roster != NULL) json_decref(impl->subtree_roster);
     if (impl->proc != NULL) {
         if (impl->proc->protocol.handlers != NULL) map_free(impl->proc->protocol.handlers);
         pthread_rwlock_destroy(&impl->proc->protocol.peers_rwlock);
@@ -202,6 +208,48 @@ static void _free_participant_impl(ic_impl_t *impl) {
     if (impl->pub != NULL) smrt_deref(impl->pub);
     if (impl->full != NULL) identity_free(impl->full);
     free(impl);
+}
+
+/* ---- Subtree member-roster enumeration (mirror of the Python adapter) ---- */
+
+/* This participant's identity uuid as a string. */
+static void _ic_uuid_str(ic_impl_t *impl, char out[UUID_STRING_LEN + 1]) {
+    uuid_unparse_lower(impl->full->uuid, out);
+}
+
+/* Participant id whose identity uuid == @p uuid, or NULL. */
+static const char *_ic_pid_for_uuid(sce_run_ctx_t *ctx, const char *uuid) {
+    char u[UUID_STRING_LEN + 1];
+    for (size_t i = 0; i < ctx->participant_count; i++) {
+        ic_impl_t *impl = (ic_impl_t *)ctx->participants[i].impl;
+        if (impl == NULL || impl->full == NULL) continue;
+        _ic_uuid_str(impl, u);
+        if (strcmp(u, uuid) == 0) return ctx->participants[i].id;
+    }
+    return NULL;
+}
+
+static int _roster_strp_cmp(const void *a, const void *b) {
+    const char *sa = *(const char *const *)a;
+    const char *sb = *(const char *const *)b;
+    if (sa == NULL) return sb == NULL ? 0 : -1;
+    if (sb == NULL) return 1;
+    return strcmp(sa, sb);
+}
+
+/* Aggregation fetch: the gateway with uuid @p gw_uuid produces its roster
+ * response via the SAME helper the wire handler uses. ctx is the run ctx. */
+static json_t *_roster_fetch(void *vctx, const char *gw_uuid) {
+    sce_run_ctx_t *ctx = (sce_run_ctx_t *)vctx;
+    char u[UUID_STRING_LEN + 1];
+    for (size_t i = 0; i < ctx->participant_count; i++) {
+        ic_impl_t *impl = (ic_impl_t *)ctx->participants[i].impl;
+        if (impl == NULL || impl->full == NULL) continue;
+        _ic_uuid_str(impl, u);
+        if (strcmp(u, gw_uuid) == 0)
+            return identity_roster_response(impl->proc);
+    }
+    return NULL;  /* unreachable gateway */
 }
 
 #ifdef AT_ZTA_ENABLED
@@ -245,6 +293,22 @@ static void _apply_zta_fixtures(sce_run_ctx_t *ctx, json_t *fixtures) {
         }
     }
 
+    /* Advertised operator-attended claim (ethne D8/Q9): set the announcing
+     * identity's operator_bound so the gate sees the CLAIM on from_whom. It is
+     * always neutralized and re-derived from operator-anchor verification, so a
+     * `true` claim on a non-operator credential must end up false. Mirrors the
+     * Python adapter's operator_claims wiring. */
+    json_t *claims = json_object_get(fixtures, "operator_claims");
+    if (json_is_object(claims)) {
+        const char *pid; json_t *cv;
+        json_object_foreach(claims, pid, cv) {
+            sce_participant_t *p = sce_find_participant(ctx, pid);
+            if (p == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)p->impl;
+            impl->pub->operator_bound = json_is_true(cv);
+        }
+    }
+
     json_t *zp = json_object_get(fixtures, "zta_policy");
     if (json_is_object(zp)) {
         for (size_t i = 0; i < ctx->participant_count; i++) {
@@ -277,6 +341,18 @@ static void _apply_zta_fixtures(sce_run_ctx_t *ctx, json_t *fixtures) {
                          pol->crl_path);
                 snprintf(pol->crl_path, sizeof(pol->crl_path),
                          "%.*s", (int)(sizeof(pol->crl_path) - 1), abs);
+            }
+            /* Same corpus-relative -> absolute fixup for the distinct operator
+             * trust anchor (ethne D8/Q9); mirrors Python's operator_ca_bundle_path
+             * resolution so operator-class classification loads the right CA. */
+            if (root != NULL && pol->operator_ca_bundle_path[0] != '\0'
+                && pol->operator_ca_bundle_path[0] != '/') {
+                char abs[1024];
+                snprintf(abs, sizeof(abs), "%.700s/%.255s", root,
+                         pol->operator_ca_bundle_path);
+                snprintf(pol->operator_ca_bundle_path,
+                         sizeof(pol->operator_ca_bundle_path),
+                         "%.*s", (int)(sizeof(pol->operator_ca_bundle_path) - 1), abs);
             }
             config_t *cfg = calloc(1, sizeof(config_t));
             if (cfg == NULL) { free(pol); continue; }
@@ -509,6 +585,80 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
                 snprintf(slot->nickname, sizeof(slot->nickname),
                          "capless-%s-%lld", cl_pid, (long long)i);
                 p->protocol.num_peers++;
+            }
+        }
+    }
+
+    /* cohort_tree: seed a gateway hierarchy so a subtree-roster enumeration
+     * spans multiple levels. Mirrors the Python adapter's _apply_cohort_tree.
+     * Each node gets a primary group (self + `members`) and, if it has a
+     * `child_group`, a child cohort + the `gateway` recursion target. */
+    json_t *cohort = json_object_get(fixtures, "cohort_tree");
+    if (json_is_object(cohort)) {
+        json_t *nodes = json_object_get(cohort, "nodes");
+        const char *cpid;
+        json_t *cspec;
+        json_object_foreach(nodes, cpid, cspec) {
+            sce_participant_t *part = sce_find_participant(ctx, cpid);
+            if (part == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            process_t *proc = impl->proc;
+            /* Primary group = self + any extra members. */
+            uuid_t guuid;
+            uuid_generate(guuid);
+            group_init(&guuid, (char *)impl->full->address, &proc->protocol.group);
+            char su[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(impl->full->uuid, su);
+            group_add_address(&proc->protocol.group, su, impl->full->address);
+            json_t *members = json_object_get(cspec, "members");
+            if (json_is_array(members)) {
+                size_t i, n = json_array_size(members);
+                for (i = 0; i < n; i++) {
+                    const char *m_pid =
+                        json_string_value(json_array_get(members, i));
+                    sce_participant_t *mp =
+                        m_pid ? sce_find_participant(ctx, m_pid) : NULL;
+                    if (mp == NULL) continue;
+                    ic_impl_t *mi = (ic_impl_t *)mp->impl;
+                    char mu[UUID_STRING_LEN + 1];
+                    uuid_unparse_lower(mi->full->uuid, mu);
+                    group_add_address(&proc->protocol.group, mu,
+                                      mi->full->address);
+                }
+            }
+            /* A child cohort this node gateways + the recursion target. */
+            json_t *cg = json_object_get(cspec, "child_group");
+            if (json_is_array(cg) && json_array_size(cg) > 0) {
+                group_t *child = calloc(1, sizeof(group_t));
+                if (child == NULL) continue;
+                uuid_t cguuid;
+                uuid_generate(cguuid);
+                group_init(&cguuid, (char *)impl->full->address, child);
+                size_t i, n = json_array_size(cg);
+                for (i = 0; i < n; i++) {
+                    const char *m_pid =
+                        json_string_value(json_array_get(cg, i));
+                    sce_participant_t *mp =
+                        m_pid ? sce_find_participant(ctx, m_pid) : NULL;
+                    if (mp == NULL) continue;
+                    ic_impl_t *mi = (ic_impl_t *)mp->impl;
+                    char mu[UUID_STRING_LEN + 1];
+                    uuid_unparse_lower(mi->full->uuid, mu);
+                    group_add_address(child, mu, mi->full->address);
+                }
+                char gwb[UUID_STRING_LEN + 1];
+                const char *gw_uuid_str = NULL;
+                const char *gw_pid =
+                    json_string_value(json_object_get(cspec, "gateway"));
+                if (gw_pid != NULL) {
+                    sce_participant_t *gp = sce_find_participant(ctx, gw_pid);
+                    if (gp != NULL) {
+                        ic_impl_t *gi = (ic_impl_t *)gp->impl;
+                        uuid_unparse_lower(gi->full->uuid, gwb);
+                        gw_uuid_str = gwb;
+                    }
+                }
+                identity_add_child_group(proc, child, gw_uuid_str);
             }
         }
     }
@@ -887,6 +1037,36 @@ static int _dispatch(sce_run_ctx_t *ctx,
         identity_periodic_caps_resync(impl->proc);
         return 0;
     }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_subtree_roster") == 0) {
+        /* Pseudo-function: run the requestor-side subtree-roster walk on this
+         * participant. The fetch asks each gateway for its roster response via
+         * the SAME helper the wire handler uses. The flattened member uuids are
+         * mapped back to participant ids and stored (sorted) for the check.
+         * Mirrors the Python adapter's trigger_subtree_roster handling. */
+        char top_uuid[UUID_STRING_LEN + 1];
+        _ic_uuid_str(impl, top_uuid);
+        json_t *members = NULL, *privates = NULL;
+        bool complete = false;
+        identity_aggregate_subtree_roster(top_uuid, _roster_fetch, ctx,
+                                          &members, &complete, &privates);
+        json_t *ids = json_array();
+        if (json_is_array(members)) {
+            size_t i, n = json_array_size(members);
+            for (i = 0; i < n; i++) {
+                const char *mu = json_string_value(
+                    json_object_get(json_array_get(members, i), "uuid"));
+                const char *pid = mu ? _ic_pid_for_uuid(ctx, mu) : NULL;
+                if (pid != NULL) json_array_append_new(ids, json_string(pid));
+            }
+        }
+        if (impl->subtree_roster != NULL) json_decref(impl->subtree_roster);
+        impl->subtree_roster = ids;
+        if (members != NULL) json_decref(members);
+        if (privates != NULL) json_decref(privates);
+        return 0;
+    }
     /* directory_t is array_t of sibling-process queue names. Populate it
      * with the names handlers expect to find: _announce_identity (the
      * partition-recovery request_access re-broadcast) returns early unless
@@ -991,6 +1171,46 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              "%s: has_peer %s not present (have %d peers)",
                              pid, uuid_str, (int)proc->protocol.num_peers);
                     return -1;
+                }
+            } else if (strcmp(key, "operator_bound") == 0) {
+                /* { "<peer_ref>": bool } — the welcomer's VERIFIED
+                 * operator-attended determination per stored peer (ethne
+                 * D8/Q9). peer_ref matches the stored peer's nickname
+                 * "<id>.scenario" or a raw uuid; symmetric with the Python
+                 * adapter's accessor. */
+                if (!json_is_object(val)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: operator_bound expects an object", pid);
+                    return -1;
+                }
+                const char *ref; json_t *wantv;
+                json_object_foreach(val, ref, wantv) {
+                    bool want_bound = json_is_true(wantv);
+                    char nick[NAME_LEN + 1];
+                    snprintf(nick, sizeof(nick), "%s.scenario", ref);
+                    bool found = false, actual = false;
+                    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+                        char ustr[UUID_STRING_LEN + 1];
+                        uuid_unparse_lower(proc->protocol.peers[i].uuid, ustr);
+                        if (strcmp(proc->protocol.peers[i].nickname, nick) == 0
+                            || strcmp(proc->protocol.peers[i].nickname, ref) == 0
+                            || strcmp(ustr, ref) == 0) {
+                            found = true;
+                            actual = proc->protocol.peers[i].operator_bound;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: operator_bound: no stored peer %s", pid, ref);
+                        return -1;
+                    }
+                    if (actual != want_bound) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: operator_bound[%s]=%d, expected %d",
+                                 pid, ref, (int)actual, (int)want_bound);
+                        return -1;
+                    }
                 }
             } else if (strcmp(key, "peer_caps_count") == 0) {
                 /* `peer_caps_count: <int>` — assert the number of caps
@@ -1186,6 +1406,40 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: provisional_peer_count=%d, expected %d",
                              pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "subtree_roster") == 0) {
+                /* Flattened membership roll of this gateway's subtree, as
+                 * sorted participant ids (filled by trigger_subtree_roster).
+                 * Compared as sorted lists; mirrors the Python adapter's
+                 * subtree_roster check. */
+                if (!json_is_array(val)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: subtree_roster expects a list", pid);
+                    return -1;
+                }
+                const char *av[SCE_MAX_PARTICIPANTS];
+                const char *ev[SCE_MAX_PARTICIPANTS];
+                size_t an = 0, en = 0, i;
+                json_t *actual = impl->subtree_roster;
+                if (json_is_array(actual)) {
+                    size_t n = json_array_size(actual);
+                    for (i = 0; i < n && an < SCE_MAX_PARTICIPANTS; i++)
+                        av[an++] = json_string_value(json_array_get(actual, i));
+                }
+                size_t vn = json_array_size(val);
+                for (i = 0; i < vn && en < SCE_MAX_PARTICIPANTS; i++)
+                    ev[en++] = json_string_value(json_array_get(val, i));
+                qsort(av, an, sizeof(av[0]), _roster_strp_cmp);
+                qsort(ev, en, sizeof(ev[0]), _roster_strp_cmp);
+                bool eq = (an == en);
+                for (i = 0; eq && i < an; i++)
+                    if (av[i] == NULL || ev[i] == NULL
+                        || strcmp(av[i], ev[i]) != 0) eq = false;
+                if (!eq) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: subtree_roster mismatch (got %d, expected %d)",
+                             pid, (int)an, (int)en);
                     return -1;
                 }
             } else {
