@@ -27,6 +27,7 @@
 #include "config/configuration.h"
 #include "utilities/exception.h"
 #include "utilities/util.h"
+#include "utilities/b64.h"
 
 #include "identity_priv.h"
 
@@ -233,6 +234,36 @@ int public_identity_to_json(const public_identity_t *p, json_t **obj_ptr)
     json_object_set_new(encr, "hex_seed", json_string((char *)hex));
     free(hex);
     json_object_set_new(obj, "encryptor", encr);
+
+    /* Operator-attended signal + the ZTA binding that backs it (ethne D8/Q9).
+       Emitted ONLY when non-default so a plain (non-operator) peer's canonical
+       form is byte-identical to before (backward-compat), matching the Python
+       public_identity_to_canonical omit-when-default rule. Bytes are base64
+       (VARIANT_ORIGINAL == Python base64.b64encode). */
+    if (p->operator_bound)
+        json_object_set_new(obj, "operator_bound", json_true());
+    if (p->operator_attested_at > 0.0)
+        json_object_set_new(obj, "operator_attested_at",
+                            json_real(p->operator_attested_at));
+#ifdef AT_ZTA_ENABLED
+    if (p->zta_issuer[0] != '\0')
+        json_object_set_new(obj, "zta_issuer", json_string(p->zta_issuer));
+    if (p->zta_credential_len > 0 && p->zta_credential != NULL) {
+        size_t hlen = b64_encoded_len(sizeof(p->zta_credential_hash));
+        char *hb64 = malloc(hlen);
+        if (hb64 == NULL) return ENOMEM;
+        base64_encode(p->zta_credential_hash, sizeof(p->zta_credential_hash),
+                      hb64, hlen);
+        json_object_set_new(obj, "zta_credential_hash", json_string(hb64));
+        free(hb64);
+        size_t clen = b64_encoded_len(p->zta_credential_len);
+        char *cb64 = malloc(clen);
+        if (cb64 == NULL) return ENOMEM;
+        base64_encode(p->zta_credential, p->zta_credential_len, cb64, clen);
+        json_object_set_new(obj, "zta_credential", json_string(cb64));
+        free(cb64);
+    }
+#endif
     return 0;
 }
 
@@ -268,6 +299,33 @@ int public_identity_from_json(const json_t *obj, public_identity_t *p)
                               (const unsigned char *)enc_hex,
                               strlen(enc_hex)) != 0)
         return -1;
+
+    /* Operator-attended signal + ZTA binding (all optional; p was memset to 0
+       above so absent keys default false/0/empty). Mirror of the encoder and of
+       Python public_identity_from_canonical. */
+    p->operator_bound = json_is_true(json_object_get(obj, "operator_bound"));
+    json_t *oa = json_object_get(obj, "operator_attested_at");
+    p->operator_attested_at = json_is_number(oa) ? json_number_value(oa) : 0.0;
+#ifdef AT_ZTA_ENABLED
+    const char *iss = json_string_value(json_object_get(obj, "zta_issuer"));
+    if (iss != NULL)
+        snprintf(p->zta_issuer, sizeof(p->zta_issuer), "%s", iss);
+    const char *hb64 = json_string_value(json_object_get(obj, "zta_credential_hash"));
+    if (hb64 != NULL)
+        base64_decode(hb64, strlen(hb64),
+                      p->zta_credential_hash, sizeof(p->zta_credential_hash));
+    const char *cb64 = json_string_value(json_object_get(obj, "zta_credential"));
+    if (cb64 != NULL) {
+        size_t declen = b64_decoded_len_s(strlen(cb64), cb64);
+        if (declen > 0 && declen <= ZTA_CRED_MAX) {
+            p->zta_credential = malloc(declen);
+            if (p->zta_credential != NULL) {
+                base64_decode(cb64, strlen(cb64), p->zta_credential, declen);
+                p->zta_credential_len = declen;
+            }
+        }
+    }
+#endif
     return 0;
 }
 
@@ -368,6 +426,12 @@ int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core_
     proto->encryptor->hex_seed.data = identity->encryptor.public_hex;
     proto->encryptor->hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
 
+    /* Operator-attended signal (proto fields 12-13; parity with Python
+       sync_to_message). Proto3 scalars are always present, so set them
+       unconditionally (default false/0 round-trips cleanly). */
+    proto->operator_bound = identity->operator_bound;
+    proto->operator_attested_at = identity->operator_attested_at;
+
 #ifdef AT_ZTA_ENABLED
     if (identity->zta_credential_len > 0 && identity->zta_credential != NULL) {
         proto->zta_credential_hash.data = identity->zta_credential_hash;
@@ -398,6 +462,11 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
     if (public_encryptor_init(&identity->encryptor, proto->encryptor->hex_seed.data,
                               proto->encryptor->hex_seed.len) != 0)
         return -1;
+
+    /* Operator-attended signal (proto fields 12-13); parity with Python
+       sync_from_message. */
+    identity->operator_bound = proto->operator_bound;
+    identity->operator_attested_at = proto->operator_attested_at;
 
 #ifdef AT_ZTA_ENABLED
     memset(identity->zta_credential_hash, 0, sizeof(identity->zta_credential_hash));

@@ -72,6 +72,12 @@ _DEFAULT_BLOCK_IMPL = AgreementImpl.POA.value
 # CAPS_RESYNC_MAX_PER_SWEEP. The C adapter recognizes the same string.
 _TRIGGER_CAPS_RESYNC = 'trigger_caps_resync'
 
+# Pseudo-function: drive the requestor-side subtree-roster enumeration on the
+# target participant (aggregate_subtree_roster over a fetch that asks each
+# gateway for its local members + child gateways). Used by
+# subtree-member-roster. The C adapter recognizes the same string.
+_TRIGGER_SUBTREE_ROSTER = 'trigger_subtree_roster'
+
 
 @dataclass
 class _Participant:
@@ -89,6 +95,10 @@ class _Participant:
     # Message.function string (e.g. 'group_partition_probe'). Mirrors the
     # C adapter's scan of the engine's captured[] for the same function.
     emit_tally: dict[str, int] = field(default_factory=dict)
+    # Result of a trigger_subtree_roster enumeration on this participant: the
+    # flattened member uuids (strings) of its cohort subtree. Filled by the
+    # engine's _dispatch; read by the subtree_roster expected-state check.
+    subtree_roster: list = field(default_factory=list)
 
     def drain_outbox(self) -> list[CapturedMessage]:
         captured: list[CapturedMessage] = []
@@ -245,6 +255,43 @@ class _Participant:
                         f'{self.id}: provisional_peer_count={actual}, '
                         f'expected {int(expected)}'
                     )
+            elif key == 'subtree_roster':
+                # The flattened membership roll of this gateway's cohort subtree
+                # (trigger_subtree_roster), as sorted participant ids — each
+                # roster member uuid mapped back to its participant by the
+                # engine, so the check is language-agnostic. C mirrors via
+                # identity_aggregate_subtree_roster + the same uuid->id mapping.
+                actual = sorted(self.subtree_roster)
+                want = sorted(expected)
+                if actual != want:
+                    raise AssertionError(
+                        f'{self.id}: subtree_roster={actual}, expected {want}')
+            elif key == 'operator_bound':
+                # The welcomer's VERIFIED operator-attended determination for
+                # each named stored peer (ethne D8/Q9). expected = {peer_ref:
+                # bool}, where peer_ref is a participant id (matched against the
+                # stored peer's nickname "<id>.scenario") or a raw uuid — both
+                # language-agnostic, so C mirrors via the same accessor. Reads
+                # the operator_bound the ZTA gate set on the stored peer.
+                stored = [p for level in self.process.peers.hierarchy
+                          for p in level.values()]
+
+                def _find(ref):
+                    for p in stored:
+                        if (str(p.uuid) == ref or p.nickname == ref
+                                or p.nickname == f'{ref}.scenario'):
+                            return p
+                    return None
+                for ref, want_val in expected.items():
+                    peer = _find(ref)
+                    if peer is None:
+                        raise AssertionError(
+                            f'{self.id}: operator_bound: no stored peer {ref!r}')
+                    actual_val = bool(getattr(peer, 'operator_bound', False))
+                    if actual_val != bool(want_val):
+                        raise AssertionError(
+                            f'{self.id}: operator_bound[{ref}]={actual_val}, '
+                            f'expected {want_val}')
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
 
@@ -391,6 +438,17 @@ class IdentityAdapter:
                 with open(self.corpus_root / rel, 'rb') as fp:
                     identities[pid].zta_credential = fp.read()
 
+        # Advertised operator-attended claim (ethne D8/Q9): set the announcing
+        # identity's operator_bound so the welcoming committee sees the CLAIM on
+        # from_whom. The gate always neutralizes it and re-derives the truth from
+        # operator-anchor verification — so a `true` claim on a non-operator
+        # credential must end up false (operator-bound-lying-rejected). Mirrors
+        # the C adapter's operator_claims wiring.
+        claim_fix: dict[str, bool] = fixtures.get('operator_claims', {}) or {}
+        for pid, want in claim_fix.items():
+            if pid in identities:
+                identities[pid].operator_bound = bool(want)
+
         # ZTA policy (zta-x509-* scenarios): a single policy applied to every
         # participant's IdentityProcess (the border guards consult it at
         # admission). ca_bundle_path resolves against the corpus root. Mirrors
@@ -407,6 +465,13 @@ class IdentityAdapter:
             # REVOKED). See zta-x509-reject-revoked-credential.
             if spec.get('crl_path'):
                 spec['crl_path'] = str(self.corpus_root / spec['crl_path'])
+            # Distinct operator trust anchor (ethne D8/Q9): resolves against the
+            # corpus root like ca_bundle_path. A credential is operator-class iff
+            # it also chain-verifies here. Mirrors the C adapter wiring. See
+            # operator-bound-verified.yaml.
+            if spec.get('operator_ca_bundle_path'):
+                spec['operator_ca_bundle_path'] = str(
+                    self.corpus_root / spec['operator_ca_bundle_path'])
             zta_policy = ZtaPolicy(**spec)
 
         # Distinct-group mode (partition-recovery scenarios): when
@@ -535,6 +600,16 @@ class IdentityAdapter:
                 id=pid, role=role, impl=participant,
                 dispatch=lambda msg, p=participant: self._dispatch(p, msg),
             )
+        # Registry for the requestor-side subtree-roster walk (uuid -> impl,
+        # uuid -> pid); the trigger enumeration routes/labels by these.
+        self._handles = handles
+        self._roster_by_uuid = {
+            str(h.impl.identity.uuid): h.impl for h in handles.values()}
+        self._roster_uuid_to_pid = {
+            str(h.impl.identity.uuid): pid for pid, h in handles.items()}
+        # cohort_tree fixture: seed each gateway's child group + recursion
+        # target so a subtree-roster enumeration spans the whole tree.
+        self._apply_cohort_tree(handles, fixtures)
         return handles
 
     def _load_keys(self, pid: str, keys_fix: dict[str, Any]) -> tuple[bytes, bytes]:
@@ -604,6 +679,57 @@ class IdentityAdapter:
             filler_addr = f'10.9.{group_index}.{k + 2}'
             grp.add_address(filler_uuid, filler_addr)
         return grp
+
+    def _apply_cohort_tree(self, handles: dict[str, ParticipantHandle],
+                           fixtures: dict[str, Any]) -> None:
+        """Seed a gateway hierarchy from the `cohort_tree` fixture so a
+        subtree-roster enumeration spans multiple levels.
+
+        `cohort_tree.nodes.<pid>` may carry: `child_group` (participant ids
+        that make up the cohort this node gateways), `gateway` (which of them
+        is the deeper gateway to recurse into), and `members` (extra
+        primary-group members). Each named id must be a participant. Mirrors
+        the C adapter's cohort_tree handling in _apply_fixtures.
+        """
+        tree = fixtures.get('cohort_tree')
+        if not isinstance(tree, dict):
+            return
+        nodes = tree.get('nodes', {}) or {}
+        from uuid import uuid5
+
+        def _impl(name: str):
+            h = handles.get(name)
+            if h is None:
+                raise AssertionError(
+                    f'cohort_tree references unknown participant {name!r}')
+            return h.impl
+
+        for pid, spec in nodes.items():
+            me = _impl(pid)
+            proc = me.process
+            # Primary group = self + any extra members.
+            grp = Group(me.identity.uuid,
+                        {me.identity.uuid: me.identity.address},
+                        f'grp-{pid}', Encryptor.generate(), False)
+            for m_pid in (spec.get('members') or []):
+                m = _impl(m_pid)
+                grp.add_address(m.identity.uuid, m.identity.address)
+            proc.group = grp
+            # A child cohort this node gateways + the recursion target.
+            child_members = spec.get('child_group') or []
+            if child_members:
+                cg_uuid = str(uuid5(
+                    UUID('00000000-0000-0000-0000-000000000aaa'),
+                    f'at-conformance-cg:{pid}'))
+                cgrp = Group(UUID(cg_uuid), {}, f'cg-{pid}',
+                             Encryptor.generate(), False)
+                for m_pid in child_members:
+                    m = _impl(m_pid)
+                    cgrp.add_address(m.identity.uuid, m.identity.address)
+                proc.child_groups[cg_uuid] = cgrp
+                gw_pid = spec.get('gateway')
+                if gw_pid is not None:
+                    proc.child_gateways[cg_uuid] = str(_impl(gw_pid).identity.uuid)
 
     def _build_one(self, pid: str, role: str, identity: Identity,
                    peers: Peers, group: Group | None,
@@ -695,6 +821,25 @@ class IdentityAdapter:
             # dispatch). The emitted caps_query messages are captured in
             # emit_tally; caps_query_emitted asserts the per-sweep cap.
             participant.process._periodic_caps_resync(participant.queues)
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_SUBTREE_ROSTER:
+            # Pseudo-function: run the requestor-side subtree-roster walk on
+            # this participant. fetch asks each gateway (by uuid) for its
+            # roster response via the SAME helper the wire handler uses, so
+            # the enumeration is faithful. The flattened member uuids are
+            # mapped back to participant ids and stored for the check.
+            from autonomous_trust.core.identity.idprocess import (
+                aggregate_subtree_roster)
+
+            def _fetch(gw_uuid):
+                impl = self._roster_by_uuid.get(str(gw_uuid))
+                return impl.process._roster_response() if impl is not None else None
+
+            top_uuid = str(participant.identity.uuid)
+            members, _complete, _private = aggregate_subtree_roster(top_uuid, _fetch)
+            ids = [self._roster_uuid_to_pid[str(m['uuid'])]
+                   for m in members if str(m.get('uuid')) in self._roster_uuid_to_pid]
+            participant.subtree_roster = sorted(ids)
             return participant.drain_outbox()
         # The protocol's handler dispatch is run synchronously. Threads
         # spawned via _spawn() are inlined because synchronous_dispatch is on.
@@ -857,9 +1002,9 @@ class IdentityAdapter:
         else:
             obj = to_json_string(payload)
 
-        if function == _TRIGGER_CAPS_RESYNC:
-            # Pseudo-function: no wire payload; _dispatch invokes the periodic
-            # caps-resync sweep instead of a handler.
+        if function in (_TRIGGER_CAPS_RESYNC, _TRIGGER_SUBTREE_ROSTER):
+            # Pseudo-function: no wire payload; _dispatch invokes the sweep /
+            # roster enumeration directly instead of a handler.
             obj = ''
 
         msg = Message(CfgIds.identity, function, obj,

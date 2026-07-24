@@ -163,6 +163,11 @@ int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
                         json_string((const char *)msg->from_whom.signature.public_hex));
     json_object_set_new(root, "from_enc_hex",
                         json_string((const char *)msg->from_whom.encryptor.public_hex));
+    /* Sender topology rank (mirrors Python Message.__bytes__'s from_rank).
+     * Outside the signed pre-image (process|function|data) and the ciphertext,
+     * so it neither breaks signatures nor encryption. A receiver captures it
+     * into peer_ranks for rank-based child-gateway discovery. */
+    json_object_set_new(root, "from_rank", json_integer(msg->from_rank));
 
     char *json_str = json_dumps(root, JSON_COMPACT);
     json_decref(root);
@@ -279,6 +284,10 @@ int net_message_from_wire(const uint8_t *data, size_t len,
             (void)public_encryptor_init(&msg_out->from_whom.encryptor,
                                         (const unsigned char *)from_enc, strlen(from_enc));
     }
+    /* Sender topology rank (default 0 when the field is absent — older peers
+     * or unsigned/anonymous senders). Read regardless of the transport-`peer`
+     * branch: rank is the sender's claim on the envelope, not a transport fact. */
+    msg_out->from_rank = (int)json_integer_value(json_object_get(root, "from_rank"));
 
     /* extract and verify signature if present */
     msg_out->has_signature = false;

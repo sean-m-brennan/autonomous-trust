@@ -191,3 +191,163 @@ group-channel drain to: find the group in `{self.group} ∪ self.child_groups.va
 4. **Non-regression:** existing `examples/*/test_rank_gate.py`, `test_trust_ladder.py`, and the
    reputation tests still pass; `scripts/test-conformance.sh` shows only the expected (deferred)
    C-parity diff on the new `group_uuid` field.
+
+---
+
+# Subtree member-roster enumeration (identity process)
+
+A **lean, membership-only** capability, deliberately **decoupled from the
+reputation chain tree above**: given a gateway, return the flattened set of
+**member identities** (uuid + public naming fields) across its whole subtree,
+at **arbitrary depth**. Built because the `ethne` polity tier needs a
+community's full membership roll to ratify a founding boundary, and AT is
+hierarchical — a member gateway hides a cohort behind it, so the flat local
+peer view does not reveal everyone. It carries **no reputation** (that stays in
+the Phase 1–3 chain tree, which is still local-depth-2).
+
+Homed in the **identity** process (it is membership; identity already holds
+`child_groups`, the address maps, and the conformance `identity` adapter).
+
+## Design — requestor-side BFS (not gateway-side recursion)
+
+Each gateway answers **only about itself** and stays **stateless and
+non-blocking**:
+
+- `handle_roster_request` replies with this node's **local** members
+  (self + primary group + each gatewayed child group, from every group's
+  `address_map`) **plus the uuids of its child gateways** to recurse into.
+- The **requestor** drives the walk (`aggregate_subtree_roster`): a
+  breadth-first flatten over a per-gateway `fetch`, deduping members by uuid
+  and sorting by uuid (the canonical cross-language ordering), cycle- and
+  fan-out-guarded (`SUBTREE_ROSTER_MAX_NODES`).
+
+This was chosen over the gateway-side "forward to children and await" model
+(the shape the reputation skeleton *looks* like) because that skeleton is in
+fact **local depth-2 only** — there is no existing precedent for a recursive
+network forward-and-await, and blocking a handler awaiting child responses
+violates AT's single-threaded process loop. Requestor-side BFS is the clean
+non-blocking design for a distributed recursive query, and it composes to any
+depth because each gateway is independently seeded with its *direct* children.
+(Decision: 2026-07-23, overriding the plan's original gateway-side wording.)
+
+Partial/failure semantics: a gateway that is unreachable / never answers leaves
+the roster **incomplete** (returned partial, never hangs). This is distinct
+from privacy (below).
+
+## Child-gateway discovery — by rank
+
+A gateway's roster response names the **child gateways** to recurse into. Those
+are not carried on the wire per-peer; they are **derived** at response time, one
+per gatewayed child group:
+
+> the child gateway is the **highest-rank member** of that child group,
+> **excluding self**, ties broken by the **lexicographically greater uuid**.
+
+The uuid tiebreak makes the derivation **deterministic and identical in both
+languages** with no shared state. An explicit `child_gateways[cg]` entry, when
+present, **overrides** discovery — used by tests and pinned topologies.
+(Decision: 2026-07-23 — rank-based discovery chosen over a config-seeded child
+list, so live enumeration can go past depth-2 without a new seeding mechanism.)
+
+**Rank source.** Python peers already carry rank (`effective_rank`, else
+`_rank`), so `_member_rank` reads it directly. **C peers do not**: they are
+stored as `public_identity_t`, which drops rank. C therefore keeps a
+**`peer_ranks` map** on the `protocol` struct and `_roster_member_rank` reads it
+(default `0`/unknown). Because a single non-self member wins regardless of rank,
+a single-member child group resolves identically in both languages with no rank
+data at all.
+
+**How rank reaches a C peer — the message envelope.** Rank enters the system at
+self-announce, which rides the **message envelope** (`from_whom`), not the
+identity payload. The JSON wire envelope carries a **`from_rank`** field
+(`net_message.c` pack/unpack ⟂ Python `Message.__bytes__` / `_identity_from_wire`),
+sourced from the sender's own rank — in C stamped by the network process from
+the local `identity_t` (`net_proc.c`), in Python read from `from_whom._rank`.
+This mirrors Python's long-standing behaviour (rank has always ridden the
+envelope there; `_identity_from_wire` now reconstructs it). `from_rank` sits
+outside the signed pre-image (`process|function|data`) and outside the
+ciphertext, so it affects neither signatures nor encryption, and an absent field
+(older peer) reads back as `0`. On the C side the identity process captures it
+into `peer_ranks` at admission — `_peer_accepted` (rank argument) and the
+`request_access` potential-store — via `identity_set_peer_rank`. Only a known
+(non-zero) rank is stored, so an unknown `0` never clobbers a prior value.
+
+## Opt-out — private networks (`AT_ROSTER_PRIVATE`)
+
+Any gateway — **including the top one** — can refuse disclosure via the AT
+config option **`AT_ROSTER_PRIVATE`** (`_env_bool` in Python, `getenv` in C;
+per-node, one node = one process). A private node replies with a **`private`
+marker** carrying no members and no child gateways: the enumeration stops there
+as an **intentional opaque boundary**, recorded separately from an unreachable
+node (privacy ≠ incompleteness). A private **top** gateway therefore yields an
+**empty-but-complete** roster — a fully private network/subtree opts out of
+being mapped at all, and `ethne` falls back to its `ManualFounding` path.
+Enforced **only at the disclosure boundary** (`handle_roster_request` /
+`_roster_response`); `enumerate_local_members` stays pure (a node always knows
+its own members locally).
+
+## Implementations (C ⟂ Python parity)
+
+- **Python** (`identity/idprocess.py`): `enumerate_local_members`,
+  `_child_gateway_uuids` (+ `_discover_child_gateway` / `_member_rank`),
+  `_roster_response`, `handle_roster_request`, module-level
+  `aggregate_subtree_roster` → `(members, complete, private_boundaries)`;
+  `roster_private` from `AT_ROSTER_PRIVATE`; `roster_req`/`roster_resp` in
+  `identity/protocol.py`. App-facing async emit/consume in `automate.py`
+  (`request_subtree_roster` + `_consume_roster_resp`, resolving child gateways
+  via the requestor's peer table, graceful partial when unroutable).
+- **C** (`identity/id_proc.c`, declared in `id_proc_priv.h`):
+  `identity_enumerate_local_members`, `identity_roster_response`
+  (+ `_roster_child_gateway_array` / `_roster_discover_child_gateway` /
+  `_roster_member_rank`), `handle_roster_request`,
+  `identity_aggregate_subtree_roster` (fetch-callback BFS),
+  `identity_add_child_group` / `identity_set_roster_private` /
+  `identity_set_peer_rank`; `child_groups`/`child_gateways`/`peer_ranks`/
+  `roster_private` on the `protocol` struct (`processes/processes.h`);
+  `ID_ROSTER_QUERY`/`ID_ROSTER_RESPONSE`. Live rank propagation via the envelope
+  `from_rank` field (`net_message.c`, `net_proc.c`, `msg_types.h`,
+  `net_message.h`) captured at admission (`id_proc.c`).
+- Both the wire handler and the conformance/aggregation fetch call the **same**
+  roster-response helper (`_roster_response` / `identity_roster_response`), so
+  the two paths and the two languages emit identical content.
+
+## Verification
+
+- **Python unit:** `tests/a_unit/test_subtree_roster.py` (local enum, handler,
+  BFS flatten/dedup/cycle/cap/partial, opt-out, **rank-based discovery**
+  (higher-rank / uuid-tiebreak / explicit-override / self-exclusion), + in-process
+  integration over a real ≥3-level cohort) and `tests/a_unit/test_automate_roster.py`
+  (the requestor-side async walk).
+- **C unit:** `test/subtree_roster_test.c` (enumerate, handler + opt-out,
+  aggregate flatten/private-boundary/partial/cycle, config-file seeding, and the
+  four **rank-based discovery** cases mirroring Python).
+- **Conformance:** `scenarios/identity/subtree-member-roster.yaml` — a 3-level
+  `cohort_tree` whose child gateways are **discovered by rank** (no `gateway`
+  pin), a `trigger_subtree_roster` pseudo-step, and
+  `expected_state.top.subtree_roster` compared as sorted **participant ids**
+  (each roster uuid mapped back to its participant, so the check is
+  language-agnostic). Exercising discovery — not an explicit pin — means the
+  rank derivation itself is held to cross-language parity. Diff: **0 asymmetric**.
+
+## Verification (rank propagation)
+
+- **C unit:** `test/net_message_test.c` — `from_rank` survives the wire
+  round-trip, and a legacy envelope without the field parses to `0`.
+- **Python unit:** `tests/a_unit/test_message.py` — the envelope carries
+  `from_rank` onto a reconstructed `from_whom`, and an absent field defaults to
+  `0`.
+- **Conformance:** the seven `message-envelope-*` byte-pinned wire vectors were
+  regenerated for the new envelope; both languages emit identical bytes
+  (cross-language diff **0 asymmetric**).
+
+## Deferred
+
+- **C app-facing carrier + async wire-unroll** — new `message_type_t`
+  `ROSTER_QUERY`/`ROSTER_RESPONSE` + `autonomous_trust.c` `extern_q`/`q_out`
+  routing, and the C twin of `automate.py`'s emit/consume. This is the surface
+  `ethne-at` will read; not needed for scenario-observable conformance.
+
+(Done since the first draft: C child-group seeding from `group_child_*.cfg.json`
+via `identity_load_child_groups` — the Python `Group`-schema bridge — is built
+and unit-tested. Child *gateways* no longer need seeding at all; they are
+derived by rank at response time.)

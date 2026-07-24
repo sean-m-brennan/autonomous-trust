@@ -72,6 +72,12 @@ def bind_piv_credential(identity, cert_der: bytes):
     identity.zta_credential = cert_der
     identity.zta_issuer = piv_issuer(cert_der)
     identity.zta_credential_hash = hashlib.sha256(cert_der).digest()
+    # Durable operator-attended signal (ethne D8/Q9): this node now has a human
+    # guardian. Persisted with the identity, so the identity process advertises
+    # operator_bound=True across restarts. Excluded from Identity.__eq__, so it
+    # never changes identity. (The live attended-now stamp is NOT set here — it
+    # is runtime freshness produced by the live OperatorSession, never durable.)
+    identity.operator_bound = True
     return identity
 
 

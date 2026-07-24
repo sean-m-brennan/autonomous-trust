@@ -20,6 +20,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <sodium.h>
 
@@ -32,15 +33,27 @@
 #include "utilities/timeout.h"
 #include "structures/data.h"
 #include "network/net_message.h"
+#include "config/configuration.h"
 #include "peers.h"
 #include "history.h"
 #include "identity_priv.h"
 #include "id_proc_priv.h"
+#include "utilities/b64.h"
 
 #ifdef AT_ZTA_ENABLED
 #include "zta/zta_policy.h"
 #include "zta/zta_verifier.h"
 #include "zta/zta_audit.h"
+#endif
+
+/* Operator-attended signal helpers (ethne D8/Q9); defined below _build_announcement
+ * but used earlier in handle_welcoming_committee. */
+static json_t *_operator_attestation_json(const public_identity_t *pub);
+static void _apply_operator_attestation_json(const json_t *att, public_identity_t *pub);
+#ifdef AT_ZTA_ENABLED
+static bool _is_operator_credential(const zta_policy_t *policy,
+                                    const uint8_t *cred, size_t cred_len,
+                                    const uint8_t *advertised_hash);
 #endif
 
 DEFINE_ERROR(EID_NOQ, "Required process queue missing");
@@ -83,6 +96,14 @@ static char ID_TIER[]        = "tier_update";
 static char ID_PARTITION_SIGNAL[]   = "partition_signal";
 static char ID_PARTITION_PROBE[]    = "group_partition_probe";
 static char ID_PARTITION_RESPONSE[] = "group_partition_response";
+/* Subtree member-roster enumeration (hierarchy-aware membership). A node asks
+ * a gateway to enumerate its subtree; the gateway replies with its LOCAL
+ * members plus the child gateways to recurse into, and the requestor
+ * aggregates breadth-first (identity_aggregate_subtree_roster). Mirrors
+ * Python IdentityProtocol.roster_req / roster_resp. See
+ * doc/architecture/gateway-reputation-tree.md. */
+static char ID_ROSTER_QUERY[]    = "subtree_roster_query";
+static char ID_ROSTER_RESPONSE[] = "subtree_roster_response";
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -631,8 +652,21 @@ static int _send_caps_query(const process_t *proc, const public_identity_t *peer
 
 /* Frama-C: skipped — [solver-timeout] identity/peers preconditions */
 static int _peer_accepted(process_t *proc, directory_t *queues,
-                          const public_identity_t *new_peer, bool amnesia)
+                          const public_identity_t *new_peer, int rank,
+                          bool amnesia)
 {
+    /* Record the peer's topology rank (carried on the message envelope) for
+     * rank-based child-gateway discovery — the live source that replaces the
+     * rank C peers drop (public_identity_t has none). Kept current even on the
+     * amnesia path. Only a known (non-zero) rank is stored; an absent/unknown
+     * rank (0) reads back as the default and must not clobber a prior value.
+     * Mirrors Python, whose peers carry _rank off the same envelope. */
+    if (new_peer != NULL && rank != 0) {
+        char ru[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(new_peer->uuid, ru);
+        identity_set_peer_rank(proc, ru, rank);
+    }
+
     /* Send ID_CONFIRM to existing group members with new_peer identity in JSON payload.
      *
      * Two modes:
@@ -856,8 +890,28 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         log_info(proc->logger,
                  "Identity: peer %s already known (amnesia path)\n",
                  nmsg->from_whom.nickname);
-        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom, true);
+        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom,
+                       nmsg->from_rank, true);
         return true;
+    }
+
+    /* Operator-attended signal (ethne D8/Q9): deliver any wire-carried
+     * attestation (payload slot 2) onto from_whom — the ZTA credential is NOT
+     * on the envelope, so this is what makes a real-wire credential available
+     * to the gate below (the conformance harness attaches from_whom in-process,
+     * so a missing payload is fine). Then neutralize the advertised
+     * operator_bound: it is earned only by operator-anchor verification in the
+     * ZTA block, never trusted from the wire. Mirrors Python
+     * welcoming_committee's _apply_operator_attestation + _zta_admit entry. */
+    {
+        json_t *apayload = NULL;
+        if (net_msg_unpack_json(nmsg, &apayload) == 0 && apayload != NULL) {
+            if (json_is_array(apayload) && json_array_size(apayload) > 2)
+                _apply_operator_attestation_json(json_array_get(apayload, 2),
+                                                 &nmsg->from_whom);
+            json_decref(apayload);
+        }
+        nmsg->from_whom.operator_bound = false;
     }
 
 #ifdef AT_ZTA_ENABLED
@@ -937,6 +991,23 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
                         return true; /* reject */
                     }
                 }
+                if (zta_result.status == ZTA_VERIFIED) {
+                    /* Peer credential verified against the mission anchor. Now
+                     * classify operator-class against the DISTINCT operator
+                     * anchor (ethne D8/Q9): only a credential that also
+                     * chain-verifies there marks a human guardian. Overwrites
+                     * the (neutralized) operator_bound with the verified truth,
+                     * so a lying node's advertised claim never survives. */
+                    if (_is_operator_credential(zta_policy,
+                                                nmsg->from_whom.zta_credential,
+                                                nmsg->from_whom.zta_credential_len,
+                                                nmsg->from_whom.zta_credential_hash)) {
+                        nmsg->from_whom.operator_bound = true;
+                        log_info(proc->logger,
+                                 "Identity: %s is operator-attended (human guardian)\n",
+                                 nmsg->from_whom.nickname);
+                    }
+                }
                 if (zta_result.status == ZTA_UNAVAILABLE || zta_result.status == ZTA_DEFERRED) {
                     if (!zta_policy->allow_ddil_fallback) {
                         log_warn(proc->logger,
@@ -967,13 +1038,20 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     {
         log_info(proc->logger, "Identity: bootstrap — auto-accepting first peer %s\n",
                  nmsg->from_whom.nickname);
-        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom, false);
+        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom,
+                       nmsg->from_rank, false);
         return true;
     }
 
     /* Store proposed peer in potentials and self-vote before sending proposals */
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(nmsg->from_whom.uuid, uuid_str);
+    /* Capture the announced rank now, so a later majority-vote admission
+     * (handle_count_vote, which adds from peer_potentials without a fresh
+     * envelope) already has it for rank-based child-gateway discovery. Only a
+     * known (non-zero) rank is stored (see _peer_accepted). */
+    if (nmsg->from_rank != 0)
+        identity_set_peer_rank((process_t *)proc, uuid_str, nmsg->from_rank);
 
     pthread_mutex_lock(&id_state.lock);
     public_identity_t *potential = smrt_create(sizeof(public_identity_t));
@@ -1071,7 +1149,8 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         log_info(proc->logger,
                  "Identity: synchronous_dispatch — self-vote majority for %s\n",
                  nmsg->from_whom.nickname);
-        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom, false);
+        _peer_accepted((process_t *)proc, queues, &nmsg->from_whom,
+                       nmsg->from_rank, false);
     }
     return true;
 }
@@ -2011,7 +2090,9 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
         {
             log_info(proc->logger, "Identity: majority vote reached for %s, accepting peer\n",
                      uuid_key);
-            _peer_accepted(proc, queues, new_peer, false);
+            /* Rank was captured at the potential-store (handle_welcoming_
+             * committee); pass 0 so _peer_accepted's non-zero gate leaves it. */
+            _peer_accepted(proc, queues, new_peer, 0, false);
         }
         else
         {
@@ -2945,6 +3026,117 @@ static int _acquire_capabilities(const process_t *proc, directory_t *queues)
 }
 
 /* Frama-C: skipped — [solver-timeout] JSON + identity preconditions */
+/* Build the operator-attended attestation for the request_access DATA payload
+ * (ethne D8/Q9), mirroring Python IdentityProcess._operator_attestation: emit
+ * only the non-default fields (a plain node contributes an empty {} so the
+ * payload stays backward-compatible). The ZTA binding rides here because it is
+ * NOT on the envelope — this payload is also what delivers the verifiable
+ * credential to the welcoming committee. Bytes are base64 (VARIANT_ORIGINAL ==
+ * Python base64.b64encode). Returns a new json object (never NULL on success). */
+static json_t *_operator_attestation_json(const public_identity_t *pub)
+{
+    json_t *att = json_object();
+    if (att == NULL || pub == NULL)
+        return att;
+    if (pub->operator_bound)
+        json_object_set_new(att, "operator_bound", json_true());
+    if (pub->operator_attested_at > 0.0)
+        json_object_set_new(att, "operator_attested_at",
+                            json_real(pub->operator_attested_at));
+#ifdef AT_ZTA_ENABLED
+    if (pub->zta_issuer[0] != '\0')
+        json_object_set_new(att, "zta_issuer", json_string(pub->zta_issuer));
+    if (pub->zta_credential_len > 0 && pub->zta_credential != NULL) {
+        size_t hlen = b64_encoded_len(sizeof(pub->zta_credential_hash));
+        char *hb64 = malloc(hlen);
+        if (hb64 != NULL) {
+            base64_encode(pub->zta_credential_hash, sizeof(pub->zta_credential_hash),
+                          hb64, hlen);
+            json_object_set_new(att, "zta_credential_hash", json_string(hb64));
+            free(hb64);
+        }
+        size_t clen = b64_encoded_len(pub->zta_credential_len);
+        char *cb64 = malloc(clen);
+        if (cb64 != NULL) {
+            base64_encode(pub->zta_credential, pub->zta_credential_len, cb64, clen);
+            json_object_set_new(att, "zta_credential", json_string(cb64));
+            free(cb64);
+        }
+    }
+#endif
+    return att;
+}
+
+/* Copy the request_access attestation dict onto a newly-announced peer identity
+ * (inverse of _operator_attestation_json; mirror of Python
+ * _apply_operator_attestation). The advertised operator_bound is copied only as
+ * a claim — the welcoming committee overwrites it with the verified result. */
+static void _apply_operator_attestation_json(const json_t *att, public_identity_t *pub)
+{
+    if (att == NULL || pub == NULL || !json_is_object(att))
+        return;
+    pub->operator_bound = json_is_true(json_object_get(att, "operator_bound"));
+    json_t *oa = json_object_get(att, "operator_attested_at");
+    pub->operator_attested_at = json_is_number(oa) ? json_number_value(oa) : 0.0;
+#ifdef AT_ZTA_ENABLED
+    const char *iss = json_string_value(json_object_get(att, "zta_issuer"));
+    if (iss != NULL)
+        snprintf(pub->zta_issuer, sizeof(pub->zta_issuer), "%s", iss);
+    const char *hb64 = json_string_value(json_object_get(att, "zta_credential_hash"));
+    if (hb64 != NULL)
+        base64_decode(hb64, strlen(hb64),
+                      pub->zta_credential_hash, sizeof(pub->zta_credential_hash));
+    const char *cb64 = json_string_value(json_object_get(att, "zta_credential"));
+    if (cb64 != NULL) {
+        size_t declen = b64_decoded_len_s(strlen(cb64), cb64);
+        if (declen > 0 && declen <= ZTA_CRED_MAX) {
+            if (pub->zta_credential != NULL) {  /* free prior to avoid a leak */
+                free(pub->zta_credential);
+                pub->zta_credential = NULL;
+                pub->zta_credential_len = 0;
+            }
+            pub->zta_credential = malloc(declen);
+            if (pub->zta_credential != NULL) {
+                base64_decode(cb64, strlen(cb64), pub->zta_credential, declen);
+                pub->zta_credential_len = declen;
+            }
+        }
+    }
+#endif
+}
+
+#ifdef AT_ZTA_ENABLED
+/* True iff the credential is operator-class: it chain-verifies against the
+ * DISTINCT operator trust anchor AND its sha256 matches the advertised hash
+ * (ethne D8/Q9). Non-forgeable (derived from verification, never the advertised
+ * bool) and fail-safe (no anchor / no match / not verified -> false). Mirror of
+ * Python IdentityProcess._is_operator_credential. Issuer-based markers are NOT
+ * used (a distinct anchor is the agreed discriminator). */
+static bool _is_operator_credential(const zta_policy_t *policy,
+                                    const uint8_t *cred, size_t cred_len,
+                                    const uint8_t *advertised_hash)
+{
+    if (cred == NULL || cred_len == 0)
+        return false;
+    uint8_t actual[crypto_hash_sha256_BYTES];
+    crypto_hash_sha256(actual, cred, cred_len);
+    bool adv_present = false;
+    for (size_t i = 0; i < sizeof(actual); i++)
+        if (advertised_hash[i] != 0) { adv_present = true; break; }
+    if (adv_present && sodium_memcmp(actual, advertised_hash, sizeof(actual)) != 0)
+        return false;
+    zta_verifier_t *op = NULL;
+    if (zta_policy_create_operator_verifier(policy, &op) != 0 || op == NULL)
+        return false;
+    zta_result_t r;
+    memset(&r, 0, sizeof(r));
+    op->verify_credential(op, cred, cred_len, &r);
+    bool ok = (r.status == ZTA_VERIFIED);
+    op->destroy(op);
+    return ok;
+}
+#endif
+
 static int _build_announcement(const process_t *proc, generic_msg_t *buf)
 {
     memset(buf, 0, sizeof(generic_msg_t));
@@ -3000,6 +3192,13 @@ static int _build_announcement(const process_t *proc, generic_msg_t *buf)
             pthread_mutex_unlock(&id_state.lock);
         }
         json_array_append_new(payload, caps_arr);
+        /* Slot 2 (optional): operator-attended attestation (ethne D8/Q9),
+         * built from this node's own identity (already in from_whom above). A
+         * plain node emits an empty {} so Python's arity-tolerant unpack still
+         * reads [package_hash, capabilities]. Mirrors Python
+         * _broadcast_request_access appending _operator_attestation(). */
+        json_array_append_new(payload,
+                              _operator_attestation_json(&buf->info.net_msg.from_whom));
         net_msg_pack_json(&buf->info.net_msg, payload);
         json_decref(payload);
     }
@@ -3957,6 +4156,478 @@ static bool handle_partition_response(const process_t *proc, directory_t *queues
     return true;
 }
 
+/****************************
+ * Subtree member-roster enumeration (requestor-side BFS + opt-out)
+ *
+ * The C twin of Python's idprocess enumerate_local_members /
+ * handle_roster_request / aggregate_subtree_roster. Each gateway answers
+ * ONLY about itself (local members + child-gateway uuids) and stays
+ * stateless/non-blocking; the requestor walks the tree. A node that opted
+ * out (AT_ROSTER_PRIVATE) replies with a `private` marker and discloses
+ * nothing. See doc/architecture/gateway-reputation-tree.md.
+ ****************************/
+
+/* Fan-out / cycle backstop for the recursive aggregation (mirrors Python's
+ * SUBTREE_ROSTER_MAX_NODES). Far above any real cohort tree. */
+#define ROSTER_MAX_NODES 4096
+
+static bool _roster_env_private(void)
+{
+    const char *v = getenv("AT_ROSTER_PRIVATE");
+    if (v == NULL || v[0] == '\0') return false;
+    return strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0
+        || strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0;
+}
+
+static int _roster_key_cmp(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Add (or enrich) a member into the by-uuid accumulator object. Missing
+ * nickname/address on an existing entry are filled; uuid is the key. */
+static void _roster_add_member(json_t *by_uuid, const char *uuid,
+                               const char *nickname, const char *address)
+{
+    if (by_uuid == NULL || uuid == NULL || uuid[0] == '\0') return;
+    json_t *entry = json_object_get(by_uuid, uuid);  /* borrowed */
+    if (entry == NULL) {
+        entry = json_object();
+        json_object_set_new(entry, "uuid", json_string(uuid));
+        json_object_set_new(entry, "nickname",
+                            (nickname && nickname[0]) ? json_string(nickname)
+                                                      : json_null());
+        json_object_set_new(entry, "address",
+                            (address && address[0]) ? json_string(address)
+                                                    : json_null());
+        json_object_set_new(by_uuid, uuid, entry);  /* steals entry */
+        return;
+    }
+    if (nickname && nickname[0]) {
+        json_t *n = json_object_get(entry, "nickname");
+        if (n == NULL || json_is_null(n))
+            json_object_set_new(entry, "nickname", json_string(nickname));
+    }
+    if (address && address[0]) {
+        json_t *a = json_object_get(entry, "address");
+        if (a == NULL || json_is_null(a))
+            json_object_set_new(entry, "address", json_string(address));
+    }
+}
+
+/* Flatten a by-uuid accumulator into a NEW json array sorted by uuid — the
+ * canonical member ordering shared with Python (sort by uuid on both sides). */
+static json_t *_roster_sorted_members(json_t *by_uuid)
+{
+    json_t *arr = json_array();
+    size_t n = json_object_size(by_uuid);
+    if (n == 0) return arr;
+    const char **keys = calloc(n, sizeof(*keys));
+    if (keys == NULL) return arr;
+    size_t i = 0;
+    const char *k; json_t *v;
+    json_object_foreach(by_uuid, k, v) { keys[i++] = k; }
+    qsort(keys, n, sizeof(*keys), _roster_key_cmp);
+    for (i = 0; i < n; i++)
+        json_array_append(arr, json_object_get(by_uuid, keys[i]));  /* incref */
+    free(keys);
+    return arr;
+}
+
+/* Add every member of a group's address_map (uuid -> address) to by_uuid. */
+static void _roster_add_group_members(group_t *group, json_t *by_uuid)
+{
+    if (group == NULL) return;
+    map_key_t key;
+    data_t *value;
+    map_entries_for_each(&group->address_map, key, value)
+        string_t addr = NULL;
+        data_string_ptr(value, &addr);
+        _roster_add_member(by_uuid, key, NULL, addr);
+    map_end_for_each
+}
+
+/* This node's own membership contribution: itself + primary group + each
+ * gatewayed child group, deduped and sorted by uuid. Pure and local — no
+ * network, no reputation. Caller owns the returned array (json_decref).
+ * Stays PURE regardless of roster_private; privacy is enforced only at the
+ * disclosure boundary (handle_roster_request). */
+json_t *identity_enumerate_local_members(const process_t *proc)
+{
+    json_t *by_uuid = json_object();
+    if (proc != NULL) {
+        const identity_t *self = _partition_self_identity(proc);
+        if (self != NULL) {
+            char su[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(self->uuid, su);
+            _roster_add_member(by_uuid, su, self->nickname, self->address);
+        }
+        _roster_add_group_members(&((process_t *)proc)->protocol.group, by_uuid);
+        if (proc->protocol.child_groups != NULL) {
+            map_key_t key;
+            data_t *value;
+            map_entries_for_each(proc->protocol.child_groups, key, value)
+                group_t *cg = NULL;
+                if (data_object_ptr(value, (ptr_t *)&cg) == 0 && cg != NULL)
+                    _roster_add_group_members(cg, by_uuid);
+            map_end_for_each
+        }
+    }
+    json_t *out = _roster_sorted_members(by_uuid);
+    json_decref(by_uuid);
+    return out;
+}
+
+/* A peer's rank for child-gateway discovery, read from the peer_ranks seam
+ * (default 0/unknown). C peers are public_identity_t, which drops rank, so the
+ * map is the rank source rather than the peer table. Mirrors Python's
+ * IdentityProcess._member_rank. */
+static int _roster_member_rank(const process_t *proc, const char *uuid)
+{
+    if (proc == NULL || proc->protocol.peer_ranks == NULL || uuid == NULL)
+        return 0;
+    data_t *rd = NULL;
+    int r = 0;
+    if (map_get(proc->protocol.peer_ranks, (map_key_t)uuid, &rd) == 0
+        && rd != NULL && data_integer(rd, &r) == 0)
+        return r;
+    return 0;
+}
+
+/* Discover the recursion target for one child group = its highest-rank member
+ * (excluding self), ties broken by the lexicographically greater uuid so the
+ * choice is deterministic and identical in Python. Writes the winning uuid
+ * into @p out (UUID_STRING_LEN+1) and returns true, or returns false for an
+ * empty / self-only group. Mirrors Python's _discover_child_gateway. */
+static bool _roster_discover_child_gateway(const process_t *proc,
+                                           group_t *group, const char *self_uuid,
+                                           char *out)
+{
+    if (group == NULL) return false;
+    bool have = false;
+    int best_rank = 0;
+    char best_uuid[UUID_STRING_LEN + 1] = {0};
+    map_key_t key;
+    data_t *value;
+    map_entries_for_each(&group->address_map, key, value)
+        (void)value;  /* discovery keys on member uuid, not address */
+        const char *u = (const char *)key;
+        if (u == NULL || u[0] == '\0') continue;
+        if (self_uuid != NULL && strcmp(u, self_uuid) == 0) continue;
+        int rank = _roster_member_rank(proc, u);
+        /* key = (rank, uuid); greater wins (uuid tiebreak = strcmp > 0). */
+        if (!have || rank > best_rank
+            || (rank == best_rank && strcmp(u, best_uuid) > 0)) {
+            have = true;
+            best_rank = rank;
+            strncpy(best_uuid, u, UUID_STRING_LEN);
+            best_uuid[UUID_STRING_LEN] = '\0';
+        }
+    map_end_for_each
+    if (have)
+        memcpy(out, best_uuid, UUID_STRING_LEN + 1);  /* incl. NUL */
+    return have;
+}
+
+/* The child gateways a full-subtree roster recurses into (deduped,
+ * order-stable) as a NEW json array of node-uuid strings — one per gatewayed
+ * child group, DISCOVERED by rank (highest-rank member excluding self), with an
+ * explicit child_gateways[cg] entry overriding discovery. Empty when this node
+ * gateways no deeper gateways — a roster query is then purely local. Mirrors
+ * Python's _child_gateway_uuids. */
+static json_t *_roster_child_gateway_array(const process_t *proc)
+{
+    json_t *arr = json_array();
+    if (proc == NULL || proc->protocol.child_groups == NULL) return arr;
+    const identity_t *self = _partition_self_identity(proc);
+    char self_uuid[UUID_STRING_LEN + 1] = {0};
+    if (self != NULL) uuid_unparse_lower(self->uuid, self_uuid);
+    const char *self_p = self != NULL ? self_uuid : NULL;
+    json_t *seen = json_object();
+    map_key_t key;
+    data_t *value;
+    map_entries_for_each(proc->protocol.child_groups, key, value)
+        const char *cg_uuid = (const char *)key;
+        char gw[UUID_STRING_LEN + 1] = {0};
+        const char *gw_p = NULL;
+        data_t *ov = NULL;
+        if (proc->protocol.child_gateways != NULL)
+            map_get(proc->protocol.child_gateways, (map_key_t)cg_uuid, &ov);
+        string_t ov_s = NULL;
+        if (ov != NULL && data_string_ptr(ov, &ov_s) == 0
+            && ov_s != NULL && ov_s[0] != '\0') {
+            gw_p = ov_s;  /* explicit override */
+        } else {
+            group_t *cg = NULL;
+            if (data_object_ptr(value, (ptr_t *)&cg) == 0 && cg != NULL
+                && _roster_discover_child_gateway(proc, cg, self_p, gw))
+                gw_p = gw;
+        }
+        if (gw_p != NULL && gw_p[0] != '\0'
+            && json_object_get(seen, gw_p) == NULL) {
+            json_object_set_new(seen, gw_p, json_true());
+            json_array_append_new(arr, json_string(gw_p));
+        }
+    map_end_for_each
+    json_decref(seen);
+    return arr;
+}
+
+/* This node's roster-query answer as a NEW json object {members,
+ * child_gateways, private} (caller owns). A node that opted out discloses
+ * nothing. Shared by handle_roster_request (the wire path) and the
+ * requestor-side aggregation's fetch (tests / conformance), so both see
+ * identical content. See gateway-reputation-tree.md. */
+json_t *identity_roster_response(const process_t *proc)
+{
+    json_t *out = json_object();
+    if (out == NULL) return NULL;
+    if (proc != NULL && proc->protocol.roster_private) {
+        json_object_set_new(out, "members", json_array());
+        json_object_set_new(out, "child_gateways", json_array());
+        json_object_set_new(out, "private", json_true());
+    } else {
+        json_object_set_new(out, "members",
+                            identity_enumerate_local_members(proc));
+        json_object_set_new(out, "child_gateways",
+                            _roster_child_gateway_array(proc));
+        json_object_set_new(out, "private", json_false());
+    }
+    return out;
+}
+
+/* Handler: answer a subtree-roster query with this node's LOCAL members and
+ * the child gateways to recurse into (the requestor does the BFS). A node
+ * that opted out replies with an empty `private` marker. Never blocks
+ * awaiting children — matches the async, no-blocking-handler model. */
+bool handle_roster_request(const process_t *proc, directory_t *queues,
+                           generic_msg_t *msg)
+{
+    (void)queues;
+    if (proc == NULL || msg == NULL) return true;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *out = identity_roster_response(proc);
+    if (out == NULL) return true;
+
+    generic_msg_t reply = {0};
+    reply.type = NET_MESSAGE;
+    strncpy(reply.info.net_msg.process, "identity", PROC_NAME_LEN);
+    reply.info.net_msg.function = ID_ROSTER_RESPONSE;
+    reply.info.net_msg.encrypt = false;
+    /* Route the reply back to the requestor (mirrors rep_proc grant). */
+    memcpy(&reply.info.net_msg.to_whom, &nmsg->from_whom,
+           sizeof(public_identity_t));
+    strncpy(reply.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    net_msg_pack_json(&reply.info.net_msg, out);
+    json_decref(out);
+    messaging_send("network", NET_MESSAGE, &reply, false);
+    return true;
+}
+
+/* Requestor-side breadth-first flatten of a gateway's subtree into a deduped,
+ * uuid-sorted member roster. `fetch(ctx, gateway_uuid)` returns a NEW response
+ * object {members, child_gateways, private} (the aggregator decrefs it) or
+ * NULL on failure. On return *out_members (always set, caller owns) is the
+ * sorted roster, *out_complete is false only on a fetch failure or the node
+ * cap (unreachability, NOT privacy), and *out_private (if non-NULL, caller
+ * owns) lists the gateways that opted out. */
+int identity_aggregate_subtree_roster(const char *top_uuid,
+                                      roster_fetch_fn fetch, void *ctx,
+                                      json_t **out_members, bool *out_complete,
+                                      json_t **out_private)
+{
+    if (top_uuid == NULL || fetch == NULL || out_members == NULL) return -1;
+    json_t *by_uuid = json_object();
+    json_t *privates = json_array();
+    json_t *seen = json_object();
+    json_t *q = json_array();
+    bool complete = true;
+    json_array_append_new(q, json_string(top_uuid));
+    json_object_set_new(seen, top_uuid, json_true());
+    size_t qi = 0, guard = 0;
+    while (qi < json_array_size(q)) {
+        if (guard++ >= ROSTER_MAX_NODES) { complete = false; break; }
+        const char *gw = json_string_value(json_array_get(q, qi++));
+        if (gw == NULL) { complete = false; continue; }
+        json_t *resp = fetch(ctx, gw);
+        if (resp == NULL) { complete = false; continue; }
+        json_t *priv = json_object_get(resp, "private");
+        if (priv != NULL && json_is_true(priv)) {
+            json_array_append_new(privates, json_string(gw));
+            json_decref(resp);
+            continue;
+        }
+        json_t *members = json_object_get(resp, "members");
+        if (json_is_array(members)) {
+            size_t i, n = json_array_size(members);
+            for (i = 0; i < n; i++) {
+                json_t *m = json_array_get(members, i);  /* borrowed */
+                const char *mu = json_string_value(json_object_get(m, "uuid"));
+                if (mu != NULL && mu[0] != '\0'
+                    && json_object_get(by_uuid, mu) == NULL)
+                    json_object_set(by_uuid, mu, m);  /* incref */
+            }
+        }
+        json_t *children = json_object_get(resp, "child_gateways");
+        if (json_is_array(children)) {
+            size_t i, n = json_array_size(children);
+            for (i = 0; i < n; i++) {
+                const char *cu = json_string_value(json_array_get(children, i));
+                if (cu != NULL && cu[0] != '\0'
+                    && json_object_get(seen, cu) == NULL) {
+                    json_object_set_new(seen, cu, json_true());
+                    json_array_append_new(q, json_string(cu));
+                }
+            }
+        }
+        json_decref(resp);
+    }
+    *out_members = _roster_sorted_members(by_uuid);
+    if (out_complete) *out_complete = complete;
+    if (out_private) *out_private = privates; else json_decref(privates);
+    json_decref(by_uuid);
+    json_decref(seen);
+    json_decref(q);
+    return 0;
+}
+
+/* Seed a child cohort this node gateways (the C twin of Python's child_groups
+ * seeding). `gateway_uuid` names the deeper gateway node to recurse into for
+ * that child group (may be NULL for a 2-level gateway). Test/harness surface;
+ * the live app path would populate these from group_child_*.cfg.json. */
+int identity_add_child_group(process_t *proc, group_t *group,
+                             const char *gateway_uuid)
+{
+    if (proc == NULL || group == NULL) return -1;
+    if (proc->protocol.child_groups == NULL
+        && map_create(&proc->protocol.child_groups) != 0)
+        return -1;
+    char cg_uuid[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(group->uuid, cg_uuid);
+    data_t *gd = object_ptr_data(group, sizeof(group_t));
+    if (gd == NULL || map_set(proc->protocol.child_groups, cg_uuid, gd) != 0)
+        return -1;
+    if (gateway_uuid != NULL && gateway_uuid[0] != '\0') {
+        if (proc->protocol.child_gateways == NULL
+            && map_create(&proc->protocol.child_gateways) != 0)
+            return -1;
+        data_t *gwd = string_data((string_t)gateway_uuid,
+                                  strlen(gateway_uuid));
+        if (gwd == NULL
+            || map_set(proc->protocol.child_gateways, cg_uuid, gwd) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+void identity_set_roster_private(process_t *proc, bool enabled)
+{
+    if (proc == NULL) return;
+    proc->protocol.roster_private = enabled;
+}
+
+/* Record a peer's rank for rank-based child-gateway discovery — the seam that
+ * stands in for the rank C peers drop (public_identity_t carries no rank). The
+ * live app path would populate this from the rank on full identity_t blocks
+ * received via the history/chain path. Mirrors the fact that Python peers
+ * already carry _rank/effective_rank. */
+int identity_set_peer_rank(process_t *proc, const char *uuid, int rank)
+{
+    if (proc == NULL || uuid == NULL || uuid[0] == '\0') return -1;
+    if (proc->protocol.peer_ranks == NULL
+        && map_create(&proc->protocol.peer_ranks) != 0)
+        return -1;
+    data_t *rd = integer_data(rank);
+    if (rd == NULL || map_set(proc->protocol.peer_ranks, (map_key_t)uuid, rd) != 0)
+        return -1;
+    return 0;
+}
+
+/* Parse ONE group_child_*.cfg.json into a heap group_t (member enumeration
+ * only: uuid + address_map). The on-disk files are the Python `Group` schema
+ * (top-level array [group, hist]; group carries `_uuid` / `_address_map`),
+ * which the flat C group_from_json does not read — so this bridges it, and
+ * also tolerates the flat `uuid`/`address_map` shape. Encryptor/nickname are
+ * intentionally NOT parsed: the roster capability reads only address_map.
+ * Returns a heap group_t* (caller/child_groups owns it) or NULL. */
+static group_t *_load_child_group_file(const char *path)
+{
+    json_error_t jerr;
+    json_t *root = json_load_file(path, 0, &jerr);
+    if (root == NULL) return NULL;
+    json_t *gj = root;
+    if (json_is_array(root)) {
+        if (json_array_size(root) == 0) { json_decref(root); return NULL; }
+        gj = json_array_get(root, 0);  /* borrowed */
+    }
+    if (!json_is_object(gj)) { json_decref(root); return NULL; }
+    const char *uuid_str = json_string_value(json_object_get(gj, "_uuid"));
+    if (uuid_str == NULL)
+        uuid_str = json_string_value(json_object_get(gj, "uuid"));
+    json_t *amap = json_object_get(gj, "_address_map");
+    if (amap == NULL) amap = json_object_get(gj, "address_map");
+    uuid_t guuid;
+    if (uuid_str == NULL || !json_is_object(amap)
+        || uuid_parse(uuid_str, guuid) != 0) {
+        json_decref(root);
+        return NULL;
+    }
+    group_t *g = calloc(1, sizeof(group_t));
+    if (g == NULL) { json_decref(root); return NULL; }
+    char no_addr[1] = {0};
+    group_init(&guuid, no_addr, g);
+    const char *mk;
+    json_t *mv;
+    json_object_foreach(amap, mk, mv) {
+        const char *addr = json_string_value(mv);
+        if (mk != NULL && addr != NULL)
+            group_add_address(g, mk, addr);
+    }
+    json_decref(root);
+    return g;
+}
+
+/* Seed child groups from group_child_*.cfg.json under @p cfg_dir — the C twin
+ * of Python's IdentityProcess._load_child_groups. A gateway is seeded with one
+ * such file per cohort it gateways; each becomes a child_groups entry so a
+ * subtree-roster query enumerates those members. Matches the Python live path:
+ * child_groups only (NOT child_gateways — deeper-recursion seeding is an
+ * unspecified shared design question in both languages). Returns the count
+ * adopted. See doc/architecture/gateway-reputation-tree.md. */
+int identity_load_child_groups(process_t *proc, const char *cfg_dir)
+{
+    if (proc == NULL || cfg_dir == NULL) return 0;
+    DIR *d = opendir(cfg_dir);
+    if (d == NULL) return 0;
+    static const char prefix[] = "group_child";
+    static const char ext[] = ".cfg.json";
+    const size_t plen = sizeof(prefix) - 1;
+    const size_t elen = sizeof(ext) - 1;
+    int loaded = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *name = ent->d_name;
+        size_t nlen = strlen(name);
+        if (strncmp(name, prefix, plen) != 0) continue;
+        if (nlen < elen || strcmp(name + nlen - elen, ext) != 0) continue;
+        char full[CFG_PATH_LEN + 1];
+        if ((size_t)snprintf(full, sizeof(full), "%s/%s", cfg_dir, name)
+            >= sizeof(full))
+            continue;  /* path too long; skip rather than truncate */
+        group_t *g = _load_child_group_file(full);
+        if (g == NULL) continue;
+        if (identity_add_child_group(proc, g, NULL) == 0) {
+            loaded++;
+        } else {
+            group_free(g);
+            free(g);
+        }
+    }
+    closedir(d);
+    return loaded;
+}
+
 int identity_register_handlers(process_t *proc)
 {
     if (proc == NULL) return -1;
@@ -3990,6 +4661,13 @@ int identity_register_handlers(process_t *proc)
                              (handler_ptr_t)handle_partition_probe);
     process_register_handler(proc, ID_PARTITION_RESPONSE,
                              (handler_ptr_t)handle_partition_response);
+    process_register_handler(proc, ID_ROSTER_QUERY,
+                             (handler_ptr_t)handle_roster_request);
+    /* Roster-privacy opt-out (AT config AT_ROSTER_PRIVATE). Read once here,
+     * mirroring Python's _env_bool init. child_groups/child_gateways stay NULL
+     * (empty) until seeded — a leaf node then answers a roster query purely
+     * locally, identical to today. See gateway-reputation-tree.md. */
+    proc->protocol.roster_private = _roster_env_private();
     return 0;
 }
 
@@ -4004,6 +4682,20 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         return err;
 
     identity_register_handlers(proc);
+
+    /* Seed-assisted dual membership: adopt any group_child_*.cfg.json cohorts
+     * this gateway holds (C twin of Python's _load_child_groups). A leaf with
+     * no such files is unchanged. See gateway-reputation-tree.md. */
+    {
+        char cfg_dir[CFG_PATH_LEN + 1];
+        if (get_cfg_dir(cfg_dir) > 0) {
+            int adopted = identity_load_child_groups(proc, cfg_dir);
+            if (adopted > 0)
+                log_info(proc->logger,
+                         "Identity: seeded %d child group(s) from config\n",
+                         adopted);
+        }
+    }
 
     /* Phase 0→1: Acquire capabilities */
     _acquire_capabilities(proc, queues);

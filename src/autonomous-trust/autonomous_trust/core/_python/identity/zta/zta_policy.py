@@ -56,7 +56,8 @@ class ZtaPolicy(Configuration):
                  crl_path: str = '',
                  factors: Optional[List[dict]] = None,
                  operator_allow_ddil_relay: bool = True,
-                 operator_privileged_requires_full_verify: bool = True):
+                 operator_privileged_requires_full_verify: bool = True,
+                 operator_ca_bundle_path: str = ''):
         super().__init__()
         self.enabled = enabled
         self.require_at_admission = require_at_admission
@@ -82,6 +83,18 @@ class ZtaPolicy(Configuration):
         # cap at presence/communication and gate privileged origination.
         self.operator_allow_ddil_relay = operator_allow_ddil_relay
         self.operator_privileged_requires_full_verify = operator_privileged_requires_full_verify
+        # Distinct trust anchor for OPERATOR (human-attended) credentials, used
+        # by the admission gate to tell an operator credential from an ordinary
+        # device/drone credential (ethne guardian edge, D8/Q9). A credential is
+        # operator-class iff it chain-verifies against THIS bundle — a separate
+        # CA from ca_bundle_path (mirrors real deployments where PIV/CAC CAs are
+        # distinct from device CAs). Empty => no operator anchor => the node
+        # cannot confirm any peer is human (operator_bound stays False, the
+        # fail-safe). Non-forgeable: derived from the verified chain, never from
+        # the peer-advertised operator_bound/zta_issuer. C parity: the same
+        # bundle path in the C zta_policy. Additive/optional key so the C parser
+        # (and older configs) ignore it safely.
+        self.operator_ca_bundle_path = operator_ca_bundle_path
 
     @classmethod
     def defaults(cls) -> 'ZtaPolicy':
@@ -117,6 +130,17 @@ class ZtaPolicy(Configuration):
         if vt == 'mfa':
             return self._create_mfa_chain()
         return NullVerifier()
+
+    def create_operator_verifier(self) -> Optional[Verifier]:
+        """Construct the OPERATOR-anchor verifier (a chain-only X509Verifier over
+        ``operator_ca_bundle_path``), or None when no operator anchor is
+        configured. The admission gate uses it to classify a already-verified
+        credential as operator-class (ethne D8/Q9); it is deliberately separate
+        from ``create_verifier`` (the peer anchor). Mirror of the C
+        ``zta_policy_create_operator_verifier``."""
+        if not self.enabled or not self.operator_ca_bundle_path:
+            return None
+        return X509Verifier(self.operator_ca_bundle_path, self.ocsp_url, self.crl_path)
 
     def _create_mfa_chain(self) -> MfaChain:
         """Build an `MfaChain` from ``self.factors`` (AND-combined).

@@ -1,0 +1,78 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: subtree-member-roster
+byte_pinning: false
+description: |
+    Pins hierarchy-aware subtree member-roster enumeration cross-language: a
+    gateway's full membership roll, flattened across a >=3-level cohort tree,
+    is identical in Python and C.
+
+    The cohort_tree fixture wires a 3-level tree rooted at `top`:
+        top  --gateways-->  mid  --gateways-->  leaf  (+ member `alice`)
+    Each gateway's child group holds only the next level's gateway. The child
+    gateway to recurse into is NOT pinned — it is DISCOVERED by rank (the
+    highest-rank member of the child group, excluding self; here the sole
+    non-self member), so this scenario also pins that the rank-based derivation
+    matches byte-for-byte across languages. `leaf` additionally holds `alice`
+    as an ordinary member.
+
+    The trigger_subtree_roster pseudo-step drives the requestor-side breadth-
+    first enumeration on `top` (aggregate_subtree_roster over a fetch that asks
+    each gateway for its LOCAL members + child gateways). The result is the
+    flattened, deduped set of every member across all three levels:
+        {top, mid, leaf, alice}
+    surfaced as the subtree_roster observable and compared as sorted
+    participant ids (each roster uuid mapped back to its participant), so the
+    check is language-agnostic and does not depend on uuid derivation.
+
+    subtree_roster == [alice, leaf, mid, top] pins the design on BOTH sides: if
+    either enumeration, the recursive walk, or the dedup/flatten drifts, the
+    rosters diverge and the cross-language diff goes asymmetric.
+
+    Both adapters recognize the trigger_subtree_roster pseudo-function (run the
+    aggregation on the named participant) and the cohort_tree fixture (seed each
+    gateway's child group; the child gateway is discovered by rank unless the
+    optional `gateway` pin is given), and expose the flattened roster as
+    subtree_roster.
+
+participants:
+  - id: top
+    role: border_guard
+  - id: mid
+    role: border_guard
+  - id: leaf
+    role: border_guard
+  - id: alice
+    role: border_guard
+
+fixtures:
+  # A gateway tree. `nodes.<pid>.child_group` lists the members of the child
+  # cohort <pid> gateways; the deeper gateway to recurse into is discovered by
+  # rank (optional `gateway` pin overrides); `members` (leaf only) adds ordinary
+  # primary-group members. Every named id is a participant, so its identity
+  # (uuid + address) is deterministic within the run and the roster maps cleanly
+  # back to ids.
+  cohort_tree:
+    root: top
+    nodes:
+      top:
+        child_group: [mid]
+      mid:
+        child_group: [leaf]
+      leaf:
+        members: [alice]
+
+steps:
+  - id: 1
+    from: top
+    to: top
+    function: trigger_subtree_roster
+    description: |
+        Drive the requestor-side subtree-roster enumeration on top. The walk
+        asks top, then mid, then leaf (each for its local members + child
+        gateways), flattening and deduping to the full membership roll.
+
+expected_state:
+  top:
+    subtree_roster: [alice, leaf, mid, top]

@@ -1,0 +1,5 @@
+# Marp CLI config for TekFive decks in this directory.
+# Registers the shared branding theme so `theme: tekfive` resolves.
+# Run marp from this directory (doc/tekfive/) or pass -c doc/tekfive/.marprc.yml.
+themeSet:
+  - ./tekfive.css

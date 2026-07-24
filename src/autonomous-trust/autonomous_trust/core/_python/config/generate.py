@@ -180,9 +180,22 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         if not os.path.exists(cfg_file) or not preserve:
             overwrite = True
             if os.path.exists(cfg_file):
+                # An existing config defaults to being kept ([y/N] -> N); only
+                # an explicit interactive 'y' overwrites it. In silent /
+                # non-interactive mode (containers, CI, tests, closed stdin) we
+                # can't prompt, so follow that default and keep the file. This
+                # also stops the one prompt in this function that wasn't EOF-
+                # tolerant from raising EOFError/StopIteration on the non-
+                # interactive path -- every other input() here already
+                # degrades gracefully.
                 overwrite = False
-                if input('    Write %s config to %s [y/N] ' % (cfg_name, cfg_file)).lower().startswith('y'):
-                    overwrite = True
+                if not silent:
+                    try:
+                        if input('    Write %s config to %s [y/N] '
+                                 % (cfg_name, cfg_file)).lower().startswith('y'):
+                            overwrite = True
+                    except EOFError:
+                        pass  # no tty -> keep the existing file (the default)
             if overwrite:
                 cfg.to_file(cfg_file)
                 _logger.debug('%s config written to %s', cfg_name.capitalize(), cfg_file)

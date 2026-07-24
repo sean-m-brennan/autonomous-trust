@@ -71,6 +71,13 @@ typedef struct
     size_t len;
     public_identity_t to_whom;
     public_identity_t from_whom;
+    /* Sender topology rank carried on the envelope (mirrors Python's
+     * from_whom._rank riding the wire). public_identity_t drops rank, so the
+     * envelope carries it alongside; net_proc route_to_process copies it in
+     * from the wire, and the identity process captures it into peer_ranks at
+     * admission for rank-based child-gateway discovery. Default 0 (unknown).
+     * See doc/architecture/gateway-reputation-tree.md. */
+    int from_rank;
     bool encrypt;
     char return_to[PROC_NAME_LEN+1];
     /* 32-char hex (UUID4 without dashes) + NUL — must match

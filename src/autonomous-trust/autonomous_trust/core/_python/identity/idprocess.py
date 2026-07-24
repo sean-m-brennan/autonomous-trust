@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import base64
 import hashlib
 import hmac
 import os
@@ -45,7 +46,7 @@ from .history import IdentityObj
 from .protocol import IdentityProtocol
 from .zta import ZtaPolicy, ZtaStatus, ZTA_CRED_MAX
 from ..structures.dag import LinkedStep
-from ..system import CfgIds, encoding, PackageHash, now
+from ..system import CfgIds, encoding, PackageHash, now, _env_bool
 from .. import _probes
 
 
@@ -61,6 +62,73 @@ GroupTree = tuple[Group, list[LinkedStep]]
 # REPUTATION_PERSIST_THRESHOLD (rep > 0.5) via TIER_FLOORS: tier 1 floor
 # is 0.50, so any peer that's been scored above 0.5 has _tier >= 1.
 PERSIST_TIER_FLOOR = 1
+
+
+# Fan-out / cycle backstop for the recursive subtree-roster aggregation. Far
+# above any real cohort tree; bounds a malformed or looping topology so the
+# query returns a partial result rather than hanging.
+SUBTREE_ROSTER_MAX_NODES = 4096
+
+
+def aggregate_subtree_roster(top_gateway_uuid, fetch, max_nodes=SUBTREE_ROSTER_MAX_NODES):
+    """Breadth-first flatten of a gateway's subtree into a deduped, sorted
+    member roster — the requestor side of the recursive enumeration.
+
+    ``fetch(gateway_uuid) -> {'members': [...], 'child_gateways': [uuid_str],
+    'private': bool}`` is the per-gateway query: a network round-trip
+    (roster_req / roster_resp) in production, an injected stub in tests. Each
+    visited gateway contributes its local members and names the child gateways
+    to recurse into; this walks the tree, dedups members by uuid, and sorts by
+    uuid so the result is canonical across implementations.
+
+    A gateway that has opted out of disclosure (AT_ROSTER_PRIVATE) replies
+    with ``private: True`` and no members/children: it is recorded as an
+    intentional, opaque boundary, NOT as a failure — the enumeration simply
+    does not see behind it. A private TOP gateway therefore yields an empty
+    roster that is nonetheless ``complete`` (the network chose not to be
+    mapped), which the caller distinguishes from an unreachable node via the
+    boundary list.
+
+    Cycle- and fan-out-guarded. Returns ``(members, complete,
+    private_boundaries)`` where ``complete`` is False only if a fetch
+    failed/returned nothing or the node cap tripped (unreachability, NOT
+    privacy), and ``private_boundaries`` lists the gateway uuids that opted
+    out. A partial roster is returned rather than hanging or raising."""
+    by_uuid: dict[str, dict] = {}
+    private_boundaries: list[str] = []
+    complete = True
+    queued = [str(top_gateway_uuid)]
+    visited: set[str] = set()
+    while queued:
+        if len(visited) >= max_nodes:
+            complete = False
+            break
+        gateway = queued.pop(0)
+        if gateway in visited:
+            continue
+        visited.add(gateway)
+        try:
+            resp = fetch(gateway)
+        except Exception:
+            complete = False
+            continue
+        if not resp:
+            complete = False
+            continue
+        if resp.get('private'):
+            # Intentional opaque boundary — succeeded, but discloses nothing.
+            private_boundaries.append(gateway)
+            continue
+        for member in resp.get('members') or []:
+            key = str(member.get('uuid')) if isinstance(member, dict) else None
+            if key and key not in by_uuid:
+                by_uuid[key] = member
+        for child in resp.get('child_gateways') or []:
+            child = str(child)
+            if child not in visited and child not in queued:
+                queued.append(child)
+    members = [by_uuid[k] for k in sorted(by_uuid)]
+    return members, complete, private_boundaries
 
 
 class IdentityProcess(Process, metaclass=ProcMeta,
@@ -147,7 +215,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # See doc/architecture/zta-python-parity.md and zta-integration.md §11.
         self._zta_policy_cache: Optional[ZtaPolicy] = None
         self._zta_verifier_cache = None
+        self._zta_operator_verifier_cache = None  # operator-anchor verifier (D8/Q9)
         self._zta_capped: set = set()  # uuids admitted via DDIL fallback (rep-capped)
+        self._operator_verified: set = set()  # uuids whose operator credential verified
+        self._operator_session = None  # live OperatorSession, attached in P-L3
         self.choosing = False
         # P1 group-merge tracking: set when choose_group falls through to
         # self-bootstrap (mesh didn't answer in init_timeout). A late
@@ -167,6 +238,28 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # multi-group path inert and behaviour identical to today.
         self.child_groups: dict[str, Group] = {}
         self.parent_gateway: Optional[str] = None
+        # Subtree member-roster recursion targets: child-group-uuid-str ->
+        # child-gateway-node-uuid-str. The values are the gateways a full
+        # subtree-roster query recurses into (see handle_roster_request /
+        # aggregate_subtree_roster). Empty on a leaf or a gateway with no
+        # deeper gateways, in which case a roster query is purely local and
+        # behaviour is identical to today. Seeded (group_child_*.cfg.json may
+        # name a gateway) or supplied by a test/adapter fixture.
+        self.child_gateways: dict[str, str] = {}
+        # Roster-privacy opt-out (AT config option AT_ROSTER_PRIVATE). When
+        # set, this node refuses to disclose its subtree to a roster query:
+        # handle_roster_request replies with a `private` marker carrying no
+        # members and no child gateways, so the enumeration stops at this
+        # node as an intentional, opaque boundary (distinct from an
+        # unreachable/timed-out node). Applies uniformly to every requestor,
+        # including the node's own app-issued enumeration — so a private
+        # TOP gateway yields an empty roster, which is how a fully private
+        # network/subtree opts out of being mapped at all. Enforced at the
+        # DISCLOSURE boundary only; enumerate_local_members stays pure (a
+        # node always knows its own members locally). Per-node granularity
+        # (one node = one process); C reads the same env var for parity.
+        # See doc/architecture/gateway-reputation-tree.md.
+        self.roster_private: bool = _env_bool('AT_ROSTER_PRIVATE')
         # Partition-recovery state — see doc/architecture/partition-recovery.md.
         # All three maps are pure local memory; no wire egress, no
         # configuration import.  They get reset when _merge_to_mesh adopts
@@ -197,6 +290,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
         self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
         self.protocol.register_handler(IdentityProtocol.id_response, self.handle_identity_response)
+        self.protocol.register_handler(IdentityProtocol.roster_req, self.handle_roster_request)
         self.protocol.register_handler(IdentityProtocol.tier_update, self.handle_tier_update)
         self.protocol.register_handler(IdentityProtocol.partition_signal, self.handle_partition_signal)
         self.protocol.register_handler(IdentityProtocol.partition_probe, self.handle_partition_probe)
@@ -363,6 +457,144 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         except Exception as err:
             self.logger.warning('_load_child_groups failed: %s' % err)
 
+    # --- Subtree member-roster enumeration -----------------------------------
+
+    def enumerate_local_members(self):
+        """The member identities this node holds directly: itself, its primary
+        group, and every child group it gateways (from each group's address
+        map). Returns a list of ``{'uuid', 'nickname', 'address'}`` dicts,
+        deduped by uuid and sorted by uuid. Pure and local — no network, no
+        reputation. A leaf node returns itself plus its primary-group members;
+        a gateway additionally includes each child group's members. This is the
+        per-node contribution the recursive aggregation composes across the
+        cohort tree. See doc/architecture/gateway-reputation-tree.md."""
+        by_uuid: dict[str, dict] = {}
+
+        def add(uuid, address=None, nickname=None):
+            key = str(uuid)
+            if not key:
+                return
+            entry = by_uuid.get(key)
+            if entry is None:
+                by_uuid[key] = {'uuid': key, 'nickname': nickname, 'address': address}
+                return
+            if nickname and not entry.get('nickname'):
+                entry['nickname'] = nickname
+            if address and not entry.get('address'):
+                entry['address'] = address
+
+        if self.identity is not None:
+            add(self.identity.uuid, getattr(self.identity, 'address', None),
+                getattr(self.identity, 'nickname', None))
+        groups = [self.group] + list(self.child_groups.values())
+        for grp in groups:
+            if grp is None:
+                continue
+            amap = getattr(grp, '_address_map', None) or {}
+            try:
+                items = list(amap.items())
+            except AttributeError:
+                items = []
+            for uuid, address in items:
+                nick = None
+                try:
+                    ident = self.peers.find_by_uuid(uuid) if self.peers else None
+                    nick = getattr(ident, 'nickname', None) if ident else None
+                except Exception:
+                    nick = None
+                add(uuid, address, nick)
+        return [by_uuid[k] for k in sorted(by_uuid)]
+
+    def _member_rank(self, uuid):
+        """A peer's rank for child-gateway discovery: operational
+        ``effective_rank`` if present, else the static ``_rank``, else 0
+        (unknown). Mirrors the welcomer-selection rank read (idprocess ~2082)."""
+        try:
+            peer = self.peers.find_by_uuid(uuid) if self.peers else None
+        except Exception:
+            peer = None
+        if peer is None:
+            return 0
+        r = getattr(peer, 'effective_rank', None)
+        if r is None:
+            r = getattr(peer, '_rank', 0)
+        return r or 0
+
+    def _discover_child_gateway(self, group, self_uuid):
+        """The recursion target for one child group = its highest-rank member
+        (excluding self), ties broken by the lexicographically greater uuid so
+        the choice is deterministic and identical in C. Returns a uuid string
+        or None (empty group / self only)."""
+        amap = getattr(group, '_address_map', None) or {}
+        best, best_key = None, None
+        for uuid in amap:
+            u = str(uuid)
+            if self_uuid is not None and u == self_uuid:
+                continue
+            key = (self._member_rank(u), u)
+            if best_key is None or key > best_key:
+                best, best_key = u, key
+        return best
+
+    def _child_gateway_uuids(self):
+        """Node uuids of the child gateways a full-subtree roster recurses into
+        — one per gatewayed child group, **discovered by rank** (the highest-rank
+        member of the group, excluding self; see :meth:`_discover_child_gateway`).
+        An explicit ``self.child_gateways[cg]`` entry overrides discovery (tests /
+        pinned topologies). Deduped, order-stable. Empty when this node gateways
+        no deeper gateways — a roster query is then purely local. See
+        doc/architecture/gateway-reputation-tree.md."""
+        self_uuid = str(self.identity.uuid) if self.identity is not None else None
+        out = []
+        for cg_uuid, group in self.child_groups.items():
+            explicit = self.child_gateways.get(cg_uuid)
+            gw = str(explicit) if explicit else self._discover_child_gateway(group, self_uuid)
+            if gw and gw not in out:
+                out.append(gw)
+        return out
+
+    def _roster_response(self):
+        """This node's roster-query answer as a plain dict: ``{'members',
+        'child_gateways', 'private'}``. A node that opted out
+        (``self.roster_private``, AT config ``AT_ROSTER_PRIVATE``) discloses
+        nothing. Shared by :meth:`handle_roster_request` (the wire path) and
+        the requestor-side aggregation's fetch (tests / conformance), so both
+        see byte-identical content. See gateway-reputation-tree.md."""
+        if self.roster_private:
+            return {'members': [], 'child_gateways': [], 'private': True}
+        return {'members': self.enumerate_local_members(),
+                'child_gateways': self._child_gateway_uuids(),
+                'private': False}
+
+    def handle_roster_request(self, queues, message):
+        """Answer a subtree-roster query with this node's LOCAL members and the
+        child gateways to recurse into. The requestor performs the breadth-first
+        aggregation across the tree (see :func:`aggregate_subtree_roster`), so
+        this handler never blocks awaiting child responses — matching the async,
+        no-blocking-handler model of the rest of the protocol.
+
+        A node that has opted out of disclosure (``self.roster_private``,
+        AT config option ``AT_ROSTER_PRIVATE``) replies with a ``private``
+        marker carrying NO members and NO child gateways: the enumeration
+        stops here as an intentional, opaque boundary. The requestor
+        records the boundary (see :func:`aggregate_subtree_roster`) rather
+        than treating it as an unreachable/incomplete node."""
+        if message.function != IdentityProtocol.roster_req:
+            return False
+        try:
+            requestor = message.from_whom
+            out = to_json_string(self._roster_response())
+            reply = Message(self.name, IdentityProtocol.roster_resp, out,
+                            to_whom=requestor if requestor is not None
+                            else Network.broadcast,
+                            from_whom=self.identity, encrypt=False)
+            queues[CfgIds.network].put(reply, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('handle_roster_request: Network queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_roster_request')
+        return True
+
     def _record_peers(self, queues):
         self.logger.debug('Add peers')
         self._remember_activity(queues, CfgIds.peers, self.peers)
@@ -400,6 +632,101 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         with self.lock:
             self.phase = 1
 
+    def set_operator_session(self, session):
+        """Attach a live OperatorSession so (re)announces can stamp attended-now
+        (ethne D8/Q9). In-process seam: usable when the session and the identity
+        process share an address space (tests, single-process embeds). The
+        multiprocess node runs the identity process in its own subprocess where
+        this object is not reachable — carrying the live session state across
+        that boundary over IPC is a flagged follow-up; the DURABLE operator_bound
+        signal already crosses it via the persisted identity."""
+        self._operator_session = session
+
+    def _refresh_operator_attestation(self):
+        """Re-stamp self.identity.operator_attested_at from the live operator
+        session state just before a (re)announce (ethne D8/Q9 attended-now).
+
+        No-op unless an OperatorSession has been attached (set_operator_session).
+        When one is present and ACTIVE (and not due for re-verification) the node
+        stamps the current epoch time; otherwise it clears the stamp to 0 so a
+        locked/absent session reads as not-attended. operator_bound (durable) is
+        set once at operator activation (operator/activate.bind_piv_credential)
+        and is not touched here."""
+        session = getattr(self, '_operator_session', None)
+        if session is None:
+            return
+        try:
+            session.poll()
+            from ..operator.session import SessionState  # local import: operator pkg is optional
+            fresh = (session.state is SessionState.ACTIVE
+                     and not session.needs_reverify())
+            self.identity.operator_attested_at = self._now_epoch() if fresh else 0.0
+        except Exception:  # never let attestation refresh break an announce
+            self.logger.debug('operator attestation refresh skipped', exc_info=True)
+
+    def _now_epoch(self):
+        """Wall-clock epoch seconds; a seam so P-L3 unit tests can inject a
+        deterministic clock."""
+        return time.time()
+
+    def _operator_attestation(self):
+        """Build the operator-attended attestation carried in the signed
+        request_access DATA payload (ethne guardian edge, D8/Q9). It reuses
+        the node's own ZTA binding so the welcoming committee can verify the
+        operator credential and confirm the claim (see welcoming_committee /
+        _zta_admit). Emitted as a dict of only the non-default fields so a node
+        with no operator binding contributes an empty dict (backward-compatible
+        with the 2-element payload). Bytes are base64 (standard, no newline),
+        matching public_identity_to_canonical and the C payload encoder.
+
+        NOTE: this reads self.identity's CURRENT fields. operator_attested_at
+        freshness is (re)stamped by _refresh_operator_attestation (P-L3) before
+        this is called; here in P-L1 it reflects whatever activation set."""
+        me = self.identity
+        att = {}
+        if getattr(me, 'operator_bound', False):
+            att['operator_bound'] = True
+        attested = float(getattr(me, 'operator_attested_at', 0.0) or 0.0)
+        if attested:
+            att['operator_attested_at'] = attested
+        issuer = getattr(me, 'zta_issuer', '') or ''
+        if issuer:
+            att['zta_issuer'] = issuer
+        cred_hash = getattr(me, 'zta_credential_hash', b'') or b''
+        if cred_hash:
+            att['zta_credential_hash'] = base64.b64encode(bytes(cred_hash)).decode('ascii')
+        cred = getattr(me, 'zta_credential', b'') or b''
+        if cred:
+            att['zta_credential'] = base64.b64encode(bytes(cred)).decode('ascii')
+        return att
+
+    @staticmethod
+    def _apply_operator_attestation(new_id, att):
+        """Decode the request_access attestation dict onto a newly-announced
+        peer identity (inverse of _operator_attestation). Copies the ZTA
+        binding (so _zta_admit can verify a wire-delivered credential) and the
+        advertised operator claim. The advertised operator_bound is NOT trusted
+        here — _zta_admit overwrites it with the verified result (P-L2).
+        Tolerant of missing/malformed keys (defaults false/0/empty)."""
+        if not isinstance(att, dict):
+            return
+        try:
+            issuer = att.get('zta_issuer', '') or ''
+            if issuer:
+                new_id.zta_issuer = issuer
+            cred_hash_b64 = att.get('zta_credential_hash', '') or ''
+            if cred_hash_b64:
+                new_id.zta_credential_hash = base64.b64decode(cred_hash_b64)
+            cred_b64 = att.get('zta_credential', '') or ''
+            if cred_b64:
+                new_id.zta_credential = base64.b64decode(cred_b64)
+            new_id.operator_bound = bool(att.get('operator_bound', False))
+            new_id.operator_attested_at = float(att.get('operator_attested_at', 0.0) or 0.0)
+        except (ValueError, TypeError):
+            # A malformed attestation is treated as absent; identity/keys still
+            # stand on their own and normal admission proceeds.
+            pass
+
     def _broadcast_request_access(self, queues):
         """Build and broadcast the `request_access` envelope on the open
         channel. Factored out of announce_identity so the group-merge
@@ -415,7 +742,19 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # and leaves request-payload identity absent) be admitted by a Python
         # welcoming committee, and vice-versa. See welcoming_committee and
         # message._identity_from_wire.
-        msg_str = to_json_string((self.package_hash, self.capabilities.to_list()))
+        #
+        # The operator-attended attestation (ethne D8/Q9) rides as an OPTIONAL
+        # 3rd payload element. It carries the node's ZTA operator binding
+        # (credential + hash + issuer) which — unlike identity in from_* — is
+        # NOT on the envelope, so this payload is also what finally delivers a
+        # verifiable credential to the welcoming committee. Because it is in the
+        # signed DATA payload (process|function|base64(data)), it is
+        # tamper-evident under the existing message signature with no change to
+        # the signing formula and no envelope/wire-vector change. Old peers emit
+        # a 2-element payload; welcoming_committee tolerates both arities.
+        self._refresh_operator_attestation()
+        msg_str = to_json_string((self.package_hash, self.capabilities.to_list(),
+                                  self._operator_attestation()))
         message = Message(self.name, IdentityProtocol.announce,
                           msg_str, to_whom=Network.broadcast,
                           from_whom=self.identity, encrypt=False)
@@ -785,6 +1124,45 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self._zta_verifier_cache = self._zta_policy().create_verifier()
         return self._zta_verifier_cache
 
+    def _zta_operator_verifier(self):
+        """Build the OPERATOR-anchor verifier once (cached); None when no
+        operator CA bundle is configured (ethne D8/Q9). Sentinel False marks
+        "already tried, none configured" so we don't rebuild every admission."""
+        if self._zta_operator_verifier_cache is None:
+            self._zta_operator_verifier_cache = \
+                self._zta_policy().create_operator_verifier() or False
+        return self._zta_operator_verifier_cache or None
+
+    @staticmethod
+    def _mark_operator_bound(new_id, value):
+        """Set the AUTHORITATIVE operator_bound on a peer identity (defensive:
+        test stand-ins may lack the attribute)."""
+        try:
+            new_id.operator_bound = bool(value)
+        except Exception:
+            pass
+
+    def _is_operator_credential(self, new_id, cred) -> bool:
+        """True iff ``cred`` is an operator (human-attended) credential — i.e.
+        it chain-verifies against the distinct operator trust anchor (D8/Q9).
+
+        Non-forgeable: the decision comes from verifying the actual credential
+        against the operator anchor, never from the peer-advertised
+        operator_bound / zta_issuer. Fail-safe: no credential, an advertised
+        hash that does not match the actual bytes, no operator anchor
+        configured, or a non-VERIFIED operator-chain result all yield False."""
+        if not cred:
+            return False
+        advertised = getattr(new_id, 'zta_credential_hash', b'') or b''
+        if advertised and hashlib.sha256(cred).digest() != bytes(advertised):
+            # The node's advertised hash disagrees with the credential it sent —
+            # do not treat as operator-class (a claim/credential mismatch).
+            return False
+        op_verifier = self._zta_operator_verifier()
+        if op_verifier is None:
+            return False
+        return op_verifier.verify_credential(cred).status is ZtaStatus.VERIFIED
+
     def _zta_credential_replayed(self, new_id, cred) -> bool:
         """True if this exact credential is already bound to a DIFFERENT network
         identity — a harvested/replayed credential (closes ISSUES §1.5).
@@ -833,7 +1211,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         no cap), 'admit_capped' (DDIL fallback, reputation-capped), or 'reject'
         (do not propose). A no-op ('admit') when the policy is disabled or does
         not require verification at admission.
+
+        Also sets the AUTHORITATIVE operator_bound (ethne D8/Q9): the advertised
+        claim is neutralized to False on entry and set True only when the
+        credential verifies against the distinct operator trust anchor (see
+        _is_operator_credential). So a disabled policy, an unverified peer, or a
+        lying node (advertising operator_bound with a non-operator credential)
+        all end up operator_bound=False.
         """
+        # Never trust the peer-advertised operator_bound: start False and earn
+        # True only via operator-anchor verification below.
+        self._mark_operator_bound(new_id, False)
         policy = self._zta_policy()
         if not (policy.enabled and policy.require_at_admission):
             return 'admit'
@@ -892,6 +1280,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                              zta_status=rev.status.value, reason=rev.reason)
                 _probes.counter('id.welcome', 'zta_rejected')
                 return 'reject'
+            # Peer credential verified against the mission anchor. Now classify
+            # operator-class against the DISTINCT operator anchor (D8/Q9): only
+            # a credential that also chain-verifies there marks a human guardian.
+            if self._is_operator_credential(new_id, cred):
+                self._mark_operator_bound(new_id, True)
+                try:
+                    self._operator_verified.add(new_id.uuid)
+                except Exception:
+                    pass
+                self.logger.debug('ZTA: %s is operator-attended (human guardian)', nick)
             return 'admit'
         if status in (ZtaStatus.REJECTED, ZtaStatus.EXPIRED, ZtaStatus.REVOKED):
             self.logger.warning('ZTA: rejecting %s at admission: %s (%s)',
@@ -940,7 +1338,19 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 if not isinstance(new_id, Identity):
                     self.logger.warning('request_access with no sender identity; ignoring')
                     return True
-                ph, caps = from_json_string(message.obj)  # [package_hash, capabilities]
+                # [package_hash, capabilities, (optional) operator attestation].
+                # Arity-tolerant: an old peer sends a 2-element payload → no
+                # attestation. The attestation's ZTA binding (credential/hash/
+                # issuer) is NOT on the envelope, so copy it onto new_id here
+                # BEFORE _zta_admit — this is the wire delivery of the
+                # verifiable credential (see _operator_attestation). The
+                # advertised operator_bound is copied only as a claim; _zta_admit
+                # overwrites it with the verified truth (P-L2).
+                parts = from_json_string(message.obj)
+                ph, caps = parts[0], parts[1]
+                attestation = parts[2] if len(parts) > 2 and isinstance(parts[2], dict) else {}
+                if attestation:
+                    self._apply_operator_attestation(new_id, attestation)
                 if new_id == self.identity:
                     self.logger.debug('Should not have received my own announcement')
                     return

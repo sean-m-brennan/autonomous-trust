@@ -170,7 +170,13 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         grp = self.group
         if grp is not None and from_addr in grp.addresses:
             return grp
-        for child in self.child_groups.values():
+        # Snapshot the child-group values before iterating: child_groups
+        # (self.protocol.child_groups) is mutated by the message-handling
+        # thread as groups form/merge while this runs on the receive path, so
+        # iterating it live raised "dictionary changed size during iteration"
+        # (same class of bug as net_stats above). We only read each child's
+        # addresses, so a values snapshot is sufficient.
+        for child in list(self.child_groups.values()):
             try:
                 if from_addr in child.addresses:
                     return child
