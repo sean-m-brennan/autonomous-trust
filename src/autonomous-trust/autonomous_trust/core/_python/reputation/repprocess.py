@@ -270,6 +270,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # snapshot's mtime and applies the offline-gap decay at start-up.
         self._last_interaction: dict[str, float] = {}
         self._last_decay_sweep = 0.0
+        # Debug instrument (AT_REP_DUMP_SEC): throttle clock for the
+        # per-node reputation-view dump emitted from process(). See
+        # _dump_reputation_trace. 0 == last dump not yet taken.
+        self._last_rep_dump = 0.0
         self._seed_idle_from_snapshot()
         # Communication-cut-off exclusion set (peer-uuid-str). A peer whose
         # aggregate reputation is below COMM_CUTOFF is excluded from the
@@ -2344,6 +2348,99 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             except Full:
                 self.logger.error('forward_reputation: %s queue full' % req_proc)
 
+    def _dump_reputation_trace(self, present):
+        """Debug instrument: emit THIS node's own reputation view of every
+        peer it knows, as a single parseable JSON log line, so a host-side
+        harvester (examples/multi_agency/log_harvest.py) can reconstruct the
+        full observer->subject bilateral matrix by union-ing every node's
+        self-report — WITHOUT relaying scores peer-to-peer over the mesh.
+
+        Opt-in and throttled via ``AT_REP_DUMP_SEC`` (float seconds; unset or
+        <= 0 disables). Emits at INFO so it reaches container stdout/stderr
+        (``docker logs`` / ``kubectl logs``). Python reputation backend only —
+        a native-C run won't emit these (same limitation as AT_REP_TRACE).
+
+        Line shape (one complete record per line)::
+
+            AT_REPDUMP {"t":<sec>,"self":"<uuid>","view":[
+                {"s":"<subj_uuid>","nick":"<subj_nick>","con":<own-view score>,
+                 "rep":<aggregate rep or null>,"n":<n_tx>,"coop":<n>,"def":<n>,
+                 "tier":<int>,"exc":<bool>}, ... ]}
+
+        ``con`` is this node's OWN computed consensus of the subject (the
+        Trust-Dynamics value); ``n``/``coop``/``def`` are the raw CTFT inputs
+        (committed bilateral txs involving the subject, split at the 0.5
+        cooperate threshold) that produced it.
+        """
+        interval = _env_float('AT_REP_DUMP_SEC', 0.0)
+        if interval <= 0:
+            return
+        if self._last_rep_dump and present - self._last_rep_dump < interval:
+            return
+        self._last_rep_dump = present
+        try:
+            me = str(self.identity.uuid)
+            # Subjects = the known cohort plus anyone we hold a reputation or
+            # tx history for (a peer that has since left the group still has
+            # an earned score worth revealing).
+            subjects: dict[str, UUID] = {}
+            try:
+                for p in self.peers.all:
+                    subjects[str(p.uuid)] = p.uuid
+            except Exception:
+                pass
+            for uid in list(self.reputations.current.keys()):
+                subjects.setdefault(str(uid), uid)
+            view = []
+            for key, subj in subjects.items():
+                if key == me:
+                    continue
+                try:
+                    con = float(self._running_consensus(subj))
+                except Exception:
+                    con = None
+                rep = float(self.reputations[subj]) \
+                    if subj in self.reputations else None
+                n = coop = defect = 0
+                try:
+                    for tx in self.history.by_peer(subj):
+                        if tx.p1_id == subj:
+                            s = tx.p1_score
+                        elif tx.p2_id == subj:
+                            s = tx.p2_score
+                        else:
+                            continue
+                        if s is None:
+                            continue
+                        n += 1
+                        if s >= 0.5:
+                            coop += 1
+                        else:
+                            defect += 1
+                except Exception:
+                    # by_peer raises KeyError for a peer with no committed
+                    # bilateral txs yet — leave the tallies at zero.
+                    pass
+                nick = None
+                try:
+                    peer = self.peers.find_by_uuid(subj)
+                    nick = getattr(peer, 'nickname', None) if peer else None
+                except Exception:
+                    nick = None
+                view.append({
+                    's': key,
+                    'nick': nick,
+                    'con': None if con is None else round(con, 4),
+                    'rep': None if rep is None else round(rep, 4),
+                    'n': n, 'coop': coop, 'def': defect,
+                    'tier': int(self.peer_tiers.get(key, 0)),
+                    'exc': key in self._excluded,
+                })
+            rec = {'t': round(present, 3), 'self': me, 'view': view}
+            self.logger.info('AT_REPDUMP %s' % to_json_string(rec))
+        except Exception as err:
+            self.logger.error('reputation dump failed: %s' % err)
+
     def process(self, queues, signal):
         # Drain budget per iter. Each handle_reputation_request spawns
         # a short-lived thread, so processing many per iter is cheap
@@ -2403,6 +2500,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # reputation toward almost-neutral (warm-start memory
                 # fades). Throttled internally to SWEEP_INTERVAL.
                 self._decay_reputations(queues, present)
+                # Debug instrument: emit this node's own reputation view for
+                # a host-side log harvester (opt-in, throttled internally).
+                self._dump_reputation_trace(present)
                 for req in list(self.requests):
                     if present - req[0] > self.expiration:
                         self.requests.remove(req)

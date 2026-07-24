@@ -57,6 +57,13 @@ typedef struct {
     char ca_bundle_path[ZTA_PATH_LEN];             /**< X.509: path to the trusted CA bundle (PEM). */
     char ocsp_url[ZTA_PATH_LEN];                   /**< X.509: OCSP responder URL; empty disables OCSP. */
     char crl_path[ZTA_PATH_LEN];                   /**< X.509: path to the CRL; empty disables CRL checks. */
+    char operator_ca_bundle_path[ZTA_PATH_LEN];    /**< DISTINCT operator trust anchor (ethne D8/Q9):
+                                                        a credential is operator-class (has a human
+                                                        guardian) iff it chain-verifies against THIS
+                                                        bundle, separate from ca_bundle_path. Empty =>
+                                                        the node cannot confirm any peer is human
+                                                        (operator_bound stays false, fail-safe).
+                                                        Parity with Python ZtaPolicy. */
 } zta_policy_t;
 
 /**
@@ -103,6 +110,16 @@ int zta_policy_from_json(const json_t *obj, void *data_struct);
   disjoint behaviors;
 */
 int zta_policy_create_verifier(const zta_policy_t *policy, zta_verifier_t **out);
+
+/**
+ * @brief Construct the OPERATOR-anchor verifier (chain-only X.509 over
+ *        operator_ca_bundle_path), used by the admission gate to classify an
+ *        already-verified credential as operator-class (ethne D8/Q9). Returns
+ *        EZTA_INTERNAL / non-zero and leaves *out NULL when disabled or no
+ *        operator anchor is configured. Distinct from zta_policy_create_verifier
+ *        (the peer anchor); parity with Python ZtaPolicy.create_operator_verifier.
+ */
+int zta_policy_create_operator_verifier(const zta_policy_t *policy, zta_verifier_t **out);
 
 #ifdef __cplusplus
 } /* extern "C" */

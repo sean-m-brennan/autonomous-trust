@@ -75,8 +75,16 @@ def _identity_from_wire(wire):
     try:
         sig = Signature(from_sig.encode('ascii'), public_only=True)
         enc = Encryptor(from_enc.encode('ascii'), public_only=True)
+        # Topology rank rides the envelope "from_rank" (parity with C); a peer
+        # reconstructed here carries it so _member_rank sees a live value for
+        # rank-based child-gateway discovery. Absent (older peer) -> 0.
+        try:
+            from_rank = int(wire.get('from_rank', 0) or 0)
+        except (TypeError, ValueError):
+            from_rank = 0
         return Identity(from_uuid, wire.get('from_address', '') or '',
-                        wire.get('from_name', '') or '', sig, enc)
+                        wire.get('from_name', '') or '', sig, enc,
+                        _rank=from_rank)
     except (ValueError, TypeError, RuntimeError):
         return None
 
@@ -223,12 +231,18 @@ class Message(object):
             'from_address': '',
             'from_sig_hex': '',
             'from_enc_hex': '',
+            # Sender topology rank on the envelope (mirrors C net_message.c's
+            # "from_rank"). Kept in lockstep with C so the wire form stays
+            # symmetric; a receiver reads it back onto the peer for rank-based
+            # child-gateway discovery. 0 when no sender / unknown.
+            'from_rank': 0,
         }
 
         if self.from_whom is not None and isinstance(self.from_whom, Identity):
             wire['from_uuid'] = str(self.from_whom.uuid)
             wire['from_name'] = getattr(self.from_whom, 'nickname', '')
             wire['from_address'] = getattr(self.from_whom, 'address', '')
+            wire['from_rank'] = int(getattr(self.from_whom, '_rank', 0) or 0)
             # publish() already returns the HEX-encoded public key (bytes), e.g.
             # b'45cf..' (64 ASCII hex chars). Just decode to str — do NOT hex
             # encode it again: a second HexEncoder.encode() yields 128 chars,

@@ -21,8 +21,11 @@ import enum
 from .._ffi import ffi, lib
 from ..identity import PublicIdentity
 
-# Re-export Python Message for full API compatibility
-from ..._python.network.message import Message  # noqa: F401
+# Re-export Python Message for full API compatibility. _identity_from_wire is
+# re-exported too: the native backend parses envelopes through this same
+# Python Message (which calls _identity_from_wire internally), so exposing it
+# here keeps `core.network.message` import-compatible across both backends.
+from ..._python.network.message import Message, _identity_from_wire  # noqa: F401
 
 
 class RecipientType(enum.IntEnum):
