@@ -76,6 +76,28 @@ struct process_s
          * identity_register_handlers) = promote on first confirm = historical
          * behavior. Non-identity processes never read it. */
         int admission_quorum;
+        /* Subtree member-roster enumeration (identity process only). Mirrors
+         * Python IdentityProcess.child_groups / child_gateways / roster_private.
+         * child_groups: child-group-uuid string -> group_t* (a cohort this node
+         * gateways, beyond its primary `group`). child_gateways: child-group-uuid
+         * string -> child-gateway node-uuid string — an EXPLICIT override of the
+         * deeper gateway a full subtree roster recurses into (tests / pinned
+         * topologies). When absent, the child gateway is DISCOVERED by rank: the
+         * highest-rank member of the child group (excluding self), ties broken by
+         * the lexicographically greater uuid — identical to Python. Both NULL/empty
+         * on a leaf, in which case a roster query is purely local and behaviour is
+         * identical to today. peer_ranks: peer-uuid string -> rank int, the seam
+         * that feeds rank-based discovery (default 0/unknown). C peers are stored
+         * as public_identity_t, which drops rank (rank travels only on the full
+         * identity_t via history), so discovery reads this map rather than the
+         * peer table; populate it via identity_set_peer_rank. roster_private:
+         * opt-out (AT config AT_ROSTER_PRIVATE) — when true this node refuses to
+         * disclose its subtree, replying with a `private` marker. Non-identity
+         * processes never read these. See gateway-reputation-tree.md. */
+        map_t *child_groups;
+        map_t *child_gateways;
+        map_t *peer_ranks;
+        bool roster_private;
     } protocol;
 };
 

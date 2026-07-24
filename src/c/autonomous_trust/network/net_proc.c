@@ -687,6 +687,7 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
     gmsg.info.net_msg.obj = wmsg->data;
     gmsg.info.net_msg.len = wmsg->data_len;
     memcpy(&gmsg.info.net_msg.from_whom, &wmsg->from_whom, sizeof(public_identity_t));
+    gmsg.info.net_msg.from_rank = wmsg->from_rank;
     gmsg.info.net_msg.encrypt = wmsg->encrypt;
     /* Carry trace_id across the IPC hop so probes_trace_msg in the
      * downstream process stays correlated with the wire side. */
@@ -1808,6 +1809,13 @@ static int network_run(const net_transport_t *transport,
                 memcpy(&wmsg.from_whom, my_public, sizeof(public_identity_t));
             else
                 memcpy(&wmsg.from_whom, &nmsg->from_whom, sizeof(public_identity_t));
+            /* Carry our topology rank on the envelope (public_identity_t drops
+             * rank; `myself` is the full identity_t). from_whom is stamped self
+             * above, so the rank is self's — mirrors Python from_whom._rank on
+             * the wire. Fall back to whatever the sibling process set when we
+             * are relaying a non-self from_whom. */
+            wmsg.from_rank = (my_public != NULL && myself != NULL)
+                             ? myself->rank : nmsg->from_rank;
 
             bool is_broadcast = (nmsg->to_whom.address[0] == '\0');
             if (is_broadcast) {

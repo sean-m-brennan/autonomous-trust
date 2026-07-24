@@ -92,11 +92,15 @@ DEFINE_TEST(test_identity_proto_roundtrip)
     /* Verify wire fields survive the roundtrip. petname is a Zooko
        local-only name that is deliberately never serialized (see
        public_identity_sync_out/in, mirroring the Python twin's
-       sync_to_message/sync_from_message), so it comes back empty -- a
-       receiver assigns its own petname locally. */
+       sync_to_message/sync_from_message). The receiver therefore mints its
+       own local petname on receipt (derive_local_petname), seeded from the
+       nickname's local-part with a random suffix -- so it comes back
+       non-empty, prefixed "Proto Node-", and deliberately NOT equal to any
+       wire-carried name. */
     ck_assert_str_eq(pub2.address, "10.0.0.99");
     ck_assert_str_eq(pub2.nickname, "Proto Node");
-    ck_assert_str_eq(pub2.petname, "");
+    ck_assert(strncmp(pub2.petname, "Proto Node-", 11) == 0);
+    ck_assert(strcmp(pub2.petname, pub2.nickname) != 0);
     ck_assert_mem_eq(pub2.uuid, uuid, sizeof(uuid_t));
 
     free(data);

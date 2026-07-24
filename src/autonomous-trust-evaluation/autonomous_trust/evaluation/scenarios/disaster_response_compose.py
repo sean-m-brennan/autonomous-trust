@@ -124,6 +124,12 @@ def _peer_entry(peer_name: str, role, ip: str, delay_sec: int,
         env["AT_PROBES"] = "1"
         env["AT_PROBES_DIR"] = opts.probes_container_dir
     env.update(opts.extra_env)
+    # Forward the reputation-dump interval (host → container) so the
+    # log-harvest debug lens can tail each peer's own-view dumps. Off
+    # unless AT_REP_DUMP_SEC is set on the host running the generator.
+    _dump = os.environ.get("AT_REP_DUMP_SEC")
+    if _dump:
+        env["AT_REP_DUMP_SEC"] = _dump
 
     # Compromised-sensor plumbing: the envdata service reads these flags
     # to know whether it's the rogue peer and when to flip.
@@ -212,7 +218,9 @@ def _inspector_entry(opts: ComposeOptions) -> list[str]:
     # carry an access token for branded styles); MAPBOX_STYLE picks
     # the style. Only emitted when set on the host running the
     # compose generator.
-    for var in ("MAPBOX", "MAPBOX_STYLE"):
+    # AT_REP_DUMP_SEC rides along so the coordinator (also a mesh node)
+    # emits its own-view dumps for the log-harvest lens too.
+    for var in ("MAPBOX", "MAPBOX_STYLE", "AT_REP_DUMP_SEC"):
         val = os.environ.get(var)
         if val:
             safe = val.replace('"', '\\"')
@@ -389,7 +397,9 @@ def _inspector_k8s_yaml(opts: ComposeOptions, namespace: str) -> str:
     }
     # Forward Mapbox env (host → cluster) when present, identical to the
     # compose path. Skipped silently when unset.
-    for var in ("MAPBOX", "MAPBOX_STYLE"):
+    # AT_REP_DUMP_SEC rides along (host → cluster) so the log-harvest lens
+    # can tail `kubectl logs` of the coordinator + peers. Off when unset.
+    for var in ("MAPBOX", "MAPBOX_STYLE", "AT_REP_DUMP_SEC"):
         val = os.environ.get(var)
         if val:
             env[var] = val
@@ -539,6 +549,11 @@ def generate_k8s_manifests(scenario, namespace: str = "disaster-demo",
                 env["AT_PROBES"] = "1"
                 env["AT_PROBES_DIR"] = opts.probes_container_dir
             env.update(opts.extra_env)
+            # Forward the reputation-dump interval (host → cluster) for the
+            # log-harvest lens; skipped unless AT_REP_DUMP_SEC is set.
+            _dump = os.environ.get("AT_REP_DUMP_SEC")
+            if _dump:
+                env["AT_REP_DUMP_SEC"] = _dump
 
             sections.append(_K8S_DEPLOYMENT_TEMPLATE.format(
                 peer_name=name,

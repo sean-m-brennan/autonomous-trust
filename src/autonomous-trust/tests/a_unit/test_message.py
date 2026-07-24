@@ -13,6 +13,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
+import json
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -145,6 +147,34 @@ def test_message_bytes_conversion():
 def test_message_parse_sender_not_identity():
     with pytest.raises(RuntimeError, match='Sender must be an Identity'):
         Message.parse('proc|func|data', 'not_identity')
+
+
+def test_envelope_carries_from_rank():
+    """The sender's topology rank rides the envelope 'from_rank' and is
+    reconstructed onto from_whom when the peer is not yet known — the live
+    source that feeds rank-based child-gateway discovery (parity with C
+    net_message.c). See gateway-reputation-tree.md."""
+    sender = _real_identity('ranked')
+    sender._rank = 5
+    # Parse with a non-Identity sender so from_whom is rebuilt from the wire
+    # (the request_access-from-unknown-peer path), not taken from `sender`.
+    parsed = Message.parse(bytes(Message('identity', 'request_access', '{}',
+                                         from_whom=sender, encrypt=False)),
+                           None, validate=False)
+    assert isinstance(parsed.from_whom, Identity)
+    assert getattr(parsed.from_whom, '_rank', 0) == 5
+
+
+def test_envelope_from_rank_absent_defaults_zero():
+    """A wire form without 'from_rank' (older peer) reconstructs rank 0."""
+    from autonomous_trust.core.network.message import _identity_from_wire
+    sender = _real_identity('legacy')
+    wire = json.loads(bytes(Message('identity', 'request_access', '{}',
+                                    from_whom=sender, encrypt=False)))
+    wire.pop('from_rank', None)
+    rebuilt = _identity_from_wire(wire)
+    assert rebuilt is not None
+    assert getattr(rebuilt, '_rank', 0) == 0
 
 
 def _real_identity(pid):

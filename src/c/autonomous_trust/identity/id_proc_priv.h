@@ -18,8 +18,10 @@
 #define ID_PROC_PRIV_H
 
 #include <stdbool.h>
+#include <jansson.h>
 
 #include "processes/processes.h"
+#include "identity/group.h"
 
 /*@
   requires \valid(proc);
@@ -185,6 +187,61 @@ void identity_set_admission_quorum(process_t *proc, int quorum);
  *  callers can set it once at adapter init. The harness calls this at
  *  the start of every scenario; production must not call it. */
 void identity_reset_state(void);
+
+/* ---- Subtree member-roster enumeration (requestor-side + opt-out) --------
+ * The C twin of Python idprocess enumerate_local_members /
+ * handle_roster_request / aggregate_subtree_roster. See
+ * doc/architecture/gateway-reputation-tree.md. */
+
+/** This node's own membership contribution (self + primary group + each
+ *  gatewayed child group), as a NEW json array of {uuid,nickname,address}
+ *  deduped and sorted by uuid. Caller owns (json_decref). Pure/local. */
+json_t *identity_enumerate_local_members(const process_t *proc);
+
+/** This node's roster-query answer as a NEW json object {members,
+ *  child_gateways, private} (caller owns). Shared by handle_roster_request
+ *  (wire) and the aggregation's fetch (tests / conformance). */
+json_t *identity_roster_response(const process_t *proc);
+
+/** Identity-protocol handler for a roster_req: replies with this node's local
+ *  members + child gateways to recurse into, or an empty `private` marker when
+ *  the node opted out. Registered internally; exposed for test rigs. */
+bool handle_roster_request(const process_t *proc, directory_t *queues,
+                           generic_msg_t *msg);
+
+/** Per-gateway fetch for the requestor-side aggregation: returns a NEW
+ *  response object {members, child_gateways, private} for @p gateway_uuid
+ *  (the aggregator decrefs it), or NULL on failure. A network round-trip in
+ *  production; an injected stub in tests / the conformance adapter. */
+typedef json_t *(*roster_fetch_fn)(void *ctx, const char *gateway_uuid);
+
+/** Requestor-side breadth-first flatten of a gateway's subtree. See the
+ *  implementation comment for the out-parameter contract. Returns 0 on
+ *  success, -1 on bad args. */
+int identity_aggregate_subtree_roster(const char *top_uuid,
+                                      roster_fetch_fn fetch, void *ctx,
+                                      json_t **out_members, bool *out_complete,
+                                      json_t **out_private);
+
+/** Seed a child cohort this node gateways (C twin of Python child_groups
+ *  seeding). @p gateway_uuid names the deeper gateway to recurse into for that
+ *  child group (NULL for a 2-level gateway). Returns 0 on success. */
+int identity_add_child_group(process_t *proc, group_t *group,
+                             const char *gateway_uuid);
+
+/** Set a participant's roster-privacy opt-out (AT config AT_ROSTER_PRIVATE).
+ *  Per-process, mirrors Python IdentityProcess.roster_private. */
+void identity_set_roster_private(process_t *proc, bool enabled);
+
+/** Record a peer's rank for rank-based child-gateway discovery — the seam that
+ *  substitutes for the rank C peers drop (public_identity_t carries none).
+ *  Discovery reads it (default 0). Returns 0 on success. */
+int identity_set_peer_rank(process_t *proc, const char *uuid, int rank);
+
+/** Seed child groups from group_child_*.cfg.json under @p cfg_dir (C twin of
+ *  Python IdentityProcess._load_child_groups). Returns the count adopted.
+ *  Bridges the on-disk Python `Group` schema (_uuid / _address_map). */
+int identity_load_child_groups(process_t *proc, const char *cfg_dir);
 
 #define EID_NOQ 215
 DECLARE_ERROR(EID_NOQ, "Required process queue missing");

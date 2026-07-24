@@ -187,4 +187,5 @@ embedded/signing.pub
 
 /src/autonomous-trust/core*
 
-doc/tekfive/NV059/
+/doc/tekfive/NV059
+/doc/tekfive/*.pdf

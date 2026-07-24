@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import base64
 import secrets
 import time
 import uuid as uuid_mod
@@ -59,7 +60,8 @@ class Identity(InitializableConfig, AgreementVoter):
 
     def __init__(self, _uuid, address, _nickname, _signature, _encryptor, petname='',
                  _public_only=True, _rank=0, _block_impl=agreement_impl, _tier=0,
-                 zta_credential=b'', zta_issuer='', zta_credential_hash=b''):
+                 zta_credential=b'', zta_issuer='', zta_credential_hash=b'',
+                 operator_bound=False, operator_attested_at=0.0):
         Configuration.__init__(self, identity_pb2.Identity)
         AgreementVoter.__init__(self, str(_uuid), _rank, _tier=_tier)
         self.address = address  # corresponds to one address in Network config
@@ -83,6 +85,17 @@ class Identity(InitializableConfig, AgreementVoter):
         self.zta_credential = zta_credential or b''
         self.zta_issuer = zta_issuer or ''
         self.zta_credential_hash = zta_credential_hash or b''
+        # Operator-attended signal (identity.proto fields 12-13; parity with C
+        # public_identity_t). operator_bound is the durable "node has a human
+        # guardian" flag — advertised by the node but authoritative only after
+        # the receiver verifies the operator credential at admission (see
+        # idprocess._zta_admit); operator_attested_at is the live freshness
+        # stamp (epoch secs of the last verified operator session, 0 = none)
+        # the node self-stamps on (re)announce. Like the zta_* fields, these
+        # are deliberately NOT part of __eq__ (attestation must not change
+        # identity). Feeds the ethne guardian edge (ethne design D8/Q9).
+        self.operator_bound = bool(operator_bound)
+        self.operator_attested_at = float(operator_attested_at or 0.0)
         # Reputation-derived trust tier (0..4) is stored on the base
         # AgreementVoter via the __init__ call above (so PoT can read
         # voter.tier directly). The protobuf wire form
@@ -109,6 +122,10 @@ class Identity(InitializableConfig, AgreementVoter):
         return d
 
     def __eq__(self, other):
+        # NB: the zta_* binding and the operator_bound/operator_attested_at
+        # attestation are intentionally excluded — credential rotation and
+        # operator (re)attestation update those fields but must never change
+        # identity (zta-integration.md §6; ethne design D8/Q9).
         return self.__class__.__name__ == other.__class__.__name__ and self.uuid == other.uuid and \
             self.address == other.address and \
             self.nickname == other.nickname and \
@@ -203,7 +220,9 @@ class Identity(InitializableConfig, AgreementVoter):
                         self.petname, True, _rank=self._rank,
                         _block_impl=self._block_impl,
                         zta_credential=self.zta_credential, zta_issuer=self.zta_issuer,
-                        zta_credential_hash=self.zta_credential_hash)
+                        zta_credential_hash=self.zta_credential_hash,
+                        operator_bound=self.operator_bound,
+                        operator_attested_at=self.operator_attested_at)
 
     def sync_to_message(self):
         self.message.uuid = str(self.uuid).encode('utf-8')
@@ -222,6 +241,12 @@ class Identity(InitializableConfig, AgreementVoter):
             self.message.zta_issuer = self.zta_issuer
         if self.zta_credential_hash:
             self.message.zta_credential_hash = self.zta_credential_hash
+        # Operator-attended signal (proto fields 12-13). Proto3 scalars are
+        # always present, so — unlike the optional zta_* bytes/string above —
+        # these are set unconditionally (default false/0 round-trips cleanly
+        # and matches the C sync_out).
+        self.message.operator_bound = self.operator_bound
+        self.message.operator_attested_at = self.operator_attested_at
 
     def sync_from_message(self):
         self._uuid = self.message.uuid.decode('utf-8')
@@ -244,6 +269,9 @@ class Identity(InitializableConfig, AgreementVoter):
         self.zta_credential = bytes(self.message.zta_credential)
         self.zta_issuer = self.message.zta_issuer
         self.zta_credential_hash = bytes(self.message.zta_credential_hash)
+        # Operator-attended signal (proto fields 12-13); parity with C sync_in.
+        self.operator_bound = bool(self.message.operator_bound)
+        self.operator_attested_at = float(self.message.operator_attested_at)
 
     @staticmethod
     def initialize(my_name, my_nickname, my_address):
@@ -268,7 +296,7 @@ def public_identity_to_canonical(identity):
     private material. See [[project_group_key_sync]]."""
     if identity is None:
         return None
-    return {
+    d = {
         'typename': 'identity',
         'uuid': str(identity.uuid),
         'address': getattr(identity, 'address', '') or '',
@@ -279,6 +307,29 @@ def public_identity_to_canonical(identity):
         'signature': {'hex_seed': identity.signature.publish().decode('ascii')},
         'encryptor': {'hex_seed': identity.encryptor.publish().decode('ascii')},
     }
+    # Operator-attended signal + the ZTA binding that backs it. Emitted ONLY
+    # when non-default so a plain (non-operator) peer's canonical form is
+    # byte-identical to before (backward-compat for existing peer bundles). C
+    # public_identity_to_json omits the same keys under the same condition, so
+    # the cross-runtime form stays symmetric. Bytes are base64 (standard, no
+    # newline); operator_attested_at is a JSON number. Keys are inserted in a
+    # fixed order; the conformance diff compares JCS-canonical (key-sorted) so
+    # order is not load-bearing, but we keep it stable for readability.
+    if getattr(identity, 'operator_bound', False):
+        d['operator_bound'] = True
+    attested = float(getattr(identity, 'operator_attested_at', 0.0) or 0.0)
+    if attested:
+        d['operator_attested_at'] = attested
+    issuer = getattr(identity, 'zta_issuer', '') or ''
+    if issuer:
+        d['zta_issuer'] = issuer
+    cred_hash = getattr(identity, 'zta_credential_hash', b'') or b''
+    if cred_hash:
+        d['zta_credential_hash'] = base64.b64encode(bytes(cred_hash)).decode('ascii')
+    cred = getattr(identity, 'zta_credential', b'') or b''
+    if cred:
+        d['zta_credential'] = base64.b64encode(bytes(cred)).decode('ascii')
+    return d
 
 
 def public_identity_from_canonical(d):
@@ -298,8 +349,22 @@ def public_identity_from_canonical(d):
         # Zooko name. A receiver assigns its own petname locally (see
         # derive_local_petname).
         nickname = d.get('nickname', '') or ''
+        # Operator-attended signal + ZTA binding (all optional; absent =>
+        # default false/0/empty, so an old peer or a plain non-operator peer
+        # reconstructs unchanged). Bytes are base64 (mirror of to_canonical).
+        operator_bound = bool(d.get('operator_bound', False))
+        operator_attested_at = float(d.get('operator_attested_at', 0.0) or 0.0)
+        zta_issuer = d.get('zta_issuer', '') or ''
+        cred_hash_b64 = d.get('zta_credential_hash', '') or ''
+        cred_b64 = d.get('zta_credential', '') or ''
+        zta_credential_hash = base64.b64decode(cred_hash_b64) if cred_hash_b64 else b''
+        zta_credential = base64.b64decode(cred_b64) if cred_b64 else b''
         return Identity(d['uuid'], d.get('address', '') or '',
                         nickname,
-                        sig, enc, derive_local_petname(nickname))
+                        sig, enc, derive_local_petname(nickname),
+                        zta_credential=zta_credential, zta_issuer=zta_issuer,
+                        zta_credential_hash=zta_credential_hash,
+                        operator_bound=operator_bound,
+                        operator_attested_at=operator_attested_at)
     except (ValueError, TypeError, RuntimeError, KeyError):
         return None

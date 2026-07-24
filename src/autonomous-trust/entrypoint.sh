@@ -62,11 +62,25 @@ export AUTONOMOUS_TRUST_EXE="${AUTONOMOUS_TRUST_EXE:-"-m autonomous_trust"}"
 if [ $# -eq 0 ] && [ -n "${AUTONOMOUS_TRUST_ARGS:-}" ]; then
     set -- $AUTONOMOUS_TRUST_ARGS
 fi
+# Decide what to run. autonomous_trust CLI args -- flags like `--live`, or an
+# optional int `ident` -- are handed to `python3 -m autonomous_trust`. But when
+# the first arg is a real executable (the test image's
+# `/bin/bash -c "... tox ..."` CMD, or an interactive `/bin/bash` from
+# test-integration.sh's --shell/--debug), run it directly. Without this the
+# ENTRYPOINT wrapped EVERY CMD in `python3 -m autonomous_trust`, so a shell/tox
+# command landed in the `ident` positional and argparse aborted with
+# "invalid int value: '/bin/bash'". Node containers pass only flags/ident,
+# which are never resolvable command names, so they still take the python path.
+if [ $# -gt 0 ] && command -v "$1" >/dev/null 2>&1; then
+    run_cmd=("$@")
+else
+    run_cmd=(python3 $AUTONOMOUS_TRUST_EXE "$@")
+fi
 export POSTMORTEM="${POSTMORTEM:-"false"}"
 if [ "$POSTMORTEM" = "true" ]; then
     # waits for manual shutdown (will not fail); cannot exec
     # FIXME does not work as intended on error
-    python3 $AUTONOMOUS_TRUST_EXE "$@" || (trap : TERM INT; sleep infinity & wait)
+    "${run_cmd[@]}" || (trap : TERM INT; sleep infinity & wait)
 else
-    exec python3 $AUTONOMOUS_TRUST_EXE "$@"
+    exec "${run_cmd[@]}"
 fi
