@@ -43,11 +43,15 @@ class TestIdentityProtocol:
           partition_probe, partition_response)
         - peer identity backfill (id_query, id_response)
         - subtree member-roster enumeration (roster_req, roster_resp)
+        - operator-attended pull (attest_req, attest_resp), its
+          local-only trigger (attest_trigger), and the local-only
+          session round trip it needs
+          (operator_state_req, operator_state_resp)
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 19
+        assert len(values) == 24
         assert 'announce' in values

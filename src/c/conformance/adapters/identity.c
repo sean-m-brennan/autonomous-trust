@@ -77,6 +77,15 @@ typedef struct {
      * subtree_roster expected-state check. Mirrors the Python adapter's
      * _Participant.subtree_roster. */
     json_t *subtree_roster;
+    /* Results of trigger_attest_pull / trigger_attest_replay with this
+     * participant as the PULLER (ethne D8/Q9): the attested-now stamp the last
+     * ACCEPTED pull yielded, the accept/reject verdict of each pull in order,
+     * and the last answer kept so a replay can re-present it. Mirrors the
+     * Python adapter's _Participant.attest_* fields. */
+    double attest_stamp;
+    json_t *attest_accepted;    /* json array of booleans */
+    json_t *attest_last_answer;
+    double attest_clock;        /* pinned clock from operator_session */
 } ic_impl_t;
 
 /* The engine ctx is global because the messaging-hook signature has no
@@ -250,6 +259,81 @@ static json_t *_roster_fetch(void *vctx, const char *gw_uuid) {
             return identity_roster_response(impl->proc);
     }
     return NULL;  /* unreachable gateway */
+}
+
+/* Participant impl whose identity carries @p uuid, or NULL. */
+static ic_impl_t *_ic_impl_for_uuid(sce_run_ctx_t *ctx, const uuid_t uuid) {
+    for (size_t i = 0; i < ctx->participant_count; i++) {
+        ic_impl_t *impl = (ic_impl_t *)ctx->participants[i].impl;
+        if (impl == NULL || impl->full == NULL) continue;
+        if (memcmp(impl->full->uuid, uuid, sizeof(uuid_t)) == 0) return impl;
+    }
+    return NULL;
+}
+
+/* One attended-now pull, end to end (ethne D8/Q9).
+ *
+ * Drives the real API on both ends: the puller mints and records a nonce, the
+ * target answers through the shared builder, and the answer is dispatched into
+ * the puller's handler. `accepted` is decided by whether the answer CONSUMED
+ * an outstanding pull — the nonce state machine — so a replay, whose nonce is
+ * already retired, reads false and leaves the recorded stamp alone.
+ *
+ * Mirrors the Python adapter's _run_attest_pull exactly, including taking the
+ * reported stamp from the answer payload: credential verification against the
+ * operator anchor is pinned separately (operator-bound-*), which needs X.509.
+ */
+static int _ic_run_attest_pull(sce_run_ctx_t *ctx, ic_impl_t *puller,
+                               ic_impl_t *target, bool replay) {
+    json_t *answer = NULL;
+    char nonce[65] = {0};
+
+    if (replay) {
+        if (puller->attest_last_answer == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "attest replay: no prior answer to replay");
+            return -1;
+        }
+        answer = json_incref(puller->attest_last_answer);
+        const char *n = json_string_value(json_object_get(answer, "nonce"));
+        if (n != NULL) strncpy(nonce, n, sizeof(nonce) - 1);
+    } else {
+        if (identity_request_attestation(puller->proc, target->pub,
+                                         nonce, sizeof(nonce)) != 0) {
+            snprintf(ctx->err, sizeof(ctx->err), "attest pull: request failed");
+            return -1;
+        }
+        answer = identity_attest_response(target->proc, nonce);
+        if (answer == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err), "attest pull: no answer built");
+            return -1;
+        }
+        if (puller->attest_last_answer != NULL)
+            json_decref(puller->attest_last_answer);
+        puller->attest_last_answer = json_incref(answer);
+    }
+
+    bool was_outstanding = identity_attest_pull_outstanding(nonce);
+
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = (char *)"operator_attest_response";
+    memcpy(&msg.info.net_msg.from_whom, target->pub, sizeof(public_identity_t));
+    net_msg_pack_json(&msg.info.net_msg, answer);
+    run_message_handlers(puller->proc, NULL, NET_MESSAGE, &msg);
+
+    bool accepted = was_outstanding
+                    && !identity_attest_pull_outstanding(nonce);
+    if (puller->attest_accepted == NULL)
+        puller->attest_accepted = json_array();
+    json_array_append_new(puller->attest_accepted, json_boolean(accepted));
+    if (accepted)
+        puller->attest_stamp = json_real_value(
+            json_object_get(answer, "operator_attested_at"));
+
+    json_decref(answer);
+    return 0;
 }
 
 #ifdef AT_ZTA_ENABLED
@@ -586,6 +670,34 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
                          "capless-%s-%lld", cl_pid, (long long)i);
                 p->protocol.num_peers++;
             }
+        }
+    }
+
+    /* operator_session: who has a human at the console, and the pinned clock
+     * every attestation stamp is taken from (ethne D8/Q9). Mirrors the Python
+     * adapter's _apply_operator_session — but where Python attaches a stub
+     * OperatorSession for its process to poll, C has no session type at all
+     * and asserts the same two-valued state through the seam. That difference
+     * in ROUTE is the documented asymmetry; the resulting answer is identical,
+     * which is what the scenarios compare. */
+    json_t *op_sess = json_object_get(fixtures, "operator_session");
+    if (json_is_object(op_sess)) {
+        double clock = json_real_value(json_object_get(op_sess, "clock"));
+        const char *spid;
+        json_t *sval;
+        json_object_foreach(op_sess, spid, sval) {
+            if (strcmp(spid, "clock") == 0) continue;
+            sce_participant_t *part = sce_find_participant(ctx, spid);
+            if (part == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            impl->attest_clock = clock;
+            identity_set_attest_clock(impl->proc, clock);
+            const char *state = json_string_value(sval);
+            /* Only an ACTIVE session counts as attended; `locked` (a guardian
+             * exists but has stepped away) and `absent` (no console at all)
+             * both read as nobody home. */
+            bool attended = (state != NULL && strcmp(state, "active") == 0);
+            identity_set_operator_attended(impl->proc, attended, clock);
         }
     }
 
@@ -1039,6 +1151,30 @@ static int _dispatch(sce_run_ctx_t *ctx,
     }
     if (inbound->type == NET_MESSAGE
         && inbound->info.net_msg.function != NULL
+        && (strcmp(inbound->info.net_msg.function, "trigger_attest_pull") == 0
+            || strcmp(inbound->info.net_msg.function,
+                      "trigger_attest_replay") == 0)) {
+        /* Pseudo-function: one operator-attended pull, end to end. `impl` is
+         * the pull TARGET; from_whom is the puller. Runs the real API on both
+         * ends — the puller mints and records a nonce
+         * (identity_request_attestation), the target answers through the same
+         * builder the wire handler uses (identity_attest_response), and the
+         * answer is dispatched back into the puller's handler. Mirrors the
+         * Python adapter's _run_attest_pull; the routes to the attended state
+         * differ by language (seam here, main-loop round trip there) but the
+         * observables do not. */
+        bool replay = (strcmp(inbound->info.net_msg.function,
+                              "trigger_attest_replay") == 0);
+        ic_impl_t *puller =
+            _ic_impl_for_uuid(ctx, inbound->info.net_msg.from_whom.uuid);
+        if (puller == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err), "attest pull: unknown puller");
+            return -1;
+        }
+        return _ic_run_attest_pull(ctx, puller, impl, replay);
+    }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
         && strcmp(inbound->info.net_msg.function, "trigger_subtree_roster") == 0) {
         /* Pseudo-function: run the requestor-side subtree-roster walk on this
          * participant. The fetch asks each gateway for its roster response via
@@ -1171,6 +1307,55 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              "%s: has_peer %s not present (have %d peers)",
                              pid, uuid_str, (int)proc->protocol.num_peers);
                     return -1;
+                }
+            } else if (strcmp(key, "attested_now") == 0) {
+                /* The attended-now stamp this participant's last ACCEPTED pull
+                 * yielded: the pinned epoch when a human is at the target's
+                 * console, 0.0 when nobody is. A rejected pull leaves it
+                 * untouched — that is how "a replay changes nothing" is
+                 * stated. Compared exactly, which is only safe because the
+                 * scenario pins the clock (fixtures.operator_session.clock)
+                 * rather than letting a wall-clock stamp in. Symmetric with
+                 * the Python adapter's accessor. */
+                double want_stamp = json_number_value(val);
+                /* The clock is pinned, so these are the same literal on both
+                 * sides; an epsilon only guards the double round-trip through
+                 * JSON, not any real tolerance for drift. */
+                double diff = impl->attest_stamp - want_stamp;
+                if (diff < 0.0) diff = -diff;
+                if (diff > 1e-6) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: attested_now=%f, expected %f",
+                             pid, impl->attest_stamp, want_stamp);
+                    return -1;
+                }
+            } else if (strcmp(key, "attest_accepted") == 0) {
+                /* Per-pull accept/reject verdicts, in step order — the nonce
+                 * state machine: an answer counts only against the pull that
+                 * asked for it, so a re-presented answer must read false. */
+                if (!json_is_array(val)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: attest_accepted expects an array", pid);
+                    return -1;
+                }
+                json_t *got = impl->attest_accepted;
+                size_t want_n = json_array_size(val);
+                size_t got_n = got ? json_array_size(got) : 0;
+                if (want_n != got_n) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: attest_accepted has %d entries, expected %d",
+                             pid, (int)got_n, (int)want_n);
+                    return -1;
+                }
+                for (size_t ai = 0; ai < want_n; ai++) {
+                    bool w = json_is_true(json_array_get(val, ai));
+                    bool g = json_is_true(json_array_get(got, ai));
+                    if (w != g) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: attest_accepted[%d]=%d, expected %d",
+                                 pid, (int)ai, (int)g, (int)w);
+                        return -1;
+                    }
                 }
             } else if (strcmp(key, "operator_bound") == 0) {
                 /* { "<peer_ref>": bool } — the welcomer's VERIFIED

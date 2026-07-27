@@ -25,6 +25,7 @@ Exercises the three pieces of the lean membership capability:
 
 See doc/architecture/gateway-reputation-tree.md.
 """
+import logging
 import queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -147,6 +148,77 @@ def test_handle_roster_request_replies_local_members_and_child_gateways():
     # reply is addressed back to the requestor (Message wraps a lone
     # Identity in a list)
     assert reply.to_whom == [requestor]
+
+
+def test_handle_roster_request_replies_to_the_requestors_named_process():
+    """The reply must reach the process that will actually consume it.
+
+    Inbound messages are routed by Message.process alone, and the breadth-first
+    aggregation lives in the requestor's MAIN loop — its identity process
+    registers no roster_resp handler. Answering to our own process name
+    stranded every reply there, so the walk never completed on a real
+    multiprocess node while still passing single-process tests.
+    """
+    node = _node('gw', primary=_group('g0', {'a': 'addr-a'}))
+    q = queue.Queue()
+    requestor = _new_identity('requestor', '10.0.0.9')
+    msg = Message(CfgIds.identity, IdentityProtocol.roster_req,
+                  to_json_string({'requestor': str(requestor.uuid),
+                                  'requesting_process': CfgIds.main}),
+                  to_whom=None, from_whom=requestor, encrypt=False)
+    assert node.handle_roster_request({CfgIds.network: q}, msg) is True
+    assert q.get_nowait().process == CfgIds.main
+
+
+def test_handle_roster_request_honors_a_non_main_requesting_process():
+    # An inspector bridge (or any non-main requestor) gets its answer where it
+    # asked for it — the same freedom rep_req's requesting_process gives.
+    node = _node('gw', primary=_group('g0', {'a': 'addr-a'}))
+    q = queue.Queue()
+    requestor = _new_identity('requestor', '10.0.0.9')
+    msg = Message(CfgIds.identity, IdentityProtocol.roster_req,
+                  to_json_string({'requestor': str(requestor.uuid),
+                                  'requesting_process': 'inspector'}),
+                  to_whom=None, from_whom=requestor, encrypt=False)
+    assert node.handle_roster_request({CfgIds.network: q}, msg) is True
+    assert q.get_nowait().process == 'inspector'
+
+
+def test_handle_roster_request_defaults_to_main_for_an_older_requestor():
+    # A requestor that predates requesting_process still gets a usable answer:
+    # main is where the aggregation lives, so the default is the right home
+    # rather than a guess.
+    node = _node('gw', primary=_group('g0', {'a': 'addr-a'}))
+    q = queue.Queue()
+    requestor = _new_identity('requestor', '10.0.0.9')
+    msg = Message(CfgIds.identity, IdentityProtocol.roster_req,
+                  to_json_string({'requestor': str(requestor.uuid)}),
+                  to_whom=None, from_whom=requestor, encrypt=False)
+    assert node.handle_roster_request({CfgIds.network: q}, msg) is True
+    assert q.get_nowait().process == CfgIds.main
+
+
+def test_send_roster_req_names_the_main_loop_as_the_return_process():
+    """The requestor half of the contract: _send_roster_req must SAY where the
+    answer goes, or the responder can only guess."""
+    from autonomous_trust.core.automate import AutonomousTrust
+
+    class _Req:
+        proc_name = CfgIds.main
+        _send_roster_req = AutonomousTrust._send_roster_req
+
+        def __init__(self):
+            self.identity = _new_identity('me', '10.0.0.1')
+            self.logger = logging.getLogger('test.roster.req')
+            self._roster_pending = set()
+            self.subtree_roster_complete = True
+
+    q = queue.Queue()
+    gateway = _new_identity('gw', '10.0.0.2')
+    assert _Req()._send_roster_req({CfgIds.network: q}, gateway) is True
+    sent = q.get_nowait()
+    assert sent.function == IdentityProtocol.roster_req
+    assert from_json_string(sent.obj)['requesting_process'] == CfgIds.main
 
 
 def test_handle_roster_request_ignores_other_functions():

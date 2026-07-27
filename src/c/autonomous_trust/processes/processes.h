@@ -98,6 +98,20 @@ struct process_s
         map_t *child_gateways;
         map_t *peer_ranks;
         bool roster_private;
+        /* Operator-attended pull (identity process only; ethne D8/Q9).
+         * Python answers a pull by asking the main loop, which shares an
+         * address space with the console's live OperatorSession. C has no
+         * OperatorSession and no console app (no PIV/MFA in C), so it answers
+         * from these fields instead: the state SOURCE differs by language, the
+         * verb shape and the answer do not. Drive them with
+         * identity_set_operator_attended; attest_clock is an injectable clock
+         * (0 = wall clock) so conformance can pin a deterministic stamp.
+         * The outstanding-pull table lives in id_state (module state, like the
+         * other identity-only maps). Non-identity processes never read these.
+         * See doc/architecture/operator-attended.md. */
+        bool operator_attended;
+        double operator_attested_at;
+        double attest_clock;
     } protocol;
 };
 

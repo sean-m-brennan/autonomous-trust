@@ -1,0 +1,56 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: attest-pull-replay-rejected
+byte_pinning: false
+description: |
+    Operator-attended pull, replay refused (ethne guardian edge, D8/Q9). An
+    answer is good exactly once.
+
+    This is what makes the signal attended-NOW rather than attended-ever.
+    Without it, a node could capture one attested response and re-present it
+    forever to claim a human is standing by — and a guardian edge built on that
+    claim would be reading a recording. The nonce is the binding: the puller
+    mints one per pull, the answer echoes it, and the puller retires it on
+    receipt. A second presentation of the same answer matches no outstanding
+    pull and is discarded.
+
+    Step 1 pulls normally and is accepted (a human is at node's console, so the
+    stamp lands). Step 2 re-presents that identical answer, nonce and all. It
+    must be refused, and — the part that matters for a consumer — the recorded
+    stamp must be UNCHANGED rather than refreshed by the replay.
+
+    attest_accepted == [true, false] pins the nonce state machine on both
+    sides; attested_now still 1721800000.0 pins that the refusal left the
+    recorded state alone. Both runtimes implement the same check against their
+    outstanding-pull table (Python _attest_sent, C id_state.attest_sent).
+
+participants:
+  - id: consumer
+    role: border_guard
+  - id: node
+    role: border_guard
+
+fixtures:
+  operator_session:
+    clock: 1721800000.0
+    node: active
+
+steps:
+  - id: 1
+    from: consumer
+    to: node
+    function: trigger_attest_pull
+    description: consumer pulls node; the answer is bound to this pull's nonce.
+  - id: 2
+    from: consumer
+    to: node
+    function: trigger_attest_replay
+    description: |
+        The exact answer from step 1 is presented again. Its nonce is retired,
+        so it matches no outstanding pull and is refused.
+
+expected_state:
+  consumer:
+    attested_now: 1721800000.0
+    attest_accepted: [true, false]
