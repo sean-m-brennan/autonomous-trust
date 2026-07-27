@@ -55,6 +55,10 @@ def _auto(self_id, peers):
     auto = AutonomousTrust.__new__(AutonomousTrust)
     auto.identity = self_id
     auto.peers = peers
+    # A real instance gets this from Protocol.__init__ (always CfgIds.main);
+    # roster_req names it so the answer comes back to this loop rather than
+    # to the requestor's identity process, which has no handler for it.
+    auto.proc_name = CfgIds.main
     auto.logger = MagicMock()
     auto.subtree_roster = {}
     auto.subtree_roster_complete = True

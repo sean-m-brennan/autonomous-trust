@@ -158,6 +158,11 @@ class OperatorApp(App):
 
     def on_mount(self) -> None:
         self.title = 'AutonomousTrust Operator'
+        # Let the node answer attended-now pulls from our live session (ethne
+        # D8). A provider, not the session: `self.session` builds it lazily.
+        attach = getattr(self.bridge, 'attach_session_provider', None)
+        if callable(attach):
+            attach(lambda: self.session)
         if self._auto_start:
             self.bridge.start()
         self.set_interval(self._poll_interval, self._drain)

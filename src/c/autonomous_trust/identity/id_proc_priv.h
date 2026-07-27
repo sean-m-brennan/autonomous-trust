@@ -209,6 +209,50 @@ json_t *identity_roster_response(const process_t *proc);
 bool handle_roster_request(const process_t *proc, directory_t *queues,
                            generic_msg_t *msg);
 
+/** This node's attended-now answer as a NEW json object (caller owns): the
+ *  admission-path attestation shape plus the echoed @p nonce and an
+ *  always-present operator_attested_at (0 = nobody attending). Shared by
+ *  handle_attest_request (wire) and tests / conformance.
+ *  See doc/architecture/operator-attended.md. */
+json_t *identity_attest_response(const process_t *proc, const char *nonce);
+
+/** Identity-protocol handler for an attest_req: answers with a freshly stamped
+ *  attestation. Refuses an un-nonced pull (an attestation bound to nothing is
+ *  replayable). Registered internally; exposed for test rigs. */
+bool handle_attest_request(const process_t *proc, directory_t *queues,
+                           generic_msg_t *msg);
+
+/** Identity-protocol handler for an attest_resp: records the peer's stamp only
+ *  if the nonce is one we minted, the responder is the node we asked, the
+ *  operator credential re-verifies against the operator anchor, and the stamp
+ *  is inside the acceptance window. Otherwise records not-attended. */
+bool handle_attest_response(process_t *proc, directory_t *queues,
+                            generic_msg_t *msg);
+
+/** Issue an attended-now pull to @p peer, minting the binding nonce (copied
+ *  into @p out_nonce when non-NULL; needs >= 33 bytes). Returns 0 on success.
+ *  C twin of Python IdentityProcess.handle_attest_trigger. */
+int identity_request_attestation(process_t *proc, const public_identity_t *peer,
+                                 char *out_nonce, size_t nonce_len);
+
+/** True while @p nonce names a pull this node issued and has not resolved.
+ *  The observable behind "was this answer bound to a request we made?"; an
+ *  answer consumes its nonce, so a replay finds nothing outstanding.
+ *  Conformance assertion surface (Python tests `nonce in _attest_sent`). */
+bool identity_attest_pull_outstanding(const char *nonce);
+
+/** Declare whether a human is at this node's console (and optionally the stamp
+ *  to report; <= 0 stamps at answer time). C has no OperatorSession and no
+ *  console app, so attendance is asserted through this seam rather than polled
+ *  — the documented Python/C asymmetry in the state SOURCE. The verb shape and
+ *  verification rules are identical in both languages. */
+void identity_set_operator_attended(process_t *proc, bool attended,
+                                    double attested_at);
+
+/** Pin the clock used for attestation stamping and window checks (0 restores
+ *  wall clock) so conformance can compare a deterministic value. */
+void identity_set_attest_clock(process_t *proc, double epoch);
+
 /** Per-gateway fetch for the requestor-side aggregation: returns a NEW
  *  response object {members, child_gateways, private} for @p gateway_uuid
  *  (the aggregator decrefs it), or NULL on failure. A network round-trip in

@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: attest-pull-unattended
+byte_pinning: false
+description: |
+    Operator-attended pull, unattended case (ethne guardian edge, D8/Q9). The
+    node has an operator session, but it is LOCKED — the machine has a human
+    guardian, yet nobody is at the console at this moment. The pull answers 0.
+
+    The zero is explicit, not an omission. "Asked, and no human is attending"
+    is a real answer, and a consumer must be able to tell it apart from "the
+    node declined to say" or "the field was never populated" — which is exactly
+    the failure the whole signal existed in name only under before: the stamp
+    was structurally always 0 on a real multiprocess node, so a reader could
+    not distinguish an unattended node from a broken one.
+
+    Together with attest-pull-attended this pins the full session -> stamp
+    derivation: ACTIVE yields the pinned epoch, anything else yields 0. Python
+    derives it by polling the session (state is ACTIVE and not due for
+    re-verification, via operator.session.is_attended); C asserts the same
+    two-valued state through identity_set_operator_attended. Same answer, and
+    the adapters absorb the difference in route.
+
+participants:
+  - id: consumer
+    role: border_guard
+  - id: node
+    role: border_guard
+
+fixtures:
+  operator_session:
+    clock: 1721800000.0
+    node: locked
+
+steps:
+  - id: 1
+    from: consumer
+    to: node
+    function: trigger_attest_pull
+    description: |
+        consumer pulls node's attended-now state; node's session is locked, so
+        it answers an explicit zero.
+
+expected_state:
+  consumer:
+    attested_now: 0.0
+    attest_accepted: [true]

@@ -78,6 +78,22 @@ _TRIGGER_CAPS_RESYNC = 'trigger_caps_resync'
 # subtree-member-roster. The C adapter recognizes the same string.
 _TRIGGER_SUBTREE_ROSTER = 'trigger_subtree_roster'
 
+# Pseudo-function: drive one operator-attended pull (ethne D8/Q9) from the
+# step's `from` participant against its `to` participant, end to end — mint the
+# nonce, build the target's answer, verify it back at the puller. A pseudo-step
+# rather than two wire steps because the two runtimes reach the attended state
+# by DIFFERENT routes: Python's identity process must ask the main loop (which
+# alone can see the console's OperatorSession), while C reads the
+# identity_set_operator_attended seam directly. The adapter absorbs that
+# difference so the observable — what the pull yields — is compared like for
+# like. The C adapter recognizes the same string.
+_TRIGGER_ATTEST_PULL = 'trigger_attest_pull'
+
+# Pseudo-function: re-present the answer from the PREVIOUS pull. It must be
+# refused: its nonce is retired, and an attestation replayable at will would
+# say nothing about attendance NOW. The C adapter recognizes the same string.
+_TRIGGER_ATTEST_REPLAY = 'trigger_attest_replay'
+
 
 @dataclass
 class _Participant:
@@ -99,6 +115,16 @@ class _Participant:
     # flattened member uuids (strings) of its cohort subtree. Filled by the
     # engine's _dispatch; read by the subtree_roster expected-state check.
     subtree_roster: list = field(default_factory=list)
+    # Results of trigger_attest_pull / trigger_attest_replay on this
+    # participant (as the PULLER): the attested-now stamp the last accepted
+    # pull yielded, and the accept/reject verdict of every pull in order.
+    # Read by the attested_now / attest_accepted expected-state checks.
+    attest_stamp: float = 0.0
+    attest_accepted: list = field(default_factory=list)
+    # The last answer received, kept so trigger_attest_replay can re-present it.
+    attest_last_answer: dict = field(default_factory=dict)
+    # Pinned attestation clock from the operator_session fixture (0 = unset).
+    attest_clock: float = 0.0
 
     def drain_outbox(self) -> list[CapturedMessage]:
         captured: list[CapturedMessage] = []
@@ -266,6 +292,34 @@ class _Participant:
                 if actual != want:
                     raise AssertionError(
                         f'{self.id}: subtree_roster={actual}, expected {want}')
+            elif key == 'attested_now':
+                # The attended-now stamp this participant's last ACCEPTED pull
+                # yielded: a pinned epoch when a human is at the target's
+                # console, 0.0 when nobody is. A rejected pull leaves it
+                # untouched, which is how "replay changes nothing" is stated.
+                # Compared exactly — the scenario pins the clock
+                # (fixtures.operator_session.clock) precisely so a live
+                # wall-clock stamp can never enter the comparison. C mirrors
+                # via the identity_set_attest_clock seam.
+                #
+                # Scope: this pins the SESSION -> STAMP derivation and the
+                # nonce state machine. Whether the operator credential inside
+                # the answer verifies against the operator anchor is pinned
+                # separately by operator-bound-verified / -lying-rejected,
+                # which need the X.509 toolchain.
+                actual = float(self.attest_stamp)
+                if actual != float(expected):
+                    raise AssertionError(
+                        f'{self.id}: attested_now={actual}, expected {float(expected)}')
+            elif key == 'attest_accepted':
+                # Per-pull accept/reject verdicts, in step order. The nonce
+                # state machine: an answer counts only against the pull that
+                # asked for it, so a re-presented answer must read false.
+                actual = [bool(v) for v in self.attest_accepted]
+                want = [bool(v) for v in expected]
+                if actual != want:
+                    raise AssertionError(
+                        f'{self.id}: attest_accepted={actual}, expected {want}')
             elif key == 'operator_bound':
                 # The welcomer's VERIFIED operator-attended determination for
                 # each named stored peer (ethne D8/Q9). expected = {peer_ref:
@@ -610,7 +664,39 @@ class IdentityAdapter:
         # cohort_tree fixture: seed each gateway's child group + recursion
         # target so a subtree-roster enumeration spans the whole tree.
         self._apply_cohort_tree(handles, fixtures)
+        # operator_session fixture: who has a human at the console, and the
+        # pinned clock every stamp is taken from.
+        self._apply_operator_session(handles, fixtures)
         return handles
+
+    def _apply_operator_session(self, handles, fixtures) -> None:
+        """Wire the operator_session fixture (ethne D8/Q9 attended-now).
+
+        ``{<pid>: active|locked|absent, clock: <epoch>}``. Python derives
+        attendance by polling a live OperatorSession, so a stub session is
+        attached per participant; C has none and asserts the same state through
+        identity_set_operator_attended. Same fixture, same resulting answer —
+        only the route differs, which is the documented asymmetry.
+
+        The clock is pinned (never wall-clock) so the stamp is a fixed value
+        both languages can be compared on.
+        """
+        session_fix = (fixtures or {}).get('operator_session', {}) or {}
+        if not session_fix:
+            return
+        clock = float(session_fix.get('clock', 0.0) or 0.0)
+        for pid, state in session_fix.items():
+            if pid == 'clock' or pid not in handles:
+                continue
+            impl = handles[pid].impl
+            impl.attest_clock = clock
+            if clock:
+                # Deterministic stamp: bind the process clock seam to it.
+                impl.process._now_epoch = lambda c=clock: c
+            if str(state) == 'absent':
+                continue  # a node with no console attached at all
+            impl.process.set_operator_session(
+                _StubOperatorSession(str(state) == 'active'))
 
     def _load_keys(self, pid: str, keys_fix: dict[str, Any]) -> tuple[bytes, bytes]:
         """Resolve the (sig_seed, enc_seed) hex pair for a participant.
@@ -812,6 +898,55 @@ class IdentityAdapter:
     # Step driver
     # ------------------------------------------------------------------
 
+    def _run_attest_pull(self, puller: _Participant, target: _Participant,
+                         replay: bool) -> None:
+        """One attended-now pull, end to end, inside the harness.
+
+        Python's responder cannot answer alone: handle_attest_request asks the
+        main loop, because only the main loop shares an address space with the
+        console's OperatorSession. There is no main loop here, so this stands
+        in for one — deriving attendance from the stub session exactly as
+        AutonomousTrust._operator_attended does (via the shared is_attended)
+        and feeding the answer back in. What is compared afterwards is the
+        outcome, which C reaches in one hop from its seam.
+
+        On ``replay`` the previous answer is re-presented instead of a fresh
+        pull: same nonce, already retired, and it must be refused.
+        """
+        from autonomous_trust.core.operator.session import is_attended
+
+        if replay:
+            answer = dict(puller.attest_last_answer)
+            if not answer:
+                raise AssertionError('attest replay: no prior answer to replay')
+        else:
+            # Deterministic per-pull nonce (production mints a random one).
+            # Nothing compares the nonce itself — only that the state machine
+            # binds an answer to the pull that asked for it — and a fixed value
+            # keeps the two runs identical.
+            nonce = '%s-%d' % (puller.id, len(puller.attest_accepted))
+            puller.process._attest_sent[nonce] = (
+                str(target.identity.uuid),
+                (puller.attest_clock or 0.0) + 10.0)
+            # The target answers. Its own session state decides the stamp.
+            session = getattr(target.process, '_operator_session', None)
+            attended = bool(session is not None and is_attended(session))
+            epoch = target.attest_clock if attended else 0.0
+            answer = target.process._attest_payload(nonce, epoch)
+            puller.attest_last_answer = dict(answer)
+
+        before = dict(puller.process._attest_sent)
+        msg = Message(CfgIds.identity, IdentityProtocol.attest_resp,
+                      to_json_string(answer),
+                      from_whom=target.identity)
+        puller.process.handle_attest_response(puller.queues, msg)
+        # Accepted iff the answer consumed an outstanding pull; a replayed or
+        # unsolicited answer matches nothing and leaves the table untouched.
+        accepted = len(puller.process._attest_sent) < len(before)
+        puller.attest_accepted.append(accepted)
+        if accepted:
+            puller.attest_stamp = float(answer.get('operator_attested_at') or 0.0)
+
     def _dispatch(self, participant: _Participant, inbound: Any) -> list[CapturedMessage]:
         if not isinstance(inbound, Message):
             raise AssertionError(f'expected a Message, got {type(inbound).__name__}')
@@ -821,6 +956,15 @@ class IdentityAdapter:
             # dispatch). The emitted caps_query messages are captured in
             # emit_tally; caps_query_emitted asserts the per-sweep cap.
             participant.process._periodic_caps_resync(participant.queues)
+            return participant.drain_outbox()
+        if inbound.function in (_TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY):
+            # `participant` is the pull TARGET; from_whom is the puller.
+            puller = self._roster_by_uuid.get(str(inbound.from_whom.uuid))
+            if puller is None:
+                raise AssertionError('attest pull: unknown puller')
+            self._run_attest_pull(
+                puller, participant,
+                replay=(inbound.function == _TRIGGER_ATTEST_REPLAY))
             return participant.drain_outbox()
         if inbound.function == _TRIGGER_SUBTREE_ROSTER:
             # Pseudo-function: run the requestor-side subtree-roster walk on
@@ -1002,7 +1146,8 @@ class IdentityAdapter:
         else:
             obj = to_json_string(payload)
 
-        if function in (_TRIGGER_CAPS_RESYNC, _TRIGGER_SUBTREE_ROSTER):
+        if function in (_TRIGGER_CAPS_RESYNC, _TRIGGER_SUBTREE_ROSTER,
+                        _TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY):
             # Pseudo-function: no wire payload; _dispatch invokes the sweep /
             # roster enumeration directly instead of a handler.
             obj = ''
@@ -1012,6 +1157,27 @@ class IdentityAdapter:
                       to_whom=Network.broadcast if to_id == 'broadcast' else None,
                       encrypt=(function != IdentityProtocol.announce))
         return msg
+
+
+class _StubOperatorSession:
+    """Minimal stand-in for a live OperatorSession (ethne D8/Q9).
+
+    The real session is built by the console app against PIV/MFA hardware,
+    which no test rig has. What the attested-now path actually consumes is a
+    two-valued answer — ACTIVE and not due for re-verification, or not — so
+    that is what this provides. C has no session type at all and asserts the
+    same state through identity_set_operator_attended.
+    """
+
+    def __init__(self, active: bool):
+        from autonomous_trust.core.operator.session import SessionState
+        self.state = SessionState.ACTIVE if active else SessionState.LOCKED
+
+    def poll(self):
+        return self.state
+
+    def needs_reverify(self) -> bool:
+        return False
 
 
 @dataclass

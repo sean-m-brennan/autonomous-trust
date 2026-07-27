@@ -22,6 +22,7 @@ import signal
 import sys
 import time
 import logging
+import uuid as _uuid
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler, SysLogHandler
 import traceback
@@ -215,6 +216,19 @@ class AutonomousTrust(Protocol):
         self.subtree_roster_private: list[str] = []
         self._roster_visited: set[str] = set()
         self._roster_pending: set[str] = set()
+        # Operator-attended pull (ethne D8, attended-now half). The live
+        # OperatorSession is created by the console app; the main loop runs in
+        # a daemon thread of that same process (see the operator bridge), so
+        # this is the one place in the node that can actually read it. The
+        # identity subprocess asks us for the current state per pull —
+        # see _answer_operator_state / operator-attended.md.
+        self._operator_session = None
+        # Consumer side: peer-uuid -> epoch we asked at, for pulls handed to the
+        # identity process and not yet reported back. Verified answers land on
+        # `peer_attestations` (peer-uuid -> attested epoch, 0 = not attended);
+        # that dict is what ethne's guardian edge reads.
+        self._attest_sent: dict[str, float] = {}
+        self.peer_attestations: dict[str, float] = {}
         self.unhandled_messages: list[Message] = []
         self.peer_count = 0
 
@@ -321,10 +335,18 @@ class AutonomousTrust(Protocol):
 
     def _send_roster_req(self, queues, gateway):
         """Send a roster_req to one gateway Identity and mark it pending.
-        The gateway's identity process answers via handle_roster_request."""
+        The gateway's identity process answers via handle_roster_request.
+
+        The payload names the process the answer must come back to. Inbound
+        messages are routed by ``Message.process`` alone (see
+        netprocess._msg_to_queue), and the aggregation this answer feeds lives
+        here in the main loop, not in the identity process — so without naming
+        it the reply lands in the wrong process and the walk never completes.
+        Same convention as rep_req's ``requesting_process``."""
         try:
             req = Message(CfgIds.identity, IdentityProtocol.roster_req,
-                          to_json_string({'requestor': str(self.identity.uuid)}),
+                          to_json_string({'requestor': str(self.identity.uuid),
+                                          'requesting_process': self.proc_name}),
                           to_whom=gateway, from_whom=self.identity)
             queues[CfgIds.network].put(req, block=True, timeout=queue_cadence)
             self._roster_pending.add(str(gateway.uuid))
@@ -394,6 +416,114 @@ class AutonomousTrust(Protocol):
                 self.subtree_roster_complete = False
                 continue
             self._send_roster_req(queues, target)
+
+    # --- Operator-attended pull (ethne D8 guardian edge) ---------------------
+
+    def set_operator_session(self, session):
+        """Attach the live :class:`OperatorSession` so this node can answer
+        attended-now pulls.
+
+        Called by the console bridge right after it builds the node, because
+        the bridge runs ``run_forever`` in a daemon thread of the app process —
+        the main loop and the session share an address space. IdentityProcess
+        does NOT: it runs in its own subprocess, which is exactly why the
+        attended-now signal was always 0 before this. It asks us per pull
+        (operator_state_query) rather than caching a mirror that could go
+        stale. See doc/architecture/operator-attended.md."""
+        self._operator_session = session
+
+    def _operator_attended(self):
+        """Current attended state as ``(attended, epoch, have_session)``.
+
+        Attended is decided by :func:`operator.session.is_attended` — the one
+        definition, shared with IdentityProcess so the two processes cannot
+        drift apart. No session (a drone, or a node with no console attached) is
+        honestly reported as have_session=False, which the puller reads as
+        not-attended rather than as an error."""
+        session = self._operator_session
+        if session is None:
+            return False, 0.0, False
+        try:
+            from .operator.session import is_attended  # operator pkg is optional
+            return bool(is_attended(session)), time.time(), True
+        except Exception:
+            # Never let a session read break the loop; unknown reads as absent.
+            self.logger.debug('operator session poll failed', exc_info=True)
+            return False, 0.0, False
+
+    def _answer_operator_state(self, queues, message):
+        """Answer the identity subprocess's operator_state_query. Local-only
+        IPC — this never touches the network queue."""
+        attended, epoch, have_session = self._operator_attended()
+        payload = {'attended': attended, 'epoch': epoch,
+                   'have_session': have_session}
+        try:
+            reply = Message(CfgIds.identity,
+                            IdentityProtocol.operator_state_resp,
+                            to_json_string(payload),
+                            from_whom=self.identity)
+            queues[CfgIds.identity].put(reply, block=True,
+                                        timeout=queue_cadence)
+        except queue.Full:
+            # The identity process ages the pull out and answers "cannot
+            # confirm" — a dropped answer degrades to not-attended, never hangs.
+            self.logger.error('_answer_operator_state: identity queue full')
+        except Exception as err:
+            self.logger.error('_answer_operator_state: %s' % err)
+
+    def request_peer_attestation(self, queues, peer):
+        """Ask for a freshly-stamped operator attestation from one peer.
+
+        Consumer-pull by design: nothing is announced on a cadence, so an idle
+        network carries no attestation traffic. ``peer`` is an Identity or a node
+        uuid. Read the answer off ``peer_attestations[peer_uuid]`` once it
+        arrives — an epoch (a human was at that node's console when it answered)
+        or 0.0 for not-attended. Returns True if the request was handed off.
+
+        The pull itself belongs to IdentityProcess, which holds the operator
+        trust anchor: an attestation is worthless until the credential in it has
+        been re-verified, so the process that can verify is the process that
+        asks. This is the local hand-off."""
+        target = str(getattr(peer, 'uuid', peer))
+        try:
+            req = Message(CfgIds.identity, IdentityProtocol.attest_trigger,
+                          to_json_string({'target': target}),
+                          from_whom=self.identity)
+            queues[CfgIds.identity].put(req, block=True, timeout=queue_cadence)
+        except queue.Full:
+            self.logger.error('request_peer_attestation: identity queue full')
+            return False
+        self._attest_sent[target] = time.time()
+        return True
+
+    def _consume_attest_resp(self, queues, message):
+        """Record a peer's verified attended-now stamp for consumers to read.
+
+        The identity process has already matched the nonce it minted and
+        re-verified the operator credential; what reaches here is a verdict, so
+        this only files it. An unsolicited report is still dropped: nothing
+        should be able to inject an attendance claim for a peer we never asked
+        about."""
+        payload = message.obj
+        if isinstance(payload, str):
+            payload = from_json_string(payload)
+        if not isinstance(payload, dict):
+            return
+        peer_uuid = payload.get('peer')
+        if not peer_uuid:
+            return
+        peer_uuid = str(peer_uuid)
+        if peer_uuid not in self._attest_sent:
+            _probes.counter('proc.automate', 'attest_unsolicited')
+            self.logger.warning('_consume_attest_resp: unsolicited report for %s'
+                                % peer_uuid)
+            return
+        del self._attest_sent[peer_uuid]
+        attested = payload.get('operator_attested_at') or 0.0
+        try:
+            self.peer_attestations[peer_uuid] = float(attested)
+        except (TypeError, ValueError):
+            self.peer_attestations[peer_uuid] = 0.0
 
     def autonomous_loop(self, results: dict[str, AsyncResult], queues: dict[str, QueueType],
                         signals: dict[str, QueueType]) -> None:
@@ -795,6 +925,16 @@ class AutonomousTrust(Protocol):
                     # merge this gateway's members and fan out roster_req to
                     # any child gateways it named (see _consume_roster_resp).
                     self._consume_roster_resp(queues, message)
+                elif (isinstance(message, Message)
+                      and message.function == IdentityProtocol.operator_state_req):
+                    # Local-only IPC: the identity subprocess cannot see the
+                    # console's OperatorSession, but this loop shares its
+                    # address space. Answer with the current attended state.
+                    self._answer_operator_state(queues, message)
+                elif (isinstance(message, Message)
+                      and message.function == IdentityProtocol.attest_resp):
+                    # A peer answered one of our attended-now pulls.
+                    self._consume_attest_resp(queues, message)
                 else:
                     self.unhandled_messages.append(message)
         return True

@@ -234,6 +234,29 @@ Partial/failure semantics: a gateway that is unreachable / never answers leaves
 the roster **incomplete** (returned partial, never hangs). This is distinct
 from privacy (below).
 
+### Reply routing — the requestor names its return process
+
+`roster_req` carries **`requesting_process`** and the gateway addresses its
+`roster_resp` to that process, defaulting to `main`. This is `rep_req`'s
+convention (`requesting_process`, netprocess `_msg_to_queue`).
+
+It is load-bearing, not decoration. Inbound messages are routed **only** by
+`Message.process` / `net_msg.process` — `return_to` is a local field used by the
+ping path and is not a wire routing hint. The BFS aggregation that consumes a
+`roster_resp` lives in the requestor's **main loop**
+(`AutonomousTrust._consume_roster_resp`); its identity process registers no
+`roster_resp` handler.
+
+An earlier version replied to the responder's *own* process name (`identity`),
+which delivered every answer into the requestor's identity process, where it
+was never handled and accumulated in `self.messages` indefinitely. Because both
+sides sit in one address space in unit tests and the conformance scenario
+drives the walk through a local fetch, the enumeration looked correct
+everywhere it was tested and would simply never complete on a real
+multiprocess node. Fixed 2026-07-27, with the routing pinned in
+`test_subtree_roster.py` and `subtree_roster_test.c` on both sides of the
+contract (requestor names it, responder honors it, absent ⇒ `main`).
+
 ## Child-gateway discovery — by rank
 
 A gateway's roster response names the **child gateways** to recurse into. Those

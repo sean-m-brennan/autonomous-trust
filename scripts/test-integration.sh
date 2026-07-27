@@ -225,10 +225,21 @@ run_test() {
 
     if $SHELL_MODE; then
         info "Dropping into test container shell ..."
-        docker run -it "${run_args[@]}" "${IMAGE_NAME}-test" /bin/bash
-    else
-        info "Running test suite ..."
-        docker run -it "${run_args[@]}" "${IMAGE_NAME}-test"
+        # Interactive diagnostic session: the shell's status says nothing about
+        # the tests, so it never fails the run.
+        docker run -it "${run_args[@]}" "${IMAGE_NAME}-test" /bin/bash || true
+        info "Test container shell closed"
+        return 0
+    fi
+
+    info "Running test suite ..."
+    local rc=0
+    docker run -it "${run_args[@]}" "${IMAGE_NAME}-test" || rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        error "Integration tests FAILED (test container exit $rc)"
+        error "Full test output: $AT_DIR/tests/tox.log"
+        return "$rc"
     fi
 
     info "Integration test complete"
