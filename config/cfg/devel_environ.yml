@@ -18,7 +18,11 @@ dependencies:
 
   # lint / test
   - pylint
-  - tox
+  # >=4.58: earlier 4.x (4.56 shipped in the test image) rolls back a failed
+  # package-env registration without clearing the config, then reports the
+  # bogus "duplicate configuration definition for .pkg" instead of the real
+  # failure -- and which of the two it reports depends on dict hash order.
+  - tox>=4.58
   - pytest
   - pytest-asyncio
   - pytest-cov

@@ -66,10 +66,12 @@ class OperatorNodeBridge:
     def __init__(self,
                  node_factory: Optional[Callable[[], Any]] = None,
                  control_queue: Optional[Queue] = None,
-                 feedback_queue: Optional[Queue] = None):
+                 feedback_queue: Optional[Queue] = None,
+                 session_provider: Optional[Callable[[], Any]] = None):
         self._node_factory = node_factory or _default_node_factory
         self.control_queue: Queue = control_queue or Queue()
         self.feedback_queue: Queue = feedback_queue or Queue()
+        self._session_provider = session_provider
         self._thread: Optional[threading.Thread] = None
         self._node: Any = None
         self._started = False
@@ -88,9 +90,35 @@ class OperatorNodeBridge:
             target=self._run, name='operator-node', daemon=True)
         self._thread.start()
 
+    def attach_session_provider(self, provider: Callable[[], Any]) -> None:
+        """Supply ``callable() -> OperatorSession``, resolved when the node
+        starts. A provider (not the session itself) because the UI builds its
+        session lazily, often after the bridge exists."""
+        self._session_provider = provider
+
+    def _attach_session(self, node: Any) -> None:
+        """Hand the live session to the node's main loop so it can answer
+        attended-now pulls (ethne D8).
+
+        This is the whole reason the signal works on a real node: the main loop
+        runs in OUR thread, sharing the app's address space with the session,
+        while the node's identity worker is a separate subprocess that cannot
+        see it. Best-effort — a node build without the seam, or no session
+        configured, simply leaves attended-now unreported."""
+        if self._session_provider is None:
+            return
+        attach = getattr(node, 'set_operator_session', None)
+        if not callable(attach):
+            return
+        try:
+            attach(self._session_provider())
+        except Exception:
+            pass
+
     def _run(self) -> None:
         try:
             self._node = self._node_factory()
+            self._attach_session(self._node)
             self._node.run_forever(q_in=self.control_queue,
                                    q_out=self.feedback_queue)
         except BaseException as err:  # surfaced to the UI, never silent

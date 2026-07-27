@@ -119,6 +119,38 @@ class IdentityProtocol(Protocol):
     #                    "signature"}
     partition_probe = 'group_partition_probe'
     partition_response = 'group_partition_response'
+    # Operator-attended pull (ethne D8 guardian edge, attended-now half).
+    # A consumer asks a node whether a human is at its console RIGHT NOW;
+    # the node answers with a freshly stamped, independently verifiable
+    # attestation (the same payload shape the admission path carries, so the
+    # receiver re-verifies the real operator credential rather than trusting
+    # an asserted bool). Pull-on-demand by design: there is no periodic
+    # keepalive re-announce, so an idle network carries no attestation
+    # traffic at all. The requestor's nonce is echoed back and is
+    # load-bearing — without it a signed attestation could be replayed
+    # forever, which would defeat the whole point of attended-NOW.
+    # See doc/architecture/operator-attended.md.
+    attest_req = 'operator_attest_query'  # msg.obj <- json {'nonce': hex_str}
+    attest_resp = 'operator_attest_response'  # msg.obj <- json {'nonce': hex_str, ...attestation}
+    # Local-only IPC (no wire egress). A consumer (ethne's guardian edge, the
+    # console, an app) asks the main loop to pull a peer; the main loop hands
+    # the request to IdentityProcess, which owns the pull end to end. It must:
+    # the answer is only worth anything if the operator credential in it is
+    # re-verified against the DISTINCT operator trust anchor, and that anchor
+    # lives in the identity process alongside the admission gate. So identity
+    # mints the nonce, emits the query, verifies the reply, and reports the
+    # verified stamp back for consumers to read.
+    attest_trigger = 'operator_attest_trigger'  # msg.obj <- json {'target': uuid_str}
+    # Local-only IPC (no wire egress). The live OperatorSession lives in the
+    # console app's address space, which the node's MAIN LOOP shares (the
+    # bridge runs run_forever in a daemon thread) — but IdentityProcess runs
+    # in its own subprocess and cannot see it. So on an inbound attest_req
+    # the identity process asks the main loop for the current session state
+    # and answers the pull once it replies. A round trip per pull, rather
+    # than a cached mirror: nothing is stored, so nothing can go stale.
+    # See doc/architecture/operator-attended.md.
+    operator_state_req = 'operator_state_query'  # msg.obj <- '' (identity asks main)
+    operator_state_resp = 'operator_state_response'  # msg.obj <- json {'attended', 'epoch', 'have_session'}
 
 
 if __name__ == '__main__':
