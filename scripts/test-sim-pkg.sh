@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # ******************
 #  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #

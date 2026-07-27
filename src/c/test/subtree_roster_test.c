@@ -64,6 +64,10 @@ static size_t g_resp_count;
 static json_t *g_last_members;       /* owned; freed in _end */
 static json_t *g_last_child_gws;     /* owned; freed in _end */
 static bool g_last_private;
+/* Which process the reply was addressed to. Inbound messages route by
+ * net_msg.process alone, so this decides whether the answer ever reaches the
+ * aggregation waiting for it. */
+static char g_last_resp_proc[PROC_NAME_LEN + 1];
 
 static int _capture_hook(const char *key, const message_type_t type,
                          generic_msg_t *msg, bool blocking)
@@ -74,6 +78,8 @@ static int _capture_hook(const char *key, const message_type_t type,
     if (strcmp(msg->info.net_msg.function, ID_ROSTER_RESPONSE_FN) != 0)
         return 0;
     g_resp_count++;
+    snprintf(g_last_resp_proc, sizeof(g_last_resp_proc), "%s",
+             msg->info.net_msg.process);
     if (msg->info.net_msg.obj == NULL)
         return 0;
     json_error_t err;
@@ -221,6 +227,7 @@ static void _begin(void)
     g_last_members = NULL;
     g_last_child_gws = NULL;
     g_last_private = false;
+    g_last_resp_proc[0] = '\0';
     messaging_set_test_hook(_capture_hook);
 }
 
@@ -280,6 +287,23 @@ static void _dispatch_roster_req(process_t *proc)
     strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
     msg.info.net_msg.function = ID_ROSTER_QUERY_FN;
     json_t *payload = json_object();
+    ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, payload));
+    json_decref(payload);
+    run_message_handlers(proc, NULL, NET_MESSAGE, &msg);
+}
+
+/* As above, but the requestor NAMES the process its answer must come back to
+ * (rep_req's requesting_process convention). */
+static void _dispatch_roster_req_from(process_t *proc, const char *req_proc)
+{
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = ID_ROSTER_QUERY_FN;
+    json_t *payload = json_object();
+    if (req_proc != NULL)
+        json_object_set_new(payload, "requesting_process",
+                            json_string(req_proc));
     ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, payload));
     json_decref(payload);
     run_message_handlers(proc, NULL, NET_MESSAGE, &msg);
@@ -584,6 +608,53 @@ DEFINE_TEST(test_discover_gateway_excludes_self)
 }
 END_TEST_DEFINITION()
 
+/* The reply must reach the process that will actually consume it. Inbound
+ * messages route by net_msg.process alone, and the aggregation lives in the
+ * requestor's MAIN loop — its identity process registers no roster_resp
+ * handler. Answering to our own process name stranded every reply there. */
+DEFINE_TEST(test_handle_roster_request_replies_to_requestors_named_process)
+{
+    _begin();
+    identity_t *me = _mk_identity("gw", "10.0.0.1");
+    process_t *proc = _mk_process(me);
+
+    _dispatch_roster_req_from(proc, "main");
+
+    ck_assert_int_eq((int)g_resp_count, 1);
+    ck_assert_str_eq(g_last_resp_proc, "main");
+    _end();
+}
+
+/* An inspector bridge (or any non-main requestor) gets its answer where it
+ * asked for it — the same freedom rep_req's requesting_process gives. */
+DEFINE_TEST(test_handle_roster_request_honors_non_main_requesting_process)
+{
+    _begin();
+    identity_t *me = _mk_identity("gw", "10.0.0.1");
+    process_t *proc = _mk_process(me);
+
+    _dispatch_roster_req_from(proc, "inspector");
+
+    ck_assert_int_eq((int)g_resp_count, 1);
+    ck_assert_str_eq(g_last_resp_proc, "inspector");
+    _end();
+}
+
+/* A requestor that predates requesting_process still gets a usable answer:
+ * main is where the aggregation lives, so the default is the right home. */
+DEFINE_TEST(test_handle_roster_request_defaults_to_main)
+{
+    _begin();
+    identity_t *me = _mk_identity("gw", "10.0.0.1");
+    process_t *proc = _mk_process(me);
+
+    _dispatch_roster_req_from(proc, NULL);
+
+    ck_assert_int_eq((int)g_resp_count, 1);
+    ck_assert_str_eq(g_last_resp_proc, "main");
+    _end();
+}
+
 RUN_TESTS(SubtreeRoster,
           test_enumerate_leaf_is_self_only,
           test_enumerate_gateway_includes_child_group,
@@ -597,4 +668,7 @@ RUN_TESTS(SubtreeRoster,
           test_discover_gateway_prefers_higher_rank,
           test_discover_gateway_uuid_tiebreak,
           test_explicit_gateway_overrides_discovery,
-          test_discover_gateway_excludes_self)
+          test_discover_gateway_excludes_self,
+          test_handle_roster_request_replies_to_requestors_named_process,
+          test_handle_roster_request_honors_non_main_requesting_process,
+          test_handle_roster_request_defaults_to_main)

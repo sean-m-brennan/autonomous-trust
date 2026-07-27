@@ -20,9 +20,11 @@ import hmac
 import os
 import sys
 import time
+import uuid
 from datetime import datetime
 from queue import Empty, Full
 import threading
+from types import SimpleNamespace
 from typing import Optional, Union
 
 from nacl.encoding import HexEncoder
@@ -219,6 +221,18 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self._zta_capped: set = set()  # uuids admitted via DDIL fallback (rep-capped)
         self._operator_verified: set = set()  # uuids whose operator credential verified
         self._operator_session = None  # live OperatorSession, attached in P-L3
+        # Attended-now pulls awaiting the main loop's session answer:
+        # nonce -> (requestor Identity, req_proc, deadline). This process runs
+        # in its own subprocess and cannot see the console's OperatorSession, so
+        # each pull costs one local round trip to the main loop (which shares
+        # the console's address space). Nothing is cached, so nothing goes
+        # stale; a pull the main loop never answers ages out and is answered
+        # honestly as not-attended. See doc/architecture/operator-attended.md.
+        self._attest_pending: dict[str, tuple] = {}
+        # Pulls we SENT and have not yet resolved: nonce -> (peer_uuid,
+        # deadline). Keyed by nonce because the nonce is the only thing that
+        # makes a returned stamp attributable to a request we actually made.
+        self._attest_sent: dict[str, tuple] = {}
         self.choosing = False
         # P1 group-merge tracking: set when choose_group falls through to
         # self-bootstrap (mesh didn't answer in init_timeout). A late
@@ -291,6 +305,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
         self.protocol.register_handler(IdentityProtocol.id_response, self.handle_identity_response)
         self.protocol.register_handler(IdentityProtocol.roster_req, self.handle_roster_request)
+        self.protocol.register_handler(IdentityProtocol.attest_req, self.handle_attest_request)
+        self.protocol.register_handler(IdentityProtocol.attest_resp, self.handle_attest_response)
+        self.protocol.register_handler(IdentityProtocol.attest_trigger, self.handle_attest_trigger)
+        self.protocol.register_handler(IdentityProtocol.operator_state_resp,
+                                       self.handle_operator_state_response)
         self.protocol.register_handler(IdentityProtocol.tier_update, self.handle_tier_update)
         self.protocol.register_handler(IdentityProtocol.partition_signal, self.handle_partition_signal)
         self.protocol.register_handler(IdentityProtocol.partition_probe, self.handle_partition_probe)
@@ -578,13 +597,32 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         marker carrying NO members and NO child gateways: the enumeration
         stops here as an intentional, opaque boundary. The requestor
         records the boundary (see :func:`aggregate_subtree_roster`) rather
-        than treating it as an unreachable/incomplete node."""
+        than treating it as an unreachable/incomplete node.
+
+        The reply is addressed to the process the requestor named in
+        ``requesting_process`` (rep_req's convention), defaulting to the main
+        loop. That default is the answer's real home: inbound messages route by
+        ``Message.process`` alone, and the breadth-first aggregation that
+        consumes a roster_resp lives in the main loop
+        (AutonomousTrust._consume_roster_resp), not in this process. Replying
+        to our own process name would deliver every answer to the requestor's
+        identity process, which has no handler for it — the walk would then
+        never complete on a real multiprocess node while still looking correct
+        in a single-process test."""
         if message.function != IdentityProtocol.roster_req:
             return False
         try:
             requestor = message.from_whom
+            payload = message.obj
+            if isinstance(payload, str) and payload:
+                try:
+                    payload = from_json_string(payload)
+                except Exception:
+                    payload = {}
+            req_proc = (payload.get('requesting_process')
+                        if isinstance(payload, dict) else None) or CfgIds.main
             out = to_json_string(self._roster_response())
-            reply = Message(self.name, IdentityProtocol.roster_resp, out,
+            reply = Message(req_proc, IdentityProtocol.roster_resp, out,
                             to_whom=requestor if requestor is not None
                             else Network.broadcast,
                             from_whom=self.identity, encrypt=False)
@@ -594,6 +632,313 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         except Exception as err:
             self.report_exception(err, 'handle_roster_request')
         return True
+
+    # --- Operator-attended pull, responder side (ethne D8/Q9) ----------------
+
+    #: how long a pull waits for the main loop's session answer before it is
+    #: answered honestly as not-attended. Short: the round trip is two local
+    #: queue hops, and a puller waiting on attendance wants a prompt "no" far
+    #: more than a slow "yes".
+    _ATTEST_ROUND_TRIP_SEC = 2.0
+
+    def handle_attest_request(self, queues, message):
+        """Take in an attended-now pull and start the local session round trip.
+
+        Cannot answer inline: the live OperatorSession belongs to the console
+        app's address space, which the node's MAIN LOOP shares but this
+        subprocess does not. So record the pull and ask the main loop
+        (operator_state_query); handle_operator_state_response finishes it.
+        Returns without blocking, matching handle_roster_request's contract —
+        no handler in this protocol may wait on another process.
+
+        Where an in-process session HAS been attached (tests, single-process
+        embeds) the answer still goes through the same path, so both
+        deployments exercise one code path."""
+        if message.function != IdentityProtocol.attest_req:
+            return False
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            if not isinstance(payload, dict):
+                payload = {}
+            nonce = payload.get('nonce')
+            if not nonce:
+                # Unnonced pulls are refused, not answered: an attestation with
+                # nothing binding it to a request is replayable forever, which
+                # is precisely what attended-NOW must not permit.
+                self.logger.warning('handle_attest_request: missing nonce')
+                return True
+            deadline = self._now_epoch() + self._ATTEST_ROUND_TRIP_SEC
+            self._attest_pending[str(nonce)] = (message.from_whom, deadline)
+            query = Message(CfgIds.main, IdentityProtocol.operator_state_req,
+                            '', from_whom=self.identity)
+            queues[CfgIds.main].put(query, block=True, timeout=self.q_cadence)
+        except Full:
+            # The main loop is backlogged; the pull ages out on the next tick
+            # and gets answered as not-attended rather than left hanging.
+            self.logger.error('handle_attest_request: main queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_attest_request')
+        return True
+
+    def _attest_payload(self, nonce, attested_at):
+        """The attestation to return for one pull: the same shape the admission
+        path carries (so the receiver can re-verify the real operator
+        credential), with attended-now overridden by what the session just said
+        and the requestor's nonce echoed back to bind it to this request."""
+        payload = dict(self._operator_attestation())
+        payload['nonce'] = str(nonce)
+        if attested_at:
+            payload['operator_attested_at'] = float(attested_at)
+        else:
+            # Explicit 0 rather than an omitted key: "asked, and no human is
+            # attending" is a real answer and must not read as "didn't say".
+            payload['operator_attested_at'] = 0.0
+        return payload
+
+    def _answer_attest_pull(self, queues, nonce, requestor, attested_at):
+        """Send one attest_resp back to the puller.
+
+        Addressed to the puller's IDENTITY process (self.name, as
+        handle_roster_request does), because that is the only process holding
+        the operator trust anchor the answer has to be checked against — an
+        unverified attestation is not evidence of anything."""
+        try:
+            reply = Message(self.name, IdentityProtocol.attest_resp,
+                            to_json_string(self._attest_payload(nonce,
+                                                                attested_at)),
+                            to_whom=requestor if requestor is not None
+                            else Network.broadcast,
+                            from_whom=self.identity, encrypt=False)
+            queues[CfgIds.network].put(reply, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('_answer_attest_pull: Network queue full')
+        except Exception as err:
+            self.report_exception(err, '_answer_attest_pull')
+
+    def handle_operator_state_response(self, queues, message):
+        """The main loop reported the console session state — answer every pull
+        waiting on it.
+
+        One answer serves all pulls in flight: they all asked the same question
+        of the same session at effectively the same instant. `have_session`
+        False (a drone, or no console attached) is a legitimate answer meaning
+        not-attended, not an error."""
+        if message.function != IdentityProtocol.operator_state_resp:
+            return False
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            if not isinstance(payload, dict):
+                payload = {}
+            attended = bool(payload.get('attended'))
+            epoch = float(payload.get('epoch') or 0.0) if attended else 0.0
+            pending, self._attest_pending = self._attest_pending, {}
+            for nonce, (requestor, _deadline) in pending.items():
+                self._answer_attest_pull(queues, nonce, requestor, epoch)
+        except Exception as err:
+            self.report_exception(err, 'handle_operator_state_response')
+        return True
+
+    def _expire_attest_pending(self, queues):
+        """Answer pulls the main loop never got to, as not-attended.
+
+        The roster convention applied to attendance: report a bounded, honest
+        partial rather than hang. Silence is what a puller cannot act on — a
+        node whose console never answers is, for the purpose of the guardian
+        edge, unattended."""
+        if not self._attest_pending:
+            return
+        tick = self._now_epoch()
+        expired = [nonce for nonce, (_r, deadline)
+                   in self._attest_pending.items() if deadline <= tick]
+        for nonce in expired:
+            requestor, _deadline = self._attest_pending.pop(nonce)
+            self.logger.debug('attest pull %s timed out; answering unattended'
+                              % nonce)
+            self._answer_attest_pull(queues, nonce, requestor, 0.0)
+
+    # --- Operator-attended pull, requestor side (ethne D8/Q9) ----------------
+
+    #: how long a pull we SENT stays open before the consumer is told
+    #: not-attended. Generous next to the responder's own round trip: this
+    #: spans the network. An unreachable node is unattended for the guardian
+    #: edge's purposes, so silence still resolves to an answer.
+    _ATTEST_REPLY_WAIT_SEC = 10.0
+
+    #: how far a peer's claimed stamp may sit from our clock and still be
+    #: believed. The nonce already stops replay of an old attestation; this
+    #: catches a peer asserting attendance at an implausible time (a
+    #: far-future stamp meant to stay "fresh", or an ancient one).
+    _ATTEST_WINDOW_SEC = 120.0
+
+    def handle_attest_trigger(self, queues, message):
+        """A consumer asked us to pull one peer's attended-now state.
+
+        The pull lives here rather than in the main loop because the answer is
+        only worth having once the operator credential inside it has been
+        re-verified against the operator trust anchor — and this process owns
+        that anchor (see _is_operator_credential, shared with admission).
+
+        Local-only verb: never leaves this node. Mints the nonce that binds
+        the peer's answer to this request."""
+        if message.function != IdentityProtocol.attest_trigger:
+            return False
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            if not isinstance(payload, dict):
+                payload = {}
+            target_uuid = payload.get('target')
+            if not target_uuid:
+                return True
+            target = None
+            try:
+                target = self.peers.find_by_uuid(str(target_uuid)) if self.peers else None
+            except Exception:
+                target = None
+            if target is None:
+                # Unroutable peer: answer the consumer now rather than let it
+                # wait on a pull that can never be sent.
+                self._report_attestation(queues, str(target_uuid), 0.0, False)
+                return True
+            nonce = uuid.uuid4().hex
+            req = Message(self.name, IdentityProtocol.attest_req,
+                          to_json_string({'nonce': nonce}),
+                          to_whom=target, from_whom=self.identity,
+                          encrypt=False)
+            queues[CfgIds.network].put(req, block=True, timeout=self.q_cadence)
+            self._attest_sent[nonce] = (
+                str(target.uuid),
+                self._now_epoch() + self._ATTEST_REPLY_WAIT_SEC)
+        except Full:
+            self.logger.error('handle_attest_trigger: Network queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_attest_trigger')
+        return True
+
+    def _report_attestation(self, queues, peer_uuid, attested_at, verified):
+        """Hand a finished pull back to the main loop for consumers to read
+        (AutonomousTrust.peer_attestations, which is what ethne's guardian
+        edge reads). Local-only; carries the VERIFIED verdict, never the
+        peer's assertion."""
+        try:
+            out = Message(CfgIds.main, IdentityProtocol.attest_resp,
+                          to_json_string({'peer': str(peer_uuid),
+                                          'operator_attested_at': float(attested_at or 0.0),
+                                          'operator_verified': bool(verified)}),
+                          from_whom=self.identity)
+            queues[CfgIds.main].put(out, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('_report_attestation: main queue full')
+        except Exception as err:
+            self.report_exception(err, '_report_attestation')
+
+    def handle_attest_response(self, queues, message):
+        """Verify one peer's attended-now answer and record it.
+
+        Nothing the peer asserts is taken at face value. Three independent
+        checks must pass before a stamp counts:
+
+        1. the nonce must be one WE minted and have not yet retired — this is
+           what makes the signal attended-*now* instead of a recording that
+           can be replayed indefinitely;
+        2. the operator credential in the payload must chain-verify against the
+           distinct operator anchor, with its hash recomputed from the actual
+           bytes (:meth:`_is_operator_credential`, the same gate admission
+           uses) — a node cannot talk its way into operator class;
+        3. the stamp must fall inside a bounded window around our clock.
+
+        A failure of any check records not-attended rather than raising: the
+        guardian edge needs a decision, and "unverified" and "unattended" are
+        the same answer to it."""
+        if message.function != IdentityProtocol.attest_resp:
+            return False
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            if not isinstance(payload, dict):
+                payload = {}
+            nonce = payload.get('nonce')
+            sent = self._attest_sent.pop(str(nonce), None) if nonce else None
+            if sent is None:
+                # Unsolicited, replayed, or an answer to a pull already retired.
+                self.logger.warning('handle_attest_response: unknown nonce %r'
+                                    % nonce)
+                return True
+            peer_uuid, _deadline = sent
+            responder_uuid = str(getattr(message.from_whom, 'uuid', '') or '')
+            if responder_uuid and responder_uuid != peer_uuid:
+                # Right nonce, wrong node — someone else answering for the
+                # peer we asked.
+                self.logger.warning('handle_attest_response: nonce %s answered '
+                                    'by %s, expected %s'
+                                    % (nonce, responder_uuid, peer_uuid))
+                self._report_attestation(queues, peer_uuid, 0.0, False)
+                return True
+            claimed = 0.0
+            try:
+                claimed = float(payload.get('operator_attested_at') or 0.0)
+            except (TypeError, ValueError):
+                claimed = 0.0
+            # Re-verify the credential against the operator anchor. Decode the
+            # attestation onto a scratch identity so the existing gate sees the
+            # same shape it sees at admission.
+            scratch = SimpleNamespace(zta_issuer='', zta_credential=b'',
+                                      zta_credential_hash=b'',
+                                      operator_bound=False,
+                                      operator_attested_at=0.0)
+            self._apply_operator_attestation(scratch, payload)
+            cred = getattr(scratch, 'zta_credential', b'') or b''
+            verified = self._is_operator_credential(scratch, cred)
+            tick = self._now_epoch()
+            in_window = bool(claimed) and abs(tick - claimed) <= self._ATTEST_WINDOW_SEC
+            if claimed and not in_window:
+                self.logger.warning('handle_attest_response: stamp %r outside '
+                                    'acceptance window (now %r)' % (claimed, tick))
+            attested = claimed if (verified and in_window) else 0.0
+            self._store_peer_attestation(peer_uuid, attested, verified)
+            self._report_attestation(queues, peer_uuid, attested, verified)
+        except Exception as err:
+            self.report_exception(err, 'handle_attest_response')
+        return True
+
+    def _store_peer_attestation(self, peer_uuid, attested_at, verified):
+        """Write the verified result onto our stored peer identity, so a
+        consumer reading the local peer mirror sees a live value instead of
+        the stamp captured once at admission (the gap this closes)."""
+        try:
+            peer = self.peers.find_by_uuid(str(peer_uuid)) if self.peers else None
+        except Exception:
+            peer = None
+        if peer is None:
+            return
+        try:
+            peer.operator_attested_at = float(attested_at or 0.0)
+        except Exception:
+            pass
+        if verified:
+            # Durable half: a peer that just proved an operator credential IS
+            # operator-bound, even if nobody is at the console right now.
+            self._mark_operator_bound(peer, True)
+
+    def _expire_attest_sent(self, queues):
+        """Resolve pulls the peer never answered as not-attended, so a
+        consumer is never left waiting on a node that has gone quiet."""
+        if not self._attest_sent:
+            return
+        tick = self._now_epoch()
+        expired = [nonce for nonce, (_u, deadline)
+                   in self._attest_sent.items() if deadline <= tick]
+        for nonce in expired:
+            peer_uuid, _deadline = self._attest_sent.pop(nonce)
+            self.logger.debug('attest pull to %s unanswered; reporting '
+                              'unattended' % peer_uuid)
+            self._report_attestation(queues, peer_uuid, 0.0, False)
 
     def _record_peers(self, queues):
         self.logger.debug('Add peers')
@@ -635,11 +980,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     def set_operator_session(self, session):
         """Attach a live OperatorSession so (re)announces can stamp attended-now
         (ethne D8/Q9). In-process seam: usable when the session and the identity
-        process share an address space (tests, single-process embeds). The
-        multiprocess node runs the identity process in its own subprocess where
-        this object is not reachable — carrying the live session state across
-        that boundary over IPC is a flagged follow-up; the DURABLE operator_bound
-        signal already crosses it via the persisted identity."""
+        process share an address space (tests, single-process embeds).
+
+        The multiprocess node runs this process in its own subprocess where the
+        console's session object is not reachable. That case is served the other
+        way round: an inbound attest_req triggers a local round trip to the main
+        loop, which DOES share the console's address space (see
+        handle_attest_request / AutonomousTrust.set_operator_session). The
+        DURABLE operator_bound signal crosses the boundary on its own, via the
+        persisted identity."""
         self._operator_session = session
 
     def _refresh_operator_attestation(self):
@@ -647,19 +996,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         session state just before a (re)announce (ethne D8/Q9 attended-now).
 
         No-op unless an OperatorSession has been attached (set_operator_session).
-        When one is present and ACTIVE (and not due for re-verification) the node
-        stamps the current epoch time; otherwise it clears the stamp to 0 so a
-        locked/absent session reads as not-attended. operator_bound (durable) is
-        set once at operator activation (operator/activate.bind_piv_credential)
-        and is not touched here."""
+        When one is present and attended the node stamps the current epoch time;
+        otherwise it clears the stamp to 0 so a locked/absent session reads as
+        not-attended. operator_bound (durable) is set once at operator activation
+        (operator/activate.bind_piv_credential) and is not touched here."""
         session = getattr(self, '_operator_session', None)
         if session is None:
             return
         try:
-            session.poll()
-            from ..operator.session import SessionState  # local import: operator pkg is optional
-            fresh = (session.state is SessionState.ACTIVE
-                     and not session.needs_reverify())
+            from ..operator.session import is_attended  # operator pkg is optional
+            fresh = is_attended(session)
             self.identity.operator_attested_at = self._now_epoch() if fresh else 0.0
         except Exception:  # never let attestation refresh break an announce
             self.logger.debug('operator attestation refresh skipped', exc_info=True)
@@ -2720,6 +3066,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     # hold an address for but no Identity (cold/late joiner;
                     # see _periodic_identity_resync + layer 3 memory).
                     self._periodic_identity_resync(queues)
+
+                # Every iteration, not interval-gated: an attended-now pull
+                # must not outlive its deadline, in either direction — a pull
+                # we owe an answer to, or one we are waiting on. Cheap — both
+                # are no-ops unless a pull is in flight.
+                self._expire_attest_pending(queues)
+                self._expire_attest_sent(queues)
 
                 untouched = []
                 while len(self.messages) > 0:

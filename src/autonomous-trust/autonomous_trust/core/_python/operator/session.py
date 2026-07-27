@@ -191,3 +191,19 @@ class OperatorSession:
         self._last_step_up = t
         self._last_activity = t
         self._last_verify = t
+
+
+def is_attended(session) -> bool:
+    """Whether a human is at the console NOW: the session polls ACTIVE and is
+    not overdue for re-verification.
+
+    The single definition of "attended" for the operator-attended signal (ethne
+    D8/Q9). Two places must agree on it and they live in different processes —
+    IdentityProcess (in-process seam, and the pull responder) and the node's
+    main loop (which is what can actually see the console's session on a real
+    multiprocess node) — so the rule lives here rather than being restated in
+    each. See doc/architecture/operator-attended.md.
+    """
+    session.poll()  # re-evaluates lock conditions (card removal, idle)
+    return (session.state is SessionState.ACTIVE
+            and not session.needs_reverify())

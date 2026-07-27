@@ -104,6 +104,22 @@ static char ID_PARTITION_RESPONSE[] = "group_partition_response";
  * doc/architecture/gateway-reputation-tree.md. */
 static char ID_ROSTER_QUERY[]    = "subtree_roster_query";
 static char ID_ROSTER_RESPONSE[] = "subtree_roster_response";
+/* Operator-attended pull (ethne D8/Q9 guardian edge, attended-now half). A
+ * consumer asks a node whether a human is at its console RIGHT NOW; the node
+ * answers with a freshly stamped attestation the requestor re-verifies against
+ * the operator trust anchor. Pull-on-demand: no periodic re-announce, so an
+ * idle network carries no attestation traffic. The echoed nonce is
+ * load-bearing — without it an attestation replays forever, defeating
+ * attended-NOW. Mirrors Python IdentityProtocol.attest_req / attest_resp.
+ *
+ * ASYMMETRY (deliberate): Python derives "attended" from a live
+ * OperatorSession reached via a local round trip to the main loop. C has no
+ * OperatorSession and no console app (no PIV/MFA in C), so it answers from
+ * proc->protocol.operator_attended, set through identity_set_operator_attended.
+ * The state SOURCE differs; the verb shape, the payload and the verification
+ * rules are identical. See doc/architecture/operator-attended.md. */
+static char ID_ATTEST_QUERY[]    = "operator_attest_query";
+static char ID_ATTEST_RESPONSE[] = "operator_attest_response";
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -141,6 +157,12 @@ static struct {
      * lowercased uuid string; values are array_t* of cap-name strings.
      * Conformance assertion surface via identity_get_peer_caps_count. */
     map_t peer_caps_map;
+    /* Outstanding operator-attended pulls WE issued: nonce string -> peer uuid
+     * string (heap-dup'd). The nonce is the only thing that makes a returned
+     * attestation attributable to a request this node actually made; a reply
+     * whose nonce is absent here is unsolicited or replayed and is dropped.
+     * Mirrors Python IdentityProcess._attest_sent. */
+    map_t attest_sent;
     /* Optional per-capability descriptors learned from the descriptor form
      * of caps_response (PIV_MFA_OPERATOR_ACCESS_PLAN.md §3.5). Keyed by
      * capability NAME (not peer uuid — a descriptor is a property of the
@@ -205,6 +227,7 @@ static void _ensure_id_init(void)
         map_init(&id_state.vote_collection);
         map_init(&id_state.own_caps_by_proc);
         map_init(&id_state.peer_caps_map);
+        map_init(&id_state.attest_sent);
         map_init(&id_state.peer_cap_descriptors_map);
         map_init(&id_state.peer_tiers);
         map_init(&id_state.partition_probe_cooldown);
@@ -4399,7 +4422,14 @@ json_t *identity_roster_response(const process_t *proc)
 /* Handler: answer a subtree-roster query with this node's LOCAL members and
  * the child gateways to recurse into (the requestor does the BFS). A node
  * that opted out replies with an empty `private` marker. Never blocks
- * awaiting children — matches the async, no-blocking-handler model. */
+ * awaiting children — matches the async, no-blocking-handler model.
+ *
+ * The reply goes to the process the requestor named in `requesting_process`
+ * (rep_req's convention), defaulting to the main loop. Inbound messages are
+ * routed by net_msg.process alone (net_proc routes on wmsg->process), and the
+ * aggregation that consumes a roster_resp lives in the requestor's MAIN loop —
+ * not in its identity process, which registers no handler for it. Answering to
+ * our own process name would strand every reply there. */
 bool handle_roster_request(const process_t *proc, directory_t *queues,
                            generic_msg_t *msg)
 {
@@ -4407,12 +4437,30 @@ bool handle_roster_request(const process_t *proc, directory_t *queues,
     if (proc == NULL || msg == NULL) return true;
     net_msg_t *nmsg = &msg->info.net_msg;
 
+    char req_proc[PROC_NAME_LEN + 1];
+    strncpy(req_proc, "main", PROC_NAME_LEN);
+    req_proc[PROC_NAME_LEN] = '\0';
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL) {
+        const char *named = json_string_value(
+            json_object_get(payload, "requesting_process"));
+        if (named != NULL && named[0] != '\0') {
+            strncpy(req_proc, named, PROC_NAME_LEN);
+            req_proc[PROC_NAME_LEN] = '\0';
+        }
+        json_decref(payload);
+    }
+
     json_t *out = identity_roster_response(proc);
     if (out == NULL) return true;
 
     generic_msg_t reply = {0};
     reply.type = NET_MESSAGE;
-    strncpy(reply.info.net_msg.process, "identity", PROC_NAME_LEN);
+    /* snprintf, not strncpy: req_proc is itself PROC_NAME_LEN long, so a
+     * PROC_NAME_LEN-bounded strncpy trips -Wstringop-truncation. This always
+     * NUL-terminates and cannot truncate (req_proc is the shorter buffer). */
+    snprintf(reply.info.net_msg.process, sizeof(reply.info.net_msg.process),
+             "%s", req_proc);
     reply.info.net_msg.function = ID_ROSTER_RESPONSE;
     reply.info.net_msg.encrypt = false;
     /* Route the reply back to the requestor (mirrors rep_proc grant). */
@@ -4422,6 +4470,287 @@ bool handle_roster_request(const process_t *proc, directory_t *queues,
     net_msg_pack_json(&reply.info.net_msg, out);
     json_decref(out);
     messaging_send("network", NET_MESSAGE, &reply, false);
+    return true;
+}
+
+/****************************
+ * Operator-attended pull (ethne D8/Q9)
+ ****************************/
+
+/* How far a peer's claimed stamp may sit from our clock and still be believed.
+ * The nonce already stops replay of an old attestation; this catches a peer
+ * asserting attendance at an implausible time. Matches Python's
+ * IdentityProcess._ATTEST_WINDOW_SEC. */
+#define ATTEST_WINDOW_SEC 120.0
+
+/* This node's clock for attestation purposes: the injected value when one is
+ * pinned (conformance needs a deterministic stamp), else wall clock. */
+static double _attest_now(const process_t *proc)
+{
+    if (proc != NULL && proc->protocol.attest_clock > 0.0)
+        return proc->protocol.attest_clock;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+        return 0.0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* This node's own published identity, copied into @p out. C keeps the node
+ * identity in the process config rather than on the protocol struct (see
+ * _build_announcement), so the pull path reads it the same way. Returns 0 on
+ * success. */
+static int _own_public_identity(const process_t *proc, public_identity_t *out)
+{
+    if (proc == NULL || out == NULL) return -1;
+    data_t *id_dat = NULL;
+    char id_key[] = "identity";
+    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
+        return -1;
+    config_t *id_cfg = NULL;
+    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0
+        || id_cfg == NULL || id_cfg->data_struct == NULL)
+        return -1;
+    public_identity_t *pub = NULL;
+    if (identity_publish((const identity_t *)id_cfg->data_struct, &pub) != 0
+        || pub == NULL)
+        return -1;
+    memcpy(out, pub, sizeof(public_identity_t));
+    smrt_deref(pub);
+    return 0;
+}
+
+/* This node's attested-now answer as a NEW json object (caller owns): the same
+ * attestation shape the admission path carries — so the receiver re-verifies a
+ * real operator credential rather than trusting an asserted bool — plus the
+ * echoed nonce and an attended-now stamp that is ALWAYS present.
+ *
+ * The stamp is written even when zero: "asked, and no human is attending" is a
+ * real answer and must not read as "declined to say".
+ *
+ * Shared by handle_attest_request (the wire path) and the conformance adapter,
+ * so both see identical content — mirroring identity_roster_response. */
+json_t *identity_attest_response(const process_t *proc, const char *nonce)
+{
+    if (proc == NULL) return NULL;
+    public_identity_t self;
+    memset(&self, 0, sizeof(self));
+    (void)_own_public_identity(proc, &self);   /* no identity yet -> bare answer */
+    json_t *out = _operator_attestation_json(&self);
+    if (out == NULL) return NULL;
+    double attested = 0.0;
+    if (proc->protocol.operator_attended)
+        attested = (proc->protocol.operator_attested_at > 0.0)
+                   ? proc->protocol.operator_attested_at : _attest_now(proc);
+    json_object_set_new(out, "operator_attested_at", json_real(attested));
+    if (nonce != NULL)
+        json_object_set_new(out, "nonce", json_string(nonce));
+    return out;
+}
+
+/* Handler: answer an attended-now pull.
+ *
+ * Unlike Python this answers inline, because C holds the attended state
+ * directly (no OperatorSession to consult across a process boundary). An
+ * un-nonced pull is REFUSED rather than answered: an attestation bound to
+ * nothing is replayable forever, which is precisely what attended-NOW must not
+ * permit. */
+bool handle_attest_request(const process_t *proc, directory_t *queues,
+                           generic_msg_t *msg)
+{
+    (void)queues;
+    if (proc == NULL || msg == NULL) return true;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    const char *nonce = json_string_value(json_object_get(payload, "nonce"));
+    if (nonce == NULL || nonce[0] == '\0') {
+        json_decref(payload);
+        return true;
+    }
+
+    json_t *out = identity_attest_response(proc, nonce);
+    json_decref(payload);
+    if (out == NULL) return true;
+
+    generic_msg_t reply = {0};
+    reply.type = NET_MESSAGE;
+    /* To the puller's IDENTITY process: only it holds the operator trust
+     * anchor the answer has to be checked against (as roster replies do). */
+    strncpy(reply.info.net_msg.process, "identity", PROC_NAME_LEN);
+    reply.info.net_msg.function = ID_ATTEST_RESPONSE;
+    reply.info.net_msg.encrypt = false;
+    memcpy(&reply.info.net_msg.to_whom, &nmsg->from_whom,
+           sizeof(public_identity_t));
+    strncpy(reply.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    net_msg_pack_json(&reply.info.net_msg, out);
+    json_decref(out);
+    messaging_send("network", NET_MESSAGE, &reply, false);
+    return true;
+}
+
+/* Issue an attended-now pull to one peer, minting the nonce that binds the
+ * answer to this request. Returns 0 on success and, when @p out_nonce is
+ * non-NULL, copies the minted nonce into it (at least 33 bytes).
+ * C twin of Python handle_attest_trigger. */
+int identity_request_attestation(process_t *proc, const public_identity_t *peer,
+                                 char *out_nonce, size_t nonce_len)
+{
+    if (proc == NULL || peer == NULL) return -1;
+    _ensure_id_init();
+
+    /* A random nonce: a reused one would make a captured answer valid for the
+     * next pull too. */
+    uint8_t raw[16];
+    randombytes_buf(raw, sizeof(raw));
+    char nonce[2 * sizeof(raw) + 1];
+    for (size_t i = 0; i < sizeof(raw); i++)
+        snprintf(nonce + 2 * i, 3, "%02x", raw[i]);
+
+    char peer_uuid[UUID_STR_LEN + 1] = {0};
+    uuid_unparse_lower(peer->uuid, peer_uuid);
+
+    data_t *dat = string_data(peer_uuid, strlen(peer_uuid) + 1);
+    if (dat == NULL) return -1;
+    if (map_set(&id_state.attest_sent, nonce, dat) != 0)
+        return -1;
+
+    json_t *body = json_object();
+    if (body == NULL) return -1;
+    json_object_set_new(body, "nonce", json_string(nonce));
+
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    strncpy(req.info.net_msg.process, "identity", PROC_NAME_LEN);
+    req.info.net_msg.function = ID_ATTEST_QUERY;
+    req.info.net_msg.encrypt = false;
+    memcpy(&req.info.net_msg.to_whom, peer, sizeof(public_identity_t));
+    (void)_own_public_identity(proc, &req.info.net_msg.from_whom);
+    strncpy(req.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    net_msg_pack_json(&req.info.net_msg, body);
+    json_decref(body);
+    messaging_send("network", NET_MESSAGE, &req, false);
+
+    if (out_nonce != NULL && nonce_len > 0) {
+        strncpy(out_nonce, nonce, nonce_len - 1);
+        out_nonce[nonce_len - 1] = '\0';
+    }
+    return 0;
+}
+
+/* True while @p nonce names a pull this node issued and has not yet resolved.
+ * The observable behind "was this answer bound to a request we made?" — an
+ * answer consumes its nonce, so a replay of it finds nothing outstanding.
+ * Mirrors testing `nonce in _attest_sent` in Python. */
+bool identity_attest_pull_outstanding(const char *nonce)
+{
+    if (nonce == NULL) return false;
+    _ensure_id_init();
+    data_t *sent = NULL;
+    return (map_get(&id_state.attest_sent, (map_key_t)nonce, &sent) == 0
+            && sent != NULL);
+}
+
+/* Handler: verify one peer's attended-now answer and record it.
+ *
+ * Nothing the peer asserts is taken at face value. Three checks must pass:
+ *   1. the nonce must be one WE minted and have not yet retired — this is what
+ *      makes the signal attended-NOW rather than a recording replayable at
+ *      will;
+ *   2. the operator credential must chain-verify against the distinct operator
+ *      anchor with its hash recomputed from the actual bytes
+ *      (_is_operator_credential, the same gate admission uses);
+ *   3. the stamp must fall inside a bounded window around our clock.
+ * Any failure records not-attended rather than erroring: the guardian edge
+ * needs a decision, and "unverified" and "unattended" are the same answer.
+ * Mirror of Python handle_attest_response. */
+bool handle_attest_response(process_t *proc, directory_t *queues,
+                            generic_msg_t *msg)
+{
+    (void)queues;
+    if (proc == NULL || msg == NULL) return true;
+    _ensure_id_init();
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    const char *nonce = json_string_value(json_object_get(payload, "nonce"));
+    if (nonce == NULL || nonce[0] == '\0') {
+        json_decref(payload);
+        return true;
+    }
+
+    /* (1) nonce must match an outstanding pull; retire it either way. */
+    data_t *sent = NULL;
+    if (map_get(&id_state.attest_sent, (map_key_t)nonce, &sent) != 0
+        || sent == NULL) {
+        json_decref(payload);
+        return true;   /* unsolicited or replayed */
+    }
+    string_t expect_uuid = NULL;
+    data_string_ptr(sent, &expect_uuid);
+    char expected[UUID_STR_LEN + 1] = {0};
+    if (expect_uuid != NULL)
+        strncpy(expected, expect_uuid, UUID_STR_LEN);
+    map_remove(&id_state.attest_sent, (map_key_t)nonce);
+
+    char responder[UUID_STR_LEN + 1] = {0};
+    uuid_unparse_lower(nmsg->from_whom.uuid, responder);
+    if (expected[0] != '\0' && strcmp(expected, responder) != 0) {
+        /* Right nonce, wrong node — someone answering for the peer we asked. */
+        json_decref(payload);
+        return true;
+    }
+
+    /* (2) re-verify the credential. Decode the attestation onto a scratch
+     * identity so the gate sees the same shape it sees at admission. */
+    public_identity_t scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    _apply_operator_attestation_json(payload, &scratch);
+    bool verified = false;
+#ifdef AT_ZTA_ENABLED
+    {
+        zta_policy_t *zta_policy = NULL;
+        data_t *zta_dat = NULL;
+        char zta_key[] = "zta_policy";
+        if (map_get(proc->configs, zta_key, &zta_dat) == 0 && zta_dat != NULL)
+            data_object_ptr(zta_dat, (void **)&zta_policy);
+        if (zta_policy != NULL)
+            verified = _is_operator_credential(zta_policy,
+                                               scratch.zta_credential,
+                                               scratch.zta_credential_len,
+                                               scratch.zta_credential_hash);
+    }
+#endif
+
+    /* (3) the stamp must be plausible against our clock. */
+    double claimed = json_real_value(json_object_get(payload,
+                                                     "operator_attested_at"));
+    double now = _attest_now(proc);
+    double delta = claimed - now;
+    if (delta < 0.0) delta = -delta;
+    bool in_window = (claimed > 0.0) && (delta <= ATTEST_WINDOW_SEC);
+    double attested = (verified && in_window) ? claimed : 0.0;
+
+    /* Write the verified result onto the stored peer, so a consumer reading
+     * the local peer mirror sees a LIVE value instead of the stamp captured
+     * once at admission — the gap this closes. */
+    peers_write_lock(proc);
+    for (int i = 0; i < proc->protocol.num_peers; i++) {
+        if (uuid_compare(proc->protocol.peers[i].uuid, nmsg->from_whom.uuid) != 0)
+            continue;
+        proc->protocol.peers[i].operator_attested_at = attested;
+        if (verified)
+            /* Durable half: a peer that just proved an operator credential IS
+             * operator-bound, even with nobody at the console right now. */
+            proc->protocol.peers[i].operator_bound = true;
+        break;
+    }
+    peers_write_unlock(proc);
+
+    json_decref(payload);
     return true;
 }
 
@@ -4525,6 +4854,26 @@ void identity_set_roster_private(process_t *proc, bool enabled)
 {
     if (proc == NULL) return;
     proc->protocol.roster_private = enabled;
+}
+
+/* Declare whether a human is at this node's console, and (optionally) the
+ * stamp to report. C's substitute for polling a live OperatorSession: there is
+ * no console app and no PIV/MFA in C, so attendance is asserted through this
+ * seam rather than derived. Pass attested_at <= 0 to stamp at answer time. */
+void identity_set_operator_attended(process_t *proc, bool attended,
+                                    double attested_at)
+{
+    if (proc == NULL) return;
+    proc->protocol.operator_attended = attended;
+    proc->protocol.operator_attested_at = attended ? attested_at : 0.0;
+}
+
+/* Pin the clock used for attestation stamping and window checks (0 restores
+ * wall clock), so cross-language conformance can compare a fixed value. */
+void identity_set_attest_clock(process_t *proc, double epoch)
+{
+    if (proc == NULL) return;
+    proc->protocol.attest_clock = epoch;
 }
 
 /* Record a peer's rank for rank-based child-gateway discovery — the seam that
@@ -4663,6 +5012,10 @@ int identity_register_handlers(process_t *proc)
                              (handler_ptr_t)handle_partition_response);
     process_register_handler(proc, ID_ROSTER_QUERY,
                              (handler_ptr_t)handle_roster_request);
+    process_register_handler(proc, ID_ATTEST_QUERY,
+                             (handler_ptr_t)handle_attest_request);
+    process_register_handler(proc, ID_ATTEST_RESPONSE,
+                             (handler_ptr_t)handle_attest_response);
     /* Roster-privacy opt-out (AT config AT_ROSTER_PRIVATE). Read once here,
      * mirroring Python's _env_bool init. child_groups/child_gateways stay NULL
      * (empty) until seeded — a leaf node then answers a roster query purely

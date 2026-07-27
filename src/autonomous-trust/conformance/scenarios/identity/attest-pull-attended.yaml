@@ -1,0 +1,60 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: attest-pull-attended
+byte_pinning: false
+description: |
+    Operator-attended pull, attended case (ethne guardian edge, D8/Q9). A
+    consumer asks a node whether a human is at its console RIGHT NOW; the node
+    has an ACTIVE operator session, so it answers with a live stamp.
+
+    This is the "attended-now" half of the signal, as distinct from the durable
+    operator_bound half pinned by operator-bound-verified. Freshness is
+    consumer-pull: nothing is announced on a cadence, so an idle network
+    carries no attestation traffic at all, and a stamp is only ever produced in
+    answer to a specific request.
+
+    Cross-impl: the two runtimes reach the attended state by DIFFERENT routes,
+    and that asymmetry is the reason this scenario exists. Python's identity
+    process cannot see the console's OperatorSession — it runs in its own
+    subprocess — so it asks the main loop, which shares the console's address
+    space, and answers when the reply lands. C has no OperatorSession and no
+    console app (no PIV/MFA in C), so it answers from the
+    identity_set_operator_attended seam in one hop. The adapters absorb the
+    route; what is compared is the answer, which must be identical.
+
+    The clock is PINNED (operator_session.clock), never wall-clock: a live
+    stamp could never match across two runs, let alone two languages. Python
+    binds the process clock seam to it; C uses identity_set_attest_clock.
+
+    attested_now == 1721800000.0 pins the session -> stamp derivation on both
+    sides. attest_accepted == [true] pins that the answer was bound to the pull
+    that asked for it. Credential verification against the operator anchor is
+    pinned separately (operator-bound-verified), since it needs X.509.
+
+participants:
+  - id: consumer
+    role: border_guard
+  - id: node
+    role: border_guard
+
+fixtures:
+  # Who has a human at the console, and the clock every stamp is taken from.
+  # `active` = attended; see attest-pull-unattended for the locked case.
+  operator_session:
+    clock: 1721800000.0
+    node: active
+
+steps:
+  - id: 1
+    from: consumer
+    to: node
+    function: trigger_attest_pull
+    description: |
+        consumer pulls node's attended-now state: mint a nonce, node answers
+        from its live session state, consumer matches the answer to its pull.
+
+expected_state:
+  consumer:
+    attested_now: 1721800000.0
+    attest_accepted: [true]

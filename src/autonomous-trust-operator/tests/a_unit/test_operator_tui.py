@@ -307,6 +307,72 @@ def test_bridge_submit_returns_false_when_control_queue_full():
     assert bridge.submit('rejected') is False
 
 
+# -- attended-now: the session must reach the node's main loop (ethne D8) ---
+
+class _SessionNode(_FakeNode):
+    """A node exposing the ``set_operator_session`` seam, so we can assert the
+    live session actually crosses from the app into the node's main loop."""
+
+    def __init__(self, snapshot):
+        super().__init__(snapshot)
+        self.session = 'unset'
+
+    def set_operator_session(self, session):
+        self.session = session
+
+
+def test_bridge_hands_session_to_node():
+    node = _SessionNode(_sample_directory())
+    sentinel = object()
+    bridge = OperatorNodeBridge(node_factory=lambda: node,
+                                session_provider=lambda: sentinel)
+    bridge.start()
+    try:
+        assert _wait_until(lambda: node.session is sentinel)
+    finally:
+        bridge.stop(timeout=2.0)
+
+
+def test_bridge_attach_session_provider_after_construction():
+    # The UI builds its session lazily, so the provider often arrives after the
+    # bridge does (see OperatorApp.on_mount).
+    node = _SessionNode(_sample_directory())
+    bridge = OperatorNodeBridge(node_factory=lambda: node)
+    bridge.attach_session_provider(lambda: 'live-session')
+    bridge.start()
+    try:
+        assert _wait_until(lambda: node.session == 'live-session')
+    finally:
+        bridge.stop(timeout=2.0)
+
+
+def test_bridge_tolerates_missing_seam_and_failing_provider():
+    # A node build without the seam (or a provider that blows up) must still
+    # start: attended-now simply goes unreported, it is not a startup failure.
+    plain = _FakeNode(_sample_directory())
+    bridge = OperatorNodeBridge(node_factory=lambda: plain,
+                                session_provider=lambda: 'ignored')
+    bridge.start()
+    try:
+        assert _wait_until(lambda: bridge.running is True)
+        assert bridge.node_error is None
+    finally:
+        bridge.stop(timeout=2.0)
+
+    def _boom_provider():
+        raise RuntimeError('no card reader')
+    node = _SessionNode(_sample_directory())
+    bridge = OperatorNodeBridge(node_factory=lambda: node,
+                                session_provider=_boom_provider)
+    bridge.start()
+    try:
+        assert _wait_until(lambda: bridge.running is True)
+        assert bridge.node_error is None
+        assert node.session == 'unset'
+    finally:
+        bridge.stop(timeout=2.0)
+
+
 # -- directory drill-down (row selection -> provider detail) --------------
 
 def test_directory_row_selection_shows_provider_detail():
