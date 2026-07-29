@@ -19,17 +19,74 @@
  *
  * The tick callback receives messages from the AT daemon and can react
  * to them — replace the body with your application logic.
+ *
+ * It also demonstrates the app-facing peer carrier: one roster request on the
+ * first tick, then PEER_OBSERVED / PEER_REPUTATION as the node's view changes.
+ * See doc/architecture/app-peer-carrier.md.
  */
 
 #include <stdio.h>
+#include <string.h>
 
 #include "autonomous_trust.h"
+#include "autonomous_trust/utilities/message.h"
 
 #define EXAMPLE_ITERATIONS 200
+
+/* Ask AT to re-emit everything it currently knows. Worth doing once at
+ * startup: the carrier is otherwise event-driven, so an app that attached
+ * after the node admitted its peers would otherwise see nothing until the
+ * next change. */
+static void request_peer_roster(at_node_t *node)
+{
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_ROSTER_REQUEST;
+    req.info.net_msg.encrypt = false;
+    if (messaging_send(node->config.q_out, NET_MESSAGE, &req, false) != 0)
+        log_exception(at_node_logger(node));
+}
+
+static void print_peer_observed(const peer_observed_msg_t *p)
+{
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(p->peer_uuid, uuid_str);
+    printf("  peer %s rank=%d key=%02x%02x..%02x", uuid_str, p->rank,
+           p->signing_pubkey[0], p->signing_pubkey[1],
+           p->signing_pubkey[crypto_sign_PUBLICKEYBYTES - 1]);
+    if (!p->operator_bound)
+        printf(" operator=none\n");
+    else if (p->operator_attested_at > 0.0)
+        /* A human is behind this node AND was verified present recently. How
+         * recently is the reader's call — the stamp is only meaningful
+         * against a clock, which is why AT does not reduce it to a bool. */
+        printf(" operator=bound attended_at=%.0f\n", p->operator_attested_at);
+    else
+        /* Bound but unattended is a normal steady state, not an error. */
+        printf(" operator=bound attended=no\n");
+}
+
+static void print_peer_reputation(const peer_reputation_msg_t *r)
+{
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(r->peer_uuid, uuid_str);
+    /* Print "unrated" rather than a number: AT has no rating for this peer,
+     * and an unrated peer's placeholder is indistinguishable from a score a
+     * peer can genuinely earn. */
+    if (r->rated)
+        printf("  peer %s reputation=%.3f\n", uuid_str, r->score);
+    else
+        printf("  peer %s reputation=unrated\n", uuid_str);
+}
 
 static int example_tick(at_node_t *node, void *user_data)
 {
     (void)user_data;
+
+    if (at_node_iteration(node) == 1)
+        request_peer_roster(node);
 
     /* Check for messages from AT sub-processes */
     generic_msg_t buf = {0};
@@ -40,7 +97,17 @@ static int example_tick(at_node_t *node, void *user_data)
         return 0;  /* no message this tick */
 
     /* React to messages here — e.g. transaction scores, task results */
-    (void)buf;
+    switch (buf.type)
+    {
+    case PEER_OBSERVED:
+        print_peer_observed(&buf.info.peer_observed);
+        break;
+    case PEER_REPUTATION:
+        print_peer_reputation(&buf.info.peer_reputation);
+        break;
+    default:
+        break;
+    }
 
     return 0;
 }

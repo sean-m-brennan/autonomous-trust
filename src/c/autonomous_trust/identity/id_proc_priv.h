@@ -287,6 +287,18 @@ int identity_set_peer_rank(process_t *proc, const char *uuid, int rank);
  *  Bridges the on-disk Python `Group` schema (_uuid / _address_map). */
 int identity_load_child_groups(process_t *proc, const char *cfg_dir);
 
+/** Emit ONE peer on the app-facing carrier (PEER_OBSERVED via AT_MAIN_QUEUE).
+ *  Carries the peer's signing key, its rank from the peer_ranks seam, and
+ *  both operator signals; the attendance stamp is zeroed unless the peer is
+ *  operator_bound. Returns 0 on success.
+ *  See doc/architecture/app-peer-carrier.md. */
+int identity_emit_peer_observed(const process_t *proc,
+                                const public_identity_t *peer);
+
+/** Re-emit every peer this process holds (the app's roster pull). Returns the
+ *  number emitted. Snapshots under the peers lock and sends outside it. */
+int identity_emit_all_peers(const process_t *proc);
+
 #define EID_NOQ 215
 DECLARE_ERROR(EID_NOQ, "Required process queue missing");
 

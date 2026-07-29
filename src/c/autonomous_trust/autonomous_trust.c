@@ -26,6 +26,7 @@
 #include <signal.h>
 
 #include "version.h"
+#include "at_route_priv.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/logger.h"
@@ -49,6 +50,142 @@ void reread_configs() { /* reserved: SIGHUP — reload config at runtime */ }
 void user1_handler() { /* reserved: SIGUSR1 — user-defined action */ }
 
 void user2_handler() { /* reserved: SIGUSR2 — user-defined action */ }
+
+
+int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
+{
+    if (msg == NULL)
+        return -1;
+    switch (msg->type)
+    {
+    case TASK:
+        /* Route tasks to negotiation process */
+        if (messaging_send("negotiation", TASK, msg, false) != 0)
+            log_exception(logger);
+        return 0;
+    case TASK_STATUS:
+        /* Route task status queries to negotiation */
+        if (messaging_send("negotiation", TASK_STATUS, msg, false) != 0)
+            log_exception(logger);
+        return 0;
+    case UPDATE_PROPOSAL:
+        /* Route update proposals to fleet process */
+        if (messaging_send("fleet", UPDATE_PROPOSAL, msg, false) != 0)
+            log_exception(logger);
+        return 0;
+    case NET_MESSAGE:
+    {
+        /* An app may invoke exactly ONE local verb, at a fixed pair of
+         * processes. Forwarding a NET_MESSAGE to whatever process it names
+         * would hand an app the whole internal verb surface. */
+        if (msg->info.net_msg.function == NULL
+            || strcmp(msg->info.net_msg.function, AT_APP_ROSTER_REQUEST) != 0)
+        {
+            log_warn(logger, "AutonomousTrust: refused extern net_msg '%s'\n",
+                     msg->info.net_msg.function == NULL
+                         ? "(none)" : msg->info.net_msg.function);
+            return -1;
+        }
+        /* Both halves of the carrier answer: identity holds the peer facts,
+         * reputation holds the scores. Each copy is addressed to its own
+         * process, since dispatch matches net_msg.process against proc->name. */
+        static const char *const roster_targets[] = { "identity", "reputation" };
+        for (size_t i = 0; i < sizeof(roster_targets) / sizeof(*roster_targets); i++)
+        {
+            generic_msg_t fwd = *msg;
+            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                     "%s", roster_targets[i]);
+            if (messaging_send(roster_targets[i], NET_MESSAGE, &fwd, false) != 0)
+                log_exception(logger);
+        }
+        return 0;
+    }
+    default:
+        log_warn(logger, "AutonomousTrust: unexpected extern message type %ld\n",
+                 msg->type);
+        return -1;
+    }
+}
+
+
+int at_route_queue_msg(array_t *unhandled, generic_msg_t *msg)
+{
+    if (unhandled == NULL || msg == NULL)
+        return -1;
+    /* By reference to the WHOLE struct: the drain switches on ->type, and
+     * object_ptr_data stores the pointer as given (it copies nothing). */
+    data_t *msg_dat = object_ptr_data(msg, sizeof(generic_msg_t));
+    if (msg_dat == NULL)
+        return -1;
+    if (array_append(unhandled, msg_dat) != 0)
+    {
+        smrt_deref(msg_dat);
+        return -1;
+    }
+    return 0;
+}
+
+
+int at_route_internal_msgs(array_t *unhandled, const char *q_out,
+                           logger_t *logger)
+{
+    if (unhandled == NULL)
+        return 0;
+    int sent = 0;
+    while (array_size(unhandled) > 0)
+    {
+        data_t *msg_dat = NULL;
+        if (array_get(unhandled, 0, &msg_dat) != 0)
+        {
+            log_exception(logger);
+            break;  // read error — abandon
+        }
+
+        /* Route internal messages by type */
+        generic_msg_t *inner = NULL;
+        data_object_ptr(msg_dat, (void **)&inner);
+        if (inner != NULL)
+        {
+            switch (inner->type)
+            {
+            case TASK_RESULT:
+                /* Task results go to reputation for scoring */
+                if (messaging_send("reputation", TASK_RESULT, inner, false) != 0)
+                    log_exception(logger);
+                break;
+            case TASK_STATUS:
+                /* Task status updates go to negotiation */
+                if (messaging_send("negotiation", TASK_STATUS, inner, false) != 0)
+                    log_exception(logger);
+                break;
+            /* App-bound: sent as we drain, in FIFO order. Batching them into a
+             * second array and sending one message after the loop is what
+             * silently dropped every message but the last. */
+            case TRANSACTION_SCORE:
+            case UPDATE_ACCEPTED:
+            case PEER_OBSERVED:
+            case PEER_REPUTATION:
+                if (q_out == NULL)
+                    break;   /* no app attached; nothing to do */
+                if (messaging_send(q_out, (message_type_t)inner->type, inner, false) != 0)
+                    log_exception(logger);
+                else
+                    sent++;
+                break;
+            default:
+                break;
+            }
+        }
+        if (array_remove(unhandled, msg_dat) != 0) {
+            log_exception(logger);
+            break;  // guard against infinite loop if remove fails
+        }
+        /* array_remove unlinks but does not free; without this the daemon
+         * leaks one data_t per message routed. */
+        smrt_deref(msg_dat);
+    }
+    return sent;
+}
 
 
 int register_queues(tracker_t *tracker, const char *main, directory_t *queues, directory_t *signals, logger_t *logger)
@@ -150,7 +287,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
     if (err != 0)
         return err;
 
-    const char *name = "AutonomousTrust";
+    const char *name = AT_MAIN_QUEUE;
     logger_t logger = {0};
     if (logger_init(&logger, log_level, log_file) != 0)
         return -1;
@@ -323,29 +460,7 @@ int run_autonomous_trust(char *q_in, char *q_out,
         if (ret == -1)
             log_exception(&logger);
         else if (ret == 0)
-        {
-            switch (task_msg.type)
-            {
-            case TASK:
-                /* Route tasks to negotiation process */
-                if (messaging_send("negotiation", TASK, &task_msg, false) != 0)
-                    log_exception(&logger);
-                break;
-            case TASK_STATUS:
-                /* Route task status queries to negotiation */
-                if (messaging_send("negotiation", TASK_STATUS, &task_msg, false) != 0)
-                    log_exception(&logger);
-                break;
-            case UPDATE_PROPOSAL:
-                /* Route update proposals to fleet process */
-                if (messaging_send("fleet", UPDATE_PROPOSAL, &task_msg, false) != 0)
-                    log_exception(&logger);
-                break;
-            default:
-                log_warn(&logger, "%s: unexpected extern message type %ld\n", name, task_msg.type);
-                break;
-            }
-        }
+            at_route_extern_msg(&task_msg, &logger);
 
         // get results from internal procs
         generic_msg_t result_msg = {0};
@@ -354,70 +469,14 @@ int run_autonomous_trust(char *q_in, char *q_out,
             log_exception(&logger);
         else if (ret == 0)
         {
-            // Internal message routed as opaque data blob
-            data_t *msg_dat = object_ptr_data(&result_msg.info, message_size(result_msg.type));
-            if (array_append(&unhandled_msgs, msg_dat) != 0)
+            /* Queued by reference; the drain below consumes it in this same
+             * iteration, before result_msg is reused. */
+            if (at_route_queue_msg(&unhandled_msgs, &result_msg) != 0)
                 log_exception(&logger);
         }
 
-        // Drain: process every pending message in FIFO order, removing as we go. 
-        array_t extern_msgs = {0};
-        if (array_init(&extern_msgs) != 0)
-            log_exception(&logger);
-        bool do_send = false;
-        while (array_size(&unhandled_msgs) > 0)
-        {                                                                                                           
-            data_t *msg_dat = NULL;                                                                                 
-            if (array_get(&unhandled_msgs, 0, &msg_dat) != 0)           
-            {                                                                                                       
-                log_exception(&logger);
-                break;  // read error — abandon
-            }                                                                                                       
-
-            /* Route internal messages by type */
-            generic_msg_t *inner = NULL;
-            data_object_ptr(msg_dat, (void **)&inner);
-            if (inner != NULL)
-            {
-                switch (inner->type)
-                {
-                case TASK_RESULT:
-                    /* Task results go to reputation for scoring */
-                    if (messaging_send("reputation", TASK_RESULT, inner, false) != 0)
-                        log_exception(&logger);
-                    break;
-                case TASK_STATUS:
-                    /* Task status updates go to negotiation */
-                    if (messaging_send("negotiation", TASK_STATUS, inner, false) != 0)
-                        log_exception(&logger);
-                    break;
-                case TRANSACTION_SCORE:
-                    /* Transaction scores go to extern */
-                    if (array_append(&extern_msgs, msg_dat) != 0)
-                        log_exception(&logger);
-                    do_send = true;
-                    break;
-                case UPDATE_ACCEPTED:
-                    /* Update accepted notifications go to extern */
-                    if (array_append(&extern_msgs, msg_dat) != 0)
-                        log_exception(&logger);
-                    do_send = true;
-                    break;
-                default:
-                    break;
-                }
-            }
-            if (array_remove(&unhandled_msgs, msg_dat) != 0) {
-                log_exception(&logger);
-                break;  // guard against infinite loop if remove fails
-            }
-        }
-
-        if (do_send)
-        {
-            if (messaging_send(q_out, result_msg.type, &result_msg, false) != 0)
-                log_exception(&logger);
-        }
+        // Drain: process every pending message in FIFO order, removing as we go.
+        at_route_internal_msgs(&unhandled_msgs, q_out, &logger);
 
         if (usleep(cadence) == -1)
         {

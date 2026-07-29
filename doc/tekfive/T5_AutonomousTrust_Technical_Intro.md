@@ -5,6 +5,7 @@ paginate: true
 header: 'AutonomousTrust'
 ---
 <!-- _class: lead -->
+
 <!-- _header: ' ' -->
 
 # AutonomousTrust
@@ -44,11 +45,12 @@ later is in service of them.
 
 Zero Trust as normally built (NIST SP 800-207) is policy-driven, and therefore human-driven. It also assumes a reachable central authority (CA / OCSP / CRL) on the hot path of *every* connection. That premise fails three ways:
 
-| Failure mode | Why it happens |
-| --- | --- |
-| **Dies when comms drop (DDIL)** | Unreachable policy engine, so no new connection. CRLs are tens of MB over kbps links; Mars light-time makes cert rotation take *hours*. The result is fail-open or fail-closed. |
-| **Blind to behavior** | A compromised endpoint with valid credentials passes every check. Authentication says nothing about current conduct. |
-| **Doesn't scale by policy** | Every asset, flow, and partner multiplies the human policy surface combinatorially. |
+
+| Failure mode                    | Why it happens                                                                                                                                                                 |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Dies when comms drop (DDIL)** | Unreachable policy engine, so no new connection. CRLs are tens of MB over kbps links; Mars light-time makes cert rotation take*hours*. The result is fail-open or fail-closed. |
+| **Blind to behavior**           | A compromised endpoint with valid credentials passes every check. Authentication says nothing about current conduct.                                                           |
+| **Doesn't scale by policy**     | Every asset, flow, and partner multiplies the human policy surface combinatorially.                                                                                            |
 
 <!--
 Speaker: These aren't bugs to patch; they follow from the design premise. A peer
@@ -63,7 +65,7 @@ net, capture a node. The fix has to change the premise, not tune the config.
 > **Authentication opens the door. AutonomousTrust decides what happens inside the room, continuously.**
 
 - Conventional ZTA/ICAM grants implicit trust after login: one proof, then trusted.
-- AT replaces that with a continuous behavioral gradient:
+- AT augments that with a continuous behavioral gradient:
   - Authentication proves *who*. AT governs *what*, *for how long*, and revokes in real time.
   - A valid credential earns a peer the right to be *heard*. It is never a substitute for *trust*.
 - "Authentication is not trust."
@@ -111,11 +113,12 @@ Decentralized by construction: groups form organically, reputation is maintained
 
 </div>
 
-| Operation | Primitive (NaCl / libsodium) |
-| --- | --- |
-| Signing | Ed25519 (identity, votes, message auth) |
-| Peer-to-peer encryption | X25519 + XSalsa20-Poly1305 (NaCl Box) |
-| Group encryption | shared symmetric key (NaCl SecretBox) |
+
+| Operation               | Primitive (NaCl / libsodium)            |
+| ----------------------- | --------------------------------------- |
+| Signing                 | Ed25519 (identity, votes, message auth) |
+| Peer-to-peer encryption | X25519 + XSalsa20-Poly1305 (NaCl Box)   |
+| Group encryption        | shared symmetric key (NaCl SecretBox)   |
 
 *Private keys never touch the wire; announcements carry public keys only.*
 
@@ -160,13 +163,14 @@ Reputation rests on a hash-linked, bilateral transaction chain. It is not a glob
 
 Scores live in [0, 1], with no negatives. Single-source thresholds (env-overridable):
 
-| Value | Meaning |
-| --- | --- |
-| **0.2** | cold-start / neutral prior (`PREREP_NEUTRAL`) |
-| **0.1** | communication cut-off; below this, peers stop relaying to you |
-| **0.0** | slash floor |
-| **0.5 / 0.65 / 0.8 / 0.9** | trust-tier floors (1 → 4) |
-| **0.21** | idle-decay asymptote |
+
+| Value                      | Meaning                                                       |
+| -------------------------- | ------------------------------------------------------------- |
+| **0.2**                    | cold-start / neutral prior (`PREREP_NEUTRAL`)                 |
+| **0.1**                    | communication cut-off; below this, peers stop relaying to you |
+| **0.0**                    | slash floor                                                   |
+| **0.5 / 0.65 / 0.8 / 0.9** | trust-tier floors (1 → 4)                                    |
+| **0.21**                   | idle-decay asymptote                                          |
 
 - Two modes with hysteresis (the band `[0.45, 0.55]` retains the prior mode):
   - Cooperation is *pure reputation*: the trust-weighted average of counterparties' scores × their standing × task weight.
@@ -174,17 +178,19 @@ Scores live in [0, 1], with no negatives. Single-source thresholds (env-overrida
 - Idle decay is asymmetric: idle peers relax toward 0.21, but decay never rehabilitates a low or slashed peer.
 
 ---
+
 <!-- _class: small -->
 
 ## Reputation III: consensus and slashing
 
 Agreement on reputation runs as leaderless Byzantine Multi-Paxos, so there is no coordinator to capture or lose.
 
-| Phase | Messages | Purpose |
-| --- | --- | --- |
-| 1 | `request` → `grant` / `nack` / `backdate` | ask permission; proposal id = (timestamp, chain-index, peer) with replay-idempotent guard |
-| 2 | `transaction` → `accepted` | on majority grant, propose the score; commit on majority accept |
-| 3 | `committed` (broadcast) | every peer writes the *same* bilateral entry |
+
+| Phase | Messages                                   | Purpose                                                                                   |
+| ----- | ------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| 1     | `request` → `grant` / `nack` / `backdate` | ask permission; proposal id = (timestamp, chain-index, peer) with replay-idempotent guard |
+| 2     | `transaction` → `accepted`                | on majority grant, propose the score; commit on majority accept                           |
+| 3     | `committed` (broadcast)                    | every peer writes the*same* bilateral entry                                               |
 
 - Catch-up queries the top-3 most-trusted peers and majority-votes the result, which is verifiable via chain links.
 - Slashing is the fast path: a quorum-co-signed (Ed25519), evidence-gated `SlashAttestation` floors a score immediately, instead of waiting roughly 20 transactions for the average to move. That is what catches short-lived rogues.
@@ -199,11 +205,13 @@ AT deliberately separates *where you sit in the network* from *how much you're t
 <div class="cols">
 
 **Rank** (topology)
+
 - one-hop / gateway reachability
 - mostly static, from config
 - gates routing, partition-leader, Proof-of-Authority votes
 
 **Trust tier** (reputation-derived)
+
 - floors at 0.5 / 0.65 / 0.8 / 0.9, giving tiers 1 to 4
 - moves with behavior, with hysteresis
 - gates capability access, transaction weighting, Proof-of-Trust votes
@@ -276,11 +284,13 @@ reconnect.
 <div class="cols">
 
 **Operator attestation**
+
 - `operator_bound` / `operator_attested_at` signal "a human stands behind this node."
 - Earned, never advertised: a claim on the wire is neutralized at admission and set true only if a *distinct operator credential* verifies.
 - Operator access is PIV/CAC plus MFA (TOTP by default, DDIL-friendly). The key never leaves the card, and the path is fail-safe.
 
 **Behavioral anomaly layer** *(Python prototype)*
+
 - Online, explainable detectors (River HST + PyOD HBOS) are deterministic, so scores are admissible signed evidence.
 - "ML proposes, consensus disposes": a per-node governor emits a *slash proposal*, and the signed quorum flow decides.
 - Human-on-the-loop by default. Dwell and quorum guards defeat the base-rate fallacy.
@@ -294,10 +304,12 @@ reconnect.
 <div class="cols">
 
 **Python** (reference & development)
+
 - rapid iteration, simulation, scenario authoring
 - executable specification of the semantics
 
 **C** (production & fielded)
+
 - runs the embedded/ARM daemon (`at_demo`), so no Python is needed on-device
 - formally verified (Frama-C / ACSL contracts): 100% of attempted proof goals discharged
 
@@ -313,19 +325,21 @@ the readable Python reference. You get provability without giving up iteration.
 -->
 
 ---
+
 <!-- _class: small -->
 
 ## Tooling & ecosystem
 
 Namespace packages layered on the core:
 
-| Package | Role |
-| --- | --- |
-| **inspector** | Live/playback dashboards (Dash + Plotly): trust timeline, per-peer detail, mesh graph, sensor charts, event log |
-| **simulator** | Multi-node mesh with mobility paths and radio physics: terrain, delay, routing, and even a space link (free-space loss, light-delay, occultation) |
-| **evaluation** | Metrics collector, M&S performance harnesses, and a red-team suite (Byzantine, Sybil, MITM, reputation-gaming; MITRE Caldera bridge) |
-| **services** | Application data carried over AT trust: environmental sensors, fusion, video, position |
-| **behaviour** | The behavioral-anomaly layer (prototype; formally-verified C twin deferred) |
+
+| Package        | Role                                                                                                                                              |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **inspector**  | Live/playback dashboards (Dash + Plotly): trust timeline, per-peer detail, mesh graph, sensor charts, event log                                   |
+| **simulator**  | Multi-node mesh with mobility paths and radio physics: terrain, delay, routing, and even a space link (free-space loss, light-delay, occultation) |
+| **evaluation** | Metrics collector, M&S performance harnesses, and a red-team suite (Byzantine, Sybil, MITM, reputation-gaming; MITRE Caldera bridge)              |
+| **services**   | Application data carried over AT trust: environmental sensors, fusion, video, position                                                            |
+| **behaviour**  | The behavioral-anomaly layer (prototype; formally-verified C twin deferred)                                                                       |
 
 ---
 
@@ -343,6 +357,7 @@ python -m examples.multi_agency      →  dashboard at http://localhost:8050
 No central authority is consulted. Nothing "fails open." That is the whole idea.
 
 ---
+
 <!-- _class: lead -->
 
 # The through-line
