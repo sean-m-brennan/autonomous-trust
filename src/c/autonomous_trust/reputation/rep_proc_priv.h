@@ -160,6 +160,14 @@ void reputation_install_coop_mode(const uuid_t peer_uuid, bool in_coop);
  *  -1 if uninitialized or @p peer_uuid is absent. */
 int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out);
 
+/** Re-emit every peer's reputation on the app-facing carrier (PEER_REPUTATION
+ *  via AT_MAIN_QUEUE) — the reputation half of the app's roster pull. Peers
+ *  AT holds no rating for are emitted with rated=false rather than skipped;
+ *  this is the ONLY path on which rated=false can cross, since every
+ *  change-driven emission is by construction rated.
+ *  Returns the number emitted. See doc/architecture/app-peer-carrier.md. */
+int reputation_emit_all(const process_t *proc);
+
 #define EREP_PAXOS 253
 DECLARE_ERROR(EREP_PAXOS, "Paxos consensus error");
 

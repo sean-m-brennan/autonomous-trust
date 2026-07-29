@@ -27,3 +27,4 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [ZTA Python Parity](zta-python-parity.md) -- Python implementation of the ZTA admission gate and wire binding
 - [Operator Access](operator-access.md) -- Human operator authentication via PIV/CAC + MFA, session lifecycle, and the request-only operator node
 - [Operator-Attended Signal](operator-attended.md) -- Which nodes have a human behind them: the durable guardian binding and the consumer-pull attended-now attestation
+- [App-Facing Peer Carrier](app-peer-carrier.md) -- What a hosting application learns about peers: the two carrier messages, the roster pull, and the flat app-facing ABI

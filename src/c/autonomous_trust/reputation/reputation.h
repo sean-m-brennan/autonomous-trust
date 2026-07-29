@@ -75,6 +75,7 @@ extern char REP_PROTO_REP_RESP[];
 extern char REP_PROTO_CONSENSUS_REP_REQ[];
 extern char REP_PROTO_LOCAL_QUERY[];
 extern char REP_PROTO_LOCAL_RESP[];
+extern char REP_PROTO_APP_ROSTER[];
 /* Slashing — fast-penalty path. A detector broadcasts SLASH_PROPOSE;
  * members co-sign with SLASH_SIGN; on quorum the slasher broadcasts
  * SLASH_FINAL and every node floors the target's reputation, bypassing

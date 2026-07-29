@@ -112,6 +112,9 @@ char REP_PROTO_REP_RESP[]    = "reputation response";
 char REP_PROTO_CONSENSUS_REP_REQ[] = "request consensus reputation";
 char REP_PROTO_LOCAL_QUERY[] = "local_rep_query";
 char REP_PROTO_LOCAL_RESP[]  = "local_rep_response";
+/* App -> AT (via the daemon main loop): re-emit the peer view on the
+ * app-facing carrier. See doc/architecture/app-peer-carrier.md. */
+char REP_PROTO_APP_ROSTER[]  = AT_APP_ROSTER_REQUEST;
 char REP_PROTO_SLASH_PROPOSE[] = "slash propose";
 char REP_PROTO_SLASH_SIGN[]    = "slash sign";
 char REP_PROTO_SLASH_FINAL[]   = "slash final";
@@ -497,6 +500,83 @@ static void _publish_tier_change(const process_t *proc,
     }
 
     json_decref(arr);
+}
+
+
+/****************************
+ * The app-facing reputation carrier (ethne D5/D18; see
+ * doc/architecture/app-peer-carrier.md).
+ *
+ * Deliberately NOT folded into _publish_tier_change: that function is gated
+ * on a tier CROSSING, and a consumer tracking earned reputation needs every
+ * change, not only the ones that step over one of four floors. It is also
+ * not folded into the tier_update IPC, because that message exists to tell
+ * the identity process a coarse tier and giving it the raw score would put a
+ * cached second copy of the score store where nothing needs one.
+ ****************************/
+
+/* @p rated is the load-bearing argument: an unrated peer reads as
+ * PREREP_NEUTRAL, which is also a score a peer can genuinely earn, so a
+ * consumer given only the number cannot tell "no information" from
+ * "rated 0.2". The score is zeroed when unrated so a consumer that ignores
+ * the flag cannot silently read a plausible-looking number. */
+static int _publish_reputation(const uuid_t peer_uuid, double score, bool rated)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_REPUTATION;
+    msg.size = sizeof(peer_reputation_msg_t);
+    uuid_copy(msg.info.peer_reputation.peer_uuid, peer_uuid);
+    msg.info.peer_reputation.score = rated ? score : 0.0;
+    msg.info.peer_reputation.rated = rated;
+    return messaging_send(AT_MAIN_QUEUE, PEER_REPUTATION, &msg, false);
+}
+
+/* A score this process just committed is by construction rated. */
+static void _publish_reputation_change(const uuid_t peer_uuid, double score)
+{
+    _publish_reputation(peer_uuid, score, true);
+}
+
+int reputation_emit_all(const process_t *proc)
+{
+    if (proc == NULL || !rep_state.initialized)
+        return 0;
+    uuid_t uuids[DEFAULT_MAX_PEERS];
+    peers_read_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    if (n > DEFAULT_MAX_PEERS)
+        n = DEFAULT_MAX_PEERS;
+    for (size_t i = 0; i < n; i++)
+        uuid_copy(uuids[i], proc->protocol.peers[i].uuid);
+    peers_read_unlock(proc);
+
+    int emitted = 0;
+    for (size_t i = 0; i < n; i++)
+    {
+        /* A peer with no rating is reported AS unrated rather than skipped:
+         * silence would leave a consumer unable to distinguish "we hold no
+         * rating" from "the message was lost". This pull is the only place
+         * rated=false can cross, since every change emission is rated. */
+        double score = 0.0;
+        pthread_mutex_lock(&rep_state.lock);
+        bool rated = (reputations_get(&rep_state.reputations, uuids[i], &score) == 0);
+        pthread_mutex_unlock(&rep_state.lock);
+        if (_publish_reputation(uuids[i], score, rated) == 0)
+            emitted++;
+    }
+    return emitted;
+}
+
+/* Handler: the app asked for the current peer view. */
+static bool handle_app_roster_request(const process_t *proc,
+                                      directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    (void)msg;
+    int n = reputation_emit_all(proc);
+    log_debug(proc->logger,
+              "Reputation: peer roster request -> %d reputation(s)\n", n);
+    return true;
 }
 
 /* Resolve @p peer_uuid to its address from the live peer roster and send a
@@ -1671,6 +1751,7 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
      * _compute_reputation runs in a spawned thread without queue access. */
     if (have_uuid) {
         _publish_tier_change(proc, peer_uuid, score);
+        _publish_reputation_change(peer_uuid, score);
         probes_counter("rep.compute", "queued", NULL);
     }
 
@@ -2164,6 +2245,7 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
         reputations_update(&rep_state.reputations, target_uuid, PREREP_NEUTRAL);
         pthread_mutex_unlock(&rep_state.lock);
         _publish_tier_change(proc, target_uuid, PREREP_NEUTRAL);
+        _publish_reputation_change(target_uuid, PREREP_NEUTRAL);
         log_info(proc->logger,
                  "Reputation: slash lifted (rehabilitate) target=%s -> %.2f\n",
                  target_str, PREREP_NEUTRAL);
@@ -2177,6 +2259,7 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
      * the peer at the network layer immediately (mirrors Python's
      * pending_tiers -> _compute_reputation -> _publish_tier_change flow). */
     _publish_tier_change(proc, target_uuid, floor);
+    _publish_reputation_change(target_uuid, floor);
     log_info(proc->logger, "Reputation: slash applied target=%s floor=%.2f\n",
              target_str, floor);
     json_decref(payload);
@@ -2389,6 +2472,7 @@ int reputation_register_handlers(process_t *proc)
     process_register_handler(proc, REP_PROTO_CONSENSUS_REP_REQ,
                              (handler_ptr_t)handle_consensus_rep_request);
     process_register_handler(proc, REP_PROTO_LOCAL_QUERY, (handler_ptr_t)handle_local_rep_query);
+    process_register_handler(proc, REP_PROTO_APP_ROSTER, (handler_ptr_t)handle_app_roster_request);
     process_register_handler(proc, REP_PROTO_SLASH_PROPOSE, (handler_ptr_t)handle_slash_propose);
     process_register_handler(proc, REP_PROTO_SLASH_SIGN,    (handler_ptr_t)handle_slash_sign);
     process_register_handler(proc, REP_PROTO_SLASH_FINAL,   (handler_ptr_t)handle_slash_final);

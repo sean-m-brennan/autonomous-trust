@@ -47,6 +47,8 @@ typedef enum {
     UPDATE_VOTE,             /**< Vote on an update proposal. */
     UPDATE_ACCEPTED,         /**< Announcement that an update was accepted. */
     PEER_RTT_UPDATE,         /**< Net-proc → sibling processes: peer RTT telemetry. Local IPC only — not part of identity.proto / public_identity_t network serialization. */
+    PEER_OBSERVED,           /**< Identity → app: one observed peer (@ref peer_observed_msg_t). Local IPC only. */
+    PEER_REPUTATION,         /**< Reputation → app: one peer's earned score (@ref peer_reputation_msg_t). Local IPC only. */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
     ZTA_VERIFICATION_RESULT  /**< Outcome of a deferred ZTA verification. */
@@ -161,6 +163,65 @@ typedef struct {
     int32_t rtt_ms;
 } peer_rtt_update_msg_t;
 
+/**
+ * @brief AT → app: one peer as this node currently observes it.
+ *
+ * Half of the app-facing peer carrier; @ref peer_reputation_msg_t is the
+ * other half. The split follows process ownership rather than the consumer's
+ * convenience: the identity process holds the peer table, the ranks and the
+ * operator signals, while earned reputation lives in the reputation process.
+ * Neither reaches into the other; the consumer joins the two on @c peer_uuid.
+ *
+ * Local IPC only — not part of identity.proto or `public_identity_t` network
+ * serialization (same standing as @ref peer_rtt_update_msg_t).
+ *
+ * See doc/architecture/app-peer-carrier.md.
+ */
+typedef struct {
+    uuid_t   peer_uuid;
+    /** ed25519 signing public key (`public_identity_t.signature.public`).
+     *  Identity for a consumer: it is what a `did:key` embeds, so no
+     *  registry is needed to name this peer outside AT. */
+    uint8_t  signing_pubkey[crypto_sign_PUBLICKEYBYTES];
+    /** Topology rank (one-hop reachability via gateways), from the identity
+     *  process's `peer_ranks` seam; 0 = unknown. NOT a trust tier. */
+    int32_t  rank;
+    /** Durable: this node has a human guardian, and OUR receiver verified
+     *  their credential against the distinct operator anchor. Never the
+     *  peer's own claim. */
+    bool     operator_bound;
+    /** Live: epoch seconds of the last verified operator session, 0 = nobody
+     *  attending (or could not confirm — for a guardian edge those are the
+     *  same operational answer). Meaningless without a clock to compare
+     *  against, so it is carried raw and graded by the consumer, never
+     *  reduced to a bool here. Read together with @c operator_bound and
+     *  never for it: a bound node with nobody at the keyboard for a week is
+     *  a normal state, not an error.
+     *  See doc/architecture/operator-attended.md. */
+    double   operator_attested_at;
+} peer_observed_msg_t;
+
+/**
+ * @brief AT → app: one peer's earned reputation.
+ *
+ * @c rated is the load-bearing field. AT's scale is anchored by fixed
+ * constants (PREREP_NEUTRAL, COMM_CUTOFF, the tier floors) rather than
+ * normalized across the peer population, so @c score crosses as-is — but a
+ * peer AT has never scored reads as exactly PREREP_NEUTRAL, which is also a
+ * score a peer can genuinely earn. Collapsing those two would let a consumer
+ * treat "no information" as a real, mid-range rating. @c rated separates
+ * them: false means @c score carries no information and must not be read.
+ *
+ * Local IPC only.
+ */
+typedef struct {
+    uuid_t peer_uuid;
+    /** AT's absolute [0.0, 1.0] score. Meaningless unless @c rated. */
+    double score;
+    /** True iff AT holds an actual rating for this peer. */
+    bool   rated;
+} peer_reputation_msg_t;
+
 #define SIGNAL_LEN 32
 
 typedef struct
@@ -203,6 +264,8 @@ typedef struct
         update_vote_msg_t update_vote;
         update_accepted_msg_t update_accepted;
         peer_rtt_update_msg_t peer_rtt_update;
+        peer_observed_msg_t peer_observed;
+        peer_reputation_msg_t peer_reputation;
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;
 #endif

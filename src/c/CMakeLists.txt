@@ -428,6 +428,7 @@ set(table_headers_in
 
 set(libsrc
     autonomous_trust/autonomous_trust.c
+    autonomous_trust/app_events.c
     autonomous_trust/node.c
     autonomous_trust/algorithms/agreement.c
     autonomous_trust/algorithms/paxos.c
@@ -1412,6 +1413,11 @@ add_executable(peer_rtt_update_test test/peer_rtt_update_test.c)
 set_source_files_properties(test/peer_rtt_update_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(peer_rtt_update_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME peer_rtt_update_test COMMAND $<TARGET_FILE:peer_rtt_update_test>)
+
+add_executable(app_events_test test/app_events_test.c)
+set_source_files_properties(test/app_events_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(app_events_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME app_events_test COMMAND $<TARGET_FILE:app_events_test>)
 
 # Envelope codec unit tests — gated by AT_NET_ENVELOPE since the codec TU
 # itself is only compiled when that option is ON.

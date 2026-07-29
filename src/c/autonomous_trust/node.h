@@ -57,9 +57,12 @@ typedef struct {
     log_level_t   log_level;
     const char   *log_file;        /* NULL = stderr */
     bool          generate_config; /* run random_config() before launch */
-    const char   *app_name;        /* IPC queue name, e.g. "at_demo"   */
+    const char   *app_name;        /* logging identity, e.g. "at_demo"  */
     const char   *q_out;           /* queue: app -> AT daemon           */
-    const char   *q_in;            /* queue: AT daemon -> app           */
+    /* queue: AT daemon -> app. at_node_start BINDS this, so it is the name
+     * the app receives on (at_node_tick's messaging_recv). Must differ from
+     * q_out — the two directions are separate sockets. */
+    const char   *q_in;
     void         *capabilities;    /* passed to run_autonomous_trust    */
     size_t        cap_len;
     size_t        max_iterations;  /* 0 = unlimited (run until signal)  */

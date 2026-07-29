@@ -66,6 +66,10 @@ size_t message_size(message_type_t type)
         return sizeof(update_accepted_msg_t);
     case PEER_RTT_UPDATE:
         return sizeof(peer_rtt_update_msg_t);
+    case PEER_OBSERVED:
+        return sizeof(peer_observed_msg_t);
+    case PEER_REPUTATION:
+        return sizeof(peer_reputation_msg_t);
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
@@ -111,6 +115,10 @@ char *message_type_to_string(message_type_t type)
         return (char*)"UPDATE_ACCEPTED";
     case PEER_RTT_UPDATE:
         return (char*)"PEER_RTT_UPDATE";
+    case PEER_OBSERVED:
+        return (char*)"PEER_OBSERVED";
+    case PEER_REPUTATION:
+        return (char*)"PEER_REPUTATION";
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
         return (char*)"ZTA_REVOCATION_ALERT";
@@ -160,6 +168,10 @@ message_type_t string_to_message_type(const char *str)
         return UPDATE_ACCEPTED;
     if (strcmp(str, "PEER_RTT_UPDATE") == 0)
         return PEER_RTT_UPDATE;
+    if (strcmp(str, "PEER_OBSERVED") == 0)
+        return PEER_OBSERVED;
+    if (strcmp(str, "PEER_REPUTATION") == 0)
+        return PEER_REPUTATION;
     return -1;  // No matching message type found (all valid types are > 0)
 }
 
@@ -383,6 +395,22 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.peer_rtt_update, subdata_len);
         break;
     }
+    case PEER_OBSERVED:
+    {
+        subdata_len = sizeof(peer_observed_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_observed, subdata_len);
+        break;
+    }
+    case PEER_REPUTATION:
+    {
+        subdata_len = sizeof(peer_reputation_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_reputation, subdata_len);
+        break;
+    }
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
@@ -587,6 +615,12 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         return 0;
     case PEER_RTT_UPDATE:
         memcpy(&msg->info.peer_rtt_update, pb_msg->value.data, sizeof(peer_rtt_update_msg_t));
+        return 0;
+    case PEER_OBSERVED:
+        memcpy(&msg->info.peer_observed, pb_msg->value.data, sizeof(peer_observed_msg_t));
+        return 0;
+    case PEER_REPUTATION:
+        memcpy(&msg->info.peer_reputation, pb_msg->value.data, sizeof(peer_reputation_msg_t));
         return 0;
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:

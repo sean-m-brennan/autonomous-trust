@@ -78,6 +78,13 @@ function(add_at_example target source)
     install(TARGETS ${target} RUNTIME DESTINATION bin)
 endfunction()
 
+# ----- Minimal host app (src/c/example.c) -----
+# Built here because nothing built it before: it is the reference an integrator
+# copies, and an uncompiled reference is one nothing checks. It shipped with
+# app_name != q_in, so the daemon's messages went to a socket the app had not
+# bound and the tick callback could never have received anything.
+add_at_example(at_example ../src/c/example.c)
+
 # ----- Demo app (fleet update, containerized) -----
 add_at_example(at_demo demo/src/at_demo.c)
 if(AT_STATIC)
