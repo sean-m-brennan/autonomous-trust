@@ -497,7 +497,7 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
     generic_msg_t notify = {0};
     notify.type = UPDATE_ACCEPTED;
     uuid_parse(prop_uuid_str, notify.info.update_accepted.proposal_uuid);
-    messaging_send("AutonomousTrust", UPDATE_ACCEPTED, &notify, false);
+    messaging_send(AT_MAIN_QUEUE, UPDATE_ACCEPTED, &notify, false);
 
     /* If we already have the artifact (proposer), mark complete.
      * Otherwise, request the artifact from the sender (proposer). */

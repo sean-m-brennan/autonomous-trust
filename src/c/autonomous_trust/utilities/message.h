@@ -28,6 +28,33 @@
 #include "msg_types.h"
 
 #define MSG_KEY_LEN PROC_NAME_LEN
+
+/**
+ * @brief IPC queue name of the daemon's own main loop.
+ *
+ * The loop binds this (@ref run_autonomous_trust) and sibling processes send
+ * to it — anything app-bound has to pass through the loop, which owns the
+ * app's queue name. One spelling, in one place, because a second spelling is
+ * exactly what silently swallowed negotiation's task results: they were sent
+ * to `"main"`, a name nothing ever binds.
+ */
+#define AT_MAIN_QUEUE "AutonomousTrust"
+
+/**
+ * @brief App → AT local-only verb: re-emit the current peer view.
+ *
+ * Carried as a @ref NET_MESSAGE `function` rather than as its own message
+ * type, following the established local-only-verb pattern (`tier_update`,
+ * `attest_trigger`, `local_rep_query`): typed messages dispatch through a
+ * single shared switch that cannot reach process-specific code, whereas a
+ * function string dispatches to whichever process registered it.
+ *
+ * This is the ONLY verb the daemon accepts from an app, and it is forwarded
+ * to a fixed pair of processes — an app must not be able to inject arbitrary
+ * internal verbs at an arbitrary process.
+ */
+#define AT_APP_ROSTER_REQUEST "app_roster_request"
+
 #define DEFAULT_MAX_MSG_SIZE 1024
 /* MAX_MSG_SIZE is configurable at runtime via messaging_set_max_size() */
 #define MAX_MSG_SIZE (messaging_max_size())
