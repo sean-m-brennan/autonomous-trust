@@ -84,6 +84,9 @@ static char ID_IDENTITY_RESPONSE[] = "peer_identity_response";
  * 2-element JSON array `[peer_uuid_str, new_tier_int]`. Mirrors
  * Python IdentityProtocol.tier_update. */
 static char ID_TIER[]        = "tier_update";
+/* Local-only IPC from the app (via the daemon main loop): re-emit the peer
+ * view on the app-facing carrier. See doc/architecture/app-peer-carrier.md. */
+static char ID_APP_ROSTER[]  = AT_APP_ROSTER_REQUEST;
 /* Group partition recovery (doc/architecture/partition-recovery.md).
  *   ID_PARTITION_SIGNAL: local-only IPC from NetProcess when group-channel
  *                        traffic is rejected (no wire egress). Payload is
@@ -609,6 +612,12 @@ static int _add_peer(process_t *proc, directory_t *queues,
     peer_msg.type = PEER;
     memcpy(&peer_msg.info.peer, new_peer, sizeof(public_identity_t));
     _remember_activity(proc, queues, &peer_msg);
+
+    /* Tell the app about the peer too. Emitted for a PROVISIONAL add as well
+     * as a confirmed one, matching the line above: the peer is in peers[]
+     * from here on, so a consumer that models what we observe should see it.
+     * Two-phase admission gates the GROUP KEY, not visibility. */
+    identity_emit_peer_observed(proc, new_peer);
 
     /* Two-phase admission (§3.1-a): propagate the group key only for a
      * CONFIRMED peer. A provisional add records the peer above (visibility /
@@ -4738,6 +4747,8 @@ bool handle_attest_response(process_t *proc, directory_t *queues,
      * the local peer mirror sees a LIVE value instead of the stamp captured
      * once at admission — the gap this closes. */
     peers_write_lock(proc);
+    public_identity_t updated = {0};
+    bool matched = false;
     for (int i = 0; i < proc->protocol.num_peers; i++) {
         if (uuid_compare(proc->protocol.peers[i].uuid, nmsg->from_whom.uuid) != 0)
             continue;
@@ -4746,9 +4757,16 @@ bool handle_attest_response(process_t *proc, directory_t *queues,
             /* Durable half: a peer that just proved an operator credential IS
              * operator-bound, even with nobody at the console right now. */
             proc->protocol.peers[i].operator_bound = true;
+        updated = proc->protocol.peers[i];
+        matched = true;
         break;
     }
     peers_write_unlock(proc);
+
+    /* Both operator signals just changed, so the app's view is stale until we
+     * say so. Emitted outside the lock — messaging_send is a syscall. */
+    if (matched)
+        identity_emit_peer_observed(proc, &updated);
 
     json_decref(payload);
     return true;
@@ -4890,7 +4908,92 @@ int identity_set_peer_rank(process_t *proc, const char *uuid, int rank)
     data_t *rd = integer_data(rank);
     if (rd == NULL || map_set(proc->protocol.peer_ranks, (map_key_t)uuid, rd) != 0)
         return -1;
+    /* A rank change is a change in what we observe about the peer, so the
+     * app-facing view is re-emitted. Cheap: one local datagram. */
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        char pu[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, pu);
+        if (strcmp(pu, uuid) == 0)
+        {
+            public_identity_t snapshot = proc->protocol.peers[i];
+            peers_read_unlock(proc);
+            identity_emit_peer_observed(proc, &snapshot);
+            return 0;
+        }
+    }
+    peers_read_unlock(proc);
     return 0;
+}
+
+
+/****************************
+ * The app-facing peer carrier (ethne D5/D7; see
+ * doc/architecture/app-peer-carrier.md).
+ *
+ * Emits to AT_MAIN_QUEUE rather than to the app directly: a sub-process does
+ * not know the app's queue name, and the main loop already owns the outward
+ * hop (fleet's UPDATE_ACCEPTED takes the same route).
+ ****************************/
+
+int identity_emit_peer_observed(const process_t *proc,
+                                const public_identity_t *peer)
+{
+    if (peer == NULL)
+        return -1;
+    generic_msg_t msg = {0};
+    msg.type = PEER_OBSERVED;
+    msg.size = sizeof(peer_observed_msg_t);
+    uuid_copy(msg.info.peer_observed.peer_uuid, peer->uuid);
+    memcpy(msg.info.peer_observed.signing_pubkey, peer->signature.public,
+           crypto_sign_PUBLICKEYBYTES);
+    char pu[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer->uuid, pu);
+    msg.info.peer_observed.rank = _roster_member_rank(proc, pu);
+    msg.info.peer_observed.operator_bound = peer->operator_bound;
+    /* Gated on operator_bound deliberately: an attendance stamp on a node
+     * whose operator credential never verified attests to nothing, and a
+     * consumer that received it would have to know to distrust it. */
+    msg.info.peer_observed.operator_attested_at =
+        peer->operator_bound ? peer->operator_attested_at : 0.0;
+    return messaging_send(AT_MAIN_QUEUE, PEER_OBSERVED, &msg, false);
+}
+
+
+int identity_emit_all_peers(const process_t *proc)
+{
+    if (proc == NULL)
+        return 0;
+    /* Snapshot under the lock, emit outside it: messaging_send is a syscall
+     * and holding the peers lock across it would block every writer. */
+    public_identity_t snapshot[DEFAULT_MAX_PEERS];
+    peers_read_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    if (n > DEFAULT_MAX_PEERS)
+        n = DEFAULT_MAX_PEERS;
+    for (size_t i = 0; i < n; i++)
+        snapshot[i] = proc->protocol.peers[i];
+    peers_read_unlock(proc);
+
+    int emitted = 0;
+    for (size_t i = 0; i < n; i++)
+        if (identity_emit_peer_observed(proc, &snapshot[i]) == 0)
+            emitted++;
+    return emitted;
+}
+
+
+/* Handler: the app asked for the current peer view (PEER_ROSTER_REQUEST). */
+static bool handle_peer_roster_request(const process_t *proc,
+                                       directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    (void)msg;
+    int n = identity_emit_all_peers(proc);
+    log_debug(proc->logger,
+              "Identity: peer roster request -> %d observation(s)\n", n);
+    return true;
 }
 
 /* Parse ONE group_child_*.cfg.json into a heap group_t (member enumeration
@@ -5004,6 +5107,8 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_IDENTITY_RESPONSE,
                              (handler_ptr_t)handle_identity_response);
     process_register_handler(proc, ID_TIER,          (handler_ptr_t)handle_tier_update);
+    process_register_handler(proc, ID_APP_ROSTER,
+                             (handler_ptr_t)handle_peer_roster_request);
     process_register_handler(proc, ID_PARTITION_SIGNAL,
                              (handler_ptr_t)handle_partition_signal);
     process_register_handler(proc, ID_PARTITION_PROBE,

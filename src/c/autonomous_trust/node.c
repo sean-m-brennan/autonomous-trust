@@ -111,8 +111,15 @@ int at_node_start(at_node_t *node)
 
     init_sig_handling(NULL);
 
-    /* Set up IPC so the host app can send messages to AT sub-processes */
-    if (messaging_init(node->config.app_name, &node->app_queue) != 0)
+    /* Set up IPC. The queue we BIND has to be the one the daemon sends to,
+     * which is `q_in` (AT -> app) — binding `app_name` instead left the
+     * daemon's outbound datagrams addressed to a socket path nobody had
+     * bound, so nothing an app was meant to receive ever arrived. Falls back
+     * to app_name for a caller that sets no q_in and only ever sends. */
+    const char *inbound = (node->config.q_in != NULL
+                           && node->config.q_in[0] != '\0')
+                              ? node->config.q_in : node->config.app_name;
+    if (messaging_init(inbound, &node->app_queue) != 0)
         log_exception(&node->log);
     messaging_assign(&node->app_queue);
 
