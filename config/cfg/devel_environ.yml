@@ -74,3 +74,9 @@ dependencies:
   - beautifulsoup4
   - playwright
   - pyee
+
+  - pip
+  - pip:
+      - jcs  # conformance: JSON Canonicalization Scheme, used by
+             # harness/common/canonical.py to compare and regenerate the
+             # byte-pinned wire vectors. No conda-forge package (checked).
