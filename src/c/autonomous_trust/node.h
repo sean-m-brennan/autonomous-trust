@@ -99,6 +99,11 @@ typedef int (*at_node_tick_fn)(at_node_t *node, void *user_data);
  * Initialise the node: create logger, ensure cfg/data directories exist,
  * optionally run config generation.
  * Returns 0 on success.
+ *
+ * @p cfg may alias `&node->config`; it is copied before the node is cleared.
+ * The config stores the caller's string pointers rather than copying them, so
+ * they must outlive the node (`at_node_shutdown` logs `app_name`). A caller
+ * that cannot promise that should own copies — see app_node.h, which does.
  */
 /*@
   requires \valid(node);
@@ -115,6 +120,10 @@ int at_node_init(at_node_t *node, const at_node_config_t *cfg);
 /**
  * Launch the AT daemon, install signal handlers, set up IPC.
  * Returns 0 on success (daemon PID stored internally).
+ *
+ * Binding the inbound queue (`q_in`, falling back to `app_name`) is part of
+ * success: if it fails, the daemon is stopped again and this returns non-zero,
+ * because an app that cannot receive is not started, however live the daemon.
  */
 /*@
   requires \valid(node);

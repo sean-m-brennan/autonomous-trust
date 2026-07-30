@@ -218,6 +218,37 @@ result either way. `unrated` is the other load-bearing observation: it can only
 cross on the pull, since every change-driven emission is rated by construction,
 so a run that never shows one has not exercised that path.
 
+## Test support for a foreign consumer (2026-07-30)
+
+`app_events_test_support.{h,c}` — `at_app_test_emit_peer` and
+`at_app_test_emit_reputation` — put the **daemon's** side of this wire in the same
+flat form as the consumer's side, so a binding in another language can test its
+decoder end to end. Nothing in AT calls them; they have the same standing as
+`messaging_set_test_hook`.
+
+The gap they close is specific. A foreign consumer can *receive* through the flat
+ABI without knowing AT's internals, but cannot *send* one event without
+constructing a `generic_msg_t` — the union nobody should mirror. So `ethne`'s
+decoder was complete, linked, and tested with **no event ever having crossed the
+boundary**. Now five of its tests drive the whole path.
+
+Two properties to preserve if these are ever edited:
+
+- **They need no queue of their own.** `at_app_events_open` already calls
+  `messaging_assign`, so a consumer that bound `"q"` can emit *to* `"q"` and loop a
+  synthetic event back to itself over the real socket. With nothing assigned they
+  return -1 rather than appearing to send.
+- **They sanitize nothing** — in particular an attendance stamp is not zeroed when
+  `operator_bound` is false, though `identity_emit_peer_observed` does zero it. A
+  helper that copied the emitter's gating could not be used to test a consumer's
+  own gating of that field, which is one of the things a consumer most needs to
+  test.
+
+One caution for anyone writing such tests: AT's messaging keeps **process-global**
+state (`AUTONOMOUS_TRUST_ROOT` resolves socket paths, `messaging_assign` sets the
+sending queue), so tests that bind queues in one process must be serialized.
+ethne's first parallel run of them failed after two had passed by luck.
+
 ## Two further breaks, found by the first live cohort (2026-07-30)
 
 The first 3-node run reported no observations, no roster-verb line, and no
@@ -290,3 +321,132 @@ the `unrated` path is pinned by
 And a pull can also return nothing because `reputation_emit_all` returns early
 while `rep_state.initialized` is false, which is the same lesson arriving by a
 second route.
+
+## Owning the daemon from another language (2026-07-30)
+
+`app_node.{h,c}` — `at_app_node_start` / `at_app_node_alive` / `at_app_node_pid` /
+`at_app_node_stop` — completes the ladder the sections above started. A foreign
+consumer could *receive* AT's events through the flat ABI and still had no way to
+*start* AT, so the whole surface only worked for a host that already had a daemon.
+
+`node.h` is the lifecycle for a **C** embedder and cannot be bound from another
+language: `at_node_init` and `at_node_start` take an `at_node_t *` the caller
+allocates, and `at_node_t` embeds `logger_t` and `queue_t` **by value**, so a
+foreign mirror of it reproduces two opaque C layouts — the silent-corruption
+hazard the flat ABI exists to prevent, exactly as break #5 was. `run_autonomous_trust`
+looks flat enough to call directly and is not a safe shortcut: its declared
+contract ("blocks until the daemon exits", returning 0/non-zero) disagrees with
+`node.c`, which assigns the return value to `daemon_pid` and carries on, and its
+header declares `capabilities` as `void *` where the definition takes
+`capability_t *`. So: an **opaque heap handle**, nothing mirrored.
+
+The ordering has one sharp edge, and it is the same one `at_app_events_open_existing`
+was written for. `at_app_node_start` binds `q_in` and makes it the process's
+assigned queue, so a consumer reads with `at_app_events_open_existing`, **not**
+`at_app_events_open` — two binders of one name fight over the socket path and the
+second unlinks the first's. On the way down the reader closes first, because it
+borrows the node's queue.
+
+No `capabilities` parameter: `run_autonomous_trust` opens by discarding
+`capabilities`/`cap_len`. Propagating a knob that does nothing is worse than
+omitting it. There is likewise no `max_iterations` — a foreign host owns its own
+loop and never calls `at_node_run`.
+
+### Three defects this turned up, all of them silent
+
+**1. The wrapper discarded every argument it was given.** It passed
+`&node->config` to `at_node_init`, which opens by `memset`ting the node — so the
+config was zeroed before it was read, and each field fell back to a default with
+`init` still returning 0. Measured against the built library:
+
+| set by the caller | what survived |
+|---|---|
+| `app_name = "ethne"` | `"at_node"` |
+| `q_in = "at_to_app"` | `"at_to_extern"` |
+| `q_out = "app_to_at"` | `"extern_to_at"` |
+| `log_level = INFO` | `0`, below `DEBUG` |
+| `log_file = "/tmp/probe.log"` | `(null)` |
+| `generate_config = true` | `false` |
+
+Worst of those is `generate_config`: the knob a consumer points at a root with no
+config did nothing at all. And the wrapper validated `log_level` and then handed
+the daemon a zero. `at_node_init` now copies the config *before* the memset and
+reads only the copy — a caller may legitimately alias it — which also fixes the
+logger, whose level and file were read through the same stale pointer.
+
+**2. A lifetime obligation nobody was told about.** `at_node_config_t` stores the
+caller's `const char *`s, and `at_node_shutdown` reads `app_name` — so the strings
+had to outlive the node. Across a language boundary (a Rust `CString` temporary)
+that is a dangling read with nothing to warn you. The handle now owns copies of all
+four strings, and the header says the caller may free its own immediately.
+
+**3. A failed inbound bind was a warning.** `at_node_start` logged
+`messaging_init`'s failure and returned 0, so a host held a live daemon it could
+never receive from — break #4's shape, and indistinguishable from a quiet network.
+It is now fatal: the bind moved into `at_node_bind_inbound` (`node_priv.h`) so the
+failure is reachable from a test, `at_node_start` reaps the daemon it just forked
+rather than orphan it, and a non-NULL handle therefore means *the event stream is
+reachable*, not merely that a daemon is running.
+
+### What the flat entry points refuse
+
+Rejection rather than repair, in both `app_node.h` and `app_events.h`: an empty or
+missing name; one name used for both directions (the daemon would receive its own
+output); a log level off the `log_level_t` scale (0 or 99 is a misunderstanding,
+and silently picking a level hides it); and **a queue name longer than the 63 bytes
+`messaging_init` keeps**. That last one is break #4 by another route — a silently
+shortened name is a different name, so the app binds one string and the daemon
+sends to another. `at_app_events_open` and `at_app_events_request_roster` had the
+same hole and now share the check.
+
+### Verification
+
+    app_node_test     12 cases, 77 checks, 0 failures
+    ctest             83/83  (was 82/82)
+    library warnings  0
+    conformance       C 156/156, Python 156/0 failed, 0 asymmetric,
+                      only-python=0, only-c=0
+    ethne en-at       40 tests under `at-ffi` against this library, 3 consecutive
+                      parallel runs green, 0 warnings
+
+Every defect above is pinned by a test **confirmed to fail** when the defect is
+reintroduced. Seven controls, each rebuilt and run:
+
+| Control | Caught by |
+|---|---|
+| alias fix reverted | 5 failures — `app_name "at_node" != "ethne"`, and the logger's level `0 != 3` |
+| strings borrowed, not copied | 3 failures — `cfg.app_name` reads `"xxxxx"` |
+| bind failure non-fatal again | `at_node_bind_inbound` returned 0 |
+| over-long names truncated | 5 failures — **and `at_app_node_start` forked a real daemon**, which is what the guard prevents |
+| `app_name` bound instead of `q_in` | 5 failures, incl. the bound key being `"bind_probe"` |
+| log-level range check dropped | 3 failures — and a daemon forked on a level of `0` |
+| failed socket left open | the open-descriptor count, `5 != 4` |
+
+Baseline and post-restore runs both green, so none of those passes vacuously.
+
+Two notes on that table. The `generate_config` test is **not** a control for the
+aliasing defect (it builds its own config, so it survives with the bug present) —
+it pins that the knob still reaches the generator, which is a different regression.
+And the truncation control is the one that explains why these controls run to a
+file rather than a pipe: the daemon it forks cannot live in this sandbox, and its
+orphaned children hold an inherited stdout open long after the test has exited.
+
+### Honest limits
+
+**No readiness handshake, still.** `at_app_node_start` returns as soon as the
+daemon is forked, so the first verb a consumer sends may find no recipient — the
+race behind D1 above. The retry-and-refresh pattern is documented on
+`at_app_events_request_roster` and implemented in `at_demo`/`example.c`, but the
+correct fix remains a daemon-readiness signal in `node.c` plus daemon startup,
+which every app-to-AT verb needs and which this slice deliberately did not take.
+
+**Start and stop are not covered by a test, only by their arguments.** A unit test
+cannot follow a fork, and the daemon cannot start in this sandbox at all (ISSUES.md
+§2.1.1). What is tested is everything that decides what the daemon is told, plus
+the bind that used to fail silently. A live `start` → `poll` → `stop` through the
+flat ABI is a cohort-run check, not an in-sandbox one.
+
+**The headers are now installed.** `app_events.h`, `app_events_test_support.h`,
+`app_node.h` and `node.h` were reachable only through the source tree — an
+installed `libautonomous_trust` shipped none of the app-facing surface. They are in
+`libhdr` now.

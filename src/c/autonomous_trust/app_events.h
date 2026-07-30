@@ -113,9 +113,11 @@ typedef struct at_app_events_s at_app_events_t;
  *
  * @param[in] q_in  Queue name the daemon sends to — the same string passed as
  *                  `q_in` in @ref at_node_config_t. Binding any other name
- *                  receives nothing.
- * @return Handle, or NULL on failure (the name is already bound, or the
- *         socket path is unavailable).
+ *                  receives nothing. At most 63 bytes, the length the messaging
+ *                  layer keeps; a longer name is refused rather than shortened,
+ *                  since a shortened name is another name.
+ * @return Handle, or NULL on failure (the name is empty or too long, already
+ *         bound, or the socket path is unavailable).
  */
 at_app_events_t *at_app_events_open(const char *q_in);
 
@@ -172,7 +174,8 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
  *
  * @param[in] handle From @ref at_app_events_open.
  * @param[in] q_out  Queue name the daemon receives on — the same string
- *                   passed as `q_out` in @ref at_node_config_t.
+ *                   passed as `q_out` in @ref at_node_config_t. Same 63-byte
+ *                   limit, refused the same way.
  * @return 0 on success, -1 on failure.
  */
 int at_app_events_request_roster(at_app_events_t *handle, const char *q_out);
