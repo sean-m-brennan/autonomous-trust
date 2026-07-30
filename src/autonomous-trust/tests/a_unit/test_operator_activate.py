@@ -23,7 +23,16 @@ import pytest
 pytest.importorskip("cryptography")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.abspath(os.path.join(_HERE, '..', '..', '..', '..'))
+# Search upward for the dir holding the importable minting helpers rather than
+# counting '..' levels: under the integration test container the tests live at
+# /app/tests/a_unit, where a fixed four levels up clamps to '/'. Keying on the
+# file also steps past src/autonomous-trust, whose own tools/ is a different
+# package that does not provide provision_zta_certs.
+_ROOT = _HERE
+while _ROOT != os.path.dirname(_ROOT):
+    if os.path.isfile(os.path.join(_ROOT, 'tools', 'provision_zta_certs.py')):
+        break
+    _ROOT = os.path.dirname(_ROOT)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 

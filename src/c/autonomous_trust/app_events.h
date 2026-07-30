@@ -159,6 +159,17 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
  * whatever loop the host already runs until it succeeds. `src/c/example.c` and
  * `examples/demo/src/at_demo.c` both show the shape.
  *
+ * @warning **Then keep asking — a successful send is not a useful answer.** A
+ * pull reports what AT knows *now*, and a node that has not finished discovery
+ * knows nothing: measured on a cold 3-node cohort, the first successful pull
+ * returned 0 peers 23 seconds before the first admission. A consumer that pulls
+ * once at startup will conclude AT has no peers, and will never observe an
+ * unrated peer, since `rated == false` crosses on the pull alone. Re-pull
+ * periodically, or whenever a fresh full view is wanted. Repeats are cheap and
+ * safe: the feed is upsert-only, so a restated observation costs one message.
+ * (A pull can also return nothing because the reputation process has not
+ * finished initializing, which is the same lesson.)
+ *
  * @param[in] handle From @ref at_app_events_open.
  * @param[in] q_out  Queue name the daemon receives on — the same string
  *                   passed as `q_out` in @ref at_node_config_t.
