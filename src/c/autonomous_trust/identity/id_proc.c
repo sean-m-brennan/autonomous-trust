@@ -44,6 +44,7 @@
 #include "zta/zta_policy.h"
 #include "zta/zta_verifier.h"
 #include "zta/zta_audit.h"
+#include "zta/x509_verifier.h"   /* x509_verify_data_signature, for the binding */
 #endif
 
 /* Operator-attended signal helpers (ethne D8/Q9); defined below _build_announcement
@@ -54,6 +55,9 @@ static void _apply_operator_attestation_json(const json_t *att, public_identity_
 static bool _is_operator_credential(const zta_policy_t *policy,
                                     const uint8_t *cred, size_t cred_len,
                                     const uint8_t *advertised_hash);
+static void _verify_operator_key(const process_t *proc,
+                                 public_identity_t *pub,
+                                 const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES]);
 #endif
 
 DEFINE_ERROR(EID_NOQ, "Required process queue missing");
@@ -927,6 +931,10 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         return true;
     }
 
+    /* The guardian key a peer CLAIMS, held aside while the peer's own copy is
+     * neutralized (see just below). Empty whenever the peer advertised none. */
+    uint8_t claimed_operator_key[crypto_sign_PUBLICKEYBYTES] = {0};
+
     /* Operator-attended signal (ethne D8/Q9): deliver any wire-carried
      * attestation (payload slot 2) onto from_whom — the ZTA credential is NOT
      * on the envelope, so this is what makes a real-wire credential available
@@ -944,6 +952,20 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
             json_decref(apayload);
         }
         nmsg->from_whom.operator_bound = false;
+        /* Same rule for the guardian identity, with one wrinkle: an advertised
+         * operator_pubkey is a CLAIM until we verify its binding, so it cannot
+         * stay on the peer — but the gate below needs it, because the key is part
+         * of the pre-image the operator signed. So it moves to a local and the
+         * field is zeroed. A stored peer with a key is therefore one we verified,
+         * and a build with no ZTA gate at all leaves every peer keyless, which is
+         * the same fail-safe operator_bound takes. Declining to advertise a key
+         * reaches the gate looking exactly like a refused claim — deliberately:
+         * both mean "no guardian recorded", and only the logging tells them
+         * apart. */
+        memcpy(claimed_operator_key, nmsg->from_whom.operator_pubkey,
+               sizeof(claimed_operator_key));
+        memset(nmsg->from_whom.operator_pubkey, 0,
+               sizeof(nmsg->from_whom.operator_pubkey));
     }
 
 #ifdef AT_ZTA_ENABLED
@@ -1038,6 +1060,18 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
                         log_info(proc->logger,
                                  "Identity: %s is operator-attended (human guardian)\n",
                                  nmsg->from_whom.nickname);
+                        /* WHICH human, if the peer opted in: credit the claimed
+                         * guardian key only when the operator's own credential
+                         * signed a binding naming THIS node (uuid + signing key),
+                         * so a (key, binding) pair lifted from another peer's
+                         * announce buys nothing. Absent is the normal case and
+                         * silent; present-but-invalid is a forgery attempt and
+                         * says so, but does NOT demote operator_bound — that is
+                         * independently earned above, and node key rotation
+                         * legitimately stales a binding. Losing a guardian edge
+                         * is the failure mode; losing admission is not. */
+                        _verify_operator_key(proc, &nmsg->from_whom,
+                                             claimed_operator_key);
                     }
                 }
                 if (zta_result.status == ZTA_UNAVAILABLE || zta_result.status == ZTA_DEFERRED) {
@@ -3090,6 +3124,29 @@ static json_t *_operator_attestation_json(const public_identity_t *pub)
     if (pub->operator_attested_at > 0.0)
         json_object_set_new(att, "operator_attested_at",
                             json_real(pub->operator_attested_at));
+    /* The OPT-IN guardian identity. Outside the ZTA guard, like operator_bound:
+       what a node advertises must not depend on how it was built, only what it
+       can verify does. Both halves or neither — a key with no binding is
+       unverifiable, a binding with no key names nobody — and nothing at all when
+       the node declined, which keeps a declining node's payload byte-identical to
+       one built before these fields existed. */
+    if (!at_operator_pubkey_empty(pub->operator_pubkey)
+        && pub->operator_key_binding != NULL && pub->operator_key_binding_len > 0) {
+        size_t klen = b64_encoded_len(sizeof(pub->operator_pubkey));
+        char *kb64 = malloc(klen);
+        size_t blen = b64_encoded_len(pub->operator_key_binding_len);
+        char *bb64 = malloc(blen);
+        if (kb64 != NULL && bb64 != NULL) {
+            base64_encode(pub->operator_pubkey, sizeof(pub->operator_pubkey),
+                          kb64, klen);
+            base64_encode(pub->operator_key_binding, pub->operator_key_binding_len,
+                          bb64, blen);
+            json_object_set_new(att, "operator_pubkey", json_string(kb64));
+            json_object_set_new(att, "operator_key_binding", json_string(bb64));
+        }
+        free(kb64);
+        free(bb64);
+    }
 #ifdef AT_ZTA_ENABLED
     if (pub->zta_issuer[0] != '\0')
         json_object_set_new(att, "zta_issuer", json_string(pub->zta_issuer));
@@ -3125,6 +3182,34 @@ static void _apply_operator_attestation_json(const json_t *att, public_identity_
     pub->operator_bound = json_is_true(json_object_get(att, "operator_bound"));
     json_t *oa = json_object_get(att, "operator_attested_at");
     pub->operator_attested_at = json_is_number(oa) ? json_number_value(oa) : 0.0;
+    /* The guardian CLAIM. A wrong-length key is dropped whole (a truncated
+       ed25519 key is a different key) and an oversized binding refused. The
+       welcoming committee neutralizes the key and re-earns it from the binding;
+       what arrives here is only what the peer asserted. */
+    const char *okb64 = json_string_value(json_object_get(att, "operator_pubkey"));
+    if (okb64 != NULL) {
+        size_t declen = b64_decoded_len_s(strlen(okb64), okb64);
+        if (declen == sizeof(pub->operator_pubkey))
+            base64_decode(okb64, strlen(okb64), pub->operator_pubkey, declen);
+    }
+    const char *obb64 = json_string_value(
+        json_object_get(att, "operator_key_binding"));
+    if (obb64 != NULL) {
+        size_t declen = b64_decoded_len_s(strlen(obb64), obb64);
+        if (declen > 0 && declen <= OPERATOR_BINDING_MAX) {
+            if (pub->operator_key_binding != NULL) {  /* free prior, no leak */
+                free(pub->operator_key_binding);
+                pub->operator_key_binding = NULL;
+                pub->operator_key_binding_len = 0;
+            }
+            pub->operator_key_binding = malloc(declen);
+            if (pub->operator_key_binding != NULL) {
+                base64_decode(obb64, strlen(obb64), pub->operator_key_binding,
+                              declen);
+                pub->operator_key_binding_len = declen;
+            }
+        }
+    }
 #ifdef AT_ZTA_ENABLED
     const char *iss = json_string_value(json_object_get(att, "zta_issuer"));
     if (iss != NULL)
@@ -3181,6 +3266,60 @@ static bool _is_operator_credential(const zta_policy_t *policy,
     bool ok = (r.status == ZTA_VERIFIED);
     op->destroy(op);
     return ok;
+}
+
+/* Credit a peer's OPT-IN guardian identity, if it advertised one and the binding
+ * holds. Called only after the peer's credential has been classified
+ * operator-class, because a binding signed by a credential with no standing to
+ * name a guardian names nobody.
+ *
+ * Three outcomes, and the middle one is the point of the whole design:
+ *   - no claim         -> silent. The default, and it must stay costless.
+ *   - claim + binding verifies -> the key is written onto the peer. From here on,
+ *     a stored peer with a key is one we verified.
+ *   - claim + binding fails    -> the key stays zero and we say so. operator_bound
+ *     is NOT demoted: it was earned independently, and a stale binding after node
+ *     key rotation is an honest cause of this. */
+static void _verify_operator_key(const process_t *proc,
+                                 public_identity_t *pub,
+                                 const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES])
+{
+    if (pub == NULL || claimed_key == NULL)
+        return;
+    bool claimed = !at_operator_pubkey_empty(claimed_key);
+    if (!claimed && (pub->operator_key_binding == NULL
+                     || pub->operator_key_binding_len == 0))
+        return;                      /* declined; the normal case */
+    if (!claimed || pub->operator_key_binding == NULL
+        || pub->operator_key_binding_len == 0) {
+        /* Half a claim is not a claim: a key with no binding is unverifiable and a
+         * binding with no key names nothing. Worth a word either way, because both
+         * halves are written by the same code path — one arriving without the
+         * other means something upstream is broken, not that a peer declined. */
+        log_warn(proc->logger,
+                 "Identity: %s advertised half an operator-key binding "
+                 "(key %s, binding %s); no guardian recorded\n",
+                 pub->nickname, claimed ? "present" : "absent",
+                 pub->operator_key_binding_len > 0 ? "present" : "absent");
+        return;
+    }
+
+    uint8_t preimage[OPERATOR_BINDING_PREIMAGE_LEN];
+    if (operator_binding_preimage(pub, claimed_key, preimage) != 0)
+        return;
+    if (x509_verify_data_signature(pub->zta_credential, pub->zta_credential_len,
+                                   preimage, sizeof(preimage),
+                                   pub->operator_key_binding,
+                                   pub->operator_key_binding_len)) {
+        memcpy(pub->operator_pubkey, claimed_key, crypto_sign_PUBLICKEYBYTES);
+        log_info(proc->logger,
+                 "Identity: %s guardian key bound and verified\n", pub->nickname);
+    } else {
+        log_warn(proc->logger,
+                 "Identity: %s advertised an operator key whose binding does not "
+                 "verify against its operator credential; no guardian recorded "
+                 "(operator_bound stands on its own)\n", pub->nickname);
+    }
 }
 #endif
 
@@ -4977,6 +5116,15 @@ int identity_emit_peer_observed(const process_t *proc,
      * consumer that received it would have to know to distrust it. */
     msg.info.peer_observed.operator_attested_at =
         peer->operator_bound ? peer->operator_attested_at : 0.0;
+    /* The guardian identity, gated the same way and for the same reason. A
+     * stored key already means we verified its binding (the gate zeroes an
+     * unverified claim at admission), so this copies rather than re-checks —
+     * but the operator_bound gate stays, because the two are one answer: a
+     * named guardian on a node whose human never verified is a contradiction,
+     * and ethne's chartered edge would read it as an authority it is not. */
+    if (peer->operator_bound)
+        memcpy(msg.info.peer_observed.operator_pubkey, peer->operator_pubkey,
+               crypto_sign_PUBLICKEYBYTES);
     return messaging_send(AT_MAIN_QUEUE, PEER_OBSERVED, &msg, false);
 }
 

@@ -52,6 +52,61 @@ chains and rejects unknown-issuer certs — verified against the existing test C
 
 `NullVerifier` always returns `VERIFIED` (the runtime-disabled path, per §5).
 
+### 2.1 CA bundle / CRL encodings and bad-file diagnostics — **at parity**
+
+Both backends accept every encoding agency PKI ships, and both name a wrong-kind file instead
+of failing opaquely. Per-credential verdicts are unchanged on either side; this is *local
+configuration* handling.
+
+| CA bundle (`ca_bundle_path`) | Python `_load_bundle_certs` / `_classify_bundle` | C `x509_verifier_create` |
+|---|---|---|
+| Concatenated PEM | ✅ | ✅ `PEM_read_bio_X509` loop |
+| Single DER cert | ✅ | ✅ `d2i_X509_bio` |
+| PKCS#7 (`.p7b`/`.p7c`, DER or PEM) | ✅ | ✅ `d2i_PKCS7_bio` / `PEM_read_bio_PKCS7` |
+| Directory of PEMs | — | ✅ `X509_STORE_load_locations` |
+| Wrong-kind file (CRL / key / CSR) | reject reason names the file and what it is | `EX509_CAKIND` (vs `EX509_CALOAD` for unreadable/garbage) |
+| Loaded but **zero certificates** | `bundle_error`, everything rejected with that reason | load fails; see below |
+
+| CRL (`crl_path`) | Python `_load_crl` / `_classify_crl` | C `_load_crl_file` |
+|---|---|---|
+| PEM CRL | ✅ | ✅ `PEM_read_bio_X509_CRL` |
+| DER CRL (the usual agency encoding) | ✅ | ✅ `d2i_X509_CRL_bio` |
+| Unusable / missing file | `UNAVAILABLE` naming the file and cause | `UNAVAILABLE` naming the file and cause |
+
+The DER-CRL gap was the worst of these: a configured DER CRL parsed as nothing and fell through
+to "no revocation source configured" / "no revocation check method configured" —
+indistinguishable from having configured no CRL at all, so revocation checking appeared wired up
+while doing nothing. Both sides now return `UNAVAILABLE`, never `VERIFIED`, when the CRL cannot
+be read: a check that cannot run must not read as "not revoked".
+
+**Two silent-empty-store traps closed while doing this**, one per backend. Python's
+`_load_store` swallowed both parse exceptions and left `{}`. On the C side
+`X509_STORE_load_locations` *succeeds* on a file with no certificates — and, because it loads a
+PEM file's CRLs too, a CRL in the bundle slot produced a "successful" load with zero trust
+anchors. The C fallback therefore counts `X509_LU_X509` objects specifically and treats zero as
+a load failure.
+
+Coverage: `tests/a_unit/test_zta_bundle_formats.py` (33 tests, Python) and
+`src/c/test/zta_verifier_test.c` (82 checks incl. 10 new bundle/CRL cases, run under
+`-DAT_ZTA=ON`).
+
+PKCS#7 matters because it is the format agency PKI (incl. DoD) ships chains in; requiring an
+out-of-band `openssl pkcs7 -print_certs` step is a live foot-gun. The wrong-kind diagnostics
+exist because an unparseable bundle previously left an **empty trust store**, so every
+credential was `REJECTED` "unable to get local issuer certificate" — blaming the peer for a
+local file mix-up. Python now reports e.g. *"CA bundle x.crl holds no certificates: this is a
+CRL (revocation list), not CA certificates — pass it as crl_path/--crl-path…"*, still with
+status `REJECTED` (C parity: nothing verifies without an anchor; no new status).
+
+One asymmetry remains by design: C conveys a bad bundle as a **return code** from
+`x509_verifier_create` (`EX509_CAKIND` / `EX509_CALOAD`), since that API has no reason-string
+channel, whereas Python constructs successfully and reports `bundle_error` in the reject reason.
+Same information, different delivery — the C verifier simply never comes into existence with an
+unusable store.
+
+Note for the C side: `DECLARE_ERROR` descriptions may not contain commas — `preprocess.py`
+splits the macro's arguments on them when generating the error table.
+
 **OCSP/CRL** are optional in both implementations (empty `ocsp_url`/`crl_path` disables
 them). The Python `check_revocation` supports a CRL file (serial-number match → `REVOKED`,
 else "CRL loaded; not revoked") and treats an unreachable/unset OCSP responder as
