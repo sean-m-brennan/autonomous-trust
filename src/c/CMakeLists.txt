@@ -429,6 +429,13 @@ set(table_headers_in
 set(libsrc
     autonomous_trust/autonomous_trust.c
     autonomous_trust/app_events.c
+    # The daemon's side of the app-facing wire, in flat form, so a foreign
+    # consumer's tests can play daemon. Nothing in AT calls it; it is here for
+    # the same reason messaging_set_test_hook is in message.h.
+    autonomous_trust/app_events_test_support.c
+    # The flat counterpart to node.h, for a consumer in another language:
+    # at_node_t embeds logger_t and queue_t by value and cannot be mirrored.
+    autonomous_trust/app_node.c
     autonomous_trust/node.c
     autonomous_trust/algorithms/agreement.c
     autonomous_trust/algorithms/paxos.c
@@ -661,6 +668,14 @@ endif()
 
 set(libhdr
     autonomous_trust.h
+    # The app-facing surface. These are the headers a consumer in another
+    # language compiles against, so an installed library that omits them is
+    # unusable from outside C — app_events.h was reachable only through the
+    # source tree until now.
+    autonomous_trust/app_events.h
+    autonomous_trust/app_events_test_support.h
+    autonomous_trust/app_node.h
+    autonomous_trust/node.h
     autonomous_trust/algorithms/agreement.h
     autonomous_trust/algorithms/algorithms.h
     autonomous_trust/algorithms/paxos.h
@@ -1418,6 +1433,13 @@ add_executable(app_events_test test/app_events_test.c)
 set_source_files_properties(test/app_events_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(app_events_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME app_events_test COMMAND $<TARGET_FILE:app_events_test>)
+
+# The flat lifecycle ABI (app_node.h) and the non-forking half of
+# at_node_start. Creates and binds under its own AUTONOMOUS_TRUST_ROOT.
+add_executable(app_node_test test/app_node_test.c)
+set_source_files_properties(test/app_node_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(app_node_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME app_node_test COMMAND $<TARGET_FILE:app_node_test>)
 
 # Envelope codec unit tests — gated by AT_NET_ENVELOPE since the codec TU
 # itself is only compiled when that option is ON.
