@@ -29,7 +29,7 @@
  *
  * Usage:
  *   at_app_events_t *ev = at_app_events_open("at_to_extern");
- *   at_app_events_request_roster(ev, "extern_to_at");   // optional, once
+ *   at_app_events_request_roster(ev, "extern_to_at");   // optional; RETRY
  *   at_app_event_t batch[32];
  *   int n = at_app_events_poll(ev, batch, 32);          // non-blocking
  *   ...
@@ -149,7 +149,15 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
  *
  * The carrier is otherwise event-driven, so a consumer that attached after
  * the node admitted its peers sees nothing until something changes. Call this
- * once after opening, and again whenever a fresh full view is wanted.
+ * after opening, and again whenever a fresh full view is wanted.
+ *
+ * @warning **Retry until it returns 0 — a single call at startup loses a
+ * race.** Nothing waits for the daemon to be ready: `at_node_start` forks it
+ * and returns, so until AT's identity and reputation processes have bound their
+ * queues there is no recipient and the request is dropped. This function is
+ * caller-driven by design, so the retry is the host's: call it on each pass of
+ * whatever loop the host already runs until it succeeds. `src/c/example.c` and
+ * `examples/demo/src/at_demo.c` both show the shape.
  *
  * @param[in] handle From @ref at_app_events_open.
  * @param[in] q_out  Queue name the daemon receives on — the same string

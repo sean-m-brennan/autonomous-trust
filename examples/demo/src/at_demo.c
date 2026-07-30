@@ -24,6 +24,7 @@
 #include <sodium.h>
 
 #include "autonomous_trust.h"
+#include "autonomous_trust/utilities/message.h"
 #include "autonomous_trust/fleet/update_proposal.h"
 #include "autonomous_trust/fleet/fleet_proc.h"
 
@@ -64,6 +65,8 @@ static log_level_t parse_log_level(const char *str)
 
 typedef struct {
     bool inject_update;
+    bool roster_requested;      /* the pull has landed; stop retrying */
+    unsigned roster_attempts;
 } demo_ctx_t;
 
 /**
@@ -107,6 +110,73 @@ static void inject_self_update(at_node_t *node)
 }
 
 /* ------------------------------------------------------------------ */
+/* App-facing peer carrier                                             */
+/* ------------------------------------------------------------------ */
+
+/* Reported through the logger rather than stdout: in a container these lines
+ * belong in the same stream as the admission and reputation logs they are
+ * meant to be read against. The minimal integrator's reference is
+ * src/c/example.c; see doc/architecture/app-peer-carrier.md. */
+
+/* ~20s at the 500ms loop cadence. Past this the daemon is not coming up, and
+ * retrying forever would only bury the reason in log noise. */
+#define ROSTER_MAX_ATTEMPTS 40
+
+/**
+ * Ask AT to re-emit everything it currently knows about its peers. Worth doing
+ * at startup: the carrier is otherwise event-driven, so a node that admitted
+ * peers before this app attached would report nothing until the next change.
+ * It is also the only path on which an unrated peer can cross.
+ *
+ * Returns messaging_send's result: this MUST be retried rather than fired once.
+ * at_node_start forks the daemon and returns without waiting for it, so on the
+ * early ticks the identity and reputation processes have not necessarily bound
+ * their queues, and a single-shot request is silently lost.
+ */
+static int request_peer_roster(at_node_t *node)
+{
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_ROSTER_REQUEST;
+    req.info.net_msg.encrypt = false;
+    return messaging_send(node->config.q_out, NET_MESSAGE, &req, false);
+}
+
+static void log_peer_observed(at_node_t *node, const peer_observed_msg_t *p)
+{
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(p->peer_uuid, uuid_str);
+
+    /* The stamp is only meaningful against a clock, which is why AT does not
+     * reduce it to a bool. Bound-but-unattended is a normal steady state. */
+    const char *operator_state = "none";
+    if (p->operator_bound)
+        operator_state = p->operator_attested_at > 0.0 ? "bound" : "bound-unattended";
+
+    log_info(at_node_logger(node),
+             "peer observed: %s rank=%d key=%02x%02x..%02x operator=%s attended_at=%.0f\n",
+             uuid_str, p->rank, p->signing_pubkey[0], p->signing_pubkey[1],
+             p->signing_pubkey[crypto_sign_PUBLICKEYBYTES - 1],
+             operator_state, p->operator_attested_at);
+}
+
+static void log_peer_reputation(at_node_t *node, const peer_reputation_msg_t *r)
+{
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(r->peer_uuid, uuid_str);
+
+    /* "unrated" rather than a number: AT has no rating for this peer, and a
+     * placeholder is indistinguishable from a score a peer can genuinely earn. */
+    if (r->rated)
+        log_info(at_node_logger(node), "peer reputation: %s score=%.3f\n",
+                 uuid_str, r->score);
+    else
+        log_info(at_node_logger(node), "peer reputation: %s unrated\n", uuid_str);
+}
+
+/* ------------------------------------------------------------------ */
 /* Tick callback                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -115,6 +185,38 @@ static int demo_tick(at_node_t *node, void *user_data)
     demo_ctx_t *ctx = (demo_ctx_t *)user_data;
     if (ctx->inject_update && at_node_iteration(node) == INJECT_DELAY_ITERATIONS)
         inject_self_update(node);
+
+    if (!ctx->roster_requested && ctx->roster_attempts < ROSTER_MAX_ATTEMPTS)
+    {
+        ctx->roster_attempts++;
+        if (request_peer_roster(node) == 0)
+            ctx->roster_requested = true;
+        else if (ctx->roster_attempts == ROSTER_MAX_ATTEMPTS)
+            log_warn(at_node_logger(node),
+                     "peer roster request never accepted (%u attempts); "
+                     "the app will still see change-driven observations\n",
+                     ctx->roster_attempts);
+    }
+
+    generic_msg_t buf = {0};
+    int err = messaging_recv(&buf);
+    if (err == -1)
+        log_exception(at_node_logger(node));
+    if (err != 0)
+        return 0;  /* no message this tick */
+
+    switch (buf.type)
+    {
+    case PEER_OBSERVED:
+        log_peer_observed(node, &buf.info.peer_observed);
+        break;
+    case PEER_REPUTATION:
+        log_peer_reputation(node, &buf.info.peer_reputation);
+        break;
+    default:
+        break;
+    }
+
     return 0;
 }
 

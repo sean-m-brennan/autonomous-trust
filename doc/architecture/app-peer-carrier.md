@@ -161,9 +161,10 @@ indistinguishable, to a consumer, from one whose producer is broken.
 
 ## Verification
 
-`src/c/test/app_events_test.c` — 16 cases, 102 checks, driven through the
+`src/c/test/app_events_test.c` — 20 cases, 134 checks, driven through the
 messaging test hook, plus two that use real unix sockets because a hook cannot
-see a queue-name mismatch (break #4's failure mode).
+see a queue-name mismatch (break #4's failure mode), and three that enter
+through an admission path (see "Two further breaks" below).
 
 Each break is pinned by a test that was **confirmed to fail** when the defect
 was reintroduced:
@@ -186,4 +187,59 @@ baseline.
 with `*** stack smashing detected ***` during startup here — including on the
 unmodified `at_demo -g` path, which touches none of this code — so break #4's
 fix is verified at the mechanism level (real sockets, matching and mismatched
-names) but not against a running daemon. See ISSUES.md.
+names) but not against a running daemon. See ISSUES.md §2.1.1, which records
+that the abort does not reproduce on a host machine.
+
+## Observing the carrier on a live cohort
+
+`at_demo` carries the same three pieces as the integrator's reference
+(`src/c/example.c`): the first-tick roster pull, and a log line per
+`PEER_OBSERVED` / `PEER_REPUTATION`. It reports through the logger rather than
+stdout so the lines land in the same stream as the admission and reputation logs
+they are meant to be read against, and `Dockerfile-c` installs `at_demo` alone —
+so a container cohort reports the carrier with no image or entrypoint change:
+
+```bash
+tilt up -- --variant=c --num-nodes=3
+```
+
+A single host cannot run two C nodes: `COMM_PORT` is fixed (`network.h:28`) and
+`ping.c` / `ntp.c` bind `INADDR_ANY` on the derived ports, so peering needs a
+container or a machine per node. This is why the demos are containerized.
+
+**An empty roster emits nothing, which is indistinguishable from break #4
+returning.** Read a `peer observed` line only against the admission it should
+correspond to — a uuid the node logged admitting. Silence on its own is not a
+result either way. `unrated` is the other load-bearing observation: it can only
+cross on the pull, since every change-driven emission is rated by construction,
+so a run that never shows one has not exercised that path.
+
+## Two further breaks, found by the first live cohort (2026-07-30)
+
+The first 3-node run reported no observations, no roster-verb line, and no
+`unrated` — while logging a sybil-collision refusal, which fires from *inside*
+the loop over `protocol.peers[]` and therefore proves the table was not empty.
+Peers existed and the app was told nothing.
+
+**#6 — the pull raced the daemon and lost, every time.** `at_node_run` does
+`iteration++` before the tick, so `at_node_iteration(node) == 1` is the first
+tick, and `at_node_start` forks the daemon and returns with **no readiness
+handshake**. The identity and reputation processes have not bound their queues
+yet, so a single-shot request is dropped, and nothing retried it. Fixed by
+retrying until `messaging_send` succeeds (capped, one warning at the cap).
+
+The honest scope: this race belongs to *every* app-to-AT verb, not just the
+roster pull, and the retry is a workaround at the app. A daemon-readiness signal
+is the real fix and is not built.
+
+**#7 — three of the four paths that admit a peer emitted nothing.** Only
+`_add_peer` did. `handle_acceptance` — the path by which a *joining* node records
+the peer that accepted it, and so the first peer a fresh cohort can report at
+all — `_populate_peers_from_history`, and `handle_identity_response` all appended
+to `peers[]` silently. All three now emit, outside the peers lock.
+
+**Why the existing suite stayed green through both.** Every case entered through
+an emitter or through the routing; none entered where a peer actually arrives.
+The three new admission tests do, and with the emissions removed again they fail
+6 assertions while every `num_peers == 1` check still passes — the shape of the
+bug itself.
