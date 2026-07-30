@@ -102,6 +102,15 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
             ev->data.peer.operator_attested_at =
                 msg.info.peer_observed.operator_bound
                     ? msg.info.peer_observed.operator_attested_at : 0.0;
+            /* Same re-assertion for the guardian key: a consumer reading this
+             * ABI must never see a named guardian on a peer whose human was
+             * not verified, whoever produced the message. The event was
+             * memset above, so declining to copy IS the all-zero "no guardian
+             * advertised" answer. */
+            if (msg.info.peer_observed.operator_bound)
+                memcpy(ev->data.peer.operator_pubkey,
+                       msg.info.peer_observed.operator_pubkey,
+                       AT_APP_SIGNING_KEY_LEN);
             break;
         }
         case PEER_REPUTATION:

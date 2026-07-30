@@ -89,6 +89,12 @@ Two distributions:
   (lazy `PyKCS11`, PIV auth slot 9A, `CKA_ID` `0x01`, EC raw→DER signature
   conversion) for a real card, and `SoftwareToken` (pure `cryptography`) for
   dev/CI/no-hardware. The token signs a nonce; the private key never leaves it.
+  Also `probe_token()` — a **PIN-less** card-present probe (module resolved by
+  `find_pkcs11_module()`: explicit path, then `$AUTONOMOUS_TRUST_PKCS11_MODULE`,
+  then an `opensc-pkcs11.so` search) returning a `TokenProbe(present,
+  module_path, detail)`. `PyKcs11Token` cannot answer presence pre-PIN because
+  its constructor logs in, so the console's status line uses the probe and shows
+  `detail` to distinguish a missing module/binding from an empty reader.
 - **`piv_verifier.py`** — `PivVerifier` + `PivCredential` (a length-prefixed
   envelope of cert / nonce / signature).
 

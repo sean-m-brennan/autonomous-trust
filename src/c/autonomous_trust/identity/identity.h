@@ -61,6 +61,24 @@ typedef struct
  * hostile or corrupted peer and would let a remote cause an OOM. */
 #define ZTA_CRED_MAX (64u * 1024u)
 
+/* Domain separation for the operator-key binding (proto field 15). Versioned in
+ * the tag itself: a v2 pre-image must not be verifiable as a v1 one. Keep this
+ * string byte-identical to Python
+ * `identity/operator_binding.py::OPERATOR_BINDING_TAG` — the two pre-image
+ * builders are the one place this design can drift silently, which is why a
+ * conformance vector pins the bytes. */
+#define OPERATOR_BINDING_TAG "at-operator-binding-v1"
+#define OPERATOR_BINDING_TAG_LEN (sizeof(OPERATOR_BINDING_TAG) - 1)
+#define OPERATOR_BINDING_PREIMAGE_LEN \
+    (OPERATOR_BINDING_TAG_LEN + UUID_LEN + crypto_sign_PUBLICKEYBYTES \
+     + crypto_sign_PUBLICKEYBYTES)
+
+/* Hard cap on a binding signature carried on the wire. An RSA-4096 PKCS#1
+ * signature is 512 bytes and an ECDSA P-384 DER signature well under 128, so
+ * 1 KiB fits every credential a PIV can hold; more is hostile or corrupt. Same
+ * reasoning as ZTA_CRED_MAX, three orders of magnitude smaller. */
+#define OPERATOR_BINDING_MAX 1024u
+
 typedef struct
 {
     smrt_ptr_t;
@@ -82,6 +100,36 @@ typedef struct
        none). NOT part of identity equality. */
     bool operator_bound;
     double operator_attested_at;
+    /* WHICH human (proto fields 14-15), and STRICTLY OPT-IN. The two fields
+       above say a human exists and when one was last present; neither names
+       them. ethne's chartered node->guardian edge (D15) needs a guardian that
+       can co-sign, so a node MAY advertise `operator_pubkey` (the guardian's
+       ed25519 public key, one per OPERATOR and stable across the nodes that
+       human guards) together with `operator_key_binding` — a signature by the
+       operator's PIV private key over
+       OPERATOR_BINDING_TAG || uuid || signature.public || operator_pubkey,
+       verified against the operator credential's public key.
+
+       ABSENT BY DEFAULT, AND ABSENCE COSTS NOTHING: AT never requires a
+       guardian identity, so a node that declines stays anonymous, is admitted
+       identically, and serializes byte-for-byte as it does today (both fields
+       are emitted only when non-default). Requiring one is a consumer's rule.
+
+       Outside the AT_ZTA_ENABLED guard, like operator_bound: the fields — and
+       therefore the app-facing carrier's ABI — must not depend on a build flag.
+       Only VERIFICATION is ZTA-gated.
+
+       There is deliberately NO `operator_key_verified` flag. On a STORED PEER a
+       non-empty `operator_pubkey` *means* our receiver verified the binding: an
+       unverified or forged claim is zeroed at admission rather than kept beside a
+       flag saying not to believe it. One representation, so there is nothing to
+       disagree with — and with ZTA off nothing is ever verified, so no peer
+       carries a key, which is the fail-safe `operator_bound` already takes.
+
+       NOT part of identity equality. */
+    uint8_t operator_pubkey[crypto_sign_PUBLICKEYBYTES];
+    uint8_t *operator_key_binding;      /* heap-allocated, may be NULL */
+    size_t operator_key_binding_len;
 #ifdef AT_ZTA_ENABLED
     uint8_t zta_credential_hash[32];  /* SHA-256 of ZTA credential at admission */
     char zta_issuer[64];              /* Credential issuer identifier */
@@ -185,6 +233,53 @@ int identity_create(uuid_t *uuid, const char *address, const char *nickname,
   disjoint behaviors null_ident, success;
 */
 int identity_publish(const identity_t *ident, public_identity_t **pub_copy);
+
+/**
+ * @brief Whether an operator public key slot holds no key.
+ *
+ * All-zero is the "no guardian advertised" sentinel: a valid ed25519 public key
+ * is a curve point encoding and is never all-zero, and the opt-out path has to be
+ * representable without a second flag that could disagree with the bytes.
+ *
+ * @param[in] pubkey  Key slot (@ref public_identity_t::operator_pubkey).
+ * @return true when the slot is empty.
+ */
+/*@
+  requires \valid_read(pubkey + (0 .. crypto_sign_PUBLICKEYBYTES - 1));
+  assigns \nothing;
+*/
+bool at_operator_pubkey_empty(const uint8_t pubkey[crypto_sign_PUBLICKEYBYTES]);
+
+/**
+ * @brief Build the pre-image an operator's PIV signs to bind @p operator_pubkey
+ *        to @p ident.
+ *
+ *     OPERATOR_BINDING_TAG || uuid (16) || ident->signature.public (32)
+ *                          || operator_pubkey (32)
+ *
+ * The node is named inside the signed bytes on purpose: without that, a
+ * `(key, binding)` pair lifted from another node's announce would let any node
+ * claim that human as its guardian, and a count of guardians would mean nothing.
+ *
+ * Must stay byte-identical to Python
+ * `identity/operator_binding.py::operator_binding_preimage`; the pair is pinned
+ * by a conformance vector because two hand-written builders are exactly the kind
+ * of thing that drifts unnoticed.
+ *
+ * @param[in]  ident           Node whose uuid and signing key are bound.
+ * @param[in]  operator_pubkey The guardian's ed25519 public key.
+ * @param[out] out             Receives @ref OPERATOR_BINDING_PREIMAGE_LEN bytes.
+ * @return 0, or EINVAL on a NULL argument.
+ */
+/*@
+  requires \valid_read(ident);
+  requires \valid_read(operator_pubkey + (0 .. crypto_sign_PUBLICKEYBYTES - 1));
+  requires \valid(out + (0 .. OPERATOR_BINDING_PREIMAGE_LEN - 1));
+  assigns out[0 .. OPERATOR_BINDING_PREIMAGE_LEN - 1];
+*/
+int operator_binding_preimage(const public_identity_t *ident,
+                              const uint8_t operator_pubkey[crypto_sign_PUBLICKEYBYTES],
+                              uint8_t out[OPERATOR_BINDING_PREIMAGE_LEN]);
 
 /**
  * @brief Produce a detached Ed25519 signature prepended to the message.

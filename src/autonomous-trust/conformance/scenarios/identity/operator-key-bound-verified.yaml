@@ -1,0 +1,91 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: operator-key-bound-verified
+byte_pinning: false
+description: |
+    The opt-in guardian identity — happy path, and the live source for ethne's
+    chartered node->guardian edge (D15). The newcomer presents the operator
+    credential AND advertises an operator ed25519 key with a binding signed by
+    that credential's private key over
+
+        "at-operator-binding-v1" || uuid || node signing key || operator key
+
+    The border guard, having already classified the credential operator-class
+    against the DISTINCT operator anchor, verifies the binding against the same
+    credential's public key and keeps the key. Both determinations are required
+    and neither substitutes for the other: a chain without a binding names no
+    human, and a binding whose credential is not operator-class is a human with
+    no standing to name one.
+
+    The binding is signed AT SCENARIO TIME by both adapters from
+    testdata/zta/certs/operator_leaf.key, not pinned as a recorded blob. That
+    is the point of the case: it holds the two implementations to the same
+    signature scheme and the same pre-image, rather than to one implementation's
+    saved output. RSA PKCS#1 v1.5 over SHA-256 is deterministic, so they agree
+    byte for byte or the scenario fails.
+
+    Cross-impl: pinned on BOTH sides, ZTA-gated like operator-bound-verified —
+    without OpenSSL the C side skips it and diff_results.py treats a one-side
+    skip as a match.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+    operator_ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+  credentials:
+    newcomer: testdata/zta/certs/operator_leaf.der
+  operator_bindings:
+    newcomer: valid
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces with an operator credential AND an advertised
+        guardian key. bg's welcoming_committee verifies the chain, classifies
+        the credential operator-class, then checks the binding.
+  - id: 2
+    from: bg
+    to: broadcast
+    function: propose_peer
+    in_response_to: 1
+    description: bg proposes the candidate to the group.
+  - id: 3
+    from: bg
+    to: broadcast
+    function: peer_accepted
+    in_response_to: 1
+    description: |
+        After synchronous vote finalization, _peer_accepted stores the newcomer
+        with whatever the gate concluded about its guardian.
+  - id: 4
+    from: bg
+    to: newcomer
+    function: access_granted
+    in_response_to: 1
+    description: bg sends its published identity to the newcomer.
+  - id: 5
+    from: bg
+    to: newcomer
+    function: full_history
+    in_response_to: 1
+    description: bg sends the group key + history DAG.
+
+expected_state:
+  bg:
+    operator_bound:
+      newcomer: true
+    operator_guardian:
+      newcomer: true

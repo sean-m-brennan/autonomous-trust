@@ -110,7 +110,7 @@ hand-written mirror would corrupt silently the first time any of those changed.
 
 | Message | Direction | Producer | Payload |
 |---|---|---|---|
-| `PEER_OBSERVED` | AT → app | identity | uuid, ed25519 signing key, rank, `operator_bound`, `operator_attested_at` |
+| `PEER_OBSERVED` | AT → app | identity | uuid, ed25519 signing key, rank, `operator_bound`, `operator_attested_at`, `operator_pubkey` (opt-in) |
 | `PEER_REPUTATION` | AT → app | reputation | uuid, score, `rated` |
 | `app_roster_request` | app → AT | — | none (a `NET_MESSAGE` function) |
 
@@ -147,16 +147,28 @@ address — no signing keys — so it cannot feed a key-identified peer. An
 opaque-boundary signal is likewise not emitted: it would only be meaningful
 alongside a subtree view this carrier does not provide.
 
-**There is no guardian identity.** `operator_bound` says a human exists and
+**~~There is no guardian identity.~~ Closed, for nodes that opt in
+(2026-07-30).** This limit read: `operator_bound` says a human exists and
 `operator_attested_at` says when one was last verified present, but AT never
-carries *which* human: the credential is a PIV/CAC X.509 with no ed25519 key to
-become a `did:key`. A consumer needing a guardian that can *sign* — ethne's
-chartered node→guardian edge requires guardian co-signature — cannot build one
-from this carrier. Closing that means binding an operator ed25519 key with the
-PIV credential and advertising it: a wire-protocol change, and its own slice.
+carries *which* human, the credential being a PIV/CAC X.509 with no ed25519 key
+to become a `did:key`. That slice was built. `at_app_peer_t.operator_pubkey`
+now carries the guardian's ed25519 key for a peer that advertised one and whose
+PIV binding **this node verified** — never a peer's own claim, and zeroed
+whenever `operator_bound` is false, exactly as the attendance stamp is. ethne's
+chartered node→guardian edge has a live source: an opted-in peer reaches a
+`MemberCandidate.guardian` off this carrier.
 
-**No dead fields.** None of the three limits above is represented by a field or
-message type that nothing sets. A carrier field with no producer is
+The limit that replaces it is narrower and is not a defect: **most peers will
+carry no guardian, and that is correct.** Advertising one is opt-in on the
+far side, because one key per operator is stable across that human's nodes and
+therefore links them; AT will not spend a node's anonymity on it. A consumer
+must read all-zero as "unguarded machine", never as an error or a missing
+producer. See `operator-attended.md`.
+
+**No dead fields.** None of the limits above is represented by a field or
+message type that nothing sets — which is why the guardian key was added only
+once something produced it, and why the limit it leaves behind (most peers
+carry no guardian) is a *fact about deployments*, not an unwired field. A carrier field with no producer is
 indistinguishable, to a consumer, from one whose producer is broken.
 
 ## Verification
@@ -238,8 +250,9 @@ Two properties to preserve if these are ever edited:
   `messaging_assign`, so a consumer that bound `"q"` can emit *to* `"q"` and loop a
   synthetic event back to itself over the real socket. With nothing assigned they
   return -1 rather than appearing to send.
-- **They sanitize nothing** — in particular an attendance stamp is not zeroed when
-  `operator_bound` is false, though `identity_emit_peer_observed` does zero it. A
+- **They sanitize nothing** — in particular neither an attendance stamp nor a
+  guardian key is zeroed when `operator_bound` is false, though
+  `identity_emit_peer_observed` does zero both. A
   helper that copied the emitter's gating could not be used to test a consumer's
   own gating of that field, which is one of the things a consumer most needs to
   test.

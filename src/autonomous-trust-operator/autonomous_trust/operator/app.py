@@ -36,11 +36,30 @@ from .screens import (ActivateView, ActivityView, DirectoryView, RequestView,
                       StatusView)
 
 
+#: How to get past the stub activator, shown on the Activate result line.
+#:
+#: Deliberately does **not** say "--ca-bundle" on its own: `build_app` builds an
+#: activator only when the cert and key accompany the bundle, and live-card
+#: activation is not wired yet (plan §7.1 stage 3 -- card *presence* is live, the
+#: PIN-unlocked challenge-response is not). Naming the bundle alone would send an
+#: operator in a circle.
+ACTIVATION_SETUP_HINT = (
+    'activation needs a CA bundle plus the token it verifies:\n'
+    '  run-operator.sh --software-cert C.pem --software-key K.pem '
+    '--ca-bundle CA.pem\n'
+    'where --ca-bundle is the issuing-CA chain (PEM) for that cert. For a '
+    'throwaway dev token use --demo. Live-card activation (PIN -> PKCS#11 '
+    'challenge-response) is not wired yet, so an inserted card is detected but '
+    'cannot activate.')
+
+#: One-line form for the token-status line, which has no room for the above.
+ACTIVATION_SETUP_SHORT = 'activation not configured — needs --ca-bundle + token'
+
+
 class _StubResult:
     """Returned by the default activator when no real PIV token is wired."""
     status = 'UNAVAILABLE'
-    reason = ('no PIV token configured — run with a PKCS#11 module + CA bundle, '
-              'or inject an activator (see __main__)')
+    reason = 'no PIV token configured — ' + ACTIVATION_SETUP_HINT
 
 
 def _default_activator(pin: str, mfa: str) -> Any:  # noqa: ARG001
@@ -77,9 +96,14 @@ class OperatorApp(App):
     :param session: an ``OperatorSession`` (optional; lazily created).
     :param activator: ``callable(pin, mfa) -> result`` with ``.status``/``.reason``
         (e.g. operator-core ``activate`` bound to a token). Defaults to a stub.
-    :param token_provider: ``callable() -> bool`` for card-present status.
+    :param token_provider: ``callable()`` for card-present status, returning a
+        bool or a ``TokenProbe`` (``.present``/``.detail``). Defaults to a
+        no-token stub -- the entry point wires the live PKCS#11 probe.
     :param auto_start: start the node bridge on mount (off for tests).
     :param poll_interval: feedback-drain cadence in seconds.
+    :param token_poll_interval: card-presence poll cadence in seconds; a card
+        inserted after startup is picked up within this interval. ``<= 0``
+        disables polling (mount-time probe only).
     """
 
     CSS = """
@@ -110,6 +134,7 @@ class OperatorApp(App):
                  requestor_provider: Optional[Callable[[], Any]] = None,
                  auto_start: bool = True,
                  poll_interval: float = 1.0,
+                 token_poll_interval: float = 2.0,
                  **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.bridge = bridge or OperatorNodeBridge()
@@ -120,6 +145,12 @@ class OperatorApp(App):
         self._requestor_provider = requestor_provider or (lambda: 'operator')
         self._auto_start = auto_start
         self._poll_interval = poll_interval
+        #: card-presence poll cadence in seconds; <= 0 disables (tests)
+        self._token_poll_interval = token_poll_interval
+        #: last (present, detail) seen, so the line repaints only on a change
+        self._last_token_status: Optional[tuple] = None
+        #: guard against overlapping threaded probes on slow middleware
+        self._token_probe_running: bool = False
         self.activated: bool = False
         #: a request deferred pending step-up re-auth: (resource, args, timeout)
         self._pending_request: Optional[tuple] = None
@@ -133,11 +164,32 @@ class OperatorApp(App):
             self._session = OperatorSession()
         return self._session
 
-    def token_present(self) -> bool:
+    @property
+    def activation_configured(self) -> bool:
+        """Whether pressing Activate can actually reach a token. False means the
+        stub activator is in place, so a detected card still cannot activate --
+        the status line must say so rather than imply readiness."""
+        return self.activator is not _default_activator
+
+    @property
+    def activation_hint(self) -> str:
+        """One-line fix for an unconfigured activator ('' when configured)."""
+        return '' if self.activation_configured else ACTIVATION_SETUP_SHORT
+
+    def token_status(self) -> tuple:
+        """``(present, detail)`` for the Activate status line. The provider may
+        return a plain bool or a ``TokenProbe``-shaped object (``.present`` /
+        ``.detail``); the latter lets the live PKCS#11 probe explain *why* no card
+        was seen (missing module vs. empty reader) instead of a bare "no token"."""
         try:
-            return bool(self._token_provider())
-        except Exception:
-            return False
+            raw = self._token_provider()
+        except Exception as err:
+            return False, 'probe failed: %s' % err
+        present = getattr(raw, 'present', raw)
+        return bool(present), str(getattr(raw, 'detail', '') or '')
+
+    def token_present(self) -> bool:
+        return self.token_status()[0]
 
     # -- layout -----------------------------------------------------------
 
@@ -166,7 +218,60 @@ class OperatorApp(App):
         if self._auto_start:
             self.bridge.start()
         self.set_interval(self._poll_interval, self._drain)
+        # Card insertion/removal is not an event we can subscribe to, so poll the
+        # PIN-less probe on its own slower cadence (and in a worker thread, see
+        # _poll_token): each probe is a dlopen + C_Initialize + C_Finalize, too
+        # heavy for the feedback interval.
+        if self._token_poll_interval > 0:
+            self.set_interval(self._token_poll_interval, self._poll_token)
         self._refresh_status()
+
+    def _poll_token(self) -> None:
+        """Kick off a card-presence probe in a **worker thread**.
+
+        The probe is a dlopen + ``C_Initialize`` + slot enumeration that talks to
+        pcscd; on slow middleware that is hundreds of milliseconds, which would
+        stutter the UI every tick if run on the event loop. Overlapping probes are
+        skipped rather than queued, so a probe slower than the interval degrades to
+        "as often as it can finish" instead of piling up threads.
+        """
+        if self._token_probe_running:
+            return
+        self._token_probe_running = True
+        try:
+            self.run_worker(self._probe_token_worker, thread=True,
+                            group='token-probe', exit_on_error=False)
+        except Exception:
+            self._token_probe_running = False
+
+    def _probe_token_worker(self) -> None:
+        """Thread body: probe, then hand the result back to the UI thread. Never
+        touches widgets directly."""
+        try:
+            state = self.token_status()
+        except Exception:
+            state = (False, '')
+        try:
+            if state != self._last_token_status:
+                self.call_from_thread(self._apply_token_status, state)
+        except Exception:
+            pass  # app shutting down mid-probe
+        finally:
+            self._token_probe_running = False
+
+    def _apply_token_status(self, state: tuple) -> None:
+        """UI thread: repaint only on an actual change, so an idle console does not
+        churn the display."""
+        if state == self._last_token_status:
+            return
+        self._last_token_status = state
+        try:
+            view = self.query_one('#view-activate', ActivateView)
+        except Exception:
+            return  # not mounted (yet)
+        # Pass the probed state: re-probing here would put the blocking PKCS#11
+        # call back on the event loop, defeating the worker.
+        view.refresh_token_status(state)
 
     # -- actions ----------------------------------------------------------
 

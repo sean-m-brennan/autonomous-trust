@@ -51,6 +51,7 @@
 #include "identity/id_proc_priv.h"
 #include "reputation/rep_proc_priv.h"
 #include "autonomous_trust/app_events.h"
+#include "autonomous_trust/app_events_test_support.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -548,6 +549,67 @@ DEFINE_TEST(test_unverified_operator_suppresses_the_attendance_stamp)
 }
 END_TEST_DEFINITION()
 
+/* Whether a peer's all-zero operator_pubkey slot is empty. Spelled out here
+ * rather than calling at_operator_pubkey_empty: a test that reuses the
+ * production predicate cannot catch that predicate being wrong. */
+static bool obs_key_is_empty(const peer_observed_msg_t *o)
+{
+    for (size_t i = 0; i < crypto_sign_PUBLICKEYBYTES; i++)
+        if (o->operator_pubkey[i] != 0)
+            return false;
+    return true;
+}
+
+DEFINE_TEST(test_guardian_key_rides_the_carrier_only_for_a_verified_operator)
+{
+    capture_reset();
+
+    process_t proc;
+    proc_with_peers(&proc, 3, 0x50);
+
+    /* Peer 0: opted in — a verified guardian who advertised a key. This is
+     * the only one of the three ethne may charter a node->guardian edge for. */
+    proc.protocol.peers[0].operator_bound = true;
+    proc.protocol.peers[0].operator_attested_at = 1721800000.0;
+    for (size_t k = 0; k < crypto_sign_PUBLICKEYBYTES; k++)
+        proc.protocol.peers[0].operator_pubkey[k] = (uint8_t)(0xA0 + k);
+
+    /* Peer 1: OPT-OUT CONTROL — a verified human who declined to name one.
+     * The ordinary case, and the one that must cost nothing: bound stays
+     * true, the stamp still crosses, only the key is absent. */
+    proc.protocol.peers[1].operator_bound = true;
+    proc.protocol.peers[1].operator_attested_at = 1721800001.0;
+
+    /* Peer 2: NEGATIVE CONTROL 7 — a guardian key on a node whose operator
+     * credential never verified. Unreachable through admission (the gate
+     * zeroes an unverified claim), so this is the belt-and-braces case: were
+     * the stored key ever set some other way, it must not become an identity
+     * a consumer can act on. */
+    proc.protocol.peers[2].operator_bound = false;
+    for (size_t k = 0; k < crypto_sign_PUBLICKEYBYTES; k++)
+        proc.protocol.peers[2].operator_pubkey[k] = (uint8_t)(0xC0 + k);
+
+    ck_assert_int_eq(identity_emit_all_peers(&proc), 3);
+
+    ck_assert(captured[0].msg.info.peer_observed.operator_bound);
+    ck_assert(!obs_key_is_empty(&captured[0].msg.info.peer_observed));
+    ck_assert_int_eq(captured[0].msg.info.peer_observed.operator_pubkey[0], 0xA0);
+    ck_assert_int_eq(captured[0].msg.info.peer_observed.operator_pubkey[31], 0xBF);
+
+    ck_assert(captured[1].msg.info.peer_observed.operator_bound);
+    ck_assert_double_eq_tol(
+        captured[1].msg.info.peer_observed.operator_attested_at,
+        1721800001.0, 1e-6);
+    ck_assert(obs_key_is_empty(&captured[1].msg.info.peer_observed));
+
+    ck_assert(!captured[2].msg.info.peer_observed.operator_bound);
+    ck_assert(obs_key_is_empty(&captured[2].msg.info.peer_observed));
+
+    pthread_rwlock_destroy(&proc.protocol.peers_rwlock);
+    capture_done();
+}
+END_TEST_DEFINITION()
+
 DEFINE_TEST(test_reputation_pull_reports_unrated_peers_as_unrated)
 {
     capture_reset();
@@ -903,6 +965,56 @@ DEFINE_TEST(test_app_bound_to_the_wrong_name_receives_nothing)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_poll_refuses_a_guardian_key_from_an_unverified_operator)
+{
+    /* The emitter already gates this, so the case cannot arise from AT's own
+     * identity process. The point is that the flat ABI does not DEPEND on
+     * that: a handle can be opened on a queue fed by anything, and a consumer
+     * reading only this header has no way to audit the producer. So the gate
+     * is re-asserted at the boundary the consumer actually trusts. */
+    messaging_set_test_hook(NULL);
+    socket_root_setup();
+
+    at_app_events_t *ev = at_app_events_open("test_at_to_app_guardian");
+    ck_assert_ptr_nonnull(ev);
+
+    /* Hostile producer: a named guardian on a node with no verified human. */
+    uint8_t key[AT_APP_SIGNING_KEY_LEN];
+    for (size_t k = 0; k < sizeof(key); k++)
+        key[k] = (uint8_t)(0xD0 + k);
+    uint8_t uuid[AT_APP_UUID_LEN], sign[AT_APP_SIGNING_KEY_LEN];
+    memset(uuid, 0x71, sizeof(uuid));
+    memset(sign, 0x72, sizeof(sign));
+
+    ck_assert_int_eq(
+        at_app_test_emit_peer("test_at_to_app_guardian", uuid, sign, 2,
+                              false, 1721800500.0, key), 0);
+    /* And the same key on a properly bound peer, to prove the refusal above
+     * is the gate doing its work and not the key being dropped wholesale. */
+    memset(uuid, 0x73, sizeof(uuid));
+    ck_assert_int_eq(
+        at_app_test_emit_peer("test_at_to_app_guardian", uuid, sign, 2,
+                              true, 1721800500.0, key), 0);
+
+    at_app_event_t batch[4];
+    memset(batch, 0, sizeof(batch));
+    ck_assert_int_eq(at_app_events_poll(ev, batch, 4), 2);
+
+    /* Unverified: the stamp AND the guardian identity are both refused. */
+    ck_assert(!batch[0].data.peer.operator_bound);
+    ck_assert_double_eq_tol(batch[0].data.peer.operator_attested_at, 0.0, 1e-9);
+    for (size_t k = 0; k < AT_APP_SIGNING_KEY_LEN; k++)
+        ck_assert_int_eq(batch[0].data.peer.operator_pubkey[k], 0);
+
+    /* Verified: it crosses intact. */
+    ck_assert(batch[1].data.peer.operator_bound);
+    ck_assert_int_eq(batch[1].data.peer.operator_pubkey[0], 0xD0);
+    ck_assert_int_eq(batch[1].data.peer.operator_pubkey[31], 0xEF);
+
+    at_app_events_close(ev);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(App_Events,
           test_drain_sends_every_app_bound_message,
           test_drain_routes_on_the_type_tag_not_the_payload,
@@ -917,6 +1029,8 @@ RUN_TESTS(App_Events,
           test_identity_emits_one_observation_per_peer,
           test_identity_roster_pull_with_no_peers_emits_nothing,
           test_unverified_operator_suppresses_the_attendance_stamp,
+          test_guardian_key_rides_the_carrier_only_for_a_verified_operator,
+          test_poll_refuses_a_guardian_key_from_an_unverified_operator,
           test_reputation_pull_reports_unrated_peers_as_unrated,
           test_roster_verb_dispatches_to_the_registered_handlers,
           test_acceptance_admission_tells_the_app,

@@ -31,7 +31,8 @@ int at_app_test_emit_peer(const char *q_name,
                           const uint8_t signing_pubkey[AT_APP_SIGNING_KEY_LEN],
                           int32_t rank,
                           bool operator_bound,
-                          double operator_attested_at)
+                          double operator_attested_at,
+                          const uint8_t operator_pubkey[AT_APP_SIGNING_KEY_LEN])
 {
     if (q_name == NULL || q_name[0] == '\0' || peer_uuid == NULL
         || signing_pubkey == NULL)
@@ -49,6 +50,14 @@ int at_app_test_emit_peer(const char *q_name,
      * that, and a helper that copied the emitter could not be used to test a
      * consumer's own gating of it. */
     msg.info.peer_observed.operator_attested_at = operator_attested_at;
+    /* Verbatim for the same reason, and NULL is how a caller says "no
+     * guardian": the message was zeroed above, so absence needs no flag. A
+     * key sent with operator_bound false is exactly the case a consumer's
+     * gating has to be provable against, so this helper must be able to
+     * produce it. */
+    if (operator_pubkey != NULL)
+        memcpy(msg.info.peer_observed.operator_pubkey, operator_pubkey,
+               AT_APP_SIGNING_KEY_LEN);
 
     /* Non-blocking, like every app-bound send: a full queue is the caller's
      * problem to see, not something to hang on. */

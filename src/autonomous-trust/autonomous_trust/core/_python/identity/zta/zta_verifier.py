@@ -23,6 +23,7 @@ identically by either side. See doc/architecture/zta-python-parity.md.
 from __future__ import annotations
 
 import hashlib
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -154,6 +155,9 @@ class X509Verifier(Verifier):
         self._store: dict = {}
         # credential_hash -> parsed cert, for check_revocation (mirror C cache)
         self._cert_cache: dict = {}
+        #: why the trust store is empty ('' when it loaded) -- surfaced in the
+        #: reject reason so a bad bundle file is not mistaken for a bad peer.
+        self.bundle_error: str = ''
         self._x509 = None  # cryptography.x509 module, loaded lazily
         self._load_store()
 
@@ -167,23 +171,108 @@ class X509Verifier(Verifier):
 
     def _load_store(self):
         x509 = self._ensure_x509()
+        self.bundle_error = ''
+        if not self.ca_bundle_path:
+            self._store = {}
+            self.bundle_error = 'no CA bundle configured'
+            return
         try:
             with open(self.ca_bundle_path, 'rb') as fp:
                 data = fp.read()
-        except OSError:
-            # No bundle -> empty store. verify_credential then rejects everything
-            # with "unknown issuer", and is_available() reports False.
+        except OSError as err:
+            # No bundle -> empty store, and is_available() reports False. The
+            # reason is kept so verify_credential can name the real problem
+            # instead of blaming the credential for a local misconfiguration.
             self._store = {}
+            self.bundle_error = ('CA bundle %s could not be read: %s'
+                                 % (self.ca_bundle_path, err.strerror or err))
             return
-        try:
-            certs = x509.load_pem_x509_certificates(data)
-        except Exception:
-            certs = []
-            try:
-                certs = [x509.load_der_x509_certificate(data)]
-            except Exception:
-                certs = []
+        certs = self._load_bundle_certs(x509, data)
         self._store = {c.subject.public_bytes(): c for c in certs}
+        if not self._store:
+            self.bundle_error = ('CA bundle %s holds no certificates: %s'
+                                 % (self.ca_bundle_path,
+                                    self._classify_bundle(x509, data)))
+
+    @staticmethod
+    def _load_bundle_certs(x509, data: bytes) -> list:
+        """Parse a CA bundle in any encoding agency PKI ships it in: concatenated
+        PEM, a single DER cert, or **PKCS#7** (`.p7b`/`.p7c`, DER or PEM-wrapped)
+        -- the usual DoD PKI chain format, which otherwise needed an out-of-band
+        ``openssl pkcs7 -print_certs`` conversion.
+        """
+        for loader in (x509.load_pem_x509_certificates,
+                       lambda d: [x509.load_der_x509_certificate(d)]):
+            try:
+                certs = list(loader(data))
+            except Exception:
+                continue
+            if certs:
+                return certs
+        # Agency PKCS#7 bundles are often BER- rather than strictly DER-encoded
+        # (set ordering), which pyca accepts with a UserWarning that an operator
+        # can do nothing about -- silenced. Should pyca ever promote that to an
+        # exception, these loaders start failing and `_classify_bundle` reports
+        # the .p7b as unrecognized; converting with `openssl pkcs7 -print_certs
+        # -in b.p7b -out CA.pem` is the fallback at that point.
+        from cryptography.hazmat.primitives.serialization import pkcs7
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            for loader in (pkcs7.load_der_pkcs7_certificates,
+                           pkcs7.load_pem_pkcs7_certificates):
+                try:
+                    certs = list(loader(data))
+                except Exception:
+                    continue
+                if certs:
+                    return certs
+        return []
+
+    @staticmethod
+    def _classify_bundle(x509, data: bytes) -> str:
+        """Name what an unusable bundle file actually is.
+
+        A CRL, private key, or CSR in the ``--ca-bundle`` slot used to leave an
+        empty store, so every credential was REJECTED with 'unable to get local
+        issuer certificate' -- blaming the peer for a local file mix-up. These
+        messages say which file was handed over and where it belongs instead.
+        """
+        head = data[:4096]
+        for marker, desc in (
+                (b'BEGIN X509 CRL',
+                 'this is a CRL (revocation list), not CA certificates -- pass '
+                 'it as crl_path/--crl-path and supply the issuing CA certs here'),
+                (b'BEGIN CERTIFICATE REQUEST',
+                 'this is a certificate request (CSR), not a signed certificate'),
+                (b'BEGIN NEW CERTIFICATE REQUEST',
+                 'this is a certificate request (CSR), not a signed certificate'),
+                (b'BEGIN ENCRYPTED PRIVATE KEY',
+                 'this is an encrypted private key, not a certificate'),
+                (b'PRIVATE KEY',
+                 'this is a private key, not a certificate -- never pass a key '
+                 'as the CA bundle'),
+                (b'BEGIN PUBLIC KEY',
+                 'this is a bare public key, not a certificate')):
+            if marker in head:
+                return desc
+        # DER equivalents, which carry no textual marker to match on.
+        for loader, desc in (
+                (x509.load_der_x509_crl,
+                 'this is a DER CRL (revocation list), not CA certificates -- '
+                 'pass it as crl_path/--crl-path'),
+                (x509.load_der_x509_csr,
+                 'this is a DER certificate request (CSR), not a certificate')):
+            try:
+                loader(data)
+                return desc
+            except Exception:
+                pass
+        if b'BEGIN PKCS7' in head or b'BEGIN PKCS #7' in head:
+            return 'this is a PKCS#7 container holding no certificates'
+        if not data:
+            return 'the file is empty'
+        return ('unrecognized format -- expected concatenated PEM certificates, '
+                'a DER certificate, or a PKCS#7 (.p7b) bundle')
 
     @staticmethod
     def _parse_cert(x509, cred_data: bytes):
@@ -217,6 +306,11 @@ class X509Verifier(Verifier):
         bundled cert as a terminal anchor -- so the depth bound was unreachable
         dead code and multi-hop chains were never actually walked.)
         """
+        # An unusable trust store is a *local* fault, so say which file is wrong
+        # rather than reporting the peer's cert as having an unknown issuer.
+        # Status stays REJECTED (C parity: nothing verifies without an anchor).
+        if not self._store and self.bundle_error:
+            return ZtaResult.set(ZtaStatus.REJECTED, self.bundle_error)
         now = datetime.now(timezone.utc)
         cur = leaf
         intermediates = 0
@@ -278,6 +372,44 @@ class X509Verifier(Verifier):
         from cryptography.hazmat.primitives.serialization import Encoding
         return Encoding.DER
 
+    def _load_crl(self, x509, data: bytes):
+        """Parse a CRL as PEM **or DER**. Returns ``(crl, error_message)``.
+
+        Agency CRLs are normally DER; only PEM was accepted before, so a DER file
+        silently parsed as nothing (see `check_revocation`).
+        """
+        for loader in (x509.load_pem_x509_crl, x509.load_der_x509_crl):
+            try:
+                return loader(data), ''
+            except Exception:
+                continue
+        return None, ('CRL %s could not be parsed: %s'
+                      % (self.crl_path, self._classify_crl(x509, data)))
+
+    @staticmethod
+    def _classify_crl(x509, data: bytes) -> str:
+        """Name what a file in the CRL slot actually is (mirror of
+        `_classify_bundle` for the other half of the swap)."""
+        head = data[:4096]
+        if b'BEGIN CERTIFICATE' in head:
+            return ('this is a certificate, not a CRL -- pass it as the CA '
+                    'bundle instead')
+        if b'BEGIN PKCS7' in head:
+            return 'this is a PKCS#7 certificate bundle, not a CRL'
+        if b'PRIVATE KEY' in head:
+            return 'this is a private key, not a CRL'
+        if b'BEGIN CERTIFICATE REQUEST' in head:
+            return 'this is a certificate request (CSR), not a CRL'
+        try:
+            x509.load_der_x509_certificate(data)
+            return ('this is a DER certificate, not a CRL -- pass it as the CA '
+                    'bundle instead')
+        except Exception:
+            pass
+        if not data:
+            return 'the file is empty'
+        return 'unrecognized format -- expected a PEM or DER X.509 CRL'
+
     def check_revocation(self, cred_hash: bytes) -> ZtaResult:
         # CRL-based check, mirroring the C path (OCSP is best-effort / offline-
         # unavailable here; the admission gate calls only verify_credential).
@@ -285,17 +417,28 @@ class X509Verifier(Verifier):
             x509 = self._ensure_x509()
             try:
                 with open(self.crl_path, 'rb') as fp:
-                    crl = x509.load_pem_x509_crl(fp.read())
-            except Exception:
-                crl = None
-            if crl is not None:
-                cert = self._cert_cache.get(cred_hash)
-                if cert is not None and crl.get_revoked_certificate_by_serial_number(
-                        cert.serial_number) is not None:
-                    return ZtaResult.set(ZtaStatus.REVOKED,
-                                         'certificate revoked (CRL)', cred_hash)
-                return ZtaResult.set(ZtaStatus.VERIFIED,
-                                     'CRL loaded; not revoked', cred_hash)
+                    data = fp.read()
+            except OSError as err:
+                crl, crl_error = None, ('CRL %s could not be read: %s'
+                                        % (self.crl_path,
+                                           err.strerror or err))
+            else:
+                crl, crl_error = self._load_crl(x509, data)
+            if crl is None:
+                # A configured-but-unusable CRL must NOT fall through to
+                # 'no revocation source configured': that is indistinguishable
+                # from having no CRL at all, and it is exactly how a DER CRL used
+                # to disappear. Status stays UNAVAILABLE (never VERIFIED -- a
+                # revocation check that cannot run must not read as "not
+                # revoked"), but the reason now names the file and the cause.
+                return ZtaResult.set(ZtaStatus.UNAVAILABLE, crl_error, cred_hash)
+            cert = self._cert_cache.get(cred_hash)
+            if cert is not None and crl.get_revoked_certificate_by_serial_number(
+                    cert.serial_number) is not None:
+                return ZtaResult.set(ZtaStatus.REVOKED,
+                                     'certificate revoked (CRL)', cred_hash)
+            return ZtaResult.set(ZtaStatus.VERIFIED,
+                                 'CRL loaded; not revoked', cred_hash)
         if self.ocsp_url:
             return ZtaResult.set(ZtaStatus.UNAVAILABLE,
                                  'OCSP responder unreachable', cred_hash)

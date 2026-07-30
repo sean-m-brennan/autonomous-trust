@@ -83,6 +83,22 @@ typedef struct {
      *  false. Grade this against your own clock: it is a stamp, not a state,
      *  and a bound node with nobody at the keyboard for a week is normal. */
     double  operator_attested_at;
+    /** WHICH human, when the node opted in: the guardian's ed25519 public key,
+     *  or all-zero for "not advertised". A non-zero key here means THIS node
+     *  verified a binding signed by that operator's own credential and naming
+     *  this peer — never a peer's unbacked claim.
+     *
+     *  **All-zero is the normal case and carries no judgement.** Naming a
+     *  guardian is opt-in on the far side: one key per operator, stable across
+     *  the nodes that human guards, which links them — a real cost AT does not
+     *  impose. A consumer that requires a guardian (ethne's chartered
+     *  node->guardian edge) is applying its own rule, and must treat absence as
+     *  "unguarded machine", not as an error.
+     *
+     *  Zero whenever @c operator_bound is false, for the same reason the stamp
+     *  is: a guardian identity on a node with no verified human is a
+     *  contradiction. */
+    uint8_t operator_pubkey[AT_APP_SIGNING_KEY_LEN];
 } at_app_peer_t;
 
 /** One peer's earned reputation. Mirrors `peer_reputation_msg_t`. */

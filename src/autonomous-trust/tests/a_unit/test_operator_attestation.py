@@ -194,6 +194,9 @@ class _OpGateProc:
     _zta_credential_replayed = IdentityProcess._zta_credential_replayed
     _is_operator_credential = IdentityProcess._is_operator_credential
     _mark_operator_bound = staticmethod(IdentityProcess._mark_operator_bound)
+    # The opt-in guardian-key check runs inside the operator-class branch of the
+    # gate, so the stub needs it for any operator-credential case to reach the end.
+    _verify_operator_key = IdentityProcess._verify_operator_key
 
     def __init__(self, peer_status=ZtaStatus.VERIFIED, operator_anchor=True,
                  operator_status=ZtaStatus.VERIFIED):

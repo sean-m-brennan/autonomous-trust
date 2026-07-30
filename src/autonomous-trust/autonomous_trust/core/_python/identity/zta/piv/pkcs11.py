@@ -34,16 +34,147 @@ Two implementations:
                         same challenge-response, zero hardware. The live card is
                         later just a swap of the module path + slot.
 
+`probe_token()` is the **PIN-less** counterpart used by UIs to answer "is a card
+in the reader?" before any PIN has been typed -- `PyKcs11Token` cannot serve that
+question because its constructor logs in. It also reports *why* a card was not
+seen, so a missing module or missing binding is distinguishable from an empty
+reader.
+
 The PIV authentication key/cert live in **PIV slot 9A**, which OpenSC maps to
 PKCS#11 object id ``0x01``; that is the default `PyKcs11Token` selects.
 """
 from __future__ import annotations
 
+import glob
+import os
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Any, NamedTuple, Optional
 
 # OpenSC's PKCS#11 object id for the PIV 9A "PIV Authentication" key/cert.
 PIV_AUTH_CKA_ID = bytes([0x01])
+
+#: Environment override for the PKCS#11 module path. The escape hatch when
+#: autodetection misses the middleware -- a real CAC may need a vendor module or
+#: CACKey rather than OpenSC (plan §6 middleware table).
+PKCS11_MODULE_ENV = 'AUTONOMOUS_TRUST_PKCS11_MODULE'
+
+#: Where OpenSC installs ``opensc-pkcs11.so``, searched in this order (first hit
+#: wins): Debian/Ubuntu multiarch, RPM lib64, plain /usr/lib, /usr/local,
+#: Homebrew, then the macOS OpenSC installer.
+DEFAULT_MODULE_GLOBS = (
+    '/usr/lib/*-linux-gnu/opensc-pkcs11.so',
+    '/usr/lib64/opensc-pkcs11.so',
+    '/usr/lib64/pkcs11/opensc-pkcs11.so',
+    '/usr/lib/opensc-pkcs11.so',
+    '/usr/lib/pkcs11/opensc-pkcs11.so',
+    '/usr/local/lib/opensc-pkcs11.so',
+    '/usr/local/lib/pkcs11/opensc-pkcs11.so',
+    '/opt/homebrew/lib/opensc-pkcs11.so',
+    '/Library/OpenSC/lib/opensc-pkcs11.so',
+)
+
+
+def find_pkcs11_module(module_path: Optional[str] = None) -> Optional[str]:
+    """Resolve which PKCS#11 module to load: an explicit path wins, then
+    ``$AUTONOMOUS_TRUST_PKCS11_MODULE``, then the `DEFAULT_MODULE_GLOBS` search.
+    Returns ``None`` when nothing is found.
+
+    An env override is returned **unvalidated** on purpose: a typo should surface
+    as a load error naming the path, not silently fall through to autodetection.
+    """
+    if module_path:
+        return module_path
+    env = os.environ.get(PKCS11_MODULE_ENV)
+    if env:
+        return env
+    for pattern in DEFAULT_MODULE_GLOBS:
+        for hit in sorted(glob.glob(pattern)):
+            if os.path.exists(hit):
+                return hit
+    return None
+
+
+def _load_pkcs11_lib(module_path: str) -> Any:
+    """Load ``module_path`` into a fresh `PyKCS11Lib` (C_Initialize per call, so
+    a card inserted after startup is seen). Raises `PivTokenError`."""
+    try:
+        import PyKCS11  # lazy: only the real-card path needs the binding
+    except ImportError as err:
+        raise PivTokenError(
+            'PyKCS11 not installed; install it for live-card support '
+            '(or use SoftwareToken for dev/test)') from err
+    lib = PyKCS11.PyKCS11Lib()
+    try:
+        lib.load(module_path)
+    except PyKCS11.PyKCS11Error as err:
+        raise PivTokenError('failed to load PKCS#11 module %s: %s'
+                            % (module_path, err)) from err
+    return lib
+
+
+class TokenProbe(NamedTuple):
+    """Outcome of a PIN-less card-present probe.
+
+    :param present: a token is readable in the (optionally requested) slot.
+    :param module_path: the PKCS#11 module actually consulted (``None`` if none
+        could be resolved).
+    :param detail: short human-readable reason, for a UI status line.
+    """
+    present: bool
+    module_path: Optional[str]
+    detail: str
+
+
+def probe_token(module_path: Optional[str] = None, slot: Optional[int] = None,
+                lib_loader: Optional[Any] = None) -> TokenProbe:
+    """Report whether a PIV token is present **without a PIN** (no session, no
+    login) -- safe to call before the operator has typed anything, and safe to
+    call repeatedly.
+
+    Do **not** call this while a `PyKcs11Token` session is open on the same
+    module: the trailing C_Finalize is process-global and would invalidate that
+    session. An open token answers presence itself via `is_present`.
+
+    :param module_path: PKCS#11 module; resolved via `find_pkcs11_module` if omitted.
+    :param slot: require this specific slot; any slot with a token if omitted.
+    :param lib_loader: ``callable(module_path) -> PyKCS11Lib`` seam for tests.
+    """
+    path = find_pkcs11_module(module_path)
+    if path is None:
+        return TokenProbe(False, None,
+                          'no PKCS#11 module found; set %s' % PKCS11_MODULE_ENV)
+    loader = lib_loader or _load_pkcs11_lib
+    lib = None
+    try:
+        try:
+            lib = loader(path)
+        except PivTokenError as err:
+            return TokenProbe(False, path, str(err))
+        try:
+            slots = list(lib.getSlotList(tokenPresent=True))
+        except Exception as err:
+            return TokenProbe(False, path, 'slot enumeration failed: %s' % err)
+        if not slots:
+            return TokenProbe(False, path, 'module loaded, no card in any slot')
+        if slot is not None and slot not in slots:
+            return TokenProbe(False, path, 'no card in slot %s' % slot)
+        return TokenProbe(True, path, 'slot %s' % (slot if slot is not None
+                                                   else slots[0]))
+    finally:
+        # Best-effort C_Finalize so the next probe's C_Initialize is clean; not
+        # all PyKCS11 versions expose unload().
+        unload = getattr(lib, 'unload', None)
+        if callable(unload):
+            try:
+                unload()
+            except Exception:
+                pass
+
+
+def token_present(module_path: Optional[str] = None,
+                  slot: Optional[int] = None) -> bool:
+    """Boolean form of `probe_token`, for ``callable() -> bool`` seams."""
+    return probe_token(module_path, slot).present
 
 
 class PivTokenError(Exception):
@@ -153,12 +284,17 @@ class PyKcs11Token(PivToken):
     private key by `PIV_AUTH_CKA_ID`.
     """
 
-    def __init__(self, module_path: str, pin: str,
+    def __init__(self, module_path: Optional[str] = None, pin: str = '',
                  slot: Optional[int] = None,
                  cka_id: bytes = PIV_AUTH_CKA_ID):
-        self._module_path = module_path
+        resolved = find_pkcs11_module(module_path)
+        if resolved is None:
+            raise PivTokenError('no PKCS#11 module found; set %s'
+                                % PKCS11_MODULE_ENV)
+        self._module_path = resolved
         self._cka_id = cka_id
         self._pkcs11 = None
+        self._lib = None
         self._session = None
         self._slot = slot
         self._cert_der: Optional[bytes] = None
@@ -175,12 +311,7 @@ class PyKcs11Token(PivToken):
 
     def _open(self, pin: str) -> None:  # pragma: no cover - requires hardware
         pkcs11mod = self._load_lib()
-        lib = pkcs11mod.PyKCS11Lib()
-        try:
-            lib.load(self._module_path)
-        except pkcs11mod.PyKCS11Error as err:
-            raise PivTokenError('failed to load PKCS#11 module %s: %s'
-                                % (self._module_path, err)) from err
+        lib = _load_pkcs11_lib(self._module_path)
         slots = lib.getSlotList(tokenPresent=True)
         if not slots:
             raise PivTokenError('no PKCS#11 token present')
@@ -192,6 +323,9 @@ class PyKcs11Token(PivToken):
             session.closeSession()
             raise PivTokenError('PIN login failed: %s' % err) from err
         self._pkcs11 = pkcs11mod
+        # Held for the session's lifetime: if the lib handle were collected its
+        # C_Finalize would invalidate `session` out from under us.
+        self._lib = lib
         self._session = session
         self._slot = slot
         self._cert_der = self._read_cert()
@@ -239,12 +373,14 @@ class PyKcs11Token(PivToken):
         return sig
 
     def is_present(self) -> bool:  # pragma: no cover - requires hardware
-        if self._pkcs11 is None:
+        # Queries the *already-loaded* lib rather than `probe_token`: C_Finalize
+        # is process-global, so the probe's unload would tear down this open
+        # session. Use `probe_token` only when no session is live (e.g. the
+        # console's pre-PIN status line).
+        if self._lib is None:
             return False
         try:
-            lib = self._pkcs11.PyKCS11Lib()
-            lib.load(self._module_path)
-            return self._slot in lib.getSlotList(tokenPresent=True)
+            return self._slot in self._lib.getSlotList(tokenPresent=True)
         except Exception:
             return False
 
@@ -259,6 +395,7 @@ class PyKcs11Token(PivToken):
             except Exception:
                 pass
         self._session = None
+        self._lib = None
         self._cert_der = None
 
 
