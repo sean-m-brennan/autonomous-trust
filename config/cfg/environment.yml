@@ -23,6 +23,11 @@ dependencies:
   - libsodium
   - jansson
   - check
+  # Imported by the core package itself, so these are runtime, not tooling:
+  # ruamel.yaml by core/_python/trust_ladder.py, cffi by core/_native/_ffi.py
+  # (the FFI bridge the native backend loads).
+  - ruamel.yaml
+  - cffi
 
   # inspector (autonomous-trust-inspector): the web dashboard / live visualization.
   - aenum

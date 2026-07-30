@@ -183,12 +183,16 @@ a non-allowlisted inbound verb refused.
 Full suite: **82/82** (`ctest`), library **0 warnings**, up from an 81/81
 baseline.
 
-**Not verified in-sandbox:** a live-daemon end-to-end run. The daemon aborts
+**Not verifiable in-sandbox:** a live-daemon end-to-end run. The daemon aborts
 with `*** stack smashing detected ***` during startup here — including on the
 unmodified `at_demo -g` path, which touches none of this code — so break #4's
 fix is verified at the mechanism level (real sockets, matching and mismatched
 names) but not against a running daemon. See ISSUES.md §2.1.1, which records
 that the abort does not reproduce on a host machine.
+
+**Verified on a host, 2026-07-30:** the end-to-end run this blocked is done — a
+3-node cohort, all seven breaks confirmed fixed against a live daemon. See "What
+the cohort then measured" below.
 
 ## Observing the carrier on a live cohort
 
@@ -243,3 +247,46 @@ an emitter or through the routing; none entered where a peer actually arrives.
 The three new admission tests do, and with the emissions removed again they fail
 6 assertions while every `num_peers == 1` check still passes — the shape of the
 bug itself.
+
+## What the cohort then measured — the pull answers "now"
+
+Both fixes were confirmed on the next run. The uuid-exact check passed: the
+observation and the sybil-collision refusal name the same peer, 7 ms apart, the
+announcement first.
+
+But the two pull confirmations read **zero**, and the timeline says why:
+
+| Time | Line |
+|---|---|
+| 15:45:47.263 | `Identity: peer roster request -> 0 observation(s)` |
+| 15:45:47.664 | `Reputation: peer roster request -> 0 reputation(s)` |
+| 15:46:10.528 | `peer observed: 5b4f3fbd-… rank=0 key=f29f..8d operator=none attended_at=0` |
+| 15:46:10.535 | `Identity: refusing vote — candidate 5b4f3fbd-… collides … (sybil)` |
+
+The pull landed on both halves **23 seconds before the first peer existed**, and
+`0` was the correct answer. Retrying until `messaging_send` succeeds fires the
+request at the earliest instant the queues allow, which on a cold node is the
+least useful one — and nothing pulled again, so the `unrated` reputation, which
+crosses on the pull *alone*, could never appear.
+
+So a pull reports what AT knows **at that moment**; it is not a request for
+"tell me once you know something". Both `at_demo` and `example.c` now re-pull
+every ~30 s after the first one lands, and the ABI's `@warning` says so for a
+foreign host, whose loop is its own. Repeats cost one message per peer and are
+harmless by construction, the feed being upsert-only.
+
+**Confirmed on the following run:** `Identity: peer roster request -> 2
+observation(s)`, `Reputation: … -> 2 reputation(s)`, and the `unrated` lines with
+them. So on a 3-node cohort each node reports both peers, and a peer with no score
+is reported *as* unrated rather than as a placeholder number. That is the whole
+carrier verified end to end against a live daemon — and the first live observation
+of the signal ethne's `MemberCandidate` depends on (D18: `reputation: None` must
+mean unrated, not rated-low).
+
+Two honest notes. The refresh lives in the demo and the reference, not the
+library — the cadence is the host's, so there is no library-side test for it, and
+the `unrated` path is pinned by
+`reputation_pull_reports_unrated_peers_as_unrated` rather than by a live check.
+And a pull can also return nothing because `reputation_emit_all` returns early
+while `rep_state.initialized` is false, which is the same lesson arriving by a
+second route.

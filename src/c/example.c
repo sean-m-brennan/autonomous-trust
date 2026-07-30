@@ -35,6 +35,8 @@
 
 /* ~20s at the 500ms loop cadence. */
 #define ROSTER_MAX_ATTEMPTS 40
+/* ~30s between refreshes. */
+#define ROSTER_REFRESH_ITERATIONS 60
 
 /* Ask AT to re-emit everything it currently knows. Worth doing at startup: the
  * carrier is otherwise event-driven, so an app that attached after the node
@@ -43,7 +45,15 @@
  * RETRY THIS — do not fire it once. at_node_start forks the daemon and returns
  * without waiting for it, so on the early ticks AT's identity and reputation
  * processes have not necessarily bound their queues yet, and the request goes
- * nowhere. A single attempt at iteration 1 always loses the race. */
+ * nowhere. A single attempt at iteration 1 always loses the race.
+ *
+ * THEN KEEP ASKING. A pull answers "what do you know NOW", and a node that has
+ * not finished discovery honestly knows nothing — on a cold 3-node cohort the
+ * first successful pull returned 0 peers a full 23s before the first admission.
+ * An app that pulls once at startup and never again will conclude AT has no
+ * peers, and will never see an `unrated` reputation, which crosses on the pull
+ * alone. Re-pull periodically, or whenever you want a fresh view. Repeats are
+ * cheap: the feed is upsert-only, so a restated observation costs one message. */
 static int request_peer_roster(at_node_t *node)
 {
     generic_msg_t req = {0};
@@ -87,8 +97,8 @@ static void print_peer_reputation(const peer_reputation_msg_t *r)
         printf("  peer %s reputation=unrated\n", uuid_str);
 }
 
-/* Retry state for the startup roster pull. A real app would more likely keep
- * this in the struct it passes as user_data. */
+/* Roster-pull state: retry until the first one lands, then refresh. A real app
+ * would more likely keep this in the struct it passes as user_data. */
 typedef struct {
     bool roster_requested;
     unsigned roster_attempts;
@@ -107,6 +117,13 @@ static int example_tick(at_node_t *node, void *user_data)
             log_warn(at_node_logger(node),
                      "roster request never accepted (%u attempts)\n",
                      ctx->roster_attempts);
+    }
+    else if (ctx->roster_requested
+             && at_node_iteration(node) % ROSTER_REFRESH_ITERATIONS == 0)
+    {
+        /* A failure here needs no handling: the next refresh is 30s away, and
+         * change-driven observations keep arriving regardless. */
+        request_peer_roster(node);
     }
 
     /* Check for messages from AT sub-processes */

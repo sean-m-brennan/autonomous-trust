@@ -122,6 +122,9 @@ static void inject_self_update(at_node_t *node)
  * retrying forever would only bury the reason in log noise. */
 #define ROSTER_MAX_ATTEMPTS 40
 
+/* ~30s. See the "answers NOW" note below: one startup pull is not enough. */
+#define ROSTER_REFRESH_ITERATIONS 60
+
 /**
  * Ask AT to re-emit everything it currently knows about its peers. Worth doing
  * at startup: the carrier is otherwise event-driven, so a node that admitted
@@ -132,6 +135,14 @@ static void inject_self_update(at_node_t *node)
  * at_node_start forks the daemon and returns without waiting for it, so on the
  * early ticks the identity and reputation processes have not necessarily bound
  * their queues, and a single-shot request is silently lost.
+ *
+ * AND A SUCCESSFUL SEND IS NOT ENOUGH EITHER. A pull answers "what do you know
+ * NOW", so on a node that has not finished discovery the honest answer is
+ * "nothing yet" — measured on a 3-node cohort (2026-07-30): the pull landed on
+ * both halves at 15:45:47 reporting 0 observations and 0 reputations, and the
+ * first peer was admitted at 15:46:10, twenty-three seconds later. So this is
+ * also re-sent periodically. Repeats are cheap and harmless: the feed is
+ * upsert-only by design, so a restated observation costs one message.
  */
 static int request_peer_roster(at_node_t *node)
 {
@@ -196,6 +207,13 @@ static int demo_tick(at_node_t *node, void *user_data)
                      "peer roster request never accepted (%u attempts); "
                      "the app will still see change-driven observations\n",
                      ctx->roster_attempts);
+    }
+    else if (ctx->roster_requested
+             && at_node_iteration(node) % ROSTER_REFRESH_ITERATIONS == 0)
+    {
+        /* Refresh. A failure here needs no handling — the next one is 30s away,
+         * and change-driven observations keep arriving regardless. */
+        request_peer_roster(node);
     }
 
     generic_msg_t buf = {0};

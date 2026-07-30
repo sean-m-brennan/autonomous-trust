@@ -446,7 +446,10 @@ int proto_to_signal(uint8_t *data, size_t len, signal_t *sig)
      * NOT guaranteed NUL-terminated (it is a raw protobuf value), so stay
      * inside `len` throughout. */
     const char *s = (const char *)data;
-    size_t dash = 0;
+    /* A negative sig (signal_to_proto writes "%d-%s", so sig -1 yields
+     * "-1-test") puts a sign in s[0]. That leading sign is part of the
+     * integer, not the separator, so start the scan past it. */
+    size_t dash = (s[0] == '-' || s[0] == '+') ? 1 : 0;
     while (dash < len && s[dash] != '-')
         dash++;
     if (dash == 0 || dash >= len)
