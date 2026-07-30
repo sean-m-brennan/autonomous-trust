@@ -223,9 +223,11 @@ static void remove_rejected_address(const char *address)
     pthread_mutex_lock(&rejected_lock);
     for (size_t i = 0; i < rejected_count; i++) {
         if (strcmp(rejected_addresses[i], norm) == 0) {
-            for (size_t j = i + 1; j < rejected_count; j++)
-                snprintf(rejected_addresses[j - 1], sizeof(rejected_addresses[0]),
-                         "%s", rejected_addresses[j]);
+            /* memmove, not snprintf: source and destination are slots of the
+             * same array, which violates snprintf's restrict contract. */
+            if (i + 1 < rejected_count)
+                memmove(rejected_addresses[i], rejected_addresses[i + 1],
+                        (rejected_count - i - 1) * sizeof(rejected_addresses[0]));
             rejected_count--;
             rejected_addresses[rejected_count][0] = '\0';
             break;

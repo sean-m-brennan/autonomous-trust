@@ -616,6 +616,167 @@ DEFINE_TEST(test_roster_verb_dispatches_to_the_registered_handlers)
 }
 END_TEST_DEFINITION()
 
+/****************************
+ * The ADMISSION paths — the gap Sean's live cohort exposed (2026-07-30).
+ *
+ * Every test above enters through an emitter or through the routing. None
+ * entered through the paths by which a peer actually ARRIVES, and three of the
+ * four writers of protocol.peers[] emitted nothing: handle_acceptance,
+ * _populate_peers_from_history, handle_identity_response. A 3-node cohort ran
+ * with peers in the table and told its app nothing, while all 17 cases here
+ * stayed green. So these enter where a peer enters.
+ *
+ * (_populate_peers_from_history is reached only via handle_receive_history ->
+ * choose_group with a full history bundle; it emits through
+ * identity_emit_all_peers, which test_identity_emits_one_observation_per_peer
+ * and the roster-verb dispatch test already pin. Stated rather than faked.)
+ ****************************/
+
+/* An identity as it arrives on the wire: uuid, signing key, address. */
+static void wire_peer(public_identity_t *p, uint8_t seed, const char *address)
+{
+    memset(p, 0, sizeof(*p));
+    uuid_fill(p->uuid, seed);
+    for (size_t k = 0; k < crypto_sign_PUBLICKEYBYTES; k++)
+        p->signature.public[k] = (uint8_t)(seed + k);
+    snprintf(p->nickname, sizeof(p->nickname), "peer-%02x", seed);
+    snprintf(p->address, sizeof(p->address), "%s", address);
+}
+
+DEFINE_TEST(test_acceptance_admission_tells_the_app)
+{
+    capture_reset();
+
+    /* No peers yet: a joining node, which is the case that failed. */
+    process_t idp;
+    proc_with_peers(&idp, 0, 0);
+    idp.protocol.phase = 2;   /* handle_acceptance is a no-op below phase 2 */
+    ck_assert_int_eq(map_create(&idp.protocol.handlers), 0);
+    ck_assert_int_eq(identity_register_handlers(&idp), 0);
+
+    /* _remember_activity walks this; empty means it broadcasts to nobody. */
+    directory_t queues = {0};
+    array_init(&queues);
+
+    generic_msg_t accept = {0};
+    accept.type = NET_MESSAGE;
+    snprintf(accept.info.net_msg.process, sizeof(accept.info.net_msg.process),
+             "%s", idp.name);
+    accept.info.net_msg.function = (char *)"access_granted";
+    wire_peer(&accept.info.net_msg.from_whom, 0x71, "10.0.0.71");
+
+    ck_assert(run_message_handlers(&idp, &queues, NET_MESSAGE, &accept));
+
+    /* The peer landed in the table AND the app was told. Before the fix the
+     * first assertion passed and the second read 0. */
+    ck_assert_int_eq((int)idp.protocol.num_peers, 1);
+    ck_assert_int_eq(count_type(PEER_OBSERVED), 1);
+    ck_assert_int_eq(count_to(AT_MAIN_QUEUE), 1);
+
+    /* It is THIS peer that was announced, not a zeroed struct. */
+    uuid_t expect;
+    uuid_fill(expect, 0x71);
+    ck_assert_int_eq(memcmp(captured[0].msg.info.peer_observed.peer_uuid,
+                            expect, sizeof(uuid_t)), 0);
+    ck_assert_int_eq(captured[0].msg.info.peer_observed.signing_pubkey[0], 0x71);
+
+    array_free(&queues);
+    pthread_rwlock_destroy(&idp.protocol.peers_rwlock);
+    capture_done();
+}
+END_TEST_DEFINITION()
+
+/* Negative control: the emission hangs off the APPEND, not off the message.
+ * A peer re-announcing must not produce a second observation, or a chatty
+ * cohort would drown the app in restatements of what it already knows. */
+DEFINE_TEST(test_a_repeated_acceptance_is_not_re_announced)
+{
+    capture_reset();
+
+    process_t idp;
+    proc_with_peers(&idp, 0, 0);
+    idp.protocol.phase = 2;
+    ck_assert_int_eq(map_create(&idp.protocol.handlers), 0);
+    ck_assert_int_eq(identity_register_handlers(&idp), 0);
+
+    directory_t queues = {0};
+    array_init(&queues);
+
+    generic_msg_t accept = {0};
+    accept.type = NET_MESSAGE;
+    snprintf(accept.info.net_msg.process, sizeof(accept.info.net_msg.process),
+             "%s", idp.name);
+    accept.info.net_msg.function = (char *)"access_granted";
+    wire_peer(&accept.info.net_msg.from_whom, 0x72, "10.0.0.72");
+
+    ck_assert(run_message_handlers(&idp, &queues, NET_MESSAGE, &accept));
+    ck_assert(run_message_handlers(&idp, &queues, NET_MESSAGE, &accept));
+
+    ck_assert_int_eq((int)idp.protocol.num_peers, 1);
+    ck_assert_int_eq(count_type(PEER_OBSERVED), 1);
+
+    array_free(&queues);
+    pthread_rwlock_destroy(&idp.protocol.peers_rwlock);
+    capture_done();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_identity_response_backfill_tells_the_app)
+{
+    capture_reset();
+
+    process_t idp;
+    proc_with_peers(&idp, 0, 0);
+    ck_assert_int_eq(map_create(&idp.protocol.handlers), 0);
+    ck_assert_int_eq(identity_register_handlers(&idp), 0);
+
+    /* A REAL keyed identity here, not a hand-filled struct: this path parses
+     * the peer back out of JSON, and public_identity_from_json rejects an
+     * identity whose signature/encryptor seeds are not real key material. */
+    identity_t self_ident = {0};
+    ck_assert_int_eq(identity_init(NULL, "10.0.0.73", "peer-73", "",
+                                  &self_ident), 0);
+    public_identity_t *published = NULL;
+    ck_assert_int_eq(identity_publish(&self_ident, &published), 0);
+    ck_assert_ptr_nonnull(published);
+    public_identity_t member = *published;
+
+    /* The handler backfills only actual group members, so the address has to
+     * be in the group's map for the response to be accepted at all. */
+    char member_uuid[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(member.uuid, member_uuid);
+    /* group_init's `address` is our OWN address and is not optional — it is
+     * strncpy'd unguarded. Distinct from the member's, since group_add_address
+     * drops a prior entry sharing an address. */
+    char self_address[] = "10.0.0.1";
+    ck_assert_int_eq(group_init(NULL, self_address, &idp.protocol.group), 0);
+    ck_assert_int_eq(group_add_address(&idp.protocol.group, member_uuid,
+                                       member.address), 0);
+
+    json_t *ident = NULL;
+    ck_assert_int_eq(public_identity_to_json(&member, &ident), 0);
+    json_t *payload = json_object();
+    ck_assert_ptr_nonnull(payload);
+    ck_assert_int_eq(json_object_set_new(payload, "from_identity", ident), 0);
+
+    generic_msg_t resp = {0};
+    resp.type = NET_MESSAGE;
+    snprintf(resp.info.net_msg.process, sizeof(resp.info.net_msg.process),
+             "%s", idp.name);
+    resp.info.net_msg.function = (char *)"peer_identity_response";
+    ck_assert_int_eq(net_msg_pack_json(&resp.info.net_msg, payload), 0);
+    json_decref(payload);
+
+    ck_assert(run_message_handlers(&idp, NULL, NET_MESSAGE, &resp));
+
+    ck_assert_int_eq((int)idp.protocol.num_peers, 1);
+    ck_assert_int_eq(count_type(PEER_OBSERVED), 1);
+
+    pthread_rwlock_destroy(&idp.protocol.peers_rwlock);
+    capture_done();
+}
+END_TEST_DEFINITION()
+
 /* Unix-socket paths are <AUTONOMOUS_TRUST_ROOT>/var/at/<queue-name>, so a
  * bare test has to provide a root that exists before it can bind one. */
 static void socket_root_setup(void)
@@ -758,5 +919,8 @@ RUN_TESTS(App_Events,
           test_unverified_operator_suppresses_the_attendance_stamp,
           test_reputation_pull_reports_unrated_peers_as_unrated,
           test_roster_verb_dispatches_to_the_registered_handlers,
+          test_acceptance_admission_tells_the_app,
+          test_a_repeated_acceptance_is_not_re_announced,
+          test_identity_response_backfill_tells_the_app,
           test_carrier_crosses_a_real_socket_to_the_app,
           test_app_bound_to_the_wrong_name_receives_nothing)

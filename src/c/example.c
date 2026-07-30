@@ -33,11 +33,18 @@
 
 #define EXAMPLE_ITERATIONS 200
 
-/* Ask AT to re-emit everything it currently knows. Worth doing once at
- * startup: the carrier is otherwise event-driven, so an app that attached
- * after the node admitted its peers would otherwise see nothing until the
- * next change. */
-static void request_peer_roster(at_node_t *node)
+/* ~20s at the 500ms loop cadence. */
+#define ROSTER_MAX_ATTEMPTS 40
+
+/* Ask AT to re-emit everything it currently knows. Worth doing at startup: the
+ * carrier is otherwise event-driven, so an app that attached after the node
+ * admitted its peers would otherwise see nothing until the next change.
+ *
+ * RETRY THIS — do not fire it once. at_node_start forks the daemon and returns
+ * without waiting for it, so on the early ticks AT's identity and reputation
+ * processes have not necessarily bound their queues yet, and the request goes
+ * nowhere. A single attempt at iteration 1 always loses the race. */
+static int request_peer_roster(at_node_t *node)
 {
     generic_msg_t req = {0};
     req.type = NET_MESSAGE;
@@ -45,8 +52,7 @@ static void request_peer_roster(at_node_t *node)
              "identity");
     req.info.net_msg.function = (char *)AT_APP_ROSTER_REQUEST;
     req.info.net_msg.encrypt = false;
-    if (messaging_send(node->config.q_out, NET_MESSAGE, &req, false) != 0)
-        log_exception(at_node_logger(node));
+    return messaging_send(node->config.q_out, NET_MESSAGE, &req, false);
 }
 
 static void print_peer_observed(const peer_observed_msg_t *p)
@@ -81,12 +87,27 @@ static void print_peer_reputation(const peer_reputation_msg_t *r)
         printf("  peer %s reputation=unrated\n", uuid_str);
 }
 
+/* Retry state for the startup roster pull. A real app would more likely keep
+ * this in the struct it passes as user_data. */
+typedef struct {
+    bool roster_requested;
+    unsigned roster_attempts;
+} example_ctx_t;
+
 static int example_tick(at_node_t *node, void *user_data)
 {
-    (void)user_data;
+    example_ctx_t *ctx = (example_ctx_t *)user_data;
 
-    if (at_node_iteration(node) == 1)
-        request_peer_roster(node);
+    if (!ctx->roster_requested && ctx->roster_attempts < ROSTER_MAX_ATTEMPTS)
+    {
+        ctx->roster_attempts++;
+        if (request_peer_roster(node) == 0)
+            ctx->roster_requested = true;
+        else if (ctx->roster_attempts == ROSTER_MAX_ATTEMPTS)
+            log_warn(at_node_logger(node),
+                     "roster request never accepted (%u attempts)\n",
+                     ctx->roster_attempts);
+    }
 
     /* Check for messages from AT sub-processes */
     generic_msg_t buf = {0};
@@ -131,7 +152,8 @@ int main(int argc, char *argv[])
     if (at_node_start(&node) != 0)
         return 1;
 
-    int ret = at_node_run(&node, example_tick, NULL);
+    example_ctx_t ctx = {0};
+    int ret = at_node_run(&node, example_tick, &ctx);
     at_node_shutdown(&node);
     return ret;
 }
