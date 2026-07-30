@@ -210,6 +210,15 @@ run_test() {
         fi
     done
 
+    # tools/ lives at the repo root, not under $AT_DIR, and is not baked into
+    # the image. tests/a_unit/test_piv_verifier.py and test_operator_activate.py
+    # import tools.provision_zta_certs to mint their PKI fixtures; they locate
+    # it by searching upward for tools/provision_zta_certs.py, which finds
+    # /app once this is mounted.
+    if [ -e "$REPO_DIR/tools" ]; then
+        mount_args+=(-v "$REPO_DIR/tools:/app/tools")
+    fi
+
     # Run test container
     local run_args=(
         --rm
@@ -220,6 +229,56 @@ run_test() {
         -u "$(id -u):$(id -g)"
         -e "ROUTER=$gateway"
         -e 'AUTONOMOUS_TRUST_ARGS="--live --test"'
+        # tox defaults its work dir to {toxinidir}/.tox, i.e. /app/.tox. We
+        # run as the host uid (above), but /app is owned by the image's
+        # `user` (Dockerfile-devel: useradd -U user -d /app), so unless those
+        # uids happen to match, tox dies with EACCES creating .tox/.pkg. Only
+        # the individually-mounted paths below are host-owned and writable.
+        # Point the work dir at container-local /tmp instead: it also keeps
+        # .tox out of the source tree, which build-docker.sh otherwise has to
+        # stash away before conda-build walks it.
+        -e "TOX_WORK_DIR=/tmp/.tox"
+        # The macvlan segment above has no route to PyPI (its gateway is
+        # synthesized from the subnet prefix), and it does not need one: the
+        # image's conda env already supplies every entry of requirements.txt
+        # (environment.yml) and tests_require.txt (devel_environ.yml). Let
+        # tox's venv see those, so pip resolves each requirement as already
+        # satisfied and never reaches for the network -- the same "the conda
+        # env IS the environment under test" reasoning as CONFORMANCE_SKIP_TOX
+        # in test-conformance.sh, but without giving up tox.ini as the source
+        # of the pytest invocation. PIP_NO_INDEX turns any genuine gap into an
+        # immediate, legible error instead of five connection retries.
+        -e "VIRTUALENV_SYSTEM_SITE_PACKAGES=true"
+        -e "PIP_NO_INDEX=1"
+        # Skip tox's sdist build for the same reason we skip its dep install:
+        # Dockerfile-devel already ran `poetry install` into the conda env, so
+        # the project is importable there and the line above exposes it to the
+        # testenv. Building it again would need poetry-core in a PEP 517 build
+        # env -- and conda's `poetry` vendors poetry-core rather than shipping
+        # a separate distribution pip can see, so offline that build cannot be
+        # satisfied. Nothing is lost: pyproject.toml is not among the mounted
+        # paths, so tox would have been packaging the image's baked-in copy
+        # of the source, which is exactly what poetry installed.
+        -e "TOX_OVERRIDE=testenv.package=skip"
+        # tests/ is bind-mounted from the host, so its __pycache__ holds .pyc
+        # files compiled there. Their header (source mtime + size) still
+        # matches, so the container serves them instead of recompiling, and
+        # tracebacks then cite the host path -- which does not exist here, so
+        # pytest prints `???` for the source line. Relocating the cache makes
+        # the host's __pycache__ invisible; PYTHONDONTWRITEBYTECODE does NOT
+        # (it stops writes, not reads). This also keeps the container from
+        # dropping its own uid's .pyc files into the host source tree.
+        -e "PYTHONPYCACHEPREFIX=/tmp/pycache"
+        # coverage puts its SQLite data file in the CWD, i.e. /app, which this
+        # uid cannot write -- the same ownership mismatch that TOX_WORK_DIR
+        # works around, surfacing at the end of the run as an INTERNALERROR
+        # ("unable to open database file") after the tests have already
+        # passed. Only the raw data file moves; --cov-report=html:coverage
+        # still resolves against the CWD, so the report lands in the mounted
+        # coverage/ dir and reaches the host as before. /tmp matches the
+        # previous lifetime too: /app was never mounted, so the data file has
+        # always died with the container.
+        -e "COVERAGE_FILE=/tmp/.coverage"
         "${mount_args[@]}"
     )
 
