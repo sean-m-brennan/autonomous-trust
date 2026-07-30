@@ -1436,6 +1436,13 @@ add_test(NAME app_events_test COMMAND $<TARGET_FILE:app_events_test>)
 
 # The flat lifecycle ABI (app_node.h) and the non-forking half of
 # at_node_start. Creates and binds under its own AUTONOMOUS_TRUST_ROOT.
+# The opt-in operator key: the cross-language pre-image pin, and (with ZTA) the
+# signature check. Mints its own PKI at run time like zta_ocsp_test.
+add_executable(operator_binding_test test/operator_binding_test.c)
+set_source_files_properties(test/operator_binding_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(operator_binding_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME operator_binding_test COMMAND $<TARGET_FILE:operator_binding_test>)
+
 add_executable(app_node_test test/app_node_test.c)
 set_source_files_properties(test/app_node_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(app_node_test PRIVATE ${AT_TEST_LIBS})

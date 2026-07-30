@@ -126,6 +126,9 @@ def software_activator(token: Any, ca_bundle_path: str, totp_secret: str = ''):
         from autonomous_trust.core.operator.activate import activate as core
         return core(token, ca_bundle_path,
                     totp_secret=totp_secret, totp_code=mfa or '')
+    # Exposed so the entry point can drive the console's token-present line off
+    # this software token instead of probing hardware that isn't in play.
+    activate.token = token
     return activate
 
 

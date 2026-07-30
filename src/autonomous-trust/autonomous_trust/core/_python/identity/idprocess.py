@@ -33,6 +33,8 @@ from nacl.signing import SignedMessage
 
 from . import Peers
 from .identity import Identity, public_identity_to_canonical, public_identity_from_canonical
+from .operator_binding import (OPERATOR_BINDING_MAX, OPERATOR_PUBKEY_LEN,
+                               verify_operator_binding)
 from .group import Group, ChildGroupSet
 from .history.history import IdentityHistory
 from ..algorithms.agreement import AgreementProof
@@ -1044,6 +1046,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         cred = getattr(me, 'zta_credential', b'') or b''
         if cred:
             att['zta_credential'] = base64.b64encode(bytes(cred)).decode('ascii')
+        # The OPT-IN guardian identity (identity.proto 14-15). Both halves or
+        # neither — a key with no binding is unverifiable and a binding with no key
+        # names nobody — and nothing at all when this node declined, which keeps a
+        # declining node's payload byte-identical to one built before these fields
+        # existed. Mirror of the C _operator_attestation_json.
+        op_key = getattr(me, 'operator_pubkey', b'') or b''
+        op_binding = getattr(me, 'operator_key_binding', b'') or b''
+        if op_key and op_binding:
+            att['operator_pubkey'] = base64.b64encode(bytes(op_key)).decode('ascii')
+            att['operator_key_binding'] = base64.b64encode(
+                bytes(op_binding)).decode('ascii')
         return att
 
     @staticmethod
@@ -1068,6 +1081,21 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 new_id.zta_credential = base64.b64decode(cred_b64)
             new_id.operator_bound = bool(att.get('operator_bound', False))
             new_id.operator_attested_at = float(att.get('operator_attested_at', 0.0) or 0.0)
+            # The guardian CLAIM (mirror of the C _apply_operator_attestation_json).
+            # A wrong-length key is dropped whole — a truncated ed25519 key is a
+            # different key — and an oversized binding refused. _zta_admit
+            # neutralizes the key and re-earns it from the binding; nothing here is
+            # verified.
+            key_b64 = att.get('operator_pubkey', '') or ''
+            binding_b64 = att.get('operator_key_binding', '') or ''
+            if key_b64:
+                key = base64.b64decode(key_b64)
+                if len(key) == OPERATOR_PUBKEY_LEN:
+                    new_id.operator_pubkey = key
+            if binding_b64:
+                binding = base64.b64decode(binding_b64)
+                if 0 < len(binding) <= OPERATOR_BINDING_MAX:
+                    new_id.operator_key_binding = binding
         except (ValueError, TypeError):
             # A malformed attestation is treated as absent; identity/keys still
             # stand on their own and normal admission proceeds.
@@ -1479,6 +1507,50 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self._zta_policy().create_operator_verifier() or False
         return self._zta_operator_verifier_cache or None
 
+    def _verify_operator_key(self, new_id, cred, claimed_key):
+        """Credit a peer's OPT-IN guardian identity, if it advertised one and the
+        binding holds.
+
+        Called only once the credential is known to be operator-class: a binding
+        signed by a credential with no standing to name a guardian names nobody.
+
+        Three outcomes, and the middle one is the design:
+          - no claim  -> silent. The default, and it must stay costless.
+          - claim + binding verifies -> the key is written onto the peer, so from
+            here on a stored peer with a key is one we verified.
+          - claim + binding fails -> the key stays empty and we say so.
+            operator_bound is NOT demoted: it was earned independently above, and a
+            stale binding after node key rotation is an honest cause of this.
+            Losing a guardian edge is the failure mode; losing admission is not.
+
+        Mirror of the C _verify_operator_key (id_proc.c).
+        """
+        nick = getattr(new_id, 'nickname', '?')
+        binding = getattr(new_id, 'operator_key_binding', b'') or b''
+        if not claimed_key and not binding:
+            return                              # declined; the normal case
+        if not claimed_key or not binding:
+            # Half a claim is not a claim. Worth a word either way: both halves are
+            # written by one code path, so one without the other means something
+            # upstream is broken, not that a peer declined.
+            self.logger.warning(
+                'ZTA: %s advertised half an operator-key binding (key %s, '
+                'binding %s); no guardian recorded', nick,
+                'present' if claimed_key else 'absent',
+                'present' if binding else 'absent')
+            return
+        if verify_operator_binding(new_id, cred, claimed_key, binding):
+            new_id.operator_pubkey = claimed_key
+            self.logger.debug('ZTA: %s guardian key bound and verified', nick)
+            _probes.emit('id.welcome', 'operator_key_bound', peer_nick=str(nick))
+        else:
+            self.logger.warning(
+                'ZTA: %s advertised an operator key whose binding does not verify '
+                'against its operator credential; no guardian recorded '
+                '(operator_bound stands on its own)', nick)
+            _probes.emit('id.welcome', 'operator_key_refused', peer_nick=str(nick))
+            _probes.counter('id.welcome', 'operator_key_refused')
+
     @staticmethod
     def _mark_operator_bound(new_id, value):
         """Set the AUTHORITATIVE operator_bound on a peer identity (defensive:
@@ -1568,6 +1640,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # Never trust the peer-advertised operator_bound: start False and earn
         # True only via operator-anchor verification below.
         self._mark_operator_bound(new_id, False)
+        # Same rule for the OPT-IN guardian identity, with one wrinkle: the claimed
+        # key is part of the pre-image the operator signed, so the gate needs it —
+        # it moves aside and the peer's own copy is cleared. A stored peer with a
+        # key is therefore one whose binding we verified, and a policy that never
+        # verifies leaves every peer keyless (the fail-safe operator_bound takes).
+        claimed_key = getattr(new_id, 'operator_pubkey', b'') or b''
+        new_id.operator_pubkey = b''
         policy = self._zta_policy()
         if not (policy.enabled and policy.require_at_admission):
             return 'admit'
@@ -1636,6 +1715,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 except Exception:
                     pass
                 self.logger.debug('ZTA: %s is operator-attended (human guardian)', nick)
+                self._verify_operator_key(new_id, cred, claimed_key)
             return 'admit'
         if status in (ZtaStatus.REJECTED, ZtaStatus.EXPIRED, ZtaStatus.REVOKED):
             self.logger.warning('ZTA: rejecting %s at admission: %s (%s)',

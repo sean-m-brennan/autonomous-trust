@@ -1,0 +1,79 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: operator-key-absent-is-normal
+byte_pinning: false
+description: |
+    THE OPT-OUT CONTROL, and the one this whole slice is answerable to.
+
+    A verified operator node that declines to name a guardian is admitted
+    exactly as it was before the feature existed: operator_bound true, the
+    attendance signal intact, no guardian key, no warning, no penalty. Naming a
+    guardian links an operator's nodes to each other — one key per operator,
+    stable across them — which is a real cost, so AT never requires it. ethne
+    may; that is ethne's rule to apply, and absence there means "unguarded
+    machine", not an error.
+
+    If opting out ever starts costing something, this scenario is where it
+    shows up. It carries no operator_bindings fixture at all, which is also how
+    every pre-existing scenario in this corpus runs — so the corpus itself is
+    the wider version of this control.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+    operator_ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+  credentials:
+    newcomer: testdata/zta/certs/operator_leaf.der
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces with an operator credential AND an advertised
+        guardian key. bg's welcoming_committee verifies the chain, classifies
+        the credential operator-class, then checks the binding.
+  - id: 2
+    from: bg
+    to: broadcast
+    function: propose_peer
+    in_response_to: 1
+    description: bg proposes the candidate to the group.
+  - id: 3
+    from: bg
+    to: broadcast
+    function: peer_accepted
+    in_response_to: 1
+    description: |
+        After synchronous vote finalization, _peer_accepted stores the newcomer
+        with whatever the gate concluded about its guardian.
+  - id: 4
+    from: bg
+    to: newcomer
+    function: access_granted
+    in_response_to: 1
+    description: bg sends its published identity to the newcomer.
+  - id: 5
+    from: bg
+    to: newcomer
+    function: full_history
+    in_response_to: 1
+    description: bg sends the group key + history DAG.
+
+expected_state:
+  bg:
+    operator_bound:
+      newcomer: true
+    operator_guardian:
+      newcomer: false
