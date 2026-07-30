@@ -28,9 +28,19 @@ struct at_app_events_s {
     bool owns_queue;
 };
 
+/* A queue name only survives if the messaging layer keeps all of it:
+ * messaging_init copies MSG_KEY_LEN - 1 bytes into a zeroed key, so a name of
+ * exactly that length is the longest intact one. Truncating means binding, or
+ * sending to, a name the other side does not share — break #4 with no visible
+ * cause — so both flat entry points refuse rather than shorten. */
+static bool name_survives(const char *name)
+{
+    return name != NULL && name[0] != '\0' && strlen(name) <= MSG_KEY_LEN - 1;
+}
+
 at_app_events_t *at_app_events_open(const char *q_in)
 {
-    if (q_in == NULL || q_in[0] == '\0')
+    if (!name_survives(q_in))
         return NULL;
     at_app_events_t *h = calloc(1, sizeof(*h));
     if (h == NULL)
@@ -118,7 +128,7 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
 
 int at_app_events_request_roster(at_app_events_t *handle, const char *q_out)
 {
-    if (handle == NULL || q_out == NULL || q_out[0] == '\0')
+    if (handle == NULL || !name_survives(q_out))
         return -1;
     generic_msg_t req = {0};
     req.type = NET_MESSAGE;
