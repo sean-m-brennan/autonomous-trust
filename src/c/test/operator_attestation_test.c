@@ -270,9 +270,9 @@ DEFINE_TEST(test_attest_pull_attended_stamps_and_echoes_nonce)
     ck_assert_ptr_nonnull(g_last_attest);
     ck_assert_str_eq(json_string_value(json_object_get(g_last_attest, "nonce")),
                      "cafebabe");
-    ck_assert(json_real_value(json_object_get(g_last_attest,
-                                              "operator_attested_at"))
-              == PINNED_CLOCK);
+    ck_assert_double_eq_tol(json_real_value(json_object_get(g_last_attest,
+                                                           "operator_attested_at")),
+                            PINNED_CLOCK, 1e-6);
     _attest_end();
 }
 
@@ -290,7 +290,7 @@ DEFINE_TEST(test_attest_pull_unattended_answers_explicit_zero)
     ck_assert_int_eq((int)g_attest_count, 1);
     json_t *stamp = json_object_get(g_last_attest, "operator_attested_at");
     ck_assert_ptr_nonnull(stamp);            /* present, not omitted */
-    ck_assert(json_real_value(stamp) == 0.0);
+    ck_assert_double_eq_tol(json_real_value(stamp), 0.0, 1e-9);
     _attest_end();
 }
 
@@ -323,8 +323,9 @@ DEFINE_TEST(test_attest_seam_clears_stamp_when_unattended)
 
     identity_set_operator_attended(proc, false, PINNED_CLOCK);
     _dispatch_pull(proc, "n2");
-    ck_assert(json_real_value(json_object_get(g_last_attest,
-                                              "operator_attested_at")) == 0.0);
+    ck_assert_double_eq_tol(json_real_value(json_object_get(g_last_attest,
+                                                           "operator_attested_at")),
+                            0.0, 1e-9);
     _attest_end();
 }
 
@@ -379,7 +380,7 @@ DEFINE_TEST(test_attest_response_unknown_nonce_leaves_peer_untouched)
     json_decref(payload);
     run_message_handlers(proc, NULL, NET_MESSAGE, &msg);
 
-    ck_assert(proc->protocol.peers[0].operator_attested_at == 0.0);
+    ck_assert_double_eq_tol(proc->protocol.peers[0].operator_attested_at, 0.0, 1e-9);
     smrt_deref(peer_pub);
     _attest_end();
 }

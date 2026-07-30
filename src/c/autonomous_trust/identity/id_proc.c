@@ -1245,6 +1245,12 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
         peer_msg.type = PEER;
         memcpy(&peer_msg.info.peer, &nmsg->from_whom, sizeof(public_identity_t));
         _remember_activity(proc, queues, &peer_msg);
+
+        /* And tell the app, on the same terms as _add_peer: this is the path
+         * by which a joining node records the peer that accepted IT, so in a
+         * fresh cohort it is the first peer the app can be told about at all.
+         * Outside the peers lock — messaging_send is a syscall. */
+        identity_emit_peer_observed(proc, &nmsg->from_whom);
     }
 
     return true;
@@ -1402,6 +1408,15 @@ static int _populate_peers_from_history(process_t *proc,
         log_debug(proc->logger,
                   "Identity: history bundle added %zu previously unknown peer(s)\n",
                   added);
+
+        /* Tell the app. The whole view rather than just the `added` ones: the
+         * feed is upsert-only by design, so a repeated observation is harmless,
+         * and a restore is exactly the moment when "here is everything I know"
+         * is the honest message. Emitting only the delta would also cost a
+         * second 128-entry snapshot frame on top of the one emit_all_peers
+         * already takes. Outside the peers lock. */
+        identity_emit_all_peers(proc);
+
         /* Bundled peers don't know about us yet — fix the asymmetry. */
         _announce_self_to_bundled_peers(proc, queues, peer_idents, n);
     }
@@ -3771,6 +3786,11 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
         log_debug(proc->logger,
                   "Identity resync: backfilled identity for group member %s\n",
                   u);
+        /* A backfilled group member is a peer the app can now be told about;
+         * that it arrived by resync rather than admission is our bookkeeping,
+         * not a distinction a consumer of the feed should have to make.
+         * Outside the peers lock. */
+        identity_emit_peer_observed(proc, &parsed);
     } else {
         probes_counter("peer.set", "identity_response_redundant", "1");
     }
