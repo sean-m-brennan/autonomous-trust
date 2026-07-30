@@ -84,6 +84,11 @@ extern "C" {
  * @param[in] operator_bound Whether a human guardian was verified.
  * @param[in] operator_attested_at Epoch seconds; passed through verbatim,
  *                          including when @p operator_bound is false.
+ * @param[in] operator_pubkey The guardian's ed25519 public key, @ref
+ *                          AT_APP_SIGNING_KEY_LEN bytes, or NULL for the
+ *                          ordinary "no guardian advertised" case. Also
+ *                          verbatim — pass a key with @p operator_bound false
+ *                          to test that a consumer refuses it.
  * @return 0 on success, -1 on failure (no assigned queue, bad argument, or the
  *         target queue is not bound).
  */
@@ -92,7 +97,8 @@ int at_app_test_emit_peer(const char *q_name,
                           const uint8_t signing_pubkey[AT_APP_SIGNING_KEY_LEN],
                           int32_t rank,
                           bool operator_bound,
-                          double operator_attested_at);
+                          double operator_attested_at,
+                          const uint8_t operator_pubkey[AT_APP_SIGNING_KEY_LEN]);
 
 /**
  * @brief Send a synthetic @c PEER_REPUTATION to a queue, as the daemon would.

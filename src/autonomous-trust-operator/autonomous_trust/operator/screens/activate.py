@@ -51,11 +51,47 @@ class ActivateView(Vertical):
 
     def on_mount(self) -> None:
         self.refresh_token_status()
+        # Don't invite a futile PIN entry: if no activator is wired, say so up
+        # front instead of leaving the "enter PIN + MFA" prompt standing.
+        hint = str(getattr(self.app, 'activation_hint', '') or '')
+        if hint:
+            self.query_one('#activate-result', Static).update(
+                f'[yellow]{hint}[/] [dim]— see run-operator.sh --help[/]')
 
-    def refresh_token_status(self) -> None:
-        present = bool(getattr(self.app, 'token_present', lambda: False)())
-        label = ('[green]token present[/]' if present
-                 else '[yellow]no token detected — insert PIV card[/]')
+    def refresh_token_status(self, state: Any = None) -> None:
+        """Repaint the token line.
+
+        :param state: a pre-computed ``(present, detail)``. The background poller
+            passes the result of its **threaded** probe so this never runs a
+            blocking PKCS#11 call on the UI thread; user-driven refreshes (mount,
+            post-activation) omit it and probe inline.
+        """
+        if state is not None:
+            present, detail = state
+        else:
+            status = getattr(self.app, 'token_status', None)
+            if callable(status):
+                present, detail = status()
+            else:  # older/stubbed app seam: bool only
+                present = bool(getattr(self.app, 'token_present', lambda: False)())
+                detail = ''
+        hint = str(getattr(self.app, 'activation_hint', '') or '')
+        # Three distinct states, because a detected card that *cannot* activate is
+        # neither "token present" (implies ready) nor "no token" (plainly wrong):
+        # claiming either one is what sends operators chasing the reader.
+        if present and hint:
+            label = '[yellow]card detected, cannot activate[/]'
+            detail = f'{detail}; {hint}' if detail else hint
+        elif present:
+            label = '[green]token present[/]'
+        else:
+            label = '[yellow]no token detected — insert PIV card[/]'
+            if hint:
+                detail = f'{detail}; {hint}' if detail else hint
+        # The reason matters when absent (no middleware vs. empty reader) and
+        # identifies the token when present (real slot vs. software dev token).
+        if detail:
+            label += f' [dim]({detail})[/]'
         self.query_one('#token-status', Static).update(f'Token: {label}')
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -73,8 +109,13 @@ class ActivateView(Vertical):
         return result
 
     def show_result(self, result: Any) -> None:
-        status = str(getattr(result, 'status', result) or 'UNAVAILABLE')
-        status = getattr(status, 'value', status)
+        # Unwrap the enum BEFORE stringifying: core `activate` returns a
+        # `ZtaStatus`, and str()-first rendered it as "ZtaStatus.VERIFIED", which
+        # also missed the _STATUS_STYLE lookup and so lost the green. Mirrors the
+        # order in `OperatorApp.do_activate`.
+        status = getattr(result, 'status', result)
+        status = getattr(status, 'value', status) or 'UNAVAILABLE'
+        status = str(status)
         reason = getattr(result, 'reason', '') or ''
         color = _STATUS_STYLE.get(str(status).upper(), 'white')
         msg = f'[{color}]{status}[/]'

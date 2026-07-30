@@ -172,6 +172,59 @@ int identity_publish(const identity_t *ident, public_identity_t **pub_copy)
     if (rc != 0)
         return -1;
 
+    /* The opt-in guardian identity travels with the published copy, because this
+       is the copy that becomes an outgoing announce — without it a C node could
+       hold a binding and never advertise one. (operator_bound deliberately does
+       NOT ride here: in C it crosses in the separate attestation payload. The
+       guardian key rides in BOTH, for the same reason it must not be half
+       present: a published identity naming no guardian while the attestation
+       named one would be two answers to one question.)
+
+       A node's OWN key needs no verification flag: it holds a binding because
+       an operator signed one for it. */
+    if (!at_operator_pubkey_empty(ident->operator_pubkey)
+        && ident->operator_key_binding != NULL
+        && ident->operator_key_binding_len > 0) {
+        memcpy(newIdent->operator_pubkey, ident->operator_pubkey,
+               sizeof(newIdent->operator_pubkey));
+        newIdent->operator_key_binding = malloc(ident->operator_key_binding_len);
+        if (newIdent->operator_key_binding == NULL)
+            return EXCEPTION(ENOMEM);
+        memcpy(newIdent->operator_key_binding, ident->operator_key_binding,
+               ident->operator_key_binding_len);
+        newIdent->operator_key_binding_len = ident->operator_key_binding_len;
+    }
+
+    return 0;
+}
+
+bool at_operator_pubkey_empty(const uint8_t pubkey[crypto_sign_PUBLICKEYBYTES])
+{
+    if (pubkey == NULL)
+        return true;
+    /* Not memcmp against a zero buffer: this is not a secret comparison, and an
+       explicit loop keeps the "all-zero means absent" rule readable at the one
+       place it is defined. */
+    for (size_t i = 0; i < crypto_sign_PUBLICKEYBYTES; i++)
+        if (pubkey[i] != 0)
+            return false;
+    return true;
+}
+
+int operator_binding_preimage(const public_identity_t *ident,
+                              const uint8_t operator_pubkey[crypto_sign_PUBLICKEYBYTES],
+                              uint8_t out[OPERATOR_BINDING_PREIMAGE_LEN])
+{
+    if (ident == NULL || operator_pubkey == NULL || out == NULL)
+        return EINVAL;
+    uint8_t *p = out;
+    memcpy(p, OPERATOR_BINDING_TAG, OPERATOR_BINDING_TAG_LEN);
+    p += OPERATOR_BINDING_TAG_LEN;
+    memcpy(p, ident->uuid, UUID_LEN);
+    p += UUID_LEN;
+    memcpy(p, ident->signature.public, crypto_sign_PUBLICKEYBYTES);
+    p += crypto_sign_PUBLICKEYBYTES;
+    memcpy(p, operator_pubkey, crypto_sign_PUBLICKEYBYTES);
     return 0;
 }
 
@@ -245,6 +298,28 @@ int public_identity_to_json(const public_identity_t *p, json_t **obj_ptr)
     if (p->operator_attested_at > 0.0)
         json_object_set_new(obj, "operator_attested_at",
                             json_real(p->operator_attested_at));
+    /* The opt-in guardian identity. Emitted only when a key is actually bound,
+       so a node that declines is byte-identical to one built before these fields
+       existed — which is the whole of AT's side of the anonymity guarantee.
+       Kept OUTSIDE the ZTA guard (like operator_bound) so the serialized form
+       does not depend on a build flag. */
+    if (!at_operator_pubkey_empty(p->operator_pubkey)) {
+        size_t klen = b64_encoded_len(sizeof(p->operator_pubkey));
+        char *kb64 = malloc(klen);
+        if (kb64 == NULL) return ENOMEM;
+        base64_encode(p->operator_pubkey, sizeof(p->operator_pubkey), kb64, klen);
+        json_object_set_new(obj, "operator_pubkey", json_string(kb64));
+        free(kb64);
+    }
+    if (p->operator_key_binding_len > 0 && p->operator_key_binding != NULL) {
+        size_t blen = b64_encoded_len(p->operator_key_binding_len);
+        char *bb64 = malloc(blen);
+        if (bb64 == NULL) return ENOMEM;
+        base64_encode(p->operator_key_binding, p->operator_key_binding_len,
+                      bb64, blen);
+        json_object_set_new(obj, "operator_key_binding", json_string(bb64));
+        free(bb64);
+    }
 #ifdef AT_ZTA_ENABLED
     if (p->zta_issuer[0] != '\0')
         json_object_set_new(obj, "zta_issuer", json_string(p->zta_issuer));
@@ -306,6 +381,28 @@ int public_identity_from_json(const json_t *obj, public_identity_t *p)
     p->operator_bound = json_is_true(json_object_get(obj, "operator_bound"));
     json_t *oa = json_object_get(obj, "operator_attested_at");
     p->operator_attested_at = json_is_number(oa) ? json_number_value(oa) : 0.0;
+    /* The opt-in guardian claim, imported as a CLAIM only: a key of the wrong
+       length is dropped whole rather than zero-padded (a truncated ed25519 key
+       is a different key). Verification has not happened yet: on a STORED peer a
+       non-empty key means verified, and the admission gate is what zeroes an
+       unverified claim. */
+    const char *kb64 = json_string_value(json_object_get(obj, "operator_pubkey"));
+    if (kb64 != NULL) {
+        size_t declen = b64_decoded_len_s(strlen(kb64), kb64);
+        if (declen == sizeof(p->operator_pubkey))
+            base64_decode(kb64, strlen(kb64), p->operator_pubkey, declen);
+    }
+    const char *bb64 = json_string_value(json_object_get(obj, "operator_key_binding"));
+    if (bb64 != NULL) {
+        size_t declen = b64_decoded_len_s(strlen(bb64), bb64);
+        if (declen > 0 && declen <= OPERATOR_BINDING_MAX) {
+            p->operator_key_binding = malloc(declen);
+            if (p->operator_key_binding != NULL) {
+                base64_decode(bb64, strlen(bb64), p->operator_key_binding, declen);
+                p->operator_key_binding_len = declen;
+            }
+        }
+    }
 #ifdef AT_ZTA_ENABLED
     const char *iss = json_string_value(json_object_get(obj, "zta_issuer"));
     if (iss != NULL)
@@ -365,6 +462,31 @@ int identity_to_json(const void *data_struct, json_t **obj_ptr)
     free(hex);
     json_object_set_new(obj, "encryptor", encr);
 
+    /* The node's OWN opt-in guardian identity, so it survives a restart. C never
+       signs a binding — there is no PIV in C, by design (see
+       doc/architecture/operator-attended.md) — so a fielded C node is given the
+       pair here, produced once by the operator's own tooling against this node's
+       uuid and signing key. Written only when present, so an unbound node's
+       identity.cfg.json is unchanged. */
+    if (!at_operator_pubkey_empty(ident->operator_pubkey)
+        && ident->operator_key_binding != NULL
+        && ident->operator_key_binding_len > 0) {
+        size_t klen = b64_encoded_len(sizeof(ident->operator_pubkey));
+        char *kb64 = malloc(klen);
+        size_t blen = b64_encoded_len(ident->operator_key_binding_len);
+        char *bb64 = malloc(blen);
+        if (kb64 != NULL && bb64 != NULL) {
+            base64_encode(ident->operator_pubkey, sizeof(ident->operator_pubkey),
+                          kb64, klen);
+            base64_encode(ident->operator_key_binding,
+                          ident->operator_key_binding_len, bb64, blen);
+            json_object_set_new(obj, "operator_pubkey", json_string(kb64));
+            json_object_set_new(obj, "operator_key_binding", json_string(bb64));
+        }
+        free(kb64);
+        free(bb64);
+    }
+
     return 0;
 }
 
@@ -396,6 +518,30 @@ int identity_from_json(const json_t *obj, void *data_struct)
         && encryptor_init(&ident->encryptor,
                           (const unsigned char *)enc_hex, strlen(enc_hex)) != 0)
         return -1;
+
+    /* The node's own guardian pair, if an operator provisioned one. Both halves or
+       neither: a key with no binding cannot be verified by any peer, so advertising
+       it would only produce "does not verify" warnings across the cohort. A
+       wrong-length key or an oversized binding is dropped the same way it is on the
+       wire. */
+    const char *okb64 = json_string_value(json_object_get(obj, "operator_pubkey"));
+    const char *obb64 = json_string_value(
+        json_object_get(obj, "operator_key_binding"));
+    if (okb64 != NULL && obb64 != NULL) {
+        size_t klen = b64_decoded_len_s(strlen(okb64), okb64);
+        size_t blen = b64_decoded_len_s(strlen(obb64), obb64);
+        if (klen == sizeof(ident->operator_pubkey)
+            && blen > 0 && blen <= OPERATOR_BINDING_MAX) {
+            uint8_t *binding = malloc(blen);
+            if (binding != NULL) {
+                base64_decode(okb64, strlen(okb64), ident->operator_pubkey, klen);
+                base64_decode(obb64, strlen(obb64), binding, blen);
+                free(ident->operator_key_binding);
+                ident->operator_key_binding = binding;
+                ident->operator_key_binding_len = blen;
+            }
+        }
+    }
     return 0;
 }
 
@@ -432,6 +578,20 @@ int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core_
     proto->operator_bound = identity->operator_bound;
     proto->operator_attested_at = identity->operator_attested_at;
 
+    /* The opt-in guardian identity (proto fields 14-15). Unlike the scalars
+       above, these are set only when a key is bound: proto3 omits empty bytes,
+       so a node that declines puts nothing on the wire at all — the wire form of
+       the anonymity guarantee. Both travel or neither does; a key with no
+       binding is unverifiable and a binding with no key names nothing. */
+    if (!at_operator_pubkey_empty(identity->operator_pubkey)
+        && identity->operator_key_binding != NULL
+        && identity->operator_key_binding_len > 0) {
+        proto->operator_pubkey.data = identity->operator_pubkey;
+        proto->operator_pubkey.len = sizeof(identity->operator_pubkey);
+        proto->operator_key_binding.data = identity->operator_key_binding;
+        proto->operator_key_binding.len = identity->operator_key_binding_len;
+    }
+
 #ifdef AT_ZTA_ENABLED
     if (identity->zta_credential_len > 0 && identity->zta_credential != NULL) {
         proto->zta_credential_hash.data = identity->zta_credential_hash;
@@ -467,6 +627,30 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
        sync_from_message. */
     identity->operator_bound = proto->operator_bound;
     identity->operator_attested_at = proto->operator_attested_at;
+
+    /* The guardian claim (proto fields 14-15), imported as a CLAIM. Wrong-length
+       key: dropped whole, never truncated into a different key. Oversized
+       binding: rejected outright, like an oversized credential. Verification is
+       our receiver's job and has not happened yet. */
+    memset(identity->operator_pubkey, 0, sizeof(identity->operator_pubkey));
+    identity->operator_key_binding = NULL;
+    identity->operator_key_binding_len = 0;
+    if (proto->operator_pubkey.len == sizeof(identity->operator_pubkey)
+        && proto->operator_pubkey.data != NULL)
+        memcpy(identity->operator_pubkey, proto->operator_pubkey.data,
+               sizeof(identity->operator_pubkey));
+    if (proto->operator_key_binding.len > 0
+        && proto->operator_key_binding.data != NULL) {
+        if (proto->operator_key_binding.len > OPERATOR_BINDING_MAX)
+            return EXCEPTION(EINVAL);
+        identity->operator_key_binding = malloc(proto->operator_key_binding.len);
+        if (identity->operator_key_binding) {
+            memcpy(identity->operator_key_binding,
+                   proto->operator_key_binding.data,
+                   proto->operator_key_binding.len);
+            identity->operator_key_binding_len = proto->operator_key_binding.len;
+        }
+    }
 
 #ifdef AT_ZTA_ENABLED
     memset(identity->zta_credential_hash, 0, sizeof(identity->zta_credential_hash));

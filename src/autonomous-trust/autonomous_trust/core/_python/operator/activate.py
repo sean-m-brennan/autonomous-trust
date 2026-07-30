@@ -131,8 +131,79 @@ def write_operator_policy(cfg_dir: str, ca_bundle_path: str,
     return path
 
 
-def bind_identity_file(cfg_dir: str, cert_der: bytes) -> Optional[str]:
+def operator_key_path(keystore_dir: str = '') -> str:
+    """Where the operator's ed25519 signing key lives.
+
+    **Not in the node's config directory, deliberately.** One key per operator,
+    stable across every node that human guards (ethne D24: per-node keys would let
+    one person present as N guardians), which means a node that could read it could
+    impersonate that human on all their other nodes. It belongs to the operator, so
+    it lives with the operator: ``$AT_OPERATOR_KEYSTORE``, else
+    ``$XDG_CONFIG_HOME/at-operator``, else ``~/.config/at-operator``.
+    """
+    base = (keystore_dir or os.environ.get('AT_OPERATOR_KEYSTORE', '')
+            or os.path.join(os.environ.get(
+                'XDG_CONFIG_HOME', os.path.expanduser('~/.config')),
+                'at-operator'))
+    return os.path.join(base, 'operator_ed25519.key')
+
+
+def load_or_create_operator_key(keystore_dir: str = '') -> tuple:
+    """Return ``(private_key_hex, public_key_bytes)`` for this operator, creating
+    the key on first use.
+
+    Stored 0600 in a 0700 directory, hex-encoded to match how every other key in
+    this tree is persisted (`Signature.to_dict`). Created only when an operator
+    asks to bind one — see `activate(bind_operator_key=True)`.
+    """
+    from nacl.encoding import HexEncoder
+    from ..identity.sign import Signature  # local: heavy import
+    path = operator_key_path(keystore_dir)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    if os.path.isfile(path):
+        with open(path, 'rb') as fp:
+            hex_seed = fp.read().strip()
+        sig = Signature(hex_seed, public_only=False)
+    else:
+        sig = Signature.generate()
+        hex_seed = sig.private.encode(encoder=HexEncoder)
+        with open(path, 'wb') as fp:
+            fp.write(hex_seed)
+        os.chmod(path, 0o600)
+    return hex_seed, bytes(sig.public)
+
+
+def bind_operator_key_to_identity(identity, token: PivToken,
+                                  keystore_dir: str = '') -> bytes:
+    """Bind this operator's ed25519 key to ``identity`` and return the public key.
+
+    The PIV signs
+    ``OPERATOR_BINDING_TAG || uuid || node signing key || operator_pubkey``, so any
+    peer holding the operator credential can check the claim offline and no node can
+    lift the pair onto a different identity. Mutates ``identity`` in place; both
+    fields are set together or not at all.
+
+    OPT-IN ONLY. Nothing calls this unless an operator asked for it: publishing one
+    key across that operator's nodes is a persistent pseudonym linking them, which
+    is a real cost and not one AT may impose. A node that never binds is admitted
+    identically and serializes byte-for-byte as before.
+    """
+    from ..identity.operator_binding import operator_binding_preimage
+    _hex_seed, pubkey = load_or_create_operator_key(keystore_dir)
+    binding = token.sign(operator_binding_preimage(identity, pubkey))
+    identity.operator_pubkey = pubkey
+    identity.operator_key_binding = binding
+    return pubkey
+
+
+def bind_identity_file(cfg_dir: str, cert_der: bytes,
+                       token: Optional[PivToken] = None,
+                       bind_operator_key: bool = False,
+                       keystore_dir: str = '') -> Optional[str]:
     """Load ``identity.cfg.json`` from ``cfg_dir``, bind the PIV cert, save.
+
+    With ``bind_operator_key`` (and the open token), also binds the operator's
+    ed25519 key so this node can name *which* human guards it — off by default.
 
     Returns the identity file path, or None if no identity file is present
     (mirrors examples/dod_mission/participant._attach_zta_credential).
@@ -143,6 +214,8 @@ def bind_identity_file(cfg_dir: str, cert_der: bytes) -> Optional[str]:
         return None
     ident = Identity.from_file(id_path)
     bind_piv_credential(ident, cert_der)
+    if bind_operator_key and token is not None:
+        bind_operator_key_to_identity(ident, token, keystore_dir)
     ident.to_file(id_path)
     return id_path
 
@@ -152,7 +225,9 @@ def activate(token: PivToken, ca_bundle_path: str,
              identity_id: str = '',
              factors: Optional[List[dict]] = None,
              crl_path: str = '', ocsp_url: str = '',
-             totp_secret: str = '', totp_code: str = '') -> ActivationResult:
+             totp_secret: str = '', totp_code: str = '',
+             bind_operator_key: bool = False,
+             operator_keystore: str = '') -> ActivationResult:
     """Run PIV challenge-response (+ TOTP, if enrolled) and, on success, bind.
 
     ``token`` is an already-open `PivToken` (the CLI opens it after PIN entry; a
@@ -162,6 +237,12 @@ def activate(token: PivToken, ca_bundle_path: str,
     invalid second factor blocks activation. When ``cfg_dir`` is given, the
     verified credential is bound to the identity file and the operator policy
     (incl. the TOTP factor) is written there.
+
+    ``bind_operator_key`` — **off by default** — additionally binds this operator's
+    ed25519 key to the node's identity, so the node can advertise *which* human
+    guards it (ethne's chartered node->guardian edge, D15). It is opt-in because the
+    key is stable across the operator's nodes and therefore links them; declining
+    changes nothing about admission, and is the anonymous default.
     """
     cert_der = token.certificate_der()
     piv = PivVerifier(ca_bundle_path, token=token, crl_path=crl_path,
@@ -188,7 +269,9 @@ def activate(token: PivToken, ca_bundle_path: str,
         return ActivationResult(status=result.status, reason=result.reason,
                                 credential_hash=result.credential_hash)
     if cfg_dir is not None:
-        bind_identity_file(cfg_dir, cert_der)
+        bind_identity_file(cfg_dir, cert_der, token=token,
+                           bind_operator_key=bind_operator_key,
+                           keystore_dir=operator_keystore)
         write_operator_policy(cfg_dir, ca_bundle_path, factors=factors,
                               crl_path=crl_path, ocsp_url=ocsp_url,
                               totp_secret=totp_secret)

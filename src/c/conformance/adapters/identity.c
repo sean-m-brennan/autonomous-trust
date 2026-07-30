@@ -47,6 +47,8 @@
 #include "config/configuration.h"     /* config_t (proc->configs["identity"]) */
 #include "structures/data.h"          /* object_ptr_data */
 #ifdef AT_ZTA_ENABLED
+#include <openssl/evp.h>              /* scenario-time operator-binding signing */
+#include <openssl/pem.h>
 #include "zta/zta_policy.h"           /* zta_policy_t / defaults / from_json */
 #endif
 #include "network/net_message.h"
@@ -337,6 +339,97 @@ static int _ic_run_attest_pull(sce_run_ctx_t *ctx, ic_impl_t *puller,
 }
 
 #ifdef AT_ZTA_ENABLED
+/* Mint a scenario participant's (operator_pubkey, operator_key_binding) pair,
+ * matching the Python adapter byte for byte.
+ *
+ * The operator key is DERIVED from the participant's uuid rather than
+ * generated: a conformance corpus has to produce identical bytes on every run
+ * and in both languages, and a fresh keypair would make the two adapters
+ * disagree for a reason unrelated to the rule under test. It is not a real
+ * ed25519 secret — nothing here signs with it, and AT only ever verifies the
+ * BINDING over it.
+ *
+ * `variant` selects what is wrong with the binding, if anything:
+ *   "valid"          signed by the leaf whose certificate the peer presents
+ *   "forged"         signed by an unrelated key of the same kind, so the ONE
+ *                    difference from "valid" is who held the private key
+ *   "other-identity" correctly signed by the real operator, but over a
+ *                    pre-image naming a DIFFERENT node (ISSUES.md §1.5's
+ *                    harvested credential)
+ */
+static int _scenario_operator_binding(const char *root, const char *variant,
+                                      public_identity_t *pub)
+{
+    if (root == NULL || variant == NULL || pub == NULL)
+        return -1;
+
+    /* The derived operator key: SHA-256 over a domain tag and the uuid. Keep
+     * this tag byte-identical to the Python adapter's. */
+    static const char TAG[] = "conformance-operator-key:";
+    uint8_t seed[sizeof(TAG) - 1 + UUID_LEN];
+    memcpy(seed, TAG, sizeof(TAG) - 1);
+    memcpy(seed + sizeof(TAG) - 1, pub->uuid, UUID_LEN);
+    uint8_t op_pub[crypto_sign_PUBLICKEYBYTES];
+    crypto_hash_sha256(op_pub, seed, sizeof(seed));
+
+    /* The pre-image, built by the production function so a drift between it and
+     * the scenario would be caught rather than papered over. For
+     * "other-identity" the uuid is perturbed first — the signature is perfect
+     * and still must be refused. */
+    public_identity_t bind_to = *pub;
+    if (strcmp(variant, "other-identity") == 0)
+        for (size_t i = 0; i < UUID_LEN; i++)
+            bind_to.uuid[i] = (uint8_t)((pub->uuid[i] + 1) % 256);
+
+    uint8_t preimage[OPERATOR_BINDING_PREIMAGE_LEN];
+    if (operator_binding_preimage(&bind_to, op_pub, preimage) != 0)
+        return -1;
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/testdata/zta/certs/%s", root,
+             strcmp(variant, "forged") == 0 ? "impostor_leaf.key"
+                                            : "operator_leaf.key");
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL)
+        return -1;
+    EVP_PKEY *priv = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+    fclose(fp);
+    if (priv == NULL)
+        return -1;
+
+    /* RSA PKCS#1 v1.5 over SHA-256 — deterministic, which is why the two
+     * adapters can produce the same bytes without either pinning them. */
+    int rc = -1;
+    uint8_t *sig = NULL;
+    size_t siglen = 0;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (ctx == NULL)
+        goto out;
+    if (EVP_DigestSignInit(ctx, NULL, EVP_sha256(), NULL, priv) != 1)
+        goto out;
+    if (EVP_DigestSign(ctx, NULL, &siglen, preimage, sizeof(preimage)) != 1)
+        goto out;
+    sig = malloc(siglen);
+    if (sig == NULL)
+        goto out;
+    if (EVP_DigestSign(ctx, sig, &siglen, preimage, sizeof(preimage)) != 1)
+        goto out;
+
+    memcpy(pub->operator_pubkey, op_pub, sizeof(op_pub));
+    free(pub->operator_key_binding);
+    pub->operator_key_binding = sig;
+    pub->operator_key_binding_len = siglen;
+    sig = NULL;   /* ownership moved to the identity */
+    rc = 0;
+
+out:
+    free(sig);
+    if (ctx != NULL)
+        EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(priv);
+    return rc;
+}
+
 /* ZTA fixtures (zta-x509-* scenarios). Mirrors the Python adapter:
  *   fixtures.zta_policy   -> a zta_policy_t in each participant's
  *                            proc->configs["zta_policy"] (object_ptr_data
@@ -390,6 +483,39 @@ static void _apply_zta_fixtures(sce_run_ctx_t *ctx, json_t *fixtures) {
             if (p == NULL) continue;
             ic_impl_t *impl = (ic_impl_t *)p->impl;
             impl->pub->operator_bound = json_is_true(cv);
+        }
+    }
+
+    /* The OPT-IN guardian identity. `operator_bindings: {<pid>: <variant>}`
+     * makes that participant advertise an operator key plus a binding signed
+     * AT SCENARIO TIME, so the two implementations are held to the same
+     * signature scheme and the same pre-image rather than to one of them having
+     * recorded its own output. Mirrors the Python adapter's
+     * _scenario_operator_binding, variant for variant. */
+    json_t *binds = json_object_get(fixtures, "operator_bindings");
+    if (json_is_object(binds) && root != NULL) {
+        const char *pid; json_t *bv;
+        json_object_foreach(binds, pid, bv) {
+            if (!json_is_string(bv)) continue;
+            sce_participant_t *p = sce_find_participant(ctx, pid);
+            if (p == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)p->impl;
+            if (_scenario_operator_binding(root, json_string_value(bv),
+                                           impl->pub) != 0) {
+                /* Fatal, not skipped. This applier is void and cannot fail a
+                 * scenario, and a skipped mint would leave the participant
+                 * advertising nothing — which is precisely the expected
+                 * outcome of the forged and other-identity cases, so they
+                 * would PASS for the wrong reason and the corpus would report
+                 * green while testing nothing. A fixture that will not load is
+                 * a harness fault; the run stops and says so. */
+                fprintf(stderr,
+                        "conformance: %s: cannot mint operator binding '%s' "
+                        "(missing testdata/zta/certs key?) — aborting rather "
+                        "than running a scenario that would pass vacuously\n",
+                        pid, json_string_value(bv));
+                exit(2);
+            }
         }
     }
 
@@ -1394,6 +1520,51 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         snprintf(ctx->err, sizeof(ctx->err),
                                  "%s: operator_bound[%s]=%d, expected %d",
                                  pid, ref, (int)actual, (int)want_bound);
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "operator_guardian") == 0) {
+                /* { "<peer_ref>": bool } — whether the welcomer KEPT the peer's
+                 * advertised guardian key, which it does only after verifying
+                 * the binding against the operator anchor. A bool rather than
+                 * the key bytes on purpose: the assertion is the verdict, and
+                 * comparing key material would pin each adapter's derivation
+                 * instead of the rule. The stored key IS the verdict — there is
+                 * no separate verified flag — so empty means refused or never
+                 * offered. Symmetric with the Python adapter's accessor. */
+                if (!json_is_object(val)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: operator_guardian expects an object", pid);
+                    return -1;
+                }
+                const char *gref; json_t *gwant;
+                json_object_foreach(val, gref, gwant) {
+                    bool want_g = json_is_true(gwant);
+                    char nick[NAME_LEN + 1];
+                    snprintf(nick, sizeof(nick), "%s.scenario", gref);
+                    bool found = false, actual = false;
+                    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+                        char ustr[UUID_STRING_LEN + 1];
+                        uuid_unparse_lower(proc->protocol.peers[i].uuid, ustr);
+                        if (strcmp(proc->protocol.peers[i].nickname, nick) == 0
+                            || strcmp(proc->protocol.peers[i].nickname, gref) == 0
+                            || strcmp(ustr, gref) == 0) {
+                            found = true;
+                            actual = !at_operator_pubkey_empty(
+                                proc->protocol.peers[i].operator_pubkey);
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: operator_guardian: no stored peer %s",
+                                 pid, gref);
+                        return -1;
+                    }
+                    if (actual != want_g) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: operator_guardian[%s]=%d, expected %d",
+                                 pid, gref, (int)actual, (int)want_g);
                         return -1;
                     }
                 }

@@ -27,11 +27,13 @@ Wire / crypto / negative kinds for the identity protocol are out of scope.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import queue
 import tempfile
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -346,8 +348,91 @@ class _Participant:
                         raise AssertionError(
                             f'{self.id}: operator_bound[{ref}]={actual_val}, '
                             f'expected {want_val}')
+            elif key == 'operator_guardian':
+                # { peer_ref: bool } — whether the welcomer KEPT the peer's
+                # advertised guardian key, which it does only after verifying
+                # the binding against the operator anchor. Deliberately a bool
+                # and not the key bytes: the assertion is about the verdict, and
+                # comparing key material would pin the adapter's own derivation
+                # in both languages instead of the rule. The stored key IS the
+                # verdict (there is no separate verified flag), so an empty key
+                # here means refused-or-never-offered.
+                stored = [p for level in self.process.peers.hierarchy
+                          for p in level.values()]
+
+                def _find_g(ref):
+                    for p in stored:
+                        if (str(p.uuid) == ref or p.nickname == ref
+                                or p.nickname == f'{ref}.scenario'):
+                            return p
+                    return None
+                for ref, want_val in expected.items():
+                    peer = _find_g(ref)
+                    if peer is None:
+                        raise AssertionError(
+                            f'{self.id}: operator_guardian: no stored peer {ref!r}')
+                    actual_val = bool(getattr(peer, 'operator_pubkey', b''))
+                    if actual_val != bool(want_val):
+                        raise AssertionError(
+                            f'{self.id}: operator_guardian[{ref}]={actual_val}, '
+                            f'expected {want_val}')
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
+
+
+def _uuid_of(ident) -> bytes:
+    """A participant's uuid as raw bytes. Python holds it as a UUID or a string
+    depending on how the identity was built; the binding covers the 16 raw bytes
+    C binds, so the two must agree here rather than at each caller."""
+    u = ident.uuid
+    return u.bytes if isinstance(u, UUID) else UUID(str(u)).bytes
+
+
+def _scenario_operator_binding(corpus_root: Path, ident: Identity,
+                               variant: str) -> tuple[bytes, bytes]:
+    """Mint an (operator_pubkey, binding) pair for a scenario participant.
+
+    The operator key is derived deterministically from the participant's uuid
+    rather than generated: conformance corpora must produce identical bytes on
+    every run and in both languages, and a random keypair would make the C and
+    Python adapters disagree for a reason that has nothing to do with the rule
+    under test.
+
+    The signature itself is real — RSA PKCS#1 v1.5 over SHA-256 with the leaf
+    key from testdata, which is deterministic, so the two adapters produce the
+    same bytes without either one pinning them.
+    """
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    from autonomous_trust.core.identity.operator_binding import (
+        operator_binding_preimage,
+    )
+
+    # Deterministic 32-byte "operator key": the uuid, domain-separated. Not a
+    # real ed25519 secret — nothing in this path signs with it, and AT only ever
+    # verifies the BINDING over it.
+    op_pub = hashlib.sha256(b'conformance-operator-key:'
+                            + _uuid_of(ident)).digest()
+
+    bind_to = ident
+    if variant == 'other-identity':
+        # Correctly signed by the real operator, but naming a DIFFERENT node —
+        # exactly what an attacker gets by harvesting a credential from a
+        # clear-text announce (ISSUES.md §1.5). Valid in every way except the
+        # one that matters, which is why the pre-image names the node at all.
+        bind_to = SimpleNamespace(
+            uuid=UUID(bytes=bytes((b + 1) % 256 for b in _uuid_of(ident))),
+            signature=ident.signature)
+
+    preimage = operator_binding_preimage(bind_to, op_pub)
+
+    key_name = ('impostor_leaf.key' if variant == 'forged'
+                else 'operator_leaf.key')
+    with open(corpus_root / 'testdata' / 'zta' / 'certs' / key_name, 'rb') as fp:
+        priv = serialization.load_pem_private_key(fp.read(), password=None)
+    sig = priv.sign(preimage, padding.PKCS1v15(), hashes.SHA256())
+    return op_pub, sig
 
 
 def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
@@ -502,6 +587,30 @@ class IdentityAdapter:
         for pid, want in claim_fix.items():
             if pid in identities:
                 identities[pid].operator_bound = bool(want)
+
+        # The OPT-IN guardian identity. `operator_bindings: {<pid>: <variant>}`
+        # makes that participant advertise an operator ed25519 key together with
+        # a binding signed AT SCENARIO TIME — not a pinned blob — so both
+        # implementations must produce and accept the same signature scheme
+        # rather than agreeing on one recorded output. Variants:
+        #
+        #   valid           signed by the leaf whose cert the peer presents
+        #   forged          signed by an unrelated key (impostor_leaf.key)
+        #   other-identity  correctly signed, but over a pre-image naming a
+        #                   DIFFERENT node — the harvested-credential case
+        #
+        # A participant absent from the map advertises nothing, which is the
+        # ordinary opted-out node and must stay indistinguishable from one built
+        # before these fields existed.
+        bind_fix: dict[str, str] = fixtures.get('operator_bindings', {}) or {}
+        for pid, variant in bind_fix.items():
+            if pid not in identities:
+                continue
+            ident = identities[pid]
+            op_pub, binding = _scenario_operator_binding(
+                self.corpus_root, ident, str(variant))
+            ident.operator_pubkey = op_pub
+            ident.operator_key_binding = binding
 
         # ZTA policy (zta-x509-* scenarios): a single policy applied to every
         # participant's IdentityProcess (the border guards consult it at

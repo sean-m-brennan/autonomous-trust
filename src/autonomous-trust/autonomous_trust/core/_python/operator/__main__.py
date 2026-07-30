@@ -61,7 +61,9 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--module', help='PKCS#11 module path (e.g. opensc-pkcs11.so)')
+    ap.add_argument('--module',
+                    help='PKCS#11 module path (default: autodetected '
+                         'opensc-pkcs11.so, or $AUTONOMOUS_TRUST_PKCS11_MODULE)')
     ap.add_argument('--slot', type=int, default=None, help='PKCS#11 slot index')
     ap.add_argument('--ca-bundle', required=True,
                     help='agency root/intermediate CA bundle (PEM)')
@@ -76,6 +78,17 @@ def main(argv=None) -> int:
                     help='first-activation: generate + enroll a new TOTP secret')
     ap.add_argument('--totp-code', default=None,
                     help='TOTP code (prompted if omitted when a factor is enrolled)')
+    # The guardian identity (ethne D15) — OFF unless asked for. Binding publishes
+    # one key per operator across that operator's nodes, which links them; AT must
+    # never require that, so the flag exists and the default is anonymous.
+    ap.add_argument('--bind-operator-key', action='store_true',
+                    help='also bind your ed25519 operator key to this node, so it '
+                         'can name WHICH human guards it (opt-in; links the nodes '
+                         'you guard to one another)')
+    ap.add_argument('--operator-keystore', default='',
+                    help='directory holding your operator key '
+                         '(default $AT_OPERATOR_KEYSTORE, else '
+                         '~/.config/at-operator). Never the node config dir.')
     # Dev/CI software-token path (no card).
     ap.add_argument('--software-cert', default=None,
                     help='dev only: PEM cert for a SoftwareToken')
@@ -111,13 +124,21 @@ def main(argv=None) -> int:
         result = activate(token, args.ca_bundle, cfg_dir=args.cfg_dir,
                           identity_id=args.identity_id,
                           crl_path=args.crl_path, ocsp_url=args.ocsp_url,
-                          totp_secret=totp_secret, totp_code=totp_code or '')
+                          totp_secret=totp_secret, totp_code=totp_code or '',
+                          bind_operator_key=args.bind_operator_key,
+                          operator_keystore=args.operator_keystore)
     finally:
         token.close()
 
     if result.status is ZtaStatus.VERIFIED:
         print('ACTIVATED: %s (cred sha256=%s)'
               % (result.issuer, result.credential_hash.hex()[:16]))
+        if args.bind_operator_key and args.cfg_dir:
+            from .activate import operator_key_path
+            print('GUARDIAN KEY bound for this node; your key stays at %s '
+                  '(back it up — a lost key means re-binding every node you '
+                  'guard, a stolen one impersonates you on all of them)'
+                  % operator_key_path(args.operator_keystore))
         return 0
     print('DENIED [%s]: %s' % (result.status.value, result.reason), file=sys.stderr)
     return 1

@@ -27,6 +27,7 @@ from ..system import encoding, agreement_impl
 from ..algorithms.agreement import AgreementVoter
 from .sign import Signature
 from .encrypt import Encryptor
+from .operator_binding import OPERATOR_BINDING_MAX, OPERATOR_PUBKEY_LEN
 from autonomous_trust.core.protobuf.identity import identity_pb2
 
 def derive_local_petname(nickname):
@@ -61,7 +62,8 @@ class Identity(InitializableConfig, AgreementVoter):
     def __init__(self, _uuid, address, _nickname, _signature, _encryptor, petname='',
                  _public_only=True, _rank=0, _block_impl=agreement_impl, _tier=0,
                  zta_credential=b'', zta_issuer='', zta_credential_hash=b'',
-                 operator_bound=False, operator_attested_at=0.0):
+                 operator_bound=False, operator_attested_at=0.0,
+                 operator_pubkey=b'', operator_key_binding=b''):
         Configuration.__init__(self, identity_pb2.Identity)
         AgreementVoter.__init__(self, str(_uuid), _rank, _tier=_tier)
         self.address = address  # corresponds to one address in Network config
@@ -96,6 +98,25 @@ class Identity(InitializableConfig, AgreementVoter):
         # identity). Feeds the ethne guardian edge (ethne design D8/Q9).
         self.operator_bound = bool(operator_bound)
         self.operator_attested_at = float(operator_attested_at or 0.0)
+        # WHICH human (identity.proto fields 14-15; parity with C
+        # public_identity_t), and STRICTLY OPT-IN. The two fields above say a
+        # human exists and when one was last present; neither names them, because
+        # the operator credential is an X.509 with no ed25519 key. ethne's
+        # chartered node->guardian edge (D15) needs a guardian that can co-sign,
+        # so a node MAY carry `operator_pubkey` (one key per OPERATOR, stable
+        # across the nodes that human guards — per-node keys would let one person
+        # present as N guardians, ethne D24) together with the PIV signature over
+        # operator_binding_preimage() that earns it.
+        #
+        # ABSENT BY DEFAULT, AND ABSENCE COSTS NOTHING. AT never requires a
+        # guardian identity: a node that declines is admitted identically, keeps
+        # its anonymity, and serializes byte-for-byte as before (both fields are
+        # emitted only when non-default, in the canonical form and by proto3).
+        # Requiring a guardian is a consumer's rule, not AT's.
+        #
+        # Excluded from __eq__ with the rest: re-binding must not change identity.
+        self.operator_pubkey = operator_pubkey or b''
+        self.operator_key_binding = operator_key_binding or b''
         # Reputation-derived trust tier (0..4) is stored on the base
         # AgreementVoter via the __init__ call above (so PoT can read
         # voter.tier directly). The protobuf wire form
@@ -222,7 +243,9 @@ class Identity(InitializableConfig, AgreementVoter):
                         zta_credential=self.zta_credential, zta_issuer=self.zta_issuer,
                         zta_credential_hash=self.zta_credential_hash,
                         operator_bound=self.operator_bound,
-                        operator_attested_at=self.operator_attested_at)
+                        operator_attested_at=self.operator_attested_at,
+                        operator_pubkey=self.operator_pubkey,
+                        operator_key_binding=self.operator_key_binding)
 
     def sync_to_message(self):
         self.message.uuid = str(self.uuid).encode('utf-8')
@@ -247,6 +270,24 @@ class Identity(InitializableConfig, AgreementVoter):
         # and matches the C sync_out).
         self.message.operator_bound = self.operator_bound
         self.message.operator_attested_at = self.operator_attested_at
+        # The opt-in guardian identity (proto fields 14-15). Bytes, so proto3
+        # omits them when empty: a node that declines puts nothing on the wire,
+        # which is the wire form of the anonymity guarantee. Both travel or
+        # neither does — a key with no binding is unverifiable, and a binding with
+        # no key names nothing. Mirrors the C sync_out.
+        if self.operator_pubkey and self.operator_key_binding:
+            self.message.operator_pubkey = self.operator_pubkey
+            self.message.operator_key_binding = self.operator_key_binding
+        else:
+            # Cleared, not merely left unset: `self.message` is reused across
+            # calls, so a node that UN-binds (the operator revokes the key, or
+            # rotation invalidates the binding) would otherwise keep advertising a
+            # guardian it no longer has. C sync_out builds a fresh proto each call
+            # and has no such state; this is what keeps the two the same. (The
+            # zta_* fields above carry the same latent staleness, harmless today
+            # because their rotation path always writes a new value.)
+            self.message.ClearField('operator_pubkey')
+            self.message.ClearField('operator_key_binding')
 
     def sync_from_message(self):
         self._uuid = self.message.uuid.decode('utf-8')
@@ -272,6 +313,15 @@ class Identity(InitializableConfig, AgreementVoter):
         # Operator-attended signal (proto fields 12-13); parity with C sync_in.
         self.operator_bound = bool(self.message.operator_bound)
         self.operator_attested_at = float(self.message.operator_attested_at)
+        # The guardian CLAIM (proto fields 14-15); parity with C sync_in. A key of
+        # the wrong length is dropped whole rather than kept as a truncated (i.e.
+        # different) key, and nothing here is verified: that happens in
+        # _zta_admit, against the operator anchor.
+        key = bytes(self.message.operator_pubkey)
+        self.operator_pubkey = key if len(key) == OPERATOR_PUBKEY_LEN else b''
+        binding = bytes(self.message.operator_key_binding)
+        self.operator_key_binding = (
+            binding if 0 < len(binding) <= OPERATOR_BINDING_MAX else b'')
 
     @staticmethod
     def initialize(my_name, my_nickname, my_address):
@@ -329,6 +379,16 @@ def public_identity_to_canonical(identity):
     cred = getattr(identity, 'zta_credential', b'') or b''
     if cred:
         d['zta_credential'] = base64.b64encode(bytes(cred)).decode('ascii')
+    # The opt-in guardian identity, emitted only when a key is actually bound —
+    # so a node that declines produces exactly the bytes it produced before these
+    # fields existed. That is AT's side of the anonymity guarantee, at the byte
+    # level, and it is pinned by a test rather than asserted here. Both keys
+    # appear together or not at all (see sync_to_message).
+    op_key = getattr(identity, 'operator_pubkey', b'') or b''
+    op_binding = getattr(identity, 'operator_key_binding', b'') or b''
+    if op_key and op_binding:
+        d['operator_pubkey'] = base64.b64encode(bytes(op_key)).decode('ascii')
+        d['operator_key_binding'] = base64.b64encode(bytes(op_binding)).decode('ascii')
     return d
 
 
@@ -359,12 +419,26 @@ def public_identity_from_canonical(d):
         cred_b64 = d.get('zta_credential', '') or ''
         zta_credential_hash = base64.b64decode(cred_hash_b64) if cred_hash_b64 else b''
         zta_credential = base64.b64decode(cred_b64) if cred_b64 else b''
+        # The guardian claim, imported as a claim. A key of the wrong length is
+        # dropped whole (a truncated ed25519 key is a different key) and an
+        # oversized binding is refused; nothing here is verified — that happens at
+        # admission, against the operator anchor.
+        op_key_b64 = d.get('operator_pubkey', '') or ''
+        op_binding_b64 = d.get('operator_key_binding', '') or ''
+        operator_pubkey = base64.b64decode(op_key_b64) if op_key_b64 else b''
+        operator_key_binding = base64.b64decode(op_binding_b64) if op_binding_b64 else b''
+        if len(operator_pubkey) != OPERATOR_PUBKEY_LEN:
+            operator_pubkey = b''
+        if not 0 < len(operator_key_binding) <= OPERATOR_BINDING_MAX:
+            operator_key_binding = b''
         return Identity(d['uuid'], d.get('address', '') or '',
                         nickname,
                         sig, enc, derive_local_petname(nickname),
                         zta_credential=zta_credential, zta_issuer=zta_issuer,
                         zta_credential_hash=zta_credential_hash,
                         operator_bound=operator_bound,
-                        operator_attested_at=operator_attested_at)
+                        operator_attested_at=operator_attested_at,
+                        operator_pubkey=operator_pubkey,
+                        operator_key_binding=operator_key_binding)
     except (ValueError, TypeError, RuntimeError, KeyError):
         return None

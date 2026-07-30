@@ -4,6 +4,9 @@
 > Attended-now half (`operator_attested_at`, consumer-pull) completes it: the
 > live IPC gap and the peer-refresh gap described below are closed, in Python
 > and C, pinned by three cross-language conformance scenarios.
+>
+> A **third** signal, `operator_pubkey`, names *which* human — opt-in, off by
+> default, and described in "The guardian identity" below.
 
 ## Context
 
@@ -84,6 +87,56 @@ console never replies, or a peer that has gone quiet, resolves to *not attended*
 hanging. For a guardian edge, "cannot confirm a human is present" and "no human is present" are the
 same operational answer; an unbounded wait is the only genuinely useless outcome.
 
+## The guardian identity (`operator_pubkey`) — opt-in
+
+The two signals above answer *whether* a human stands behind a node and *when* one was last there.
+Neither says **which** human, and for a long time nothing did: the operator credential is a PIV/CAC
+X.509, which holds no ed25519 key that could become a `did:key`. That mattered more than a missing
+field usually would, because ethne's chartered node→guardian edge (**D15**) requires a guardian to
+*co-sign* — a guardian who cannot sign is unusable, so a chartered rule was running with no live
+source at all.
+
+A node may now advertise `operator_pubkey`, the guardian's ed25519 public key, together with
+`operator_key_binding`, a signature by that operator's PIV private key over
+
+    "at-operator-binding-v1" || uuid (16) || node signing key (32) || operator key (32)
+
+verified at admission against the credential's own public key — the same credential the gate has
+already classified operator-class against the distinct operator anchor. Both halves are required
+and neither substitutes for the other: **a chain without a binding names no human, and a binding
+whose credential is not operator-class is a human with no standing to name one.**
+
+**Opting out is free, and that is a rule, not a default.** AT never requires a guardian identity. A
+node that declines is admitted identically, keeps `operator_bound` and its attendance stamp, and
+serializes byte-for-byte as it did before this field existed — both fields are emitted only when
+non-default, so a declining node puts nothing on the wire. A consumer that *requires* a guardian is
+applying its own rule; that is ethne's business, and there absence means "unguarded machine", never
+an error.
+
+The reason to protect that is specific. **One key per operator, stable across every node that human
+guards** — per-node keys would let one person present as N guardians, which is ethne D24's chorus
+moved down a layer. But a stable key is a persistent pseudonym: anyone watching two cohorts can link
+an operator's nodes to each other. That is a real cost, paid by a real person, so it is theirs to
+choose. Off by default is the mitigation, and the CLI is where the choice is made
+(`--bind-operator-key` on activation) rather than the TUI's recurring unlock screen — a decision
+that de-anonymizes a whole fleet does not belong on a daily login prompt.
+
+The pre-image names the node deliberately. Without the uuid and signing key inside the signed
+bytes, a `(key, binding)` pair lifted from another node's clear-text announce would let any node
+claim that human, and a count of guardians would mean nothing. This also gives ISSUES.md §1.5 a
+narrow, honest answer for opted-in operator nodes — and none at all for anyone else.
+
+**What a bad binding costs.** Absent: no guardian key, nothing else changes. Present but invalid —
+forged, naming another node, wrong length — the key is refused and the peer is stored without one.
+`operator_bound` is **not** demoted: it was earned independently from the anchor, and node key
+rotation legitimately stales a binding, so demotion would turn an honest re-keying into a lost
+credential. Losing a guardian edge is the failure mode; losing admission is not.
+
+Two limits worth stating. The operator's ed25519 key is software-held, so a stolen keystore
+impersonates that human on every node they guard — hardware-held ed25519 is the successor. And
+distinct guardian keys are still not distinct humans; ethne must not count them as such without an
+independence attestation (its D24 finding), which is not built here.
+
 ## Protocol
 
 Four verbs (`identity/protocol.py`), two on the wire and two local-only:
@@ -159,6 +212,17 @@ Cross-language conformance (`conformance/scenarios/identity/`):
 | `attest-pull-replay-rejected` | re-presented answer refused; recorded stamp unchanged |
 | `operator-bound-verified` | operator credential ⇒ `operator_bound: true` |
 | `operator-bound-lying-rejected` | asserted claim on a non-operator credential ⇒ `false` |
+| `operator-key-bound-verified` | a binding signed by the presented credential ⇒ the guardian key is kept |
+| `operator-key-binding-forged-rejected` | same everything, signed by an unrelated key ⇒ refused, `operator_bound` still true |
+| `operator-key-bound-to-another-identity-rejected` | a perfect signature naming a *different* node ⇒ refused (ISSUES §1.5's harvested credential) |
+| `operator-key-absent-is-normal` | the opt-out: bound, attended, no guardian, no penalty |
+
+Those four bindings are **signed at scenario time** by both adapters from
+`testdata/zta/certs/operator_leaf.key`, not pinned as recorded blobs. That is deliberate: a pinned
+signature would hold the two implementations to one of them having saved its own output, whereas
+signing live holds them to the same pre-image and the same scheme. RSA PKCS#1 v1.5 over SHA-256 is
+deterministic, so they agree byte for byte or the scenario fails. The leaf's private key is
+committed for exactly this reason — it is a test anchor with standing nowhere.
 
 The clock is **pinned** in these scenarios (`fixtures.operator_session.clock`), never wall-clock: a
 live stamp could not match across two runs, let alone two languages.

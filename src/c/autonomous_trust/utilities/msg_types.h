@@ -199,6 +199,18 @@ typedef struct {
      *  a normal state, not an error.
      *  See doc/architecture/operator-attended.md. */
     double   operator_attested_at;
+    /** WHICH human, when the peer opted in: the guardian's ed25519 public
+     *  key, all-zero for "not advertised". Non-zero only when OUR receiver
+     *  verified a binding signed by that operator's credential and naming
+     *  this peer — the stored key IS the verification, so there is no second
+     *  flag here to disagree with it.
+     *
+     *  All-zero is the ordinary case and says nothing bad about the peer:
+     *  naming a guardian is opt-in, and one key per operator links that
+     *  human's nodes to each other, which is a real cost AT does not impose.
+     *  Zeroed whenever @c operator_bound is false, for the same reason the
+     *  stamp is. */
+    uint8_t  operator_pubkey[crypto_sign_PUBLICKEYBYTES];
 } peer_observed_msg_t;
 
 /**
