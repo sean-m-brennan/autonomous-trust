@@ -196,6 +196,50 @@ def bind_operator_key_to_identity(identity, token: PivToken,
     return pubkey
 
 
+def sign_with_operator_key(payload: bytes, keystore_dir: str = '') -> bytes:
+    """Sign arbitrary bytes with this operator's ed25519 key; return the raw signature.
+
+    The operator's half of an *out-of-band co-signature*: a governance tier above AT
+    (ethne charters a node→guardian edge and requires the named guardian to co-sign it)
+    exports the exact bytes of a record and needs this human's signature over them. The
+    key stays here and only the signature travels back, which is the whole point of
+    keeping it in the operator's own keystore rather than a node's config directory.
+
+    Does **not** create a key. If this operator has never bound one there is nothing to
+    sign with, and quietly generating a fresh key would produce a signature no node's
+    binding attests to; the caller gets an error naming the file instead.
+
+    Nothing in AT calls this — it exists for an operator to run deliberately, and it
+    signs whatever it is handed, so the caller is responsible for showing the human what
+    the bytes say before asking for a signature.
+    """
+    sig = _operator_signature(keystore_dir)
+    return sig.private.sign(payload).signature
+
+
+def operator_public_key(keystore_dir: str = '') -> bytes:
+    """This operator's raw 32-byte ed25519 public key.
+
+    Deliberately raw bytes rather than any particular identifier format: the tier above
+    decides how to name a key (ethne derives a `did:key` from exactly these bytes), and
+    AT has no business knowing that encoding.
+    """
+    return bytes(_operator_signature(keystore_dir).public)
+
+
+def _operator_signature(keystore_dir: str = ''):
+    """Load the operator's keypair, refusing to invent one."""
+    from ..identity.sign import Signature  # local: heavy import
+    path = operator_key_path(keystore_dir)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f'no operator key at {path}; bind one first with `--bind-operator-key` '
+            '(binding is opt-in, and it is what creates the key)')
+    with open(path, 'rb') as fp:
+        hex_seed = fp.read().strip()
+    return Signature(hex_seed, public_only=False)
+
+
 def bind_identity_file(cfg_dir: str, cert_der: bytes,
                        token: Optional[PivToken] = None,
                        bind_operator_key: bool = False,
