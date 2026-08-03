@@ -48,7 +48,7 @@ Zero Trust as normally built (NIST SP 800-207) is policy-driven, and therefore h
 
 | Failure mode                    | Why it happens                                                                                                                                                                 |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Dies when comms drop (DDIL)** | Unreachable policy engine, so no new connection. CRLs are tens of MB over kbps links; Mars light-time makes cert rotation take*hours*. The result is fail-open or fail-closed. |
+| **Dies when comms drop (DDIL)** | Unreachable policy engine, so no new connection. CRLs are tens of MB over kbps links; Mars light-time makes cert rotation take *hours*. The result is fail-open or fail-closed. |
 | **Blind to behavior**           | A compromised endpoint with valid credentials passes every check. Authentication says nothing about current conduct.                                                           |
 | **Doesn't scale by policy**     | Every asset, flow, and partner multiplies the human policy surface combinatorially.                                                                                            |
 
@@ -190,13 +190,15 @@ Agreement on reputation runs as leaderless Byzantine Multi-Paxos, so there is no
 | ----- | ------------------------------------------ | ----------------------------------------------------------------------------------------- |
 | 1     | `request` → `grant` / `nack` / `backdate` | ask permission; proposal id = (timestamp, chain-index, peer) with replay-idempotent guard |
 | 2     | `transaction` → `accepted`                | on majority grant, propose the score; commit on majority accept                           |
-| 3     | `committed` (broadcast)                    | every peer writes the*same* bilateral entry                                               |
+| 3     | `committed` (broadcast)                    | every peer writes the *same* bilateral entry                                               |
 
 - Catch-up queries the top-3 most-trusted peers and majority-votes the result, which is verifiable via chain links.
 - Slashing is the fast path: a quorum-co-signed (Ed25519), evidence-gated `SlashAttestation` floors a score immediately, instead of waiting roughly 20 transactions for the average to move. That is what catches short-lived rogues.
 - Exclusion is sticky: a cut-off peer can't transact its way back, and recovery is an explicit, signed `rehabilitate`.
 
 ---
+
+<!-- _class: smaller -->
 
 ## Two orthogonal axes: rank vs. trust tier
 
@@ -279,6 +281,8 @@ reconnect.
 
 ---
 
+<!-- _class: smallest -->
+
 ## Human-in-the-loop and behavioral sensing
 
 <div class="cols">
@@ -298,6 +302,8 @@ reconnect.
 </div>
 
 ---
+
+<!-- _class: smaller -->
 
 ## Two implementations, one contract
 
