@@ -65,7 +65,10 @@ def main(argv=None) -> int:
                     help='PKCS#11 module path (default: autodetected '
                          'opensc-pkcs11.so, or $AUTONOMOUS_TRUST_PKCS11_MODULE)')
     ap.add_argument('--slot', type=int, default=None, help='PKCS#11 slot index')
-    ap.add_argument('--ca-bundle', required=True,
+    # Not `required=True`: the co-signing verbs below touch only the operator
+    # keystore, so demanding a CA bundle for them would be a lie about what they need.
+    # Activation still refuses to proceed without one.
+    ap.add_argument('--ca-bundle', default=None,
                     help='agency root/intermediate CA bundle (PEM)')
     ap.add_argument('--cfg-dir', default=None,
                     help='config dir to bind the credential + write the policy')
@@ -94,8 +97,45 @@ def main(argv=None) -> int:
                     help='dev only: PEM cert for a SoftwareToken')
     ap.add_argument('--software-key', default=None,
                     help='dev only: PEM private key for a SoftwareToken')
+    ap.add_argument('--sign-file', default=None, metavar='PATH',
+                    help='co-sign a governance record instead of activating: sign the '
+                         'bytes in PATH with this operator ed25519 key and print the '
+                         'signature as hex. Needs no PIV token — the key is already '
+                         'bound. Use "-" to read stdin.')
+    ap.add_argument('--print-operator-key', action='store_true',
+                    help='print this operator ed25519 public key as hex and exit')
     args = ap.parse_args(argv)
 
+    # The co-signing verbs touch only the operator keystore, so they run without a
+    # card and without the CA bundle's activation machinery.
+    if args.print_operator_key or args.sign_file:
+        from .activate import operator_public_key, sign_with_operator_key
+        try:
+            if args.print_operator_key:
+                print(operator_public_key(args.operator_keystore).hex())
+                return 0
+            payload = (sys.stdin.buffer.read() if args.sign_file == '-'
+                       else open(args.sign_file, 'rb').read())
+        except (FileNotFoundError, OSError) as err:
+            print('ERROR: %s' % err, file=sys.stderr)
+            return 2
+        # Say what is being signed. A seam that asks a human to sign opaque bytes has
+        # taught them to sign anything; the tier that exported these bytes should have
+        # shipped a readable description alongside, and this at least pins the size and
+        # digest so the two can be compared.
+        import hashlib
+        print('signing %d bytes, sha256=%s'
+              % (len(payload), hashlib.sha256(payload).hexdigest()), file=sys.stderr)
+        try:
+            print(sign_with_operator_key(payload, args.operator_keystore).hex())
+        except FileNotFoundError as err:
+            print('ERROR: %s' % err, file=sys.stderr)
+            return 2
+        return 0
+
+    if not args.ca_bundle:
+        ap.error('--ca-bundle is required to activate (not needed by --sign-file '
+                 'or --print-operator-key)')
     if not (args.software_cert and args.software_key) and not args.module:
         ap.error('one of --module (real card) or --software-cert/--software-key '
                  '(dev) is required')

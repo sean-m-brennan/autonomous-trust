@@ -5,6 +5,7 @@ paginate: true
 header: 'AutonomousTrust'
 ---
 <!-- _class: lead -->
+
 <!-- _header: ' ' -->
 
 # AutonomousTrust
@@ -30,11 +31,12 @@ Zero Trust (NIST SP 800-207) as normally built is policy-driven, and therefore h
 
 That assumption fails in exactly three ways at the tactical edge:
 
-| Failure mode                    | Why it happens                                                                                                                          |
-| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+
+| Failure mode                    | Why it happens                                                                                                                                       |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Dies when comms drop (DDIL)** | §5.2: an unreachable policy engine means no new connection. CRLs are tens of MB; SATCOM is 9.6 to 256 kbps. The result is fail-open or fail-closed. |
-| **Can't see behavior**          | A compromised endpoint with valid credentials passes every check. This is SP 800-207's blind spot.                                       |
-| **Doesn't scale by policy**     | Every asset, flow, and partner multiplies the human policy surface combinatorially.                                                     |
+| **Can't see behavior**          | A compromised endpoint with valid credentials passes every check. This is SP 800-207's blind spot.                                                   |
+| **Doesn't scale by policy**     | Every asset, flow, and partner multiplies the human policy surface combinatorially.                                                                  |
 
 <!--
 Speaker: The point to land here is that these aren't bugs you patch; they follow
@@ -76,6 +78,9 @@ AT is a resident agent co-located with each combat-system or OT endpoint, or a b
                          └► signed audit
 ```
 
+<!-- _class: smaller -->
+
+
 - It sits between the mission application and the network as that node's policy-decision and enforcement point.
 - Bounded-memory deterministic C core, plus a streaming anomaly layer with fixed per-peer state and no data-lake backhaul.
 - It runs low-priority co-resident, or offloads entirely to the gateway so a compute-starved sensor carries little cost.
@@ -93,6 +98,7 @@ work onto a gateway. We measure and report the footprint rather than hand-waving
 ## The trust model: five bases
 
 A real-time system must judge assets before behavioral history exists. So AT layers five bases:
+
 
 | # | Basis                                                                                  | Needs history?     |
 | - | -------------------------------------------------------------------------------------- | ------------------ |
@@ -260,11 +266,12 @@ named Phase II task.
 
 A Maritime Targeting Cell engagement: ISR sensors → track-fusion/targeting node → fires/effects console, spread across ships and disadvantaged nodes on tactical SATCOM.
 
-| Situation                         | What AT does                                                                                                                                                                                                                     |
-| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Steady state**                  | A sensor's tracks reach the targeting node only while both hold reputation above the required tier.                                                                                                                               |
+
+| Situation                         | What AT does                                                                                                                                                                                                                                                                                           |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Steady state**                  | A sensor's tracks reach the targeting node only while both hold reputation above the required tier.                                                                                                                                                                                                    |
 | **Captured / spoofed sensor**     | Authenticated and cert-valid, but it injects an off-track return, drifts outside its learned envelope, loses reputation, and is autonomously slashed and tier-gated out of the fires path, locally and in real time, with signed evidence. Human-on-the-loop keeps override for safety-critical fires. |
-| **SATCOM to PDP / DoD PKI drops** | The cohort keeps operating: the targeting node is vouched by quorum at a capped tier, each admission is signed, and the audit reconciles on reconnect.                                                                            |
+| **SATCOM to PDP / DoD PKI drops** | The cohort keeps operating: the targeting node is vouched by quorum at a capped tier, each admission is signed, and the audit reconciles on reconnect.                                                                                                                                                 |
 
 > No step in this loop waits on a reachable central authority.
 
@@ -286,6 +293,7 @@ Feasibility is established the right way for each claim, with M&S where simulati
 - M&S for latency comparison, attack outcomes, and admin overhead, against an externally-anchored ZTA-only baseline and a pre-registered, MITRE ATT&CK-mapped attack corpus, delivered as reproducible Government artifacts.
 - The existing subscale C prototype on embedded ARM for real-time authentication latency, because M&S can't substitute for silicon timing.
 - Resilience demonstrated under Sybil, Byzantine, compromised-credential, partition, and DDIL conditions with no reachable infrastructure, reporting false-exclusion rate against a realistic base rate.
+
 
 | Target              | Goal       | How substantiated          |
 | ------------------- | ---------- | -------------------------- |

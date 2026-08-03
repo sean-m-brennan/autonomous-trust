@@ -1,177 +1,163 @@
 # AutonomousTrust
 
-## High-Trust Systems for Secure Cooperation
+## High-trust systems for secure cooperation
 
 *Sean M. Brennan*
 
 ---
 
-## Executive Summary
+## Executive summary
 
-Cybersecurity efforts are failing to keep pace because they rest on an assumption that doesn't scale: that humans can write policies fast enough to keep machines safe. Zero Trust Architecture---the current mandate and the best we have---is still, at its core, humans writing rules for machines to enforce. Every access decision traces back to a policy that someone had to anticipate, author, and maintain. More systems mean more policies mean more gaps mean more attack surface. The logical endpoint of ever-tightening restrictions is total lockdown: the opposite of the mission.
+Cybersecurity is losing ground because it rests on an assumption that does not scale: that humans can write policy fast enough to keep machines safe. Zero Trust Architecture, the current mandate and the best we have, is still humans writing rules for machines to enforce. Every access decision traces back to a policy that someone had to anticipate, author, and maintain. More systems mean more policies, more policies mean more gaps, and more gaps mean more attack surface. Ever-tightening restriction has exactly one logical endpoint, total lockdown of all resources, which is the opposite of the mission.
 
-AutonomousTrust takes a fundamentally different approach. Instead of humans telling machines whom to trust, we teach the machines to figure it out for themselves.
+We propose an inversion. Instead of humans telling machines whom to trust, we teach machines to work it out for themselves.
 
-Each machine in an AutonomousTrust network independently evaluates every peer it interacts with, based on that peer's ongoing behavior. It acts on that evaluation autonomously---refusing messages from bad actors, denying services to unproven peers, sharing data only with those who have earned it---with no central authority and no human in the loop. There is no dashboard. There is no alert console. There is no operator deciding what to do about a threat. The machines handle it, the way your immune system handles pathogens without asking your permission.
+Every machine in an AutonomousTrust network evaluates every peer it deals with, continuously, on the evidence of that peer's behavior, and acts on its own evaluation: refusing messages from bad actors, withholding services from unproven peers, sharing data only with peers that have earned it. There is no central authority, no human in the loop, no dashboard, no alert console, and no operator deciding what to do about a threat. The machines settle it among themselves, much as an immune system deals with a pathogen without consulting you first.
 
-This is not another security tool. It is a computing paradigm in which security is an emergent property of how machines relate to each other.
+This is a computing paradigm rather than a security product. Security is an emergent property of how the machines relate to each other.
 
-AutonomousTrust does not replace your Zero Trust investment. It extends it into territory Zero Trust cannot reach: continuous, adaptive, autonomous trust evaluation that scales without human policy authoring. The two work together, but they operate on fundamentally different axes.
+AutonomousTrust does not replace a Zero Trust investment. It extends ZTA into territory ZTA cannot reach, namely continuous behavioral trust evaluation that scales without human policy authoring. The two operate on different axes and work well together.
 
 This paper explains what AutonomousTrust is, how it works, how it relates to Zero Trust, and what it looks like in practice.
 
 ---
 
-## 1. The Problem
+## 1. The problem
 
-You are implementing Zero Trust because you were mandated to, and the mandate is sound. Zero Trust Architecture (ZTA) as defined in NIST SP 800-207 represents a genuine improvement over perimeter-based security. It eliminates implicit trust, enforces least-privilege access, and treats every request as potentially hostile regardless of network location.
+You are implementing Zero Trust because you were mandated to, and the mandate is sound. ZTA as defined in NIST SP 800-207 is a real improvement over perimeter-based security: it eliminates implicit trust, enforces least-privilege access, and treats every request as potentially hostile regardless of network location.
 
 But ZTA has a ceiling, and most organizations implementing it are about to hit it.
 
-**Zero Trust is policy-driven, which means it is human-driven.** Every access decision flows through a Policy Decision Point that evaluates requests against rules that a human being wrote. Should this identity, with this device posture, access this resource, in this context? Allow or deny. The PDP can only enforce what it was told to enforce. It cannot evaluate situations no one anticipated. It cannot adapt to a novel threat in real time. It cannot notice that a fully authenticated, policy-compliant endpoint is behaving in ways that are technically permitted but strategically hostile.
+Zero Trust is policy-driven, which is to say human-driven. Every access decision flows through a Policy Decision Point that evaluates requests against rules a person wrote. Should this identity, with this device posture, access this resource, in this context? Allow or deny. The PDP enforces what it was told to enforce and nothing else. It cannot evaluate a situation nobody anticipated, adapt to a novel threat while the threat is happening, or notice that a fully authenticated, policy-compliant endpoint is doing things that are permitted but hostile.
 
-**This doesn't scale.** As systems grow more complex and interconnected, the policy surface grows combinatorially. Each new integration, each new data flow, each new agency partnership demands new rules, new exceptions, new edge cases---all authored and maintained by human beings who are already overwhelmed. The inevitable result is either gaps (which attackers exploit) or over-restriction (which impedes the mission). Usually both.
+Nor does it scale. As systems grow more interconnected, the policy surface grows combinatorially. Every new integration, data flow, or inter-agency partnership demands new rules and new exceptions, authored and maintained by people who are already overwhelmed. The result is gaps, which attackers exploit, or over-restriction, which impedes the mission. Usually both.
 
-**The fundamental limitation is not technical; it is conceptual.** We have not given machines the ability to make trust decisions on their own. We still treat every machine as an obedient but unintelligent gatekeeper that can only follow the script it was given. When the script doesn't cover the situation---and it increasingly won't---the machine does nothing, or worse, does the wrong thing.
+The limitation here is conceptual rather than technical. We have never given machines the ability to make trust decisions on their own; we treat each one as an obedient but unintelligent gatekeeper that can only follow its script. When the script does not cover the situation, and increasingly it will not, the machine either does nothing or does the wrong thing.
 
-The early internet didn't have this problem because it didn't need to. ARPANET participants were specialists operating in a high-trust, small-group social environment where human oversight was feasible. That environment is gone. We are now operating at scales and speeds where human-in-the-loop trust decisions are a bottleneck, a liability, and often simply impossible.
+The early Internet did not have this problem because it did not need to. ARPANET participants were specialists in a small, high-trust social environment where human oversight was feasible. That environment is gone. We now operate at scales and speeds where human-in-the-loop trust decisions are a bottleneck, a liability, and frequently impossible.
 
 We need to teach machines how to trust.
 
 ---
 
-## 2. What If Machines Could Trust?
+## 2. What if machines could trust?
 
-**Let us be explicit about what AutonomousTrust is not.**
+AutonomousTrust is not a monitoring tool. It does not feed a dashboard, generate alerts for an analyst to triage, or produce actionable intelligence for a network operations center. There is no console, and no operator in the loop making runtime decisions about whom to trust or what to block.
 
-It is not a monitoring tool. It does not feed information to a dashboard. It does not generate alerts for a human analyst to triage. It does not produce actionable intelligence for a Network Operations Center. There is no central console, no single pane of glass, no operator in the loop making runtime decisions about whom to trust or what to block.
+What it is: a computing paradigm in which every machine independently and continuously evaluates the trustworthiness of every other machine it interacts with, on observed behavior, and then acts on that evaluation itself.
 
-**Here is what it is.**
+An agent running AutonomousTrust can adaptively: 1) refuse communications from severely untrusted peers, conserving bandwidth; 2) communicate with but refuse computation services to faintly trusted peers, protecting CPU time; 3) offer services but refuse data-sharing to moderately trusted peers, protecting data; *and* 4) offer data-sharing to well trusted peers. All four at once, within the same application.
 
-AutonomousTrust is a computing paradigm in which every machine independently and continuously evaluates the trustworthiness of every other machine it interacts with, based on observed behavior, and acts on that evaluation autonomously.
+These are not four static access tiers set by an administrator. They are points on a continuous gradient, and the thresholds move in real time as the agent watches its peers. A peer that was fully trusted five minutes ago can be cut off now because its behavior changed. No human issued that order and no policy was updated; the machine decided, on the evidence.
 
-An agent running AutonomousTrust can, within the same application and simultaneously:
+Why model this on human trust? Human trust mechanisms evolved over at least a hundred thousand years under hard selective pressure, and they address the problems we actually face in distributed computing: cooperating with strangers, detecting defection, scaling social structure past what any individual can track, recovering from betrayal. The alternative is designing a trust system from first principles, and the academic literature is littered with domain-specific attempts that never left the lab. We would rather copy the mechanisms evolution has already optimized.
 
-- **Refuse all communication** from severely untrusted peers, conserving bandwidth
-- **Communicate but deny computation** to faintly trusted peers, protecting CPU
-- **Offer services but refuse data sharing** to moderately trusted peers, protecting data
-- **Share data freely** with well-trusted peers
+This is not metaphor. The seven structural facets of human trust relationships map directly onto concrete machine implementations, as the next section details.
 
-These are not four static access tiers configured by an administrator. They are points on a continuous, dynamically evaluated gradient. The thresholds shift in real time as the agent observes its peers' behavior. A peer that was fully trusted five minutes ago can be cut off now if its behavior changes. No human issued that order. No policy was updated. The machine decided, based on evidence.
+Security, then, is not a layer in this system. There is no security module to bypass, misconfigure, or switch off. Trust evaluation *is* how the system operates, and every message, negotiation, and data exchange either builds or erodes it. Security emerges from the structure of the interactions rather than from rules laid on top of them.
 
-**Why model this on human trust?**
-
-Human trust mechanisms evolved over at least a hundred thousand years under intense selective pressure. They handle exactly the problems we face in distributed computing: how to cooperate with strangers, how to detect defection, how to scale social structures beyond what any individual can track, how to recover from betrayal. Rather than designing a trust system from scratch---and the academic literature is littered with domain-specific attempts that never left the lab---we model the mechanisms that evolution already optimized.
-
-This is not metaphor. The seven structural facets of human trust relationships map directly to concrete machine implementations, as detailed in the next section.
-
-**The key consequence:** security is not a layer in this system. There is no "security module" that can be bypassed, misconfigured, or turned off. Trust evaluation *is* how the system operates. Every message, every negotiation, every data exchange either builds or erodes trust. Security is emergent---it arises from the structure of interactions, not from rules imposed on top of them.
-
-Think of it as an immune system, not a security guard. A security guard follows a checklist. An immune system learns, adapts, and responds to threats it has never seen before, without waiting for instructions. AutonomousTrust gives machine networks an immune system.
+A security guard follows a checklist; an immune system learns, adapts, and responds to threats it has never seen before, without waiting for instructions. AutonomousTrust gives a machine network the latter.
 
 ---
 
-## 3. The Seven Facets of Machine Trust
+## 3. The seven facets of machine trust
 
 Human trust relationships have identifiable structural characteristics. Each maps to a concrete machine implementation.
 
 ### 3.1 Scale
 
-**Human:** Social groups are cognitively bounded. Dunbar's research establishes a maximum of roughly 150 meaningful relationships, with tighter tiers at 5, 15, and 35 for progressively more intense interactions. Larger organizations use hierarchy---companies, battalions, agencies---to loosely cohere groups that exceed the individual cognitive limit.
+**Human:** Social groups are cognitively bounded. Dunbar's work gives a maximum of roughly 150 meaningful relationships, with tighter tiers at 5, 15, and 35 for progressively more intense ones. Organizations larger than that use hierarchy (companies, battalions, agencies) to loosely cohere groups beyond the individual cognitive limit.
 
-**Machine:** AutonomousTrust enclaves are similarly bounded. Peer-to-peer communication is direct within an enclave. A dynamic, emergent hierarchy of peer leaders connects enclaves, handling service discovery and identity propagation across the broader network. This hierarchy is not imposed or static. Resource-rich, well-connected nodes naturally become peer leaders. Leaders rise and fall based on capability and trust. Any node can assume any hierarchical role. The network topology self-organizes.
+**Machine:** AutonomousTrust enclaves are bounded the same way. Communication inside an enclave is direct and peer-to-peer. A dynamic hierarchy of peer leaders connects enclaves and handles service discovery and identity propagation across the wider network. That hierarchy is neither imposed nor static. Resource-rich, well-connected nodes become peer leaders naturally, leaders rise and fall on capability and trust, and any node can adopt any hierarchical role. The topology self-organizes.
 
 ### 3.2 Language
 
-**Human:** Shared language is a critical bonding element---a means of efficient knowledge transfer and an in-group signifier. Exclusive jargon, dialects, and technical vocabularies simultaneously enable collaboration and define group boundaries.
+**Human:** Shared language is a critical bonding element, both a means of efficient knowledge transfer and an in-group signifier. Exclusive jargon, dialects, and technical vocabulary enable collaboration and mark group boundaries at the same time.
 
-**Machine:** Agents communicate using inheritable, extensible message schemas descended from a common format. A human-readable header enables routing; everything else is encrypted. The schemas an agent implements define which groups it participates in. Schema is membership. Domain-specific schemas keep messages short, efficient, and unambiguous.
+**Machine:** Agents communicate with inheritable, extensible message schemas descended from a common format. A header in the clear enables routing; everything else is encrypted. The schemas an agent implements define which groups it participates in. Schema is membership. Domain-specific schemas keep messages short and unambiguous.
 
-### 3.3 Shared Goals
+### 3.3 Shared goals
 
-**Human:** Trust is hardly present or needed when people merely work near each other. It becomes critical when they work *together*. Shared goals---concerns, missions, beliefs---create the cohesion that trust operates on.
+**Human:** Trust is barely present, and barely needed, when people merely work near each other. It becomes critical when they work *together*. Shared goals, concerns, missions or beliefs create the cohesion that trust operates on.
 
-**Machine:** Agents negotiate goals explicitly via protocol. Domain-specific schemas define precisely what data and services are exchanged, under what terms. No shared goal, no interaction. This is not a limitation; it is a feature. An agent that has no business talking to you simply won't.
+**Machine:** Agents negotiate goals explicitly, by protocol. Domain-specific schemas define what data and services are exchanged and on what terms. No shared goal, no interaction: an agent with no business talking to you simply will not.
 
 ### 3.4 Identity
 
-**Human:** Consistent personal identity is a prerequisite for trust. Revealing false identity, misrepresentation, or mis-identification produces immediate and severe social consequences---ranging from embarrassment to aggression---because trust cannot function without it.
+**Human:** Consistent personal identity is a prerequisite for trust. False identity, misrepresentation, or mis-identification produces immediate and severe social consequences, from embarrassment to aggression, because trust cannot function without it.
 
-**Machine:** Peer-level identities are recorded in a distributed blockchain. Each identity record is minimal: a UUID, a cryptographic signature, a public key, a timestamp, and a routable address. An agent can update its own address, but nothing else---short of abandoning the identity entirely and starting over. Starting over means starting at zero reputation, which is expensive.
+**Machine:** Peer-level identities are recorded in a distributed blockchain. The record is minimal: a UUID, a cryptographic signature, a public key, a timestamp, and a routable address. An agent can update its own address and nothing else, short of abandoning the identity and starting over. Starting over means starting at zero reputation, which is expensive.
 
-The global identity ledger is not a monolithic chain. Peer leaders coordinate local identity subchains. The overall structure is a blockdag---a directed acyclic graph of subchains, all living at the peer level. This keeps the ledger distributed, scalable, and resistant to single points of failure.
+The global identity ledger is not one monolithic chain. Peer leaders coordinate local subchains, and the overall structure is a blockdag, a directed acyclic graph of subchains that all live at the peer level. The ledger stays distributed and scalable, with no single point of failure.
 
 ### 3.5 Reputation
 
-**Human:** Reputation enables indirect reciprocity. You react to someone based partly on how that reaction will affect your standing with third parties, not just the immediate interaction. Despite high individual dynamism, overall social network metrics tend toward equilibrium.
+**Human:** Reputation enables indirect reciprocity. You react to someone based partly on how that reaction will affect your standing with third parties, not only on the immediate interaction. Individual reputation is highly dynamic, yet overall social network metrics tend toward equilibrium.
 
-**Machine:** Transaction scores are stored in a separate blockchain from identity. Every interaction---including the act of messaging itself---produces a scored record signed by both participants. Agents maintain private local data structures for fast reputation queries. Well-trusted peers can gossip pre-computed reputation scores to accelerate convergence.
+**Machine:** Transaction scores live in a blockchain separate from identity. Every interaction, including the act of messaging itself, produces a scored record signed by both participants. Agents keep private local data structures for fast reputation queries, and well-trusted peers gossip pre-computed scores to speed convergence.
 
-Crucially, reputation is *weighted*: if an agent trusts A more than B, it weights A's scores of third parties more heavily. This implements indirect reciprocity. Trust propagates through the network based on the trustworthiness of the source, not on raw vote counts.
+Reputation is weighted. If an agent trusts A more than B, it also weights A's scores of third parties more heavily, which is how indirect reciprocity works in the machine: trust propagates according to the trustworthiness of the source rather than by raw vote count.
 
-Reputation is therefore an inversion of risk. All service requests---computation, data, anything---are negotiated, and reputation is the primary input. A service provider weighs the risk of a low-reputation client against the resource exposure and the reciprocity value that client brings. A client weighs the risk of a low-reputation provider against its need for the service. This negotiation happens machine-to-machine, in real time, with no human involvement.
+Reputation is thus an inversion of risk. Every service request, computation or data or anything else, is negotiated with reputation as the primary input. The provider weighs the risk of a low-reputation client against the resource exposure requested and the reciprocity value the client brings. The client weighs the risk of a low-reputation provider against its need for the service. The negotiation runs machine to machine, in real time, with no human in it.
 
-### 3.6 Optimization (Bootstrap)
+### 3.6 Optimization (bootstrap)
 
-**Human:** When interacting with strangers---where reputation information is sparse---humans use heuristics. Give them a chance, but cut them off fast if they defect. Generous, but not naive.
+**Human:** With strangers, where reputation information is sparse, humans fall back on heuristics: give them a chance, cut them off quickly if they defect. Generous, but not naive.
 
-**Machine:** When bootstrapping new peers or new networks, there is no reputation to rely on. AutonomousTrust degrades to a minimal optimization mode using game-theoretic strategies from experimental economics:
+**Machine:** Bootstrapping a new peer, or a whole new network, means there is no reputation to work from. AutonomousTrust degrades to a minimal optimization mode built on two strategies out of experimental economics. Contrite tit-for-tat (CTFT) cooperates until the other side defects, then defects until it cooperates again, with a bias toward forgiveness; this disarms the always-defect tactic and leaves room for cooperation. Win-stay/lose-shift (WS/LS) sticks with whatever worked last round and changes only on a loss; it is more efficient than CTFT but vulnerable to always-defect, so it needs CTFT standing guard.
 
-- **Contrite tit-for-tat (CTFT):** Cooperate until the other defects, then defect until the other cooperates---but with a bias toward forgiveness. This disarms the always-defect strategy and creates space for cooperation.
-- **Win-stay/lose-shift (WS/LS):** Stick with what worked last time; change only on failure. More efficient than CTFT but vulnerable to always-defect, so it needs CTFT as a guard.
+The bootstrap phase cannot be skipped or short-circuited. An agent that presents valid credentials, via ZTA or any other identity system, still starts at zero reputation. Authentication is not trust. Bootstrap is where behavior gets observed, scored, and converted into reputation that was earned.
 
-This bootstrap phase is critical. **It cannot be skipped or short-circuited.** An agent that presents valid credentials (via ZTA or any other identity system) still starts at zero reputation in AutonomousTrust. Authentication is not trust. Identity is not behavior. The bootstrap phase is where behavior is observed, scored, and converted into earned reputation.
-
-This same fallback engages when established reputation levels drop below threshold---indicating either hardware failure, network overload, or active attack. The system reverts to CTFT/WS/LS to rapidly surface bad actors.
+The same fallback engages when established reputation levels drop below threshold, which indicates widespread hardware failure, network overload, or active attack. The system reverts to CTFT and WS/LS to surface bad actors quickly.
 
 ### 3.7 Prioritization
 
-**Human:** Tracking trust relationships is cognitively taxing, which limits social group scale. Humans use shortcuts---social roles, hierarchies, heuristics---to manage cognitive load while maintaining adequate trust calibration.
+**Human:** Tracking trust relationships is cognitively taxing, and that taxes group scale. Humans use shortcuts, most visibly social roles and hierarchy, to hold cognitive load down while keeping trust calibration adequate.
 
-**Machine:** Agents balance security against opportunity through configurable strategies. An agent can be more trusting (prioritizing cooperation and service discovery) or more cautious (prioritizing security), depending on its mission and environment. Peer leaders collate service advertisements and interest announcements, enabling efficient hierarchy traversal for cross-domain communication. This encourages system-wide trust-building rather than clique formation.
+**Machine:** Agents balance security against opportunity through configurable strategy. An agent can lean trusting, prioritizing cooperation and service discovery, or lean cautious, prioritizing security, according to its mission and environment. Peer leaders collate service advertisements and interest announcements so the hierarchy can be traversed efficiently for cross-domain communication, which encourages system-wide trust-building instead of clique formation.
 
 ---
 
-## 4. How It Works
+## 4. How it works
 
-This section traces the technical mechanisms for readers who need to evaluate feasibility.
+Wherein we trace the technical mechanisms, for readers who need to judge feasibility.
 
 ### 4.1 Communication
 
-All communication is peer-to-peer and encrypted end-to-end using NaCl/libsodium: Curve25519 key exchange with ChaCha20-Poly1305 transport cipher. AutonomousTrust is carrier and protocol agnostic---it operates over any connection that can move bytes.
+All communication is peer-to-peer and encrypted end to end with NaCl/libsodium: Curve25519 key exchange with a ChaCha20-Poly1305 transport cipher. We are carrier and protocol agnostic; anything that can move bytes will do.
 
-Messages use a structured format: a short, in-the-clear addressing header for routing, followed by a domain typology subheader (describing the message schema, analogous to an email subject line), followed by the encrypted body. The subheader enables rapid discard of irrelevant messages. Because decryption is streamed via the transport cipher, a connection can be cut early---mid-message---if the sender is not trusted. This reduces the impact of denial-of-service attacks.
+Messages are structured: a short addressing header in the clear for routing, then a domain typology subheader describing the message schema (much like an email subject line), then the encrypted body. The subheader allows rapid discard of irrelevant messages. Because decryption is streamed through the transport cipher, a connection can be cut early, mid-message, when the sender is not trusted, which blunts denial-of-service attacks.
 
-Messaging itself is a first-class trust-scored transaction. Sending messages costs reputation if those messages are unwanted or spurious. This makes spam and flooding self-defeating: the attacker's reputation collapses, and the network autonomously stops listening to them.
+Messaging is itself a first-class, trust-scored transaction. Unwanted or spurious messages cost the sender reputation, so spam and flooding are self-defeating: the attacker's reputation collapses and the network stops listening of its own accord.
 
-Deliverability reports trace message receipts to determine underlying network reachability, which is critical for applications requiring timeliness or reliability.
+Deliverability reports trace message receipts to determine underlying network reachability, which matters when the application requires timeliness or reliability.
 
-### 4.2 Network Topology
+### 4.2 Network topology
 
-The network hierarchy is emergent, not imposed. There is no pre-configured tree, no central directory, no designated authorities. Nodes with more resources and better connectivity naturally become peer leaders, serving as clearinghouses for message schemas and coordinators for service discovery and identity propagation.
+The hierarchy is emergent, not imposed. There is no pre-configured tree, no central directory, no designated authorities. Nodes with more resources and better connectivity become peer leaders, acting as clearinghouses for message schemas and coordinating service discovery and identity propagation.
 
-Peer leaders coordinate with higher levels of the hierarchy. Branches grow or shrink. Leaders rise or fall based on their capabilities and trustworthiness. At all times, the trust mechanism is in play---and affects the structure of individual enclaves. All hierarchy leaders are also full participants in their own enclave; the network graph is not a strict tree.
+Peer leaders coordinate with higher levels of the hierarchy. Branches grow and shrink. Leaders rise or fall on capability and trustworthiness. The trust mechanism is always in play and shapes individual enclaves as it goes. Every hierarchy leader is also a full participant in its own enclave, so the network graph is not a strict tree.
 
-This has a critical implication: any node can assume any hierarchical role. The system does not depend on any single node, and cannot be decapitated by removing one.
+Any node can adopt any hierarchical role, which means the system depends on no single node and cannot be decapitated by removing one.
 
-### 4.3 Identity Ledger
+### 4.3 Identity ledger
 
-Identity uses a distributed blockchain with different consensus mechanisms for different cases. The identity chain must presume initially unknown participants (identity creation is open), but updates are infrequent. Consensus algorithms appropriate for unknown-participant scenarios (Proof-of-Work, Proof-of-Stake, Proof-of-Authority) are used here.
+Identity uses a distributed blockchain, and the consensus mechanism differs by case. The identity chain must presume initially unknown participants, since identity creation is open, but its updates are infrequent. Algorithms suited to unknown participants (Proof-of-Work, Proof-of-Stake, Proof-of-Authority) apply here.
 
-Each identity record is compact:
+The identity record is compact:
 
 
 | Field | UUID | Signature | Public Key | Timestamp | Routable Address |
 | ----- | ---- | --------- | ---------- | --------- | ---------------- |
 | Bytes | 16   | 64        | 32         | 8         | 16               |
 
-An agent can update its own address field (subject to peer verification) but no other field. Changing any other aspect of identity requires creating a new identity---which means abandoning all accumulated reputation.
+An agent can update its own address field, subject to peer verification, and no other field. Changing anything else means creating a new identity and abandoning all accumulated reputation.
 
-Peer leaders coordinate local identity subchains. The global identity ledger is a blockdag: a directed acyclic graph of subchains. This keeps identity distributed and scalable while avoiding the performance and storage problems of a single global chain.
+Peer leaders coordinate local identity subchains, and the global ledger is a blockdag, a directed acyclic graph of those subchains. Identity stays distributed and scalable without the performance and storage problems of one global chain.
 
-### 4.4 Reputation Ledger
+### 4.4 Reputation ledger
 
-Reputation uses a separate blockchain from identity. The reputation chain *must* know all participants (it records bilateral transaction scores among known peers), and updates frequently. Byzantine fault-tolerant consensus algorithms for known participants (PBFT and variants) are used here.
+Reputation uses a blockchain separate from identity. This chain *must* know all participants, because it records bilateral transaction scores among known peers, and it updates frequently. Byzantine fault-tolerant algorithms for known participants (PBFT and its variants) apply here.
 
 Each transaction record:
 
@@ -180,65 +166,57 @@ Each transaction record:
 | ----- | ---- | ---- | --------- | -------- | --------- | ------- | -------- | --------- | ------- |
 | Bytes | 16   | 4    | 8         | 16       | 8         | 64      | 16       | 8         | 64      |
 
-Both participants sign their score of the other. Raw transaction scores are tracked rather than aggregated summaries, so agents can weight those scores based on the reputation of the scorer. Agents maintain private local data structures for fast reputation queries, updated as new transaction records arrive.
+Both participants sign their score of the other. We track raw transaction scores rather than aggregated summaries so that agents can weight scores by the reputation of the scorer. Each agent keeps a private local structure for fast queries, updated as new records arrive.
 
-The use of two separate blockchains with different consensus mechanisms---one for infrequent identity operations with unknown participants, one for frequent reputation operations among known participants---is a deliberate design choice. It avoids forcing a single consensus model onto fundamentally different operational patterns.
+Two blockchains with two consensus mechanisms, one for infrequent identity operations among unknown participants and one for frequent reputation operations among known ones, is a deliberate choice. A single consensus model would have to be forced onto two very different operational patterns.
 
-### 4.5 Negotiation and Access Gradient
+### 4.5 Negotiation and the access gradient
 
-All service requests are negotiated via domain-specific protocols. The negotiation is bilateral: both parties evaluate the other and agree on terms. Transactions are scored on transparent, schema-defined or negotiated criteria---typically result applicability and timeliness. Service providers also rate clients on adherence to negotiated terms.
+All service requests are negotiated through domain-specific protocols, and the negotiation is bilateral: each party evaluates the other and both agree on terms. Transactions are scored on transparent criteria, schema-defined or negotiated, usually result applicability and timeliness. Providers also rate clients on adherence to the agreed terms.
 
-Because results must be validated (implying some adaptive or AI-assisted validation capability), transaction record submission may be delayed. Bounds on this delay are themselves negotiated criteria. Failure to validate in a timely manner affects reputation---which incentivizes agents to be realistic about their capabilities rather than over-committing.
+Because results have to be validated, which implies some adaptive facility such as AI, submission of the transaction record may be delayed; the bounds on that delay are themselves negotiated criteria. Failing to validate in time affects reputation, which gives agents a reason to be realistic about their capabilities instead of over-committing.
 
-Access is not binary. The trust gradient means an agent can simultaneously maintain different levels of engagement with different peers, and those levels shift continuously based on accumulated evidence. This is not four access tiers configured by an administrator; it is a continuous function of earned trust.
+Access is not binary. The trust gradient lets an agent hold different levels of engagement with different peers simultaneously, and those levels shift continuously on accumulated evidence. It is a continuous function of earned trust, not a set of tiers an administrator configured.
 
-### 4.6 Social Fences
+### 4.6 Social fences
 
-Certain rules are hard-coded and non-negotiable. Violation results in immediate and irreversible reputation collapse. These "social fences" define the boundaries of legitimate behavior within the system:
+A few rules are hard-coded and non-negotiable, and violating one collapses reputation immediately and irreversibly. These social fences mark the boundary of legitimate behavior within the system.
 
-- **Freedom of association:** No agent may block another agent's communications with third parties. Man-in-the-middle blocking of messages is a fence violation. This prevents authoritarian attacks where a malicious peer leader censors or isolates subordinates.
-- **Rule of law:** Agents higher in the emergent hierarchy are held to *stricter* standards, not looser ones. Reputation thresholds for leadership roles are higher than for peers. Authority is earned and maintained by exceeding expectations.
-- **Skin in the game:** Hierarchical leaders must be full participants in the domain they oversee. A peer leader that does not interact meaningfully with its enclave loses reputation. This prevents absentee authorities and empty credential-holders.
+**Freedom of association:** no agent may block another agent's communications with third parties. Man-in-the-middle blocking of messages is a fence violation. This is what prevents authoritarian attacks, in which a malicious peer leader censors or isolates its subordinates.
 
-These fences cannot be reconfigured, negotiated away, or overridden by reputation. They are structural---analogous to constitutional constraints rather than policy rules.
+**Rule of law:** agents higher in the emergent hierarchy are held to *stricter* standards, not looser ones. Reputation thresholds for leadership roles exceed those for peers. Authority is earned by exceeding expectations, and maintained the same way.
 
-### 4.7 Dispute Resolution
+**Skin in the game:** a hierarchical leader must be a full participant in the domain it oversees. A peer leader that does not interact meaningfully with its enclave loses reputation. This is what keeps out absentee authorities and holders of empty credentials.
 
-When agents disagree about reputation scores, data validity, or negotiation terms, the system provides structured resolution:
+The fences cannot be reconfigured, negotiated away, or overridden by reputation. They are structural, closer to a constitutional constraint than to a policy rule.
 
-- **Verification:** Competing claims are tested against observable evidence. Multiple corroborating sources carry more weight than any single assertion.
-- **Leader mediation:** The local peer leader can review disputed transactions and render judgments. This is always local---there is no global arbiter.
-- **Graduated discipline:** Responses to violations are proportional, not binary. Not every failure results in exile; some result in reduced trust, increased scrutiny, or temporary access restrictions.
+### 4.7 Dispute resolution
+
+When agents disagree about reputation scores, data validity, or negotiated terms, resolution is structured. Competing claims are tested against observable evidence, and multiple corroborating sources outweigh any single assertion. The local peer leader can review disputed transactions and render judgment, always locally; there is no global arbiter. Discipline is graduated rather than binary, so not every failure ends in exile. Some end in reduced trust, closer scrutiny, or a temporary restriction on access.
 
 ---
 
 ## 5. AutonomousTrust and Zero Trust
 
-Your organization is implementing Zero Trust Architecture because it was mandated to. This section explains where ZTA's strengths end, where AutonomousTrust begins, and how the two work together.
+Your organization is implementing Zero Trust Architecture because it was mandated to. Here we set out where ZTA's strengths end, where AutonomousTrust begins, and how the two fit together.
 
-### 5.1 What Zero Trust Does Well
+### 5.1 What Zero Trust does well
 
-ZTA, as codified in NIST SP 800-207 and operationalized via CISA's Zero Trust Maturity Model and OMB M-22-09, addresses real and critical problems:
+ZTA, codified in NIST SP 800-207 and operationalized through CISA's Zero Trust Maturity Model and OMB M-22-09, addresses real problems. Every access request is authenticated regardless of network location. The security state of the requesting device is evaluated before access is granted. Access is scoped to the minimum the task requires, is time-limited, and is continuously re-evaluated against policy. Network resources are micro-segmented to limit lateral movement.
 
-- **Identity verification:** Every access request is authenticated, regardless of network location.
-- **Device posture:** The security state of the requesting device is evaluated before granting access.
-- **Least privilege:** Access is scoped to the minimum necessary for the task.
-- **Session management:** Access is time-limited and continuously re-evaluated against policy.
-- **Micro-segmentation:** Network resources are isolated to limit lateral movement.
+These are real advances over perimeter-based security: implicit trust is gone and verification is explicit. AutonomousTrust replaces none of it.
 
-These are genuine advances over perimeter-based security. They eliminate implicit trust and force explicit verification. AutonomousTrust does not replace any of this.
+### 5.2 Where Zero Trust hits its ceiling
 
-### 5.2 Where Zero Trust Hits Its Ceiling
+ZTA answers one question: *should this authenticated identity, with this device posture, access this resource, in this context?* The answer is a policy lookup, and that creates three structural limits.
 
-ZTA answers one question: *should this authenticated identity, with this device posture, access this resource, in this context?* The answer is a policy lookup. This creates three structural limitations:
+First, policy is static relative to threats. ZTA policies are human-authored rules. They can be updated, but they cannot adapt in real time to behavior nobody wrote a rule about. A compromised endpoint with valid credentials and compliant device posture sails straight through, because nothing in the policy says to stop it. The compromise is behavioral, not credential-based, and ZTA has no mechanism for evaluating behavior.
 
-**1. Policy is static relative to threats.** ZTA policies are human-authored rules. They can be updated, but they cannot adapt in real time to novel behavior. A compromised endpoint with valid credentials and compliant device posture sails through ZTA because nothing in the policy says to stop it. The compromise is behavioral, not credential-based, and ZTA has no mechanism for evaluating behavior.
+Second, policy does not scale. Every new system, integration, data flow, or inter-agency partnership demands new policy. The policy surface grows combinatorially while human capacity to author and maintain it grows linearly at best. The result is gaps, or more often over-broad policies that grant more access than intended, because writing a precise policy for every case is infeasible.
 
-**2. Policy doesn't scale.** Each new system, integration, data flow, or inter-agency partnership demands new policies. The policy surface grows combinatorially while the human capacity to author and maintain it grows linearly at best. The result is inevitable gaps---or, more commonly, over-broad policies that grant more access than intended because writing precise policies for every case is infeasible.
+Third, the Policy Decision Point is a single point of failure. ZTA's architecture centers on a PDP that must be correct, available, and uncompromised. A misconfigured PDP, an outage, or an attacker in control of policy takes the whole security posture down with it. There is no fallback, because the machines have no independent judgment.
 
-**3. The Policy Decision Point is a single point of failure.** ZTA's architecture centers on a PDP that must be correct, available, and uncompromised. If the PDP is wrong (misconfigured policy), unavailable (outage), or compromised (attacker gains control of policy), the entire security posture collapses. There is no fallback, because the machines have no independent judgment.
-
-### 5.3 How They Complement Each Other
+### 5.3 How they complement each other
 
 ZTA and AutonomousTrust operate on different axes:
 
@@ -251,135 +229,120 @@ ZTA and AutonomousTrust operate on different axes:
 | **Temporal scope** | Point-in-time access decision        | Continuous relationship evaluation       |
 | **Scales via**     | More policies (human-written)        | Distributed local evaluation (automatic) |
 
-Together:
+ZTA handles the front door. It verifies identity, checks device posture, and establishes the initial conditions for access, which is necessary work. AutonomousTrust handles everything after the door. Once an authenticated peer is inside, AT keeps evaluating its behavior: is it doing what it negotiated to do, are its messages consistent with the capabilities it claims, do other sources corroborate what it reports?
 
-- **ZTA handles the front door.** It verifies identity, checks device posture, and establishes initial access conditions. This is valuable and necessary work.
-- **AutonomousTrust handles everything after.** Once an authenticated peer is inside the system, AT continuously evaluates its behavior. Is it doing what it negotiated to do? Are its messages consistent with its stated capabilities? Is its behavior corroborated by other sources?
+ZTA authentication does not grant AutonomousTrust reputation, and that boundary is the important one. A ZTA-authenticated peer enters the network at zero reputation and must earn trust through the behavioral bootstrap of section 3.6. ZTA can confirm that a peer *is who it claims to be*. Only AutonomousTrust can determine whether that peer *should be trusted, based on what it does*. Conflating the two questions, letting credential verification stand in for behavioral evaluation, is exactly the gap attackers exploit.
 
-**The critical boundary:** ZTA authentication does not grant AutonomousTrust reputation. A ZTA-authenticated peer enters the AutonomousTrust network at zero reputation and must earn trust through the behavioral bootstrap phase (Section 3.6). This is by design. ZTA can confirm that a peer *is who it claims to be*. Only AutonomousTrust can determine whether that peer *should be trusted based on what it does*. These are different questions, and conflating them---letting credential verification substitute for behavioral evaluation---is precisely the gap that attackers exploit.
+By analogy: ZTA is the badge check that gets you into the building, and AutonomousTrust is the professional culture inside that decides whether anyone will work with you. Showing a badge earns you entry, not trust; consistent, reliable work earns trust. And when your behavior changes, trust adjusts immediately, with no policy update in the loop.
 
-Think of it this way: ZTA is the credential check that gets you into the building. AutonomousTrust is the professional culture inside the building that determines whether anyone will work with you. Showing your badge doesn't earn you trust. Consistent, reliable behavior does. And if your behavior changes, trust adjusts immediately---no policy update required.
+### 5.4 Compatibility with the ZTA mandate
 
-### 5.4 Compatibility with the ZTA Mandate
+Implementing AutonomousTrust does not conflict with a Zero Trust mandate. It extends one. Identity verification, least privilege, session management and micro-segmentation all stay in place. AutonomousTrust adds what ZTA's architecture cannot provide: continuous, autonomous, behavioral trust evaluation that scales without human policy authoring.
 
-Implementing AutonomousTrust does not conflict with your Zero Trust mandate. It extends it. Every ZTA requirement---identity verification, least privilege, session management, micro-segmentation---remains in place. AutonomousTrust adds a capability that ZTA's architecture cannot provide: continuous, autonomous, behavioral trust evaluation that scales without human policy authoring.
-
-If your mandate is to minimize implicit trust, AutonomousTrust is the logical conclusion: a system where trust is never implicit, never static, and never dependent on a human to keep it current.
+If the mandate is to minimize implicit trust, this is where that mandate leads. Trust is never implicit, never static, and never dependent on a human to keep it current.
 
 ---
 
-## 6. Scenario: Multi-Agency Federal Data Sharing
+## 6. Scenario: multi-agency federal data sharing
 
-Three federal agencies---NOAA, FEMA, and USGS---must share real-time environmental sensor data during a natural disaster response. Each agency runs its own infrastructure, has its own data sensitivity policies, and has no authority over the others. There is no shared operations center. There is no central broker. There is no human operator deciding what data goes where.
+Three federal agencies (NOAA, FEMA and USGS) must share real-time environmental sensor data during a natural disaster response. Each runs its own infrastructure, holds its own data sensitivity policies, and has no authority over the others. There is no shared operations center, no central broker, and no human operator deciding what data goes where.
 
 ### Setup
 
-Each agency's edge devices---weather stations, seismic sensors, flood gauges, field stations---run AutonomousTrust agents. Before the disaster response begins, agencies establish identity chains and data-sharing schemas for common environmental data types. ZTA is in place at each agency: devices are authenticated, credentials are valid, device posture is verified.
+Each agency's edge devices, meaning weather stations, seismic sensors, flood gauges and field stations, run AutonomousTrust agents. Before the response begins, the agencies establish identity chains and data-sharing schemas for the common environmental data types. ZTA is in place at each agency: devices are authenticated, credentials are valid, device posture is verified.
 
 ### Discovery
 
-A FEMA field station announces interest in seismic and weather data. USGS and NOAA agents, having advertised those services, respond. Negotiation happens machine-to-machine: what data, in what format, at what frequency, with what latency bounds. Terms are agreed. Data begins flowing. No human arranged this specific pairing. No human wrote a policy for this specific data exchange. The machines found each other, negotiated, and started cooperating---because they shared goals defined by compatible schemas.
+A FEMA field station announces interest in seismic and weather data. USGS and NOAA agents that advertised those services respond. Negotiation runs machine to machine: what data, in what format, at what frequency, within what latency bounds. Terms are agreed and data begins flowing. No human arranged this particular pairing and no human wrote a policy for this particular exchange. The machines found each other, negotiated, and started cooperating, because compatible schemas gave them a shared goal.
 
-### Trust Bootstrap
+### Trust bootstrap
 
-These agencies have not worked together in this configuration before. Their agents have no prior reputation with each other. ZTA confirmed their identities, but AutonomousTrust does not care. Each agent starts at zero reputation and enters the bootstrap phase: contrite tit-for-tat, then win-stay/lose-shift. Early transactions are small and cautious. Agents validate results, score transactions, and build reputation incrementally. Within minutes of consistent, accurate data delivery, trust reaches working levels. Data flows freely among agents that have proven themselves. This happened without any human intervention.
+These agencies have not worked together in this configuration, so their agents hold no prior reputation with each other. ZTA confirmed their identities; AutonomousTrust does not care. Each agent starts at zero and enters bootstrap, contrite tit-for-tat and then win-stay/lose-shift. Early transactions are small and cautious. Agents validate results, score transactions, and accumulate reputation incrementally. Within minutes of consistent, accurate data delivery, trust reaches working levels and data flows freely among the agents that have proven themselves. No human intervened at any point.
 
 ### Compromise
 
-A NOAA coastal weather sensor is compromised by an adversary. It begins injecting subtly falsified weather data---wind speeds that are plausible but wrong. Its ZTA credentials are still valid. Its device posture checks pass. A traditional ZTA system has no reason to block it.
+An adversary compromises a NOAA coastal weather sensor, which begins injecting subtly falsified data: wind speeds that are plausible and wrong. Its ZTA credentials remain valid and its device posture checks still pass, so a conventional ZTA deployment has no reason to block it.
 
-AutonomousTrust catches it anyway. FEMA agents receiving this sensor's data also receive corroborating weather data from other NOAA sensors and from their own instruments. The compromised sensor's data diverges from corroborating sources. Agents that detect the inconsistency score the compromised sensor's transactions low. Other agents, weighting these scores by the reputation of the scorers, independently reach the same conclusion. Within moments, the compromised sensor's reputation collapses below the threshold for data sharing. Then below the threshold for service negotiation. Then below the threshold for communication entirely. The network stops listening to it.
+AutonomousTrust catches it anyway. The FEMA agents receiving that sensor's data also receive corroborating weather data from other NOAA sensors and from their own instruments, and the compromised sensor's readings diverge from all of it. Agents that spot the inconsistency score its transactions low. Other agents, weighting those scores by the reputation of the scorers, reach the same conclusion independently. The sensor's reputation falls below the threshold for data sharing, then below the threshold for service negotiation, then below the threshold for communication at all. The network stops listening to it.
 
-No human detected this. No analyst triaged an alert. No incident response team convened. No policy was updated. The machines identified the behavioral anomaly, scored it, propagated the scores, and autonomously excluded the compromised peer. The rest of the network continued operating with accurate data.
+No human detected this. No analyst triaged an alert, no incident response team convened, and no policy was updated. The machines found the behavioral anomaly, scored it, propagated the scores, and excluded the compromised peer, while the rest of the network went on working with accurate data.
 
-### A New Agency Joins
+### A new agency joins
 
-Midway through the response, EPA requests access to the data-sharing network for water quality monitoring. EPA's agents authenticate via ZTA. Their credentials are valid.
+Midway through the response, EPA asks for access to the data-sharing network for water quality monitoring. Its agents authenticate through ZTA and their credentials are valid.
 
-AutonomousTrust does not skip the bootstrap. EPA's agents enter at zero reputation, regardless of their ZTA authentication status. They must earn trust through consistent, accurate transactions---just as every other agent did. The existing network does not extend automatic trust simply because credentials checked out. Identity is confirmed; behavior is not yet observed. Within the AutonomousTrust paradigm, these are separate concerns.
+The bootstrap still applies. EPA's agents enter at zero reputation regardless of authentication status, and earn trust through consistent, accurate transactions exactly as every other agent did. The existing network extends no automatic trust on the strength of credentials alone. Identity is confirmed; behavior has not yet been observed. Within this paradigm those are separate concerns.
 
-### What Happened---and What Didn't
+### What happened, and what did not
 
-At no point did a human operator decide what to share with whom. At no point did a centralized system evaluate the trustworthiness of a peer. At no point did an analyst receive an alert, review a dashboard, or issue a blocking order. The machines:
+At no point did a human operator decide what to share with whom, no centralized system evaluated a peer's trustworthiness, and no analyst received an alert, reviewed a dashboard, or issued a blocking order. The machines found each other, negotiated terms, built trust on demonstrated behavior, detected and excluded a compromised peer, onboarded a new participant safely, and kept operating throughout.
 
-- Found each other
-- Negotiated terms
-- Built trust through demonstrated behavior
-- Detected and excluded a compromised peer
-- Onboarded a new participant safely
-- Continued operating throughout
-
-This is what AutonomousTrust does. Not monitoring. Not alerting. Not reporting. *Autonomous trust evaluation and action.*
+That is what AutonomousTrust does: autonomous trust evaluation and action, rather than monitoring, alerting or reporting.
 
 ---
 
-## 7. Security Analysis
+## 7. Security analysis
 
-AutonomousTrust is a new computing paradigm, and its security properties differ fundamentally from traditional systems. Some attack vectors are eliminated by the architecture itself. Others require active resistance.
+AutonomousTrust is a new computing paradigm, and its security properties differ from those of traditional systems. Some attack vectors the architecture eliminates outright. Others it has to actively resist.
 
-### 7.1 Attacks Neutralized by Design
+### 7.1 Attacks neutralized by design
 
-**Man-in-the-middle and spoofing.** All messages are encrypted end-to-end with post-quantum techniques (Curve25519 + ChaCha20-Poly1305). There is nothing to intercept and no way to impersonate without the private key.
+**Man-in-the-middle and spoofing.** Every message is encrypted end to end with post-quantum techniques (Curve25519 with ChaCha20-Poly1305). There is nothing to intercept, and no way to impersonate a peer without its private key.
 
-**Compromised-but-authenticated endpoints.** This is Zero Trust's blind spot and AutonomousTrust's strength. Valid credentials are irrelevant; behavior is what matters. The compromised NOAA sensor in Section 6 had valid credentials. AT cut it off because its behavior diverged from corroborating evidence.
+**Compromised but authenticated endpoints.** This is Zero Trust's blind spot and our strength. Valid credentials are irrelevant here; behavior is what counts. The compromised NOAA sensor in section 6 had perfectly valid credentials, and AT cut it off because its behavior diverged from corroborating evidence.
 
-**Supply chain attacks (SunBurst-class).** The 2019-2020 SunBurst attack via SolarWinds Orion was undetectable by state-of-the-art security tools once inside the network. Attacker activity was indistinguishable from valid developer behavior. AutonomousTrust makes this attack structurally impossible in two ways. First, even code developers would not have direct access to the build system under AT's capability restrictions, eliminating the binary injection vector. Second, any product running within an AT network is constrained to the scope of its negotiated schema. When the trojan phones home or attempts to control systems outside its specification, reputation collapses and access is revoked---autonomously, immediately, and without human detection.
+**Supply chain attacks of the SunBurst class.** The 2019-2020 SunBurst attack through SolarWinds Orion was undetectable by state-of-the-art tools once inside the network, since attacker activity was indistinguishable from that of valid developers. AutonomousTrust makes this attack structurally impossible in two ways. Under AT's capability restrictions, even code developers have no direct access to the build system, which eliminates the binary injection. And any product running inside an AT network is confined to the scope of its negotiated schema, so when the Trojan Horse phones home or reaches for systems outside its specification, its reputation collapses and its access goes away, autonomously and immediately.
 
-**Denial-of-service and message flooding.** Messaging is trust-scored. Untrusted senders are cut off mid-stream (streamed decryption allows early connection termination). Message flooding costs the attacker reputation, making the attack self-defeating. At sufficient scale, firmware-level AT enforcement on network switches could further reduce DoS impact.
+**Denial of service and message flooding.** Messaging is trust-scored, and untrusted senders are cut off mid-stream thanks to streamed decryption. Flooding costs the attacker reputation, so the attack defeats itself. At sufficient scale, AT enforcement in network switch firmware would reduce DoS impact further.
 
-**Metadata harvesting.** Identity/address pairs are only exposed in direct messaging. The system supports long-latency, near-contact networking that minimizes metadata exposure. Identities can be anonymous where the domain does not require identity disclosure, rendering metadata collection largely useless.
+**Metadata harvesting.** Identity and address pairs are exposed only in direct messaging. The system supports long-latency, near-contact networking that minimizes even that exposure, and identities can be anonymous in domains that do not require disclosure, which leaves metadata collection with little to work on.
 
-### 7.2 Attacks Requiring Active Resistance
+### 7.2 Attacks requiring active resistance
 
-**Deceit.** Malicious agents may falsify data or results. This cannot survive when competing service providers are present. Even a single client can make comparisons across providers that reveal inconsistencies, as demonstrated in the compromised-sensor scenario.
+**Deceit.** Malicious agents may falsify data or results. This cannot survive the presence of competing service providers; even a single client can make the comparison that reveals it, as the compromised sensor above shows.
 
-**Insider betrayal.** A malicious agent builds trust over a long period, then exploits it. This attack is costly: reputation is public, and betrayal is a one-time event for a given identity. The attacker must invest significant time and resources to build the reputation it intends to spend, and once spent, that identity is permanently burned. Starting over with a new identity means starting at zero reputation.
+**Insider betrayal.** A malicious agent builds trust patiently, then spends it. The attack is costly: reputation is public, and betrayal is a one-time event for a given identity. The attacker has to invest real time and resources building the reputation it intends to burn, and once burned, that identity is finished. Starting over starts at zero.
 
-**Bad reputation / Collusion.** A group of peers colludes to drive a target's reputation down through low transaction scores or false gossip. Peer leaders can independently review and verify gossip claims. The target's connections outside the enclave serve as a check---if external peers continue to rate the target well, the collusion is detectable.
+**Bad reputation and collusion.** A group of peers colludes to drive a target's reputation down, most easily through gossip but also through low transaction scores. Peer leaders can independently review and verify gossip claims, and the target's connections outside the enclave act as a check: if external peers keep rating the target well, the collusion shows.
 
-**Sybil.** Multiple fake identities controlled by a single entity attempt to manipulate the network. Identities are cheap to create, but reputation is expensive to build. Impatient Sybils---agents that appear with no reputation and attempt to influence the network immediately---are trivially ignored. Patient Sybils that invest in reputation-building before striking are the most serious version of the insider betrayal threat.
+**Sybil.** Many fake identities under one entity's control attempt to manipulate or derail the network. The textbook defense is to make identity generation expensive. Our identities are cheap to create, but reputation is not, so impatient Sybils that appear with no reputation and try to exert influence right away are trivial to ignore. Patient Sybils that invest in reputation first are the serious case, and they amount to a form of insider betrayal.
 
-**Atomization (Eclipse).** Malicious agents isolate a target peer, controlling all its connections and feeding it false data and reputation scores. Mitigated by maintaining connections outside the enclave. The social fences (Section 4.6) further protect against this: freedom of association means no agent may block another's communications with third parties, making isolation structurally harder to achieve.
+**Atomization, known in distributed computing as the Eclipse attack.** Malicious agents isolate a target peer, control all of its connections, and feed it false data and false reputation scores. Connections outside the enclave mitigate this, and the social fences of section 4.6 harden it further: freedom of association means no agent may block another's communications with third parties, which makes isolation structurally hard to arrange.
 
-**Rogue authority.** A malicious peer leader abuses its hierarchical position to censor, isolate, or deceive its enclave. The social fences impose stricter standards on leaders than on peers, and any peer can compete for leadership. A rogue authority is out-competed by a legitimate peer that demonstrates better behavior. Additionally, the skin-in-the-game requirement means a leader that stops participating meaningfully in its domain loses reputation automatically.
+**Rogue authority.** A malicious peer leader abuses its hierarchical position to censor, isolate or deceive its enclave. The social fences hold leaders to stricter standards than peers, and any peer can compete for leadership, so a better-behaved peer out-competes the rogue. Skin in the game also means a leader that stops participating meaningfully in its domain loses reputation without anyone having to intervene.
 
-**DLT-specific attacks (51%, block injection).** Attempts to corrupt the blockchain by injecting bad blocks or overwhelming consensus. Significantly reduced by the use of two separate blockchains with different consensus mechanisms, and by the required investment of reputation-building that makes such attacks expensive.
+**DLT-specific attacks such as the 51% attack and block injection.** Attempts to corrupt a chain by injecting bad blocks or overwhelming consensus are significantly reduced by our use of two disparate but mutually supporting blockchains, and by the reputation investment such an attack would require.
 
 ---
 
 ## 8. Conclusion
 
-The cybersecurity paradigm is broken at its foundation. We keep writing more rules for machines to enforce, and we keep falling behind. Zero Trust Architecture is the best articulation of the current approach, and it is genuinely valuable---but it is still humans trying to think faster than threats evolve. That race is unwinnable.
+The current cybersecurity paradigm is in trouble at its foundation. We keep writing more rules for machines to enforce, and we keep falling behind. Zero Trust Architecture is the best articulation of that approach and it is worth having, but it is still humans trying to think faster than threats evolve, and that race cannot be won.
 
-AutonomousTrust represents a different paradigm: one in which security is not a set of rules imposed on a system, but an emergent property of how the system's components relate to each other. Machines evaluate trust based on behavior, not policy. They adapt in real time, without waiting for a human to update a rule. They scale naturally, because evaluation is distributed and local. They handle novel threats, because behavioral anomaly detection does not require someone to have anticipated the specific attack.
+AutonomousTrust represents a new paradigm in computing: security is not a set of rules imposed on a system but an emergent property of how the system's parts relate to each other. Machines evaluate trust on behavior rather than policy. They adapt as events happen, without waiting for someone to update a rule. They scale, because evaluation is local and distributed. And they handle novel threats, because scoring a behavioral anomaly does not require that anyone anticipated the specific attack.
 
-For organizations implementing Zero Trust, AutonomousTrust is the natural extension: it takes the principle of "never trust implicitly" to its logical conclusion by making trust evaluation continuous, autonomous, and behavioral. It does not replace your ZTA investment; it completes it.
-
-The machines don't report problems to you. They solve them.
+For an organization implementing Zero Trust, this is the natural extension. It takes "never trust implicitly" to its conclusion by making trust evaluation continuous, autonomous and behavioral. It does not replace a ZTA investment, it completes one, and it moves the work of acting on a threat from your operators to the machines that see it first.
 
 ---
 
-## 9. Project Status
+## 9. Project status
 
-AutonomousTrust is not speculative, and it is not vaporware. It is an active research prototype with production-ready components, built entirely on current technology: standard cryptographic libraries (NaCl/libsodium), established blockchain consensus algorithms, proven game-theoretic strategies, and small messages over any connection. No special hardware. No unproven algorithms. No centralized infrastructure.
+AutonomousTrust is an active research prototype, not a concept paper. It is built entirely on current technology: standard cryptographic libraries (NaCl/libsodium), established blockchain consensus algorithms, game-theoretic strategies with decades of literature behind them, and small messages over any connection. No special hardware, no unproven algorithms, no centralized infrastructure.
 
 ### What is built and working
 
-The **core process framework**---the multiprocessing architecture that orchestrates all subsystems---is mature and functional. The **C library** (17,000+ lines, built as both shared and static libraries) mirrors the Python core and is production-grade with comprehensive test coverage. **Protocol definitions** (Protobuf) are complete across all subsystems.
+The core process framework, the multiprocessing architecture that orchestrates all subsystems, is mature and functional. The C library mirrors the Python core in more than 17,000 lines, builds as both a shared and a static library, and carries comprehensive test coverage. Protobuf protocol definitions are complete across all subsystems.
 
-The **identity subsystem** handles peer registration and supports multiple blockchain agreement protocols (Proof-of-Work, Proof-of-Stake, Proof-of-Authority). The **network subsystem** provides both UDP and TCP messaging with heartbeat mechanisms. The **negotiation subsystem** implements the task negotiation protocol. The **reputation subsystem** implements transaction scoring with Paxos-style consensus.
+The identity subsystem handles peer registration and supports several blockchain agreement protocols (Proof-of-Work, Proof-of-Stake, Proof-of-Authority). The network subsystem provides UDP and TCP messaging with heartbeat mechanisms. The negotiation subsystem implements the task negotiation protocol, and the reputation subsystem implements transaction scoring with Paxos-style consensus.
 
-A **services layer** provides data client/server capabilities, video frame processing, and peer position tracking. A **simulation framework** supports multi-scenario testing---including ground-based and space-based scenarios---with red-team attack orchestration (Byzantine, Sybil, and partition attacks) and CALDERA attack framework integration. An **inspector UI** provides visualization of network state and peer relationships. **Deployment infrastructure** includes Docker, Docker Compose, Kubernetes manifests, and Tiltfile-based orchestration.
+A services layer provides data client and server capabilities, video frame processing, and peer position tracking. A simulation framework supports multi-scenario testing, ground-based and space-based, with red-team attack orchestration (Byzantine, Sybil and partition attacks) and CALDERA integration. An inspector UI visualizes network state and peer relationships. Deployment infrastructure covers Docker, Docker Compose, Kubernetes manifests and Tiltfile-based orchestration.
 
-The project has an extensive test suite spanning unit, integration, and system tests, with working example deployments.
+There is an extensive test suite spanning unit, integration and system tests, with working example deployments.
 
 ### What remains to be done
 
-The system is in alpha. Critical security mechanisms are implemented in structure but require hardening before adversarial deployment:
+The system is in alpha. Several critical security mechanisms exist in structure but need hardening before any adversarial deployment.
 
-- **Cryptographic message authentication** is scaffolded but not yet enforced end-to-end at the network layer. Message signatures are defined but verification is not yet active.
-- **Identity validation** has known gaps in the history DAG---branch divergence handling and several eligibility confirmation steps need completion.
-- **Reputation-based enforcement** in negotiation (rejecting low-reputation peers, conflict resolution) is partially implemented.
-- **Zero-knowledge proof integration** is planned but not yet built.
+Cryptographic message authentication is scaffolded rather than enforced end to end at the network layer; signatures are defined but verification is not yet active. Identity validation has known gaps in the history DAG, specifically branch divergence handling and several eligibility confirmation steps. Reputation-based enforcement in negotiation, meaning rejection of low-reputation peers and conflict resolution, is only partly implemented. Zero-knowledge proof integration is planned and not yet built.
 
-These gaps are documented, tracked, and well-understood. They represent engineering work on a sound architecture, not fundamental design uncertainty. The core mechanisms---behavioral trust evaluation, game-theoretic bootstrapping, dual-blockchain identity and reputation, emergent hierarchy---are implemented and demonstrable in simulation today.
+These gaps are documented and tracked. They are engineering work on an architecture we consider sound, not symptoms of design uncertainty. The core mechanisms, behavioral trust evaluation, game-theoretic bootstrapping, dual-blockchain identity and reputation, and emergent hierarchy, are implemented and demonstrable in simulation today.

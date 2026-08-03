@@ -92,10 +92,30 @@ section .cols > * {
   flex: 1;
   min-width: 0;
 }
-/* Dense-content slides opt in via <!-- _class: small --> */
+/* Dense-content slides opt in via <!-- _class: small --> (or the denser steps
+   below). Three rungs, each ~2px of body type: reach for the mildest one that
+   clears the branded footer. */
 section.small {
   font-size: 22px;
 }
 section.small table {
   font-size: 0.64em;
+}
+section.smaller {
+  font-size: 20px;
+}
+section.smaller table {
+  font-size: 0.60em;
+}
+section.smallest {
+  font-size: 18px;
+}
+section.smallest table {
+  font-size: 0.56em;
+}
+/* At the densest rung the inherited em-based heading gets noticeably smaller
+   than its neighbors', so pin it to roughly the `small` rung's rendered size
+   and let only the body shrink. */
+section.smallest h2 {
+  font-size: 33px;
 }
