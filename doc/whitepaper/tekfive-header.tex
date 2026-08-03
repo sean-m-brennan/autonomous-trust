@@ -1,0 +1,71 @@
+% ******************
+%  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+%
+%   Licensed under the Apache License, Version 2.0 (the "License");
+%   you may not use this file except in compliance with the License.
+%   You may obtain a copy of the License at
+%
+%     http://www.apache.org/licenses/LICENSE-2.0
+%
+%   Unless required by applicable law or agreed to in writing, software
+%   distributed under the License is distributed on an "AS IS" BASIS,
+%   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%   See the License for the specific language governing permissions and
+%   limitations under the License.
+% ******************
+%
+% Loads doc/tekfive/whitepaper/tekfive.sty for the markdown whitepapers, using
+% the same options as doc/tekfive/whitepaper/HighTrust_DOD.tex.
+%
+% This wrapper exists because pandoc has no way to load a package directly:
+% --include-in-header pastes a file's contents into the preamble verbatim, and
+% pasting tekfive.sty would inject its \NeedsTeXFormat / \ProvidesPackage and,
+% worse, its closing \endinput, which would truncate the document. So the .sty
+% stays a package on the TEXINPUTS path (build.sh sets it) and this file is
+% nothing but the \usepackage line the .tex papers already use, plus the few
+% adjustments pandoc output needs.
+
+\usepackage[sided=twoside]{tekfive}
+
+% Sans-serif body, as in HighTrust_DOD.tex.
+\usepackage[scaled]{helvet}
+\renewcommand*\familydefault{\sfdefault}
+
+% t5logo lives next to the real tekfive.sty, one directory up from the symlink.
+\graphicspath{{doc/tekfive/}{../tekfive/}{./}}
+
+% Better justification and fewer overfull lines.
+\usepackage{microtype}
+
+% Pandoc renders pipe tables as longtable; keep them flush with the text block
+% instead of centered inside it.
+\setlength{\LTleft}{0pt}
+\setlength{\LTright}{0pt}
+
+% Row separation for tables whose cells run to whole paragraphs. Pandoc's
+% LaTeX output carries booktabs rules at the top, under the header, and at the
+% bottom only, and neither pipe nor grid table syntax can ask for rules between
+% body rows. Alternating row tint separates them instead.
+%
+% \rowcolors comes from xcolor's `table' option. xcolor is already loaded by
+% pandoc's template, so re-loading it here would be an option clash; build.sh
+% passes `table' as a global class option instead, which reaches xcolor without
+% one. T5blue is defined by tekfive.sty.
+\definecolor{T5rowtint}{HTML}{EDF2F6}
+\rowcolors{2}{T5rowtint}{}
+
+% A little more height per row, so the tint bands read as bands.
+\renewcommand{\arraystretch}{1.15}
+
+% The .tex papers call \TekFiveTitle, which widens the title page's bottom
+% margin so the three-line address footer has room. Pandoc emits its own
+% \maketitle instead, so hook the same adjustment onto that. The branded header
+% and footer only appear on this page, because tekfive.sty defines them in the
+% `plain` page style and article uses `plain` for the title page.
+\usepackage{etoolbox}
+\newlength{\tfFirstPageBottom}
+\setlength{\tfFirstPageBottom}{%
+    \dimexpr \paperheight - \textheight + \topmargin - \footskip + 3\baselineskip}
+\pretocmd{\maketitle}{%
+    \newgeometry{left=2.5cm, top=2.5cm, right=3cm, bottom=\tfFirstPageBottom}}{}{}
+\apptocmd{\maketitle}{\afterpage{\globaldefs=1 \restoregeometry}}{}{}
