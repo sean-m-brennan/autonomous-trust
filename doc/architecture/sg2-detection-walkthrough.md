@@ -1,4 +1,4 @@
-# Stretch Goal 2 — Sparse Detection Events — Walkthrough
+# Stretch goal 2 walkthrough: sparse detection events
 
 A demo viewer's tour of the DoD mission `dod_mission` scenario after
 Stretch Goal 2 landed, focused on the MQ-800 deception story and
@@ -17,7 +17,7 @@ compound in Madison County, Alabama. Two friendly RQ-86 recon drones
 orbit overhead; four squad-launched microdrones sweep ahead; three
 leave-behind seismic/acoustic sensors are scattered along the
 approach route. At T+4:00, an MQ-800 armed drone arrives. It is
-compromised — its ISR pipeline reports detections under the honest
+compromised: its ISR pipeline reports detections under the honest
 `compound-alpha` label but with `compound-bravo`'s coordinates and
 imagery. The autonomous-trust network catches the lie inside the
 `compound-alpha` cross-source bucket, drops the MQ-800's reputation
@@ -45,17 +45,17 @@ $ python -m tools.detection_prep              # 17 thumbnails + JSON
 
 Outputs land under `examples/dod_mission/assets/`:
 
-* `video/naip_huntsville.jpg` — 4096×4096 px, 1 m/px, USDA-public
+* `video/naip_huntsville.jpg`: 4096×4096 px, 1 m/px, USDA-public
   domain aerial imagery of Huntsville, AL, centred on
   `(34.724448°N, -86.639802°W)` (the RQ-86 orbit centre + true target).
-* `detections/catalogue.json` — 17 entries: the 6 hand-authored
+* `detections/catalogue.json`: 17 entries: the 6 hand-authored
   scenario-overlay objects (`compound-alpha`, `compound-bravo` decoy
-  ~141 m NE, three sensor sites along the squad approach — two hacked,
-  one clean — and an `insertion-zone` at the squad's start point) plus
+  ~141 m NE, three sensor sites along the squad approach, two hacked,
+  one clean, and an `insertion-zone` at the squad's start point) plus
   11 YOLOv8-OBB detections. With `--no-real-detector` the count drops
   to the 6 overlay-only objects and the storyline still runs end-to-end.
-* `detections/crops/*.jpg` — 128×96 per-object thumbnails.
-* `detections/overlay.json` — the hand-authored input
+* `detections/crops/*.jpg`: 128×96 per-object thumbnails.
+* `detections/overlay.json`: the hand-authored input
   (committed; everything else is regenerated on first run).
 
 ![catalogue overlay on Huntsville panorama](_generated/sg2/catalogue_overlay.jpg)
@@ -64,7 +64,7 @@ The red ring is `compound-alpha` (the MQ-800's true target).
 The orange ring is `compound-bravo` (the decoy the compromised MQ-800
 reports instead). Magenta rings are hacked leave-behind sensors;
 cyan is the clean one. Lime at the bottom is the squad insertion
-zone. Yellow rectangles are YOLOv8-OBB finds — mostly suburbia-class
+zone. Yellow rectangles are YOLOv8-OBB finds: mostly suburbia-class
 false positives (the DOTA model wasn't tuned for Huntsville), kept in
 the catalogue because `DetectionSource` keys off `world_uid` and the
 six named scenario-overlay objects drive the trust story.
@@ -77,7 +77,7 @@ The dashboard is a Dash app on `:8050`. The right-hand column has
 **Reputations**, **Event Log**, and the new **Peer Detail** drawer
 driven by a peer-name dropdown.
 
-### T+0:00 — Setup
+### T+0:00: setup
 
 Squad + microdrones + RQ-86s + command form the network through
 pre-established identity chains. The drawer for any drone shows
@@ -88,17 +88,17 @@ the `insertion-zone` marker; RQ-86s see everything in the 4 km AO.
 The Reputations column shows all peers at ~0.5 (bootstrapping); the
 Event Log shows handshakes and bootstrap-complete events.
 
-### T+1:00–T+3:00 — Approach, Contact, Intel
+### T+1:00-T+3:00: approach, contact, intel
 
 Squad advances. Phase 2 fires Sybil-style identity rejections on the
 two hacked sensors (`sensor-1`, `sensor-2`); the Event Log records
-`PEER_EXCLUDE`. Phase 3 starts the multi-source fusion stream — both
+`PEER_EXCLUDE`. Phase 3 starts the multi-source fusion stream: both
 RQ-86s now emit `Reading(data_type="target_position_x"/"_y",
 metadata={"world_uid": "compound-alpha"})` every ~5 s. The
 cross-source validator (50 m threshold, 2-source minimum) sees them
 converge.
 
-### T+4:00 — Rogue (the headline)
+### T+4:00: rogue (the headline)
 
 MQ-800 ingresses from the east. At T+4:15
 (`COMPROMISE_START`) the compromise wrapper activates:
@@ -115,15 +115,15 @@ class CompromisedDetectionSource(DetectionSource):
 What the operator sees:
 
 1. **Peer Detail drawer**, MQ-800 selected:
-   * Crop shows `compound-bravo` — a *different* building.
+   * Crop shows `compound-bravo`, a *different* building.
    * Dashed red bbox over the bravo crop.
    * Label reads `target-building`, `uid compound-alpha`.
    * The header status badge flips to `COMPROMISED` once the
      reputation drops past 0.4.
 2. **Peer Detail drawer**, RQ-86-1 selected:
-   * Crop shows `compound-alpha` — the *correct* building.
+   * Crop shows `compound-alpha`, the *correct* building.
    * Same label `target-building`, `uid compound-alpha`.
-3. The two crops are visibly different — the storyline is now
+3. The two crops are visibly different: the storyline is now
    visible without reading any timeline charts.
 
 The HTML A/B (open in a browser) shows the two drawers side-by-side
@@ -131,7 +131,7 @@ with the live drawer markup:
 
 * [`drawer_ab.html`](_generated/sg2/drawer_ab.html)
 
-### T+4:30 — Compromise detect
+### T+4:30: compromise detect
 
 The cross-source validator (`POSITION_VALIDATOR_X` /
 `POSITION_VALIDATOR_Y` in `examples/dod_mission/tasks/validation.py`)
@@ -145,14 +145,14 @@ exceeds the 50 m threshold and `submit()` returns
 COMPROMISE_DETECT  mq800  target_position_x  deviation 97.5 > 50.0
 ```
 
-### T+4:45 — Peer exclude
+### T+4:45: peer exclude
 
 MQ-800's reputation collapses; the Negotiation rank-gate downstream
 of CTFT excludes it from the cohort. The drawer header shows
 `EXCLUDED`. The agency map's MQ-800 marker dims, but its
 detection-target marker stays visible to preserve the post-mortem.
 
-### T+5:00 — ECM, T+6:00 — Strike, T+7:00 — Exfil
+### T+5:00 ECM, T+6:00 strike, T+7:00 exfil
 
 RQ-86s engage ECM. Fighter jet ingresses at T+6:00, completes rapid
 trust-validation, fires on the *honest* `compound-alpha`
@@ -181,7 +181,7 @@ image alongside the HTML.)
 
 ---
 
-## 5. Under the hood — what changed and where
+## 5. Under the hood: what changed and where
 
 | What | Where | Lines |
 |---|---|---|

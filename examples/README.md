@@ -8,10 +8,10 @@ demonstrating a different deployment shape.
 | `mission/` | DoD ISR / strike-team coordination; TCP-simulator-driven physics | `autonomous_trust.simulator` ⟶ `SimulationInterface` |
 | `multi_agency/` | Civilian disaster-response (NOAA / USGS / FEMA / EPA) | in-process `PlaybackEngine` + live AT bridge ⟶ `PlaybackInterface` |
 | `appalachia/`, `asteroid_belt/` | Compose-only sample topologies | scenario YAML |
-| `monitor/`, `requestor/` | Single-node smoke utilities | — |
+| `monitor/`, `requestor/` | Single-node smoke utilities | n/a |
 | `zta/` | Zero-trust enrollment + OCSP demo | docker-compose only |
-| `demo/` | Misc one-off demos | — |
-| `run_example.py`, `validate_configs.py` | Runners shared by the python examples | — |
+| `demo/` | Misc one-off demos | n/a |
+| `run_example.py`, `validate_configs.py` | Runners shared by the python examples | n/a |
 
 The remainder of this document covers **adding a new scenario** that
 shares the dashboard infrastructure used by `mission/` and
@@ -55,7 +55,7 @@ for fields that don't fit the common shape.
 
 ---
 
-## Pattern 1 — In-process scenario (like `multi_agency/`)
+## Pattern 1: in-process scenario (like `multi_agency/`)
 
 Use this when the scenario logic runs **inside** the inspector
 process: scripted timeline, optional canned playback, optional live
@@ -113,7 +113,7 @@ exposes three event streams beyond the ABC's `register_update_handler`:
 | `on_engine_event(h)` | direct passthrough to the engine's listener (e.g. `KeyStatTracker`) |
 
 `MultiAgencyDemo` (`examples/multi_agency/demo.py`) is the reference
-consumer — it owns the layout, the Dash callbacks, and all UI-derived
+consumer: it owns the layout, the Dash callbacks, and all UI-derived
 state (timeline samples, sensor history, streams panel), and registers
 handlers on the interface for everything else.
 
@@ -137,12 +137,12 @@ copy that pattern with your own capability names.
 
 ---
 
-## Pattern 2 — TCP-simulator-driven scenario (like `mission/`)
+## Pattern 2: TCP-simulator-driven scenario (like `mission/`)
 
 Use this when scenario state is computed by an external simulator
 process (`autonomous_trust.simulator`) and pushed to the dashboard
-over a socket. The dashboard side uses `SimulationInterface` directly
-— no new code required.
+over a socket. The dashboard side uses `SimulationInterface` directly:
+no new code required.
 
 ### 1. Define a simulator scenario YAML
 
@@ -151,7 +151,7 @@ antennas, and data streams. See
 `examples/mission/simulator/scenario.yaml` for a worked example. The
 multi-agency demo also has a generator
 (`examples/multi_agency/simulator/generate_scenario.py`) that
-translates a Python `Scenario` definition into the YAML format —
+translates a Python `Scenario` definition into the YAML format:
 useful if you want one source of truth for both patterns.
 
 ### 2. Run the simulator
@@ -188,16 +188,16 @@ services. For an analogous flow against in-process scenarios, see
 
 ---
 
-## Pattern 3 — Custom source
+## Pattern 3: custom source
 
 If neither pattern fits (e.g. WebSocket replay, gRPC stream, file
 tailer), implement `ScenarioInterface` directly. Required:
 
-- `start()`, `stop()` — lifecycle
-- `tick() -> ScenarioState` — fire `_fire_update(state)` and return the snapshot
-- `reset()` — fire `_fire_reset()` after rewinding internal state
-- `toggle()` — flip play/pause
-- `paused`, `current_time` — state accessors
+- `start()`, `stop()`: lifecycle
+- `tick() -> ScenarioState`: fire `_fire_update(state)` and return the snapshot
+- `reset()`: fire `_fire_reset()` after rewinding internal state
+- `toggle()`: flip play/pause
+- `paused`, `current_time`, state accessors
 
 Call `super().__init__()` so the ABC's handler lists are initialized.
 Once your subclass is in place, any Dash app written against
@@ -207,10 +207,10 @@ Once your subclass is in place, any Dash app written against
 
 ## See also
 
-- `src/autonomous-trust-evaluation/autonomous_trust/evaluation/scenarios/scenario_iface.py` — the ABC and `ScenarioState`
-- `src/autonomous-trust-evaluation/autonomous_trust/evaluation/scenarios/playback_iface.py` — in-process implementation
-- `src/autonomous-trust-evaluation/autonomous_trust/evaluation/dash_components/sim_iface.py` — TCP-simulator implementation
-- `src/autonomous-trust-inspector/autonomous_trust/inspector/bridge.py` — generic AT-mesh bridge (`InspectorBridge`)
-- `examples/multi_agency/{demo,bridge,__main__}.py` — full reference of an in-process demo
-- `examples/multi_agency/README.md` — multi-agency demo walkthrough
-- `examples/mission/conops.md` — the mission scenario's concept of operations
+- `src/autonomous-trust-evaluation/autonomous_trust/evaluation/scenarios/scenario_iface.py` (the ABC and `ScenarioState`
+- `src/autonomous-trust-evaluation/autonomous_trust/evaluation/scenarios/playback_iface.py`) in-process implementation
+- `src/autonomous-trust-evaluation/autonomous_trust/evaluation/dash_components/sim_iface.py`: TCP-simulator implementation
+- `src/autonomous-trust-inspector/autonomous_trust/inspector/bridge.py`: generic AT-mesh bridge (`InspectorBridge`)
+- `examples/multi_agency/{demo,bridge,__main__}.py`: full reference of an in-process demo
+- `examples/multi_agency/README.md`: multi-agency demo walkthrough
+- `examples/mission/conops.md`: the mission scenario's concept of operations

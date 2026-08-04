@@ -1,8 +1,8 @@
 # System Overview
 
-AutonomousTrust is a high-trust cooperative computing framework -- a data messaging system where encrypted data is shared only with trusted peers based on fine-grained, dynamically-evaluated trust scores. It implements dynamic composability of microservices with security at its core.
+AutonomousTrust is a high-trust cooperative computing framework: a data messaging system where encrypted data is shared only with trusted peers based on fine-grained, dynamically-evaluated trust scores. It implements dynamic composability of microservices, with security built in rather than bolted on.
 
-## Design Principles
+## Design principles
 
 - **Zero-trust foundation**: Every peer starts untrusted. Trust is earned through consensus-based identity verification and maintained through reputation scoring.
 - **Consensus-based admission**: New peers are admitted only after existing group members vote to accept them via a configurable agreement protocol (Proof of Work, Proof of Stake, or Proof of Authority).
@@ -21,7 +21,7 @@ AutonomousTrust uses NaCl/libsodium for all cryptographic operations:
 
 **Key principle**: Private keys are never transmitted on the wire. Identity announcements contain only the public signing key and public encryption key. Peer-to-peer encryption uses NaCl Box, which combines the sender's private key with the recipient's public key.
 
-## Package Structure
+## Package structure
 
 The system is organized as four Python namespace packages under `autonomous_trust`:
 

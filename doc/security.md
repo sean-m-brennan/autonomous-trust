@@ -4,7 +4,7 @@
 
 AutonomousTrust assumes a hostile environment with no reachable central authority to vouch for anyone (see the [adversarial assumption](concept.md#adversarial-assumption)). This document states the security properties AT aims to provide, how it contains a malicious or compromised peer, and the risks it raises the cost of without eliminating. For implementation-level hardening (memory safety, deserialization, allowlists, message verification), see [Security Hardening](architecture/security-hardening.md).
 
-## Security Properties
+## Security properties
 
 Identity is cryptographic, and there are no logins. The mesh has no user accounts or shared passwords. Every peer is a non-person entity identified by a keypair (Ed25519 for signatures, X25519 for key agreement) and a UUID. A peer proves who it is by signing, not by presenting a secret, and private keys never leave the node (see [Identity and configuration bootstrap](api.md#identity-and-configuration-bootstrap)). A human operator authenticates once at a console and is thereafter represented on the mesh by a machine identity like any other peer (see [Operator Access](architecture/operator-access.md)).
 
@@ -16,7 +16,7 @@ Access is least-privilege and scoped to a task. A peer reaches only what the wor
 
 Decisions are deterministic and auditable. A trust decision follows from signed evidence and yields the same result for every peer that checks it. The ZTA overlay writes a JSONL audit trail of every credential verification, deferral, and resolution for later review (see [ZTA Integration](architecture/zta-integration.md)).
 
-## Malicious Code Containment
+## Malicious code containment
 
 AT treats any peer as potentially compromised at any moment, including one that holds valid credentials. Containment limits what such a peer can do.
 
@@ -28,7 +28,7 @@ A peer cannot control anything outside itself. There is no central controller to
 
 Code and configuration cannot be silently changed. The embedded C core is built as a signed binary and verified before it loads. At runtime, configuration is parsed against a closed allowlist of registered types, so a crafted payload cannot instantiate an arbitrary class and gain code execution. Network data is deserialized with msgpack rather than pickle, and peer-supplied class names resolve only against a closed allowlist. See [Security Hardening](architecture/security-hardening.md) for the full set of these measures.
 
-## Known Vulnerabilities
+## Known vulnerabilities
 
 AT raises the cost of the following attack classes. It does not claim to eliminate them, and the honest framing is residual risk, not immunity.
 

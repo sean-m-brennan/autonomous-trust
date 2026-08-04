@@ -25,13 +25,13 @@ the daemon's queue. This is the gap the carrier itself fills.
 **2. Two of the three app-bound routing arms had no reachable producer.** The
 daemon forwarded `TRANSACTION_SCORE` outward, but every producer sent that
 message to the *reputation* process instead. `TASK_RESULT` was worse: the
-negotiation process sent it to `"main"` — a queue name `messaging_init` is
+negotiation process sent it to `"main"`, a queue name `messaging_init` is
 never called with anywhere in the tree, so those datagrams addressed a socket
 path that does not exist. Only the fleet process's `UPDATE_ACCEPTED` was
 actually addressed to the daemon.
 
 **3. The drain built a batch and threw it away.** The loop appended each
-app-bound message to a local `extern_msgs` array, then never sent or freed it —
+app-bound message to a local `extern_msgs` array, then never sent or freed it:
 sending, instead, the *last message the loop happened to receive*. With at most
 one message in flight per iteration that coincided with correct behaviour,
 which is why it survived: the bug was invisible exactly as long as the traffic
@@ -40,11 +40,11 @@ was too sparse to expose it. Two messages in one iteration meant one delivery.
 **4. Nothing was listening.** The daemon sends to the `q_out` name it was
 launched with; `at_node_start` bound `config.app_name`. The shipped example set
 those to different strings, so the daemon's datagrams went to an unbound path.
-Nothing errored on the app side — there was simply never anything to receive.
+Nothing errored on the app side: there was simply never anything to receive.
 
 **5. The drain switched on the payload, not the type.** The loop queued its
-message with `object_ptr_data(&result_msg.info, ...)` — a pointer to the
-*union* — and the drain read each entry back as a whole `generic_msg_t` and
+message with `object_ptr_data(&result_msg.info, ...)` (a pointer to the
+*union*) and the drain read each entry back as a whole `generic_msg_t` and
 switched on `->type`. `info` sits at offset 16, so `->type` read the first
 eight bytes of the payload. For an `UPDATE_ACCEPTED` that is the front half of
 a UUID: measured at `-6366218896703053408` where `12` was meant. The one arm
@@ -58,15 +58,15 @@ Together: the app-facing stream carried nothing at all.
 **Two messages, joined by the consumer.** `PEER_OBSERVED` comes from the
 identity process (uuid, signing key, rank, both operator signals);
 `PEER_REPUTATION` comes from the reputation process (score, rated). The split
-follows process ownership, not consumer convenience. The alternative — one
-assembled message — needs the score pushed into the identity process, which
+follows process ownership, not consumer convenience. The alternative (one
+assembled message) needs the score pushed into the identity process, which
 means a cached second copy of the score store living where nothing reads it,
 and a rank pushed into every process that the comments say only identity reads.
 Joining two facts on a uuid is the consumer's job and costs it a small table.
 
 **Emitted to the daemon queue, not to the app.** A sub-process does not know
 the app's queue name. It sends to `AT_MAIN_QUEUE` and the main loop owns the
-outward hop — the route `UPDATE_ACCEPTED` already took.
+outward hop: the route `UPDATE_ACCEPTED` already took.
 
 **`rated` is a separate field, not a sentinel.** AT scores are anchored by
 fixed constants rather than normalized across the population, so the number
@@ -76,7 +76,7 @@ information". The flag carries it, and the score is zeroed when unrated so a
 consumer that ignores the flag cannot read a plausible number by accident.
 
 **`rated=false` can only cross on a pull.** Every change-driven emission is by
-construction rated — the process just committed a score. The roster pull walks
+construction rated: the process just committed a score. The roster pull walks
 the peer table instead, so it is the only path that reports a peer AT has never
 scored. That makes the pull load-bearing for the distinction, not merely a
 convenience.
@@ -88,7 +88,7 @@ asks, and an idle network carries no traffic to answer a question nobody asked.
 
 **One inbound verb, allowlisted, at a fixed pair of processes.** The pull is a
 `NET_MESSAGE` function string, following the established local-only-verb
-pattern (`tier_update`, `attest_trigger`, `local_rep_query`) — typed messages
+pattern (`tier_update`, `attest_trigger`, `local_rep_query`): typed messages
 dispatch through one shared switch that cannot reach process-specific code.
 The daemon accepts exactly this one function from an app and forwards it only
 to identity and reputation. Forwarding a `net_msg` to whatever process it names
@@ -112,7 +112,7 @@ hand-written mirror would corrupt silently the first time any of those changed.
 |---|---|---|---|
 | `PEER_OBSERVED` | AT → app | identity | uuid, ed25519 signing key, rank, `operator_bound`, `operator_attested_at`, `operator_pubkey` (opt-in) |
 | `PEER_REPUTATION` | AT → app | reputation | uuid, score, `rated` |
-| `app_roster_request` | app → AT | — | none (a `NET_MESSAGE` function) |
+| `app_roster_request` | app → AT | n/a | none (a `NET_MESSAGE` function) |
 
 Both carrier types are **local IPC only**, the same standing as
 `PEER_RTT_UPDATE`: they are not part of `identity.proto` or
@@ -128,7 +128,7 @@ and needs no cross-language conformance scenario. (A judgment call, on the
  app ──app_roster_request──▶ q_in ──▶ {identity, reputation} ──▶ re-emit everything held
 ```
 
-Emission points: a peer is added (provisional or confirmed — two-phase
+Emission points: a peer is added (provisional or confirmed, two-phase
 admission gates the group key, not visibility); its rank is recorded; an
 operator attestation is verified; a score is committed (compute, slash, or
 rehabilitation); or the app pulls.
@@ -137,13 +137,13 @@ rehabilitation); or the app pulls.
 
 **The live feed is upsert-only.** Nothing anywhere removes an entry from
 `protocol.peers[]`, so there is no departure event to emit and none is defined.
-A consumer grades absence by staleness against its own clock — which is what
+A consumer grades absence by staleness against its own clock, which is what
 ethne's cohesion machinery already does. Reputation's communication cut-off is
 a network exclusion, not a roster departure, and is not reported as one.
 
 **The view is this node's admitted peers, not the gateway subtree.** The
 subtree roster (`identity_aggregate_subtree_roster`) carries uuid, nickname and
-address — no signing keys — so it cannot feed a key-identified peer. An
+address (no signing keys) so it cannot feed a key-identified peer. An
 opaque-boundary signal is likewise not emitted: it would only be meaningful
 alongside a subtree view this carrier does not provide.
 
@@ -153,7 +153,7 @@ alongside a subtree view this carrier does not provide.
 carries *which* human, the credential being a PIV/CAC X.509 with no ed25519 key
 to become a `did:key`. That slice was built. `at_app_peer_t.operator_pubkey`
 now carries the guardian's ed25519 key for a peer that advertised one and whose
-PIV binding **this node verified** — never a peer's own claim, and zeroed
+PIV binding **this node verified**: never a peer's own claim, and zeroed
 whenever `operator_bound` is false, exactly as the attendance stamp is. ethne's
 chartered node→guardian edge has a live source: an opted-in peer reaches a
 `MemberCandidate.guardian` off this carrier.
@@ -166,14 +166,14 @@ must read all-zero as "unguarded machine", never as an error or a missing
 producer. See `operator-attended.md`.
 
 **No dead fields.** None of the limits above is represented by a field or
-message type that nothing sets — which is why the guardian key was added only
+message type that nothing sets, which is why the guardian key was added only
 once something produced it, and why the limit it leaves behind (most peers
 carry no guardian) is a *fact about deployments*, not an unwired field. A carrier field with no producer is
 indistinguishable, to a consumer, from one whose producer is broken.
 
 ## Verification
 
-`src/c/test/app_events_test.c` — 20 cases, 134 checks, driven through the
+`src/c/test/app_events_test.c`: 20 cases, 134 checks, driven through the
 messaging test hook, plus two that use real unix sockets because a hook cannot
 see a queue-name mismatch (break #4's failure mode), and three that enter
 through an admission path (see "Two further breaks" below).
@@ -183,7 +183,7 @@ was reintroduced:
 
 | Break | Regression test | Reintroduced ⇒ |
 |---|---|---|
-| #3 batch discarded | `drain_sends_every_app_bound_message` | 21 failures; `accept_count 22 != 11` — only the last message left |
+| #3 batch discarded | `drain_sends_every_app_bound_message` | 21 failures; `accept_count 22 != 11`, only the last message left |
 | #5 payload-as-tag | `drain_routes_on_the_type_tag_not_the_payload` | 21 failures; the message routed to `reputation` |
 | #4 wrong queue name | `app_bound_to_the_wrong_name_receives_nothing` | paired with the real-socket delivery test, so neither passes vacuously |
 
@@ -197,8 +197,8 @@ baseline.
 
 **~~Not verifiable in-sandbox:~~ verifiable in-sandbox since 2026-08-04.** This
 said a live-daemon end-to-end run was impossible here, because the daemon aborted
-with `*** stack smashing detected ***` during startup — including on the
-unmodified `at_demo -g` path — and ISSUES.md §2.1.1 recorded that the abort did
+with `*** stack smashing detected ***` during startup (including on the
+unmodified `at_demo -g` path) and ISSUES.md §2.1.1 recorded that the abort did
 not reproduce on a host machine.
 
 **That was a real overflow, not an environment quirk.** §2.1.1 is now RESOLVED:
@@ -211,11 +211,11 @@ as at the mechanism level.
 
 **Worth keeping as a lesson about attribution:** an environment that reproduces a
 crash the developer's machine does not is evidence about the *input*, not proof
-about the environment. The band worth remembering is 91–98 bytes of root path,
+about the environment. The band worth remembering is 91-98 bytes of root path,
 where the same defect silently bound a **different socket name** and reported
 success.
 
-**Verified on a host, 2026-07-30:** the end-to-end run this blocked is done — a
+**Verified on a host, 2026-07-30:** the end-to-end run this blocked is done, a
 3-node cohort, all seven breaks confirmed fixed against a live daemon. See "What
 the cohort then measured" below.
 
@@ -225,7 +225,7 @@ the cohort then measured" below.
 (`src/c/example.c`): the first-tick roster pull, and a log line per
 `PEER_OBSERVED` / `PEER_REPUTATION`. It reports through the logger rather than
 stdout so the lines land in the same stream as the admission and reputation logs
-they are meant to be read against, and `Dockerfile-c` installs `at_demo` alone —
+they are meant to be read against, and `Dockerfile-c` installs `at_demo` alone,
 so a container cohort reports the carrier with no image or entrypoint change:
 
 ```bash
@@ -238,22 +238,22 @@ container or a machine per node. This is why the demos are containerized.
 
 **An empty roster emits nothing, which is indistinguishable from break #4
 returning.** Read a `peer observed` line only against the admission it should
-correspond to — a uuid the node logged admitting. Silence on its own is not a
+correspond to: a uuid the node logged admitting. Silence on its own is not a
 result either way. `unrated` is the other load-bearing observation: it can only
 cross on the pull, since every change-driven emission is rated by construction,
 so a run that never shows one has not exercised that path.
 
 ## Test support for a foreign consumer (2026-07-30)
 
-`app_events_test_support.{h,c}` — `at_app_test_emit_peer` and
-`at_app_test_emit_reputation` — put the **daemon's** side of this wire in the same
+`app_events_test_support.{h,c}` (`at_app_test_emit_peer` and
+`at_app_test_emit_reputation`) put the **daemon's** side of this wire in the same
 flat form as the consumer's side, so a binding in another language can test its
 decoder end to end. Nothing in AT calls them; they have the same standing as
 `messaging_set_test_hook`.
 
 The gap they close is specific. A foreign consumer can *receive* through the flat
 ABI without knowing AT's internals, but cannot *send* one event without
-constructing a `generic_msg_t` — the union nobody should mirror. So `ethne`'s
+constructing a `generic_msg_t`: the union nobody should mirror. So `ethne`'s
 decoder was complete, linked, and tested with **no event ever having crossed the
 boundary**. Now five of its tests drive the whole path.
 
@@ -263,7 +263,7 @@ Two properties to preserve if these are ever edited:
   `messaging_assign`, so a consumer that bound `"q"` can emit *to* `"q"` and loop a
   synthetic event back to itself over the real socket. With nothing assigned they
   return -1 rather than appearing to send.
-- **They sanitize nothing** — in particular neither an attendance stamp nor a
+- **They sanitize nothing**: in particular neither an attendance stamp nor a
   guardian key is zeroed when `operator_bound` is false, though
   `identity_emit_peer_observed` does zero both. A
   helper that copied the emitter's gating could not be used to test a consumer's
@@ -278,11 +278,11 @@ ethne's first parallel run of them failed after two had passed by luck.
 ## Two further breaks, found by the first live cohort (2026-07-30)
 
 The first 3-node run reported no observations, no roster-verb line, and no
-`unrated` — while logging a sybil-collision refusal, which fires from *inside*
+`unrated`, while logging a sybil-collision refusal, which fires from *inside*
 the loop over `protocol.peers[]` and therefore proves the table was not empty.
 Peers existed and the app was told nothing.
 
-**#6 — the pull raced the daemon and lost, every time.** `at_node_run` does
+**#6: the pull raced the daemon and lost, every time.** `at_node_run` does
 `iteration++` before the tick, so `at_node_iteration(node) == 1` is the first
 tick, and `at_node_start` forks the daemon and returns with **no readiness
 handshake**. The identity and reputation processes have not bound their queues
@@ -293,19 +293,19 @@ The honest scope: this race belongs to *every* app-to-AT verb, not just the
 roster pull, and the retry is a workaround at the app. A daemon-readiness signal
 is the real fix and is not built.
 
-**#7 — three of the four paths that admit a peer emitted nothing.** Only
-`_add_peer` did. `handle_acceptance` — the path by which a *joining* node records
+**#7: three of the four paths that admit a peer emitted nothing.** Only
+`_add_peer` did. `handle_acceptance` (the path by which a *joining* node records
 the peer that accepted it, and so the first peer a fresh cohort can report at
-all — `_populate_peers_from_history`, and `handle_identity_response` all appended
+all) `_populate_peers_from_history`, and `handle_identity_response` all appended
 to `peers[]` silently. All three now emit, outside the peers lock.
 
 **Why the existing suite stayed green through both.** Every case entered through
 an emitter or through the routing; none entered where a peer actually arrives.
 The three new admission tests do, and with the emissions removed again they fail
-6 assertions while every `num_peers == 1` check still passes — the shape of the
+6 assertions while every `num_peers == 1` check still passes: the shape of the
 bug itself.
 
-## What the cohort then measured — the pull answers "now"
+## What the cohort then measured: the pull answers "now"
 
 Both fixes were confirmed on the next run. The uuid-exact check passed: the
 observation and the sybil-collision refusal name the same peer, 7 ms apart, the
@@ -318,12 +318,12 @@ But the two pull confirmations read **zero**, and the timeline says why:
 | 15:45:47.263 | `Identity: peer roster request -> 0 observation(s)` |
 | 15:45:47.664 | `Reputation: peer roster request -> 0 reputation(s)` |
 | 15:46:10.528 | `peer observed: 5b4f3fbd-… rank=0 key=f29f..8d operator=none attended_at=0` |
-| 15:46:10.535 | `Identity: refusing vote — candidate 5b4f3fbd-… collides … (sybil)` |
+| 15:46:10.535 | `Identity: refusing vote, candidate 5b4f3fbd-… collides … (sybil)` |
 
 The pull landed on both halves **23 seconds before the first peer existed**, and
 `0` was the correct answer. Retrying until `messaging_send` succeeds fires the
 request at the earliest instant the queues allow, which on a cold node is the
-least useful one — and nothing pulled again, so the `unrated` reputation, which
+least useful one, and nothing pulled again, so the `unrated` reputation, which
 crosses on the pull *alone*, could never appear.
 
 So a pull reports what AT knows **at that moment**; it is not a request for
@@ -336,12 +336,12 @@ harmless by construction, the feed being upsert-only.
 observation(s)`, `Reputation: … -> 2 reputation(s)`, and the `unrated` lines with
 them. So on a 3-node cohort each node reports both peers, and a peer with no score
 is reported *as* unrated rather than as a placeholder number. That is the whole
-carrier verified end to end against a live daemon — and the first live observation
+carrier verified end to end against a live daemon, and the first live observation
 of the signal ethne's `MemberCandidate` depends on (D18: `reputation: None` must
 mean unrated, not rated-low).
 
 Two honest notes. The refresh lives in the demo and the reference, not the
-library — the cadence is the host's, so there is no library-side test for it, and
+library: the cadence is the host's, so there is no library-side test for it, and
 the `unrated` path is pinned by
 `reputation_pull_reports_unrated_peers_as_unrated` rather than by a live check.
 And a pull can also return nothing because `reputation_emit_all` returns early
@@ -350,15 +350,15 @@ second route.
 
 ## Owning the daemon from another language (2026-07-30)
 
-`app_node.{h,c}` — `at_app_node_start` / `at_app_node_alive` / `at_app_node_pid` /
-`at_app_node_stop` — completes the ladder the sections above started. A foreign
+`app_node.{h,c}` (`at_app_node_start` / `at_app_node_alive` / `at_app_node_pid` /
+`at_app_node_stop`) completes the ladder the sections above started. A foreign
 consumer could *receive* AT's events through the flat ABI and still had no way to
 *start* AT, so the whole surface only worked for a host that already had a daemon.
 
 `node.h` is the lifecycle for a **C** embedder and cannot be bound from another
 language: `at_node_init` and `at_node_start` take an `at_node_t *` the caller
 allocates, and `at_node_t` embeds `logger_t` and `queue_t` **by value**, so a
-foreign mirror of it reproduces two opaque C layouts — the silent-corruption
+foreign mirror of it reproduces two opaque C layouts, the silent-corruption
 hazard the flat ABI exists to prevent, exactly as break #5 was. `run_autonomous_trust`
 looks flat enough to call directly and is not a safe shortcut: its declared
 contract ("blocks until the daemon exits", returning 0/non-zero) disagrees with
@@ -369,19 +369,19 @@ header declares `capabilities` as `void *` where the definition takes
 The ordering has one sharp edge, and it is the same one `at_app_events_open_existing`
 was written for. `at_app_node_start` binds `q_in` and makes it the process's
 assigned queue, so a consumer reads with `at_app_events_open_existing`, **not**
-`at_app_events_open` — two binders of one name fight over the socket path and the
+`at_app_events_open`: two binders of one name fight over the socket path and the
 second unlinks the first's. On the way down the reader closes first, because it
 borrows the node's queue.
 
 No `capabilities` parameter: `run_autonomous_trust` opens by discarding
 `capabilities`/`cap_len`. Propagating a knob that does nothing is worse than
-omitting it. There is likewise no `max_iterations` — a foreign host owns its own
+omitting it. There is likewise no `max_iterations`: a foreign host owns its own
 loop and never calls `at_node_run`.
 
 ### Three defects this turned up, all of them silent
 
 **1. The wrapper discarded every argument it was given.** It passed
-`&node->config` to `at_node_init`, which opens by `memset`ting the node — so the
+`&node->config` to `at_node_init`, which opens by `memset`ting the node, so the
 config was zeroed before it was read, and each field fell back to a default with
 `init` still returning 0. Measured against the built library:
 
@@ -397,18 +397,18 @@ config was zeroed before it was read, and each field fell back to a default with
 Worst of those is `generate_config`: the knob a consumer points at a root with no
 config did nothing at all. And the wrapper validated `log_level` and then handed
 the daemon a zero. `at_node_init` now copies the config *before* the memset and
-reads only the copy — a caller may legitimately alias it — which also fixes the
+reads only the copy (a caller may legitimately alias it) which also fixes the
 logger, whose level and file were read through the same stale pointer.
 
 **2. A lifetime obligation nobody was told about.** `at_node_config_t` stores the
-caller's `const char *`s, and `at_node_shutdown` reads `app_name` — so the strings
+caller's `const char *`s, and `at_node_shutdown` reads `app_name`, so the strings
 had to outlive the node. Across a language boundary (a Rust `CString` temporary)
 that is a dangling read with nothing to warn you. The handle now owns copies of all
 four strings, and the header says the caller may free its own immediately.
 
 **3. A failed inbound bind was a warning.** `at_node_start` logged
 `messaging_init`'s failure and returned 0, so a host held a live daemon it could
-never receive from — break #4's shape, and indistinguishable from a quiet network.
+never receive from: break #4's shape, and indistinguishable from a quiet network.
 It is now fatal: the bind moved into `at_node_bind_inbound` (`node_priv.h`) so the
 failure is reachable from a test, `at_node_start` reaps the daemon it just forked
 rather than orphan it, and a non-NULL handle therefore means *the event stream is
@@ -420,7 +420,7 @@ Rejection rather than repair, in both `app_node.h` and `app_events.h`: an empty 
 missing name; one name used for both directions (the daemon would receive its own
 output); a log level off the `log_level_t` scale (0 or 99 is a misunderstanding,
 and silently picking a level hides it); and **a queue name longer than the 63 bytes
-`messaging_init` keeps**. That last one is break #4 by another route — a silently
+`messaging_init` keeps**. That last one is break #4 by another route: a silently
 shortened name is a different name, so the app binds one string and the daemon
 sends to another. `at_app_events_open` and `at_app_events_request_roster` had the
 same hole and now share the check.
@@ -440,18 +440,18 @@ reintroduced. Seven controls, each rebuilt and run:
 
 | Control | Caught by |
 |---|---|
-| alias fix reverted | 5 failures — `app_name "at_node" != "ethne"`, and the logger's level `0 != 3` |
-| strings borrowed, not copied | 3 failures — `cfg.app_name` reads `"xxxxx"` |
+| alias fix reverted | 5 failures, `app_name "at_node" != "ethne"`, and the logger's level `0 != 3` |
+| strings borrowed, not copied | 3 failures, `cfg.app_name` reads `"xxxxx"` |
 | bind failure non-fatal again | `at_node_bind_inbound` returned 0 |
-| over-long names truncated | 5 failures — **and `at_app_node_start` forked a real daemon**, which is what the guard prevents |
+| over-long names truncated | 5 failures, **and `at_app_node_start` forked a real daemon**, which is what the guard prevents |
 | `app_name` bound instead of `q_in` | 5 failures, incl. the bound key being `"bind_probe"` |
-| log-level range check dropped | 3 failures — and a daemon forked on a level of `0` |
+| log-level range check dropped | 3 failures, and a daemon forked on a level of `0` |
 | failed socket left open | the open-descriptor count, `5 != 4` |
 
 Baseline and post-restore runs both green, so none of those passes vacuously.
 
 Two notes on that table. The `generate_config` test is **not** a control for the
-aliasing defect (it builds its own config, so it survives with the bug present) —
+aliasing defect (it builds its own config, so it survives with the bug present):
 it pins that the knob still reaches the generator, which is a different regression.
 And the truncation control is the one that explains why these controls run to a
 file rather than a pipe: the daemon it forks cannot live in this sandbox, and its
@@ -460,7 +460,7 @@ orphaned children hold an inherited stdout open long after the test has exited.
 ### Honest limits
 
 **No readiness handshake, still.** `at_app_node_start` returns as soon as the
-daemon is forked, so the first verb a consumer sends may find no recipient — the
+daemon is forked, so the first verb a consumer sends may find no recipient: the
 race behind D1 above. The retry-and-refresh pattern is documented on
 `at_app_events_request_roster` and implemented in `at_demo`/`example.c`, but the
 correct fix remains a daemon-readiness signal in `node.c` plus daemon startup,
@@ -473,6 +473,6 @@ the bind that used to fail silently. A live `start` → `poll` → `stop` throug
 flat ABI is a cohort-run check, not an in-sandbox one.
 
 **The headers are now installed.** `app_events.h`, `app_events_test_support.h`,
-`app_node.h` and `node.h` were reachable only through the source tree — an
+`app_node.h` and `node.h` were reachable only through the source tree: an
 installed `libautonomous_trust` shipped none of the app-facing surface. They are in
 `libhdr` now.

@@ -4,7 +4,7 @@
 
 The reputation subsystem uses a leaderless Byzantine Multi-Paxos protocol to reach consensus on transaction scores across all peers. It builds on the assumption that the Identity protocol has already succeeded (permissioned consensus).
 
-## Protocol Messages
+## Protocol messages
 
 | Message | Constant | Direction | Purpose |
 |---------|----------|-----------|---------|
@@ -30,9 +30,9 @@ Each Paxos round uses a unique proposal ID composed of:
 
 These are combined into a float index: `id1 + (id2 / 10^len(str(id2)))` for tracking.
 
-## Paxos Consensus Flow
+## Paxos consensus flow
 
-The diagram below is generated from `conformance/scenarios/reputation/reputation-canonical.yaml` by `scripts/build-docs.sh` — it cannot drift from the executable corpus. The canonical pins the Phase 1 happy path; the rest of the protocol (Phase 2, nack/backdate/sync branches) is documented as separate scenarios linked below.
+The diagram below is generated from `conformance/scenarios/reputation/reputation-canonical.yaml` by `scripts/build-docs.sh`: it cannot drift from the executable corpus. The canonical pins the Phase 1 happy path; the rest of the protocol (Phase 2, nack/backdate/sync branches) is documented as separate scenarios linked below.
 
 <!-- at_diagram:start protocol=reputation scenario=reputation-canonical -->
 ```mermaid
@@ -40,9 +40,9 @@ sequenceDiagram
     participant alice as proposer
     participant bob as acceptor
     alice->>+bob: ask permission
-    Note right of alice: Phase 1 — alice broadcasts an ask-permission ballot on the encrypted group channel. (id1, id2, proposer) uniquely tags the round; id1 is a millisecond timestamp, id2 is the proposer's chain index.
+    Note right of alice: Phase 1, alice broadcasts an ask-permission ballot on the encrypted group channel. (id1, id2, proposer) uniquely tags the round; id1 is a millisecond timestamp, id2 is the proposer's chain index.
     bob-->>-alice: permission granted (re: 1)
-    Note right of bob: Phase 1 — bob's last_id is None and chain is empty, so the strict-inequality guard passes; handle_request emits a grant ack back to alice. (Out-of-band nack / backdate / sync branches are documented in separate scenarios.)
+    Note right of bob: Phase 1, bob's last_id is None and chain is empty, so the strict-inequality guard passes; handle_request emits a grant ack back to alice. (Out-of-band nack / backdate / sync branches are documented in separate scenarios.)
 ```
 <!-- at_diagram:end -->
 
@@ -50,12 +50,12 @@ sequenceDiagram
 
 **Phase 1 alternate branches** (not in the canonical, pinned by separate scenarios):
 
-- **Nack — `try again`.** If the acceptor's `last_id` is greater-than-or-equal to the proposed `id1`, the strict-inequality guard fails and `handle_request` emits a `try again` instead of `permission granted`. The proposer applies exponential backoff (1.5× starting at 2s, capped at 90s) and retries with a fresher timestamp. Trace: [`request-nacked-stale.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/request-nacked-stale.yaml).
-- **Backdate — `out of date`.** If the proposer's chain index is behind the acceptor's recorded chain length, the acceptor emits `out of date` carrying its own `chain_len`. The proposer triggers the sync sub-protocol. Trace: [`request-backdated-chain-mismatch.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/request-backdated-chain-mismatch.yaml).
+- **Nack: `try again`.** If the acceptor's `last_id` is greater-than-or-equal to the proposed `id1`, the strict-inequality guard fails and `handle_request` emits a `try again` instead of `permission granted`. The proposer applies exponential backoff (1.5× starting at 2s, capped at 90s) and retries with a fresher timestamp. Trace: [`request-nacked-stale.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/request-nacked-stale.yaml).
+- **Backdate: `out of date`.** If the proposer's chain index is behind the acceptor's recorded chain length, the acceptor emits `out of date` carrying its own `chain_len`. The proposer triggers the sync sub-protocol. Trace: [`request-backdated-chain-mismatch.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/request-backdated-chain-mismatch.yaml).
 
-**Phase 2 — Accept.** Once the proposer reaches majority grants (`> peers/2`), it emits a `transaction` carrying the score, keyed by the same `(id1, id2, proposer)` tuple. Each acceptor verifies the round was previously granted (`paxos_has_granted_id` on the C side; `my_requests` lookup on Python) and emits `tx accepted`. The proposer commits to history on majority acceptance. Trace: [`transaction-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-accepted.yaml).
+**Phase 2: Accept.** Once the proposer reaches majority grants (`> peers/2`), it emits a `transaction` carrying the score, keyed by the same `(id1, id2, proposer)` tuple. Each acceptor verifies the round was previously granted (`paxos_has_granted_id` on the C side; `my_requests` lookup on Python) and emits `tx accepted`. The proposer commits to history on majority acceptance. Trace: [`transaction-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-accepted.yaml).
 
-**Phase 3 — Commit broadcast.** After the proposer commits to its own history, it broadcasts `tx committed` carrying `(task_id, proposer_id, score)` to the group. Each acceptor writes the same entry to its own history; the proposer skips its own bounce-back. Without this phase, every peer's local history would contain only its own submissions — when peer A and peer B independently score the same task, A's history would have `(task_id, A, A_score)` only and B's would have `(task_id, B, B_score)` only, and CTFT's bilateral check (`p1==peer && p2==self`) could never match. Phase 3 is what makes a single bilateral Transaction appear in *every* peer's view. Trace: [`transaction-committed-bilateral.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-committed-bilateral.yaml).
+**Phase 3: Commit broadcast.** After the proposer commits to its own history, it broadcasts `tx committed` carrying `(task_id, proposer_id, score)` to the group. Each acceptor writes the same entry to its own history; the proposer skips its own bounce-back. Without this phase, every peer's local history would contain only its own submissions, when peer A and peer B independently score the same task, A's history would have `(task_id, A, A_score)` only and B's would have `(task_id, B, B_score)` only, and CTFT's bilateral check (`p1==peer && p2==self`) could never match. Phase 3 is what makes a single bilateral Transaction appear in *every* peer's view. Trace: [`transaction-committed-bilateral.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-committed-bilateral.yaml).
 
 **Sync sub-protocol.** When a proposer falls behind (signalled by `out of date`), it sends `update needed` to its top-3 most-trusted peers (encrypted peer-to-peer) carrying its current chain length. Each recipient responds with `latest update` carrying any history segment beyond the proposer's chain length. The proposer majority-votes across the 3 responses and catches up. Traces: [`chain-outdated-notification.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-outdated-notification.yaml), [`chain-replay-update.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-replay-update.yaml).
 
@@ -65,27 +65,27 @@ sequenceDiagram
 - After each `permission granted` arrives, `handle_grant` increments the grant count and checks for majority before moving to Phase 2.
 - After each `tx accepted`, `handle_accepted` increments the acceptance count and commits the score to history on majority.
 
-**Replay invariants.** Both Phase 1 (`ask-permission-replay-rejected.yaml`, `ask-permission-lower-id-rejected.yaml`) and the chain-update path (`chain-replay-update.yaml`) are pinned against re-delivery — Paxos `last_id` advances on grant, so duplicate or out-of-order ballots are rejected idempotently. See BUGS.md §P6 for the closure of the original `last_id`-advance divergence.
+**Replay invariants.** Both Phase 1 (`ask-permission-replay-rejected.yaml`, `ask-permission-lower-id-rejected.yaml`) and the chain-update path (`chain-replay-update.yaml`) are pinned against re-delivery: Paxos `last_id` advances on grant, so duplicate or out-of-order ballots are rejected idempotently. See BUGS.md §P6 for the closure of the original `last_id`-advance divergence.
 
 ## Reputation scale and thresholds
 
-Reputation lives on a **`[0, 1]` scale — there are no negative values.** (An
+Reputation lives on a **`[0, 1]` scale: there are no negative values.** (An
 earlier draft drifted into a signed `[-1, 1]` framing; that was reverted.) The
-per-transaction task scores that feed the EMA/CTFT arithmetic are unchanged —
-clean ≈ 0.8, anomaly/tamper ≈ 0.3, good ≈ 0.9 — only the *interpretation
+per-transaction task scores that feed the EMA/CTFT arithmetic are unchanged
+(clean ≈ 0.8, anomaly/tamper ≈ 0.3, good ≈ 0.9) only the *interpretation
 thresholds* below define the operating bands. These constants are the single
 source of truth and live in `repprocess.py` (mirrored in `reputation.h` /
 `reputation.c`):
 
 | Value | Name | Meaning | Env override (default) |
 |-------|------|---------|------------------------|
-| 1.0 | — | maximally trusted | — |
-| 0.5 | tier-1 floor / CTFT pivot | elevated-trust floor & per-transaction cooperate/defect pivot (unchanged) | — |
+| 1.0 | n/a | maximally trusted | n/a |
+| 0.5 | tier-1 floor / CTFT pivot | elevated-trust floor & per-transaction cooperate/defect pivot (unchanged) | n/a |
 | 0.2 | `PREREP_NEUTRAL` | neutral / cold-start ("no information yet") | `AT_REP_NEUTRAL` (0.2) |
-| 0.1 | `COMM_CUTOFF` | communication cut-off — a peer below this is **excluded** | `AT_REP_COMM_CUTOFF` (0.1) |
-| 0.0 | slash floor | catastrophic failure (a slash's `floor_score`) | — |
-| — | decay asymptote | idle-decay floor, just above neutral | `AT_REP_DECAY_ASYMPTOTE` (0.21) |
-| — | persist gate | trusted-cohort persist threshold | `AT_REP_PERSIST_THRESHOLD` (0.5) |
+| 0.1 | `COMM_CUTOFF` | communication cut-off, a peer below this is **excluded** | `AT_REP_COMM_CUTOFF` (0.1) |
+| 0.0 | slash floor | catastrophic failure (a slash's `floor_score`) | n/a |
+| n/a | decay asymptote | idle-decay floor, just above neutral | `AT_REP_DECAY_ASYMPTOTE` (0.21) |
+| n/a | persist gate | trusted-cohort persist threshold | `AT_REP_PERSIST_THRESHOLD` (0.5) |
 
 The 0.2 neutral and 0.1 cut-off exist precisely so the **slash floor can sit at
 0.0** with the participation cut-off just above it: a peer we know nothing about
@@ -96,8 +96,8 @@ actively earns a sub-cut-off score is excluded.
 `COMM_CUTOFF` (0.1) is excluded**: gateways stop forwarding for it, the network
 process drops its inbound frames and filters it out of outbound targets (see
 [§ Communication cut-off](#communication-cut-off-enforcement) below), and it is
-ignored. Because it is ignored, an excluded peer **cannot transact its way back**
-— recovery is **explicit-only**, via a `REASON_REHABILITATE` slash-lift
+ignored. Because it is ignored, an excluded peer **cannot transact its way back**:
+recovery is **explicit-only**, via a `REASON_REHABILITATE` slash-lift
 (operator/quorum) that restores the score to `PREREP_NEUTRAL` (0.2) and
 re-admits it, after which it must re-earn elevated trust from neutral. The
 excluded state **persists across a restart** (see the two-sided persist filter
@@ -109,21 +109,21 @@ All four thresholds honor environment overrides (`AT_REP_NEUTRAL`,
 once via `_env_float`; the inspector dashboard reads the same
 `AT_REP_COMM_CUTOFF` so its cut-off line tracks a re-adjusted backend.
 
-## Reputation Computation
+## Reputation computation
 
-When a reputation query arrives (`rep_req`), the score is computed using one of two strategies based on the peer's current standing. The mode switch uses **hysteresis** to prevent oscillation (a peer hovering near the boundary used to flip modes every tick — e.g. 0.9 ↔ 0.4): a peer must climb above `COOP_ENTER = 0.55` to enter Cooperation Mode and must fall below `COOP_EXIT = 0.45` to drop back to Tit-for-Tat. Within the `[0.45, 0.55]` band the previously-selected mode is retained.
+When a reputation query arrives (`rep_req`), the score is computed using one of two strategies based on the peer's current standing. The mode switch uses **hysteresis** to prevent oscillation (a peer hovering near the boundary used to flip modes every tick: e.g. 0.9 ↔ 0.4): a peer must climb above `COOP_ENTER = 0.55` to enter Cooperation Mode and must fall below `COOP_EXIT = 0.45` to drop back to Tit-for-Tat. Within the `[0.45, 0.55]` band the previously-selected mode is retained.
 
-### Cooperation Mode (`prior > COOP_ENTER` to enter, retained until `prior <= COOP_EXIT`)
+### Cooperation mode (`prior > COOP_ENTER` to enter, retained until `prior <= COOP_EXIT`)
 
-Pure reputation: a weighted average of every transaction score involving this peer. Each transaction score is weighted by **two** factors — the counterparty's own reputation and the transaction's capability `transaction_weight` (a higher-tier capability counts for more):
+Pure reputation: a weighted average of every transaction score involving this peer. Each transaction score is weighted by **two** factors: the counterparty's own reputation and the transaction's capability `transaction_weight` (a higher-tier capability counts for more):
 
 ```
 score = Σ (counterparty_score · counterparty_rep · task_weight) / Σ task_weight
 ```
 
-(returns the neutral `PREREP_NEUTRAL` = `0.2` when there is no weighted history). The `transaction_weight` factor ties this directly into the tiered-transaction model — see [Trust Tiers §5](trust-tiers.md).
+(returns the neutral `PREREP_NEUTRAL` = `0.2` when there is no weighted history). The `transaction_weight` factor ties this directly into the tiered-transaction model, see [Trust Tiers §5](trust-tiers.md).
 
-### Tit-for-Tat Mode (`prior <= COOP_EXIT` to enter, retained until `prior > COOP_ENTER`)
+### Tit-for-tat mode (`prior <= COOP_EXIT` to enter, retained until `prior > COOP_ENTER`)
 
 Contrite Tit-for-Tat: examines the bilateral transaction history between the local node and the queried peer.
 
@@ -137,13 +137,13 @@ This encourages mutual recovery from low-trust situations while punishing sustai
 
 **Warm-start** is precisely this: *a memory of a peer's prior AT-bounded
 activity that becomes operational again at machine start-up.* It is not a grant
-of trust and not a configured allow-list — it is the reputation a peer **already
+of trust and not a configured allow-list: it is the reputation a peer **already
 earned** through observed, AT-mediated transactions, persisted to disk
 (`reputation.cfg.json`) and reloaded into the live `self.reputations` store when
 the node restarts. Because that score is bound to the same cryptographic
 identity and remains subject to continuous re-evaluation (every subsequent
 transaction can move it, and the slashing fast-path can floor it), a
-warm-started peer is in exactly the same regime as any other peer — it simply
+warm-started peer is in exactly the same regime as any other peer: it simply
 does not have to re-earn standing from neutral on every reboot. The safety of
 that shortcut rests on the staleness decay below: re-loaded trust is *stale*
 trust, and stale trust fades.
@@ -173,7 +173,7 @@ reference pattern for warm-starting brief-lived peers.
 
 ## Staleness decay (why warm-start is safe)
 
-Earned reputation is a memory, and memory must fade — otherwise a warm-started
+Earned reputation is a memory, and memory must fade: otherwise a warm-started
 score would be trusted forever on the strength of activity that may be hours or
 days old. `ReputationProcess` therefore relaxes an idle peer's **operational**
 reputation toward *almost-but-not-quite neutral* as a function of time since the
@@ -182,16 +182,16 @@ the process loop; `_decayed_score` is the pure function). The relevant constants
 (`REPUTATION_DECAY_*` in `repprocess.py`) are tunable:
 
 - **Asymptote** (`AT_REP_DECAY_ASYMPTOTE`, default `0.21`, just above neutral
-  `0.20` and above the `0.1` cut-off). A long-dormant peer relaxes toward — but
-  never reaches — neutral, so a previously-known asset stays
+  `0.20` and above the `0.1` cut-off). A long-dormant peer relaxes toward (but
+  never reaches) neutral, so a previously-known asset stays
   faintly preferred over a true stranger while its *elevated* trust tier
-  (tiers 2–4) lapses and must be re-earned on contact.
+  (tiers 2-4) lapses and must be re-earned on contact.
 - **Onset** grace period before any decay begins, so a brief out-of-range gap
   costs nothing.
 - **Half-life** sets how fast the gap above the asymptote then shrinks.
 
 The decay is **asymmetric by design**: it only erodes reputation *above* the
-asymptote. A score at or below it — a distrusted or corrupt node — is left
+asymptote. A score at or below it (a distrusted or corrupt node) is left
 untouched, because mere absence must never rehabilitate a bad actor (this
 preserves the sticky-low-reputation intent noted at `self._consensus_last`).
 Slashed peers (whose floor is authoritative) and self are never decayed.
@@ -199,17 +199,18 @@ Slashed peers (whose floor is authoritative) and self are never decayed.
 **Across a restart**, the time a peer spent out of contact while we were down is
 counted: `_seed_idle_from_snapshot` treats the persisted snapshot's mtime as the
 instant of last activity, seeds each loaded peer's idle clock to it, and applies
-the offline-gap decay up front — so a cohort that warm-starts after a long
+the offline-gap decay up front, so a cohort that warm-starts after a long
 dormancy comes up with appropriately faded, not stale-inflated, trust. This is
 local-view only: decay is wall-clock driven and never serialized onto the wire,
 so it is invisible to the Python↔C conformance corpus.
 
-### Planned hardening: floor, not full restoration
+### Hardening: floor, not full restoration
 
-**Status: design, not yet implemented.** Today warm-start reloads the persisted
+This is specified here and not built; it is tracked in
+[`ISSUES.md`](../../ISSUES.md) §10.3. Warm start reloads the persisted
 operational reputation scalar (subject to the decay above), so a *recently*-active
-peer with little decay is restored to whatever tier that scalar maps to —
-including an elevated tier — the instant it passes admission. The decay axis
+peer with little decay is restored to whatever tier that scalar maps to
+(including an elevated tier) the instant it passes admission. The decay axis
 covers *time out of contact*, but not the orthogonal *"this session hasn't
 re-validated you yet"* axis.
 
@@ -217,7 +218,7 @@ The hardening: warm-start should restore only **low-tier** standing (presence /
 communication) immediately, and require **fresh in-session behavioral evidence**
 before re-granting **elevated or safety-critical tiers**. Rationale: an
 *authenticated-but-compromised* asset passes ZTA admission *by definition* (it
-holds valid credentials — the headline threat), and for a short-lived asset there
+holds valid credentials, the headline threat), and for a short-lived asset there
 is no time for behavioral re-evaluation to catch it before its window closes; so
 restoring its historically-earned high tier instantly re-opens, for short-lived
 assets, exactly the compromised-but-credentialed hole the system exists to close.
@@ -233,7 +234,7 @@ When a peer's reputation crosses `COMM_CUTOFF` (0.1), the exclusion is enforced
 at the network layer, not merely reflected in a score:
 
 - **Detection.** `_publish_tier_change` checks the cut-off crossing *before* its
-  tier early-return, because 0.1 lies inside tier 0 (`[0, 0.5)`) — a 0.15 → 0.05
+  tier early-return, because 0.1 lies inside tier 0 (`[0, 0.5)`): a 0.15 → 0.05
   move is a tier-0 → tier-0 no-op for the tier logic yet must still exclude the
   peer. On a crossing it updates `self._excluded` and calls `_publish_exclusion`,
   which resolves the peer's address and sends a `Network.exclude` (or
@@ -243,7 +244,7 @@ at the network layer, not merely reflected in a score:
   peer from `_rejected_addresses`. The **inbound-drop** gate in
   `accept_peer_message` (and the ptp/group/multicast drain loops) drops frames
   from an excluded address; the **outbound-skip** gate in the group-send and
-  pseudo-multicast loops stops forwarding to it — so gateways stop relaying for
+  pseudo-multicast loops stops forwarding to it, so gateways stop relaying for
   an excluded peer.
 - **Boot & sync.** Exclusions re-seeded at boot from the persisted snapshot
   (`_seed_exclusions_from_snapshot`) are flushed to the network process once, on

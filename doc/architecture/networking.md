@@ -6,11 +6,11 @@ The network layer handles all wire communication between nodes. It provides thre
 
 > This describes the Python `NetworkProcess`. The C implementation
 > (`src/c/autonomous_trust/network/`) implements the **same wire protocol**, and
-> C and Python nodes interoperate on the same network — provided both sides use
+> C and Python nodes interoperate on the same network: provided both sides use
 > the DRY canonical JSON wire form for identity/group payloads (see
 > [Native / FFI Dual Implementation](native-ffi-dual-implementation.md) §6).
 
-## Communication Channels
+## Communication channels
 
 | Channel | Transport | Encryption | Use Case |
 |---------|-----------|------------|----------|
@@ -18,7 +18,7 @@ The network layer handles all wire communication between nodes. It provides thre
 | **Encrypted group** | UDP to each group member (port N+1) | NaCl SecretBox (shared group key) | Proposals, votes, confirmations, history diffs, Paxos consensus |
 | **Encrypted peer-to-peer** | UDP (or TCP) to individual peer (port N) | NaCl Box (sender private + recipient public) | History transfer, task negotiation, reputation messages |
 
-## Socket Layout
+## Socket layout
 
 The `UDPNetworkProcess` binds three UDP sockets:
 
@@ -30,7 +30,7 @@ The `UDPNetworkProcess` binds three UDP sockets:
 
 The `TCPNetworkProcess` extends this by replacing peer and group UDP with TCP (using `listen`/`accept`), while keeping UDP for broadcast/multicast. TCP uses `[length]\|[data]` framing for reliable delivery. By default it opens one connection per message; it can optionally reuse one connection per peer for many messages, described in [TCP Connection Pooling](network-connection-pooling.md).
 
-## Wire Message Format
+## Wire message format
 
 Messages are serialized as pipe-delimited strings:
 
@@ -44,7 +44,7 @@ process|function|data
 
 For encrypted channels, the entire serialized string is encrypted before transmission.
 
-## Receiver Threads
+## Receiver threads
 
 `NetworkProcess.process()` starts four daemon threads:
 
@@ -53,11 +53,11 @@ For encrypted channels, the entire serialized string is encrypted before transmi
 | **peer_receiver** | `peer_receiver()` | Peer socket | Appends `(raw_msg, from_addr)` to `peer_messages` |
 | **group_receiver** | `group_receiver()` | Group socket | Appends to `group_messages` |
 | **unknown_receiver** | `unknown_receiver()` | Broadcast socket | Appends to `unknown_messages` |
-| **mystery_handler** | `mystery_handler()` | -- | Retries encrypted messages from unknown peers |
+| **mystery_handler** | `mystery_handler()` |, | Retries encrypted messages from unknown peers |
 
 The mystery handler exists because during bootstrapping, encrypted messages may arrive before the sender's identity is known. It holds these messages and retries decryption periodically (up to 30 seconds) as peers are discovered.
 
-## Send-Side Message Routing
+## Send-side message routing
 
 When a process places a `Message` on the network queue, `NetworkProcess` routes it based on `message.to_whom`:
 
@@ -82,7 +82,7 @@ flowchart TD
     PeerPlain --> SendPeer
 ```
 
-## Receive-Side Message Processing
+## Receive-side message processing
 
 The main loop processes one message from each receive queue per tick:
 
@@ -117,7 +117,7 @@ flowchart TD
     end
 ```
 
-## Queue Dispatch
+## Queue dispatch
 
 After decryption, `_msg_to_queue()` parses the wire format and routes the resulting `Message` to the correct process queue:
 
@@ -127,7 +127,7 @@ After decryption, `_msg_to_queue()` parses the wire format and routes the result
 
 If the process name is not recognized, the message is logged and dropped.
 
-## Pest Tracking
+## Pest tracking
 
 Peers that send invalid encrypted messages (returning `None` from decryption but with a known address) are tracked in a `pests` dict. After exceeding `annoy_limit` (5) failed messages, the peer is demoted in the hierarchy.
 

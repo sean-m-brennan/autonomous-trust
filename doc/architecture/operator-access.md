@@ -4,18 +4,18 @@
 
 How a **human operator** authenticates to an AutonomousTrust fleet with a PIV/CAC
 smartcard plus a second factor, activates a local node, discovers what the fleet
-can do, and issues requests — all from a terminal UI. This is the human-facing
+can do, and issues requests: all from a terminal UI. This is the human-facing
 counterpart to peer admission ([ZTA Integration](zta-integration.md)): the same
 verifier machinery that decides whether a *peer* may join also decides whether a
 *person* may operate, with a challenge-response and a second factor layered on
 top.
 
 Implementation plan: `doc/NV059/work/PIV_MFA_OPERATOR_ACCESS_PLAN.md` (phases
-P0–P6). This document describes the shipped design.
+P0-P6). This document describes the shipped design.
 
 ---
 
-## 1. Why a Separate Access Path
+## 1. Why a separate access path
 
 A peer proves it is a legitimate node by presenting a credential the border
 guard can chain to a trusted CA (see [ZTA Integration §11](zta-integration.md)).
@@ -23,7 +23,7 @@ A human operator needs more:
 
 1. **Possession + knowledge.** A certificate on a card proves the card exists.
    The operator must additionally prove they hold the card *now* (the private
-   key never leaves it — PKCS#11 sign-only) and know a PIN/second factor. A bare
+   key never leaves it: PKCS#11 sign-only) and know a PIN/second factor. A bare
    cert on the wire cannot prove liveness.
 2. **A non-replayable challenge.** Peer admission accepts a static credential;
    operator activation must defeat replay, so it binds a fresh, single-use,
@@ -66,36 +66,36 @@ the admission gate.
 ```
 
 The split mirrors the existing **Inspector** pattern: the AT node runs in its own
-thread/process and the UI never imports AT internals — it drains DTO-shaped
+thread/process and the UI never imports AT internals; it drains DTO-shaped
 objects off `external_feedback` and pushes `Task` DTOs onto `external_control`.
 This keeps the (synchronous, Textual) UI decoupled from the node's message loop
 and makes every screen testable headless.
 
 Two distributions:
 
-- **`core/_python/operator/`** — the node-side core (activation, session, DDIL
+- **`core/_python/operator/`**: the node-side core (activation, session, DDIL
   posture, resource directory, `OperatorNode`). Imports as
   `autonomous_trust.core.operator`. No UI dependency.
-- **`src/autonomous-trust-operator/`** — the Textual TUI (`autonomous_trust.
+- **`src/autonomous-trust-operator/`**: the Textual TUI (`autonomous_trust.
   operator`): app, screens, node bridge. Depends on the core but not vice-versa.
 
 ---
 
-## 3. PIV Verifier and the Challenge-Response
+## 3. PIV verifier and the challenge-response
 
 `identity/zta/piv/`:
 
-- **`pkcs11.py`** — `PivToken` ABC with two implementations: `PyKcs11Token`
+- **`pkcs11.py`**: `PivToken` ABC with two implementations: `PyKcs11Token`
   (lazy `PyKCS11`, PIV auth slot 9A, `CKA_ID` `0x01`, EC raw→DER signature
   conversion) for a real card, and `SoftwareToken` (pure `cryptography`) for
   dev/CI/no-hardware. The token signs a nonce; the private key never leaves it.
-  Also `probe_token()` — a **PIN-less** card-present probe (module resolved by
+  Also `probe_token()`: a **PIN-less** card-present probe (module resolved by
   `find_pkcs11_module()`: explicit path, then `$AUTONOMOUS_TRUST_PKCS11_MODULE`,
   then an `opensc-pkcs11.so` search) returning a `TokenProbe(present,
   module_path, detail)`. `PyKcs11Token` cannot answer presence pre-PIN because
   its constructor logs in, so the console's status line uses the probe and shows
   `detail` to distinguish a missing module/binding from an empty reader.
-- **`piv_verifier.py`** — `PivVerifier` + `PivCredential` (a length-prefixed
+- **`piv_verifier.py`**: `PivVerifier` + `PivCredential` (a length-prefixed
   envelope of cert / nonce / signature).
 
 Activation flow:
@@ -110,7 +110,7 @@ Activation flow:
      wrong-identity nonces);
    - verifies the signature against the cert's public key.
 
-A bare cert (no envelope) skips steps 1–3 and runs chain-only — the peer path. A
+A bare cert (no envelope) skips steps 1-3 and runs chain-only: the peer path. A
 DER cert begins `0x30 0x82…`, never the `0x0000…` length prefix of an envelope,
 so the two forms never alias.
 
@@ -121,7 +121,7 @@ rotating the second factor is not a new identity). See
 
 ---
 
-## 4. MFA Chain
+## 4. MFA chain
 
 `identity/zta/mfa.py` provides `MfaChain(Verifier)` with `CombinePolicy.AND`:
 
@@ -131,7 +131,7 @@ rotating the second factor is not a new identity). See
 - **Composite credential** (`MfaCredential`, magic-prefixed `MFA1` + one blob per
   factor): on a composite, blob *i* dispatches to factor *i* and **all** factors
   are required. On a **bare** credential (a peer's wire cert) only the primary
-  factors run — secondary factors (`secondary_factor=True`, e.g. TOTP) are
+  factors run: secondary factors (`secondary_factor=True`, e.g. TOTP) are
   skipped. One chain therefore serves both operator activation (composite, all
   factors) and peer admission (bare, primary only).
 - **Hash passthrough:** the combined `credential_hash` is always the **primary**
@@ -144,12 +144,12 @@ and FIDO2 are configured alternatives / future work.
 
 Policy wiring (`zta_policy.py`): `verifier_type="mfa"` + a `factors: list[dict]`
 list; `_build_factor` constructs each factor (`x509`/`piv`/`totp`/`oidc`; unknown
-→ `NullVerifier`). The additions are additive and optional — the C policy parser
+→ `NullVerifier`). The additions are additive and optional: the C policy parser
 ignores unknown keys, so this is parity-safe.
 
 ---
 
-## 5. Activation and Identity Binding
+## 5. Activation and identity binding
 
 `operator/activate.py` (+ `__main__.py` CLI) binds a verified credential to the
 local node:
@@ -170,9 +170,9 @@ backend redirector's loader has no `get_code` for runpy); use the concrete
 
 ---
 
-## 6. Session Lifecycle
+## 6. Session lifecycle
 
-`operator/session.py` — `OperatorSession` (clock-injectable for tests):
+`operator/session.py`: `OperatorSession` (clock-injectable for tests):
 
 | Event | Behavior |
 |---|---|
@@ -187,9 +187,9 @@ persisted.
 
 ---
 
-## 7. DDIL Posture
+## 7. DDIL posture
 
-`operator/ddil.py` — `evaluate_operator_posture(validation_state, allow_relay,
+`operator/ddil.py`: `evaluate_operator_posture(validation_state, allow_relay,
 priv_requires_full)` → `OperatorPosture(tier_cap, privileged_allowed)`:
 
 - **DIRECT** validation, or a **sanctioned RELAYED** validation through a
@@ -200,13 +200,13 @@ priv_requires_full)` → `OperatorPosture(tier_cap, privileged_allowed)`:
 
 This is **fail-safe, hierarchy-relayed**: it prefers delegated PIV validation
 over a connected gateway (`operator_allow_ddil_relay`), and absent any relay path
-caps rather than hard-denies — never fail-open, never a blunt fail-closed. It is
+caps rather than hard-denies, never fail-open, never a blunt fail-closed. It is
 stricter than peer admission's `allow_ddil_fallback` (which may admit a
 reputation-capped peer) because an operator *originates* privileged actions.
 
 ---
 
-## 8. Resource Directory
+## 8. Resource directory
 
 `operator/resource_directory.py` is a **pure read-model**: `build_directory(
 descriptors, providers, peers, my_tier)` → a `ResourceDirectory` of
@@ -214,15 +214,15 @@ descriptors, providers, peers, my_tier)` → a `ResourceDirectory` of
 my_reach}`.
 
 `my_reach` ∈ {`INVOKABLE`, `LOCKED_BY_TIER`, `UNKNOWN`}. Tier gating is
-**execution-time only**, so locked resources are **shown, not hidden** — the
+**execution-time only**, so locked resources are **shown, not hidden**: the
 operator can see what exists and what standing it would take to invoke it.
 
 `operator/operator_node.py`:
 
-- `directory_from_state(...)` — a pure adapter from live node state
+- `directory_from_state(...)`: a pure adapter from live node state
   (local capabilities, peer capabilities, peers, tier, reputations, online uuids)
   to a directory snapshot (tested with duck-typed fakes).
-- `OperatorNode(AutonomousTrust)` — the request-only node. It drains
+- `OperatorNode(AutonomousTrust)`: the request-only node. It drains
   `PeerCapabilities` from unhandled messages, emits directory snapshots on
   `external_feedback`, and issues a directed `caps_query` sweep on
   `request_caps_refresh`.
@@ -232,7 +232,7 @@ operator can see what exists and what standing it would take to invoke it.
 Capabilities now carry optional runtime descriptor fields
 (`description`/`kind`/`arg_schema`). On the wire, `caps_response` becomes a JSON
 **array of descriptor objects** (`{name, required_tier, description, kind,
-arg_schema}`) — but the receiver is **tolerant**: each item may be a bare name
+arg_schema}`), but the receiver is **tolerant**: each item may be a bare name
 string (legacy) or a descriptor object, so the change is backward-compatible. All
 fields are bounded and sanitized on both emit and receive (untrusted peer input
 is clamped, not rejected). The proto/persist wire form is unchanged; descriptors
@@ -244,7 +244,7 @@ instead of forcing `UNKNOWN`. Pinned cross-language by conformance
 
 ---
 
-## 9. Request Submission and Results
+## 9. Request submission and results
 
 `RequestView` (TUI) auto-renders an argument form from a resource's `arg_schema`,
 coerces inputs to the declared types, and gates **submit** on `my_reach`
@@ -267,7 +267,7 @@ rather than being dropped.
 
 ## 10. Terminal UI
 
-`src/autonomous-trust-operator/` — a tabbed Textual `OperatorApp` over
+`src/autonomous-trust-operator/`: a tabbed Textual `OperatorApp` over
 `OperatorNodeBridge`:
 
 | Screen | Purpose |
@@ -287,32 +287,32 @@ reflow on tab re-show. The status helper is named `_render_status`, not
 
 ## 11. Testing (and the live-card boundary)
 
-The two artifacts that gate a *real* DoD CAC/PIV — the issuing-CA bundle (DoD
-Root + DoD ID CA-xx intermediate) and a live CRL/OCSP source — are
+The two artifacts that gate a *real* DoD CAC/PIV (the issuing-CA bundle (DoD
+Root + DoD ID CA-xx intermediate) and a live CRL/OCSP source) are
 program-environment-only. So **all development and CI run against a self-minted
 test PKI**; validating a real card against the real DoD chain is a
 program-environment step, not a local one (plan §7.1).
 
 Staged so the live card is the last variable:
 
-1. **Unit** — mint CA + leaf + CRL with a test PKI and drive
+1. **Unit**: mint CA + leaf + CRL with a test PKI and drive
    `X509Verifier`/`PivVerifier`/`MfaChain`/`TotpVerifier` directly. No card, no
    daemon. (`tests/a_unit/test_piv_verifier.py`, `test_mfa.py`, `test_totp.py`,
    `test_operator_session.py`, `test_operator_ddil.py`,
    `test_resource_directory.py`, `test_operator_node.py`.)
-2. **Software token** — `SoftwareToken` stands in for the PKCS#11 module; the
+2. **Software token**: `SoftwareToken` stands in for the PKCS#11 module; the
    operator package assembles a usable mock in `operator/demo.py`
    (`mint_demo_pki`, `software_activator`, a `DemoNode` that serves a seeded
    directory and answers `Task`s with synthetic `TaskResult`s). `--demo`
    activates (real challenge-response), browses, submits, and shows results with
    zero card/cohort/network. The live card later is just a swap of the PKCS#11
    module path + slot.
-3. **Live card** — OpenSC/vendor module + reader + the card's real issuing-CA
+3. **Live card**: OpenSC/vendor module + reader + the card's real issuing-CA
    bundle + PIN, inside the program environment.
 
 The Textual screens are covered by headless Pilot tests
 (`tests/a_unit/test_operator_tui.py`). Demo PIN/MFA are both ignored (a software
-token has no PIN; no TOTP enrolled = single factor) — just press Activate.
+token has no PIN; no TOTP enrolled = single factor): just press Activate.
 
 ### Revocation at admission (P6)
 
@@ -327,18 +327,18 @@ configured) still admits. Pinned cross-language by conformance
 
 ---
 
-## 12. Security Considerations
+## 12. Security considerations
 
 - PIV private key **never leaves the card** (PKCS#11 sign-only); PIN held only to
   open the session, never persisted.
 - **Challenge nonce** is fresh, single-use, identity-bound, and TTL'd (replay
   defense).
-- **Factor independence** — TOTP does not share an IdP with PIV, so one IdP
+- **Factor independence**: TOTP does not share an IdP with PIV, so one IdP
   cannot gate both factors.
 - **Identity binding** via `zta_credential_hash` prevents transferring a
   credential to another AT identity; excluded from equality so rotation ≠ new
   identity.
-- **DDIL posture is fail-safe** — prefer hierarchical relay, otherwise cap at
+- **DDIL posture is fail-safe**: prefer hierarchical relay, otherwise cap at
   tier 1 and block privileged origination; never fail-open, never a blunt deny.
 - **Secret zeroization** on logout / card removal / idle lock.
 - **Revocation is enforced at admission** (§11), so a revoked operator or peer
@@ -351,13 +351,13 @@ configured) still admits. Pinned cross-language by conformance
 
 ## References
 
-- `doc/NV059/work/PIV_MFA_OPERATOR_ACCESS_PLAN.md` — implementation plan (P0–P6).
-- [ZTA Integration](zta-integration.md) — peer admission, verifier interface,
+- `doc/NV059/work/PIV_MFA_OPERATOR_ACCESS_PLAN.md`: implementation plan (P0-P6).
+- [ZTA Integration](zta-integration.md): peer admission, verifier interface,
   policy, the admission gate.
-- [ZTA Python Parity](zta-python-parity.md) — the Python↔C parity discipline the
+- [ZTA Python Parity](zta-python-parity.md): the Python↔C parity discipline the
   verifier and descriptor work follow.
-- [Identity Protocol](identity-protocol.md) — Phase 3 border-guard admission.
-- [Trust Tiers](trust-tiers.md) — the tier gradient that gates resource reach.
+- [Identity Protocol](identity-protocol.md): Phase 3 border-guard admission.
+- [Trust Tiers](trust-tiers.md): the tier gradient that gates resource reach.
 - NIST SP 800-73 (PIV), RFC 6238 (TOTP), NIST SP 800-207 (ZTA).
 
 [< ZTA Integration](zta-integration.md)
