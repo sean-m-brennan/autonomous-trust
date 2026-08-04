@@ -235,12 +235,19 @@ int tracker_from_file(const char *filename, logger_t *logger, tracker_t **tracke
 /* Frama-C: skipped —
  * [syscall] tracker_config: at_snprintf + ensures + assigns (filesystem path formatting).
  */
-int tracker_config(char config_file[])
+int tracker_config(char *config_file, size_t destlen)
 {
-    get_cfg_dir(config_file);
+    /* Both bounds come from the caller now. This function had the same shape as
+     * the defect in ISSUES.md §2.1.1 — an unsized `char config_file[]` parameter
+     * with `CFG_PATH_LEN` hardcoded as its length — and was safe only because its
+     * one caller happened to pass a buffer that big. */
+    if (config_file == NULL || destlen == 0)
+        return -1;
+    if (get_cfg_dir(config_file, destlen) < 0)
+        return -1;
     size_t len = strlen(config_file);
-    int n = snprintf(config_file + len, CFG_PATH_LEN - len, "/%s", default_tracker_filename);
-    if (n < 0 || (size_t)n >= CFG_PATH_LEN - len)
+    int n = snprintf(config_file + len, destlen - len, "/%s", default_tracker_filename);
+    if (n < 0 || (size_t)n >= destlen - len)
         return -1;
     return (int)(len + 1);
 }

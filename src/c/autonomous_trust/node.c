@@ -65,8 +65,8 @@ int at_node_init(at_node_t *node, const at_node_config_t *cfg)
     /* Ensure required directories exist */
     char cfg_dir[CFG_PATH_LEN + 1];
     char data_dir[CFG_PATH_LEN + 1];
-    get_cfg_dir(cfg_dir);
-    get_data_dir(data_dir);
+    get_cfg_dir(cfg_dir, sizeof(cfg_dir));
+    get_data_dir(data_dir, sizeof(data_dir));
 
     if (makedirs(cfg_dir, 0755) != 0)
     {
@@ -215,8 +215,52 @@ void at_node_shutdown(at_node_t *node)
         log_info(&node->log, "Sending SIGINT to AT daemon (PID %d)\n",
                  node->daemon_pid);
         kill(node->daemon_pid, SIGINT);
-        int status;
-        waitpid(node->daemon_pid, &status, 0);
+
+        /* `waitpid` here CANNOT reap this daemon and never could: `daemonize`
+         * double-forks (`FORK` defaults to 2, daemonize.c), so `daemon_pid` names
+         * a grandchild that init has already adopted. waitpid returns -1/ECHILD
+         * immediately, which is why it went unnoticed — the call looked like it
+         * was doing the waiting and was doing nothing at all. Kept because a
+         * single-fork build (`-DFORK=1`) DOES make the daemon our child, and then
+         * this both reaps it and is the whole wait.
+         *
+         * Measured 2026-08-04: the daemon needs about 5.3 s to shut down, because
+         * it gives its own subsystem processes a grace period before SIGKILL. So
+         * without a wait, `at_node_shutdown` returned while the daemon was still
+         * running and still holding its sockets — and a host that stopped a node
+         * and immediately started another raced the corpse for the socket path.
+         * "Reap rather than orphan" was the intent at the call site in
+         * `at_node_start`; this makes it true. */
+        int status = 0;
+        (void)waitpid(node->daemon_pid, &status, 0);
+
+        /* Poll for actual exit, since ECHILD leaves us no event to block on. */
+        const int step_ms = 50;
+        int waited_ms = 0;
+        while (waited_ms < AT_DAEMON_EXIT_TIMEOUT_MS)
+        {
+            if (kill(node->daemon_pid, 0) == -1 && errno == ESRCH)
+                break;
+            usleep(step_ms * 1000);
+            waited_ms += step_ms;
+        }
+        if (kill(node->daemon_pid, 0) == 0)
+        {
+            /* Named, not papered over. Escalating to SIGKILL is deliberately NOT
+             * done here: the daemon may be mid-write to the identity or peer
+             * stores, and a corrupted store is worse than a lingering process.
+             * A caller that must have the pid back has it from
+             * `at_node_daemon_pid` and can make that choice itself. */
+            log_error(&node->log,
+                      "AT daemon (PID %d) has not exited %d ms after SIGINT; "
+                      "leaving it rather than risking SIGKILL mid-write\n",
+                      node->daemon_pid, AT_DAEMON_EXIT_TIMEOUT_MS);
+        }
+        else
+        {
+            log_info(&node->log, "AT daemon (PID %d) exited after %d ms\n",
+                     node->daemon_pid, waited_ms);
+        }
         node->daemon_alive = false;
     }
     log_info(&node->log, "%s exiting\n", node->config.app_name);

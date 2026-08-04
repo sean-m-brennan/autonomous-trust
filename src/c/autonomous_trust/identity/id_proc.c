@@ -5314,7 +5314,7 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
      * no such files is unchanged. See gateway-reputation-tree.md. */
     {
         char cfg_dir[CFG_PATH_LEN + 1];
-        if (get_cfg_dir(cfg_dir) > 0) {
+        if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) > 0) {
             int adopted = identity_load_child_groups(proc, cfg_dir);
             if (adopted > 0)
                 log_info(proc->logger,

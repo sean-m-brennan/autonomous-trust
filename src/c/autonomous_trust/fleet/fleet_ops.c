@@ -47,7 +47,7 @@ int fleet_store_artifact(const char *file_path, const char *version,
                          uint8_t *hash_out, char *hash_hex_out)
 {
     char data_dir[CFG_PATH_LEN + 1];
-    get_data_dir(data_dir);
+    get_data_dir(data_dir, sizeof(data_dir));
     artifact_store_init(data_dir);
 
     FILE *f = fopen(file_path, "rb");

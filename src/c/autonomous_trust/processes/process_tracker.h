@@ -121,17 +121,19 @@ int tracker_create(logger_t *logger, tracker_t **tracker_ptr);
 int tracker_from_file(const char *filename, logger_t *logger, tracker_t **tracker_ptr);
 
 /**
- * @brief
+ * @brief Build the path to the process-tracker config file.
  *
- * @param config_file
+ * @param[out] config_file  Destination buffer.
+ * @param destlen           Size of @p config_file in bytes. Pass `sizeof` it.
  * @return int
  */
 /*@
-  requires \valid(config_file + (0 .. CFG_PATH_LEN - 1));
-  assigns config_file[0 .. CFG_PATH_LEN - 1];
-  ensures \result >= 0;
+  requires destlen > 0;
+  requires \valid(config_file + (0 .. destlen - 1));
+  assigns config_file[0 .. destlen - 1];
+  ensures \result >= 0 || \result < 0;
 */
-int tracker_config(char config_file[]);
+int tracker_config(char *config_file, size_t destlen);
 
 /**
  * @brief Register a subsystem process
