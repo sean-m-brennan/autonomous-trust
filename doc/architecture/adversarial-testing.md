@@ -2,7 +2,7 @@
 
 # Adversarial Testing
 
-The adversarial testing framework validates the security claims of the AutonomousTrust protocol stack through five automated attack scenarios. Each scenario targets a specific vulnerability class — Sybil resistance, Byzantine fault tolerance, network partition recovery, reputation gaming resilience, and encryption integrity — and measures the protocol's response against a Phase 2 baseline collected from the Appalachian mesh simulation.
+The adversarial testing framework validates the security claims of the AutonomousTrust protocol stack through five automated attack scenarios. Each scenario targets a specific vulnerability class (Sybil resistance, Byzantine fault tolerance, network partition recovery, reputation gaming resilience, and encryption integrity) and measures the protocol's response against a Phase 2 baseline collected from the Appalachian mesh simulation.
 
 The framework is structured in two layers: a standalone Python layer that requires no external dependencies, and an optional CALDERA orchestration layer that adds MITRE ATT&CK-aligned scheduling and reporting.
 
@@ -43,7 +43,7 @@ flowchart TB
     Baseline --> Report
 ```
 
-## AttackScenario Interface
+## AttackScenario interface
 
 Each attack implements the `AttackScenario` base class with three methods:
 
@@ -59,7 +59,7 @@ The original design considered a per-timestep `execute()` callback, but none of 
 
 Partitions are defined as `PartitionEvent` dataclasses specifying a time window and two groups of peer IDs. The router checks the partition schedule on each timestep and activates or deactivates iptables DROP rules bidirectionally between the groups. The `finish()` override clears all partition rules before parent teardown.
 
-## Attack Scenarios
+## Attack scenarios
 
 | Scenario | Mechanism | Target Vulnerability | Expected AT Response |
 |----------|-----------|---------------------|---------------------|
@@ -71,15 +71,15 @@ Partitions are defined as `PartitionEvent` dataclasses specifying a time window 
 
 The Byzantine attack exploits two distinct quorum thresholds in the current Paxos implementation. The prepare phase requires `>= len(peers) // 2` grants, and the accept phase requires `> len(peers) // 2` acceptances. Neither meets the `> 2*peers/3` threshold required for Byzantine fault tolerance. A single Byzantine node in a group of three can break consensus at the prepare phase.
 
-The MITM analysis searches captured bytes for known AT message signatures — process names and function identifiers registered via `Protocol.register_handler()` (such as `'ask permission'` and `'transaction'`). It also attempts replay of captured packets to verify nonce-based rejection.
+The MITM analysis searches captured bytes for known AT message signatures: process names and function identifiers registered via `Protocol.register_handler()` (such as `'ask permission'` and `'transaction'`). It also attempts replay of captured packets to verify nonce-based rejection.
 
-## Harness Orchestration
+## Harness orchestration
 
 The harness accepts a list of `AttackScenario` instances and a base Appalachian scenario configuration. It loads the Phase 2 baseline from `baseline-results.json`, calls `setup()` on each scenario to modify the configuration, launches the simulation, collects metrics, calls `collect()` for attack-specific results, and compares post-attack metrics against the baseline. Output is a consolidated JSON report with per-attack results (`PASS`, `FAIL`, `ERROR`, or `NO_DATA`) and a human-readable markdown summary.
 
 A configurable wall-clock timeout (default: `--quick` duration plus 60 seconds grace) guards against hangs. If the simulation exits non-zero, the harness collects partial metrics and marks the attack as `ERROR`. If metrics collection fails entirely, container logs are attached under `NO_DATA`.
 
-## CALDERA Orchestration (Optional)
+## CALDERA orchestration (optional)
 
 MITRE CALDERA provides an optional scheduling and reporting layer. When enabled via the `--caldera` flag, it runs alongside the AT containers on the same Docker bridge network without replacing any attack logic.
 
@@ -100,13 +100,13 @@ flowchart LR
     N1 -- "caldera_bridge.py<br/>--action collect" --> CAL
 ```
 
-The key design constraint is that `AttackScenario.setup()` methods modify compose and simulation configuration **before** containers launch, while CALDERA abilities run **after** containers are up. Therefore all attack pre-configuration is baked into the Docker Compose YAML at generation time by `caldera_compose.patch_caldera()`. CALDERA abilities only invoke `collect()` — they gather attack-specific metrics from running containers via a CLI bridge (`caldera_bridge.py`). The bridge is a thin read-only dispatcher: it instantiates the appropriate `AttackScenario`, calls `collect()`, and prints JSON to stdout.
+The key design constraint is that `AttackScenario.setup()` methods modify compose and simulation configuration **before** containers launch, while CALDERA abilities run **after** containers are up. Therefore all attack pre-configuration is baked into the Docker Compose YAML at generation time by `caldera_compose.patch_caldera()`. CALDERA abilities only invoke `collect()`: they gather attack-specific metrics from running containers via a CLI bridge (`caldera_bridge.py`). The bridge is a thin read-only dispatcher: it instantiates the appropriate `AttackScenario`, calls `collect()`, and prints JSON to stdout.
 
 Only three attacks are CALDERA-orchestrated (Sybil, Byzantine, reputation gaming). The network partition attack operates at the Router level with no agent needed, and the MITM attack uses its own tcpdump sidecar.
 
 CALDERA failures are non-fatal. If sandcat agents do not register within 60 seconds or if an operation fails, the harness falls back to direct Python `collect()` calls with a warning. Metrics output is identical regardless of whether CALDERA is active.
 
-### IP Allocation
+### IP allocation
 
 | Address | Role |
 |---------|------|
@@ -115,7 +115,7 @@ CALDERA failures are non-fatal. If sandcat agents do not register within 60 seco
 | `10.27.3.11+` | AT peer nodes |
 | `10.27.3.30+` | Sybil attack nodes |
 
-## Known Vulnerabilities Targeted
+## Known vulnerabilities targeted
 
 The adversarial framework specifically targets three weaknesses in the current AT implementation:
 
