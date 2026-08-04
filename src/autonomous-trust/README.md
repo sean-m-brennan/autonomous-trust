@@ -48,7 +48,7 @@ Run `./at help` for the full command list (build, test, and run targets).
 Start here
 ----------
 
-New to AutonomousTrust? Read these in order. Each builds on the last.
+Read these in order; each builds on the last.
 
 1. **[Purpose](doc/concept.md)**: why AT exists, and the access model it replaces.
 2. **[Architecture](doc/architecture/README.md)**: how a node is built, from cryptographic identity through group formation, task negotiation, and reputation consensus.

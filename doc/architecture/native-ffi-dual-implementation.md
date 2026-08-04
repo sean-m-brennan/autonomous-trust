@@ -21,9 +21,10 @@ FFI boundary and its drift guard, and the embedded/microdrone runtime.
 > native backend is selected, and (b) as the standalone `at_demo` daemon for
 > embedded ARM microdrones, which interoperate on the wire with the Python
 > nodes. Feature-wise the native C code currently leads Python in some areas
-> (e.g. the ZTA background process — see [ZTA Python Parity](zta-python-parity.md))
-> and Python leads C in others (e.g. recursive subtree reputation — see
-> [Gateway Reputation Tree](gateway-reputation-tree.md), Phase 3 deferred).
+> (e.g. the ZTA background process, see [ZTA Python Parity](zta-python-parity.md))
+> and Python leads C in others (e.g. recursive subtree reputation, see
+> [Gateway Reputation Tree](gateway-reputation-tree.md), whose phase 3 is the
+> C-parity half).
 
 ## 1. Backend selection
 
@@ -66,7 +67,7 @@ queue-based IPC the C side does not yet provide.
 `NativeAutonomousTrust` (`_native/_automate_native.py`) is a separate, low-level
 wrapper around the C `run_autonomous_trust()` daemon entry point, intended for
 future use when the C library is built with `-DFORK=0` (no double-fork). It is
-**not** the default runtime path — the standalone C daemon is used by the
+**not** the default runtime path: the standalone C daemon is used by the
 embedded build (§5), not by the in-CPython native backend.
 
 ## 3. The FFI boundary
@@ -97,9 +98,9 @@ cheap, dependency-free static check that compares the `cdef` in `_ffi.py`
 against the authoritative C header prototypes in `src/c` and reports any
 function whose **argument count** disagrees:
 
-- **DANGEROUS** — drift in a function a `_native` wrapper actually calls
+- **DANGEROUS**: drift in a function a `_native` wrapper actually calls
   (`lib.<name>(...)`): a latent segfault → exit 1.
-- **LATENT** — drift in a `cdef`-only function nothing calls from Python yet:
+- **LATENT**: drift in a `cdef`-only function nothing calls from Python yet:
   reported, fails only under `--strict`.
 
 It runs without the conda env, so it is safe as a fast pre-build gate in
@@ -108,7 +109,7 @@ It runs without the conda env, so it is safe as a fast pre-build gate in
 ## 5. Embedded / microdrone runtime
 
 The embedded target runs the **standalone C daemon** (`at_demo`,
-`examples/demo/src/at_demo.c`) — no Python on the device.
+`examples/demo/src/at_demo.c`): no Python on the device.
 
 - **Build:** `embedded/build-arm.sh` cross-compiles `at_demo` for ARM64 (and
   optionally AMD64) via `docker buildx`, producing architecture-specific
@@ -123,7 +124,7 @@ The embedded target runs the **standalone C daemon** (`at_demo`,
 ## 6. Cross-runtime interoperability
 
 C and Python nodes interoperate on **live UDP**. The contract they must both
-honor is the **DRY canonical wire form** — a flat-dict JSON shape that is
+honor is the **DRY canonical wire form**: a flat-dict JSON shape that is
 byte-parseable by C (Python's default `ConfigJSONEncoder` form, with
 `__type__`/`_uuid` markers and a base64-wrapped hex seed, is *not* parseable by
 C). Identity and `Group` objects expose `to_canonical()`/`from_canonical()` for

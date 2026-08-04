@@ -1,12 +1,12 @@
 # Persistent Cohort State
 
-How a node's identity, peer table, and reputation survive a restart —
+How a node's identity, peer table, and reputation survive a restart,
 and how the DoD mission demo pre-seeds the squad / microdrone / jet
 cohort with mutual trust so they boot in a high-trust network.
 
 **What "warm-start" means.** A warm-started peer is one whose reputation
 is *a memory of its prior AT-bounded activity that becomes operational
-again at machine start-up* — the score it already earned through observed
+again at machine start-up*: the score it already earned through observed
 AT-mediated transactions, persisted here and reloaded into the live
 reputation store on restart, rather than re-earned from neutral on every
 reboot. It is not a trust grant and not an allow-list; the reloaded score
@@ -14,7 +14,7 @@ is bound to the same cryptographic identity and stays under continuous
 re-evaluation (any transaction can move it; the slashing fast-path can
 floor it). What keeps the shortcut honest is that **re-loaded trust is
 stale trust, and stale trust decays** toward almost-neutral with time out
-of contact — see §3.1 and [Reputation › Staleness decay](reputation.md).
+of contact, see §3.1 and [Reputation › Staleness decay](reputation.md).
 
 ## 1. What gets persisted
 
@@ -29,7 +29,7 @@ on each relevant state change:
 | `peer-capabilities.cfg.json` | `IdentityProcess._record_peers` | On capability announcement | `{capability_name: [peer_uuids]}` |
 | `reputation.cfg.json` | `ReputationProcess._persist_reputations` | After every `_compute_reputation()` call | `{peer_uuid: float}` |
 
-JSON is pretty-printed (`indent=2`) — diff-friendly, hand-editable for
+JSON is pretty-printed (`indent=2`): diff-friendly, hand-editable for
 debugging.
 
 ## 2. The >0.5 reputation gate
@@ -46,7 +46,7 @@ Self is always included regardless of score.
 Tier 1 corresponds to score ≥ 0.50 per `ReputationProcess.TIER_FLOORS`,
 so the on-disk snapshots agree on which peers count as "trusted".
 
-The in-memory peer table is *not* filtered — only the saved snapshot
+The in-memory peer table is *not* filtered: only the saved snapshot
 is. A peer that drifts below 0.5 mid-session is still tracked +
 scored in the live process; it just doesn't survive a restart.
 
@@ -66,7 +66,7 @@ tail-of-loop persistence:
 - `IdentityProcess.process` → final `_record_group()` + `_record_peers()`
 
 `SIGINT` (Ctrl-C) was already handled via `KeyboardInterrupt` in the
-autonomous loop; SIGTERM is the new path — `kubectl delete pod`,
+autonomous loop; SIGTERM is the new path: `kubectl delete pod`,
 `docker stop`, `tilt down`, supervisor restart all go through it.
 
 ### 3.1 Staleness: warm-start memory fades
@@ -74,21 +74,21 @@ autonomous loop; SIGTERM is the new path — `kubectl delete pod`,
 A reloaded reputation is a *memory*, so it is not trusted indefinitely.
 `ReputationProcess` relaxes an idle peer's operational reputation toward
 *almost-but-not-quite neutral* (`0.51`, just above `0.50`) as a function
-of time since the last transaction with that peer — eroding earned trust
+of time since the last transaction with that peer: eroding earned trust
 above the asymptote while leaving a distrusted/corrupt node's low score
 untouched (decay is asymmetric: absence never rehabilitates a bad actor;
 slashed peers and self are never decayed). The time the peer spent out of
 contact **while the node was down counts**: `_seed_idle_from_snapshot`
 reads `reputation.cfg.json`'s mtime as the instant of last activity and
 applies the offline-gap decay at start-up, so a long-dormant cohort warm-
-starts with faded — not stale-inflated — trust. A peer's *elevated* tier
-(2–4) thus lapses over a long absence and must be re-earned on contact,
+starts with faded (not stale-inflated) trust. A peer's *elevated* tier
+(2-4) thus lapses over a long absence and must be re-earned on contact,
 while tier 1 (presence) persists. Tunable via `REPUTATION_DECAY_*` in
 `repprocess.py`. Local-view only (wall-clock driven, never on the wire),
 so the conformance corpus is unaffected. Full rationale in
 [Reputation › Staleness decay](reputation.md).
 
-**Planned hardening — floor, not full restoration (design, not yet
+**Planned hardening: floor, not full restoration (design, not yet
 implemented).** Decay covers *time out of contact* but not the orthogonal
 *"this session hasn't re-validated you yet"* axis: a recently-active peer
 with little decay is restored to its full earned tier the instant it is
@@ -126,7 +126,7 @@ Everyone else cold-bootstraps:
 dir before the demo brings any containers up. For every peer in
 {`squad-*`, `microdrone-*`, `jet-*`}:
 
-1. Generate (or reload — idempotent unless `--force`) a fresh Ed25519
+1. Generate (or reload: idempotent unless `--force`) a fresh Ed25519
    + X25519 keypair, write `identity.cfg.json`.
 2. Construct one shared `Group` with all seeded peers in its
    address map; write its `group.cfg.json` into every seeded peer's dir
@@ -139,7 +139,7 @@ dir before the demo brings any containers up. For every peer in
    bootstrap capability list per peer.
 
 ```bash
-# Default — writes to .demo-state/dod-mission/
+# Default: writes to .demo-state/dod-mission/
 python -m tools.seed_dod_cohort
 
 # Custom out + larger swarm
@@ -162,8 +162,8 @@ receivers' peer tables update accordingly.
 
 ### 4.3 Disabling the seed
 
-Set `AT_PRESEED=0` before `run-demo.sh` to skip the seed step entirely
-— useful for testing the bare handshake / Sybil-rejection paths without
+Set `AT_PRESEED=0` before `run-demo.sh` to skip the seed step entirely:
+useful for testing the bare handshake / Sybil-rejection paths without
 the warm start. Set `AT_PRESEED_FORCE=1` to regenerate identities even
 on a re-run (default is to preserve so warm restarts stay consistent).
 
@@ -196,7 +196,7 @@ PYTHONPATH=src/autonomous-trust:src/autonomous-trust-services:src/autonomous-tru
   src/autonomous-trust/.venv/bin/python -m pytest \
     examples/dod_mission/test_persistent_cohort.py -v
 
-# 4. Bring the demo up — peers warm-start from the seed.
+# 4. Bring the demo up: peers warm-start from the seed.
 scripts/run-demo.sh --variant=dod-mission --tilt
 ```
 
