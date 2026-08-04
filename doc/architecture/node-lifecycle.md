@@ -2,7 +2,7 @@
 
 # Node Lifecycle
 
-## Startup Sequence
+## Startup sequence
 
 When `AutonomousTrust.run_forever()` is called, the node goes through a deterministic startup sequence before entering its active state.
 
@@ -18,7 +18,7 @@ When `AutonomousTrust.run_forever()` is called, the node goes through a determin
 
 6. **Active**: All subsystems run concurrently. The orchestrator enters `autonomous_loop`.
 
-## State Diagram
+## State diagram
 
 ```mermaid
 stateDiagram-v2
@@ -70,7 +70,7 @@ stateDiagram-v2
     Shutdown --> [*]: sig_quit to all processes
 ```
 
-## Active State
+## Active state
 
 In the active state, four activities run concurrently:
 
@@ -82,9 +82,9 @@ In the active state, four activities run concurrently:
 Two further mechanisms run as backstops in the active state:
 
 - **Bootstrap corpus** (`BootstrapWorker`): drives the bilateral bootstrap-capability exchanges that warm up a freshly-admitted peer's transaction history. See [Trust Tiers §6](trust-tiers.md).
-- **Resync sweeps** (Identity): periodic caps-resync and identity-resync queries that backfill state lost to dropped UDP — capabilities for admitted-but-capless peers, and Identities for group addresses with no known peer object. See [Partition Recovery §12](partition-recovery.md).
+- **Resync sweeps** (Identity): periodic caps-resync and identity-resync queries that backfill state lost to dropped UDP, capabilities for admitted-but-capless peers, and Identities for group addresses with no known peer object. See [Partition Recovery §12](partition-recovery.md).
 
-## Post-admission Recovery
+## Post-admission recovery
 
 Admission is not assumed to be lossless. A new peer can end up *admitted* (in the group address map) yet missing either its capabilities (`caps_query`/response dropped) or, for a late/cold joiner, the Identity objects of co-members. Two periodic Identity sweeps converge these:
 
@@ -93,6 +93,6 @@ Admission is not assumed to be lossless. A new peer can end up *admitted* (in th
 
 These are the "layer 3" of partition recovery; their state machine and the symmetric **probe-adopt** merge path are documented in [Partition Recovery](partition-recovery.md).
 
-## Process Monitoring
+## Process monitoring
 
 The orchestrator monitors subprocess health each tick via `_monitor_processes()`. If a process terminates unexpectedly (its `AsyncResult` becomes ready), the exception is logged and the process name is added to `_stopped_procs` to prevent repeated error logging.

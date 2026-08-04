@@ -18,7 +18,7 @@ default; when it is off, the transport behaves exactly as it always has, one
 > per-message node interoperate on the same network (see
 > [Interoperability](#interoperability)).
 
-## Why Pooling Exists
+## Why pooling exists
 
 Without pooling, `TCPNetworkProcess` opens a TCP connection for every
 application message: `socket()`, `connect()`, send one length-prefixed frame,
@@ -32,7 +32,7 @@ continuous slice of CPU, independent of the poll cadence. Pooling reuses a
 connection across many messages, so in steady state the handshake rate drops
 from roughly one per message to roughly one per peer per idle period.
 
-## Framing Is Unchanged
+## Framing is unchanged
 
 Each message is a 4-byte big-endian length prefix followed by that many bytes
 of payload (`struct.pack('!I', len)` + body). A pooled connection simply
@@ -41,7 +41,7 @@ frame at a time, so a persistent reader is the same read logic called in a
 loop. Because the bytes on the wire are identical either way, the conformance
 corpus (which pins message bytes, not connection lifecycle) is unaffected.
 
-## Send Side: The Connection Pool
+## Send side: the connection pool
 
 `TCPNetworkProcess` keeps a pool keyed by destination:
 
@@ -93,7 +93,7 @@ longer than the TTL, so the pool does not hold file descriptors open for peers
 that have gone quiet. A live-connection cap bounds the pool size directly; when
 a new destination would exceed it, the oldest idle connection is evicted first.
 
-## Receive Side: Persistent Readers
+## Receive side: persistent readers
 
 When a sender keeps its connection open and streams frames, the receiver cannot
 go back to `accept` after a single read. With pooling on, `start_receivers`
@@ -185,7 +185,7 @@ rate should fall well below the message rate.
 | `net.tcp.{peer,group}/drop` | Inbound connection refused (own address, blacklist, or cap). |
 | `net.tcp.reader/open`, `net.tcp.reader/close` | Persistent reader started or exited (close carries a reason). |
 
-## Failure Handling
+## Failure handling
 
 - **Half-open or reset sockets** on the send side are caught by the
   reconnect-once retry, backed by keepalive for connections that sit idle.

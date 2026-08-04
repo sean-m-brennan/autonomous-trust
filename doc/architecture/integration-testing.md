@@ -4,7 +4,7 @@
 
 The simulator's integration testing framework runs real AutonomousTrust processes over terrain-aware simulated networks and measures protocol performance under realistic mesh conditions. An Appalachian mountain scenario serves as the reference topology, with 20 nodes (8 hilltop relays, 12 valley endpoints) deployed across Braxton County, West Virginia.
 
-## Component Overview
+## Component overview
 
 | Component | Module | Purpose |
 |-----------|--------|---------|
@@ -41,9 +41,9 @@ The collector tracks four metrics derived from protocol message streams:
 
 On shutdown, the collector writes a JSON report to a configurable output path.
 
-## Appalachian Compose Generator
+## Appalachian Compose generator
 
-The compose generator wraps `gen_compose.generate_compose()` and patches the output YAML to add scenario-specific metadata. Each Docker service is renamed to its Appalachian node identifier and receives environment variables for coordinates, elevation, antenna tier, and terrain configuration path. Existing properties from `gen_compose` -- IP assignment (`172.27.3.{10+i}`), staggered startup delays, backend selection, and `NET_ADMIN` capability -- are preserved.
+The compose generator wraps `gen_compose.generate_compose()` and patches the output YAML to add scenario-specific metadata. Each Docker service is renamed to its Appalachian node identifier and receives environment variables for coordinates, elevation, antenna tier, and terrain configuration path. Existing properties from `gen_compose` (IP assignment (`172.27.3.{10+i}`), staggered startup delays, backend selection, and `NET_ADMIN` capability) are preserved.
 
 ```python
 def generate_appalachian_compose(
@@ -54,7 +54,7 @@ def generate_appalachian_compose(
 ) -> str: ...
 ```
 
-## System Topology
+## System topology
 
 ```mermaid
 flowchart TB
@@ -76,7 +76,7 @@ flowchart TB
     MC -- "JSON report" --> Report["metrics.json"]
 ```
 
-## Verification Strategy
+## Verification strategy
 
 Testing is layered to separate protocol correctness from infrastructure concerns:
 
@@ -85,7 +85,7 @@ Testing is layered to separate protocol correctness from infrastructure concerns
 
 Both layers assert against the same metric targets.
 
-## Metrics Targets
+## Metrics targets
 
 | Metric | Target | Rationale |
 |--------|--------|-----------|
@@ -100,7 +100,7 @@ Both layers assert against the same metric targets.
 - **Docker daemon**: Required for the system test and the `test-simulation.sh` orchestration script.
 - **conda environment** (`muudd_simulation`): All AT packages installed.
 
-## Integration Points
+## Integration points
 
 - MetricsCollector plugs into the process system via `ProcMeta`, identical to any other AT subsystem. It is listed as optional in `subsystems.cfg.json` and loaded only when the scenario configuration includes it.
 - `appalachian_compose.py` imports `gen_compose.generate_compose()` directly, adding no new Docker abstractions.

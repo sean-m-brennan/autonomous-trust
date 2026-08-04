@@ -1,4 +1,4 @@
-# Identity & Reputation vs. Typical Blockchain — Architecture
+# Identity & Reputation vs. Typical Blockchain: Architecture
 
 > Status: Implemented. Describes the **current** state of the code, grounded in
 > `src/autonomous-trust/autonomous_trust/core/_python/{identity,reputation,structures}`
@@ -9,8 +9,8 @@
 > History: this began as a review of how the reputation subsystem compared to
 > "typical" blockchains, prompted by the dod_mission "mq800 stuck at 0.5"
 > reputation bug. The three improvements it recommended for the reputation chain
-> — slashing-style fast penalties, hash/Merkle-linking, and a quorum-signed
-> finality artifact — have since been implemented (Phases 0–3 below). This
+> (slashing-style fast penalties, hash/Merkle-linking, and a quorum-signed
+> finality artifact) have since been implemented (Phases 0-3 below). This
 > document now records what the code does and why, rather than proposing it.
 
 ## Key distinction up front
@@ -20,8 +20,8 @@ a Merkle tree (`MerkleTree`, `root_digest`, `inclusion_proof`/`audit` in
 `structures/merkle.py`) over a StepDAG of Merkle-root history with Ed25519-signed
 steps.
 
-The **reputation** chain is a deliberately different animal — a bounded,
-evicting, derive-on-read evidence log — but it is **no longer cryptographically
+The **reputation** chain is a deliberately different animal (a bounded,
+evicting, derive-on-read evidence log) but it is **no longer cryptographically
 naked**. A committed `Transaction` now carries a `prev_hash` (hash-linked
 chain), the resident window has an RFC 6962 Merkle root (`window_root`) that a
 quorum co-signs into a `Checkpoint`, and provable misbehavior is punished by a
@@ -44,7 +44,7 @@ because the system sits in neither cleanly.
   Finality is *immediate on majority-accept*, not probabilistic-after-N-confirmations.
   No mining, no token, no gas, no fork-choice-by-work.
 - **Group-scoped, not global.** Each group keeps its *own* chain (`self.history`,
-  plus `child_histories` for gateways). There is no single canonical world-state —
+  plus `child_histories` for gateways). There is no single canonical world-state:
   the "ledger" is plural and local.
 - **Bounded, evicting chain.** A blockchain is append-only-forever and immutable;
   this is a *sliding window that forgets* (`max_chain_len`, `_evict_oldest`,
@@ -54,7 +54,7 @@ because the system sits in neither cleanly.
   evidence; the reputation number is *computed on read* (EMA / CTFT / pure). That's
   event-sourcing, not account-state.
 - **Bilateral, mutual attestations.** A `Transaction` commits only with *both* `p1`
-  and `p2` scores — a two-party handshake, not a single-signer transfer.
+  and `p2` scores: a two-party handshake, not a single-signer transfer.
 - **Integrity now rests on the artifact as well as the live protocol.** Entries are
   admitted by signed Paxos votes *and* are hash-linked (`Transaction.prev_hash` =
   `entry_hash` of the predecessor), so the catch-up sync verifies link continuity
@@ -70,9 +70,9 @@ This side is close to blockchain norms and well-built:
   selected per-identity via `block_impl`. **Default: PoA** (`AgreementImpl.POA`,
   `core/_python/system.py`; `idprocess.py` builds `IdentityByAuthority(..., 2)`).
   The default PoA is **reputation-tied** (BUGS.md §P2): authority weight auto-rises
-  as a peer earns rank — a reputation feedback loop even in the default.
+  as a peer earns rank, a reputation feedback loop even in the default.
 - Ed25519-signed votes; key/UUID collision rejection; group-key rotation.
-- **PoS uses reputation as stake weight** (`reputation_fn` → stake) — reputation
+- **PoS uses reputation as stake weight** (`reputation_fn` → stake): reputation
   already feeds back into identity admission.
 - The Merkle layer provides **SPV-style light proofs** (`inclusion_proof` / `audit`).
 
@@ -109,7 +109,7 @@ sub-protocol is *verifiable* rather than merely social:
   `blake2b(canonical_bytes ‖ prev_hash)` over a language-agnostic serialization
   (pipe-joined fields, `%.17g` floats, lowercase-hyphenated UUIDs). `verify_chain_links`
   rejects any segment whose adjacent `prev_hash`/`entry_hash` linkage is broken, and
-  `catchup()` runs it before replaying a received segment — so a peer (or a corrupted
+  `catchup()` runs it before replaying a received segment, so a peer (or a corrupted
   transfer) cannot slip an altered committed entry past the sync. C twin:
   `transaction_entry_hash` / `tx_verify_chain_links` (byte-identical).
 
@@ -119,14 +119,14 @@ sub-protocol is *verifiable* rather than merely social:
   ambiguity). It is a pure function of the ordered leaf digests, so it is
   byte-identical to the C twin `transaction_window_root`. `inclusion_proof(index)` /
   `verify_inclusion()` (C: `transaction_window_proof` / `tx_merkle_verify`) give an
-  `O(log n)` membership proof — the primitive a gateway parent uses to verify a
+  `O(log n)` membership proof, the primitive a gateway parent uses to verify a
   child-group score without holding the whole child chain, and the anchor for the
   slash evidence of §2.3.
 
 - **Quorum-signed checkpoints (Phase 2).** A node proposes a `Checkpoint` over its
   `window_root` (`checkpoint_propose`); a member co-signs (`checkpoint_sign`) **only
   if its own `window_root` matches**, so a finalized `SignedCheckpoint`
-  (`checkpoint_final`) certifies that a quorum observed the same committed window — a
+  (`checkpoint_final`) certifies that a quorum observed the same committed window: a
   lightweight finality gadget over the BFT chain, and the trust anchor for slash
   evidence. State: `_checkpoint` / `_checkpoint_sigs` / `_checkpoint_pending`. C twin:
   `REP_PROTO_CHECKPOINT_*` handlers + `checkpoint_root`/`checkpoint_sigs`/`checkpoint_pending`.
@@ -138,9 +138,9 @@ sub-protocol is *verifiable* rather than merely social:
 
 ### 2.2 Slashing-style fast penalties (the mq800 fix)
 
-In PoS, *provable* misbehavior triggers an immediate, heavily-weighted penalty — it
+In PoS, *provable* misbehavior triggers an immediate, heavily-weighted penalty: it
 does not wait for a slow average to drift. The reputation EMA (`CONSENSUS_EMA_HALF_LIFE`,
-~20 txs) is the opposite, and could never react to a ~30-second rogue — the original
+~20 txs) is the opposite, and could never react to a ~30-second rogue: the original
 "mq800 stuck at 0.5" symptom.
 
 A **slashing fast-path (Phase 0)** fixes this. A detector broadcasts a
@@ -149,10 +149,10 @@ detector broadcasts a `SignedSlash` (`slash_final`) and every node *floors* the
 target's reputation at the top of `_consensus_reputation` / `_compute_reputation`,
 bypassing the chain/EMA entirely. Reasons: `sustained_anomaly`, `peer_exclude`,
 `invalid_tx`, `rehabilitate`. Rehabilitation deliberately lifts only the hard floor
-(`_slashed`) — the floored value persists in `self.reputations` as the cold-start
+(`_slashed`): the floored value persists in `self.reputations` as the cold-start
 prior, so a rehabilitated peer must *earn* its standing back through new committed
 transactions rather than snapping to neutral. C twin: `_apply_slash_locked` +
-`REP_PROTO_SLASH_*` handlers. This is the principled "detection-driven floor" — a
+`REP_PROTO_SLASH_*` handlers. This is the principled "detection-driven floor": a
 PoS-style penalty / PKI-style revocation, not a tuning tweak.
 
 ### 2.3 Evidence-gated slashing (Merkle proof verification)
@@ -174,7 +174,7 @@ Global immutable ledger, PoW, single canonical world-state, permanent history. T
 domain (edge / space / DoD mesh: intermittent links, partitions, small-memory nodes)
 is the textbook case where those are *wrong*. The bounded evicting chain,
 group-scoping, and AP-leaning gossip are correct CAP choices. The bounded chain is a
-**feature** — and its consequence (reputation history is lossy) is exactly why the
+**feature**, and its consequence (reputation history is lossy) is exactly why the
 slashing fast-path for negative evidence exists, rather than relying on the chain to
 "remember and average."
 
@@ -188,22 +188,23 @@ batching. So L2 is the right answer for "score 100 field peers through 2 gateway
 hops," and the *wrong* answer for "make the rogue crater in 30 s" (that was the
 slashing fast-path of §2.2, now implemented).
 
-Status of the scale/throughput directions:
+The scale and throughput directions:
 
-- **Gateway reputation tree (in progress).** Child-group chains roll up into a parent.
-  With the Phase 2 Merkle checkpoints now in place, a gateway can post a child chain's
+- **Gateway reputation tree.** Child-group chains roll up into a parent.
+  On the Merkle checkpoints of phase 2, a gateway can post a child chain's
   **quorum-signed `window_root`** to the parent, and the parent can verify a child
-  score by inclusion proof (`verify_inclusion`) instead of holding child history — a
+  score by inclusion proof (`verify_inclusion`) instead of holding child history: a
   validity-rollup in all but name. See `doc/architecture/gateway-reputation-tree.md`.
 - **State channels (future).** Peer ⇄ coordinator could exchange signed score deltas
   off-chain and settle a checkpoint periodically, collapsing N decimated Paxos rounds
-  into one commit. Fits the bilateral-transaction model; not yet implemented.
+  into one commit. Fits the bilateral-transaction model; not built, and carried in
+  [`ISSUES.md`](../../ISSUES.md) §10.4.
 - **Anti-entropy gossip / CRDTs (future).** Push committed-tx digests, pull missing
-  entries, CRDT-merge observations — converges faster than the top-3 sync and ties into
+  entries, CRDT-merge observations: converges faster than the top-3 sync and ties into
   the partition-recovery work.
 - **ZK / verifiable-credential "reputation passports" (future).** The ZKP build path
-  exists; a signed, verifiable attestation of standing — checkable without chain replay
-  — would speed cross-group and post-partition warm-start.
+  exists; a signed, verifiable attestation of standing (checkable without chain replay)
+  would speed cross-group and post-partition warm-start.
 
 ---
 
@@ -213,13 +214,13 @@ The reputation system stays non-blockchain where that is a deliberate CAP choice
 (bounded, group-scoped, derive-on-read), while having adopted the three things from
 "typical" implementations that genuinely help here:
 
-1. **Hash-linking + Merkle checkpoints** (Phase 1–2) — reputation history is now
+1. **Hash-linking + Merkle checkpoints** (Phase 1-2): reputation history is now
    auditable and the catch-up sync is verifiable; checkpoints give inclusion proofs for
    the gateway rollup.
 2. **A quorum-signed finality artifact** (`Checkpoint`/`SignedCheckpoint`) over the
    committed window.
 3. **Slashing-style fast penalties** (Phase 0), hardened with **checkpoint-verified
-   Merkle evidence** (Phase 3) — the principled resolution of the mq800
+   Merkle evidence** (Phase 3): the principled resolution of the mq800
    "short-lived rogue never drops off baseline" bug.
 
 **L2 patterns** (Merkle-root gateway rollup, state channels, gossip/CRDT, ZK passports)
