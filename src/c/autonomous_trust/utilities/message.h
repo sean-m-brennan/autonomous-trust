@@ -98,6 +98,29 @@ typedef struct
 int messaging_init(const char *id, queue_t *queue);
 
 /**
+ * @brief Is a queue with this key actually bound — i.e. is somebody listening?
+ *
+ * The readiness question a host needs and could not previously ask. A forked
+ * daemon exists long before its message loop binds anything: measured, about
+ * **170-210 ms** separate `at_app_node_start` returning from the daemon's inbound
+ * queue appearing, and for that whole window the process is alive and nothing
+ * sent to it arrives. `at_app_node_alive` truthfully reports a running process
+ * and says nothing about reachability; this answers the other half.
+ *
+ * Probes with `connect` on a throwaway datagram socket rather than checking that
+ * the socket file exists, because a daemon that died leaves the file behind and a
+ * file check would call that ready. Sends nothing; has no effect on a listener.
+ *
+ * @param key Queue name.
+ * @return true if a socket is bound at that key's path.
+ */
+/*@
+  requires key != \null && \valid_read(key);
+  assigns \nothing;
+*/
+bool messaging_bound(const char *key);
+
+/**
  * @brief Identify the queue that belong to this process.
  *
  * @param queue Queue object

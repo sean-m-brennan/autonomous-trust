@@ -780,7 +780,7 @@ int zta_process_run(process_t *proc, directory_t *queues,
 
     /* Init audit log */
     char data_dir[CFG_PATH_LEN];
-    get_data_dir(data_dir);
+    get_data_dir(data_dir, sizeof(data_dir));
     char audit_path[CFG_PATH_LEN + 32];
     snprintf(audit_path, sizeof(audit_path), "%s/zta_audit.jsonl", data_dir);
     if (zta_audit_init(&zta_state.audit, audit_path) != 0) {

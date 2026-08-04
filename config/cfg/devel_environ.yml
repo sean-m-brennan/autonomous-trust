@@ -38,8 +38,9 @@ dependencies:
   - curl
   - libffi
   - pandoc
-  - conda-pypi::mermaid-cli    # core: docs diagram rendering
-  - conda-pypi::jcs            # core: JSON canonicalization (conformance / identity)
+  # Uncomment and remove pip entries once conda-pypi is mainstream
+  #- conda-pypi::mermaid-cli    # core: docs diagram rendering
+  #- conda-pypi::jcs            # core: JSON canonicalization (conformance / identity)
 
   # C / C++ toolchain + coverage (the C library build)
   - git
@@ -77,6 +78,7 @@ dependencies:
 
   - pip
   - pip:
+      - mermaid-cli
       - jcs  # conformance: JSON Canonicalization Scheme, used by
              # harness/common/canonical.py to compare and regenerate the
              # byte-pinned wire vectors. No conda-forge package (checked).

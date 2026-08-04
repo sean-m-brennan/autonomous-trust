@@ -195,12 +195,25 @@ a non-allowlisted inbound verb refused.
 Full suite: **82/82** (`ctest`), library **0 warnings**, up from an 81/81
 baseline.
 
-**Not verifiable in-sandbox:** a live-daemon end-to-end run. The daemon aborts
-with `*** stack smashing detected ***` during startup here — including on the
-unmodified `at_demo -g` path, which touches none of this code — so break #4's
-fix is verified at the mechanism level (real sockets, matching and mismatched
-names) but not against a running daemon. See ISSUES.md §2.1.1, which records
-that the abort does not reproduce on a host machine.
+**~~Not verifiable in-sandbox:~~ verifiable in-sandbox since 2026-08-04.** This
+said a live-daemon end-to-end run was impossible here, because the daemon aborted
+with `*** stack smashing detected ***` during startup — including on the
+unmodified `at_demo -g` path — and ISSUES.md §2.1.1 recorded that the abort did
+not reproduce on a host machine.
+
+**That was a real overflow, not an environment quirk.** §2.1.1 is now RESOLVED:
+`get_data_dir` told `path_join` its destination held 255 bytes when `unix_addr`'s
+holds 108, so a long `$AUTONOMOUS_TRUST_ROOT` wrote past the end of the caller's
+stack frame. Short root paths hide it, which is the whole of why a host machine
+looked fine. With the bound fixed, a live `start → poll → stop` runs clean in this
+sandbox, so break #4's fix is now verified against a running daemon here as well
+as at the mechanism level.
+
+**Worth keeping as a lesson about attribution:** an environment that reproduces a
+crash the developer's machine does not is evidence about the *input*, not proof
+about the environment. The band worth remembering is 91–98 bytes of root path,
+where the same defect silently bound a **different socket name** and reported
+success.
 
 **Verified on a host, 2026-07-30:** the end-to-end run this blocked is done — a
 3-node cohort, all seven breaks confirmed fixed against a live daemon. See "What

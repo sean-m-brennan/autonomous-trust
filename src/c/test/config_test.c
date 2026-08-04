@@ -22,6 +22,7 @@
 #include <limits.h>
 
 #include "autonomous_trust/config/configuration.h"
+#include "autonomous_trust/processes/process_tracker.h"
 #include "autonomous_trust/utilities/logger.h"
 
 extern int config_absolute_path(const char *path_in, char *path_out);
@@ -40,7 +41,7 @@ DEFINE_TEST(test_get_cfg_dir)
     setenv("AUTONOMOUS_TRUST_ROOT", "/tmp/at_test", 1);
 
     char path[256] = {0};
-    int len = get_cfg_dir(path);
+    int len = get_cfg_dir(path, sizeof(path));
     ck_assert(len > 0);
     ck_assert_str_eq(path, "/tmp/at_test/etc/at");
 
@@ -53,7 +54,7 @@ DEFINE_TEST(test_get_data_dir)
     setenv("AUTONOMOUS_TRUST_ROOT", "/tmp/at_test", 1);
 
     char path[256] = {0};
-    int len = get_data_dir(path);
+    int len = get_data_dir(path, sizeof(path));
     ck_assert(len > 0);
     ck_assert_str_eq(path, "/tmp/at_test/var/at");
 
@@ -68,8 +69,8 @@ DEFINE_TEST(test_get_dirs_empty_root)
 
     char cfg_path[256] = {0};
     char data_path[256] = {0};
-    int len1 = get_cfg_dir(cfg_path);
-    int len2 = get_data_dir(data_path);
+    int len1 = get_cfg_dir(cfg_path, sizeof(cfg_path));
+    int len2 = get_data_dir(data_path, sizeof(data_path));
     ck_assert(len1 > 0);
     ck_assert(len2 > 0);
     /* Should contain the relative paths */
@@ -128,7 +129,7 @@ DEFINE_TEST(test_config_absolute_path_rejects_traversal)
     setenv("AUTONOMOUS_TRUST_ROOT", "/tmp/at_test", 1);
 
     char cfg_dir[CFG_PATH_LEN + 1] = {0};
-    ck_assert(get_cfg_dir(cfg_dir) > 0);
+    ck_assert(get_cfg_dir(cfg_dir, sizeof(cfg_dir)) > 0);
     size_t cfg_dir_len = strlen(cfg_dir);
 
     const char *attacks[] = {
@@ -203,8 +204,88 @@ DEFINE_TEST(test_load_config_cfg_name_bounded)
 }
 END_TEST_DEFINITION()
 
+/* The defect these cover is ISSUES.md §2.1.1: both functions hardcoded 255 as
+ * path_join's destination length while taking an unsized `char path[]`, so
+ * path_join's own correct bounds check ran against a number that had nothing to do
+ * with the caller's buffer. unix_addr passes 108 bytes, and a long
+ * AUTONOMOUS_TRUST_ROOT therefore wrote past the end of its stack frame. */
+
+DEFINE_TEST(test_get_dirs_respect_the_destlen_they_are_given)
+{
+    setenv("AUTONOMOUS_TRUST_ROOT", "/tmp/at_test", 1);
+
+    /* "/tmp/at_test/var/at" is 19 chars + NUL. A buffer that cannot hold it must
+     * be refused, not filled past its end — and the refusal has to be visible,
+     * because the caller cannot see the length it did not supply. */
+    char exact[20] = {0};
+    ck_assert((get_data_dir(exact, sizeof(exact))) > 0);
+    ck_assert_str_eq(exact, "/tmp/at_test/var/at");
+
+    char one_short[19];
+    memset(one_short, 'Z', sizeof(one_short));
+    ck_assert((get_data_dir(one_short, sizeof(one_short))) < 0);
+    ck_assert_int_eq(one_short[0], '\0');   /* refused, and says so in the buffer */
+
+    char tiny[4];
+    memset(tiny, 'Z', sizeof(tiny));
+    ck_assert((get_cfg_dir(tiny, sizeof(tiny))) < 0);
+    ck_assert_int_eq(tiny[0], '\0');
+
+    unsetenv("AUTONOMOUS_TRUST_ROOT");
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_get_dirs_refuse_a_root_too_long_for_the_buffer)
+{
+    /* The shape that crashed: a long root with a small destination. Before the
+     * fix this wrote strlen(root) bytes into whatever the caller had. */
+    char root[200];
+    memset(root, 'r', sizeof(root) - 1);
+    root[0] = '/';
+    root[sizeof(root) - 1] = '\0';
+    setenv("AUTONOMOUS_TRUST_ROOT", root, 1);
+
+    char sock_sized[108];               /* exactly unix_addr's buffer */
+    memset(sock_sized, 'Z', sizeof(sock_sized));
+    ck_assert((get_data_dir(sock_sized, sizeof(sock_sized))) < 0);
+    ck_assert_int_eq(sock_sized[0], '\0');
+
+    /* Everything past the refusal must be untouched — a refusal that had already
+     * scribbled would be the original bug wearing a return code. */
+    for (size_t i = 1; i < sizeof(sock_sized); i++)
+        ck_assert_int_eq(sock_sized[i], 'Z');
+
+    unsetenv("AUTONOMOUS_TRUST_ROOT");
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tracker_config_respects_its_destlen)
+{
+    setenv("AUTONOMOUS_TRUST_ROOT", "/tmp/at_test", 1);
+
+    char ok[CFG_PATH_LEN + 1] = {0};
+    ck_assert((tracker_config(ok, sizeof(ok))) >= 0);
+    ck_assert(strstr(ok, "/tmp/at_test/etc/at/") == ok);
+
+    /* Same unsized-parameter shape as get_cfg_dir had, and it also hardcoded
+     * CFG_PATH_LEN; it was safe only because its one caller passed a buffer that
+     * big. Now a small buffer is refused instead of trusted. */
+    char small[24];
+    memset(small, 'Z', sizeof(small));
+    ck_assert((tracker_config(small, sizeof(small))) < 0);
+
+    ck_assert((tracker_config(NULL, 16)) < 0);
+    ck_assert((tracker_config(ok, 0)) < 0);
+
+    unsetenv("AUTONOMOUS_TRUST_ROOT");
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Config, test_get_cfg_dir, test_get_data_dir,
           test_get_dirs_empty_root, test_find_configuration_missing,
           test_find_configuration_exists, test_config_absolute_path,
           test_config_absolute_path_rejects_traversal,
-          test_load_config_cfg_name_bounded)
+          test_load_config_cfg_name_bounded,
+          test_get_dirs_respect_the_destlen_they_are_given,
+          test_get_dirs_refuse_a_root_too_long_for_the_buffer,
+          test_tracker_config_respects_its_destlen)

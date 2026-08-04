@@ -205,8 +205,14 @@ ffi.cdef("""
     extern config_t configuration_table[];
     extern size_t configuration_table_size;
 
-    int  get_cfg_dir(char path[]);
-    int  get_data_dir(char path[]);
+    /* Both gained an explicit `destlen` on 2026-08-04 (ISSUES.md §2.1.1: they
+       used to hardcode 255 as path_join's bound while taking an unsized
+       `char path[]`, which overflowed a 108-byte caller). Keep the arity in step
+       with the C header — `ffi.dlopen` is ABI mode, so CFFI validates nothing
+       and a stale arity means the C side reads `destlen` off a garbage register
+       and writes that far. `scripts/audit-ffi-drift.py` catches this one. */
+    int  get_cfg_dir(char path[], size_t destlen);
+    int  get_data_dir(char path[], size_t destlen);
     int  read_config_file(const char *filename, void *data_struct);
     int  write_config_file(const config_t *cfg_obj, const void *data_struct,
                            const char *filename);
@@ -245,6 +251,23 @@ ffi.cdef("""
            offset — is wrong. */
         bool operator_bound;
         double operator_attested_at;
+        /* Operator KEY binding (identity.h:130-132), the operator-key slice's
+           three fields. Also outside the AT_ZTA guard in C, for the same reason.
+           `crypto_sign_PUBLICKEYBYTES` is 32; spelled literally because the cdef
+           has no libsodium macros.
+
+           These were MISSING here until 2026-08-04, and the comment above
+           already said what that costs: the struct was 48 bytes short and every
+           ZTA offset below it was wrong. `PublicIdentity.from_proto_bytes` does
+           `ffi.new('public_identity_t *')` and hands that to `proto_to_peer`,
+           which writes the full C-sized struct into the undersized CFFI
+           allocation — a heap overflow that surfaced later as
+           `free(): invalid pointer` and aborted pytest. Struct drift is invisible
+           to `scripts/audit-ffi-drift.py`, which compares function ARG COUNTS
+           only. */
+        uint8_t operator_pubkey[32];
+        uint8_t *operator_key_binding;
+        size_t operator_key_binding_len;
         /* ZTA credential binding (identity.h, #ifdef AT_ZTA_ENABLED). The
            native lib is built AT_ZTA=ON (build-native.sh -DAT_ZTA=ON), so these
            are part of the ABI layout and must be present here to match. */
@@ -308,14 +331,26 @@ ffi.cdef("""
         } target;
     } net_recipient_t;
 
+    /* Field order is the ABI. `trace_id` and `from_rank` sit MID-STRUCT, so
+       omitting them (as this did until 2026-08-04) did not merely truncate the
+       struct — it put `to_whom`, `from_whom` and `encrypt` at wrong offsets, so
+       every one of them was read from the wrong bytes. Total was 1792 against
+       C's 1896, and `ffi.new('net_wire_msg_t *')` in _native/network/message.py
+       handed C a buffer 104 bytes short. Verified by measurement against the
+       header: cdef sizeof == C sizeof == 1896. */
     typedef struct {
         char process[65];        /* PROC_NAME_LEN(64) + 1 */
         char *function;
         uint8_t *data;
         size_t data_len;
+        char trace_id[33];       /* NET_TRACE_ID_LEN(32) + 1 */
         net_recipient_t to_whom;
         public_identity_t from_whom;
+        int from_rank;
         bool encrypt;
+        uint8_t signature[64];   /* crypto_sign_BYTES */
+        bool has_signature;
+        bool verified;
     } net_wire_msg_t;
 
     int  net_message_to_wire(const net_wire_msg_t *msg,
@@ -329,13 +364,20 @@ ffi.cdef("""
     /* ---- network/ping.h ---- */
     typedef struct {
         char host[17];           /* IPV4_ADDR_LEN(16) + 1 */
-        double rtt_ms[4];       /* PING_COUNT */
+        /* MAX_PING_COUNT (64), which is the ARRAY BOUND -- not PING_COUNT (4),
+           which is merely the default number of pings sent. This mirrored the
+           wrong constant until 2026-08-04 and dropped `count` entirely, making
+           the struct 96 bytes where C's is 584: `ffi.new('ping_stats_t *')` in
+           _ping_native.py handed C a buffer 488 bytes too small. Verified by
+           measurement, cdef sizeof == C sizeof == 584. */
+        double rtt_ms[64];
         double min_rtt;
         double max_rtt;
         double avg_rtt;
         double loss;
         int sent;
         int received;
+        int count;               /* actual count used */
     } ping_stats_t;
 
     int  ping(const char *host, int count, ping_stats_t *stats);
@@ -439,10 +481,21 @@ ffi.cdef("""
 
     typedef int (*handler_ptr_t)(process_t *, array_t *, char *, logger_t *);
 
+    /* The four trailing collaborators became a `proc_context_t` in the
+       2026-07-01 refactor (ISSUES.md §2.1, autonomous_trust.c:283); this cdef
+       kept the old 8-arg form until 2026-08-04. Nothing calls it from Python,
+       so it was LATENT rather than a live segfault — `audit-ffi-drift.py`
+       classifies it exactly that way. */
+    typedef struct {
+        map_t *procs;
+        pthread_mutex_t *procs_lock;
+        directory_t *queues;
+        logger_t *logger;
+    } proc_context_t;
+
     int  start_process(char *pname, handler_ptr_t runner,
                        map_t *configs, tracker_t *tracker,
-                       map_t *procs, pthread_mutex_t *procs_lock,
-                       directory_t *queues, logger_t *logger);
+                       proc_context_t *ctx);
     void process_free(process_t *proc);
 
     /* ---- negotiation/task.h ---- */

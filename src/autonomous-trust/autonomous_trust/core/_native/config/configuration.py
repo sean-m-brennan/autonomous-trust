@@ -29,21 +29,33 @@ from ..._python.config.configuration import (  # noqa: F401
 )
 
 
+_PATH_BUF_LEN = 512
+
+# Both C functions take an explicit `destlen` since 2026-08-04 and return the
+# joined path's LENGTH on success (path_join's contract), negative if it does not
+# fit. So the success test is `rc < 0`, not `rc != 0`: testing against 0 rejects
+# every successful call, since a non-empty path always has a positive length.
+
+
 def get_cfg_dir() -> str:
     """Return the configuration directory path (C implementation)."""
-    path_buf = ffi.new('char[512]')
-    rc = lib.get_cfg_dir(path_buf)
-    if rc != 0:
-        raise RuntimeError(f"get_cfg_dir failed with rc={rc}")
+    path_buf = ffi.new(f'char[{_PATH_BUF_LEN}]')
+    rc = lib.get_cfg_dir(path_buf, _PATH_BUF_LEN)
+    if rc < 0:
+        raise RuntimeError(
+            f"get_cfg_dir failed with rc={rc} "
+            f"(AUTONOMOUS_TRUST_ROOT too long for {_PATH_BUF_LEN} bytes?)")
     return ffi.string(path_buf).decode('utf-8')
 
 
 def get_data_dir() -> str:
     """Return the data directory path (C implementation)."""
-    path_buf = ffi.new('char[512]')
-    rc = lib.get_data_dir(path_buf)
-    if rc != 0:
-        raise RuntimeError(f"get_data_dir failed with rc={rc}")
+    path_buf = ffi.new(f'char[{_PATH_BUF_LEN}]')
+    rc = lib.get_data_dir(path_buf, _PATH_BUF_LEN)
+    if rc < 0:
+        raise RuntimeError(
+            f"get_data_dir failed with rc={rc} "
+            f"(AUTONOMOUS_TRUST_ROOT too long for {_PATH_BUF_LEN} bytes?)")
     return ffi.string(path_buf).decode('utf-8')
 
 
