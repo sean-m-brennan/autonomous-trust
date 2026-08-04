@@ -245,7 +245,7 @@ int process_apply_handler_config(const process_t *proc)
      * from a sibling JSON file written by hand. Path mirrors the
      * config dir convention: `<cfg_dir>/<proc_name>.handlers.json`. */
     char cfg_dir[CFG_PATH_LEN + 1];
-    if (get_cfg_dir(cfg_dir) < 0)
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) < 0)
         return 0;
     char path[CFG_PATH_LEN + 1];
     if (path_join(path, sizeof(path), cfg_dir, proc->name) < 0)
@@ -406,7 +406,7 @@ int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
                   process_ctx_t *ctx)
 {
     char data_path[MAX_FILENAME + 1];
-    get_data_dir(data_path);
+    get_data_dir(data_path, sizeof(data_path));
 
     ctx->fd1 = 0;
     ctx->fd2 = 0;

@@ -73,7 +73,7 @@ static void queue_dir_setup(void)
 {
     root_setup();
     char data_dir[CFG_PATH_LEN + 1] = {0};
-    ck_assert(get_data_dir(data_dir) >= 0);
+    ck_assert(get_data_dir(data_dir, sizeof(data_dir)) >= 0);
     ck_assert(makedirs(data_dir, 0755) == 0);
 }
 
@@ -81,7 +81,7 @@ static void queue_dir_setup(void)
 static bool cfg_dir_has(const char *name)
 {
     char dir[CFG_PATH_LEN + 1] = {0};
-    if (get_cfg_dir(dir) < 0)
+    if (get_cfg_dir(dir, sizeof(dir)) < 0)
         return false;
     DIR *d = opendir(dir);
     if (d == NULL)
@@ -364,7 +364,7 @@ DEFINE_TEST(test_an_inbound_queue_that_cannot_bind_fails_the_bind)
     ck_assert_ret_ok(at_node_init(&node, &cfg));
 
     char data_dir[CFG_PATH_LEN + 1] = {0};
-    ck_assert(get_data_dir(data_dir) >= 0);
+    ck_assert(get_data_dir(data_dir, sizeof(data_dir)) >= 0);
     char blocked[CFG_PATH_LEN + 64];
     snprintf(blocked, sizeof(blocked), "%s/%s", data_dir, cfg.q_in);
     ck_assert_int_eq(mkdir(blocked, 0700), 0);
@@ -434,7 +434,80 @@ DEFINE_TEST(test_a_null_handle_is_harmless)
      * things of it. None may crash. */
     ck_assert(!at_app_node_alive(NULL));
     ck_assert_int_eq(at_app_node_pid(NULL), 0);
+    ck_assert(!at_app_node_ready(NULL));
+    ck_assert(!at_app_node_wait_ready(NULL, 50));
     at_app_node_stop(NULL);
+}
+END_TEST_DEFINITION()
+
+/****************************
+ * Readiness — the other half of alive
+ ****************************/
+
+/* `alive` and `ready` were one question and are two. Measured on a cold node:
+ * at_app_node_start returns after ~2 ms, alive is true immediately, and the
+ * daemon's inbound queue does not exist for another ~210 ms. Everything a host
+ * sends in that window goes nowhere. This cannot fork a daemon (the test suite
+ * must not), so it exercises the predicate against a queue it binds itself —
+ * which is the same question `ready` asks about the daemon's. */
+
+DEFINE_TEST(test_readiness_is_about_a_bound_queue_not_a_live_process)
+{
+    queue_dir_setup();
+
+    /* Nothing bound under this name: not ready, however alive anyone is. */
+    ck_assert(!messaging_bound("_ready_probe_q"));
+
+    queue_t q;
+    ck_assert_ret_ok(messaging_init("_ready_probe_q", &q));
+    ck_assert(messaging_bound("_ready_probe_q"));
+
+    messaging_qclose(&q);
+    ck_assert(!messaging_bound("_ready_probe_q"));
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_wait_ready_does_not_wait_out_the_timeout_for_nothing)
+{
+    queue_dir_setup();
+
+    /* A NULL handle is the shape a host holds when start failed; waiting on it
+     * must return at once rather than sleeping the whole timeout. Timing is the
+     * assertion, since the point of the bound is that it is not paid when the
+     * answer is already known. */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    ck_assert(!at_app_node_wait_ready(NULL, 2000));
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    ck_assert(ms < 500);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_roster_pull_says_not_ready_rather_than_just_failing)
+{
+    queue_dir_setup();
+
+    at_app_events_t *ev = at_app_events_open("_roster_ready_in");
+    ck_assert_ptr_nonnull(ev);
+
+    /* Nobody has bound the outbound name, which on a cold daemon is the ORDINARY
+     * case for the first ~210 ms. It used to be indistinguishable from a genuine
+     * send failure, so a caller could only guess whether to retry. */
+    ck_assert_int_eq(at_app_events_request_roster(ev, "_roster_ready_out"),
+                     AT_APP_NOT_READY);
+
+    /* A real failure keeps reporting -1, so the two remain distinguishable. */
+    ck_assert_int_eq(at_app_events_request_roster(ev, ""), -1);
+    ck_assert_int_eq(at_app_events_request_roster(NULL, "_roster_ready_out"), -1);
+
+    /* Bind the far end and the pull goes through. */
+    queue_t far;
+    ck_assert_ret_ok(messaging_init("_roster_ready_out", &far));
+    ck_assert_int_eq(at_app_events_request_roster(ev, "_roster_ready_out"), 0);
+
+    messaging_qclose(&far);
+    at_app_events_close(ev);
 }
 END_TEST_DEFINITION()
 
@@ -450,4 +523,7 @@ RUN_TESTS(App_Node,
           test_a_name_longer_than_the_messaging_layer_keeps_is_refused,
           test_an_inbound_queue_that_cannot_bind_fails_the_bind,
           test_the_bound_name_is_q_in_and_falls_back_to_app_name,
-          test_a_null_handle_is_harmless)
+          test_a_null_handle_is_harmless,
+          test_readiness_is_about_a_bound_queue_not_a_live_process,
+          test_wait_ready_does_not_wait_out_the_timeout_for_nothing,
+          test_a_roster_pull_says_not_ready_rather_than_just_failing)

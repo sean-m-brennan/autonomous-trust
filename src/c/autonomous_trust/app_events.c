@@ -139,6 +139,10 @@ int at_app_events_request_roster(at_app_events_t *handle, const char *q_out)
 {
     if (handle == NULL || !name_survives(q_out))
         return -1;
+    /* Separate "nobody is listening yet" from "the send failed", because on a cold
+     * daemon the first is the ordinary case and the two were the same answer. */
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
     generic_msg_t req = {0};
     req.type = NET_MESSAGE;
     snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),

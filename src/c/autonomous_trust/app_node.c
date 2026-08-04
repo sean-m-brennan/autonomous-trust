@@ -145,6 +145,40 @@ bool at_app_node_alive(at_app_node_t *node)
     return true;
 }
 
+bool at_app_node_ready(at_app_node_t *node)
+{
+    if (!at_app_node_alive(node))
+        return false;
+    /* The handle already owns the queue names (at_app_node_strings_t), so
+     * readiness needs no new state — only the question nobody was asking. */
+    return messaging_bound(node->owned.q_out);
+}
+
+bool at_app_node_wait_ready(at_app_node_t *node, int timeout_ms)
+{
+    if (node == NULL)
+        return false;
+    if (at_app_node_ready(node))
+        return true;
+    if (timeout_ms <= 0)
+        return false;
+
+    /* 5 ms is well under the ~210 ms this typically waits, so the extra latency
+     * past ready is noise, and it is long enough that the poll costs nothing. */
+    const int step_ms = 5;
+    for (int waited = 0; waited < timeout_ms; waited += step_ms)
+    {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = (long)step_ms * 1000000L};
+        nanosleep(&ts, NULL);
+        if (at_app_node_ready(node))
+            return true;
+        /* Don't wait out the timeout for a daemon that has died. */
+        if (!at_app_node_alive(node))
+            return false;
+    }
+    return false;
+}
+
 int at_app_node_pid(const at_app_node_t *node)
 {
     return node == NULL ? 0 : node->node.daemon_pid;

@@ -149,7 +149,20 @@ class TestProbe:
         assert probe_token('/m.so', lib_loader=_loader(_BadUnload())).present
 
     def test_token_present_is_boolean_form(self):
-        assert token_present('/m.so') in (True, False)
+        # `token_present` takes no `lib_loader`, so this one call cannot use the
+        # fake and really does reach PyKCS11, which really does try to dlopen
+        # '/m.so' and prints its own diagnostic to stderr:
+        #   src/dyn_unix.c:34:SYS_dyn_LoadLibrary() /m.so: cannot open shared
+        #   object file
+        # That line is expected third-party output, not a failure -- it is only
+        # *visible* because scripts/test-packages.sh runs pytest with `-s`, which
+        # disables capture. What matters is that an unloadable module is reported
+        # as "no token", never raised.
+        #
+        # Asserted as `is False` rather than the previous `in (True, False)`,
+        # which was a tautology: it held for any bool, so it would have passed
+        # just as well had the swallow-and-report behaviour been broken.
+        assert token_present('/m.so') is False
         assert probe_token('/m.so', lib_loader=_loader(_FakeLib(()))).present is False
 
     def test_probe_takes_no_pin(self):

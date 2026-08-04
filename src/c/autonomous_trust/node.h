@@ -151,8 +151,26 @@ int at_node_start(at_node_t *node);
 */
 int at_node_run(at_node_t *node, at_node_tick_fn tick, void *user_data);
 
+/** How long @ref at_node_shutdown waits for the daemon to actually exit.
+ *
+ *  Generous on purpose: the daemon gives its own subsystem processes a grace
+ *  period before SIGKILL, and a full shutdown was measured at about 5.3 s. A
+ *  bound tighter than that would turn an ordinary stop into a reported failure.
+ */
+#define AT_DAEMON_EXIT_TIMEOUT_MS 15000
+
 /**
- * Graceful shutdown: SIGINT the daemon, wait for it, log exit.
+ * Graceful shutdown: SIGINT the daemon, wait for it to exit, log it.
+ *
+ * Returns once the daemon is gone, or after @ref AT_DAEMON_EXIT_TIMEOUT_MS with
+ * an error logged naming the pid. It does **not** escalate to SIGKILL: the
+ * daemon may be mid-write to a store.
+ *
+ * The wait is a poll, not a `waitpid`, and that is forced rather than chosen —
+ * `daemonize` double-forks, so the daemon is init's child and not ours. Before
+ * 2026-08-04 this called `waitpid` alone, which returned ECHILD at once, so
+ * "wait for it" was not happening and a stop returned with the daemon still
+ * live and still holding its sockets.
  */
 /*@
   requires \valid(node);

@@ -62,7 +62,40 @@ USER user
 # the rattler solver (the classic/libmamba solver can't fetch jcs). Install the
 # rattler solver plugin into base and select it so the env create/update below
 # use it.
-RUN conda install -n base -y conda-rattler-solver && conda config --set solver rattler
+#
+# `repodata_use_shards false` works around an UPSTREAM conda bug, not anything
+# of ours (2026-08-04, conda 26.7.0 / conda-rattler-solver 0.1.1 / py-rattler
+# 0.25.0). conda's sharded-repodata reader decompresses each shard through
+# `capped_decompress(data, max_output_size=ZSTD_MAX_SHARD_SIZE)`
+# (`conda/_private/zstd.py`), and `ZSTD_MAX_SHARD_SIZE` is a hard-coded 16 MiB
+# constant with no config knob. A conda-forge shard has outgrown it, so the
+# fetch dies with `backports.zstd.ZstdError: decompressed output exceeds
+# 16777216 bytes` and the whole solve fails.
+#
+# This setting is the right lever rather than switching solvers, because it is
+# the one the rattler solver itself checks — `conda_rattler_solver/index.py`:
+#
+#     def _is_sharded_repodata_enabled():
+#         return getattr(context, "repodata_use_shards", True)
+#     ...
+#     if self.in_state and self.build_repodata_subset and _is_sharded_repodata_enabled():
+#
+# so a false here takes the documented "fall back to non-sharded path" branch
+# and keeps the rattler solver the conda-pypi:: specs above need. Dropping to
+# classic/libmamba to dodge the shard code would break those instead.
+#
+# That same line explains why `env create` below survived and `env update`
+# failed: the sharded path also requires `in_state`, which is populated for an
+# update against an existing env, not for a fresh create.
+#
+# Cost: repodata fetches go back to full `repodata.json`, so the solve is
+# slower (the shard format exists to avoid exactly that). Revisit when conda
+# either raises the cap or makes it configurable. ISSUES.md §9.1 holds the
+# durable half of this: the base image and this solver plugin are both
+# unpinned, which is why an upstream change reached a working build at all.
+RUN conda install -n base -y conda-rattler-solver && \
+    conda config --set solver rattler && \
+    conda config --set repodata_use_shards false
 
 COPY --chown=user:user config/cfg/environment.yml /build/config/cfg/environment.yml
 COPY --chown=user:user config/cfg/devel_environ.yml /build/config/cfg/devel_environ.yml
