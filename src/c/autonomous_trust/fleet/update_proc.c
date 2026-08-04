@@ -284,7 +284,7 @@ static void rollback(const process_t *proc, update_state_t *state)
     {
         /* Config rollback: restore all backed-up configs */
         char cfg_dir[CFG_PATH_LEN];
-        if (get_cfg_dir(cfg_dir) == 0)
+        if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) == 0)
         {
             if (config_restore_all(cfg_dir, update_data_dir) != 0)
             {
@@ -327,7 +327,7 @@ static void rollback(const process_t *proc, update_state_t *state)
 static void run_health_check(const process_t *proc, update_state_t *state)
 {
     char cfg_dir[CFG_PATH_LEN];
-    if (get_cfg_dir(cfg_dir) != 0)
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) != 0)
     {
         const char *root = getenv("AUTONOMOUS_TRUST_ROOT");
         if (root != NULL)
@@ -588,7 +588,7 @@ int update_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
 {
     /* Determine data directory */
     char data_dir[CFG_PATH_LEN];
-    if (get_data_dir(data_dir) != 0)
+    if (get_data_dir(data_dir, sizeof(data_dir)) != 0)
     {
         const char *root = getenv("AUTONOMOUS_TRUST_ROOT");
         if (root != NULL)

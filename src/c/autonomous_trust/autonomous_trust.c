@@ -197,7 +197,7 @@ int register_queues(tracker_t *tracker, const char *main, directory_t *queues, d
         return -1;
     }
     char tracker_cfg[CFG_PATH_LEN + 1];
-    if (tracker_config(tracker_cfg) < 0)
+    if (tracker_config(tracker_cfg, sizeof(tracker_cfg)) < 0)
     {
         log_exception(logger);
         return -1;
@@ -268,9 +268,9 @@ int run_autonomous_trust(char *q_in, char *q_out,
     (void)capabilities; (void)cap_len;
     int error = 0;
     char cfg_dir[CFG_PATH_LEN + 1] = {0};
-    get_cfg_dir(cfg_dir);
+    get_cfg_dir(cfg_dir, sizeof(cfg_dir));
     char data_dir[CFG_PATH_LEN + 1] = {0};
-    get_data_dir(data_dir);
+    get_data_dir(data_dir, sizeof(data_dir));
 
     int fd1 = 0;
     int fd2 = 0;

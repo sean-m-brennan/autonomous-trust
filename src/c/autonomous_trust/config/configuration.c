@@ -91,15 +91,15 @@ const char *at_serialize_mode_file_ext(at_serialize_mode_t mode)
 }
 
 /* Frama-C: skipped — get_data_dir / get_cfg_dir: path_join with assigns. */
-int get_cfg_dir(char path[])
+int get_cfg_dir(char *path, size_t destlen)
 {
-    return path_join(path, 255, rootDir(), CFG_PATH);
+    return path_join(path, destlen, rootDir(), CFG_PATH);
 }
 
 /* Frama-C: skipped — get_data_dir / get_cfg_dir: path_join with assigns. */
-int get_data_dir(char path[])
+int get_data_dir(char *path, size_t destlen)
 {
-    return path_join(path, 255, rootDir(), DATA_PATH);
+    return path_join(path, destlen, rootDir(), DATA_PATH);
 }
 
 /* Frama-C: skipped — find_configuration: 3x assigns + ensures. */
@@ -187,7 +187,7 @@ int config_absolute_path(const char *path_in, char *path_out)
         return EXCEPTION(EINVAL);
 
     char cfg_dir[CFG_PATH_LEN + 1];
-    int len = get_cfg_dir(cfg_dir);
+    int len = get_cfg_dir(cfg_dir, sizeof(cfg_dir));
     if (len < 0 || len > CFG_PATH_LEN)
         return -1;
 

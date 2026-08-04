@@ -703,12 +703,12 @@ int config_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
     peers_read_unlock(proc);
     paxos_init(&config_state.vote_paxos, config_state.num_peers, logger);
 
-    if (get_cfg_dir(config_cfg_dir) != 0)
+    if (get_cfg_dir(config_cfg_dir, sizeof(config_cfg_dir)) != 0)
     {
         const char *root = getenv("AUTONOMOUS_TRUST_ROOT");
         if (root) snprintf(config_cfg_dir, sizeof(config_cfg_dir), "%s/etc/at", root);
     }
-    if (get_data_dir(config_data_dir) != 0)
+    if (get_data_dir(config_data_dir, sizeof(config_data_dir)) != 0)
     {
         const char *root = getenv("AUTONOMOUS_TRUST_ROOT");
         if (root) snprintf(config_data_dir, sizeof(config_data_dir), "%s/var/at", root);

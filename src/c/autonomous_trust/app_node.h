@@ -131,6 +131,43 @@ at_app_node_t *at_app_node_start(const char *app_name,
 bool at_app_node_alive(at_app_node_t *node);
 
 /**
+ * @brief Whether the daemon can actually be **reached** yet.
+ *
+ * @ref at_app_node_alive and this are different questions, and conflating them
+ * costs a host its first messages. Measured on a cold node: `at_app_node_start`
+ * returns after about **2 ms**, `at_app_node_alive` is true immediately, and the
+ * daemon's inbound queue does not exist for another **~170-210 ms**
+ * (range over repeated runs). Everything a host
+ * sends in that window goes nowhere — including
+ * @ref at_app_events_request_roster, which is how the gap was first noticed.
+ *
+ * `alive` is not wrong; it answers "is the process running", which it is. This
+ * answers "is the stream two-way yet", by probing whether the daemon has bound the
+ * app-to-AT queue it was told to. Non-blocking, so it belongs in a host's ordinary
+ * poll loop; see @ref at_app_node_wait_ready to simply wait.
+ *
+ * @param[in] node Handle, or NULL (returns false).
+ * @return true when the daemon is alive **and** its inbound queue is bound.
+ */
+bool at_app_node_ready(at_app_node_t *node);
+
+/**
+ * @brief Wait, up to @p timeout_ms, for @ref at_app_node_ready.
+ *
+ * A convenience for a tool or a test whose next step is pointless before the
+ * daemon can hear it. A host running its own loop should poll
+ * @ref at_app_node_ready instead of blocking in here.
+ *
+ * Returns as soon as the node is ready, or false if the timeout elapses or the
+ * daemon dies while waiting — a dead daemon is reported immediately rather than
+ * waiting out the full timeout for something that will never happen.
+ *
+ * @param[in] node       Handle, or NULL (returns false).
+ * @param timeout_ms     How long to wait. <= 0 is a single non-blocking check.
+ */
+bool at_app_node_wait_ready(at_app_node_t *node, int timeout_ms);
+
+/**
  * @brief The daemon's pid, for logs and diagnostics. 0 if @p node is NULL.
  */
 int at_app_node_pid(const at_app_node_t *node);

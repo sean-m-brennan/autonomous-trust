@@ -59,6 +59,12 @@ extern "C" {
 /** Length of a UUID in bytes. */
 #define AT_APP_UUID_LEN 16
 
+/** Returned instead of -1 when the daemon exists but has not bound its queue
+ *  yet, so a caller can retry rather than treat a normal cold start as an error.
+ *  Distinct from -1 because a forked daemon takes ~170-210 ms to become reachable and
+ *  every send before that failed identically to a genuine fault. */
+#define AT_APP_NOT_READY (-2)
+
 /** Discriminates @ref at_app_event_t. Values are frozen: a consumer compiled
  *  against an older header must keep decoding what it already understood, so
  *  new kinds are only ever appended. */
@@ -192,7 +198,12 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
  * @param[in] q_out  Queue name the daemon receives on — the same string
  *                   passed as `q_out` in @ref at_node_config_t. Same 63-byte
  *                   limit, refused the same way.
- * @return 0 on success, -1 on failure.
+ * @return 0 on success, @ref AT_APP_NOT_READY if nothing is bound at @p q_out
+ *         yet, -1 on any other failure.
+ *
+ * @note The not-ready case used to be indistinguishable from a real failure, so a
+ *       caller could only guess which it was — and a cold daemon takes ~170-210 ms to
+ *       bind, so it is the common one. See @ref at_app_node_ready.
  */
 int at_app_events_request_roster(at_app_events_t *handle, const char *q_out);
 
