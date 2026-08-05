@@ -32,10 +32,10 @@ from ..identity.protocol import IdentityProtocol
 from ..processes import Process, ProcMeta
 from .. import _probes
 from ..identity import Group
-from ..system import CfgIds, comm_port, net_cadence
+from ..system import CfgIds, PortSource, comm_port, net_cadence, resolve_comm_port
 from .network import Network
 from .message import Message
-from .ping import PingServer, ping
+from .ping_at import PingATServer, ping_at
 
 
 class NetworkProtocol(Enum):
@@ -97,12 +97,20 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     def __init__(self, configurations, subsystems, log_q, acceptance_func=None, **kwargs):
         super().__init__(configurations, subsystems, log_q, **kwargs)
         self.net_cfg = configurations[CfgIds.network]
-        port = self.net_cfg.port
-        self.port = port
-        if port is None:
+        # One resolution, same order as C's net_port_resolve: a usable config
+        # port wins, else AT_COMM_PORT, else the compile-time default. Going
+        # through the resolver (rather than `port or default_port`) is what
+        # range-checks a bad configured value and logs which layer supplied the
+        # result, so an operator can tell an ignored override from an applied one.
+        self.port, self.port_source = resolve_comm_port(self.net_cfg.port or 0, self.logger)
+        if self.port_source == PortSource.default:
+            # The metaclass default is the same defaults layer; keep honoring an
+            # explicit subclass override of `port=` in that case only.
             self.port = self.default_port  # noqa
+        self.logger.info('network base port %d from %s (group %d)'
+                         % (self.port, self.port_source, self.port + 1))
         self.diplomat = True
-        self.ping = None
+        self.ping_at_server = None
         self.myself = configurations[CfgIds.identity]
         self.peer_messages = deque()
         self.encrypted_messages = deque()
@@ -129,8 +137,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self._partition_signal_lru: dict[str, datetime] = {}
         # Lazily created in process(). ThreadPoolExecutor can't be
         # pickled, so creating it here would break the multiprocessing
-        # spawn handoff. See `_ensure_ping_pool`.
-        self._ping_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        # spawn handoff. See `_ensure_ping_at_pool`.
+        self._ping_at_pool: concurrent.futures.ThreadPoolExecutor | None = None
 
     @property
     def my_ip(self):
@@ -254,7 +262,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     # No-ops here; a transport that keeps long-lived connections (the TCP
     # pool) overrides them. They run in the worker subprocess from
     # process(), which matters because threading primitives can't survive
-    # the multiprocessing spawn pickle (see _ensure_ping_pool).
+    # the multiprocessing spawn pickle (see _ensure_ping_at_pool).
 
     def _init_transport(self):
         """Per-worker transport setup that can't be pickled across the
@@ -395,27 +403,34 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         except Full:
             _probes.counter('net.group', 'partition_signal_drop', 'queue_full')
 
-    def _ensure_ping_pool(self):
+    def _ensure_ping_at_pool(self):
         """Lazily instantiate the ping thread pool inside the subprocess.
         Created on demand so it doesn't try to ride through a pickle
-        handoff. Outbound pings dispatch here so the synchronous ping()
+        handoff. Outbound pings dispatch here so the synchronous ping_at()
         function (which sleeps 1 s per packet × count) doesn't block the
         main process loop.
         """
-        if self._ping_pool is None:
-            self._ping_pool = concurrent.futures.ThreadPoolExecutor(
+        if self._ping_at_pool is None:
+            self._ping_at_pool = concurrent.futures.ThreadPoolExecutor(
                 max_workers=16, thread_name_prefix='netproc-ping')
-        return self._ping_pool
+        return self._ping_at_pool
 
-    def _do_ping_async(self, address, count, return_queue):
-        """Run ping() in a worker thread and post stats back to the
+    def _do_ping_at_async(self, address, count, return_queue, peer=None):
+        """Run ping_at() in a worker thread and post stats back to the
         original requester's return queue. Errors are logged but not
         raised — a failed ping is just a missed RTT sample, not a
         process-fatal event.
+
+        The reply carries the pinged peer as `from_whom` so the requester can
+        attribute the sample. Without it the reply named nobody: PingATStats
+        only knows the address it dialed, and every consumer keys peers by
+        Identity UUID, so a sample either landed on a node named for an IP or
+        on no node at all.
         """
         try:
-            stats = ping(address, count=count)  # noqa
-            msg = Message(self.name, Network.ping, stats)  # noqa
+            stats = ping_at(address, count=count)  # noqa
+            msg = Message(self.name, Network.ping_at, stats,  # noqa
+                          from_whom=peer)
             return_queue.put(msg, block=True, timeout=self.q_cadence)
         except TransmissionError as err:
             self.logger.error('Ping (async): %s' % err)
@@ -634,12 +649,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             try:
                 self.reap_idle_conns()
                 if self.diplomat:
-                    if self.ping is None:
-                        self.ping = PingServer(self.net_cfg.ip4, self.logger)
-                        self.ping.start()
-                elif self.ping is not None:
-                    self.ping.stop()
-                    self.ping = None
+                    if self.ping_at_server is None:
+                        self.ping_at_server = PingATServer(self.net_cfg.ip4, self.logger)
+                        self.ping_at_server.start()
+                elif self.ping_at_server is not None:
+                    self.ping_at_server.stop()
+                    self.ping_at_server = None
                 try:
                     message = queues[self.name].get(block=True, timeout=self.q_cadence)  # noqa
                     _probes.counter('net.dequeue', 'got')
@@ -675,7 +690,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             if message.function == Network.stats_req:
                                 msg = Message(CfgIds.network, Network.stats_resp, self.net_stats)
                                 queues[message.process].put(msg, block=True, timeout=self.q_cadence)
-                            elif message.function == Network.ping:
+                            elif message.function == Network.ping_at:
                                 # Message.__init__ wraps a single Identity
                                 # to_whom in a list; pull the head out
                                 # before dereferencing .address.
@@ -691,15 +706,15 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                         '(expected a queue key); skipping' %
                                         message.return_to)
                                 else:
-                                    # Dispatch to a worker thread; ping()
+                                    # Dispatch to a worker thread; ping_at()
                                     # is synchronous and sleeps 1 s per
                                     # packet (count=5 → ≥5 s). Running it
                                     # inline blocks the netproc main loop
                                     # and starves all other outbound.
-                                    self._ensure_ping_pool().submit(
-                                        self._do_ping_async,
+                                    self._ensure_ping_at_pool().submit(
+                                        self._do_ping_at_async,
                                         target.address, message.obj,
-                                        queues[message.return_to])
+                                        queues[message.return_to], target)
                             elif message.to_whom == Network.broadcast:
                                 msg = bytes(message)
                                 try:

@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import logging
 import os
 import sys
 from datetime import UTC, datetime
@@ -45,16 +46,16 @@ class MetadataProtocol(Protocol):
 
 class TimeSource(object):
     def acquire(self) -> datetime:
-        """Return the current time, NTP-adjusted when a sync is running.
+        """Return the current time from the host clock.
 
         Delegates to the core time authority
-        (``autonomous_trust.core.system.now``), which adds the running NTP
-        offset maintained by ``core/network/ntp.py`` (the Python mirror of the
-        C-side native RFC 5905 client at ``network/ntp.c``). With no NTP sync
-        active the offset is zero, so this is identical to ``datetime.now(UTC)``;
-        but once a peer-shared time source is syncing, all participants order
-        events on a common clock despite local drift. See ``NtpTimeSource`` to
-        drive that sync from the metadata config.
+        (``autonomous_trust.core.system.now``), which reads the host clock as
+        disciplined by a stock NTP daemon (chrony / ntpd / systemd-timesyncd).
+        Participants order events on a common clock because the daemon steers the
+        kernel, not because AT applies a correction of its own -- it used to, and
+        that offset was visible only to AT code, leaving AT and its own host
+        disagreeing about the time. See ``NtpTimeSource`` for a source that also
+        reports how trustworthy that discipline currently is.
         """
         try:
             from autonomous_trust.core.system import now
@@ -64,35 +65,58 @@ class TimeSource(object):
 
 
 class NtpTimeSource(TimeSource):
-    """Time source that also drives a background NTP sync.
+    """Time source that also reports the quality of the host's NTP discipline.
 
-    Constructing one ensures a daemon thread is querying ``server`` every
-    ``interval`` seconds and maintaining the process-global offset that
-    ``TimeSource.acquire`` (inherited) then applies. The sync is started at
-    most once per ``(server, interval)`` pair, so repeated construction — e.g.
-    on every config reload — never spawns duplicate threads. If NTP is
-    unavailable (no ``ntplib``, no reachable server) the offset stays zero and
-    ``acquire`` degrades to the local UTC clock.
+    AT does not implement NTP. This source reads what the stock daemon has
+    achieved -- via ``ntp_adjtime`` (unprivileged, no socket or network, and
+    honest inside a container because CLOCK_REALTIME is shared with the host),
+    plus chronyc detail when that happens to be reachable. ``acquire`` returns
+    the host clock exactly as the base class does; the value added here is
+    ``quality`` / ``trustworthy``, so a consumer can decline to order events on a
+    clock nothing is steering rather than silently trusting it.
 
-    This is the parameterized counterpart enabled by ``Metadata``'s per-source
-    kwargs payload: register it as a metadata class and give the metadata a
-    ``time_src_kwargs`` of e.g. ``{'server': 'ntp.mil', 'interval': 60}``.
+    Register it as a metadata class to get clock-quality reporting alongside the
+    timestamp. The legacy ``server`` / ``interval`` kwargs are accepted so
+    existing ``time_src_kwargs`` payloads keep loading, but they no longer mean
+    anything: choosing servers and poll intervals is the daemon's configuration,
+    not AT's. Passing them warns once.
     """
 
-    _started: set = set()
+    _legacy_warned: bool = False
 
-    def __init__(self, server: str = 'pool.ntp.org', interval: float = 300.0):
+    def __init__(self, server: str = None, interval: float = None,
+                 max_error_sec: float = 1.0):
+        self.max_error_sec = float(max_error_sec)
+        # Kept only so an old config does not fail to load.
         self.server = server
-        self.interval = float(interval)
-        key = (self.server, self.interval)
-        if key in NtpTimeSource._started:
-            return
+        self.interval = interval
+        if (server is not None or interval is not None) and not NtpTimeSource._legacy_warned:
+            NtpTimeSource._legacy_warned = True
+            logging.getLogger(__name__).warning(
+                'NtpTimeSource: server/interval are ignored — AT no longer runs its '
+                'own NTP client. Configure the stock daemon (chrony/ntpd/timesyncd) '
+                'on the host instead; this source only reports its state.')
+
+    @property
+    def quality(self):
+        """The host clock's discipline state, or None if core is unavailable."""
         try:
-            from autonomous_trust.core.network.ntp import start_sync
-            start_sync(self.server, self.interval)
-            NtpTimeSource._started.add(key)
-        except ImportError:  # NTP support absent — acquire() falls back to local clock
-            pass
+            from autonomous_trust.core.network.clock import clock_state
+        except ImportError:
+            return None
+        return clock_state()
+
+    @property
+    def trustworthy(self) -> bool:
+        """True iff a daemon is steering this clock and its error is bounded.
+
+        False is a real answer, not an error: it means timestamps from this host
+        should not be used to order events against other peers'.
+        """
+        state = self.quality
+        if state is None:
+            return False
+        return state.synced and state.max_error.total_seconds() <= self.max_error_sec
 
 
 class PositionSource(object):

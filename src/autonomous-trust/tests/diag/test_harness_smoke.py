@@ -63,6 +63,43 @@ def test_harness_starts_two_peers():
 
 
 @_skip_loopback
+def test_harness_two_peers_separated_by_port_only():
+    """Two peers on ONE address, separated only by base port.
+
+    This is the co-location axis `AT_COMM_PORT` exists for, and the only one
+    that also separates the derived ports (group, and Python's ping/ntp) -- so
+    anything still binding a wildcard address stops contending. The
+    address-separated smoke test above cannot cover it: both peers there hold
+    distinct addresses, so a path that ignored the configured port would still
+    look fine.
+    """
+    import os
+    with MultiPeerHarness(n_peers=2, runtime_sec=12, separate_by='port',
+                          log_level='warning') as h:
+        addrs = {p.addr for p in h.peers}
+        ports = {p.comm_port for p in h.peers}
+        assert len(addrs) == 1, f'port mode should share one address, got {addrs}'
+        assert len(ports) == h.n_peers, f'each peer needs its own base, got {ports}'
+        for p in h.peers:
+            ident = os.path.join(p.cfg_dir, 'identity.cfg.json')
+            assert os.path.exists(ident), \
+                f'peer {p.idx} (port {p.comm_port}): identity not persisted'
+            assert p.error is None, \
+                f'peer {p.idx} reported error: {p.error}'
+            assert p.process.is_alive(), \
+                f'peer {p.idx} (port {p.comm_port}) died -- ports did not separate it'
+
+
+@_skip_loopback
+def test_port_mode_refuses_address_based_convergence_check():
+    """all_peers_grouped() identifies peers by address, so in port mode it must
+    refuse rather than pass vacuously on a single-element expected set."""
+    h = MultiPeerHarness(n_peers=2, separate_by='port')
+    with pytest.raises(NotImplementedError):
+        h.all_peers_grouped()
+
+
+@_skip_loopback
 @pytest.mark.slow
 def test_harness_two_peers_converge():
     """Convergence: each peer's persisted Peers list eventually

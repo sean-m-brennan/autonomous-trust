@@ -44,7 +44,6 @@
 #include "network/net_message.h"
 #include "network/net_transport.h"
 #include "network/net_proc_priv.h"
-#include "network/ping.h"
 #ifdef AT_NET_ENVELOPE
 #include "network/net_envelope.h"
 #endif
@@ -145,13 +144,105 @@ DEFINE_ERROR(ENET_RECV, "Network receive failed");
 /* Protocol-string definitions (declared `extern char[]` in network.h). */
 char NET_FN_STATS_REQ[]  = "stats_req";
 char NET_FN_STATS_RESP[] = "stats_resp";
-char NET_FN_PING[]       = "ping";
+char NET_FN_PING_AT[]    = "ping_at";
 /* Reputation communication cut-off control (local IPC from rep_proc's
  * _publish_exclusion). Mirror: Python Network.exclude / Network.readmit. */
 char NET_FN_EXCLUDE[]    = "exclude";
 char NET_FN_READMIT[]    = "readmit";
 
 static const int RECV_POLL_TIMEOUT_MS = 100;
+
+/****************************
+ * Base port resolution
+ ****************************/
+
+/* AT_COMM_PORT, read once and cached — same habit as the other AT_* overrides
+ * (generate.c AT_TRANSPORT, AT_MYSTERY_MAX_AGE_SEC below, configuration.c
+ * AT_SERIALIZE_MODE). 0 means "no usable override"; a value that is present but
+ * unparseable or out of range is refused once, loudly, and the default kept —
+ * never a silent 0, which would ask the kernel for an ephemeral port and put
+ * the node somewhere no peer is looking. */
+static int  env_comm_port       = 0;
+static bool env_comm_port_read  = false;
+static bool env_comm_port_bad   = false;
+static char env_comm_port_raw[32] = {0};
+
+static int comm_port_from_env(logger_t *logger)
+{
+    if (!env_comm_port_read) {
+        env_comm_port_read = true;
+        const char *raw = getenv("AT_COMM_PORT");
+        if (raw != NULL && raw[0] != '\0') {
+            snprintf(env_comm_port_raw, sizeof(env_comm_port_raw), "%s", raw);
+            char *end = NULL;
+            errno = 0;
+            long val = strtol(raw, &end, 10);
+            if (errno != 0 || end == raw || (end != NULL && *end != '\0') ||
+                val < COMM_PORT_MIN || val > COMM_PORT_MAX) {
+                env_comm_port_bad = true;
+            } else {
+                env_comm_port = (int)val;
+            }
+        }
+    }
+    if (env_comm_port_bad) {
+        /* Report every time it is consulted with a logger: the resolver may be
+         * called before the logger exists, and a refused override must not be
+         * the one thing that goes unlogged. */
+        log_warn(logger,
+                 "Network: refusing AT_COMM_PORT='%s' (want an integer in "
+                 "[%d, %d]); using default %d\n",
+                 env_comm_port_raw, COMM_PORT_MIN, COMM_PORT_MAX, COMM_PORT);
+    }
+    return env_comm_port;
+}
+
+const char *net_port_source_name(net_port_source_t src)
+{
+    switch (src) {
+        case PORT_SRC_CONFIG: return "config";
+        case PORT_SRC_ENV:    return "AT_COMM_PORT";
+        case PORT_SRC_DEFAULT:
+        default:              return "default";
+    }
+}
+
+int net_port_resolve(int cfg_port, net_port_source_t *src, logger_t *logger)
+{
+    if (cfg_port >= COMM_PORT_MIN && cfg_port <= COMM_PORT_MAX) {
+        /* The provisioned config wins. Say so when an override was also given,
+         * rather than letting the operator believe AT_COMM_PORT took effect. */
+        if (comm_port_from_env(logger) != 0 && env_comm_port != cfg_port)
+            log_info(logger,
+                     "Network: config port %d overrides AT_COMM_PORT=%d\n",
+                     cfg_port, env_comm_port);
+        if (src != NULL) *src = PORT_SRC_CONFIG;
+        return cfg_port;
+    }
+    if (cfg_port != 0)
+        log_warn(logger,
+                 "Network: refusing configured port %d (want an integer in "
+                 "[%d, %d]); falling back\n",
+                 cfg_port, COMM_PORT_MIN, COMM_PORT_MAX);
+
+    int from_env = comm_port_from_env(logger);
+    if (from_env != 0) {
+        if (src != NULL) *src = PORT_SRC_ENV;
+        return from_env;
+    }
+    if (src != NULL) *src = PORT_SRC_DEFAULT;
+    return COMM_PORT;
+}
+
+/* Test seam: forget the cached AT_COMM_PORT so a test can exercise more than
+ * one value in one process. Not declared in network.h — tests declare it. */
+void net_port_resolve_reset(void)
+{
+    env_comm_port      = 0;
+    env_comm_port_read = false;
+    env_comm_port_bad  = false;
+    env_comm_port_raw[0] = '\0';
+}
 
 /****************************
  * Blacklist / rejected addresses
@@ -659,7 +750,7 @@ static int decrypt_message(const identity_t *myself, const public_identity_t *pe
  ****************************/
 
 /* Frama-C: skipped — [alloc-pattern] route_to_process: at_memcpy + strdup + messaging_send. */
-/* stats_req / ping interception (divergence.md H7, H8) does NOT live here —
+/* stats_req / ping_at interception (divergence.md H7, H8) does NOT live here —
  * it lives in the outbound queue drain at the end of net_process_run(),
  * mirroring Python netprocess.py:501-528 which intercepts on the OUTBOUND
  * path (after the local process puts the request into the network process's
@@ -892,12 +983,12 @@ static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *
                                 int port, logger_t *logger);
 
 /****************************
- * stats_req / ping outbound interception (divergence.md H7, H8)
+ * stats_req / ping_at outbound interception (divergence.md H7, H8)
  *
  * Mirrors Python netprocess.py:501-528. The local outbound drain
  * checks `process==network` plus a function selector and either
  * (H7) synthesizes a stats_resp pointed back at from_whom, or
- * (H8) dispatches a worker thread that runs the blocking ping()
+ * (H8) answers the ping_at selector (C implements no PingAT; it once
  * RFC5905-style synchronous loop and posts a stats Message back
  * into the requester's queue via return_to.
  ****************************/
@@ -927,81 +1018,45 @@ static uint8_t *peer_stats_to_json_bytes(size_t *out_len)
     return (uint8_t *)s;
 }
 
-/* Worker arguments for the async ping dispatch. Owned by the worker;
- * the worker frees this after posting the result (or on error). */
-typedef struct {
-    char     target_addr[ADDR_LEN + 1];
-    int      count;
-    char     return_to[PROC_NAME_LEN + 1];
-    logger_t *logger;
-} ping_worker_args_t;
-
-static void *ping_worker_thread(void *arg)
+/* Answer a `ping_at` request with an explicit refusal.
+ *
+ * PingAT confirms an AT peer is present and answering on AT's own UDP ports via
+ * a cooperating responder; it is NOT ICMP reachability. C implements no PingAT
+ * responder or client, so the selector is intercepted here only so a
+ * requester gets an answer. The reply carries the SAME function selector the
+ * requester is waiting on, with an error body, so it fails fast instead of
+ * waiting out its own timeout; a distinct "unsupported" selector would be
+ * ignored by a requester blocked on `ping_at`. This is a local IPC reply into
+ * return_to (as the removed ping worker did), never a wire message.
+ *
+ * Returns 0 when the refusal was posted, non-zero on allocation/send failure
+ * (caller logs). Python performs the PingAT instead (netprocess.py) and
+ * is the only implementation — see ISSUES.md. */
+int refuse_ping_at_unsupported(const char *target_addr,
+                            const char *return_to, logger_t *logger)
 {
-    ping_worker_args_t *args = (ping_worker_args_t *)arg;
-    ping_stats_t stats = {0};
-    int rc = ping(args->target_addr, args->count, &stats);
-    if (rc != 0) {
-        log_warn(args->logger, "Ping (async) to %s failed (rc=%d)\n",
-                 args->target_addr, rc);
-        free(args);
-        return NULL;
-    }
-    /* Serialize the ping_stats_t as JSON. Mirror Python's ping result
-     * shape loosely — sender treats obj as opaque bytes here. */
     json_t *jr = json_object();
-    if (jr == NULL) { free(args); return NULL; }
-    json_object_set_new(jr, "host", json_string(stats.host));
-    json_object_set_new(jr, "sent", json_integer(stats.sent));
-    json_object_set_new(jr, "received", json_integer(stats.received));
-    json_object_set_new(jr, "min_rtt", json_real(stats.min_rtt));
-    json_object_set_new(jr, "max_rtt", json_real(stats.max_rtt));
-    json_object_set_new(jr, "avg_rtt", json_real(stats.avg_rtt));
-    json_object_set_new(jr, "loss", json_real(stats.loss));
+    if (jr == NULL) return SYS_EXCEPTION();
+    json_object_set_new(jr, "error", json_string("unsupported"));
+    json_object_set_new(jr, "function", json_string(NET_FN_PING_AT));
+    json_object_set_new(jr, "host", json_string(target_addr != NULL ? target_addr : ""));
     char *body = json_dumps(jr, JSON_COMPACT);
     json_decref(jr);
-    if (body == NULL) { free(args); return NULL; }
-    size_t body_len = strlen(body);
+    if (body == NULL) return SYS_EXCEPTION();
 
     generic_msg_t gmsg = {0};
     gmsg.type = NET_MESSAGE;
     snprintf(gmsg.info.net_msg.process, sizeof(gmsg.info.net_msg.process), "network");
-    gmsg.info.net_msg.function = strdup(NET_FN_PING);
+    gmsg.info.net_msg.function = strdup(NET_FN_PING_AT);
     gmsg.info.net_msg.obj = (uint8_t *)body;
-    gmsg.info.net_msg.len = body_len;
+    gmsg.info.net_msg.len = strlen(body);
     gmsg.info.net_msg.encrypt = false;
-    if (messaging_send(args->return_to, NET_MESSAGE, &gmsg, false) != 0) {
-        log_warn(args->logger, "Ping (async): failed to post result to '%s'\n",
-                 args->return_to);
-    }
+    int rc = messaging_send(return_to, NET_MESSAGE, &gmsg, false);
+    if (rc != 0)
+        log_warn(logger, "Network: failed to post ping_at refusal to '%s'\n", return_to);
     if (gmsg.info.net_msg.function != NULL) free(gmsg.info.net_msg.function);
     free(body);
-    free(args);
-    return NULL;
-}
-
-/* Dispatch a detached worker. Returns 0 on dispatch, non-zero if the
- * thread couldn't be started (caller logs). */
-static int dispatch_ping_async(const char *target_addr, int count,
-                               const char *return_to, logger_t *logger)
-{
-    ping_worker_args_t *args = calloc(1, sizeof(*args));
-    if (args == NULL) return SYS_EXCEPTION();
-    snprintf(args->target_addr, sizeof(args->target_addr), "%s", target_addr);
-    args->count = count > 0 ? count : PING_COUNT;
-    snprintf(args->return_to, sizeof(args->return_to), "%s", return_to);
-    args->logger = logger;
-    pthread_t tid;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    int rc = pthread_create(&tid, &attr, ping_worker_thread, args);
-    pthread_attr_destroy(&attr);
-    if (rc != 0) {
-        free(args);
-        return rc;
-    }
-    return 0;
+    return rc;
 }
 
 /* Handle a stats_req intercepted on the outbound drain. Sends a
@@ -1628,7 +1683,10 @@ static int network_run(const net_transport_t *transport,
                        queue_id_t signal, logger_t *logger)
 {
     network_config_t *net_cfg = (network_config_t *)proc->conf.data_struct;
-    int port_num = net_cfg->port ? net_cfg->port : COMM_PORT;
+    net_port_source_t port_src = PORT_SRC_DEFAULT;
+    int port_num = net_port_resolve(net_cfg->port, &port_src, logger);
+    log_info(logger, "Network: base port %d from %s (group %d)\n",
+             port_num, net_port_source_name(port_src), port_num + 1);
 
     /* Extract identity before opening the transport — non-IP transports
      * (DTN) derive their local endpoint name from myself->uuid and need
@@ -1735,16 +1793,14 @@ static int network_run(const net_transport_t *transport,
                                               port_num, logger);
                     continue;
                 }
-                if (strcmp(nmsg->function, NET_FN_PING) == 0) {
-                    int count = PING_COUNT;
-                    if (nmsg->obj != NULL && nmsg->len == sizeof(int))
-                        count = *(const int *)nmsg->obj;
+                if (strcmp(nmsg->function, NET_FN_PING_AT) == 0) {
                     const char *ret_q = nmsg->return_to[0] != '\0'
                                          ? nmsg->return_to : "network";
-                    if (dispatch_ping_async(nmsg->to_whom.address, count,
-                                            ret_q, logger) != 0)
-                        log_warn(logger, "Network: ping dispatch failed for %s\n",
-                                 nmsg->to_whom.address);
+                    log_warn(logger,
+                             "Network: ping_at is unsupported in C, refusing "
+                             "request for %s (requester '%s')\n",
+                             nmsg->to_whom.address, ret_q);
+                    refuse_ping_at_unsupported(nmsg->to_whom.address, ret_q, logger);
                     continue;
                 }
                 /* Reputation communication cut-off enforcement. rep_proc's

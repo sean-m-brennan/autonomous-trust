@@ -361,28 +361,26 @@ ffi.cdef("""
                                net_wire_msg_t *msg_out);
     void net_wire_msg_free(net_wire_msg_t *msg);
 
-    /* ---- network/ping.h ---- */
-    typedef struct {
-        char host[17];           /* IPV4_ADDR_LEN(16) + 1 */
-        /* MAX_PING_COUNT (64), which is the ARRAY BOUND -- not PING_COUNT (4),
-           which is merely the default number of pings sent. This mirrored the
-           wrong constant until 2026-08-04 and dropped `count` entirely, making
-           the struct 96 bytes where C's is 584: `ffi.new('ping_stats_t *')` in
-           _ping_native.py handed C a buffer 488 bytes too small. Verified by
-           measurement, cdef sizeof == C sizeof == 584. */
-        double rtt_ms[64];
-        double min_rtt;
-        double max_rtt;
-        double avg_rtt;
-        double loss;
-        int sent;
-        int received;
-        int count;               /* actual count used */
-    } ping_stats_t;
+    /* ---- network/network.h ---- */
+    /* Base-port resolution: config -> AT_COMM_PORT -> COMM_PORT. Declared so
+       the Python side can assert it agrees with C for a given base instead of
+       hand-copying the constants (which is how the old port table drifted). */
+    typedef enum { PORT_SRC_CONFIG, PORT_SRC_ENV, PORT_SRC_DEFAULT } net_port_source_t;
+    int net_port_resolve(int cfg_port, net_port_source_t *src, void *logger);
+    const char *net_port_source_name(net_port_source_t src);
+    void net_port_resolve_reset(void);
 
-    int  ping(const char *host, int count, ping_stats_t *stats);
-    int  ping_server_start(void);
-    int  ping_server_stop(void);
+    /* ping.h is deliberately absent: C does not implement ping. There was a
+       ping_stats_t + ping()/ping_server_start()/ping_server_stop() block here,
+       bound by _ping_native.py. Both are gone -- Python's ping is the only
+       implementation, and the C network process answers the `ping` selector
+       with {"error": "unsupported"}. Do NOT re-add these declarations without
+       the C functions. `ffi.dlopen` resolves symbols LAZILY, per attribute
+       (measured): a stale declaration does NOT fail at import -- it raises
+       AttributeError the first time something touches `lib.<name>`, so the
+       breakage surfaces wherever that call site is, possibly long after the
+       mismatch was introduced. Delete declarations together with the functions
+       they describe rather than leaving harmless-looking prototypes. */
 
     /* ---- processes/capabilities.h ---- */
     /* thread_args_t and capability_t contain embedded opaque structs
