@@ -14,18 +14,25 @@
 #   limitations under the License.
 # ******************
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 try:
+    from autonomous_trust.services.peer import metadata as _metadata_mod
     from autonomous_trust.services.peer.metadata import (
         PeerData, MetadataProtocol, TimeSource, NtpTimeSource, PositionSource, Metadata,
     )
     from autonomous_trust.services.peer.position import GeoPosition
 except ImportError as _e:
     pytestmark = pytest.mark.skip(reason=f"missing dependency: {_e}")
+    # The skip mark does not stop this module's body from executing, so the names
+    # the class bodies below subclass/reference must still exist -- otherwise a
+    # missing dependency surfaces as a NameError that hides which import failed.
+    _metadata_mod = MagicMock()
+    PeerData = MetadataProtocol = TimeSource = NtpTimeSource = MagicMock()
+    PositionSource = Metadata = GeoPosition = object
 
 
 class _ParamPositionSource(PositionSource):
@@ -99,12 +106,21 @@ class TestTimeSource:
 
 # --- NtpTimeSource ---
 
+def _state(synced=True, max_error_sec=0.01, status=0, source='ntp_adjtime'):
+    from autonomous_trust.core.network.clock import ClockState
+    return ClockState(synced=synced, max_error=timedelta(seconds=max_error_sec),
+                      est_error=timedelta(seconds=max_error_sec), status=status,
+                      source=source)
+
+
 class TestNtpTimeSource:
+    """The source now READS stock NTP's state; it no longer maintains an offset."""
+
     def setup_method(self):
-        NtpTimeSource._started.clear()
+        NtpTimeSource._legacy_warned = False
 
     def teardown_method(self):
-        NtpTimeSource._started.clear()
+        NtpTimeSource._legacy_warned = False
 
     def test_is_registered(self):
         # name_to_class resolves it -> proves it's in the allowlist
@@ -112,38 +128,66 @@ class TestNtpTimeSource:
             'autonomous_trust.services.peer.metadata.NtpTimeSource')
         assert klass is NtpTimeSource
 
-    def test_construction_starts_sync(self):
-        with patch('autonomous_trust.core.network.ntp.start_sync') as mock_sync:
+    def test_construction_starts_no_sync(self):
+        # The whole point of the change: constructing it must not spawn a client.
+        with patch('threading.Thread') as mock_thread:
+            NtpTimeSource()
+        mock_thread.assert_not_called()
+
+    def test_legacy_kwargs_tolerated_and_warned_once(self):
+        # Existing time_src_kwargs payloads must keep loading, not crash.
+        with patch.object(_metadata_mod.logging, 'getLogger') as mock_get:
             src = NtpTimeSource('ntp.example.mil', 42)
-        mock_sync.assert_called_once_with('ntp.example.mil', 42.0)
-        assert src.server == 'ntp.example.mil'
-        assert src.interval == 42.0
-
-    def test_sync_started_once_per_server_interval(self):
-        with patch('autonomous_trust.core.network.ntp.start_sync') as mock_sync:
             NtpTimeSource('ntp.example.mil', 42)
-            NtpTimeSource('ntp.example.mil', 42)  # duplicate -> no new thread
-            NtpTimeSource('ntp.example.mil', 99)  # different interval -> new thread
-        assert mock_sync.call_count == 2
+        assert src.server == 'ntp.example.mil'
+        assert mock_get.return_value.warning.call_count == 1
 
-    def test_sync_import_error_is_tolerated(self):
+    def test_no_warning_without_legacy_kwargs(self):
+        with patch.object(_metadata_mod.logging, 'getLogger') as mock_get:
+            NtpTimeSource()
+        mock_get.return_value.warning.assert_not_called()
+
+    def test_acquire_is_the_host_clock(self):
+        sentinel = datetime(2031, 6, 6, 6, 6, 6)
+        with patch('autonomous_trust.core.system.now', return_value=sentinel):
+            assert NtpTimeSource().acquire() == sentinel
+
+    def test_quality_reads_kernel_state(self):
+        state = _state()
+        with patch('autonomous_trust.core.network.clock.clock_state',
+                   return_value=state):
+            assert NtpTimeSource().quality is state
+
+    def test_trustworthy_when_synced_and_within_bound(self):
+        with patch('autonomous_trust.core.network.clock.clock_state',
+                   return_value=_state(synced=True, max_error_sec=0.5)):
+            assert NtpTimeSource(max_error_sec=1.0).trustworthy is True
+
+    def test_untrustworthy_when_unsynced(self):
+        # This sandbox's real state: STA_UNSYNC, maxerror 16s.
+        with patch('autonomous_trust.core.network.clock.clock_state',
+                   return_value=_state(synced=False, max_error_sec=16.0,
+                                       status=0x0040)):
+            assert NtpTimeSource().trustworthy is False
+
+    def test_untrustworthy_when_error_exceeds_bound(self):
+        # Synced but imprecise is still not good enough to order peer events.
+        with patch('autonomous_trust.core.network.clock.clock_state',
+                   return_value=_state(synced=True, max_error_sec=5.0)):
+            assert NtpTimeSource(max_error_sec=1.0).trustworthy is False
+
+    def test_quality_import_error_is_untrustworthy_not_a_crash(self):
         real_import = __import__
 
         def _boom(name, *args, **kwargs):
-            if name == 'autonomous_trust.core.network.ntp':
+            if name == 'autonomous_trust.core.network.clock':
                 raise ImportError('simulated')
             return real_import(name, *args, **kwargs)
 
         with patch('builtins.__import__', side_effect=_boom):
-            src = NtpTimeSource('ntp.example.mil', 5)  # must not raise
-        assert src.server == 'ntp.example.mil'
-
-    def test_acquire_inherits_ntp_adjusted_clock(self):
-        sentinel = datetime(2031, 6, 6, 6, 6, 6)
-        with patch('autonomous_trust.core.network.ntp.start_sync'):
-            src = NtpTimeSource('ntp.example.mil', 5)
-        with patch('autonomous_trust.core.system.now', return_value=sentinel):
-            assert src.acquire() == sentinel
+            src = NtpTimeSource()
+            assert src.quality is None
+            assert src.trustworthy is False   # fails closed, never open
 
 
 # --- PositionSource ---
@@ -211,16 +255,19 @@ class TestMetadata:
         assert ps.device == '/dev/gps0'
 
     def test_time_source_receives_kwargs(self):
-        NtpTimeSource._started.clear()
+        # A legacy payload still reaches the source and still constructs; the
+        # server/interval keys are now inert (see TestNtpTimeSource).
         m = Metadata('uuid-123', 'drone', {}, PositionSource, NtpTimeSource,
                      time_src_kwargs={'server': 'ntp.example.mil', 'interval': 30})
-        with patch('autonomous_trust.core.network.ntp.start_sync') as mock_sync:
-            ts = m.time_source
+        ts = m.time_source
         assert isinstance(ts, NtpTimeSource)
         assert ts.server == 'ntp.example.mil'
-        assert ts.interval == 30.0
-        mock_sync.assert_called_once_with('ntp.example.mil', 30.0)
-        NtpTimeSource._started.clear()
+        assert ts.interval == 30
+
+    def test_time_source_receives_current_kwargs(self):
+        m = Metadata('uuid-123', 'drone', {}, PositionSource, NtpTimeSource,
+                     time_src_kwargs={'max_error_sec': 0.25})
+        assert m.time_source.max_error_sec == 0.25
 
     def test_kwargs_copied_not_aliased(self):
         payload = {'origin': '1,2'}

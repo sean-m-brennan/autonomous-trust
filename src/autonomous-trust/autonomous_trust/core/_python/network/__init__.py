@@ -19,4 +19,6 @@ from .message import Message
 from .netprocess import NetworkProcess, NetworkProtocol
 from .tcp import TCPNetworkProcess
 from .udp import UDPNetworkProcess
-from .ping import ping
+from .ping_at import ping_at
+from .clock import (ClockState, UnsyncedClockError, clock_state,  # noqa: F401
+                    kernel_clock_state, require_synced_clock)

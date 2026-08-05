@@ -48,10 +48,12 @@ from autonomous_trust.core.identity.peers import Peers
 from autonomous_trust.core.network import Network, Message
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.system import queue_cadence
+
 from autonomous_trust.core._python import _probes
 from autonomous_trust.services.data.server import DataProtocol
 
 from .inspector import Inspector
+from .latency import summarize
 from .transitive_trust import PEER_PAIR_QUERY_SEC
 
 
@@ -64,7 +66,13 @@ logger = logging.getLogger(__name__)
 #         public signing key (hex, 16 chars). Either string may be
 #         empty if the peer's Identity object is missing those fields.
 #   ("reputation", name:str, score:float, wall_t:float)
-#   ("ping",       name:str, rtt_ms:float, wall_t:float)
+#   ("ping_at",    name:str, rtt_ms:float, loss_pct:float, count:int,
+#                  wall_t:float)
+#       — a PingAT round: an AT peer answered on AT's ports via a
+#         cooperating responder. Distinct from ICMP reachability, and
+#         non-load-bearing: a missed reply costs a sample, nothing more.
+#         rtt_ms is the round's average; loss_pct and count come along
+#         because an average alone hides a peer answering 1 in 5.
 #   ("rep_pair",   observer:str, subject:str, score:float, wall_t:float)
 #       — bilateral observation: observer's view of subject.
 #   ("reading",    peer:str, reading_dict:dict, wall_t:float)
@@ -421,7 +429,7 @@ class InspectorBridge(Inspector):
                     # top-level queue) via Protocol.__init__.
                     # netproc dispatches ping() into a thread pool, so
                     # this no longer blocks the main loop.
-                    ping = Message(CfgIds.network, Network.ping, 5,
+                    ping = Message(CfgIds.network, Network.ping_at, 5,
                                    peer, return_to=self.proc_name)
                     queues[CfgIds.network].put(
                         ping, block=True, timeout=queue_cadence)
@@ -485,18 +493,24 @@ class InspectorBridge(Inspector):
 
             for message in list(self.unhandled_messages):
                 # unhandled_messages is a mixed bag — skip anything
-                # that isn't a Network.ping Message.
-                if getattr(message, "function", None) != Network.ping:
+                # that isn't a Network.ping_at Message.
+                if getattr(message, "function", None) != Network.ping_at:
                     continue
                 self.unhandled_messages.remove(message)
-                try:
-                    rtt = float(message.obj)
-                except (TypeError, ValueError):
+                # message.obj is a PingATStats, not a number: float(obj) raised
+                # TypeError, which this loop caught and skipped, so the latency
+                # panel never received a sample. Loss and count ride along
+                # because latency alone hides a peer answering one ping in five.
+                sample = summarize(message.obj)
+                if sample is None:
                     continue
-                target = _peer_name(getattr(message, "to_whom", None)
-                                    or getattr(message, "from_whom", None)
-                                    or "?")
-                self._push(("ping", target, rtt, time.time()))
+                peer = getattr(message, "from_whom", None) \
+                    or getattr(message, "to_whom", None)
+                if isinstance(peer, (list, tuple)):
+                    peer = peer[0] if peer else None
+                target = _peer_name(peer if peer is not None else "?")
+                self._push(("ping_at", target, sample.rtt_ms, sample.loss_pct,
+                            sample.count, time.time()))
 
     def _push(self, event):
         try:

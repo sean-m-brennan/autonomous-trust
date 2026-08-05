@@ -24,9 +24,48 @@ The `UDPNetworkProcess` binds three UDP sockets:
 
 | Socket | Address | Port | Purpose |
 |--------|---------|------|---------|
-| `recv_ptp_sock` | Node IP | N (default 27787) | Peer-to-peer receive |
+| `recv_ptp_sock` | Node IP | N | Peer-to-peer receive |
 | `recv_grp_sock` | Node IP | N+1 | Group receive |
 | `recv_cast_sock` | Broadcast/multicast addr | N | Open broadcast receive |
+
+### Where N comes from
+
+N is resolved once per node, from three layers in order:
+
+1. the provisioned config's `port` (a config always wins),
+2. the `AT_COMM_PORT` environment variable (operator override, applied only
+   where the config is silent),
+3. the compile-time default, 27787.
+
+C: `net_port_resolve()` (`network/network.h`), logged at startup with the layer
+that supplied it. Python: `system.resolve_comm_port()`. Both refuse a value that
+is unparseable or outside [1024, 65534], keeping the default rather than
+yielding 0, which would take an ephemeral port and leave the node where no peer
+looks. The upper bound leaves room for the derived N+1. The two implementations
+are held to the same table by the `network/port-resolution` conformance case.
+
+The config generator records `port` only when the operator asked for one, so a
+provisioned root does not pin every node to one port.
+
+**Two nodes on one host** therefore need only different `AT_COMM_PORT` values,
+or different addresses. Same base *and* same address is a silent failure, not a
+loud one: `SO_REUSEADDR` is set on every bind, so both succeed and the last
+binder receives everything (see `ISSUES.md`).
+
+Python derives two further ports from the same base: `ping_at_rcv` = N+2 and
+`ping_at_snd` = N+3. C has no counterpart: it implements neither.
+
+**PingAT is not ICMP.** It asks whether an *AT peer* is present and answering on
+AT's own ports via a cooperating responder (`PingATServer`); `ping(8)` asks
+whether a *host* is reachable. A host can answer ICMP with no AT process running
+at all, and an AT node can be present while ICMP is filtered, so the two answer
+different questions. The name says which one this is. PingAT is
+non-load-bearing: a missed reply costs a latency sample and changes no AT
+behaviour.
+
+There is no NTP port. AT carries no NTP implementation on either side; a stock
+daemon on the host disciplines the clock and AT only reads what it achieved
+(see [Node Lifecycle](node-lifecycle.md#clock-discipline)).
 
 The `TCPNetworkProcess` extends this by replacing peer and group UDP with TCP (using `listen`/`accept`), while keeping UDP for broadcast/multicast. TCP uses `[length]\|[data]` framing for reliable delivery. By default it opens one connection per message; it can optionally reuse one connection per peer for many messages, described in [TCP Connection Pooling](network-connection-pooling.md).
 
@@ -65,7 +104,7 @@ When a process places a `Message` on the network queue, `NetworkProcess` routes 
 flowchart TD
     Start["Message from<br/>process queue"] --> Special{"Special<br/>message?"}
     Special -- "stats_req" --> Stats["Return net stats<br/>to sender"]
-    Special -- "ping" --> Ping["ICMP ping<br/>target host"]
+    Special -- "ping_at" --> Ping["Python: ping the AT peer<br/>C: reply {error: unsupported}"]
     Special -- "no" --> Broadcast{"to_whom ==<br/>broadcast?"}
     Broadcast -- "yes" --> SendAny["send_any()<br/>UDP broadcast/multicast<br/>unencrypted"]
     Broadcast -- "no" --> GroupCheck{"to_whom is<br/>Group?"}

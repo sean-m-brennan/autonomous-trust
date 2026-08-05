@@ -30,6 +30,7 @@ for Phase A and raise NotImplementedError so the runner records them as skip.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -345,9 +346,69 @@ class NetworkAdapter:
         if case.name == 'group-key-rotation-decrypt-fails':
             self._run_group_key_rotation_decrypt_fails(case)
             return
+        if case.name == 'port-resolution':
+            self._run_port_resolution(case)
+            return
         raise NotImplementedError(
             f'network scenario {case.name!r} not implemented'
         )
+
+    def _run_port_resolution(self, case: Case) -> None:
+        """Base-port resolution: config -> AT_COMM_PORT -> default.
+
+        Runs the scenario's table against the production resolver. The C
+        adapter runs the same table against ``net_port_resolve``, so a change
+        to either resolution order fails here rather than at a peer that
+        cannot be reached. Refusals are part of the contract: a bad override
+        must keep the default and never yield 0.
+        """
+        from autonomous_trust.core._python import system as at_system
+
+        fixtures = case.data.get('fixtures') or {}
+        table = fixtures.get('resolutions') or []
+        if not table:
+            raise AssertionError('scenario: fixtures.resolutions missing or empty')
+
+        # Pinned in the scenario so a drift in either side's constants fails
+        # here instead of agreeing on a value neither side got from the other.
+        for key, actual in (('default_port', at_system.default_comm_port),
+                            ('port_min', at_system.comm_port_min),
+                            ('port_max', at_system.comm_port_max)):
+            if key in fixtures and fixtures[key] != actual:
+                raise AssertionError(
+                    f'{key}: scenario says {fixtures[key]}, Python says {actual}')
+
+        saved = os.environ.get('AT_COMM_PORT')
+        try:
+            for row in table:
+                rid = row.get('id', '?')
+                cfg_port = row.get('cfg_port') or 0
+                env = row.get('env')
+                want_port = row['expect_port']
+                want_src = row['expect_source']
+
+                if env is None:
+                    os.environ.pop('AT_COMM_PORT', None)
+                else:
+                    os.environ['AT_COMM_PORT'] = str(env)
+
+                got, got_src = at_system.resolve_comm_port(cfg_port)
+                shown = '(unset)' if env is None else env
+                if got != want_port:
+                    raise AssertionError(
+                        f'{rid}: cfg_port={cfg_port} AT_COMM_PORT={shown} -> '
+                        f'port {got}, want {want_port}')
+                if got_src != want_src:
+                    raise AssertionError(
+                        f'{rid}: cfg_port={cfg_port} AT_COMM_PORT={shown} -> '
+                        f"source {got_src!r}, want {want_src!r}")
+                if got + 1 > at_system.comm_port_max + 1:
+                    raise AssertionError(f'{rid}: group port {got + 1} out of range')
+        finally:
+            if saved is None:
+                os.environ.pop('AT_COMM_PORT', None)
+            else:
+                os.environ['AT_COMM_PORT'] = saved
 
     def _run_peer_encrypted_roundtrip(self, case: Case) -> None:
         """Exercise A.encrypt → B.decrypt → Message.parse end-to-end.

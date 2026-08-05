@@ -55,7 +55,7 @@ from .capabilities import Capabilities, Capability, PeerCapabilities
 from .system import CfgIds, PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
 from .protocol import Protocol
 from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, NegotiationProtocol
-from .network import Message
+from .network import Message, require_synced_clock
 from .reputation import TransactionScore, ReputationProtocol
 from .queue_pool import QueuePool
 from .._zkp import ZKP_AVAILABLE
@@ -561,6 +561,12 @@ class AutonomousTrust(Protocol):
         :return: None
         """
         os.makedirs(Configuration.get_data_dir(), exist_ok=True)
+        # Clock gate, before anything timestamps or votes. AT carries no NTP
+        # client of its own: a stock daemon on the HOST disciplines the clock
+        # and this reads only what it achieved. Enforcing inside AT container
+        # images (they set AT_REQUIRE_SYNCED_CLOCK=1), advisory elsewhere so a
+        # developer machine still runs. Mirrors the C gate in at_node_init.
+        require_synced_clock(self.logger)
         configs = self._configure()
         procs: list[Process] = configs[Process.key]
         if self._log_level <= LogLevel.WARNING:

@@ -26,7 +26,23 @@ from autonomous_trust.core.reputation.protocol import ReputationProtocol
 
 from .viz.server import VizServer, default_port as _viz_default_port
 from .viz.live_graph import LiveData
+from .latency import summarize
 from .transitive_trust import TransitiveTrustMixin, PEER_PAIR_QUERY_SEC
+
+
+def _replied_uuid(message) -> str | None:
+    """The UUID of the peer a PingAT reply is about, or None.
+
+    netprocess sets `from_whom` to the pinged peer; the graph keys nodes by
+    UUID string (see LiveNetworkGraph._peer_node), the same key the reputation
+    pushes use, so a sample keyed any other way would land on a node of its
+    own and never join the peer it measured.
+    """
+    peer = getattr(message, 'from_whom', None) or getattr(message, 'to_whom', None)
+    if isinstance(peer, (list, tuple)):
+        peer = peer[0] if peer else None
+    uuid = getattr(peer, 'uuid', None)
+    return str(uuid) if uuid else None
 
 
 class InspectorProcess(Process, metaclass=ProcMeta,
@@ -70,7 +86,7 @@ class Inspector(TransitiveTrustMixin, AutonomousTrust):
                 query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
                                 to_json_string((peer, self.proc_name)), self.identity)
                 queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
-                ping = Message(CfgIds.network, Network.ping, 5, peer, return_to=self.proc_name)
+                ping = Message(CfgIds.network, Network.ping_at, 5, peer, return_to=self.proc_name)
                 queues[CfgIds.network].put(ping, block=True, timeout=queue_cadence)
         if self.tasking_tick(3, PEER_PAIR_QUERY_SEC):
             # Transitive trust (resolves the former open design question):
@@ -95,10 +111,21 @@ class Inspector(TransitiveTrustMixin, AutonomousTrust):
             for message in list(self.unhandled_messages):
                 # unhandled_messages may contain non-Message objects
                 # (e.g. IdentityByAuthority); skip anything without .function.
-                if getattr(message, "function", None) == Network.ping:
+                if getattr(message, "function", None) == Network.ping_at:
                     self.unhandled_messages.remove(message)
-                    self.data_queue.put((LiveData.latencies, message.obj),
-                                        block=True, timeout=queue_cadence)
+                    # The latencies channel takes (uuid, rtt_ms) — see
+                    # LiveNetworkGraph._apply_latency, which ignores anything
+                    # that is not a 2-tuple. Forwarding the raw PingATStats
+                    # object here meant the display silently never updated.
+                    sample = summarize(message.obj)
+                    if sample is None:
+                        continue
+                    peer_uuid = _replied_uuid(message)
+                    if peer_uuid is None:
+                        continue        # a sample naming nobody is not a sample
+                    self.data_queue.put(
+                        (LiveData.latencies, (peer_uuid, sample.rtt_ms)),
+                        block=True, timeout=queue_cadence)
             self._report_unhandled()
 
     def cleanup(self):
