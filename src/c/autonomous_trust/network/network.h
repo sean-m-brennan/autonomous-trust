@@ -24,11 +24,20 @@
 #include <stdint.h>
 #include <jansson.h>
 #include "utilities/allocation.h"
+#include "utilities/logger.h"
 
+/* Compile-time DEFAULT base port, not a fixed one. The port a node actually
+ * uses is resolved by net_port_resolve() below; the transports derive the
+ * encrypted-group port as base + 1. Two nodes co-locate on one host by taking
+ * different bases (or the same base on different addresses). Mirrors Python
+ * system.py comm_port. */
 #define COMM_PORT 27787
-#define PING_RCV_PORT (COMM_PORT + 2)
-#define PING_SND_PORT (PING_RCV_PORT + 1)
-#define NTP_PORT (COMM_PORT + 4)
+
+/* Lowest/highest base a node may be given. The upper bound leaves room for
+ * the derived group port (base + 1) inside the 16-bit port space, and the
+ * lower bound keeps a node off the privileged range it cannot bind unprivileged. */
+#define COMM_PORT_MIN 1024
+#define COMM_PORT_MAX 65534
 
 #define IPV4_ADDR_LEN 16
 #define CIDR4_LEN (IPV4_ADDR_LEN + 3)
@@ -37,11 +46,11 @@
 #define MAC_ADDR_LEN 17
 
 /* Per-peer duplicate-broadcast threshold before demotion. Mirrors
- * Python NetworkProcess.annoy_limit (netprocess.py:90). The pest-
- * tracking map itself isn't yet wired into the C receive path —
- * defining the constant here so it's discoverable at the matching
- * call sites and so a future implementer has one knob to tune.
- * See divergence.md M13. */
+ * Python NetworkProcess.annoy_limit (netprocess.py:90). The pest-tracking
+ * map IS wired into the C receive path — net_proc.c:287 compares against
+ * this constant to set over_limit. Note the tunability divergence: Python
+ * exposes annoy_limit as an overridable class attribute, C has only this
+ * macro (see ISSUES.md, tunable-on-one-side entry). */
 #define NET_ANNOY_LIMIT 5
 
 /**
@@ -58,13 +67,18 @@ typedef enum {
 } network_protocol_t;
 
 /* Wire-protocol function selectors handled by the network process
- * outbound queue (mirrors Python Network.{stats_req,stats_resp,ping}
+ * outbound queue (mirrors Python Network.{stats_req,stats_resp,ping_at}
  * in network.py:33-35). Defined via `extern char[]` so callers compare
  * against the same bytes the wire serializer emits — see
  * project_proto_string_arrays. */
 extern char NET_FN_STATS_REQ[];
 extern char NET_FN_STATS_RESP[];
-extern char NET_FN_PING[];
+/* PingAT: confirmation that an AT peer is present and answering on AT's own
+ * UDP ports via a cooperating responder — NOT ICMP reachability. C implements
+ * no PingAT. The selector is retained so the outbound drain recognizes the
+ * request and answers {"error": "unsupported"} rather than dropping it and
+ * leaving a requester to time out. Python is the only implementation. */
+extern char NET_FN_PING_AT[];
 /* Reputation communication cut-off control (local IPC only; mirrors Python
  * Network.exclude / Network.readmit in network.py). */
 extern char NET_FN_EXCLUDE[];
@@ -97,6 +111,50 @@ typedef struct
     char ip6_cidr[CIDR6_LEN + 1];
     char mcast6_addr[IPV6_ADDR_LEN + 1];
 } network_config_t;
+
+/** Which layer supplied the base port a node is running on. */
+typedef enum {
+    PORT_SRC_CONFIG  = 0,  /**< network_config_t.port was non-zero. */
+    PORT_SRC_ENV     = 1,  /**< AT_COMM_PORT supplied it. */
+    PORT_SRC_DEFAULT = 2,  /**< Nothing did; COMM_PORT. */
+} net_port_source_t;
+
+/**
+ * @brief Resolve the base port a node communicates on.
+ *
+ * Resolution order: a non-zero @p cfg_port (the provisioned config always
+ * wins) → the AT_COMM_PORT environment variable (operator override, applied
+ * only where the config is silent) → COMM_PORT. The environment value is read
+ * once and cached, matching the other AT_* overrides in this tree
+ * (generate.c AT_TRANSPORT, net_proc.c AT_MYSTERY_MAX_AGE_SEC,
+ * configuration.c AT_SERIALIZE_MODE).
+ *
+ * An AT_COMM_PORT that is unparseable or outside [COMM_PORT_MIN,
+ * COMM_PORT_MAX] is refused with a warning and the default kept — never a
+ * silent 0. The result is always a bindable base, and base + 1 (the derived
+ * encrypted-group port) is always in range.
+ *
+ * @param cfg_port  network_config_t.port, or 0/negative when unset.
+ * @param src       Optional out-param: which layer supplied the result.
+ * @param logger    Optional; used to report a refused AT_COMM_PORT.
+ * @return the resolved base port, in [COMM_PORT_MIN, COMM_PORT_MAX].
+ */
+/*@
+  requires src == \null || \valid(src);
+  ensures \result >= COMM_PORT_MIN && \result <= COMM_PORT_MAX;
+  ensures cfg_port >= COMM_PORT_MIN && cfg_port <= COMM_PORT_MAX
+          ==> \result == cfg_port;
+*/
+int net_port_resolve(int cfg_port, net_port_source_t *src, logger_t *logger);
+
+/**
+ * @brief Human-readable name of a port source, for logs.
+ */
+/*@
+  assigns \nothing;
+  ensures \result != \null;
+*/
+const char *net_port_source_name(net_port_source_t src);
 
 /*@
   requires cidr != \null && \valid_read(cidr);

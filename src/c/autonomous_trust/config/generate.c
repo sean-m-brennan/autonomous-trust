@@ -408,7 +408,20 @@ int generate_network_config(const char *cfg_dir, bool preserve)
         return err;
 
     network_config_t net_cfg = {0};
-    net_cfg.port = COMM_PORT;
+    /* Record a port ONLY when the operator asked for one. Writing COMM_PORT
+     * unconditionally (as this did) pinned every provisioned root to 27787:
+     * the config layer always wins in net_port_resolve(), so nothing was left
+     * to default and no two generated nodes could differ — which made
+     * AT_COMM_PORT inert in exactly the co-location case it exists for. Left
+     * at 0, the resolver's later layers still apply at run time. Mirrors
+     * Python, where Network.__init__(_port=None) leaves it unset and
+     * netprocess.py falls back at use. The C tree parses no CLI options
+     * (example.c ignores argv), so AT_COMM_PORT is the operator's knob and
+     * asking the resolver keeps one source of truth for its range checks. */
+    net_port_source_t port_src = PORT_SRC_DEFAULT;
+    int asked = net_port_resolve(0, &port_src, NULL);
+    if (port_src == PORT_SRC_ENV)
+        net_cfg.port = asked;
     snprintf(net_cfg.mac_address, sizeof(net_cfg.mac_address), "%s", iface.mac_addr);
     snprintf(net_cfg.ip4_cidr, sizeof(net_cfg.ip4_cidr), "%s", iface.ip4_cidr);
     snprintf(net_cfg.ip6_cidr, sizeof(net_cfg.ip6_cidr), "%s", iface.ip6_cidr);

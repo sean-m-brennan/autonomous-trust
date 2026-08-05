@@ -29,6 +29,7 @@
 #include "node.h"
 #include "node_priv.h"
 #include "config/generate.h"
+#include "utilities/clock.h"
 #include "utilities/sighandler.h"
 #include "utilities/util.h"
 #include "processes/processes.h"   /* cadence */
@@ -61,6 +62,14 @@ int at_node_init(at_node_t *node, const at_node_config_t *cfg)
     /* Logger */
     logger_init(&node->log, node->config.log_level,
                 (char *)node->config.log_file);
+
+    /* Clock gate, before anything that timestamps or votes. AT carries no NTP
+     * client: a stock daemon on the HOST disciplines the clock and this only
+     * reads what it achieved. Enforcing inside AT container images (they set
+     * AT_REQUIRE_SYNCED_CLOCK=1), advisory elsewhere so a developer machine
+     * still runs. */
+    if (at_clock_require_synced(&node->log, 0) != 0)
+        return -1;
 
     /* Ensure required directories exist */
     char cfg_dir[CFG_PATH_LEN + 1];

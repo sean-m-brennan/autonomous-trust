@@ -139,4 +139,16 @@ void net_proc_test_reset_last_routed_from_addr(void);
  *         if no call has happened since the last reset. */
 void net_proc_test_get_last_routed_from_addr(char *out, size_t outlen);
 
+/* ---- ping_at refusal (divergence: C implements no PingAT) ----
+ * The outbound drain answers the `ping_at` selector with an explicit refusal
+ * instead of performing one. Exposed here (not in network.h) so a test can
+ * assert the reply's selector and body without standing up a whole network
+ * process; it is not public API. */
+
+/** @brief Post `{"error":"unsupported", ...}` on the NET_FN_PING_AT selector to
+ *         @p return_to. Local IPC only — never a wire message.
+ *  @return 0 when the refusal was posted, non-zero on alloc/send failure. */
+int refuse_ping_at_unsupported(const char *target_addr, const char *return_to,
+                            logger_t *logger);
+
 #endif  // NET_PROC_PRIV_H

@@ -22,11 +22,12 @@ from .._ffi import ffi, lib
 from ..._python.network.network import Network  # noqa: F401
 
 
-# Port constants from network.h
-COMM_PORT = 27787
-PING_RCV_PORT = COMM_PORT + 2
-PING_SND_PORT = PING_RCV_PORT + 1
-NTP_PORT = COMM_PORT + 4
+# One definition, not a copy. This used to hand-restate four constants under
+# the comment "Port constants from network.h", which is exactly how a port
+# table drifts from the header it claims to mirror. The ping/ntp three have no
+# C counterpart at all now (C implements neither), and the base comes from the
+# same place every other Python caller gets it.
+from ..._python.system import default_comm_port as COMM_PORT  # noqa: E402,F401
 
 
 def _set_char_field(field, value: str, max_len: int):

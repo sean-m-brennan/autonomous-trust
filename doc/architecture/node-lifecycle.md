@@ -6,6 +6,8 @@
 
 When `AutonomousTrust.run_forever()` is called, the node goes through a deterministic startup sequence before entering its active state.
 
+0. **Clock gate**: read the host's clock discipline and refuse to continue on a clock nothing is steering (see [Clock discipline](#clock-discipline)). The C side does the same in `at_node_init` before it touches any directory.
+
 1. **Configure**: Load configuration files from `$AUTONOMOUS_TRUST_ROOT/etc/at/`. Required configs: network, identity, peers, capabilities. The `ProcessTracker` reads `subsystems.cfg.json` to determine which process classes to instantiate.
 
 2. **Spawn processes**: The orchestrator creates a process pool and starts each subsystem process (`NetworkProcess`, `IdentityProcess`, `NegotiationProcess`, `ReputationProcess`) as an async worker, each with access to the shared queue dict. An additional worker, `BootstrapWorker`, is also registered (see [Process Architecture](process-architecture.md)) to run the bootstrap-capability corpus once peers begin to join.
@@ -18,11 +20,57 @@ When `AutonomousTrust.run_forever()` is called, the node goes through a determin
 
 6. **Active**: All subsystems run concurrently. The orchestrator enters `autonomous_loop`.
 
+## Clock discipline
+
+AT carries no NTP implementation. A stock daemon (chrony, ntpd or
+systemd-timesyncd) disciplines the clock, and AT reads what that daemon
+achieved so it can decline to run on a clock nothing is steering. Timestamps
+order events across a cohort, so a node whose clock is unsteered corrupts every
+comparison it takes part in.
+
+The read is `ntp_adjtime(modes = 0)`: unprivileged (setting the clock needs
+`CAP_SYS_TIME`), free of any dependency on a chrony socket or client binary, and
+honest inside a container, because `CLOCK_REALTIME` is not namespaced: a time
+namespace can offset only `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME`. Both
+implementations use the same syscall, so both agree on what "synced" means:
+`core/_python/network/clock.py` and `utilities/clock.{c,h}`. When `chronyc`
+happens to be present and reachable, root dispersion, stratum and leap state
+enrich the log line; nothing requires it.
+
+**The daemon belongs on the host, not in the container.** A container cannot
+discipline `CLOCK_REALTIME`. `clock_settime` returns `EPERM` without
+`CAP_SYS_TIME`, and granting it would only let the container fight its host, so
+AT images deliberately carry no `chronyd`. Any host running AT containers must
+run a stock NTP daemon; the same applies to a Compose or Tilt host.
+
+The gate has two modes, and the log line always names which one applied, so a
+start that proceeded is never ambiguous about whether the clock was checked:
+
+| `AT_REQUIRE_SYNCED_CLOCK` | Behaviour |
+|---------------------------|-----------|
+| set (`1`/`true`/`yes`/`on`) | Enforcing: refuse to start, naming what was seen. AT container images set this. |
+| unset or falsy | Advisory: one warning, then proceed. A developer machine is often unsteered, and a gate that refused there would block every local run. |
+
+Refusal covers two conditions: the kernel reports `STA_UNSYNC` (or returns
+`TIME_ERROR`), or its estimated maximum error exceeds one second. NTP's own
+unusable distance is around that (RFC 5905 MAXDIST is 1.5 s), and an
+undisciplined Linux kernel reports 16 s, so the bound separates "synced but
+imprecise" from "nobody is steering this clock". A query that cannot be made at
+all counts as unsynced: a check that failed open would be worse than no check.
+
+`NtpTimeSource` (`services/peer/metadata.py`) is the same reading offered as a
+peer metadata source. It returns the host clock like any `TimeSource` and adds
+`quality` / `trustworthy`, so a consumer can decline to order events against a
+badly synced peer instead of trusting the timestamp silently.
+
 ## State diagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Configure: run_forever()
+    [*] --> ClockGate: run_forever()
+    ClockGate: Clock gate\nread host NTP discipline
+    ClockGate --> [*]: unsynced and enforcing\n(refuse to start)
+    ClockGate --> Configure: clock acceptable\nor advisory
     Configure --> SpawnProcesses: configs loaded
     SpawnProcesses --> NetworkBind: processes started
 

@@ -31,7 +31,7 @@ class Network(InitializableConfig):
     broadcast = 'anyone'
     multicast_v4_address = '239.0.0.65'  # must be setup in OS
     multicast_v6_address = 'ff00::41e9:dddc:e4c7:e7e7'
-    ping = 'ping'
+    ping_at = 'ping_at'
     stats_req = 'stats_req'
     stats_resp = 'stats_resp'
     # Reputation communication cut-off control (local IPC, reputation ->
