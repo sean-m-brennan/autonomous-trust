@@ -99,7 +99,7 @@ class TCPNetworkProcess(UDPNetworkProcess):
         # Everything here must survive the multiprocessing spawn pickle:
         # empty dict/set and None are fine, but a threading.Lock is not, so
         # the locks are created later in _init_transport() (which runs in
-        # the worker subprocess). This mirrors the lazy _ping_pool.
+        # the worker subprocess). This mirrors the lazy _ping_at_pool.
         self._pool_enabled = system.net_persistent_conn
         self._conn_idle_ttl = system.net_conn_idle_ttl
         self._max_live_conns = system.net_max_live_conns

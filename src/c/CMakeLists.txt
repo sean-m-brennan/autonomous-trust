@@ -456,8 +456,6 @@ set(libsrc
     autonomous_trust/reputation/reputation.c
     autonomous_trust/reputation/rep_proc.c
     autonomous_trust/config/generate.c
-    autonomous_trust/network/ping.c
-    autonomous_trust/network/ntp.c
     autonomous_trust/network/net_message.c
     autonomous_trust/network/net_proc.c
     autonomous_trust/network/net_transport_ip.c
@@ -482,6 +480,7 @@ set(libsrc
     autonomous_trust/utilities/allocation.c
     autonomous_trust/utilities/at_jansson.c
     autonomous_trust/utilities/b64.c
+    autonomous_trust/utilities/clock.c
     autonomous_trust/utilities/err_str.c
     autonomous_trust/utilities/exception.c
     autonomous_trust/utilities/logger.c
@@ -694,6 +693,7 @@ set(libhdr
     autonomous_trust/structures/datetime.h
     autonomous_trust/structures/map.h
     autonomous_trust/structures/merkle.h
+    autonomous_trust/utilities/clock.h
     autonomous_trust/utilities/exception.h
     autonomous_trust/utilities/logger.h
     autonomous_trust/utilities/message.h
@@ -703,8 +703,6 @@ set(libhdr
     autonomous_trust/negotiation/negotiation.h
     autonomous_trust/reputation/reputation.h
     autonomous_trust/config/generate.h
-    autonomous_trust/network/ping.h
-    autonomous_trust/network/ntp.h
     autonomous_trust/fleet/update_proposal.h
     autonomous_trust/fleet/fleet_proc.h
     autonomous_trust/fleet/artifact_store.h
@@ -1059,6 +1057,10 @@ add_executable(b64_test test/b64_test.c)
 set_source_files_properties(test/b64_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(b64_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(clock_test test/clock_test.c)
+set_source_files_properties(test/clock_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(clock_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(group_test test/group_test.c)
 set_source_files_properties(test/group_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(group_test PRIVATE ${AT_TEST_LIBS})
@@ -1144,6 +1146,7 @@ add_test(NAME data_source_test COMMAND $<TARGET_FILE:data_source_test>)
 add_test(NAME net_proc_ageout_test COMMAND $<TARGET_FILE:net_proc_ageout_test>)
 add_test(NAME datetime_test COMMAND $<TARGET_FILE:datetime_test>)
 add_test(NAME b64_test COMMAND $<TARGET_FILE:b64_test>)
+add_test(NAME clock_test COMMAND $<TARGET_FILE:clock_test>)
 add_test(NAME group_test COMMAND $<TARGET_FILE:group_test>)
 add_test(NAME data_json_test COMMAND $<TARGET_FILE:data_json_test>)
 add_test(NAME datetime2_test COMMAND $<TARGET_FILE:datetime2_test>)
@@ -1162,6 +1165,10 @@ add_executable(network2_test test/network2_test.c)
 set_source_files_properties(test/network2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(network2_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(net_port_test test/net_port_test.c)
+set_source_files_properties(test/net_port_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_port_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(proc_tracker2_test test/proc_tracker2_test.c)
 set_source_files_properties(test/proc_tracker2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(proc_tracker2_test PRIVATE ${AT_TEST_LIBS})
@@ -1176,6 +1183,7 @@ target_link_libraries(capabilities_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME msg_types_test COMMAND $<TARGET_FILE:msg_types_test>)
 add_test(NAME network2_test COMMAND $<TARGET_FILE:network2_test>)
+add_test(NAME net_port_test COMMAND $<TARGET_FILE:net_port_test>)
 add_test(NAME proc_tracker2_test COMMAND $<TARGET_FILE:proc_tracker2_test>)
 add_test(NAME processes_test COMMAND $<TARGET_FILE:processes_test>)
 add_test(NAME capabilities_test COMMAND $<TARGET_FILE:capabilities_test>)

@@ -162,7 +162,14 @@ int network_to_json(const void *data_struct, json_t **obj_ptr)
     if (err != 0)
         return EXCEPTION(EJSN_OBJ_SET);
         
-    json_object_set_new(obj, "port", json_integer(net->port));
+    /* Omit an unset port rather than recording a literal 0. The config layer
+     * always wins in net_port_resolve(), so a `"port": 0` would read back as
+     * "no choice made" anyway — and a config file should state only what was
+     * actually chosen, leaving AT_COMM_PORT and the compile-time default free
+     * to apply. network_from_json() reads a missing key as 0 already
+     * (json_integer_value(NULL) == 0), so the round trip is unchanged. */
+    if (net->port != 0)
+        json_object_set_new(obj, "port", json_integer(net->port));
     json_object_set_new(obj, "ip4_cidr", json_string((char *)net->ip4_cidr));
     json_object_set_new(obj, "ip6_cidr", json_string((char *)net->ip6_cidr));
     json_object_set_new(obj, "mcast4_addr", json_string((char *)net->mcast4_addr));

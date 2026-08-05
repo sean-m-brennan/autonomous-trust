@@ -16,11 +16,11 @@
 
 import asyncio
 
-from .ping import PingStats, ping_rcv_port, ping_snd_port
+from .ping_at import PingATStats, ping_at_rcv_port, ping_at_snd_port
 from ..system import now
 
 
-class _PingServerProtocol(object):
+class _PingATServerProtocol(object):
     def __init__(self):
         self._error = None
         self._transport = None
@@ -50,7 +50,7 @@ class _PingServerProtocol(object):
         raise error
 
 
-class _PingClientProtocol(_PingServerProtocol):
+class _PingATClientProtocol(_PingATServerProtocol):
     def __init__(self, max_q=0):
         super().__init__()
         self._packets = asyncio.Queue(max_q)
@@ -73,7 +73,7 @@ class _PingClientProtocol(_PingServerProtocol):
         return await self._packets.get()
 
 
-class _PingServer(object):
+class _PingATServer(object):
     def __init__(self, transport, protocol):
         self.transport = transport
         self.protocol = protocol
@@ -82,14 +82,14 @@ class _PingServer(object):
         self.transport.close()
 
 
-async def AsyncPingServer(host='0.0.0.0'):  # noqa
+async def AsyncPingATServer(host='0.0.0.0'):  # noqa
     loop = asyncio.get_running_loop()
-    transport, protocol = await loop.create_datagram_endpoint(lambda: _PingServerProtocol(),  # noqa
-                                                              local_addr=(host, ping_rcv_port))
-    return _PingServer(transport, protocol)
+    transport, protocol = await loop.create_datagram_endpoint(lambda: _PingATServerProtocol(),  # noqa
+                                                              local_addr=(host, ping_at_rcv_port))
+    return _PingATServer(transport, protocol)
 
 
-async def async_ping(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0) -> PingStats:
+async def async_ping_at(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0) -> PingATStats:
     if seq_num is None:
         seq_num = 1
     try:
@@ -97,9 +97,9 @@ async def async_ping(host: str, seq_num: int = None, count: int = 1, timeout: fl
     except OverflowError:
         data = (1).to_bytes(4, 'big')
     loop = asyncio.get_running_loop()
-    transport, protocol = await loop.create_datagram_endpoint(lambda: _PingClientProtocol(),  # noqa
-                                                              local_addr=('0.0.0.0', ping_snd_port),
-                                                              remote_addr=(host, ping_rcv_port))
+    transport, protocol = await loop.create_datagram_endpoint(lambda: _PingATClientProtocol(),  # noqa
+                                                              local_addr=('0.0.0.0', ping_at_snd_port),
+                                                              remote_addr=(host, ping_at_rcv_port))
     times = {}
     start = now()
     end = now()
@@ -122,4 +122,4 @@ async def async_ping(host: str, seq_num: int = None, count: int = 1, timeout: fl
         if remainder > 0:
             await asyncio.sleep(remainder)
     transport.close()
-    return PingStats(host, times, (end-start))
+    return PingATStats(host, times, (end-start))

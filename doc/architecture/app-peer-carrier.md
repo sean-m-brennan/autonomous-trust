@@ -232,9 +232,30 @@ so a container cohort reports the carrier with no image or entrypoint change:
 tilt up -- --variant=c --num-nodes=3
 ```
 
-A single host cannot run two C nodes: `COMM_PORT` is fixed (`network.h:28`) and
-`ping.c` / `ntp.c` bind `INADDR_ANY` on the derived ports, so peering needs a
-container or a machine per node. This is why the demos are containerized.
+A single host **can** run two C nodes, on either of two axes: distinct base
+ports, or distinct addresses. `COMM_PORT` (`network.h`) is the compile-time
+*default*, not a fixed port — `net_port_resolve()` takes the base from the
+provisioned config, else `AT_COMM_PORT`, else that default, and the transports
+derive the encrypted-group port as base + 1 while binding the node's own address
+out of `net_cfg->ip4_cidr`. Two co-located nodes therefore need only different
+`AT_COMM_PORT` values.
+
+What used to make this impossible was the config *generator*, which wrote
+`COMM_PORT` into every provisioned root, so nothing was left to default and no
+two generated nodes could differ. It now records a port only when the operator
+asked for one. (The earlier claim here also blamed `ping.c` / `ntp.c` binding
+`INADDR_ANY`; ping and ntp have since been removed from C entirely — Python
+implements both, and the C network process answers the `ping` selector with
+`{"error": "unsupported"}`.)
+
+One hazard survives, recorded in `ISSUES.md`: two nodes given the *same* base on
+the *same* address both bind and neither is told. `net_transport_ip.c` sets
+`SO_REUSEADDR` on every bind, and with the option on both sockets Linux permits
+the duplicate and delivers every datagram to the last binder, so the first node
+goes deaf with no error anywhere. Give co-located nodes different bases.
+
+The demos remain containerized for isolation of config and state, not because
+co-location is impossible.
 
 **An empty roster emits nothing, which is indistinguishable from break #4
 returning.** Read a `peer observed` line only against the admission it should

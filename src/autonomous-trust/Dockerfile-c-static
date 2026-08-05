@@ -82,6 +82,18 @@ COPY --from=builder /build/install/usr/local/bin/at_demo /usr/local/bin/at_demo
 RUN ldd /usr/local/bin/at_demo 2>&1 | grep -q "not a dynamic executable" || \
     (echo "ERROR: at_demo is not statically linked" && ldd /usr/local/bin/at_demo && exit 1)
 
+# --- Clock discipline (required) -------------------------------------------
+# AT carries no NTP client of its own. This node refuses to start on a clock
+# no daemon is steering: the in-process gate reads ntp_adjtime(modes=0), which
+# is honest inside a container because CLOCK_REALTIME is shared with the host
+# (a time namespace can offset only CLOCK_MONOTONIC and CLOCK_BOOTTIME).
+#
+# THE HOST MUST RUN A STOCK NTP DAEMON -- chrony, ntpd or systemd-timesyncd.
+# A container cannot discipline CLOCK_REALTIME itself: clock_settime() returns
+# EPERM without CAP_SYS_TIME, and granting it would only let the container
+# fight its host. So there is deliberately no chronyd in this image.
+ENV AT_REQUIRE_SYNCED_CLOCK=1
+
 ENV AUTONOMOUS_TRUST_ROOT="/"
 
 ENTRYPOINT ["/usr/local/bin/at_demo"]

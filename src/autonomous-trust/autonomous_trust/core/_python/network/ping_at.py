@@ -20,10 +20,10 @@ import time
 from datetime import timedelta
 import socket
 
-from ..system import now, ping_rcv_port, ping_snd_port
+from ..system import now, ping_at_rcv_port, ping_at_snd_port
 
 
-class PingStats(object):
+class PingATStats(object):
     def __init__(self, host, times, total):
         self.host = host
         self.times = times
@@ -66,7 +66,7 @@ class PingStats(object):
             (self.min.total_seconds() * 1000, self.avg.total_seconds() * 1000, self.max.total_seconds() * 1000)
 
 
-class PingServer(threading.Thread):
+class PingATServer(threading.Thread):
     def __init__(self, host, logger=None):
         super().__init__()
         self.logger = logger
@@ -76,13 +76,13 @@ class PingServer(threading.Thread):
         # Python 3.13's settimeout(positive) leaves the socket in
         # non-blocking mode (recvfrom raises BlockingIOError immediately).
         # The 0.1s default was already set by NetworkProcess.__init__,
-        # so this is mostly a no-op safety net for direct PingServer
+        # so this is mostly a no-op safety net for direct PingATServer
         # instantiation outside the AT runtime.
         timeout = 0.1
         socket.setdefaulttimeout(timeout)
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.recv_sock.bind((host, ping_rcv_port))
+        self.recv_sock.bind((host, ping_at_rcv_port))
         self.done = False
 
     def run(self):
@@ -101,8 +101,8 @@ class PingServer(threading.Thread):
                 except OverflowError:
                     data = (1).to_bytes(4, 'big')
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
-                    self.logger.debug('Echo ping to %s:%s' % (host, ping_snd_port))
-                    sent = sock.sendto(data, (host, ping_snd_port))
+                    self.logger.debug('Echo ping to %s:%s' % (host, ping_at_snd_port))
+                    sent = sock.sendto(data, (host, ping_at_snd_port))
                     if sent == 0:
                         raise RuntimeError("Socket connection broken (no bytes sent)")
         self.logger.info('Ping server halted')
@@ -111,7 +111,7 @@ class PingServer(threading.Thread):
         self.done = True
 
 
-def ping(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0) -> PingStats:
+def ping_at(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0) -> PingATStats:
     if seq_num is None:
         seq_num = 1
     try:
@@ -122,7 +122,7 @@ def ping(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0) -
     socket.setdefaulttimeout(timeout)
     recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    recv_sock.bind(('', ping_snd_port))
+    recv_sock.bind(('', ping_at_snd_port))
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
         times = {}
@@ -130,8 +130,8 @@ def ping(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0) -
         end = now()
         for seq_num in range(1, count+1):
             init = now()
-            sent = sock.sendto(data, (host, ping_rcv_port))
-            logging.getLogger(__name__).debug('Ping %s:%s from %s' % (host, ping_rcv_port, recv_sock.getsockname()))
+            sent = sock.sendto(data, (host, ping_at_rcv_port))
+            logging.getLogger(__name__).debug('Ping %s:%s from %s' % (host, ping_at_rcv_port, recv_sock.getsockname()))
             if sent == 0:
                 raise RuntimeError("Socket connection broken (no bytes sent)")
             try:
@@ -149,4 +149,4 @@ def ping(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0) -
             if elapsed < 1.0:
                 time.sleep(1.0 - elapsed)
     recv_sock.close()
-    return PingStats(host, times, (end-start))
+    return PingATStats(host, times, (end-start))

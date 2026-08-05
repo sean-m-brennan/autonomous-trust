@@ -25,11 +25,21 @@ unhandled-cascade fails here without needing a docker compose run.
 
 Topology
 --------
-Each peer process binds to `127.0.0.{base+i}` on the same `comm_port`
-(its `group_port` is `comm_port + 1`). UDP broadcast goes to
-`127.255.255.255` (the /8 broadcast). Linux loopback supports
-SO_REUSEADDR + broadcast on all of 127/8 by default; macOS does not,
-hence `pytest.mark.skipif` on the smoke test.
+Peers can be separated on either of two axes (`separate_by`):
+
+- `'address'` (default, the original topology): each peer binds
+  `127.0.0.{base+i}` on the same `comm_port` (its `group_port` is
+  `comm_port + 1`).
+- `'port'`: every peer binds ONE address and gets its own base port via
+  `AT_COMM_PORT`, `port_stride` apart. This is the axis `AT_COMM_PORT`
+  exists for, and the only one that also separates the derived ports, so
+  anything still binding a wildcard address (see ISSUES.md on ping.py's
+  receive bind) stops contending. Convergence helpers that identify peers
+  by address refuse to run in this mode rather than pass vacuously.
+
+UDP broadcast goes to `127.255.255.255` (the /8 broadcast). Linux loopback
+supports SO_REUSEADDR + broadcast on all of 127/8 by default; macOS does
+not, hence `pytest.mark.skipif` on the smoke test.
 
 Each peer has its own `etc/at` config dir under the harness tmp root
 so identity/peer/group state is fully isolated. The harness reads
@@ -58,12 +68,17 @@ from typing import Callable, Optional
 def _peer_main(peer_idx: int, addr: str, cfg_dir: str,
                transport: str, runtime_sec: float,
                log_level_name: str, ready_q,
-               probes_dir: Optional[str]):
+               probes_dir: Optional[str], comm_port: Optional[int] = None):
     """Forkserver target. Top-level so it pickles cleanly."""
     # Configure environment BEFORE importing autonomous_trust.core, so
     # transport selection + config dir are visible at import time.
     os.environ['AT_TRANSPORT'] = transport
     os.environ['AT_PEER_NAME'] = f'peer-{peer_idx}'
+    # Separation by port, as an alternative to separation by address. Must be
+    # set before core import: system.comm_port and the ports derived from it
+    # are resolved at import time.
+    if comm_port is not None:
+        os.environ['AT_COMM_PORT'] = str(comm_port)
     if probes_dir:
         os.environ['AT_PROBES'] = '1'
         os.environ['AT_PROBES_DIR'] = probes_dir
@@ -149,6 +164,7 @@ class PeerHandle:
     cfg_dir: str
     process: Optional[mp.Process] = None
     error: Optional[str] = None
+    comm_port: Optional[int] = None  # None => the default base for every peer
 
 
 @dataclass
@@ -167,11 +183,36 @@ class MultiPeerHarness:
     capture_probes: bool = False
     tmp_root: Optional[str] = None
     peers: list[PeerHandle] = field(default_factory=list)
+    # Separation axis. 'address' is the original behaviour: every peer on the
+    # shared default comm_port, distinguished by loopback alias. 'port' puts
+    # every peer on ONE address and separates them by base port instead, which
+    # is what AT_COMM_PORT exists for and the only axis that also separates the
+    # derived ports (group, and Python's ping/ntp). Separating by address alone
+    # leaves anything that binds a wildcard address contending — see ISSUES.md
+    # on ping.py's receive bind.
+    separate_by: str = 'address'
+    port_stride: int = 100   # gap between peers' bases; > 1 leaves room for +1
 
     def __post_init__(self):
         if self.tmp_root is None:
             self.tmp_root = tempfile.mkdtemp(prefix='at_harness_')
         os.makedirs(self.tmp_root, exist_ok=True)
+
+    def endpoint_for(self, i: int) -> tuple[str, Optional[int]]:
+        """The (address, comm_port) peer `i` should bind.
+
+        In 'address' mode the port is None, meaning "whatever the peer resolves
+        by default" — the original topology. In 'port' mode every peer shares
+        one loopback address and gets its own base.
+        """
+        if self.separate_by == 'port':
+            from autonomous_trust.core._python.system import default_comm_port
+            return (f'127.0.0.{self.base_octet}',
+                    default_comm_port + (i + 1) * self.port_stride)
+        if self.separate_by != 'address':
+            raise ValueError(f'separate_by must be address or port, '
+                             f'not {self.separate_by!r}')
+        return f'127.0.0.{self.base_octet + i}', None
 
     # Required for `with` use
     def __enter__(self) -> 'MultiPeerHarness':
@@ -201,14 +242,15 @@ class MultiPeerHarness:
         self._ready_q = manager.Queue()
 
         for i in range(self.n_peers):
-            addr = f'127.0.0.{self.base_octet + i}'
+            addr, port = self.endpoint_for(i)
             cfg_dir = os.path.join(self.tmp_root, f'peer_{i}', 'etc', 'at')
             os.makedirs(cfg_dir, exist_ok=True)
-            handle = PeerHandle(idx=i, addr=addr, cfg_dir=cfg_dir)
+            handle = PeerHandle(idx=i, addr=addr, cfg_dir=cfg_dir,
+                                comm_port=port)
             proc = ctx.Process(
                 target=_peer_main,
                 args=(i, addr, cfg_dir, self.transport, self.runtime_sec,
-                      self.log_level, self._ready_q, self.probes_dir),
+                      self.log_level, self._ready_q, self.probes_dir, port),
                 daemon=False)
             proc.start()
             handle.process = proc
@@ -267,6 +309,17 @@ class MultiPeerHarness:
 
     def all_peers_grouped(self) -> bool:
         """Every peer sees every other peer in its persisted Peers."""
+        if self.separate_by == 'port':
+            # Refuse rather than mislead: this check identifies peers by
+            # address, and in port mode every peer shares one. The expected set
+            # would collapse to the peer's own address and the assertion would
+            # pass vacuously. Convergence coverage needs address separation (or
+            # a peer identifier that is not the address); port mode exists for
+            # the bind/co-location question.
+            raise NotImplementedError(
+                'all_peers_grouped() identifies peers by address and cannot '
+                'work in separate_by="port" mode; use separate_by="address" '
+                'for convergence assertions')
         for i in range(self.n_peers):
             seen = set(self.peers_known_by(i))
             expected = {p.addr for p in self.peers if p.idx != i}

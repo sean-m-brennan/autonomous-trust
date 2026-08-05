@@ -1,0 +1,138 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: port-resolution
+byte_pinning: false
+description: |
+    Base-port resolution agreement. Both implementations resolve the port a
+    node communicates on from three layers, in one order: a usable configured
+    port wins, else the AT_COMM_PORT environment override, else the
+    compile-time default. The derived encrypted-group port is base + 1.
+
+    This case exists because the two sides could drift with nothing noticing.
+    Before it, the port surface was asserted nowhere in the corpus, every
+    `.port =` in the C test tree was the literal 27787, and the constants were
+    stated three times (network.h, _python/system.py, and a hand-copy in
+    _native/network/_netconfig.py under the comment "Port constants from
+    network.h"). A path that ignored the configured value, or an override that
+    silently produced port 0, would have passed everything.
+
+    A refused override is as much a part of the contract as an accepted one:
+    an unparseable, zero, privileged or out-of-range AT_COMM_PORT must fall
+    back to the default and never yield 0, which would ask the kernel for an
+    ephemeral port and put the node where no peer is looking.
+
+    Production-code analogue:
+      Python: system.resolve_comm_port(cfg_port, logger); NetworkProcess
+              __init__ resolves it from net_cfg.port.
+      C:      net_port_resolve(cfg_port, &src, logger) (network/network.h);
+              network_run resolves it from net_cfg->port.
+
+    Note: ping and ntp ports are deliberately absent. C implements neither, so
+    there is no cross-language contract to assert; Python derives its own from
+    the same base (see ISSUES.md, ping/ntp are Python-only).
+
+participants:
+  - id: node
+    role: resolver
+
+fixtures:
+  # Bounds and default, stated here so a drift in either implementation's
+  # constants shows up as a case failure rather than as agreement on a value
+  # neither side got from the other.
+  default_port: 27787
+  port_min: 1024
+  port_max: 65534
+  resolutions:
+    - id: config-wins
+      cfg_port: 28500
+      env: "31000"
+      expect_port: 28500
+      expect_source: config
+    - id: config-wins-no-env
+      cfg_port: 28500
+      env: null
+      expect_port: 28500
+      expect_source: config
+    - id: env-applies-when-config-silent
+      cfg_port: 0
+      env: "31000"
+      expect_port: 31000
+      expect_source: AT_COMM_PORT
+    - id: default-when-both-silent
+      cfg_port: 0
+      env: null
+      expect_port: 27787
+      expect_source: default
+    - id: env-at-lower-bound
+      cfg_port: 0
+      env: "1024"
+      expect_port: 1024
+      expect_source: AT_COMM_PORT
+    - id: env-at-upper-bound
+      cfg_port: 0
+      env: "65534"
+      expect_port: 65534
+      expect_source: AT_COMM_PORT
+    - id: refuse-unparseable
+      cfg_port: 0
+      env: "abc"
+      expect_port: 27787
+      expect_source: default
+    - id: refuse-trailing-garbage
+      cfg_port: 0
+      env: "31000x"
+      expect_port: 27787
+      expect_source: default
+    - id: refuse-zero
+      cfg_port: 0
+      env: "0"
+      expect_port: 27787
+      expect_source: default
+    - id: refuse-negative
+      cfg_port: 0
+      env: "-1"
+      expect_port: 27787
+      expect_source: default
+    - id: refuse-privileged
+      cfg_port: 0
+      env: "80"
+      expect_port: 27787
+      expect_source: default
+    - id: refuse-above-range
+      cfg_port: 0
+      env: "99999"
+      expect_port: 27787
+      expect_source: default
+    - id: refuse-no-room-for-group-port
+      cfg_port: 0
+      env: "65535"
+      expect_port: 27787
+      expect_source: default
+    - id: refuse-bad-config-falls-through-to-env
+      cfg_port: 70000
+      env: "31000"
+      expect_port: 31000
+      expect_source: AT_COMM_PORT
+    - id: refuse-bad-config-falls-through-to-default
+      cfg_port: 70000
+      env: null
+      expect_port: 27787
+      expect_source: default
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: resolve_port
+    description: |
+        For each entry in fixtures.resolutions the adapter sets or clears
+        AT_COMM_PORT, resolves the base port from the given configured value,
+        and records the resolved port, its source, and the derived group port.
+
+expected_state:
+  node:
+    # Every resolution must match its own expect_port/expect_source, and the
+    # group port must be exactly base + 1 in every case.
+    all_resolutions_match: true
+    group_port_is_base_plus_one: true
