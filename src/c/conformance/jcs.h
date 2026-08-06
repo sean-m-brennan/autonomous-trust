@@ -49,6 +49,25 @@ extern "C" {
  */
 int jcs_canonicalize(const char *json_utf8, size_t len, char **out, size_t *out_len);
 
+/* Test seam (ISSUES §2.1.2).  Reshape a Ryu `d2s_buffered_n` output to the
+ * ES6/JCS canonical form, reading EXACTLY @p n_in bytes of @p ryu.
+ *
+ * Exposed only so a test can hand it a buffer that is deliberately NOT
+ * NUL-terminated, which is the contract `d2s_buffered_n` actually provides and
+ * the one that broke: the exponent used to be read with `strtol`, running off
+ * the end into uninitialized stack and producing a garbage exponent in ~3% of
+ * runs.  Since JCS is what wire bytes are signed over, that made a node sign a
+ * byte string its verifier could not reproduce.  Going through the public
+ * canonicalizer cannot pin this — whatever follows a local buffer is incidental
+ * — so the counted contract is tested directly.
+ *
+ * Writes at most @p out_cap bytes to @p out (no NUL).
+ *
+ * @return the number of bytes written, or -1 on a malformed/oversized input.
+ */
+int jcs_es6_from_ryu_for_test(const char *ryu, size_t n_in,
+                              char *out, size_t out_cap);
+
 #ifdef __cplusplus
 }
 #endif
